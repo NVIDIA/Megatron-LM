@@ -15,7 +15,22 @@ from megatron.training.argument_utils import (
     TypeInferenceError,
     pretrain_cfg_container_from_args,
 )
+from megatron.training.arguments import _validate_rl_refit_method
 from megatron.training.config import PretrainConfigContainer
+
+
+def test_nccl_m2n_rejects_collocated_rl_refit():
+    args = Namespace(
+        context_parallel_size=1,
+        refit_method="nccl_m2n",
+        rl_inference_tensor_model_parallel_size=1,
+        rl_inference_pipeline_model_parallel_size=None,
+        rl_inference_expert_model_parallel_size=None,
+        rl_inference_expert_tensor_model_parallel_size=None,
+    )
+
+    with pytest.raises(ValueError, match="requires non-collocated"):
+        _validate_rl_refit_method(args)
 
 
 @dataclass

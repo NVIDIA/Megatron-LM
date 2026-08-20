@@ -111,8 +111,10 @@ def _build_plan_cache_key(
     )
 
 
-# Module-level cache for refit services to avoid repeated allocations
-_service_cache: dict[str, CopyService] = {}
+# Module-level cache for refit services to avoid repeated allocations. Services
+# own process-group-specific communicators, so the group identity is part of the
+# key. ``id(group)`` also supports ProcessGroup wrappers that are not hashable.
+_service_cache: dict[tuple[str, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
 
 
@@ -126,8 +128,9 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
         backend: Backend name ("nccl", "nccl_m2n", "gloo", "nvshmem", or "nixl").
         group: Optional process group for the backend.
     """
-    if backend in _service_cache:
-        return _service_cache[backend]
+    cache_key = (backend, id(group) if group is not None else None)
+    if cache_key in _service_cache:
+        return _service_cache[cache_key]
 
     if backend == "nccl":
         service = NCCLCopyService(group=group)
@@ -142,7 +145,7 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     else:
         raise ValueError(f"Unknown backend '{backend}'")
 
-    _service_cache[backend] = service
+    _service_cache[cache_key] = service
     return service
 
 

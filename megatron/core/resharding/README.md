@@ -35,7 +35,7 @@ from megatron.core.resharding import swap_model_weights
 swap_model_weights(
     src_model=training_model,
     target_model=inference_model,
-    refit_method="nccl",  # or "nccl_m2n", "gloo", "nvshmem", or "nixl"
+    refit_method="nccl",  # or "gloo", "nvshmem", or "nixl"
 )
 ```
 
@@ -123,6 +123,10 @@ when the application has extra ranks. Tensor data is packed into an ordinary,
 reusable CUDA tensor; model parameter storage itself is not replaced. Supported
 mesh sizes are validated by `nccl-extensions`.
 
+The built-in RL loop currently creates its training and inference models on the
+same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public
+API or the ReFIT benchmark.
+
 ## How the Reshard Plan Works
 
 1. Each rank extracts parameter metadata (shape, sharding, TP/EP/PP groups).
@@ -170,7 +174,7 @@ across refits.
 
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
-| `_service_cache` | Backend name | `CopyService` instance | Avoid re-creating CUDA streams / NVSHMEM buffers |
+| `_service_cache` | Backend name + process-group identity | `CopyService` instance | Avoid re-creating backend communicators and buffers |
 | `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits |
 
 Call `clear_all_caches()` before destroying distributed process groups

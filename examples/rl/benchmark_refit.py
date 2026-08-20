@@ -240,6 +240,11 @@ def benchmark_non_collocated():
     dst_world = dst_tp * dst_pp * dst_ep
 
     required_size = src_world + dst_world
+    if args.refit_method == 'nccl_m2n' and world_size != required_size:
+        raise ValueError(
+            f"NCCL M2N requires exactly {required_size} source and destination GPUs, "
+            f"got {world_size}"
+        )
     if world_size < required_size:
         raise ValueError(f"Non-collocated requires {required_size} GPUs, got {world_size}")
 
@@ -333,6 +338,9 @@ def main():
     )
 
     args = get_args()
+
+    if args.refit_method == 'nccl_m2n' and args.refit_mode != 'non-collocated':
+        raise ValueError("NCCL M2N supports only non-collocated refit")
 
     # Set default vocab size if not provided
     if args.vocab_size is None:

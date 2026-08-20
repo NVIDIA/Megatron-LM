@@ -386,6 +386,25 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def _validate_rl_refit_method(args: argparse.Namespace) -> None:
+    """Reject ReFIT backends unsupported by the built-in collocated RL loop."""
+    uses_separate_inference_model = args.context_parallel_size > 1 or any(
+        size is not None
+        for size in (
+            args.rl_inference_tensor_model_parallel_size,
+            args.rl_inference_pipeline_model_parallel_size,
+            args.rl_inference_expert_model_parallel_size,
+            args.rl_inference_expert_tensor_model_parallel_size,
+        )
+    )
+    if args.refit_method == 'nccl_m2n' and uses_separate_inference_model:
+        raise ValueError(
+            "--refit-method nccl_m2n requires non-collocated source and destination ranks; "
+            "the built-in RL loop creates both models on every rank"
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -448,6 +467,8 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:
+        _validate_rl_refit_method(args)
+
         # ----------------------------------------------------------------
         # CUDA graphs
         #
