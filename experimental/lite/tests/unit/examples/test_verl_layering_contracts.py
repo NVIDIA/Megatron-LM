@@ -101,3 +101,10 @@ def test_verl_mlite_layer_does_not_see_model_internal_batch_fields() -> None:
         _python_files(VERL_MLITE_ROOT), {"packed_seq_params", "position_ids", "to_bridge_dict"}
     )
     assert violations == []
+
+
+def test_sitecustomize_does_not_depend_on_workspace_kernel_shims() -> None:
+    sitecustomize = LITE_ROOT / "examples" / "verl" / "sitecustomize.py"
+    imports = {module for _, module in _imported_modules(sitecustomize)}
+
+    assert "rat_kernel_compat" not in imports

@@ -24,29 +24,3 @@ if (
     from verl_mlite.compat import apply_runtime_patches
 
     apply_runtime_patches()
-
-    # Keep the proven DS4 environment process-wide: canonical DeepGEMM for
-    # dense kernels, with only the validated batch-invariant masked-grouped
-    # entry point overlaid.  vLLM TP workers use ``spawn`` and therefore must
-    # install this in sitecustomize; a parent-process monkeypatch is not
-    # inherited.
-    if os.environ.get("VLLM_BATCH_INVARIANT", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        from rat_kernel_compat import (
-            configure_deep_gemm_batch_invariant,
-            enable_batched_deepgemm_batch_invariance,
-            install_deep_gemm_batch_invariant_overlay,
-            patch_deep_ep_buffer_kwargs,
-        )
-
-        # The proven four-layer gate uses DeepEP-align_fp8, whose Buffer does
-        # not expose vLLM's newer, disabled-by-default enable_shrink keyword.
-        # Spawned rollout workers must install the same compatibility shim.
-        patch_deep_ep_buffer_kwargs()
-        install_deep_gemm_batch_invariant_overlay()
-        if configure_deep_gemm_batch_invariant():
-            enable_batched_deepgemm_batch_invariance()
