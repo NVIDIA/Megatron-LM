@@ -818,7 +818,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -840,19 +841,21 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        kwargs = {
-            "logits": logits,
-            "topk": topk,
-            "use_pre_softmax": use_pre_softmax,
-            "num_groups": num_groups,
-            "group_topk": group_topk,
-            "scaling_factor": scaling_factor,
-            "score_function": score_function,
-            "expert_bias": expert_bias,
-        }
-        if fused_topk_with_score_function_supports_topk_indices:
-            kwargs["topk_indices"] = topk_indices
-        return fused_topk_with_score_function(**kwargs)
+        return fused_topk_with_score_function(
+            logits=logits,
+            topk=topk,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+            scaling_factor=scaling_factor,
+            score_function=score_function,
+            expert_bias=expert_bias,
+            **(
+                {"topk_indices": topk_indices}
+                if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None
+                else {}
+            ),
+        )
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -945,11 +948,6 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
-
-    if topk_indices is not None:
-        topk_indices.copy_(top_indices.to(topk_indices.dtype))
-        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
-        return routing_probs, topk_indices
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
