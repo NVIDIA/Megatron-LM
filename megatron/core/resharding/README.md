@@ -120,10 +120,8 @@ group must contain a contiguous source interval starting at group rank 0,
 immediately followed by a contiguous destination interval, with no overlapping
 or idle ranks. Use a process group scoped to exactly one source/destination pool
 when the application has extra ranks. Tensor data is packed into an ordinary,
-reusable CUDA tensor; model parameter storage itself is not replaced. The stock
-v0.2 copy/staging path caps meshes at 16 source and 64 destination ranks. A
-custom build with larger bounds can be used by constructing
-`NCCLM2NCopyService` with `enforce_mesh_limits=False`.
+reusable CUDA tensor; model parameter storage itself is not replaced. Supported
+mesh sizes are validated by `nccl-extensions`.
 
 ## How the Reshard Plan Works
 

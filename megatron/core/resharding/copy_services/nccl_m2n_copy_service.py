@@ -1,14 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import importlib
 import logging
-import os
-import re
-import threading
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, TypeVar
 
 import torch
@@ -21,8 +16,6 @@ logger = logging.getLogger(__name__)
 _TransferOpT = TypeVar("_TransferOpT", SendOp, RecvOp)
 
 _MINIMUM_NCCL_VERSION = (2, 30, 5)
-_NCCL_RESHARD_MAX_SOURCES = 16
-_NCCL_RESHARD_MAX_TARGETS = 64
 
 
 @dataclass(frozen=True)
@@ -64,20 +57,6 @@ def _validate_role_roster(roles: list[tuple[bool, bool]]) -> _M2NTopology:
     return _M2NTopology(src_ranks=src_ranks, dst_ranks=dst_ranks)
 
 
-def _validate_mesh_limits(topology: _M2NTopology) -> None:
-    """Reject meshes that exceed the stock v0.2 copy/staging bounds."""
-    src_count = len(topology.src_ranks)
-    dst_count = len(topology.dst_ranks)
-    if src_count > _NCCL_RESHARD_MAX_SOURCES or dst_count > _NCCL_RESHARD_MAX_TARGETS:
-        raise RuntimeError(
-            "NCCL M2N mesh exceeds the v0.2 copy/staging limits: "
-            f"{src_count} source ranks (max {_NCCL_RESHARD_MAX_SOURCES}) and "
-            f"{dst_count} destination ranks (max {_NCCL_RESHARD_MAX_TARGETS}). "
-            "Use a supported mesh; if nccl-extensions was rebuilt with larger "
-            "reshard_limits.h bounds, construct the service with enforce_mesh_limits=False."
-        )
-
-
 def _ordered_ops_by_peer(
     ops: list[_TransferOpT], *, is_send: bool
 ) -> dict[int, list[_TransferOpT]]:
@@ -107,182 +86,28 @@ def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().reshape(-1).view(torch.uint8)
 
 
-def _version_tuple(version: object) -> tuple[int, int, int]:
-    """Normalize NCCL4Py version objects and strings for comparison."""
-    release = getattr(version, "release", None)
-    if release is not None:
-        numbers = [int(value) for value in release[:3]]
-    else:
-        numbers = [int(value) for value in re.findall(r"\d+", str(version))[:3]]
-    major, minor, patch = (numbers + [0, 0, 0])[:3]
-    return major, minor, patch
+def _validate_nccl_version(nccl: Any) -> None:
+    """Ensure the loaded NCCL library supports the current M2N API."""
+    try:
+        version = nccl.get_version().libnccl.version
+        release = tuple(version.release)
+    except AttributeError as exc:
+        raise RuntimeError("NCCL M2N requires the current NCCL4Py package") from exc
+
+    if release < _MINIMUM_NCCL_VERSION:
+        required = ".".join(str(value) for value in _MINIMUM_NCCL_VERSION)
+        raise RuntimeError(f"NCCL M2N requires NCCL >= {required}, found {version}")
 
 
-def _explicit_library_path(library_path: str | os.PathLike) -> str:
-    candidate = Path(library_path).expanduser()
-    if candidate.is_dir():
-        candidate = candidate / "libnccl_m2n.so"
-    if not candidate.is_file():
-        raise RuntimeError(f"NCCL M2N library does not exist: {candidate}")
-    return str(candidate.resolve())
-
-
-class _OfficialM2NRuntime:
-    """Process-level owner of the official nccl-extensions Python objects."""
-
-    def __init__(
-        self,
-        library_path: str | os.PathLike | None = None,
-        *,
-        _m2n_module: Any | None = None,
-        _nccl_module: Any | None = None,
-    ) -> None:
-        self.explicit_library_path: str | None = None
-        if library_path is not None:
-            self.explicit_library_path = _explicit_library_path(library_path)
-            configured_path = os.getenv("NCCL_M2N_LIBRARY")
-            if configured_path is not None:
-                configured_path = str(Path(configured_path).expanduser().resolve())
-                if configured_path != self.explicit_library_path:
-                    raise RuntimeError(
-                        "NCCL_M2N_LIBRARY is already set to "
-                        f"'{configured_path}', which differs from requested library "
-                        f"'{self.explicit_library_path}'"
-                    )
-            os.environ["NCCL_M2N_LIBRARY"] = self.explicit_library_path
-
-        self._m2n = _m2n_module or self._import_backend("nccl.m2n")
-        self._nccl = _nccl_module or self._import_backend("nccl.core")
-        self._validate_api()
-        self._validate_nccl_version()
-        self._handle = self._m2n.init(self._m2n.Config())
-        self.library_path = (
-            self.explicit_library_path
-            or os.getenv("NCCL_M2N_LIBRARY")
-            or "nccl-extensions native-library search"
-        )
-
-    @staticmethod
-    def _import_backend(module_name: str) -> Any:
-        try:
-            return importlib.import_module(module_name)
-        except (ImportError, ModuleNotFoundError) as exc:
-            raise RuntimeError(
-                "NCCL M2N refit requires the official NVIDIA/nccl-extensions Python "
-                "package and NCCL4Py. Build/install nccl-extensions/python and ensure "
-                "that `import nccl.m2n` and `import nccl.core` both succeed."
-            ) from exc
-
-    def _validate_api(self) -> None:
-        m2n_names = ("Config", "Mesh", "Replicate", "Shard", "init", "reshard")
-        nccl_names = ("Communicator", "UniqueId", "get_unique_id", "get_version")
-        missing_m2n = [name for name in m2n_names if not hasattr(self._m2n, name)]
-        missing_nccl = [name for name in nccl_names if not hasattr(self._nccl, name)]
-        if missing_m2n or missing_nccl:
-            raise RuntimeError(
-                "NCCL M2N refit found incompatible Python bindings; missing "
-                f"nccl.m2n={missing_m2n} nccl.core={missing_nccl}. Install the current "
-                "NVIDIA/nccl-extensions package."
-            )
-
-    def _validate_nccl_version(self) -> None:
-        version_info = self._nccl.get_version()
-        library_info = getattr(version_info, "libnccl", None)
-        version = getattr(library_info, "version", version_info)
-        if _version_tuple(version) < _MINIMUM_NCCL_VERSION:
-            required = ".".join(str(value) for value in _MINIMUM_NCCL_VERSION)
-            raise RuntimeError(f"NCCL M2N requires NCCL >= {required}, found {version}")
-
-    def get_unique_id(self, *, empty: bool) -> bytes:
-        """Return serialized NCCL4Py bootstrap material."""
-        return bytes(self._nccl.get_unique_id(empty=empty))
-
-    def init_comm(self, world_size: int, rank: int, unique_id_bytes: bytes) -> Any:
-        """Create a dedicated NCCL4Py communicator for an M2N mesh."""
-        unique_id = self._nccl.UniqueId.from_bytes(unique_id_bytes)
-        return self._nccl.Communicator.init(world_size, rank, unique_id)
-
-    @staticmethod
-    def destroy_comm(comm: Any) -> None:
-        """Destroy a communicator after all of its work has completed."""
-        comm.destroy()
-
-    def reshard(
-        self,
-        comm: Any,
-        src: torch.Tensor | None,
-        dst: torch.Tensor | None,
-        topology: _M2NTopology,
-        slot_bytes: int,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        """Enqueue one staging-backed reshard through the official API."""
-        src_count = len(topology.src_ranks)
-        dst_count = len(topology.dst_ranks)
-        self._m2n.reshard(
-            src=src,
-            dst=dst,
-            comm=comm,
-            stream=stream,
-            src_mesh=self._m2n.Mesh((src_count,), start_rank=topology.src_ranks[0]),
-            src_placements=(self._m2n.Shard(0),),
-            src_local_shape=(1, dst_count, slot_bytes),
-            src_dtype=torch.uint8,
-            dst_mesh=self._m2n.Mesh((dst_count,), start_rank=topology.dst_ranks[0]),
-            dst_placements=(self._m2n.Shard(1),),
-            dst_local_shape=(src_count, 1, slot_bytes),
-            dst_dtype=torch.uint8,
-            handle=self._handle,
-        )
-
-    def finalize(self) -> None:
-        """Release the explicit M2N handle after its CUDA work has completed."""
-        if self._handle is not None:
-            self._handle.destroy()
-            self._handle = None
-
-
-_m2n_lock = threading.RLock()
-_shared_runtime: _OfficialM2NRuntime | None = None
-_shared_runtime_users = 0
-_pending_comms: list[Any] = []
-
-
-def _acquire_shared_runtime(library_path: str | os.PathLike | None) -> _OfficialM2NRuntime:
-    global _shared_runtime, _shared_runtime_users
-    # M2N v0.2 retains process-global caches and requires serialized lifecycle
-    # and reshard calls, even when they use different handles or communicators.
-    with _m2n_lock:
-        if _shared_runtime is None:
-            _shared_runtime = _OfficialM2NRuntime(library_path)
-        elif library_path is not None:
-            requested = _explicit_library_path(library_path)
-            if requested != _shared_runtime.explicit_library_path:
-                loaded = _shared_runtime.library_path
-                raise RuntimeError(
-                    "NCCL M2N is already initialized process-wide with "
-                    f"'{loaded}', so it cannot be reinitialized from '{requested}'"
-                )
-        _shared_runtime_users += 1
-        return _shared_runtime
-
-
-def _release_shared_runtime(runtime: _OfficialM2NRuntime, comm: Any | None) -> None:
-    global _shared_runtime, _shared_runtime_users
-    with _m2n_lock:
-        if runtime is not _shared_runtime:
-            return
-        if comm is not None:
-            _pending_comms.append(comm)
-        _shared_runtime_users -= 1
-        if _shared_runtime_users == 0:
-            # M2N caches borrow communicator resources, so the final handle
-            # must be destroyed before any parent communicator.
-            runtime.finalize()
-            for pending_comm in _pending_comms:
-                runtime.destroy_comm(pending_comm)
-            _pending_comms.clear()
-            _shared_runtime = None
+def _load_backend() -> tuple[Any, Any]:
+    """Load the optional official M2N and NCCL4Py modules."""
+    try:
+        import nccl.core as nccl
+        import nccl.m2n as m2n
+    except ImportError as exc:
+        raise RuntimeError("NCCL M2N refit requires NVIDIA/nccl-extensions and NCCL4Py") from exc
+    _validate_nccl_version(nccl)
+    return m2n, nccl
 
 
 class NCCLM2NCopyService(CopyService):
@@ -300,22 +125,11 @@ class NCCLM2NCopyService(CopyService):
 
     Args:
         group: NCCL process group containing exactly the source and destination ranks.
-        library_path: Optional explicit path to ``libnccl_m2n.so``. The official
-            binding otherwise applies its normal library search rules.
-        enforce_mesh_limits: Enforce the stock v0.2 copy/staging mesh caps. Disable
-            only when using nccl-extensions rebuilt with larger bounds.
     """
 
     requires_process_group_barrier = False
 
-    def __init__(
-        self,
-        group=None,
-        library_path: str | os.PathLike | None = None,
-        *,
-        enforce_mesh_limits: bool = True,
-        _runtime: _OfficialM2NRuntime | None = None,
-    ):
+    def __init__(self, group=None):
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NCCLM2NCopyService()")
         if not torch.cuda.is_available():
@@ -325,11 +139,9 @@ class NCCLM2NCopyService(CopyService):
         self._device = torch.device("cuda", torch.cuda.current_device())
         if dist.get_backend(group) != "nccl":
             raise RuntimeError("NCCLM2NCopyService requires an NCCL process group")
-        self._process_group = group if group is not None else dist.group.WORLD
 
-        self._uses_shared_runtime = _runtime is None
-        self._runtime = _acquire_shared_runtime(library_path) if _runtime is None else _runtime
-        self._enforce_mesh_limits = enforce_mesh_limits
+        self._m2n, self._nccl = _load_backend()
+        self._handle = self._m2n.init()
         self._is_source: bool | None = None
         self._is_destination: bool | None = None
         self._buffer: torch.Tensor | None = None
@@ -338,12 +150,7 @@ class NCCLM2NCopyService(CopyService):
         self._poisoned = False
         self.send_ops: list[SendOp] = []
         self.recv_ops: list[RecvOp] = []
-        logger.info(
-            "NCCLM2NCopyService initialized on rank %d/%d with %s",
-            self.rank,
-            self.world_size,
-            getattr(self._runtime, "library_path", "injected runtime"),
-        )
+        logger.info("NCCLM2NCopyService initialized on rank %d/%d", self.rank, self.world_size)
 
     def set_model_roles(self, *, is_source: bool, is_destination: bool) -> None:
         """Set this rank's source/destination participation for the next run."""
@@ -403,8 +210,6 @@ class NCCLM2NCopyService(CopyService):
         topology = _validate_role_roster(
             [(bool(is_src), bool(is_dst)) for is_src, is_dst, _size in host_states]
         )
-        if self._enforce_mesh_limits:
-            _validate_mesh_limits(topology)
         return topology, max(size for _is_src, _is_dst, size in host_states)
 
     def _validate_peers(
@@ -427,14 +232,16 @@ class NCCLM2NCopyService(CopyService):
         if self._comm is not None:
             return self._comm
 
-        unique_id = self._runtime.get_unique_id(empty=self.rank != 0)
+        unique_id = bytes(self._nccl.get_unique_id(empty=self.rank != 0))
         if not unique_id:
             raise RuntimeError("NCCL4Py returned an empty NCCL unique ID")
         unique_id_tensor = torch.tensor(list(unique_id), dtype=torch.uint8, device=self._device)
-        src_rank = 0 if self.group is None else dist.get_global_rank(self._process_group, 0)
+        src_rank = 0 if self.group is None else dist.get_global_rank(self.group, 0)
         dist.broadcast(unique_id_tensor, src=src_rank, group=self.group)
         unique_id = bytes(unique_id_tensor.cpu().tolist())
-        self._comm = self._runtime.init_comm(self.world_size, self.rank, unique_id)
+        self._comm = self._nccl.Communicator.init(
+            self.world_size, self.rank, self._nccl.UniqueId.from_bytes(unique_id)
+        )
         return self._comm
 
     def _ensure_buffer(self, required_size: int) -> None:
@@ -517,8 +324,23 @@ class NCCLM2NCopyService(CopyService):
             src, dst = self._local_m2n_buffers(topology, slot_bytes)
             stream = torch.cuda.current_stream(self._device)
             try:
-                with _m2n_lock:
-                    self._runtime.reshard(comm, src, dst, topology, slot_bytes, stream)
+                src_count = len(topology.src_ranks)
+                dst_count = len(topology.dst_ranks)
+                self._m2n.reshard(
+                    src=src,
+                    dst=dst,
+                    comm=comm,
+                    stream=stream,
+                    src_mesh=self._m2n.Mesh((src_count,), start_rank=topology.src_ranks[0]),
+                    src_placements=(self._m2n.Shard(0),),
+                    src_local_shape=(1, dst_count, slot_bytes),
+                    src_dtype=torch.uint8,
+                    dst_mesh=self._m2n.Mesh((dst_count,), start_rank=topology.dst_ranks[0]),
+                    dst_placements=(self._m2n.Shard(1),),
+                    dst_local_shape=(src_count, 1, slot_bytes),
+                    dst_dtype=torch.uint8,
+                    handle=self._handle,
+                )
             except BaseException:
                 self._poisoned = True
                 raise
@@ -540,9 +362,9 @@ class NCCLM2NCopyService(CopyService):
             return
         torch.cuda.synchronize(self._device)
         self._buffer = None
-        if self._uses_shared_runtime:
-            _release_shared_runtime(self._runtime, self._comm)
-        elif self._comm is not None:
-            self._runtime.destroy_comm(self._comm)
+        self._handle.destroy()
+        self._handle = None
+        if self._comm is not None:
+            self._comm.destroy()
         self._comm = None
         self._closed = True
