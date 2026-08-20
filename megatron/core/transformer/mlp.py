@@ -96,6 +96,8 @@ def set_glu_linear_fc1_attributes(
         is_weight = leaf_name == 'weight' or (
             leaf_name.startswith('weight') and leaf_name[len('weight') :].isdigit()
         )
+        # TE single-grouped expert weights are 3D containers. Muon rejects that
+        # configuration explicitly until it can maintain per-expert state within them.
         if is_weight and param.ndim == 2:
             param.is_glu = True
             param.glu_interleave_size = interleave_size

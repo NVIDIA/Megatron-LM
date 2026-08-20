@@ -101,11 +101,7 @@ def test_muon_optimizer_glu_split(monkeypatch):
     param = torch.nn.Parameter(torch.zeros(8, 4, device='cuda'))
     param.is_glu = True
     optimizer = TensorParallelMuon(
-        params=[param],
-        split_glu=True,
-        num_ns_steps=1,
-        pg_collection=None,
-        tp_mode="duplicated",
+        params=[param], split_glu=True, num_ns_steps=1, pg_collection=None, tp_mode="duplicated"
     )
     grad = torch.arange(32, dtype=torch.float32, device='cuda').view(8, 4)
     orthogonalized_grads = []
@@ -151,9 +147,9 @@ def test_muon_optimizer_interleaved_glu_split(monkeypatch):
     param.is_glu = True
     param.glu_interleave_size = 2
     optimizer = TensorParallelMuon(params=[param], split_glu=True, num_ns_steps=1)
-    grad = torch.tensor(
-        [10, 11, 20, 21, 12, 13, 22, 23], dtype=torch.float32, device='cuda'
-    ).view(8, 1)
+    grad = torch.tensor([10, 11, 20, 21, 12, 13, 22, 23], dtype=torch.float32, device='cuda').view(
+        8, 1
+    )
     orthogonalized_grads = []
 
     def fake_orthogonalize(split_grad, _tp_group, _partition_dim):
@@ -210,9 +206,7 @@ def test_muon_optimizer_glu_gtp_gathers_before_split(monkeypatch, gtp_rank, layo
     )
     orthogonalized_grads = []
 
-    monkeypatch.setattr(
-        "megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2
-    )
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2)
     monkeypatch.setattr(
         "megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: gtp_rank
     )
@@ -233,9 +227,7 @@ def test_muon_optimizer_glu_gtp_gathers_before_split(monkeypatch, gtp_rank, layo
     torch.testing.assert_close(
         orthogonalized_grads[0], full_grad.new_tensor(gate_values).view(-1, 1)
     )
-    torch.testing.assert_close(
-        orthogonalized_grads[1], full_grad.new_tensor(up_values).view(-1, 1)
-    )
+    torch.testing.assert_close(orthogonalized_grads[1], full_grad.new_tensor(up_values).view(-1, 1))
     expected = full_grad.new_tensor(expected_values).view(8, 1)
     torch.testing.assert_close(result, expected[gtp_rank * 4 : (gtp_rank + 1) * 4])
 
@@ -431,6 +423,8 @@ class TestMuonOptimizerMultiRank:
             hidden_size=4,
             num_attention_heads=1,
             gated_linear_unit=True,
+            moe_mlp_glu_interleave_size=2,
+            moe_shared_expert_glu_interleave_size=2,
         )
         model = DistributedDataParallel(
             transformer_config,
@@ -438,11 +432,7 @@ class TestMuonOptimizerMultiRank:
             GatedNet().bfloat16().cuda().requires_grad_(True),
         )
         optimizer_config = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            bf16=True,
-            muon_num_ns_steps=1,
-            muon_tp_mode="duplicated",
+            optimizer='muon', lr=0.01, bf16=True, muon_num_ns_steps=1, muon_tp_mode="duplicated"
         )
 
         optimizer = get_megatron_optimizer(
@@ -453,6 +443,7 @@ class TestMuonOptimizerMultiRank:
             param for name, param in model.named_parameters() if 'linear_fc1.weight' in name
         )
         assert fc1_param.is_glu is True
+        assert fc1_param.glu_interleave_size is None
         assert fc1_param.glu_gtp_pad_length == 0
         raw_optimizers = [
             child.optimizer
@@ -490,6 +481,22 @@ class TestMuonOptimizerMultiRank:
 
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
             get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
+
+        # A single 3D GroupedTensor combines all local-expert matrices. Until Muon can
+        # maintain and orthogonalize per-expert state within that container, reject the
+        # configuration instead of silently routing those weights to the scalar optimizer.
+        model.config.moe_single_grouped_weight = True
+        optimizer_config_single_grouped_weight = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            muon_num_ns_steps=1,
+        )
+        with pytest.raises(ValueError, match='--moe-single-grouped-weight'):
+            get_megatron_optimizer(
+                config=optimizer_config_single_grouped_weight, model_chunks=[model]
+            )
 
     def test_get_megatron_optimizer_layer_wise(self):
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
@@ -727,10 +734,7 @@ class TestMuonOptimizerMultiRankTP:
         )
         mlp = MLP(
             config=config,
-            submodules=MLPSubmodules(
-                linear_fc1=ColumnParallelLinear,
-                linear_fc2=RowParallelLinear,
-            ),
+            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
             pg_collection=pg_collection,
         )
         fc1_weight = mlp.linear_fc1.weight
