@@ -15,7 +15,6 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
-from collections.abc import Callable
 from typing import Literal, cast
 from weakref import ref
 
@@ -270,16 +269,9 @@ class FsdpModule:
         # based: once every owned Parameter has accumulated its grad, this
         # FsdpModule can reduce and reshard. Module full-backward hooks can fire
         # before that when module inputs do not require grad.
-        for group in self._parameter_groups:
-            if not group.requires_grad:
-                continue
-            for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
-
-    def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         module_ref = ref(self)
 
-        def grad_hook(_parameter: nn.Parameter) -> None:
+        def grad_hook(_: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
                 return
@@ -287,7 +279,22 @@ class FsdpModule:
             if module._num_ready_grad_parameters == module._num_trainable_parameters:
                 module.post_backward()
 
-        return grad_hook
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            for fsdp_parameter in group.fsdp_parameters:
+                parameter = fsdp_parameter.unsharded
+                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+                # gradients are materialized by ``backward_dw()``, not autograd.
+                if not getattr(parameter, "skip_backward_post_hook", False):
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    continue
+
+                module_fqn, _, _ = fsdp_parameter.fqns[0].rpartition(".")
+                parameter_module = module.get_submodule(module_fqn) if module_fqn else module
+                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+                    lambda parameter=parameter: grad_hook(parameter)
+                )
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
