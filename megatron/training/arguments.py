@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
-from megatron.core.activations import squared_relu
+from megatron.core.activations import situlu, squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
@@ -1412,8 +1412,16 @@ def validate_args(args, defaults={}):
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    use_situ_glu = getattr(args, 'situ_glu', False)
+    if use_situ_glu:
+        if args.swiglu or args.quick_geglu or args.squared_relu:
+            raise ValueError(
+                "--situ-glu is mutually exclusive with --swiglu, --quick-geglu, "
+                "and --squared-relu."
+            )
+
     if args.ffn_hidden_size is None:
-        if args.swiglu:
+        if args.swiglu or use_situ_glu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -2243,17 +2251,23 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
+    use_situ_glu = getattr(args, 'situ_glu', False)
+    if use_situ_glu:
+        kw_args['activation_func'] = situlu
+        kw_args['gated_linear_unit'] = True
+        kw_args['use_te_activation_func'] = True
+        kw_args['bias_activation_fusion'] = False
+    elif args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['activation_func'] = squared_relu
     elif args.quick_geglu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:
@@ -2995,6 +3009,15 @@ def _add_network_size_args(parser):
         '--swiglu',
         action='store_true',
         help='Use gated linear units and SiLU activation instead of default gelu',
+    )
+    group.add_argument(
+        '--situ-glu',
+        '--moe-use-situ-glu',
+        action='store_true',
+        help=(
+            'Use SiTU-GLU in all dense and MoE FFNs. TE-backed paths select SiTUGLU '
+            'or ScaledSiTUGLU; other paths use the PyTorch reference.'
+        ),
     )
     group.add_argument(
         '--quick-geglu',
