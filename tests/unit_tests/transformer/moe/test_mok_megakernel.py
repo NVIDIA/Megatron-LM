@@ -513,6 +513,8 @@ def test_import_weights_preserves_reordered_init_for_optimizer(monkeypatch):
     class Stub:
         pass
 
+    monkeypatch.setattr(mok_megakernel, "_debug_tag", lambda *_: None)
+
     hidden_size = 3
     routed_intermediate = 2
     shared_intermediate = 1
@@ -565,6 +567,7 @@ def test_import_weights_preserves_reordered_init_for_optimizer(monkeypatch):
     module.intermediate_size = routed_intermediate
     module.shared_intermediate_size = shared_intermediate
     module.num_local_experts = num_experts
+    module._debug_module_index = 0
 
     module._import_routed_weights(routed)
     module._import_shared_weights(shared)
