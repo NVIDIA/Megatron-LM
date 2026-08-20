@@ -6,6 +6,7 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
+from transformer_engine.pytorch import DotProductAttention as TEDotProductAttention
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -25,6 +26,7 @@ from megatron.core.ssm.gated_delta_net import (
 from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
+    chunk_gated_delta_rule,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
@@ -52,6 +54,21 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
         chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
         unpacked_x.append(x[tuple(chunked_index)])
     return unpacked_x
+
+
+def _assert_relative_rms_close(
+    actual: torch.Tensor, expected: torch.Tensor, tolerance: float, name: str
+) -> None:
+    actual = actual.detach().double()
+    expected = expected.detach().double()
+    assert torch.isfinite(actual).all(), f"{name} contains non-finite values"
+    assert torch.isfinite(expected).all(), f"reference {name} contains non-finite values"
+    error_rms = (actual - expected).square().mean().sqrt()
+    expected_rms = expected.square().mean().sqrt().clamp_min(1e-12)
+    relative_rms = (error_rms / expected_rms).item()
+    assert relative_rms < tolerance, (
+        f"{name} relative RMS error {relative_rms:.4g} exceeds tolerance {tolerance}"
+    )
 
 
 @pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn", "gdn2"])
@@ -313,6 +330,7 @@ class TestGatedDeltaNet:
             assert gdn.dt_bias.shape == (gdn.qk_dim // self.tp_size,)
         else:
             assert isinstance(gdn, GatedDeltaNet)
+            assert isinstance(gdn.core_attention, TEDotProductAttention)
             assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
             assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
             assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
@@ -506,6 +524,105 @@ class TestGatedDeltaNet:
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+def test_te_gdn_matches_previous_fla_path():
+    """TE's fused GDN core matches the previously used FLA rule."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        pg_collection = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+        config = TransformerConfig(
+            hidden_size=128,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=1,
+            linear_num_value_heads=2,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=2,
+            num_query_groups=2,
+            activation_func=F.silu,
+            bf16=True,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+        )
+        submodules = get_experimental_attention_variant_module_spec(config=config).submodules
+        gdn = (
+            GatedDeltaNet(
+                config,
+                submodules=submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            .cuda()
+            .bfloat16()
+        )
+
+        batch, sequence = 2, 64
+        heads = config.linear_num_value_heads
+        q = F.normalize(
+            torch.randn(batch, sequence, heads, config.linear_key_head_dim, device="cuda").float(),
+            dim=-1,
+        ).bfloat16()
+        k = F.normalize(torch.randn_like(q, dtype=torch.float32), dim=-1).bfloat16()
+        v = (
+            torch.randn(
+                batch, sequence, heads, config.linear_value_head_dim, device="cuda"
+            ).mul_(0.1).bfloat16()
+        )
+        g = torch.empty(batch, sequence, heads, device="cuda").uniform_(0.1, 1.0).log()
+        beta = torch.rand(batch, sequence, heads, device="cuda").bfloat16()
+        output_grad = torch.randn_like(v, dtype=torch.float32)
+
+        def run(gated_delta_rule):
+            inputs = {
+                name: tensor.detach().clone().requires_grad_(True)
+                for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta))
+            }
+            output, _ = gated_delta_rule(
+                inputs["q"],
+                inputs["k"],
+                inputs["v"],
+                g=inputs["g"],
+                beta=inputs["beta"],
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=None,
+            )
+            (output.float() * output_grad).sum().backward()
+            return output.detach(), {name: tensor.grad.detach() for name, tensor in inputs.items()}
+
+        te_gated_delta_rule = gdn._te_gated_delta_rule
+        assert gdn.gated_delta_rule == te_gated_delta_rule
+        te_output, te_grads = run(te_gated_delta_rule)
+        fla_output, fla_grads = run(chunk_gated_delta_rule)
+
+        _assert_relative_rms_close(te_output, fla_output, 2e-2, "output")
+        for name in te_grads:
+            _assert_relative_rms_close(te_grads[name], fla_grads[name], 5e-2, f"gradient {name}")
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")

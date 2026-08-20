@@ -19,7 +19,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
     causal_conv1d,
-    chunk_gated_delta_rule,
     get_parameter_local_cp,
     l2norm,
 )
@@ -58,7 +57,71 @@ class GatedDeltaNet(_GDNBase):
         if self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
-            self.gated_delta_rule = chunk_gated_delta_rule
+            try:
+                from transformer_engine.pytorch import DotProductAttention
+            except ImportError as exc:
+                raise ImportError(
+                    "GDN requires TransformerEngine with fused Gated DeltaNet support."
+                ) from exc
+
+            # Q/K are expanded to the value-head count by
+            # `_prepare_input_for_gated_delta_rule`, so this DPA instance operates on
+            # the local head shard produced by the TP/CP all-to-all plumbing above.
+            num_local_heads = self.num_v_heads_local_tp // self.cp_size
+            self.core_attention = DotProductAttention(
+                num_attention_heads=num_local_heads,
+                kv_channels=(self.key_head_dim, self.value_head_dim),
+                qkv_format="bshd",
+                attn_mask_type="causal",
+                layer_number=self.layer_number,
+            )
+            self.gated_delta_rule = self._te_gated_delta_rule
+
+    def _te_gated_delta_rule(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Adapt Megatron GDN tensors to TransformerEngine's fused GDN API."""
+        del kwargs
+
+        batch, sequence = q.shape[:2]
+        qkv_format = "bshd"
+        if cu_seqlens is not None:
+            qkv_format = "thd"
+            q, k, v = (tensor.reshape(-1, *tensor.shape[2:]) for tensor in (q, k, v))
+            g, beta = (tensor.reshape(-1, tensor.shape[-1]) for tensor in (g, beta))
+
+        result = self.core_attention(
+            q,
+            k,
+            v,
+            attention_mask=None,
+            qkv_format=qkv_format,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            g=g.float(),
+            beta=beta.float(),
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if output_final_state:
+            output, final_state = result
+        else:
+            output = result
+            final_state = None
+
+        output = output.reshape(batch, sequence, -1, self.value_head_dim)
+        return output, final_state
 
     @jit_fuser
     def _compute_gates(
