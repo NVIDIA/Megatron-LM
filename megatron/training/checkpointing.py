@@ -2335,9 +2335,7 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     from megatron.core.models.hybrid.hybrid_model import HybridModel
 
     # Model-only inference checkpoints may omit the saved argument namespace.
-    # Without architecture metadata, absence of a hybrid pattern does not imply
-    # that the checkpoint came from GPTModel; keep the normal load path.
-    if not vars(ckpt_args):
+    if ckpt_args is None:
         return None, False
 
     def _contains_hybrid_model(module):
@@ -2494,13 +2492,13 @@ def load_checkpoint(
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
-    ckpt_args = types.SimpleNamespace()
+    ckpt_args = None
     if (
         ckpt_format in ('torch_dist', 'fsdp_dtensor')
         and state_dict is not None
         and 'args' in state_dict
     ):
-        ckpt_args = state_dict.get('args') or types.SimpleNamespace()
+        ckpt_args = state_dict.get('args')
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
@@ -2510,6 +2508,7 @@ def load_checkpoint(
         else (None, False)
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release
+    ckpt_args = ckpt_args or types.SimpleNamespace()
 
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):

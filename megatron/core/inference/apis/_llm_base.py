@@ -267,7 +267,6 @@ class _MegatronLLMBase:
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
         inference_shards: Optional[Union[str, Sequence[InferenceShardSpec], Sequence[dict]]] = None,
-        disagg_router: str = "round_robin",
         kv_transport_backend: str = "nixl",
     ) -> None:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
@@ -301,10 +300,7 @@ class _MegatronLLMBase:
         if inference_shards is not None:
             specs = normalize_shard_specs(inference_shards, dist.get_world_size())
             configure_prebuilt_disagg_engine(
-                engine,
-                specs,
-                disagg_router=disagg_router,
-                kv_transport_backend=kv_transport_backend,
+                engine, specs, kv_transport_backend=kv_transport_backend
             )
 
         if use_coordinator:

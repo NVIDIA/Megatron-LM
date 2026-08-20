@@ -58,6 +58,33 @@ def test_coordinator_registers_client_kv_handoff_handlers():
     assert Headers.RELEASE_KV in HANDLERS
 
 
+def test_invalid_role_registration_replies_without_raising():
+    coordinator = unittest.mock.MagicMock()
+    coordinator.disagg = None
+
+    HANDLERS[Headers.REGISTER_ROLE](
+        coordinator, b"engine", [Headers.REGISTER_ROLE.value, "prefill", "nixl", []]
+    )
+
+    reply = msgpack.unpackb(
+        coordinator.router_socket.send_multipart.call_args.args[0][1], raw=False
+    )
+    assert Headers(reply[0]) == Headers.REQUEST_ERROR
+
+
+@pytest.mark.parametrize(
+    "fields", [[0, [1], {}], [0, [1], "bad params", {}, [1]], [0, [1], {}, {}, ["bad block"]]]
+)
+def test_malformed_client_handoff_does_not_allocate_request_state(fields):
+    coordinator = unittest.mock.MagicMock(known_clients={b"client"}, next_request_id=0)
+
+    HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV](
+        coordinator, b"client", [Headers.SUBMIT_REQUEST_WITH_KV.value, *fields]
+    )
+
+    assert coordinator.next_request_id == 0
+
+
 class DummyTokenizer:
     """Dummy tokenizer."""
 

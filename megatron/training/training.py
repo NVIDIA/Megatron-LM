@@ -117,7 +117,6 @@ from megatron.core.rerun_state_machine import (
     destroy_rerun_state_machine,
     get_rerun_state_machine,
 )
-from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -199,7 +198,6 @@ try:
     from megatron.rl import rl_utils
     from megatron.rl.inference.disagg import (
         build_disagg_inference_model,
-        disagg_refit_pools,
         is_disagg_rollout,
     )
     from megatron.rl.rl_profiling import (
@@ -2067,16 +2065,7 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                num_dst_pools, dst_pool_index = disagg_refit_pools(
-                    args.inference_shards, args.world_size
-                )
-                swap_model_weights(
-                    model,
-                    inference_model,
-                    args.refit_method,
-                    num_dst_pools=num_dst_pools,
-                    dst_pool_index=dst_pool_index,
-                )
+                rl_utils.refit_inference_model(model, inference_model, args)
                 rl_eval_model = inference_model
                 rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
@@ -4886,16 +4875,7 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    num_dst_pools, dst_pool_index = disagg_refit_pools(
-                        args.inference_shards, args.world_size
-                    )
-                    swap_model_weights(
-                        model,
-                        inference_model,
-                        args.refit_method,
-                        num_dst_pools=num_dst_pools,
-                        dst_pool_index=dst_pool_index,
-                    )
+                    rl_utils.refit_inference_model(model, inference_model, args)
                     rl_eval_model = inference_model
                     rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(

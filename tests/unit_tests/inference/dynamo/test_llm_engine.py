@@ -163,12 +163,13 @@ async def test_decode_health_probe_bypasses_kv_handoff():
 async def test_decode_uses_streaming_kv_handoff():
     class Stream:
         request_id = 37
+        done = False
 
         def __aiter__(self):
             return self
 
         async def __anext__(self):
-            if getattr(self, "done", False):
+            if self.done:
                 raise StopAsyncIteration
             self.done = True
             return {"final": {"generated_tokens": [9]}}
@@ -197,7 +198,7 @@ async def test_decode_uses_streaming_kv_handoff():
 async def test_abort_uses_megatron_request_id_recorded_for_context():
     aborted = []
 
-    def abort_request(request_id):
+    def abort_request_and_wait(request_id):
         assert request_id == 77
         aborted.append(request_id)
         future = asyncio.get_running_loop().create_future()
@@ -205,7 +206,7 @@ async def test_abort_uses_megatron_request_id_recorded_for_context():
         return future
 
     engine = MegatronLLMEngine(_config())
-    engine.client = SimpleNamespace(abort_request=abort_request)
+    engine.client = SimpleNamespace(abort_request_and_wait=abort_request_and_wait)
     engine._request_ids["dynamo-request"] = 77
 
     await engine.abort(_Context())

@@ -3,7 +3,7 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
-from typing import Literal, Optional, Type
+from typing import Literal, Optional
 
 import torch
 
@@ -382,7 +382,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
 def get_dynamic_inference_engine(
     model: Optional[MegatronModule] = None,
-    engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
+    engine_class: type[DynamicInferenceEngine] = DynamicInferenceEngine,
     reserve_recurrent_state_dummy_slot: bool = False,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine of the requested class."""

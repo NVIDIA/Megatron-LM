@@ -40,7 +40,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
         inference_shards: Optional[Union[str, Sequence[InferenceShardSpec], Sequence[dict]]] = None,
-        disagg_router: str = "round_robin",
         kv_transport_backend: str = "nixl",
     ) -> None:
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
@@ -65,7 +64,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
             inference_shards=inference_shards,
-            disagg_router=disagg_router,
             kv_transport_backend=kv_transport_backend,
         )
 

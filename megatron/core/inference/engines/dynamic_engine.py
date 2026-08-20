@@ -838,11 +838,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
-                    "disagg_router": (
-                        disagg_config["disagg_router"]
-                        if disagg_config is not None
-                        else "round_robin"
-                    ),
                 },
             )
             self.inference_coordinator_process.start()
@@ -1538,6 +1533,7 @@ class DynamicInferenceEngine(AbstractEngine):
         handoff_blocks_by_request = finished_handoff_block_ids or {}
         handoff_ssm_slots_by_request = finished_handoff_ssm_slots or {}
         handoff_log_probs_by_request = {}
+        # Save the sampled continuation token before prefill result trimming.
         if log_probs:
             for request_id, request_log_probs in zip(request_id_list, log_probs):
                 if request_id in finished_request_ids and request_log_probs:
@@ -2069,36 +2065,28 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
     def _find_cg_chunk_size(self, max_chunk_tokens: int) -> Optional[int]:
-        """Return the largest chunk size <= max_chunk_tokens where batch matches a captured graph,
-        or None if no graph covers any chunk in the budget.
-
-        Walks the captured-CG list (sorted descending by token_count) and returns the first chunk
-        that falls within budget and produces an applicable batch_dim under the engine's matching
-        mode (strict for hybrid models). Callers must explicitly handle the None case by deferring
-        the admission rather than scheduling eagerly.
-        """
+        """Return the largest in-budget chunk covered by a captured graph."""
         active_tok = self.context.active_token_count
         active_p = self.context.num_prefill_requests
         active_d = self.context.num_decode_requests
         strict = self.context.is_hybrid_model
 
+        best_chunk = None
         for cg in self.context.cuda_graph_batch_dimensions_list:
-            chunk = cg.token_count - active_tok
+            chunk = min(max_chunk_tokens, cg.token_count - active_tok)
             if chunk < 1:
                 continue
-            if chunk > max_chunk_tokens:
-                continue
             candidate = InferenceBatchDimensions(
-                token_count=cg.token_count,
+                token_count=active_tok + chunk,
                 prefill_req_count=active_p + 1,
                 decode_req_count=active_d,
             )
-            # candidate.token_count == cg.token_count, so the token-dimension check inside
-            # is_applicable_for_batch_dim is always True here; this call filters on P/D compatibility only.
             if cg.is_applicable_for_batch_dim(candidate, strict=strict):
-                return chunk
+                if chunk == max_chunk_tokens:
+                    return chunk
+                best_chunk = max(best_chunk or 0, chunk)
 
-        return None
+        return best_chunk
 
     def _select_cg_chunk_size(
         self, req: DynamicInferenceRequest, max_chunk_tokens: int
@@ -2107,7 +2095,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         A deferred request remains at the queue head, so no new work is admitted
         behind it. The finite resident batch can therefore drain and change the
-        graph shape without forcing the continuation onto an eager path.
+        graph shape. A miss on an empty engine means graph coverage is incomplete.
         """
         chunk_size = self._find_cg_chunk_size(max_chunk_tokens)
         if chunk_size is not None:
@@ -2118,8 +2106,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self._register_cg_wait(req)
             return None
 
-        req.cg_wait_iters = 0
-        return max_chunk_tokens
+        raise RuntimeError(
+            f"No captured CUDA graph can admit a {max_chunk_tokens}-token chunked prefill"
+        )
 
     def _register_cg_wait(self, req) -> None:
         """Track a deferred admission attempt and throw a starvation warning at the threshold.
@@ -2231,14 +2220,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 # How many tokens we can admit this step.
                 token_budget = self.context.max_tokens - self.context.active_token_count
 
-                # Prefix-cache skip: on a request's first chunk, the tokens covered
-                # by a cached prefix are reused rather than recomputed, so they do
-                # NOT consume the compute budget. Extend this chunk's SPAN to cover
-                # the entire skippable prefix plus up to `token_budget` newly computed
-                # tokens. Without this the span is capped at the budget, forcing the
-                # rest of a long cached prefix to be re-prefilled over many chunks
-                # (latency then scales with prompt length instead of the delta).
-                # add_request() only computes `effective = span - skip` tokens.
+                # Cached tokens do not consume compute budget, so include the
+                # reusable prefix in the first chunk's span.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
                     _, _, _, _, prefix_skip, _ = self.context._compute_prefix_match(
@@ -2267,20 +2250,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     prefill_chunk_length = prefix_skip + computed_chunk
 
-                # Mamba prefix caching: keep chunk boundaries block-aligned.
-                # compute_and_store_offsets() records a recurrent-state snapshot at a
-                # KV-block boundary only when that boundary lands on a multiple of the
-                # SSM chunk size measured FROM the start of the current prefill chunk
-                # (it filters on `offset % mamba_chunk_size == 0`, where the chunk start
-                # equals `finished_chunk_token_count` on continuation chunks). Block
-                # boundaries are multiples of `block_size_tokens` (itself a multiple of
-                # the SSM chunk size), so the filter only passes when
-                # `finished_chunk_token_count` is block-aligned. If a chunk ends at an
-                # arbitrary token offset, every candidate boundary in the following
-                # chunks becomes unrecordable and the last-block snapshot that lets a
-                # future request skip prefill is silently dropped. Stop a partial
-                # (non-final) chunk short at the nearest lower block boundary so the
-                # running `finished_chunk_token_count` stays block-aligned.
+                # Keep non-final hybrid chunks block-aligned so later recurrent
+                # snapshots land on reusable KV boundaries.
                 if (
                     self.context.is_hybrid_model
                     and self.context.mamba_slot_allocator is not None
@@ -2290,17 +2261,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     chunk_end = req.finished_chunk_token_count + prefill_chunk_length
                     aligned_end = (chunk_end // block_size) * block_size
                     aligned_chunk_length = aligned_end - req.finished_chunk_token_count
-                    # Only snap down when the aligned chunk still computes at least one
-                    # token beyond the skipped prefix (a chunk whose budget is smaller
-                    # than a block cannot be block-aligned; leave it unchanged).
+                    # Leave sub-block budgets unchanged so the chunk still makes progress.
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
 
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
                 # final chunk, reduce by 1 (or defer if we only have 1 computed token).
                 # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
-                # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
+                # The selected graph also covers a one-token-smaller batch.
                 if not batch_invariant_mamba_prefill and remaining_len - prefill_chunk_length == 1:
                     if computed_chunk > 1:
                         prefill_chunk_length -= 1
@@ -2308,15 +2276,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         can_schedule = False
                         break
 
-                # add_request recomputes the skip for this exact chunk and applies a
-                # ">= 2 computed tokens" clamp. When the chunk would compute fewer than
-                # 2 tokens (tight budget late in a batched step, or a prompt that is
-                # all-but-one cached) that clamp shrinks the skip and grows the computed
-                # count by up to one block, which can exceed the token budget
-                # (TokenOverflowError). Only then re-derive the exact effective length
-                # add_request will use and defer on overflow (a later full-budget step
-                # admits the request). For >= 2 computed tokens add_request computes
-                # exactly this chunk, which already fits the budget.
+                # For a one-token delta, add_request may reduce the cache match to
+                # preserve its minimum compute span. Check that exact cost here.
                 if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
                     _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
                         req, prefill_chunk_length
@@ -2810,8 +2771,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )
-                if self.pinned_handoff_block_count:
-                    output_str += ", %d handoff-pinned" % self.pinned_handoff_block_count
+                pinned_handoff_blocks = self.pinned_handoff_block_count
+                if pinned_handoff_blocks:
+                    output_str += ", %d handoff-pinned" % pinned_handoff_blocks
                 msa = self.context.mamba_slot_allocator
                 if msa is not None:
                     output_str += ", mamba %d/%d durable slots" % (
@@ -3012,9 +2974,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 try:
                     self.push_handoff_kv(request_id, data[2], cached_prefix_blocks)
                 except Exception as error:
-                    self._notify_request_error(
-                        request_id, error, source_safe=self._handoff_push_error_source_safe(error)
-                    )
+                    source_safe = self._handoff_push_error_source_safe(error)
+                    self._notify_request_error(request_id, error, source_safe=source_safe)
+                    if not source_safe:
+                        raise RuntimeError(
+                            "State transfer submission failed while source storage may still be in use"
+                        ) from error
             elif header == Headers.KV_HANDOFF_COMPLETE:
                 self._record_handoff_completion_notification(
                     int(data[1]), bool(data[2]), bool(data[3])

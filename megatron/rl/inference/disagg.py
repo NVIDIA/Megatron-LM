@@ -3,7 +3,6 @@
 """Disaggregated prefill/decode rollouts for RL."""
 
 import copy
-import functools
 from contextlib import nullcontext
 
 import torch.distributed as dist
@@ -29,15 +28,10 @@ def _specs(args):
     return parse_inference_shards_spec(args.inference_shards, args.world_size)
 
 
-def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> tuple[int, int]:
+def disagg_refit_pools(inference_shards, world_size: int, rank: int | None = None) -> tuple[int, int]:
     """Return the refit pool count and this rank's pool index."""
     if rank is None:
         rank = dist.get_rank()
-    return _disagg_refit_pools(inference_shards, world_size, rank)
-
-
-@functools.lru_cache(maxsize=32)
-def _disagg_refit_pools(inference_shards, world_size: int, rank: int) -> tuple[int, int]:
     if not (inference_shards and spec_declares_disaggregation(inference_shards)):
         return 1, 0
     specs = parse_inference_shards_spec(inference_shards, world_size)
@@ -70,11 +64,8 @@ def build_disagg_inference_model(
     """Build this rank's disaggregated RL inference shard."""
     if not is_disagg_rollout(args):
         return None
-    assert args.inference_dynamic_batching_enable_prefix_caching, (
-        "disaggregated RL rollouts (--inference-shards with role=) require "
-        "--inference-dynamic-batching-enable-prefix-caching: the decode side "
-        "admits the handed-off KV via a prefix-cache hit."
-    )
+    if not args.inference_dynamic_batching_enable_prefix_caching:
+        raise ValueError("disaggregated RL rollouts require prefix caching")
     rank = dist.get_rank()
 
     my_pg = None
@@ -118,10 +109,10 @@ def build_disagg_inference_model(
     return model
 
 
-def configure_disagg_engine(engine, *, disagg_router="round_robin"):
+def configure_disagg_engine(engine):
     """Set the disagg role on `engine` and spawn the shared coordinator."""
     args = get_args()
     configure_prebuilt_disagg_engine(
-        engine, _specs(args), disagg_router=disagg_router,
+        engine, _specs(args),
         kv_transport_backend=args.disagg_kv_transport_backend,
     )

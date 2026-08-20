@@ -44,7 +44,7 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
     coordinator._send_to_engine = lambda identity, payload: (
         sent.append((identity, msgpack.unpackb(payload, raw=False))) or True
     )
-    runtime = DisaggCoordinatorRuntime(coordinator, "round_robin")
+    runtime = DisaggCoordinatorRuntime(coordinator)
     coordinator.disagg = runtime
 
     common_meta = {
@@ -90,6 +90,39 @@ def test_request_routes_prefill_then_decode():
     assert runtime.coordinator.hash_updates == [(b"prefill", [1, 2, 3]), (b"decode", [1, 2, 3])]
 
 
+def test_prompt_log_probs_are_rejected_before_prefill():
+    runtime, sent = _runtime()
+
+    runtime.route_submit(5, [1, 2, 3], {"return_log_probs": True, "skip_prompt_log_probs": False})
+
+    assert all(identity not in (b"prefill", b"decode") for identity, _ in sent)
+    response = msgpack.unpackb(sent[-1][1][1], raw=False)
+    assert Headers(response[0]) == Headers.REQUEST_ERROR
+    assert "prompt log probabilities" in response[2]
+
+
+@pytest.mark.parametrize(
+    "handoff",
+    [
+        {"kv_meta": {"agent": "prefill"}},
+        {"block_ids": [4]},
+        {"kv_meta": {"agent": "prefill"}, "block_ids": "4"},
+    ],
+)
+def test_malformed_prefill_handoff_fails_the_request(handoff):
+    runtime, sent = _runtime()
+    runtime.route_submit(5, [1], {})
+    sent.clear()
+
+    runtime.handle_prefill_done(5, {"disaggregated_params": handoff})
+
+    client_frame = next(message for identity, message in sent if identity == b"client")
+    response = msgpack.unpackb(client_frame[1], raw=False)
+    assert Headers(response[0]) == Headers.REQUEST_ERROR
+    assert "invalid handoff metadata" in response[2]
+    assert 5 not in runtime.requests
+
+
 def test_nccl_send_waits_for_decode_destinations():
     runtime, sent = _runtime(backend="nccl")
     runtime.route_submit(5, [1], {})
@@ -127,6 +160,17 @@ def test_registration_rejects_incompatible_transfer_geometry():
 
     with pytest.raises(ValueError, match="incompatible transfer geometry"):
         runtime.register_engine(b"decode-2", "decode", "nixl", [incompatible])
+
+
+def test_reconnection_replaces_stale_engine_accounting():
+    runtime, _ = _runtime(request_capacity=1)
+    assert runtime.flow.try_reserve(b"decode", 99, 0)
+    runtime.coordinator._remove_engine = runtime.remove_engine
+
+    runtime.register_engine(b"decode", "decode", "nixl", runtime.engine_metadata[b"decode"])
+
+    assert runtime.flow.decode_load(b"decode") == (0, 0, 0)
+    assert runtime.flow.try_reserve(b"decode", 100, 0)
 
 
 def test_read_done_releases_prefill_and_admits_queued_request():
@@ -219,7 +263,7 @@ def test_active_decode_cancellation_waits_for_engine_safety():
     assert client_frames[0] == b"client"
     assert Headers(msgpack.unpackb(client_frames[1], raw=False)[0]) == Headers.REQUEST_ABORTED
     assert 5 not in runtime.prefill_by_request
-    assert 5 not in runtime.cancelled_request_ids
+    assert 5 not in runtime.terminating_request_ids
 
 
 def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
@@ -238,12 +282,15 @@ def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
 
     assert runtime.prefill_by_request[5] == b"prefill"
     assert runtime.flow.prefill_usage(b"prefill") == 1
+    assert 5 in runtime.terminating_request_ids
 
     runtime.handle_kv_read_done(b"decode", 5)
-
     assert 5 not in runtime.prefill_by_request
     assert runtime.flow.prefill_usage(b"prefill") == 0
+
+    runtime.handle_engine_aborted(5, source_safe=True)
     assert runtime.router.decode_for_request(5) is None
+    assert 5 not in runtime.terminating_request_ids
 
 
 def test_decode_removal_does_not_release_inflight_source():
@@ -314,8 +361,14 @@ def test_late_source_safety_releases_prefill_after_request_failure():
 
     assert 5 not in runtime.prefill_by_request
     assert runtime.flow.prefill_usage(b"prefill") == 0
+    assert 5 not in runtime.coordinator.request_id_to_client_id
     assert any(
         identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
+        for identity, message in sent
+    )
+    assert any(
+        identity == b"client"
+        and Headers(msgpack.unpackb(message[1], raw=False)[0]) == Headers.REQUEST_ABORTED
         for identity, message in sent
     )
 

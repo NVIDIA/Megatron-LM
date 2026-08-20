@@ -154,6 +154,22 @@ def inference_model_alloc_context(args):
     return nullcontext()
 
 
+def refit_inference_model(model, inference_model, args) -> int:
+    """Copy training weights into this rank's inference shard."""
+
+    num_dst_pools, dst_pool_index = disagg_refit_pools(
+        args.inference_shards, args.world_size
+    )
+    swap_model_weights(
+        model,
+        inference_model,
+        args.refit_method,
+        num_dst_pools=num_dst_pools,
+        dst_pool_index=dst_pool_index,
+    )
+    return num_dst_pools
+
+
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
     """Swap RL inference model weights between CPU and GPU using torch_memory_saver.
 
@@ -761,16 +777,7 @@ def get_environment_rollouts(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        num_dst_pools, dst_pool_index = disagg_refit_pools(
-            args.inference_shards, args.world_size
-        )
-        swap_model_weights(
-            model,
-            inference_model,
-            args.refit_method,
-            num_dst_pools=num_dst_pools,
-            dst_pool_index=dst_pool_index,
-        )
+        num_dst_pools = refit_inference_model(model, inference_model, args)
         if args.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
                 train_model=model,

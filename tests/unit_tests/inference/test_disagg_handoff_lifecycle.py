@@ -658,6 +658,29 @@ def test_quarantined_import_survives_backend_poll_error(handoff_loop, caplog):
     assert "Polling quarantined KV import failed" in caplog.text
 
 
+def test_quarantined_import_releases_after_start_cleanup_completes(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    cleanup = mock.Mock(storage_safe=False)
+
+    def complete():
+        cleanup.storage_safe = True
+        return True
+
+    cleanup.poll.side_effect = complete
+    pending.local_error = TransferStartError(
+        "start failed", storage_safe=False, cleanup_handles=[cleanup]
+    )
+    pending.destinations_safe = False
+    engine._quarantined_kv_imports.append(pending)
+
+    engine._poll_quarantined_kv_imports()
+
+    assert engine.context.kv_block_allocator.releases == [[block_id]]
+    assert not engine._quarantined_kv_imports
+
+
 def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine.context.prefix_cache_lru_clock = 0
@@ -1114,6 +1137,20 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     assert engine._notify_request_error.call_args.kwargs == {"source_safe": True}
 
 
+def test_unsafe_nccl_receive_failure_is_fatal(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine._kv_transfer_agent.is_push = True
+    pending = _pending_import(engine, 8, 10, 101)
+    pending.local_error = TransferStartError("receive failed", storage_safe=False)
+    pending.destinations_safe = False
+    pending.terminal_state_reported = True
+    engine._pending_kv_imports.append(pending)
+    engine._handoff_completion_notifications[8] = (True, False)
+
+    with pytest.raises(RuntimeError, match="NCCL handoff failed"):
+        engine._admit_pending_kv_imports()
+
+
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     prompt = [2] * 12
@@ -1192,7 +1229,7 @@ def test_nccl_handoff_reuses_decode_cached_prefix(handoff_loop):
     _drain_loop(handoff_loop)
 
     assert engine._kv_transfer_agent.calls == [(kv_meta, [101], [10])]
-    assert events == ["prepare", "ready", "receive"]
+    assert events == ["prepare", "receive", "ready"]
 
 
 def test_decode_role_rejects_prompt_scheduling(handoff_loop):
@@ -1235,7 +1272,7 @@ def test_push_handoff_uses_final_pinned_blocks_ssm_slot():
     )
 
 
-def test_push_start_failure_retains_untracked_transfer_resources():
+def test_push_start_failure_preserves_source_pin():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine._kv_transfer_agent = mock.Mock()
@@ -1243,13 +1280,13 @@ def test_push_start_failure_retains_untracked_transfer_resources():
     engine._pinned_handoff_blocks[7] = [20]
     plan = object()
     engine._kv_transfer_agent.prepare_push_blocks.return_value = plan
-    error = TransferStartError("post failed", storage_safe=False, resources=[plan])
+    error = TransferStartError("post failed", storage_safe=False)
     engine._kv_transfer_agent.start_prepared.side_effect = error
 
     with pytest.raises(TransferStartError, match="post failed"):
         engine.push_handoff_kv(7, [])
 
-    assert engine._unsafe_kv_push_resources == [[plan]]
+    assert engine._pinned_handoff_blocks[7] == [20]
 
 
 def test_push_handoff_rejects_ssm_state_without_kv_blocks():

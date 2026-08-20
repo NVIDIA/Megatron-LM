@@ -12,7 +12,7 @@ import msgpack
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.disaggregation.coordinator_flow_control import DisaggStateFlowControl
-from megatron.core.inference.disaggregation.coordinator_routing import make_disagg_router
+from megatron.core.inference.disaggregation.coordinator_routing import DisaggRouting
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     make_submit_request_with_kv_message,
     restore_registered_nixl_agent_metadata,
@@ -46,15 +46,16 @@ def _instance_transfer_signature(instance_meta: Any) -> tuple:
     if len(kv_signatures) != 1 or None in next(iter(kv_signatures)):
         raise ValueError("model-parallel ranks advertise inconsistent KV transfer geometry")
 
-    state_kinds = {
-        state_kind for entry in instance_meta for state_kind in (entry.get("ssm") or {}).keys()
-    }
+    ssm_entries = [entry.get("ssm") or {} for entry in instance_meta]
+    if not all(isinstance(entry, dict) for entry in ssm_entries):
+        raise ValueError("SSM transfer metadata must be a dictionary")
+    state_kinds = {state_kind for entry in ssm_entries for state_kind in entry}
     ssm_signatures = []
     for state_kind in sorted(state_kinds):
         signatures = set()
         layer_ranges = set()
-        for entry in instance_meta:
-            state_meta = (entry.get("ssm") or {}).get(state_kind)
+        for entry in ssm_entries:
+            state_meta = entry.get(state_kind)
             layout = state_meta.get("ssm_layout") if isinstance(state_meta, dict) else None
             dims = layout.get("dims") if isinstance(layout, dict) else None
             if not isinstance(dims, dict):
@@ -77,9 +78,9 @@ def _instance_transfer_signature(instance_meta: Any) -> tuple:
 class DisaggCoordinatorRuntime:
     """Own the state and two-hop routing used only by a disaggregated coordinator."""
 
-    def __init__(self, coordinator: Any, router_name: str) -> None:
+    def __init__(self, coordinator: Any) -> None:
         self.coordinator = coordinator
-        self.router = make_disagg_router(router_name)
+        self.router = DisaggRouting()
         self.flow = DisaggStateFlowControl()
         self.hop1_request_ids: set[int] = set()
         self.requests: dict[int, _RequestState] = {}
@@ -87,7 +88,7 @@ class DisaggCoordinatorRuntime:
         self.engine_role: dict[Any, str] = {}
         self.engine_transport: dict[Any, str] = {}
         self.engine_metadata: dict[Any, Any] = {}
-        self.cancelled_request_ids: set[int] = set()
+        self.terminating_request_ids: set[int] = set()
         self._transfer_signature: tuple | None = None
 
     def register_engine(self, identity, role: str, transport: str, instance_meta: Any) -> None:
@@ -95,9 +96,14 @@ class DisaggCoordinatorRuntime:
 
         previous_role = self.engine_role.get(identity)
         previous_transport = self.engine_transport.get(identity)
-        if previous_role is not None and (previous_role != role or previous_transport != transport):
-            raise ValueError(f"engine {identity!r} cannot change disaggregated role or transport")
-        if self.engine_transport and transport not in set(self.engine_transport.values()):
+        if previous_role is not None:
+            logging.warning("Coordinator: replacing reconnected engine %r", identity)
+            self.coordinator._remove_engine(identity)
+            if previous_role != role or previous_transport != transport:
+                raise ValueError(
+                    f"engine {identity!r} cannot change disaggregated role or transport"
+                )
+        if self.engine_transport and transport not in self.engine_transport.values():
             raise ValueError("prefill and decode engines must use the same state transport")
         signature = _instance_transfer_signature(instance_meta)
         if self._transfer_signature is not None and signature != self._transfer_signature:
@@ -195,6 +201,15 @@ class DisaggCoordinatorRuntime:
 
         block_hashes = self._request_hashes(prompt)
         self.requests[request_id] = _RequestState(prompt, sampling_params, block_hashes)
+        if sampling_params.get("return_log_probs") and not sampling_params.get(
+            "skip_prompt_log_probs", True
+        ):
+            self.drop_request(
+                request_id,
+                "prompt log probabilities are not supported by native disaggregation",
+                source_safe=True,
+            )
+            return
         try:
             prefill_id = self.router.route_submit(
                 request_id, self._make_routing_score(block_hashes, "prefill")
@@ -250,25 +265,35 @@ class DisaggCoordinatorRuntime:
         """Route a completed prefill handoff to a decode instance."""
 
         self.hop1_request_ids.discard(request_id)
-        if request_id in self.cancelled_request_ids:
-            self._finish_abort(request_id, source_safe=True)
+        if request_id in self.terminating_request_ids:
+            self._finish_abort(request_id)
             return
         request_state = self.requests.get(request_id)
         handoff = finished_request.get("disaggregated_params")
-        if request_state is None or not handoff:
+        if request_state is None or not isinstance(handoff, dict):
             self.drop_request(
                 request_id, "prefill reply carried no handoff metadata", source_safe=True
             )
             return
+        kv_meta = handoff.get("kv_meta")
+        block_ids = handoff.get("block_ids")
+        if (
+            not isinstance(kv_meta, dict)
+            or not isinstance(block_ids, list)
+            or any(type(block_id) is not int for block_id in block_ids)
+        ):
+            self.drop_request(
+                request_id, "prefill reply carried invalid handoff metadata", source_safe=True
+            )
+            return
         try:
-            _, decode_id = self.router.route_prefill_done(
+            decode_id = self.router.route_prefill_done(
                 request_id, self._make_routing_score(request_state.block_hashes, "decode")
             )
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to decode: {error}", source_safe=True)
             return
 
-        kv_meta = handoff["kv_meta"]
         prefill_id = self.prefill_by_request.get(request_id)
         if prefill_id is not None and self.engine_transport.get(prefill_id) == "nixl":
             try:
@@ -288,7 +313,7 @@ class DisaggCoordinatorRuntime:
                 request_state.prompt,
                 request_state.sampling_params,
                 kv_meta,
-                handoff["block_ids"],
+                block_ids,
             ),
             use_bin_type=True,
         )
@@ -423,15 +448,19 @@ class DisaggCoordinatorRuntime:
             self._drain_decode_queue(decode_id)
         self.requests.pop(request_id, None)
         self.hop1_request_ids.discard(request_id)
-        self.cancelled_request_ids.discard(request_id)
         if source_safe:
+            self.terminating_request_ids.discard(request_id)
             self._release_prefill(request_id)
             self.router.forget(request_id)
 
-        coordinator.request_id_to_client_id.pop(request_id, None)
-        client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
-        if client_identity is not None and client_request_id is not None:
-            coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+            coordinator.request_id_to_client_id.pop(request_id, None)
+            client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
+            if client_identity is not None and client_request_id is not None:
+                coordinator.client_request_to_request_id.pop(
+                    (client_identity, client_request_id), None
+                )
+        else:
+            self.terminating_request_ids.add(request_id)
 
     def handle_engine_failure(
         self, request_id: int, reason: str, *, source_safe: bool = False
@@ -443,9 +472,9 @@ class DisaggCoordinatorRuntime:
     def abort_request(self, request_id: int) -> None:
         """Cancel queued work or forward cancellation to its active engine."""
 
-        self.cancelled_request_ids.add(request_id)
+        self.terminating_request_ids.add(request_id)
         if self.flow.remove_queued(request_id):
-            self._finish_abort(request_id, source_safe=True)
+            self._finish_abort(request_id)
             return
         decode_id = self.router.decode_for_request(request_id)
         if decode_id is not None:
@@ -455,32 +484,26 @@ class DisaggCoordinatorRuntime:
         if prefill_id is not None:
             self._send(prefill_id, Headers.ABORT_REQUEST, request_id)
             return
-        self._finish_abort(request_id, source_safe=True)
+        self._finish_abort(request_id)
 
     def handle_engine_aborted(self, request_id: int, *, source_safe: bool) -> None:
         """Finish a cancellation after the engine reports transport safety."""
 
-        if request_id in self.cancelled_request_ids:
-            self._finish_abort(request_id, source_safe=source_safe)
-        elif source_safe and request_id in self.prefill_by_request:
-            # A failed handoff can report source safety after the client error.
-            self._release_prefill(request_id)
-            self.router.forget(request_id)
+        if source_safe and request_id in self.terminating_request_ids:
+            self._finish_abort(request_id)
 
-    def _finish_abort(self, request_id: int, *, source_safe: bool) -> None:
+    def _finish_abort(self, request_id: int) -> None:
         coordinator = self.coordinator
         client_identity = coordinator.request_id_to_client_id.get(request_id)
         client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
-        if source_safe:
-            self._release_prefill(request_id)
+        self._release_prefill(request_id)
         decode_id = self.flow.release_decode(request_id)
         if decode_id is not None:
             self._drain_decode_queue(decode_id)
-        if source_safe:
-            self.router.forget(request_id)
+        self.router.forget(request_id)
         self.requests.pop(request_id, None)
         self.hop1_request_ids.discard(request_id)
-        self.cancelled_request_ids.discard(request_id)
+        self.terminating_request_ids.discard(request_id)
         coordinator.request_id_to_client_id.pop(request_id, None)
         coordinator.request_id_to_client_request_id.pop(request_id, None)
         if client_identity is not None and client_request_id is not None:
@@ -489,8 +512,7 @@ class DisaggCoordinatorRuntime:
                 [
                     client_identity,
                     msgpack.packb(
-                        [Headers.REQUEST_ABORTED.value, client_request_id, source_safe],
-                        use_bin_type=True,
+                        [Headers.REQUEST_ABORTED.value, client_request_id, True], use_bin_type=True
                     ),
                 ]
             )

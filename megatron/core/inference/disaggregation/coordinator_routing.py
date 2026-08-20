@@ -4,57 +4,22 @@
 
 from __future__ import annotations
 
-import abc
-from typing import Callable, Dict, List, Tuple
+from typing import Callable
 
 PREFILL = "prefill"
 DECODE = "decode"
 
 
-class DisaggRouter(abc.ABC):
-    """Routing policy for coordinator-native disaggregation."""
-
-    @abc.abstractmethod
-    def register(self, identity, role: str) -> None:
-        """Record an engine and its role ("prefill"/"decode")."""
-
-    @abc.abstractmethod
-    def remove(self, identity) -> None:
-        """Drop a disconnected engine."""
-
-    @abc.abstractmethod
-    def route_submit(self, request_id: int, score: Callable | None = None):
-        """Hop 1: pick (and remember) the prefill engine for a new request."""
-
-    @abc.abstractmethod
-    def route_prefill_done(
-        self, request_id: int, score: Callable | None = None
-    ) -> Tuple[object, object]:
-        """Hop 2: pick the decode engine; return (prefill_id, decode_id)."""
-
-    @abc.abstractmethod
-    def forget(self, request_id: int) -> None:
-        """Drop per-request state once the reply has been routed home."""
-
-    @abc.abstractmethod
-    def requests_involving(self, identity) -> List[int]:
-        """Return requests routed through an engine."""
-
-    @abc.abstractmethod
-    def decode_for_request(self, request_id: int):
-        """Return the decode engine assigned to a request, if any."""
-
-
-class DisaggRouting(DisaggRouter):
+class DisaggRouting:
     """Load-aware prefill-to-decode router with round-robin tie breaking."""
 
     def __init__(self) -> None:
-        self.prefill_engines: List = []
-        self.decode_engines: List = []
+        self.prefill_engines: list = []
+        self.decode_engines: list = []
         self._prefill_rr = 0
         self._decode_rr = 0
-        self._req_prefill: Dict[int, object] = {}  # request_id -> prefill identity
-        self._req_decode: Dict[int, object] = {}  # request_id -> decode identity
+        self._req_prefill: dict[int, object] = {}  # request_id -> prefill identity
+        self._req_decode: dict[int, object] = {}  # request_id -> decode identity
 
     def register(self, identity, role: str) -> None:
         """Record an engine and its disagg role (idempotent)."""
@@ -82,24 +47,21 @@ class DisaggRouting(DisaggRouter):
         self._req_prefill[request_id] = ident
         return ident
 
-    def route_prefill_done(
-        self, request_id: int, score: Callable | None = None
-    ) -> Tuple[object, object]:
-        """Pick decode after prefill and return both engine identities."""
+    def route_prefill_done(self, request_id: int, score: Callable | None = None):
+        """Pick and remember the decode engine for a completed prefill."""
         if not self.decode_engines:
             raise RuntimeError("no decode engines registered")
         dec = self._pick(self.decode_engines, self._decode_rr, score)
         self._decode_rr += 1
         self._req_decode[request_id] = dec
-        prefill = self._req_prefill.get(request_id)
-        return prefill, dec
+        return dec
 
     def forget(self, request_id: int) -> None:
         """Drop per-request state once the reply has been routed to the client."""
         self._req_prefill.pop(request_id, None)
         self._req_decode.pop(request_id, None)
 
-    def requests_involving(self, identity) -> List[int]:
+    def requests_involving(self, identity) -> list[int]:
         """Request ids routed through `identity` on either hop (snapshot)."""
         rids = {rid for rid, ident in self._req_prefill.items() if ident == identity}
         rids.update(rid for rid, ident in self._req_decode.items() if ident == identity)
@@ -111,26 +73,7 @@ class DisaggRouting(DisaggRouter):
         return self._req_decode.get(request_id)
 
     @staticmethod
-    def _pick(pool: List, offset: int, score: Callable | None):
-        rotated = pool[offset % len(pool) :] + pool[: offset % len(pool)]
-        return rotated[0] if score is None else min(rotated, key=score)
-
-
-# Named policies survive the coordinator spawn boundary.
-_DISAGG_ROUTERS: Dict[str, Callable[[], DisaggRouter]] = {}
-
-
-def register_disagg_router(name: str, factory: Callable[[], DisaggRouter]) -> None:
-    """Register a DisaggRouter factory under `name` (call at import time)."""
-    _DISAGG_ROUTERS[name] = factory
-
-
-def make_disagg_router(name: str = "round_robin") -> DisaggRouter:
-    """Instantiate the router registered under `name`."""
-    try:
-        return _DISAGG_ROUTERS[name]()
-    except KeyError:
-        raise KeyError(f"unknown disagg router {name!r}; registered: {sorted(_DISAGG_ROUTERS)}")
-
-
-register_disagg_router("round_robin", DisaggRouting)
+    def _pick(pool: list, offset: int, score: Callable | None):
+        if score is None:
+            return pool[offset % len(pool)]
+        return min((pool[(offset + i) % len(pool)] for i in range(len(pool))), key=score)

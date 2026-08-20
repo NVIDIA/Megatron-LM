@@ -51,13 +51,14 @@ def test_request_capacity_limits_attention_only_engines():
     assert not flow.try_reserve(b"decode", 2, 0)
 
 
-def test_re_registration_replaces_stale_capacity():
+def test_duplicate_registration_requires_explicit_removal():
     flow = DisaggStateFlowControl()
     flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=5)])
 
-    flow.register_engine(b"decode", "decode", [_meta(global_rank=0)])
+    with pytest.raises(ValueError, match="already registered"):
+        flow.register_engine(b"decode", "decode", [_meta(global_rank=0)])
 
-    assert flow.capacity(b"decode") is None
+    assert flow.capacity(b"decode") == 5
 
 
 def test_queue_admission_reserves_only_one_handoff_at_a_time():

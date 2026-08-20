@@ -10,5 +10,3 @@ from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngin
 
 class DynamoDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceEngine):
     """Dynamic inference engine with Dynamo KV/state handoff support."""
-
-    pass

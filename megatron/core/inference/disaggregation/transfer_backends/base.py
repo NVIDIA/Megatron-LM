@@ -23,13 +23,31 @@ class TransferStartError(RuntimeError):
     """Transfer submission failed after storage may have become transport-owned.
 
     ``resources`` keeps transport descriptors and staging buffers alive while
-    their storage cannot be safely reused.
+    their storage cannot be safely reused. ``cleanup_handles`` contains any
+    submitted operations that can later prove the storage safe.
     """
 
-    def __init__(self, message: str, *, storage_safe: bool, resources: Any = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        storage_safe: bool,
+        resources: Any = None,
+        cleanup_handles: Optional[list[Any]] = None,
+    ):
         super().__init__(message)
-        self.storage_safe = storage_safe
+        self._storage_safe = storage_safe
         self.resources = resources
+        self.cleanup_handles = list(cleanup_handles or [])
+
+    @property
+    def storage_safe(self) -> bool:
+        """Whether submission failed before use or every submitted operation stopped."""
+
+        return self._storage_safe or (
+            bool(self.cleanup_handles)
+            and all(handle.storage_safe for handle in self.cleanup_handles)
+        )
 
 
 def construct_kv_transfer_backend_class(name: str) -> KVTransportBackend:

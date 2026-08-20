@@ -123,19 +123,22 @@ class DisaggStateFlowControl:
             state = self._decode
         else:
             raise ValueError(f"unknown disaggregated role {role!r}")
+        if identity in state.counts:
+            raise ValueError(f"engine {identity!r} is already registered")
         entries = self._metadata_entries(instance_meta)
         capacity = self._capacity_from_entries(entries)
         request_capacity = self._request_capacity_from_entries(entries)
-        # A reconnect may reuse an identity with new limits.
-        self._capacity.pop(identity, None)
+        prefill_slot_cost = (
+            self._prefill_slot_cost_from_entries(entries) if role == "prefill" else None
+        )
+
         self._request_capacity[identity] = request_capacity
-        self._prefill_slot_cost.pop(identity, None)
         if capacity is not None:
             self._capacity[identity] = capacity
-        if role == "prefill":
-            self._prefill_slot_cost[identity] = self._prefill_slot_cost_from_entries(entries)
-        state.usage.setdefault(identity, 0)
-        state.counts.setdefault(identity, 0)
+        if prefill_slot_cost is not None:
+            self._prefill_slot_cost[identity] = prefill_slot_cost
+        state.usage[identity] = 0
+        state.counts[identity] = 0
         return capacity
 
     def remove_engine(self, identity) -> None:

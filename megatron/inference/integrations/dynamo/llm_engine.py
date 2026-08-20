@@ -389,7 +389,7 @@ class MegatronLLMEngine(LLMEngine):
                 try:
                     if not source_safe:
                         source_safe = await asyncio.wait_for(
-                            self.client.abort_request(stream.request_id),
+                            self.client.abort_request_and_wait(stream.request_id),
                             timeout=self.config.drain_timeout,
                         )
                     if source_safe:
@@ -481,7 +481,7 @@ class MegatronLLMEngine(LLMEngine):
         request_id = self._request_ids.pop(str(context.id()), None)
         if request_id is not None and self.client is not None:
             await asyncio.wait_for(
-                self.client.abort_request(request_id), timeout=self.config.drain_timeout
+                self.client.abort_request_and_wait(request_id), timeout=self.config.drain_timeout
             )
 
     async def drain(self) -> None:

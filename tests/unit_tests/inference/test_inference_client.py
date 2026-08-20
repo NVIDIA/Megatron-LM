@@ -141,6 +141,16 @@ async def test_add_request_with_kv_handoff_returns_future():
     future.cancel()
 
 
+async def test_abort_preserves_fire_and_forget_api_and_wait_uses_running_loop():
+    client, _, _ = _make_client()
+
+    assert client.abort_request(7) is None
+    future = client.abort_request_and_wait(8)
+
+    assert future.get_loop() is asyncio.get_running_loop()
+    future.cancel()
+
+
 async def test_terminal_error_and_abort_acknowledgement():
     client, _, fake_socket = _make_client()
     recv_queue = [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
@@ -164,17 +174,14 @@ async def test_terminal_error_and_abort_acknowledgement():
     with pytest.raises(InferenceRequestError, match="read failed") as error:
         await asyncio.wait_for(unsafe, timeout=2.0)
     assert not error.value.source_safe
+    abort_ack = client.abort_request_and_wait(1)
+    assert not abort_ack.done()
+    recv_queue.append(msgpack.packb([Headers.REQUEST_ABORTED.value, 1, True]))
+    assert await asyncio.wait_for(abort_ack, timeout=2.0)
+    await asyncio.sleep(0)
     assert 1 not in client.abort_futures
 
-    cancelled = client.add_request("cancelled", SamplingParams())
-    abort_ack = client.abort_request(2)
-    assert cancelled.cancelled()
-    recv_queue.append(msgpack.packb([Headers.REQUEST_ERROR.value, 2, "read failed", False]))
-    assert not await asyncio.wait_for(abort_ack, timeout=2.0)
-    await asyncio.sleep(0)
-    assert 2 not in client.abort_futures
-
-    recv_queue.append(msgpack.packb([Headers.ENGINE_REPLY.value, 2, {}], use_bin_type=True))
+    recv_queue.append(msgpack.packb([Headers.ENGINE_REPLY.value, 1, {}], use_bin_type=True))
     await asyncio.sleep(0.01)
     assert not client.listener_task.done()
 

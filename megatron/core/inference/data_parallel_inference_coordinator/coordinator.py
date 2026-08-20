@@ -105,7 +105,6 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         disaggregated: bool = False,
-        disagg_router: str = "round_robin",
     ):
         """
         Initializes the inference coordinator.
@@ -234,7 +233,7 @@ class DataParallelInferenceCoordinator:
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
-        self.disagg = DisaggCoordinatorRuntime(self, disagg_router) if disaggregated else None
+        self.disagg = DisaggCoordinatorRuntime(self) if disaggregated else None
 
     def get_least_loaded_data_parallel_rank(self):
         """
@@ -502,7 +501,6 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         disaggregated: bool = False,
-        disagg_router: str = "round_robin",
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -538,7 +536,6 @@ class DataParallelInferenceCoordinator:
             schedule_output_path=schedule_output_path,
             hostname=hostname,
             disaggregated=disaggregated,
-            disagg_router=disagg_router,
         )
         ready_event.set()
         try:

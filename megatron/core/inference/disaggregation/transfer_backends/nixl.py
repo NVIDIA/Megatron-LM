@@ -662,10 +662,14 @@ class NixlTransferBackend:
             if isinstance(exc, TransferStartError):
                 if unsafe_cleanup is not None:
                     exc.resources = (unsafe_cleanup, exc.resources)
+                    exc.cleanup_handles.append(unsafe_cleanup)
                 raise
             if not storage_safe:
                 raise TransferStartError(
-                    str(exc), storage_safe=False, resources=unsafe_cleanup
+                    str(exc),
+                    storage_safe=False,
+                    resources=unsafe_cleanup,
+                    cleanup_handles=[unsafe_cleanup],
                 ) from exc
             raise
         return NixlPullHandle(
@@ -754,8 +758,14 @@ class NixlTransferBackend:
         except Exception as exc:
             # The transport may have accepted the operation before surfacing an
             # error, so its destination cannot be proven safe for immediate reuse.
+            cleanup = NixlPullHandle(
+                agent=self._agent, xfers=[xfer], contexts=[ctx], submitted_at=time.perf_counter()
+            )
             raise TransferStartError(
-                str(exc), storage_safe=False, resources=(xfer, src_descs, dst_descs)
+                str(exc),
+                storage_safe=False,
+                resources=(xfer, src_descs, dst_descs),
+                cleanup_handles=[cleanup],
             ) from exc
         return xfer, ctx
 

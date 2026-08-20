@@ -1,17 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Message handlers for the data parallel inference coordinator.
-
-Each handler is a free function decorated with @message_handler, which records
-it in the module-level HANDLERS registry keyed by message header. The
-coordinator builds its dispatch table from this registry, so a new message type
-is supported simply by adding a decorated function here; the coordinator's event
-loop never changes.
-
-Handlers have the signature ``(coordinator, sender_identity, payload) -> bool | None``
-where ``payload`` is the already-deserialized message. Returning a truthy value
-signals the coordinator's event loop to stop.
-"""
+"""Message handlers for the data parallel inference coordinator."""
 
 import logging
 
@@ -39,13 +28,7 @@ HANDLERS = {}
 
 
 def message_handler(*headers):
-    """Register a function as the handler for one or more message headers.
-
-    A new message type is supported by writing a handler function and decorating
-    it with the header(s) it serves; it is added to HANDLERS, which the
-    coordinator turns into its dispatch table. The event loop never needs to
-    change when a header is added.
-    """
+    """Register a function for one or more message headers."""
 
     def decorator(fn):
         for header in headers:
@@ -60,10 +43,22 @@ def message_handler(*headers):
 def handle_register_role(coordinator, sender_identity, payload):
     """Register a coordinator-native prefill or decode engine."""
 
-    if coordinator.disagg is None:
-        raise RuntimeError("REGISTER_ROLE requires a disaggregated coordinator")
-    _, role, transport, instance_meta = payload
-    coordinator.disagg.register_engine(sender_identity, role, transport, instance_meta)
+    try:
+        if coordinator.disagg is None:
+            raise ValueError("REGISTER_ROLE requires a disaggregated coordinator")
+        _, role, transport, instance_meta = payload
+        coordinator.disagg.register_engine(sender_identity, role, transport, instance_meta)
+    except (KeyError, TypeError, ValueError) as error:
+        logging.warning(
+            "Coordinator: rejecting role registration from %r: %s", sender_identity, error
+        )
+        coordinator.router_socket.send_multipart(
+            [
+                sender_identity,
+                msgpack.packb([Headers.REQUEST_ERROR.value, str(error)], use_bin_type=True),
+            ]
+        )
+        return
     coordinator.router_socket.send_multipart(
         [sender_identity, msgpack.packb([Headers.REGISTER_ROLE_ACK.value], use_bin_type=True)]
     )
@@ -260,7 +255,8 @@ def handle_kv_read_done(coordinator, sender_identity, payload):
     """Release prefill-owned cache storage after decode imports it."""
 
     if coordinator.disagg is None:
-        raise RuntimeError("KV_READ_DONE requires a disaggregated coordinator")
+        logging.warning("Coordinator: ignoring KV_READ_DONE without disaggregation enabled")
+        return
     coordinator.disagg.handle_kv_read_done(sender_identity, int(payload[1]))
 
 
@@ -269,7 +265,8 @@ def handle_kv_transfer_ready(coordinator, sender_identity, payload):
     """Start NCCL sends after decode commits the matching destinations."""
 
     if coordinator.disagg is None:
-        raise RuntimeError("KV_TRANSFER_READY requires a disaggregated coordinator")
+        logging.warning("Coordinator: ignoring KV_TRANSFER_READY without disaggregation enabled")
+        return
     coordinator.disagg.handle_kv_transfer_ready(sender_identity, int(payload[1]), int(payload[2]))
 
 
@@ -314,6 +311,8 @@ def handle_request_aborted(coordinator, sender_identity, payload):
     if coordinator.disagg is not None:
         coordinator.disagg.handle_engine_aborted(request_id, source_safe=source_safe)
         return
+    if not source_safe:
+        return
     client_identity = coordinator.request_id_to_client_id.pop(request_id, None)
     client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
     assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
@@ -353,15 +352,25 @@ def handle_submit_request_with_kv(coordinator, sender_identity, payload):
         )
         return
 
+    if isinstance(prompt, torch.Tensor):
+        prompt = prompt.tolist()
+    elif not isinstance(prompt, (str, list)):
+        logging.error("Coordinator: unsupported handoff prompt type %s", type(prompt).__name__)
+        return
+    if (
+        not isinstance(sampling_params, dict)
+        or not isinstance(kv_meta, dict)
+        or not isinstance(src_block_ids, list)
+        or any(type(block_id) is not int for block_id in src_block_ids)
+    ):
+        logging.error("Coordinator: malformed handoff transfer metadata")
+        return
+
     request_id = coordinator.next_request_id
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
-    if isinstance(prompt, torch.Tensor):
-        prompt = prompt.tolist()
-    elif not isinstance(prompt, (str, list)):
-        raise TypeError(f"unsupported prompt type {type(prompt).__name__}")
     engine_payload = msgpack.packb(
         make_submit_request_with_kv_message(
             Headers.SUBMIT_REQUEST_WITH_KV.value,

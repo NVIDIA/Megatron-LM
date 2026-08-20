@@ -40,7 +40,7 @@ def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop():
     """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
 
     args = SimpleNamespace(hybrid_layer_pattern="M*E")
-    assert _maybe_setup_gpt_to_hybrid_load(args, SimpleNamespace(), [object()]) == (None, False)
+    assert _maybe_setup_gpt_to_hybrid_load(args, None, [object()]) == (None, False)
 
 
 class MockModel(MegatronModule):

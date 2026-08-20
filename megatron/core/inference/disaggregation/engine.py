@@ -17,14 +17,7 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
 
     @internal_api
     def set_disaggregation_config(
-        self,
-        *,
-        role,
-        identity,
-        spawn_coordinator,
-        coordinator_group,
-        disagg_router="round_robin",
-        kv_transport_backend="nixl",
+        self, *, role, identity, spawn_coordinator, coordinator_group, kv_transport_backend="nixl"
     ) -> None:
         """Configure one coordinator-native prefill or decode instance."""
 
@@ -34,7 +27,6 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
             "role": role,
             "identity": identity,
             "spawn_coordinator": spawn_coordinator,
-            "disagg_router": disagg_router,
             "kv_transport_backend": kv_transport_backend,
             "coordinator_group": coordinator_group,
         }

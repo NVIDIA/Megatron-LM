@@ -2407,9 +2407,12 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self):
+        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16)
         ctx = self._get_hybrid_ep_context(
             num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True
         )
+        assert ctx.kv_block_allocator.pool_size == baseline.kv_block_allocator.pool_size
+        assert ctx.max_requests == baseline.max_requests
         metadata = ctx.mamba_metadata
         retained_slots = metadata.batch_allocate_slots(ctx.max_requests)
         assert retained_slots is not None
@@ -2427,7 +2430,7 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(1)
     def test_hybrid_ep_dummy_requires_positive_request_capacity(self):
-        with pytest.raises(AssertionError, match="leaves no request capacity"):
+        with pytest.raises(ValueError, match="leaves no request capacity"):
             self._get_hybrid_ep_context(
                 reserve_recurrent_state_dummy_slot=True, mamba_memory_ratio=1e-12
             )

@@ -88,7 +88,6 @@ class InferenceStateHandoffMixin:
         self._handoff_completion_notifications: dict[int, tuple[bool, bool]] = {}
         self._failed_handoff_requests: set[int] = set()
         self._pending_kv_pushes: list = []
-        self._unsafe_kv_push_resources: list[Any] = []
         self._deferred_handoff_releases: set[int] = set()
         self._kv_transfer_role: str | None = None
 
@@ -198,9 +197,7 @@ class InferenceStateHandoffMixin:
         unsafe = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            safe_to_release = pending.destinations_safe and self._wait_for_transfer_handles(
-                *self._pending_transfer_handles(pending)
-            )
+            safe_to_release = self._wait_for_pending_storage(pending)
             if safe_to_release:
                 self._release_pending_kv_import(pending)
                 if not pending.future.done():
@@ -210,15 +207,13 @@ class InferenceStateHandoffMixin:
         self._pending_kv_imports = unsafe
         quarantined = []
         for pending in self._quarantined_kv_imports:
-            safe_to_release = pending.destinations_safe and self._wait_for_transfer_handles(
-                *self._pending_transfer_handles(pending)
-            )
+            safe_to_release = self._wait_for_pending_storage(pending)
             if safe_to_release:
                 self._release_pending_kv_import(pending)
             else:
                 quarantined.append(pending)
         self._quarantined_kv_imports = quarantined
-        if unsafe_pushes or self._unsafe_kv_push_resources or unsafe or quarantined:
+        if unsafe_pushes or unsafe or quarantined:
             raise RuntimeError(
                 "Cannot reset while KV handoff transfers may still access cache storage"
             )
@@ -478,15 +473,7 @@ class InferenceStateHandoffMixin:
         # cleanup cannot reuse it while these sends are active.
         for agent, peer_metas, slots in ssm_pushes:
             plans.append(agent.prepare_push_blocks({"tp_metas": peer_metas}, slots))
-        try:
-            handles = [self._kv_transfer_agent.start_prepared(plans)]
-        except TransferStartError as error:
-            if not error.storage_safe:
-                self._unsafe_kv_push_resources.append(error.resources)
-                logging.error(
-                    "Quarantining request %d source state after an incomplete handoff", request_id
-                )
-            raise
+        handles = [self._kv_transfer_agent.start_prepared(plans)]
         self._pending_kv_pushes.append((request_id, handles))
         logging.info(
             "DISAGG_PREFILL_PUSH request_id=%d blocks=%d ssm=%d",
@@ -955,10 +942,9 @@ class InferenceStateHandoffMixin:
                                 ssm_meta[state_kind], [], [ssm_import.live_slot]
                             )
                         )
-                # All local transfer geometry is valid before the peer is told
-                # to post its matching sends.
-                self._notify_kv_transfer_ready(handoff.request_id, len(cached_blocks))
                 handle = self._kv_transfer_agent.start_prepared(plans)
+                # Notify prefill only after the matching receives are posted.
+                self._notify_kv_transfer_ready(handoff.request_id, len(cached_blocks))
             else:
                 handle = self._kv_transfer_agent.begin_pull_blocks(
                     transfer_meta, transfer_src_blocks, imported_blocks
@@ -1106,7 +1092,30 @@ class InferenceStateHandoffMixin:
         handles = [pending.handle]
         if pending.ssm is not None:
             handles.extend(pending.ssm.handles)
+        if isinstance(pending.local_error, TransferStartError):
+            handles.extend(pending.local_error.cleanup_handles)
         return [handle for handle in handles if handle is not None]
+
+    @staticmethod
+    def _pending_destinations_safe(pending: PendingKvImport) -> bool:
+        """Return whether a failed transfer has stopped accessing its destinations."""
+
+        if pending.destinations_safe:
+            return True
+        error = pending.local_error
+        return isinstance(error, TransferStartError) and error.storage_safe
+
+    def _wait_for_pending_storage(self, pending: PendingKvImport) -> bool:
+        """Wait for trackable operations and return whether storage can be reused."""
+
+        error = pending.local_error
+        if not pending.destinations_safe and (
+            not isinstance(error, TransferStartError) or not error.cleanup_handles
+        ):
+            return False
+        return self._wait_for_transfer_handles(
+            *self._pending_transfer_handles(pending)
+        ) and self._pending_destinations_safe(pending)
 
     def _validate_decode_ready_handoff(self, pending: PendingKvImport) -> None:
         """Validate that transferred state can start decode without prompt execution."""
@@ -1327,7 +1336,7 @@ class InferenceStateHandoffMixin:
                     pending.local_error = exc
                     failed = True
 
-            source_safe = pending.destinations_safe and all(
+            source_safe = self._pending_destinations_safe(pending) and all(
                 handle.storage_safe for handle in self._pending_transfer_handles(pending)
             )
             if (
@@ -1369,7 +1378,9 @@ class InferenceStateHandoffMixin:
                 logging.exception(
                     "Polling quarantined KV import failed for request_id=%d", pending.request_id
                 )
-            if pending.destinations_safe and all(handle.storage_safe for handle in handles):
+            if self._pending_destinations_safe(pending) and all(
+                handle.storage_safe for handle in handles
+            ):
                 self._release_pending_kv_import(pending)
                 if (
                     self._handoff_completion_tracker is None
@@ -1434,9 +1445,11 @@ class InferenceStateHandoffMixin:
                 # A peer can fail before posting its half of a two-sided transfer.
                 # Do not wait on this rank's unmatched operation; quarantine its
                 # destination unless its own handle already reached a terminal state.
-                safe_to_release = pending.destinations_safe and pending.terminal_state_reported
-                safe_to_release = safe_to_release and self._wait_for_transfer_handles(
-                    *self._pending_transfer_handles(pending)
+                safe_to_release = (
+                    pending.terminal_state_reported and self._pending_destinations_safe(pending)
+                )
+                safe_to_release = safe_to_release and all(
+                    handle.storage_safe for handle in self._pending_transfer_handles(pending)
                 )
                 if safe_to_release:
                     self._release_pending_kv_import(pending)
@@ -1453,6 +1466,10 @@ class InferenceStateHandoffMixin:
                 self._notify_request_error(pending.request_id, exc, source_safe=source_safe)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)
                 if failed:
+                    if self._kv_transfer_agent.is_push and not source_safe:
+                        raise RuntimeError(
+                            "NCCL handoff failed while transfer storage may still be in use"
+                        ) from exc
                     continue
                 remaining.extend(self._pending_kv_imports)
                 self._pending_kv_imports = remaining
