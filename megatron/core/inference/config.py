@@ -56,7 +56,7 @@ class MambaInferenceStateConfig:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:
@@ -379,6 +379,12 @@ class InferenceConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
+    mamba_prefill_backend: Literal['triton', 'cutedsl'] = 'triton'
+    """Which varlen SSD kernel Mamba prefill uses. "cutedsl" is a faster Blackwell-only
+    (SM 10.0+) backend that also costs extra per-step tiling metadata; it falls back to
+    "triton" with a warning on other hardware or without the CuteDSL runtime, and per-batch
+    for the argument combinations the kernel does not support."""
+
     offset_sampling_seed_by_dp_rank: bool = True
     """
     If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
@@ -450,6 +456,17 @@ class InferenceConfig:
                 "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
                 "(num_speculative_tokens > 0)."
             )
+
+        if self.mamba_prefill_backend == 'cutedsl':
+            from megatron.core.ssm.ops.ssd_backend import cutedsl_ssd_available
+
+            if not cutedsl_ssd_available():
+                warnings.warn(
+                    "mamba_prefill_backend='cutedsl' was requested but the CuteDSL SSD kernel "
+                    "is unavailable (requires Blackwell (SM 10.0+) and the cutlass DSL "
+                    "runtime); falling back to mamba_prefill_backend='triton'."
+                )
+                self.mamba_prefill_backend = 'triton'
 
         if self.sampling_backend == 'flashinfer':
             try:

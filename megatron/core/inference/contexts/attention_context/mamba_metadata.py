@@ -1,10 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+# pylint: disable=missing-function-docstring
+
 from typing import Optional
 
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.contexts.attention_context.mamba_ssd_metadata import MambaSSDMetadata
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
@@ -22,6 +25,7 @@ class MambaMetadata:
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
         decode_indices_dtype: torch.dtype = torch.int64,
+        use_cutedsl_ssd: bool = False,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -38,6 +42,8 @@ class MambaMetadata:
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
             decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
+            use_cutedsl_ssd (bool): Whether prefill runs on the CuteDSL varlen SSD
+                kernel, which needs the extra per-step tiling metadata.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
@@ -95,6 +101,13 @@ class MambaMetadata:
         # Request ID per chunk
         self._seq_idx_for_varlen_buffer = torch.zeros(
             self.max_chunks, dtype=torch.int32, device=self.device
+        )
+
+        # Ragged tiling for the CuteDSL varlen SSD kernel, or None under the
+        # default Triton backend, in which case nothing behind the
+        # `self.ssd is not None` guards in this class runs.
+        self.ssd = MambaSSDMetadata.create(
+            use_cutedsl_ssd, max_requests, self.max_chunks, mamba_chunk_size, self.device
         )
 
         # Conv1d per-token metadata (request ID and request start position)
@@ -176,6 +189,10 @@ class MambaMetadata:
         # Python-side precomputed values
         self.real_prefill_token_count = 0
         self.cu_seqlens_list = [0]
+
+        # Ragged tiling for the varlen SSD kernel, recomputed each step.
+        if self.ssd is not None:
+            self.ssd.reset()
 
         # Intermediate state extraction views
         self.intermediate_chunk_indices = None
@@ -293,6 +310,15 @@ class MambaMetadata:
             # sequences get a single zero-length chunk.
             cu_seqlens_all = self._cu_seqlens_buffer[: padded_prefill_count + 1].tolist()
             chunk_size = self.mamba_chunk_size
+
+            if self.ssd is not None:
+                self.ssd.update(
+                    cu_seqlens_all,
+                    padded_prefill_count,
+                    self.cu_seqlens,
+                    self.real_prefill_token_count,
+                )
+
             chunk_boundaries = [0]
             last_chunk_idx_list = []
             chunk_to_seq_list = []
@@ -614,6 +640,13 @@ class MambaMetadata:
 
             # Chunk metadata (Python loop, pure CPU).
             cu_seqlens_all = cu_seqlens_view[: padded_prefill_count + 1].tolist()
+
+            # Ragged tiling for the CuteDSL varlen SSD kernel, when enabled.
+            if self.ssd is not None:
+                result.update(
+                    self.ssd.write_cpu_buffers(bufs, cu_seqlens_all, padded_prefill_count)
+                )
+
             chunk_boundaries = [0]
             last_chunk_idx_list = []
             chunk_to_seq_list = []
@@ -709,6 +742,8 @@ class MambaMetadata:
             self.cu_seqlens = v.mamba_cu_seqlens[: padded_prefill_count + 1]
             self.cu_seqlens_list = d["cu_seqlens_list"]
             self.real_prefill_token_count = d["real_prefill_token_count"]
+            if self.ssd is not None:
+                self.ssd.load_from_gpu_view(v, d, self.cu_seqlens, self.real_prefill_token_count)
 
             padded_max_chunks = d["padded_max_chunks"]
             self.cu_chunk_seqlens = v.mamba_cu_chunk_seqlens[: padded_max_chunks + 1]

@@ -2190,6 +2190,13 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-mamba-prefill-backend',
+                       type=str, default='triton',
+                       choices=['triton', 'cutedsl'],
+                       help='Which varlen SSD kernel Mamba prefill uses. "cutedsl" opts into '
+                            'the faster Blackwell-only (SM 10.0+) kernel, which also costs '
+                            'extra per-step tiling metadata. Falls back to "triton" with a '
+                            'warning where the CuteDSL kernel is unavailable.')
     group.add_argument('--use-same-sampling-seed-across-dp-ranks',
                        action='store_false', dest='offset_sampling_seed_by_dp_rank',
                        default=True,

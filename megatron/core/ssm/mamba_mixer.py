@@ -80,6 +80,34 @@ except ImportError:
     HAVE_MAMBA_SSM = False
 
 try:
+    from megatron.core.ssm.ops.cutedsl_mamba2_ssd import SSDTiling
+except ImportError:
+    SSDTiling = None
+
+
+def _ssd_tiling_from(metadata):
+    """Build the op-layer SSD tiling for this step, or None if unavailable.
+
+    The op library takes plain tensors and scalars, never the metadata object;
+    this is the one place that translation happens.
+
+    Args:
+        metadata: The step's `MambaMetadata` (duck-typed; not imported here
+            so the mixer keeps no import-time dependency on it). Its `ssd`
+            attribute holds the tiling, and is None unless the CuteDSL backend
+            is enabled.
+
+    Returns:
+        An `SSDTiling`, or None when the CuteDSL backend is off or not
+        importable, or the batch has no prefill tiling yet.
+    """
+    ssd = getattr(metadata, "ssd", None)
+    if SSDTiling is None or ssd is None or ssd.ssd_active_seq_idx is None:
+        return None
+    return SSDTiling(ssd)
+
+
+try:
     from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_SSM_OPS_VARLEN = True
@@ -944,6 +972,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             chunk_size=self.chunk_size,
             cu_chunk_seqlens=cu_chunk_seqlens,
             last_chunk_indices=last_chunk_indices,
+            ssd_tiling=_ssd_tiling_from(metadata),  # None if CuTe DSL SSD is unavailable
             seq_idx=seq_idx_for_varlen,
             out=y,
             D=(

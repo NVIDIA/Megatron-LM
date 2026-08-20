@@ -137,6 +137,11 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
     "torch" with a warning if the flashinfer package is not installed."""
 
+    inference_dynamic_batching_mamba_prefill_backend: Literal["triton", "cutedsl"] = "triton"
+    """Which varlen SSD kernel Mamba prefill uses. Defaults to "triton"; "cutedsl" opts into the
+    faster Blackwell-only (SM 10.0+) kernel and falls back to "triton" with a warning where it is
+    unavailable."""
+
     offset_sampling_seed_by_dp_rank: bool = True
     """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
     generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
@@ -378,6 +383,7 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
+            mamba_prefill_backend=self.inference_dynamic_batching_mamba_prefill_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(
                 self.inference_dynamic_batching_async_sched_mode
