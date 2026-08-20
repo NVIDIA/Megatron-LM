@@ -2,7 +2,7 @@
 # DeepSeek-V4 DAPO launcher.
 #
 # Validated DS4 alignment dependency contract (CW H100, 2026-08-20):
-#   VERL: 36cbb408
+#   VERL: e284c51e
 #   Python: 3.12
 #   PyTorch: 2.12.0a0 nv26.05, CUDA 13.2
 #   vLLM: 0.26.1rc1.dev631+g5426311d9

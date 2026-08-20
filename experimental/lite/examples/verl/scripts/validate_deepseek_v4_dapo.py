@@ -29,7 +29,7 @@ MINIMUM_DEPENDENCIES = {
     "transformer-engine": "2.15.0",
     "nvidia-cudnn-frontend": "1.27.0",
 }
-EXPECTED_VERL_COMMIT = "36cbb408"
+EXPECTED_VERL_COMMIT = "e284c51e"
 
 
 def installed(name: str) -> str:
