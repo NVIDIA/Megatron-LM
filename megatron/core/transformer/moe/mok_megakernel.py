@@ -8,11 +8,13 @@ expert computation, and combine. Checkpoint conversion remains out of scope.
 
 from __future__ import annotations
 
+import itertools
 from typing import Any, Iterable
 
 import torch
 from torch import nn
 
+_MOK_MODULE_INDICES = itertools.count()
 _MOK_HIGH_PRECISION_INIT_ATTR = "_mok_high_precision_init_val"
 _MOK_MXFP8_COMPAT_WARNING_EMITTED = False
 
@@ -34,6 +36,27 @@ def _warn_mxfp8_compatibility_fallback() -> None:
         "substantially more GPU memory than the native single-grouped path.",
         flush=True,
     )
+
+
+def _debug_record(
+    stage: str,
+    param: torch.Tensor,
+    *,
+    tensors: dict[str, torch.Tensor | None] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Record an opt-in lifecycle snapshot without importing debug code normally."""
+    from megatron.core.mok_param_lifecycle_debug import enabled, record
+
+    if enabled():
+        record(stage, param, tensors=tensors, metadata=metadata)
+
+
+def _debug_tag(param: nn.Parameter, name: str) -> None:
+    from megatron.core.mok_param_lifecycle_debug import enabled, tag_parameter
+
+    if enabled():
+        tag_parameter(param, name)
 
 
 def _copy_parameter_attributes(dst: nn.Parameter, src: torch.Tensor, *, allreduce: bool) -> None:
@@ -705,6 +728,14 @@ class _MoKAutograd(torch.autograd.Function):
         schedule = functional.build_schedule(
             workspace, module.mok_config, top_experts, num_local_experts=module.num_local_experts
         )
+        trace_param_lifecycle = module.is_first_microbatch
+        routed_debug_param = module.routed_debug_parameter
+        if trace_param_lifecycle:
+            _debug_record(
+                "forward.after_param_sync_before_quantize",
+                routed_debug_param,
+                tensors={"main_grad": getattr(routed_debug_param, "main_grad", None)},
+            )
         prepared_gate, prepared_up, prepared_down = module.quantized_routed_weights()
         if module.use_mxfp8_weights and module.native_single_grouped_weights:
             gate_forward = prepared_gate[:2]
@@ -714,6 +745,29 @@ class _MoKAutograd(torch.autograd.Function):
             gate_forward = prepared_gate
             up_forward = prepared_up
             down_forward = prepared_down
+        if trace_param_lifecycle and module.use_mxfp8_weights:
+            if module.native_single_grouped_weights:
+                debug_tensors = {
+                    "rowwise_data": prepared_gate[0],
+                    "rowwise_scale": prepared_gate[1],
+                    "columnwise_data": prepared_gate[2],
+                    "columnwise_scale": prepared_gate[3],
+                    "actual_forward_data": gate_forward[0],
+                    "actual_forward_scale": gate_forward[1],
+                }
+            else:
+                debug_tensors = {
+                    "rowwise_data": prepared_gate.data,
+                    "rowwise_scale": prepared_gate.scale,
+                    "columnwise_data": prepared_gate.transposed_data,
+                    "columnwise_scale": prepared_gate.transposed_scale,
+                    "weight_descriptor_table": prepared_gate.storage_table,
+                }
+            _debug_record(
+                "forward.mok_quantized_weight_cache",
+                routed_debug_param,
+                tensors=debug_tensors,
+            )
         output, forward_context = functional.forward(
             module.mok_config,
             workspace,
@@ -734,6 +788,7 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.forward_context = forward_context
         ctx.quantized_weights = (prepared_gate, prepared_up, prepared_down)
+        ctx.trace_param_lifecycle = trace_param_lifecycle
         ctx.save_for_backward(
             x,
             router_weights,
@@ -765,6 +820,34 @@ class _MoKAutograd(torch.autograd.Function):
         main_grad_storage_tables = None
         if direct_wgrad_accumulation:
             main_grads, main_grad_storage_tables = ctx.module.main_grad_arguments()
+        if ctx.trace_param_lifecycle:
+            routed_debug_param = ctx.module.routed_debug_parameter
+            backward_debug_tensors = {
+                "main_grad_before": getattr(routed_debug_param, "main_grad", None)
+            }
+            if isinstance(backward_gate, tuple):
+                backward_debug_tensors.update(
+                    {
+                        "actual_backward_rowwise_data": backward_gate[0],
+                        "actual_backward_rowwise_scale": backward_gate[1],
+                        "actual_backward_columnwise_data": backward_gate[2],
+                        "actual_backward_columnwise_scale": backward_gate[3],
+                    }
+                )
+            elif ctx.module.use_mxfp8_weights:
+                backward_debug_tensors.update(
+                    {
+                        "actual_backward_rowwise_data": backward_gate.data,
+                        "actual_backward_rowwise_scale": backward_gate.scale,
+                        "actual_backward_columnwise_data": backward_gate.transposed_data,
+                        "actual_backward_columnwise_scale": backward_gate.transposed_scale,
+                    }
+                )
+            _debug_record(
+                "backward.before_mok_kernel",
+                routed_debug_param,
+                tensors=backward_debug_tensors,
+            )
         (
             d_x,
             d_router_weights,
@@ -793,6 +876,15 @@ class _MoKAutograd(torch.autograd.Function):
             main_grad_storage_tables=main_grad_storage_tables,
         )
 
+        if ctx.trace_param_lifecycle:
+            routed_debug_param = ctx.module.routed_debug_parameter
+            _debug_record(
+                "backward.after_mok_kernel",
+                routed_debug_param,
+                tensors={
+                    "main_grad_after": getattr(routed_debug_param, "main_grad", None)
+                },
+            )
         if ctx.module.fuse_wgrad_accumulation:
             routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
             d_shared_gate = _finish_weight_gradient(ctx.module.shared_gate_weight)
@@ -862,6 +954,7 @@ class MoKMegakernel(nn.Module):
         self.source_mlp_glu_interleave_size = config.mok_source_mlp_glu_interleave_size
         self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
+        self._debug_module_index = next(_MOK_MODULE_INDICES)
         self.mok_config = MoKConfig(
             fwd_num_comm_sms=config.mok_fwd_num_comm_sms,
             bwd_num_comm_sms=config.mok_bwd_num_comm_sms,
@@ -893,6 +986,14 @@ class MoKMegakernel(nn.Module):
             # deduplicates them; no additional payload storage is allocated.
             self.register_parameter("routed_fc1_weight", fc1.weight)
             self.register_parameter("routed_down_weight", fc2.weight)
+            _debug_tag(
+                self.routed_fc1_weight,
+                f"module{self._debug_module_index}.routed_fc1_weight",
+            )
+            _debug_tag(
+                self.routed_down_weight,
+                f"module{self._debug_module_index}.routed_down_weight",
+            )
         else:
             # Keep each native MCore expert parameter authoritative. MOK selects
             # its per-expert TMA descriptor inside the grouped-GEMM task, so no
@@ -925,6 +1026,14 @@ class MoKMegakernel(nn.Module):
                 self.register_parameter(down_name, down_param)
                 self._routed_fc1_parameter_names.append(fc1_name)
                 self._routed_down_parameter_names.append(down_name)
+                _debug_tag(
+                    fc1_param,
+                    f"module{self._debug_module_index}.{fc1_name}",
+                )
+                _debug_tag(
+                    down_param,
+                    f"module{self._debug_module_index}.{down_name}",
+                )
             self._routed_fc1_parameter_names = tuple(
                 self._routed_fc1_parameter_names
             )
@@ -973,6 +1082,10 @@ class MoKMegakernel(nn.Module):
     @property
     def routed_down_parameter(self) -> nn.Parameter:
         return self.routed_down_parameters[0]
+
+    @property
+    def routed_debug_parameter(self) -> nn.Parameter:
+        return self.routed_gate_parameter
 
     def main_grad_arguments(self):
         """Return MOK logical main grads and optional per-expert descriptors."""
@@ -1035,6 +1148,9 @@ class MoKMegakernel(nn.Module):
         self.routed_gate_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
         self.routed_up_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
         self.routed_down_weight = _new_bf16_parameter((e, h, i), fc2_ref, allreduce=False)
+        _debug_tag(self.routed_gate_weight, f"module{self._debug_module_index}.routed_gate_weight")
+        _debug_tag(self.routed_up_weight, f"module{self._debug_module_index}.routed_up_weight")
+        _debug_tag(self.routed_down_weight, f"module{self._debug_module_index}.routed_down_weight")
 
         routed_gate_init = None
         routed_up_init = None
@@ -1105,6 +1221,9 @@ class MoKMegakernel(nn.Module):
         self.shared_down_weight = _new_bf16_parameter(
             (h, routed_i), fc2_ref, allreduce=True, zero=True
         )
+        _debug_tag(self.shared_gate_weight, f"module{self._debug_module_index}.shared_gate_weight")
+        _debug_tag(self.shared_up_weight, f"module{self._debug_module_index}.shared_up_weight")
+        _debug_tag(self.shared_down_weight, f"module{self._debug_module_index}.shared_down_weight")
         source_fc1, fc1_has_preserved_init = _materialize_parameter_init(fc1_ref)
         source_fc2, fc2_has_preserved_init = _materialize_parameter_init(fc2_ref)
         source_fc1 = source_fc1.reshape(2 * shared_i, h)
