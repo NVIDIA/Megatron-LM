@@ -18,6 +18,7 @@ from megatron.rl.agent.responses_env_agent import (
     RunResult,
     generation_args_to_run_payload,
     next_curriculum_index,
+    resolve_curriculum_training_state,
     run_result_to_evaluation_response,
 )
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
@@ -223,9 +224,54 @@ class TestResponsesEnvAgent:
     )
     def test_next_curriculum_index(self, cursor, share, expected):
         assert (
-            next_curriculum_index(cursor, iteration=4, prompts_per_iter=12, prompt_share=share)
+            next_curriculum_index(
+                cursor, collections=4, prompts_per_collection=12, prompt_share=share
+            )
             == expected
         )
+
+    # (args attributes, expected (collections, prompts_per_collection); None = raises)
+    @pytest.mark.parametrize(
+        "attrs, expected",
+        [
+            ({"curr_iteration": 3, "grpo_prompts_per_step": 8}, (3, 8)),
+            ({"iteration": 5}, (5, 64)),
+            (
+                {
+                    "curr_iteration": 8,
+                    "grpo_prompts_per_step": 4,
+                    "grpo_group_size": 16,
+                    "global_batch_size": 32,
+                },
+                (4, 4),
+            ),
+            (
+                {
+                    "curr_iteration": 8,
+                    "grpo_prompts_per_step": 4,
+                    "grpo_group_size": 16,
+                    "global_batch_size": 32,
+                    "grpo_iterations": 2,
+                },
+                (2, 4),
+            ),
+            ({"curr_iteration": 1, "grpo_prompts_per_step": 0}, None),
+        ],
+        ids=[
+            "cadence-one-passthrough",
+            "iteration-fallback-and-default-prompts",
+            "batches-per-collection-cadence",
+            "grpo-iterations-cadence",
+            "invalid-prompts-raises",
+        ],
+    )
+    def test_resolve_curriculum_training_state(self, attrs, expected):
+        args = SimpleNamespace(**attrs)
+        if expected is None:
+            with pytest.raises(ValueError, match="must be positive"):
+                resolve_curriculum_training_state(args)
+        else:
+            assert resolve_curriculum_training_state(args) == expected
 
     @pytest.mark.asyncio
     async def test_curriculum_get_prompt(self, tmp_path, monkeypatch):

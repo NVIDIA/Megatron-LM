@@ -106,24 +106,37 @@ class EnvHTTPError(RuntimeError):
 
 
 def resolve_curriculum_training_state(args) -> tuple[int, int]:
-    """Return the live training iteration and prompt groups per iteration."""
+    """Return completed data collections and prompt groups per collection."""
     iteration = getattr(args, 'curr_iteration', None)
     if iteration is None:
         iteration = getattr(args, 'iteration')
 
-    prompts_per_iter = int(getattr(args, 'grpo_prompts_per_step', None) or 64)
-    if prompts_per_iter <= 0:
-        raise ValueError(f"grpo_prompts_per_step must be positive, got {prompts_per_iter}")
-    return int(iteration), prompts_per_iter
+    prompts_per_collection = getattr(args, 'grpo_prompts_per_step', None)
+    prompts_per_collection = 64 if prompts_per_collection is None else int(prompts_per_collection)
+    if prompts_per_collection <= 0:
+        raise ValueError(f"grpo_prompts_per_step must be positive, got {prompts_per_collection}")
+
+    # A collection feeds grpo_iterations passes over its global batches;
+    # the cursor advances per collection, not per training iteration.
+    group_size = int(getattr(args, 'grpo_group_size', None) or 1)
+    grpo_iterations = int(getattr(args, 'grpo_iterations', None) or 1)
+    samples_per_collection = prompts_per_collection * group_size
+    global_batch_size = int(getattr(args, 'global_batch_size', None) or 0) or samples_per_collection
+    batches_per_collection = max(1, samples_per_collection // global_batch_size)
+    collections = int(iteration) // max(1, grpo_iterations * batches_per_collection)
+    return collections, prompts_per_collection
 
 
 def next_curriculum_index(
-    curriculum_cursor: int | None, iteration: int, prompts_per_iter: int, prompt_share: float = 1.0
+    curriculum_cursor: int | None,
+    collections: int,
+    prompts_per_collection: int,
+    prompt_share: float = 1.0,
 ) -> tuple[int, int]:
-    """Advance a monotonic prompt-group cursor seeded from training progress."""
-    iteration_start = int(iteration * prompts_per_iter * prompt_share)
-    if curriculum_cursor is None or curriculum_cursor < iteration_start:
-        curriculum_cursor = iteration_start
+    """Advance a monotonic prompt-group cursor seeded from completed collections."""
+    restart_seed = int(collections * prompts_per_collection * prompt_share)
+    if curriculum_cursor is None or curriculum_cursor < restart_seed:
+        curriculum_cursor = restart_seed
 
     return curriculum_cursor, curriculum_cursor + 1
 
@@ -292,14 +305,14 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         try:
             from megatron.training.global_vars import get_args
 
-            iteration, prompts_per_iter = resolve_curriculum_training_state(get_args())
+            collections, prompts_per_collection = resolve_curriculum_training_state(get_args())
         except Exception:
             return self.dataset[np.random.randint(0, len(self.dataset))]
 
         idx_global, self._curriculum_cursor = next_curriculum_index(
             self._curriculum_cursor,
-            iteration,
-            prompts_per_iter,
+            collections,
+            prompts_per_collection,
             prompt_share=getattr(self, '_prompt_share', 1.0),
         )
         return self.dataset[idx_global % len(self.dataset)]
@@ -353,8 +366,8 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
                 self.env_id, failure_reason=failure_reason, rollout_status='masked'
             )
 
-        # completion_ids join rollouts to engine request records (staleness/eviction telemetry);
-        # stamp only a complete per-turn set, a partial one would misalign.
+        # completion_ids key this rollout's turns into the engine's finished-request
+        # ledger (one record per turn); a partial set would misalign the join.
         if len(completion_ids) != len(trajectory):
             completion_ids = []
 
