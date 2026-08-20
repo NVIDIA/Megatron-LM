@@ -786,13 +786,15 @@ class TestMLAOutputGate:
         gate = torch.tensor([[[-2.0, -1.0, 0.0, 1.0]], [[2.0, 3.0, 4.0, 5.0]]]).bfloat16()
 
         output = self.parallel_attention._apply_mla_output_gate(core_attn_out, gate)
-        expected = core_attn_out.view(2, 1, 4, 3) * torch.sigmoid(gate).unsqueeze(-1)
+        expected = core_attn_out.view(2, 1, 4, 3) * torch.sigmoid(gate.float()).to(
+            core_attn_out.dtype
+        ).unsqueeze(-1)
 
         torch.testing.assert_close(output, expected.reshape_as(output), atol=0, rtol=0)
 
-    def test_gate_preserves_native_dtype_vjp(self):
+    def test_gate_uses_fp32_sigmoid_vjp(self):
         if not torch.cuda.is_available():
-            pytest.skip("native BF16 VJP check requires CUDA")
+            pytest.skip("FP32 sigmoid VJP check requires CUDA")
 
         generator = torch.Generator(device="cuda").manual_seed(20260814)
         gate_input = torch.randn(
@@ -815,15 +817,17 @@ class TestMLAOutputGate:
         reference_gate = gate_input.detach().clone().requires_grad_(True)
         reference_core = core_output.detach().clone().requires_grad_(True)
         reference_output = (
-            reference_core.view(8, 1, 4, 8) * torch.sigmoid(reference_gate).unsqueeze(-1)
+            reference_core.view(8, 1, 4, 8)
+            * torch.sigmoid(reference_gate.float()).to(reference_core.dtype).unsqueeze(-1)
         ).reshape_as(reference_core)
         reference_gradients = torch.autograd.grad(
             reference_output, (reference_gate, reference_core), output_gradient
         )
 
-        torch.testing.assert_close(actual_output, reference_output, atol=0, rtol=0)
+        # Allow one BF16 quantization step from the compiled sigmoid/cast path.
+        torch.testing.assert_close(actual_output, reference_output, atol=1e-2, rtol=1e-2)
         for actual, reference in zip(actual_gradients, reference_gradients):
-            torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+            torch.testing.assert_close(actual, reference, atol=1e-2, rtol=1e-2)
 
     def test_missing_gate_spec_raises(self):
         submodules = get_mla_self_attn_submodules()
