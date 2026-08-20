@@ -24,7 +24,6 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
                 library (str): tokenizer library.
                 class_name (str): name of tokenizer class.
                 class_path (str): path to tokenizer class.
-                model_type (str): type of the model to be used with tokenizer.
         """
 
         super().__init__(path, config, **kwargs)
