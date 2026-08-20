@@ -3080,6 +3080,77 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        # mHC selective recompute couples with CUDA graphs only through the guarded
+        # attention-only Transformer Engine split. This gate must stay below the
+        # cuda_graph_modules normalization and the deprecated flag migration above:
+        # earlier placement would compare unnormalized string module forms and let
+        # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
+        if use_mhc_recompute and self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl == "local":
+                # Intentionally fail-closed even for inference-only local-graph
+                # configs that carry leftover training recompute args: mHC
+                # recompute is inert outside training, but silently accepting
+                # the combination would mask misconfigured training runs.
+                raise ValueError(
+                    "mHC recompute is not supported with cuda_graph_impl='local': "
+                    "eager mHC recompute and its per-microbatch checkpoint "
+                    "registration need host execution between captured segments, "
+                    "which the local per-layer implementation does not provide. Use "
+                    "cuda_graph_impl='transformer_engine' with "
+                    "cuda_graph_modules=['attn'], cuda_graph_impl='full_iteration' "
+                    "with dropout disabled, or disable CUDA graphs."
+                )
+            if self.cuda_graph_impl == "full_iteration":
+                # Full-iteration capture records the whole eager iteration —
+                # including mHC checkpoint registration, recompute kernels, and
+                # storage rebinding — into one graph, so replays re-execute the
+                # recompute at fixed addresses by construction (no partial-graph
+                # bridge involved). The one mechanical hazard is RNG-consuming
+                # ops inside a checkpointed region: the recompute-time RNG rewind
+                # cannot run under stream capture, so a captured recompute would
+                # replay a different dropout mask than its captured forward.
+                if self.hidden_dropout != 0.0 or self.attention_dropout != 0.0:
+                    raise ValueError(
+                        "mHC recompute with cuda_graph_impl='full_iteration' requires "
+                        "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
+                        "rewound inside CUDA graph capture, so a captured recompute "
+                        "would replay a different dropout mask than its forward pass."
+                    )
+            elif list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+                self.recompute_modules
+            ) != ["mhc"]:
+                raise ValueError(
+                    "mHC recompute with Transformer Engine CUDA Graphs currently supports "
+                    "only the initial attention-only split: cuda_graph_modules=[attn] and "
+                    "recompute_modules=[mhc]. The eager mHC producer must remain outside "
+                    "the captured consumer."
+                )
+            if (
+                self.cuda_graph_impl == "transformer_engine"
+                and self.fine_grained_activation_offloading
+            ):
+                # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
+                # TransformerLayer's implementation rather than extending it, so it
+                # never plants the offload synchronization edges the full-layer
+                # capture plants -- backward_record() on the graph input and
+                # forward_record() after capture. _set_offload_modules plants those
+                # exactly for the attention-scope modules under an attn-scope graph,
+                # so without them the offload copies race the captured attention.
+                attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
+                    self.offload_modules or []
+                )
+                if attn_scope_offload:
+                    raise ValueError(
+                        f"mHC recompute with attention-only TE CUDA Graphs is incompatible "
+                        f"with offload_modules {sorted(attn_scope_offload)}. The split "
+                        f"capture path omits the offload stream synchronization the "
+                        f"full-layer capture path performs, so the offload copies can race "
+                        f"the captured attention. Remove {sorted(attn_scope_offload)} from "
+                        f"offload_modules, or drop 'attn' from cuda_graph_modules."
+                    )
+                # The replay half of the same gap is fixed, not rejected: see
+                # _replay_mhc_attention_consumer.
+
         if self.cuda_graph_impl != "none":
 
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
