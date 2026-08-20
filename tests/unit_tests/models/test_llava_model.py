@@ -14,6 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -75,6 +76,7 @@ class TestLLaVAModel:
             img_h=336,
             img_w=336,
             patch_dim=14,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     @pytest.mark.internal
@@ -622,6 +624,7 @@ def setup_and_teardown_llava_model(request):
         img_h=336,
         img_w=336,
         patch_dim=14,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     yield model, vision_model_type
@@ -731,6 +734,7 @@ class TestLLaVAModelTokenParallel:
             img_h=336,
             img_w=336,
             patch_dim=14,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         return model

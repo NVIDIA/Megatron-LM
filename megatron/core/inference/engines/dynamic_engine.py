@@ -267,10 +267,7 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
 
-        if inference_config.pg_collection is not None:
-            self.pg_collection = inference_config.pg_collection
-        else:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = inference_config.resolve_pg_collection()
 
         # Initialization options.
         self.controller = controller

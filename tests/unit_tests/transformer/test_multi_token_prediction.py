@@ -105,7 +105,11 @@ class TestMultiTokenPredictionLayer:
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=transformer_layer_spec, use_transformer_engine=False
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp']),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert mtp.config.mtp_detach_heads is True
@@ -122,7 +126,11 @@ class TestMultiTokenPredictionLayer:
 
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp']),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert len(mtp.layers) == config.mtp_num_layers
@@ -148,7 +156,11 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp, use_te=True)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp']),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert len(mtp.layers) == config.mtp_num_layers
@@ -171,7 +183,11 @@ class TestMultiTokenPredictionLayer:
         """Test that _get_embeddings rolls padding_mask alongside input ids."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp']),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 6
@@ -209,7 +225,11 @@ class TestMultiTokenPredictionLayer:
         """Test forward passes rolled padding_mask to transformer path."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp']),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -269,7 +289,11 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         config.mtp_detach_heads = True
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp']),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -366,7 +390,11 @@ class TestMultiTokenPredictionLayer:
         config.mtp_detach_heads = detach_heads
         # Runs on GPU because _concat_embeddings exercises the (fused) norm and
         # projection kernels; the rest of the MTP transformer layer is stubbed out.
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp']),
+        ).cuda()
 
         # Replace each MTP transformer layer with an identity so the test isolates
         # gradient flow to the detach logic (not the attention kernels). Must be an

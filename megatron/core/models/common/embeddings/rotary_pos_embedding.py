@@ -17,7 +17,6 @@ from functools import lru_cache
 import torch
 from torch import Tensor, nn
 
-from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import (  # for backward compatibility; pylint: disable=unused-import
     _apply_rotary_pos_emb_bshd,
     _apply_rotary_pos_emb_thd,
@@ -83,11 +82,7 @@ class RotaryEmbedding(nn.Module):
         if rope_scaling:
             self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
 
-        self.cp_group = (
-            cp_group
-            if cp_group is not None
-            else parallel_state.get_context_parallel_group(check_initialized=False)
-        )
+        self.cp_group = cp_group
 
     def _apply_scaling(
         self,
@@ -347,11 +342,7 @@ class MultimodalRotaryEmbedding(nn.Module):
                 / dim
             )
         )
-        self.cp_group = (
-            cp_group
-            if cp_group is not None
-            else parallel_state.get_context_parallel_group(check_initialized=False)
-        )
+        self.cp_group = cp_group
 
     def forward(
         self,

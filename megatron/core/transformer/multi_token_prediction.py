@@ -619,6 +619,8 @@ def mtp_on_this_rank(
     mtp_num_layers: Optional[int] = None,
     ignore_virtual: Optional[bool] = True,
     vp_stage: Optional[int] = None,
+    *,
+    pp_group: torch.distributed.ProcessGroup,
 ) -> bool:
     """
     Check if there is MTP on the current rank.
@@ -633,7 +635,7 @@ def mtp_on_this_rank(
           pipeline stage. The function returns True only on the last pipeline stage.
     """
     mtp_on_this_rank = False
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_rank = get_pg_rank(pp_group)
     if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
         if (
@@ -1412,7 +1414,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.tp_group,
                     hidden_states,
                     decoder_input,
                     attention_mask,
@@ -1711,14 +1713,14 @@ class MultiTokenPredictionBlock(MegatronModule):
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
-        if pg_collection is None:
-            # Use default MPU process groups if not provided
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp'])
-        else:
-            # Ensure the provided process groups include CP
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "MultiTokenPredictionBlock pg_collection must have cp process group"
+        assert pg_collection is not None, (
+            "MultiTokenPredictionBlock requires an explicit pg_collection with cp/tp; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
+        # Ensure the provided process groups include CP
+        assert hasattr(
+            pg_collection, 'cp'
+        ), "MultiTokenPredictionBlock pg_collection must have cp process group"
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."

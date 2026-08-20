@@ -168,6 +168,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             mtp_num_layers=self.config.mtp_num_layers,
             ignore_virtual=False,
             vp_stage=vp_stage,
+            pp_group=self.pp_group,
         )
 
         if self.pre_process or self.mtp_process:
@@ -212,6 +213,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     self.config, "yarn_correction_range_round_to_int"
                 ),
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.cp_group,
             )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
@@ -220,6 +222,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                cp_group=self.cp_group,
             )
             self.mrope_section = self.config.mrope_section
             assert (

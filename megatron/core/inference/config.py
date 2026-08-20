@@ -449,6 +449,19 @@ class InferenceConfig:
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
 
+    def resolve_pg_collection(self) -> ProcessGroupCollection:
+        """Return the configured process groups, falling back to the MPU globals.
+
+        This is the compatibility boundary for inference: engines and wrappers call it once and
+        can then assume a collection, instead of each re-deriving one from global state. Resolution
+        is lazy so it happens after ``initialize_model_parallel``, not at config construction.
+
+        See ``docs/developer/parallel-state-deprecation.md``.
+        """
+        if self.pg_collection is None:
+            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        return self.pg_collection
+
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)

@@ -782,6 +782,9 @@ def forward_backward_no_pipelining(
             partial(check_first_val_step, first_val_step, forward_only),
         )
     elif config.hybrid_context_parallel:
+        assert hasattr(
+            pg_collection, 'dp_cp'
+        ), "pg_collection must have dp_cp when hybrid_context_parallel is enabled"
         forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
             forward_step_func,
             data_iterator,
@@ -798,6 +801,7 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             check_first_val_step,
             model_type,
+            pg_collection,
         )
     else:
         with no_sync_func():
