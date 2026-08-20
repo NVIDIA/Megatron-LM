@@ -31,9 +31,7 @@ def test_fsdp_persistent_buffer_config_validation(config_cls):
 
 
 @pytest.mark.parametrize("config_cls", [MCoreFSDPConfig, StandaloneFSDPConfig])
-@pytest.mark.parametrize(
-    "enabling_option", ["nccl_ub", "megatron_fsdp_max_pool_double_buffer"]
-)
+@pytest.mark.parametrize("enabling_option", ["nccl_ub", "megatron_fsdp_max_pool_double_buffer"])
 def test_fsdp_persistent_buffer_automatic_enablement(config_cls, enabling_option, monkeypatch):
     """Options that require persistent buffers enable the pool before validation."""
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)

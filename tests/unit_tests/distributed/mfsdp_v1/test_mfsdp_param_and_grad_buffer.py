@@ -119,9 +119,7 @@ def test_triple_buffer_pool_capacity_and_reuse(allocator_cls, monkeypatch):
 
 
 @pytest.mark.parametrize("allocator_cls", [FixedPoolAllocator, MaxPoolAllocator])
-def test_all_gather_capacity_check_groups_allocators_and_lazy_releases(
-    allocator_cls, monkeypatch
-):
+def test_all_gather_capacity_check_groups_allocators_and_lazy_releases(allocator_cls, monkeypatch):
     """Capacity prediction accounts for every pool and its pending lazy releases."""
     cpu_memory_buffer = _CpuMemoryBuffer()
     monkeypatch.setattr(
@@ -131,8 +129,7 @@ def test_all_gather_capacity_check_groups_allocators_and_lazy_releases(
     first_allocator = allocator_cls("first", parameter_groups, size=3)
     second_allocator = allocator_cls("second", parameter_groups, size=3)
     allocator_by_bucket = {
-        bucket_id: first_allocator if bucket_id < 4 else second_allocator
-        for bucket_id in range(8)
+        bucket_id: first_allocator if bucket_id < 4 else second_allocator for bucket_id in range(8)
     }
     pipeline = _make_all_gather_pipeline(parameter_groups, allocator_by_bucket)
 
