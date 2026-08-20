@@ -1,11 +1,18 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
+
 import pytest
 
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreFSDPConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp.distributed_data_parallel_config import (
     DistributedDataParallelConfig as StandaloneFSDPConfig,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+    fully_shard,
+    fully_shard_model,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
 
 
 @pytest.mark.parametrize("config_cls", [MCoreFSDPConfig, StandaloneFSDPConfig])
@@ -32,3 +39,20 @@ def test_fsdp_persistent_buffer_automatic_enablement(config_cls, enabling_option
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
     config = config_cls(**{enabling_option: True, "fsdp_buffer_count": 3})
     assert config.fsdp_double_buffer is True
+
+
+@pytest.mark.parametrize(
+    ("api", "previous_last_parameter"),
+    [
+        (fully_shard_model, "maxpool_double_buffer"),
+        (fully_shard, "maxpool_double_buffer"),
+        (MegatronFSDP.__init__, "report_nan_in_param_grad"),
+    ],
+)
+def test_fsdp_buffer_count_preserves_positional_api_compatibility(api, previous_last_parameter):
+    """New options must follow all parameters accepted by the previous public API."""
+    parameters = inspect.signature(api).parameters
+    assert list(parameters).index("fsdp_buffer_count") > list(parameters).index(
+        previous_last_parameter
+    )
+    assert parameters["fsdp_buffer_count"].default == 2
