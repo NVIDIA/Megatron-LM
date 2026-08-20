@@ -43,6 +43,15 @@ RAND_LO, RAND_HI = -0.1, 0.1
 COSINE_SIM_THRESH = 0.999
 
 
+def test_all_mhc_backends_declare_determinism():
+    """Every concrete backend declares a valid bit-exact determinism status."""
+    from megatron.core.fusions.fused_mhc_kernels import MHC_BACKEND_DETERMINISM
+
+    valid_statuses = {"deterministic", "nondeterministic", "unknown"}
+    assert set(MHC_BACKEND_DETERMINISM) == {"native", "triton", "cutile"}
+    assert set(MHC_BACKEND_DETERMINISM.values()) <= valid_statuses
+
+
 def _assert_cosine_similar(a: Tensor, b: Tensor, threshold: float, msg: str = ""):
     """Assert that flattened tensors have cosine similarity >= threshold."""
     a_flat = a.flatten().float()
