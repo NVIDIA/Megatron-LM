@@ -158,7 +158,7 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
     def cute_forward(**kwargs):
         seen.append(kwargs["save_fused_bwd_state"])
         h = saved_h if kwargs["save_fused_bwd_state"] else None
-        return kwargs["g"], q, torch.empty(1), h
+        return kwargs["g"], q, torch.empty(1), h, None, None
 
     context = SimpleNamespace()
     context.save_for_backward = lambda *args: setattr(context, "saved_tensors", args)
@@ -251,7 +251,7 @@ def test_cutedsl_forward_controls_fused_backward_h(monkeypatch, save_fused_bwd_s
     monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda g, **_kwargs: g)
     monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
 
-    _g, _output, _A, saved_h = implementation._cutedsl_forward(
+    _g, _output, _A, saved_h, _chunk_indices, _chunk_offsets = implementation._cutedsl_forward(
         **inputs,
         scale=0.5,
         cu_seqlens=None,
@@ -298,6 +298,53 @@ def test_cutedsl_forward_trusts_validated_varlen_cu_seqlens(monkeypatch):
 
     assert seen["cu_seqlens"].dtype == torch.int32
     assert seen["assume_valid_cu_seqlens"] is True
+
+
+def test_cutedsl_forward_reuses_packed_chunk_metadata(monkeypatch):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
+
+    implementation._clear_packed_chunk_metadata_cache_for_test()
+    shape = (1, 128, 3, 4)
+    q = torch.empty(shape)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(shape[:-1]),
+        "beta": torch.empty(shape[:-1]),
+    }
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    chunk_indices = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+    prepare_calls = []
+    seen = {}
+
+    def prepare(cu_arg, *_args, **_kwargs):
+        prepare_calls.append(cu_arg)
+        return chunk_indices
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(implementation, "prepare_chunk_indices", prepare)
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda g, **_kwargs: g)
+    monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
+
+    metadata = implementation._packed_chunk_metadata(cu_seqlens, cu_seqlens)
+    _g, _output, _A, _saved_h, actual_indices, chunk_offsets = implementation._cutedsl_forward(
+        **inputs,
+        scale=0.5,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens,
+        packed_metadata=metadata,
+        save_fused_bwd_state=True,
+    )
+
+    assert len(prepare_calls) == 1
+    assert prepare_calls[0] is cu_seqlens
+    assert actual_indices is chunk_indices
+    assert torch.equal(chunk_offsets, torch.tensor([0, 1, 2], dtype=torch.int32))
+    assert seen["checkpoint_cu_starts"] is chunk_offsets
 
 
 def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch):
@@ -417,6 +464,53 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     assert db.dtype == beta.dtype and dg.dtype == g.dtype
 
 
+def test_fused_backward_adapter_forwards_chunk_offsets(monkeypatch):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_bwd_cute
+
+    shape = (1, 128, 64, 128)
+    scalar_shape = shape[:-1]
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    g = torch.empty(scalar_shape, dtype=torch.float32)
+    h = torch.empty((2, 64, 128, 128), dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
+    fused_outputs = (
+        torch.empty_like(q),
+        torch.empty_like(q),
+        torch.empty_like(q),
+        torch.empty_like(g),
+        torch.empty_like(g),
+        torch.empty((2, 64, 128, 128), dtype=torch.float32),
+    )
+    seen = {}
+
+    def fused(**kwargs):
+        seen.update(kwargs)
+        return fused_outputs
+
+    monkeypatch.setattr(fused_gdr_bwd_cute, "fused_gdr_bwd", fused)
+
+    implementation._call_fused_gdr_bwd_cute(
+        q=q,
+        k=torch.empty_like(q),
+        v=torch.empty_like(q),
+        g=g,
+        beta=torch.empty_like(g),
+        A=torch.empty((*scalar_shape, 64), dtype=torch.bfloat16),
+        do=torch.empty_like(q),
+        dht=None,
+        scale=128**-0.5,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=None,
+        chunk_offsets=chunk_offsets,
+        h=h,
+    )
+
+    assert seen["cu_seqlens"] is cu_seqlens
+    assert seen["chunk_offsets"] is chunk_offsets
+
+
 def test_gdn_pre_gdr_producers_emit_fp32_beta():
     package = Path(__file__).parents[3] / "megatron/core"
     gdn_source = (package / "ssm/gated_delta_net/gdn.py").read_text()
@@ -454,6 +548,25 @@ def test_fused_backward_varlen_metadata_avoids_host_sync_for_device_offsets():
     metadata = fused_bwd._prepare_varlen_metadata(cu_seqlens, total_tokens=128, chunk_size=64)
 
     assert metadata.chunk_offsets.device.type == "meta"
+    assert metadata.num_sequences == 2
+    assert metadata.num_chunks == 2
+    assert metadata.uniform_sequence_length == 0
+
+
+def test_fused_backward_varlen_metadata_reuses_supplied_chunk_offsets():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
+        fused_bwd,
+    )
+
+    fused_bwd._clear_metadata_cache_for_test()
+    cu_seqlens = torch.empty(3, dtype=torch.int32, device="meta")
+    chunk_offsets = torch.empty(3, dtype=torch.int32, device="meta")
+
+    metadata = fused_bwd._prepare_varlen_metadata(
+        cu_seqlens, total_tokens=128, chunk_size=64, chunk_offsets=chunk_offsets
+    )
+
+    assert metadata.chunk_offsets is chunk_offsets
     assert metadata.num_sequences == 2
     assert metadata.num_chunks == 2
     assert metadata.uniform_sequence_length == 0

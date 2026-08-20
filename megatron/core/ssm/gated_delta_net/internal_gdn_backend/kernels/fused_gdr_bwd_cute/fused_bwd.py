@@ -57,13 +57,37 @@ def _check_sm100(tensor: torch.Tensor) -> None:
         raise ValueError(f"fused_gdr_bwd requires SM100, got capability {capability}")
 
 
+def _validate_chunk_offsets(
+    chunk_offsets: torch.Tensor, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
+    if not isinstance(chunk_offsets, torch.Tensor):
+        raise TypeError("chunk_offsets must be a torch.Tensor")
+    if chunk_offsets.dtype != torch.int32 or not chunk_offsets.is_contiguous():
+        raise TypeError("chunk_offsets must be contiguous torch.int32")
+    if chunk_offsets.device != cu_seqlens.device:
+        raise ValueError(
+            f"chunk_offsets must be on {cu_seqlens.device}, got {chunk_offsets.device}"
+        )
+    if tuple(chunk_offsets.shape) != tuple(cu_seqlens.shape):
+        raise ValueError(
+            f"chunk_offsets must have shape {tuple(cu_seqlens.shape)}, "
+            f"got {tuple(chunk_offsets.shape)}"
+        )
+    return chunk_offsets
+
+
 def _prepare_varlen_metadata(
-    cu_seqlens: torch.Tensor, total_tokens: int, chunk_size: int
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+    chunk_size: int,
+    chunk_offsets: torch.Tensor | None = None,
 ) -> _VarlenMetadata:
     if not isinstance(cu_seqlens, torch.Tensor):
         raise TypeError("cu_seqlens must be a torch.Tensor")
     if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
         raise TypeError("cu_seqlens must be contiguous torch.int32")
+    if chunk_offsets is not None:
+        chunk_offsets = _validate_chunk_offsets(chunk_offsets, cu_seqlens)
 
     key = id(cu_seqlens)
     version = cu_seqlens._version
@@ -74,6 +98,7 @@ def _prepare_varlen_metadata(
         and cached.version == version
         and cached.total_tokens == total_tokens
         and cached.chunk_size == chunk_size
+        and (chunk_offsets is None or cached.metadata.chunk_offsets is chunk_offsets)
     ):
         return cached.metadata
 
@@ -89,9 +114,20 @@ def _prepare_varlen_metadata(
             raise ValueError(
                 "sequence lengths must be positive multiples of " f"{chunk_size}, got {lengths}"
             )
-        chunk_offsets = torch.tensor(
-            [offset // chunk_size for offset in values], dtype=torch.int32, device=cu_seqlens.device
-        )
+        expected_offsets = [offset // chunk_size for offset in values]
+        if chunk_offsets is None:
+            chunk_offsets = torch.tensor(
+                expected_offsets, dtype=torch.int32, device=cu_seqlens.device
+            )
+        else:
+            expected = torch.tensor(
+                expected_offsets, dtype=torch.int32, device=cu_seqlens.device
+            )
+            if not bool(torch.equal(chunk_offsets, expected)):
+                raise ValueError(
+                    "chunk_offsets must equal cu_seqlens // chunk_size, "
+                    f"got {chunk_offsets.tolist()} for cu_seqlens {values}"
+                )
         num_sequences = len(lengths)
         num_chunks = sum(lengths) // chunk_size
         uniform_sequence_length = (
@@ -103,7 +139,8 @@ def _prepare_varlen_metadata(
             raise ValueError("cu_seqlens must contain at least one sequence")
         if total_tokens % chunk_size:
             raise ValueError(f"total_tokens must be divisible by {chunk_size}")
-        chunk_offsets = (cu_seqlens // chunk_size).contiguous()
+        if chunk_offsets is None:
+            chunk_offsets = (cu_seqlens // chunk_size).contiguous()
         num_chunks = total_tokens // chunk_size
         uniform_sequence_length = total_tokens if num_sequences == 1 else 0
 
@@ -210,7 +247,20 @@ def _launch_fused_gdr_bwd_out(**kwargs):
 
 
 def fused_gdr_bwd(
-    q, k, v, a, g, beta, do, dht, h, scale=None, cu_seqlens=None, chunk_size=64, state_v_first=False
+    q,
+    k,
+    v,
+    a,
+    g,
+    beta,
+    do,
+    dht,
+    h,
+    scale=None,
+    cu_seqlens=None,
+    chunk_offsets=None,
+    chunk_size=64,
+    state_v_first=False,
 ):
     if cu_seqlens is None:
         raise NotImplementedError("packed cu_seqlens are required")
@@ -232,7 +282,12 @@ def fused_gdr_bwd(
         chunk_size=chunk_size,
         state_v_first=state_v_first,
     )
-    metadata = _prepare_varlen_metadata(cu_seqlens, total_tokens=q.shape[1], chunk_size=chunk_size)
+    metadata = _prepare_varlen_metadata(
+        cu_seqlens,
+        total_tokens=q.shape[1],
+        chunk_size=chunk_size,
+        chunk_offsets=chunk_offsets,
+    )
     outputs = _allocate_outputs(q, k, v, g, beta, dht)
     _launch_fused_gdr_bwd_out(
         q=q,
