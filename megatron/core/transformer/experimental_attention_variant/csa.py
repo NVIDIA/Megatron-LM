@@ -1740,6 +1740,12 @@ class CompressedSparseAttention(MegatronModule):
         if is_mtp_layer:
             self.layer_number = self.layer_number + self.config.num_layers
         self.compress_ratio = compress_ratio
+        # Benchmark NVTX tag: layer flavor by compress ratio (W / CSA / HCA).
+        self._nvtx_layer_tag = {
+            0: "attn_window_total",
+            4: "attn_csa_total",
+            128: "attn_hca_total",
+        }.get(compress_ratio, f"attn_csa_r{compress_ratio}_total")
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
@@ -2088,6 +2094,7 @@ class CompressedSparseAttention(MegatronModule):
             output: [sq, b, np * v_head_dim]
         """
         nvtx_range_push("compressed_sparse_attn")
+        nvtx_range_push(self._nvtx_layer_tag)
 
         _orig_cp_group = self.pg_collection.cp
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
@@ -2112,6 +2119,7 @@ class CompressedSparseAttention(MegatronModule):
             else:
                 output = self._forward_thd(query, key, x, qr, packed_seq_params)
             self.pg_collection.cp = _orig_cp_group
+            nvtx_range_pop(self._nvtx_layer_tag)
             nvtx_range_pop("compressed_sparse_attn")
             return output
 
@@ -2157,6 +2165,7 @@ class CompressedSparseAttention(MegatronModule):
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
         self.pg_collection.cp = _orig_cp_group
+        nvtx_range_pop(self._nvtx_layer_tag)
         nvtx_range_pop("compressed_sparse_attn")
         return output
 
@@ -2619,40 +2628,120 @@ class CompressedSparseAttention(MegatronModule):
                     raise RuntimeError(
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
-                q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)
-                q_indexer_cp = q_indexer_cp.reshape(
-                    l_local, indexer.index_n_heads, indexer.index_head_dim
+                nvtx_range_push("indexer_total")
+                # Switch 1: take the load-balanced CP path via config flag. Fall back to the
+                # contiguous path for CP<=1 or short sequences, where the redistribute overhead
+                # outweighs the imbalance savings.
+                use_balance = (
+                    self.config.dsa_cp_balance_indexer
+                    and cp_size > 1
+                    and max_seqlen_q >= (self.config.dsa_cp_balance_min_seqlen or 0)
                 )
-                if self.config.apply_rope_fusion:
-                    rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
-                        max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+                if use_balance:
+                    # context_parallel_layout contract: this layer declares
+                    # required_cp_partition_mode == "contiguous", so any populated
+                    # batch layout metadata must agree before rows are re-balanced.
+                    _cp_mode = getattr(packed_seq_params, "cp_partition_mode", None)
+                    assert _cp_mode in (None, "contiguous"), (
+                        "balanced CP indexer requires contiguous layer input layout, got "
+                        f"PackedSeqParams.cp_partition_mode={_cp_mode!r}"
                     )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
-                        q_indexer_cp,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                    )
+                # q_indexer_cp (projected + roped) feeds the contiguous top-k and the train-time
+                # fused sparse-attn + indexer-loss path (which consumes it regardless of
+                # indexer_loss_coeff); the balanced path re-projects per chunk. Skip this
+                # projection only when neither consumer runs: balanced path in eval/no-grad.
+                if use_balance and not training_with_grad:
+                    q_indexer_cp = None
                 else:
-                    rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
-                    rotary_pos_emb = (
-                        rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                    q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)
+                    q_indexer_cp = q_indexer_cp.reshape(
+                        l_local, indexer.index_n_heads, indexer.index_head_dim
                     )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
-                        q_indexer_cp,
-                        rotary_pos_emb,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                        self.config,
-                    )
-                q_indexer_cp = rotate_activation(q_indexer_cp)
+                    if self.config.apply_rope_fusion:
+                        rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
+                            max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+                        )
+                        q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
+                            q_indexer_cp,
+                            rotary_pos_cos,
+                            rotary_pos_sin,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                        )
+                    else:
+                        rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+                        rotary_pos_emb = (
+                            rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                        )
+                        q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
+                            q_indexer_cp,
+                            rotary_pos_emb,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                            self.config,
+                        )
+                    q_indexer_cp = rotate_activation(q_indexer_cp)
                 weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                 weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
+
+                bal_dispatch_mode = None
+                bal_dispatch_handle = None
+                bal_multi_seq = False
+                if use_balance:
+                    # Real (non-empty) segment count for this microbatch: one D2H sync,
+                    # cached on PackedSeqParams and reused by every layer.
+                    bal_multi_seq = getattr(packed_seq_params, "_dsa_cp_multi_seq", None)
+                    if bal_multi_seq is None:
+                        if torch.cuda.is_current_stream_capturing():
+                            # D2H is illegal during graph capture. CUDA graphs require
+                            # static shapes, so the verdict cannot change between the
+                            # eager warmup iterations and the captured ones: reuse the
+                            # last eager decision (kept on the module).
+                            bal_multi_seq = getattr(self, "_dsa_cp_multi_seq_eager", False)
+                        else:
+                            seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                            nseg_real = int((seg_lens > 0).sum().item())
+                            total_real = int(cu_seqlens[-1].item())
+                            # "multi" here means "NOT a single sequence filling the whole
+                            # pack": the global folding is exactly balanced only in that
+                            # case; a single sequence with a capacity-padding tail is
+                            # unbalanced under folding (tail chunks land in the dead zone)
+                            # and belongs to the zigzag path.
+                            bal_multi_seq = not (nseg_real == 1 and total_real == cp_size * l_local)
+                            self._dsa_cp_multi_seq_eager = bal_multi_seq
+                        packed_seq_params._dsa_cp_multi_seq = bal_multi_seq
+                if use_balance:
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    # The hybridEP (DeepEP) all-to-all is not CUDA-graph capturable; fall back to
+                    # the graph-safe NCCL alltoall backend under any graph capture.
+                    bal_dispatch_mode = self.config.dsa_cp_balance_dispatch
+                    if bal_dispatch_mode == "hybridep" and self.config.cuda_graph_impl != "none":
+                        bal_dispatch_mode = "alltoall"
+                    if bal_dispatch_mode != "hybridep":
+                        # Issue the chunk dispatch now (async) so the transfer overlaps with the
+                        # compressor and compressed-K gather below instead of sitting on the
+                        # critical path right before the top-k.
+                        bal_dispatch_handle = cp_balanced_indexer.dispatch_chunks_async(
+                            indexer_qr,
+                            weights_indexer_cp,
+                            cp_group,
+                            cp_size,
+                            l_local,
+                            max_seqlen_q=max_seqlen_q,
+                            config=self.config,
+                            use_fused=self.use_fused_kernels,
+                            multi_seq=bal_multi_seq,
+                            layout_cache=getattr(
+                                packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                            ),
+                        )
 
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
                     hidden_compact.detach(),
@@ -2671,20 +2760,58 @@ class CompressedSparseAttention(MegatronModule):
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
                 # Each top-k entry is still a logical compressed id within that
-                # query's sequence here.
-                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
-                    q_indexer_cp,
-                    weights_indexer_cp,
-                    k_indexer_seq_major,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    ratio,
-                    indexer.index_topk,
-                    indexer.softmax_scale,
-                    max_seqlen_q=max_seqlen_q,
-                    use_fused=self.use_fused_kernels,
-                )
+                if use_balance:
+                    # Load-balanced CP indexer: process a head chunk + tail chunk per rank so each
+                    # rank does ~constant work, then combine the top-k back to contiguous order (a
+                    # drop-in for compute_cp_indexer_topk, same contiguous layout downstream).
+                    # cu_seqlens is constant across layers within a microbatch, so the chunk
+                    # layouts are cached on this microbatch's PackedSeqParams.
+                    bal_layout_cache = getattr(
+                        packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                    )
+                    if bal_layout_cache is None:
+                        bal_layout_cache = {}
+                        packed_seq_params._dsa_cp_balance_layout_cache = bal_layout_cache
+                    compressed_topk, indexer_layout = (
+                        cp_balanced_indexer.balanced_compute_cp_indexer_topk(
+                            indexer_qr,
+                            weights_indexer_cp,
+                            indexer,
+                            k_indexer_seq_major,
+                            cu_seqlens,
+                            cu_seqlens_compressed,
+                            self.config,
+                            cp_group,
+                            cp_size,
+                            l_local,
+                            global_start,
+                            ratio,
+                            indexer.index_topk,
+                            indexer.softmax_scale,
+                            max_seqlen_q,
+                            use_fused=self.use_fused_kernels,
+                            dispatch=bal_dispatch_mode,
+                            dispatch_handle=bal_dispatch_handle,
+                            layout_cache=bal_layout_cache,
+                            multi_seq=bal_multi_seq,
+                        )
+                    )
+                else:
+                    compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
+                        q_indexer_cp,
+                        weights_indexer_cp,
+                        k_indexer_seq_major,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        ratio,
+                        indexer.index_topk,
+                        indexer.softmax_scale,
+                        max_seqlen_q=max_seqlen_q,
+                        use_fused=self.use_fused_kernels,
+                    )
+
+                nvtx_range_pop("indexer_total")
 
             # ---- Step 5: attention compressed KV path -------------------------
             compressed_kv_local, _ = self.compressor._forward_thd(

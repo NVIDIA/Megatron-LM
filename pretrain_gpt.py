@@ -39,6 +39,9 @@ from megatron.core.packed_seq_params import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
+    prebuild_balanced_layouts,
+)
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
 from megatron.core.utils import (
     StragglerDetector,
@@ -142,6 +145,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             config=config,
         )
         finalize_packed_seq_params(batch[5])
+        if getattr(args, "dsa_cp_balance_indexer", False):
+            prebuild_balanced_layouts(batch[5])
         return batch
 
     # TODO: this is pretty hacky, find a better way
@@ -185,6 +190,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             qkv_format='thd',
         )
         finalize_packed_seq_params(packed_seq_params)
+        if getattr(args, "dsa_cp_balance_indexer", False):
+            prebuild_balanced_layouts(packed_seq_params)
         return (
             None,
             None,
@@ -245,6 +252,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['position_ids'] = position_ids
 
     finalize_packed_seq_params(packed_seq_params)
+    if getattr(args, "dsa_cp_balance_indexer", False):
+        prebuild_balanced_layouts(packed_seq_params)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (
