@@ -17,7 +17,13 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import (
+    get_emerging_optimizers_version,
+    get_pg_rank,
+    get_pg_size,
+    is_emerging_optimizers_min_version,
+    log_single_rank,
+)
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -42,6 +48,12 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# newton_schulz_tp() gained the use_syrk kwarg in emerging_optimizers 0.4.0. Earlier releases
+# expose use_syrk on the non-TP newton_schulz() only, so 0.3.x still rejects it here. Spelled
+# ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
+# elsewhere in the tree are written.
+_SYRK_MIN_EO_VERSION = "0.4.0.dev0"
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -130,6 +142,11 @@ def _is_nonlinear_or_embedding(param):
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 
+def _is_muon_excluded(param):
+    """True for parameters that should use the scalar optimizer instead of Muon."""
+    return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
+
+
 def _get_qkv_split_shapes(model_cfg) -> list[int]:
     """Compute QKV split shapes from model config."""
     query_projection_size = (
@@ -178,9 +195,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
+            raise ValueError(
+                f"use_syrk requires emerging_optimizers >= {_SYRK_MIN_EO_VERSION}, but "
+                f"{get_emerging_optimizers_version()} is installed. Upgrade "
+                "emerging_optimizers or drop --muon-use-syrk."
+            )
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -197,6 +221,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             size = [grad.size(-2), grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
+            # Only forward the kwarg when enabled; older emerging_optimizers do not
+            # accept it at all, and __init__ has already rejected use_syrk on those.
+            ns_kwargs = {"use_syrk": True} if use_syrk else {}
             orth_grad = newton_schulz_tp(
                 grad,
                 steps=num_ns_steps,
@@ -204,6 +231,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 tp_group=tp_group,
                 partition_dim=partition_dim,
                 tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
+                **ns_kwargs,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
@@ -353,6 +381,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: The additional scale factor to use for the update.
         pg_collection: Process group collection for distributed training.
         tp_mode: Tensor parallel mode ("blockwise", "duplicated", or "distributed").
+        use_syrk: Whether to use the Triton SYRK kernel for the Gram matrix in
+            Newton-Schulz. Requires emerging_optimizers >= 0.4.0.
         moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
         beta2: The exponential decay rate for second moment.
         eps: Small constant for numerical stability.
@@ -376,6 +406,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -398,6 +429,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
             tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
@@ -469,11 +501,9 @@ _EMERGING_OPTIMIZERS.update(
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_muon_config_to_kwargs,
             default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
+                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
+                    'optimizer': 'adam'
+                }
             },
         ),
         "adaptive_muon": EmergingOptimizerEntry(
@@ -481,11 +511,9 @@ _EMERGING_OPTIMIZERS.update(
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_adaptive_muon_config_to_kwargs,
             default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
+                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
+                    'optimizer': 'adam'
+                }
             },
         ),
     }

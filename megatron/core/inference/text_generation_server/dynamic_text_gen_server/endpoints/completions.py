@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
 import logging
 import time
-import uuid
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
@@ -98,6 +98,25 @@ try:
 
             ignore_eos = bool(req.get("ignore_eos", False))
 
+            # Optional vLLM-style multimodal input. Image entries are
+            # base64-encoded bytes ordered to match prompt placeholders.
+            request_multi_modal_data = req.get("multi_modal_data") or {}
+            if not isinstance(request_multi_modal_data, dict):
+                raise ValueError("multi_modal_data must be a dictionary.")
+            unsupported_modalities = set(request_multi_modal_data) - {"image"}
+            if unsupported_modalities:
+                raise ValueError(
+                    "Unsupported multimodal modalities: "
+                    f"{sorted(unsupported_modalities)}; only 'image' is supported."
+                )
+            encoded_images = request_multi_modal_data.get("image") or []
+            if isinstance(encoded_images, str):
+                encoded_images = [encoded_images]
+            if not isinstance(encoded_images, list):
+                raise ValueError("multi_modal_data.image must be a string or list.")
+            image_bytes_list = [base64.b64decode(encoded_image) for encoded_image in encoded_images]
+            multi_modal_data = {"image": image_bytes_list} if image_bytes_list else None
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -144,9 +163,17 @@ try:
                 streaming_interval=sampling_params.streaming_interval,
             )
             if stream_requested:
-                tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request_streaming(
+                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                    )
+                )
             else:
-                tasks.append(client.add_request(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request(
+                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                    )
+                )
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
@@ -158,6 +185,8 @@ try:
                     chat=False,
                     return_log_probs=return_log_probs,
                     include_usage=include_usage,
+                    echo_prompts=prompts_as_strings if echo else None,
+                    prompt_token_ids=prompts_as_tokens if echo else None,
                 ),
                 content_type="text/event-stream",
             )
@@ -208,8 +237,11 @@ try:
         prompt_tokens_counts = []
 
         request_idx = 0
+        response_uid = None
         for completed_request in batch_results:
             result = unwrap_serialized_tensors(completed_request)
+            if response_uid is None:
+                response_uid = result["uid"]
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
@@ -296,11 +328,6 @@ try:
                 "generation_token_ids": result["generated_tokens"],
                 "generation_log_probs": result.get("generated_log_probs", []),
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -318,7 +345,7 @@ try:
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         return jsonify(
             {
-                "id": str(uuid.uuid4()),
+                "id": response_uid,
                 "object": "text_completion",  # as per the openAI spec
                 "created": int(time.time()),
                 "model": "EMPTY",

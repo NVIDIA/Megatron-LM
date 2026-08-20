@@ -1,0 +1,11 @@
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{%- if message['content'] | length > 0 -%}
+{{ message['content'] + '\n' }}
+{%- endif -%}
+{%- elif message['role'] == 'user' -%}
+{{ message['content'] + '\n' }}
+{%- elif message['role'] == 'assistant' -%}
+{{ message['content'] + '\n\n' }}
+{%- endif -%}
+{%- endfor -%}

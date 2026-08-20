@@ -282,6 +282,9 @@ class OptimizerConfig:
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
 
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
@@ -428,10 +431,6 @@ class OptimizerConfig:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
-            assert (
-                self.use_distributed_optimizer
-            ), '--use-precision-aware-optimizer only supported with distributed optimizer'
-
             if not is_te_min_version("2.1.0"):
                 self.store_param_remainders = False
 
