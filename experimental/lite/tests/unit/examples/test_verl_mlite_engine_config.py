@@ -185,6 +185,42 @@ def test_parameter_snapshot_records_step_change(monkeypatch, tmp_path) -> None:
     assert before["parameter_count"] == after["parameter_count"] == 4
 
 
+@pytest.mark.parametrize("zero_grad_on_exit, expected_calls", [(True, 1), (False, 0)])
+def test_train_mode_clears_grads_before_context_offload(
+    zero_grad_on_exit, expected_calls
+) -> None:
+    from verl_mlite.engine.mlite_engine import _MegatronLiteModeCtx
+
+    events = []
+
+    class RuntimeContext:
+        def __enter__(self):
+            events.append("runtime_enter")
+
+        def __exit__(self, *_args):
+            events.append("runtime_exit")
+
+    engine = SimpleNamespace(
+        mode=None,
+        handle=object(),
+        runtime=SimpleNamespace(train_mode=lambda _handle: RuntimeContext()),
+        is_param_offload_enabled=True,
+        is_optimizer_offload_enabled=True,
+        optimizer_zero_grad=lambda: events.append("zero_grad"),
+        to=lambda **kwargs: events.append(("to", kwargs["device"])),
+    )
+
+    with _MegatronLiteModeCtx(
+        engine, mode="train", zero_grad_on_exit=zero_grad_on_exit
+    ):
+        events.append("body")
+
+    assert events.count("zero_grad") == expected_calls
+    assert events.index("runtime_exit") < events.index(("to", "cpu"))
+    if zero_grad_on_exit:
+        assert events.index("zero_grad") < events.index(("to", "cpu"))
+
+
 def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
     engine = _engine(engine_config=_engine_config(export_dtype="bfloat16"))
     captured = {}

@@ -287,6 +287,16 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
         try:
+            # Match every native VERL train engine: gradients are a train-call
+            # lifetime, not model state.  Clearing them before BaseEngineCtx
+            # offloads the module is especially important for FSDP2 because
+            # Module.to() also moves attached Parameter.grad tensors.  Keeping
+            # stale CPU grads here makes the following forward-only weight
+            # export reload both parameters and a second model-sized grad copy.
+            if self.mode == "train" and (
+                self.zero_grad_on_exit or exc_type is not None
+            ):
+                self.engine.optimizer_zero_grad()
             super().__exit__(exc_type, exc_val, exc_tb)
         except Exception as cleanup_error:
             if exc_type is None:
