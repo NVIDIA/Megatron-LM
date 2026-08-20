@@ -741,10 +741,7 @@ class TopKRouter(Router):
 
     @jit_fuser
     def _apply_expert_bias(
-        self,
-        routing_map: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        use_dense_indices: bool = False,
+        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ):
         """
         Update expert bias and tokens_per_expert
@@ -752,6 +749,7 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
+                use_dense_indices = routing_map.dtype != torch.bool
                 if padding_mask is not None:
                     flat_mask = padding_mask.reshape(-1)
                     assert (
@@ -841,7 +839,8 @@ class TopKRouter(Router):
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
-                with shape [num_tokens, num_experts].
+                with shape [num_tokens, num_experts], or dense top-k indices with shape
+                [num_tokens, topk] for supported Flex backends.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -854,7 +853,6 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
-        topk_indices = None
         if self.is_hash_layer:
             assert input_ids is not None, (
                 "input_ids is required for hash-based routing but was None. "
@@ -865,10 +863,13 @@ class TopKRouter(Router):
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
             topk_indices_dtype = self._dense_route_indices_dtype()
-            if topk_indices_dtype is not None:
-                topk_indices = torch.empty(
+            topk_indices = (
+                torch.empty(
                     (logits.shape[0], self.topk), dtype=topk_indices_dtype, device=logits.device
                 )
+                if topk_indices_dtype is not None
+                else None
+            )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -945,9 +946,7 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(
-            routing_map, padding_mask=padding_mask, use_dense_indices=topk_indices is not None
-        )
+        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
         return probs, routing_map
 

@@ -94,6 +94,10 @@ def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports
     if supports_topk_indices:
         assert received_kwargs["topk_indices"] is topk_indices
 
+    received_kwargs.clear()
+    topk_routing_with_score_function(logits, 2, fused=True)
+    assert "topk_indices" not in received_kwargs
+
 
 class TestTop2Router:
     def setup_method(self, method):
@@ -615,9 +619,7 @@ class TestAuxLossFreeTop2Router:
         previous_deterministic = torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(deterministic)
         try:
-            self.router._apply_expert_bias(
-                topk_indices, padding_mask=padding_mask, use_dense_indices=True
-            )
+            self.router._apply_expert_bias(topk_indices, padding_mask=padding_mask)
         finally:
             torch.use_deterministic_algorithms(previous_deterministic)
 
