@@ -417,6 +417,20 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     assert db.dtype == beta.dtype and dg.dtype == g.dtype
 
 
+def test_bf16_output_h_initialization_moves_to_kernel():
+    package = (
+        Path(__file__).parents[3]
+        / "megatron/core/ssm/gated_delta_net/internal_gdn_backend/kernels"
+        / "fused_gdr_fwd_cute"
+    )
+    wrapper_source = (package / "fused_fwd.py").read_text()
+    kernel_source = (package / "kernel.py").read_text()
+
+    assert "output_h is not None and output_h.dtype != torch.bfloat16" in wrapper_source
+    assert "tRG_rState.fill(0.0)" in kernel_source
+    assert "+ (chunk_idx * self.b_t) // checkpoint_every_n_tokens" in kernel_source
+
+
 def test_fused_backward_varlen_metadata_avoids_host_sync_for_device_offsets():
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
         fused_bwd,

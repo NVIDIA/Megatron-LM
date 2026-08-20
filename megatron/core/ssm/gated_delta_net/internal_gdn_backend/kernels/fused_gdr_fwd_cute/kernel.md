@@ -61,8 +61,9 @@ The wrapper returns the output tensor, or `(output, final_state)` when
 state, per-chunk input state `h`, and checkpoint buffers for the training
 path.
 When `output_h` is provided, it stores every 64-token chunk's input state and
-therefore requires `checkpoint_every_n_tokens=64`. The wrapper initializes the
-first saved state of each packed sequence to zero before launch.
+therefore requires `checkpoint_every_n_tokens=64`. The BF16 TMA kernel path
+initializes the first saved state of each packed sequence in-kernel; non-BF16
+fallback paths keep the wrapper-side initialization.
 
 
 ## Algorithm

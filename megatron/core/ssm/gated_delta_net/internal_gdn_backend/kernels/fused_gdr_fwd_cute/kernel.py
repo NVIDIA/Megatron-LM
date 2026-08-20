@@ -2441,21 +2441,21 @@ class GatedDeltaNetChunkedKernel:
                         self.epilogue_warp_id * self.threads_per_warp,
                     )
                     if cutlass.const_expr(self.use_bf16_h_tma):
-                        if chunk_idx != 0 or self.use_initial_state:
-                            h_checkpoint_idx = cu_checkpoints[batch_idx] + 1
-                            if chunk_idx != 0:
-                                h_checkpoint_idx += ((chunk_idx - 1) * self.b_t) // checkpoint_every_n_tokens
-                            side_output_store_consumer = self.output_h_tma_warp(
-                                (sH,),
-                                (tma_h_out,),
-                                (side_output_store_consumer,),
-                                (head_idx, h_checkpoint_idx),
-                                (
-                                    tensormap_manager,
-                                    tensormap_h_out_ptr,
-                                ),
-                                (),
-                            )
+                        h_checkpoint_idx = (
+                            cu_checkpoints[batch_idx]
+                            + (chunk_idx * self.b_t) // checkpoint_every_n_tokens
+                        )
+                        side_output_store_consumer = self.output_h_tma_warp(
+                            (sH,),
+                            (tma_h_out,),
+                            (side_output_store_consumer,),
+                            (head_idx, h_checkpoint_idx),
+                            (
+                                tensormap_manager,
+                                tensormap_h_out_ptr,
+                            ),
+                            (),
+                        )
                     if cutlass.const_expr(self.store_v_new or self.store_w):
                         side_output_store_consumer = self.side_output_tma_warp(
                             (sSideOutput,),
@@ -4541,6 +4541,19 @@ class GatedDeltaNetChunkedKernel:
             # Release slot - MMA can now acquire it for this chunk's GEMM 7
             # (which accumulates dS on top of Phi*S_prev).
             kv_handle.release()
+
+        elif cutlass.const_expr(self.use_bf16_h_tma):
+            tCsH = thr_state_t2r.partition_D(sH)
+            tRG_rState.fill(0.0)
+            h_side_output_store_handle = side_output_store_producer.acquire_and_advance()
+            for sub in cutlass.range(tRG_rState.shape[2]):
+                cute.autovec_copy(
+                    tRG_rState[None, 0, sub],
+                    tCsH[None, 0, sub],
+                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                )
+            cute.arch.fence_view_async_shared()
+            h_side_output_store_handle.commit()
 
         # Wait for kk and the qk/dummy-qk shared_acc slots to finish.
         shared_acc_consumer.advance()

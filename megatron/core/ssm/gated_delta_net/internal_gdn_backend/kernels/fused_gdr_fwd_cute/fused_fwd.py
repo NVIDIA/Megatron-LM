@@ -173,7 +173,7 @@ def chunk_gated_delta_rule_prefill_cute(
     elif state_checkpoints is not None or checkpoint_cu_starts is not None or output_h is not None:
         raise ValueError("checkpoint tensors must be None when checkpoint_every_n_tokens is 0")
 
-    if output_h is not None:
+    if output_h is not None and output_h.dtype != torch.bfloat16:
         output_h.index_fill_(0, (cu_i32[:-1] // _BT).to(torch.long), 0)
 
     if output_final_state and output_state is None:
