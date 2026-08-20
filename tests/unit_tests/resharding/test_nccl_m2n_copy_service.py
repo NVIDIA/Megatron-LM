@@ -71,6 +71,67 @@ def test_ordered_ops_requires_task_ids():
         _ordered_ops_by_peer([op], is_send=False)
 
 
+def test_model_roles_cannot_change_while_reusing_service():
+    service = object.__new__(NCCLM2NCopyService)
+    service._is_source = None
+    service._is_destination = None
+
+    service.set_model_roles(is_source=True, is_destination=False)
+    service.set_model_roles(is_source=True, is_destination=False)
+
+    with pytest.raises(RuntimeError, match="roles cannot change"):
+        service.set_model_roles(is_source=False, is_destination=True)
+
+
+def test_topology_is_collected_once_but_slot_size_is_reduced_each_run(monkeypatch):
+    service = object.__new__(NCCLM2NCopyService)
+    service._device = torch.device("cpu")
+    service._is_source = True
+    service._is_destination = False
+    service._topology = None
+    service._slot_bytes_tensor = torch.empty((), dtype=torch.int64)
+    service.world_size = 4
+    service.group = None
+    calls = {"all_gather": 0, "all_reduce": 0}
+
+    def fake_all_gather(outputs, _state, group):
+        assert group is None
+        calls["all_gather"] += 1
+        states = ((1, 0, 11), (1, 0, 17), (0, 1, 13), (0, 1, 19))
+        for output, state in zip(outputs, states):
+            output.copy_(torch.tensor(state))
+
+    def fake_all_reduce(value, op, group):
+        assert op == dist.ReduceOp.MAX
+        assert group is None
+        calls["all_reduce"] += 1
+        value.fill_(23)
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+
+    topology, first_slot_bytes = service._get_topology_and_slot_bytes(11)
+    cached_topology, second_slot_bytes = service._get_topology_and_slot_bytes(7)
+
+    assert topology is cached_topology
+    assert topology.src_ranks == (0, 1)
+    assert topology.dst_ranks == (2, 3)
+    assert first_slot_bytes == 19
+    assert second_slot_bytes == 23
+    assert calls == {"all_gather": 1, "all_reduce": 1}
+
+
+def test_pack_only_zeros_active_source_buffer():
+    service = object.__new__(NCCLM2NCopyService)
+    service._buffer = torch.full((12,), 7, dtype=torch.uint8)
+    topology = _validate_role_roster([(True, False), (False, True), (False, True)])
+
+    service._pack_sends(topology, sends={}, slot_bytes=3)
+
+    assert torch.equal(service._buffer[:6], torch.zeros(6, dtype=torch.uint8))
+    assert torch.equal(service._buffer[6:], torch.full((6,), 7, dtype=torch.uint8))
+
+
 def _has_nccl_m2n_python_package() -> bool:
     try:
         return (
@@ -106,7 +167,7 @@ def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
         if is_source:
             for dst_rank in dst_ranks:
                 task_id = rank * world_size + dst_rank
-                length = 13 + rank * 7 + (dst_rank - src_count) * 5
+                length = 13 + rank * 7 + (dst_rank - src_count) * 5 + iteration * 3
                 byte_value = (rank * 31 + dst_rank * 17 + iteration) % 251
                 service.submit_send(
                     torch.full((length,), byte_value, dtype=torch.uint8, device="cuda"),
@@ -125,7 +186,7 @@ def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
         else:
             for src_rank in src_ranks:
                 task_id = src_rank * world_size + rank
-                length = 13 + src_rank * 7 + (rank - src_count) * 5
+                length = 13 + src_rank * 7 + (rank - src_count) * 5 + iteration * 3
                 bytes_out = torch.empty(length, dtype=torch.uint8, device="cuda")
                 metadata_out = torch.empty(4, dtype=torch.int64, device="cuda")
                 service.submit_recv(bytes_out, src_rank, task_id=task_id)

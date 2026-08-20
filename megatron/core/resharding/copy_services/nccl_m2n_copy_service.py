@@ -144,6 +144,8 @@ class NCCLM2NCopyService(CopyService):
         self._handle = self._m2n.init()
         self._is_source: bool | None = None
         self._is_destination: bool | None = None
+        self._topology: _M2NTopology | None = None
+        self._slot_bytes_tensor = torch.empty((), dtype=torch.int64, device=self._device)
         self._buffer: torch.Tensor | None = None
         self._comm: Any | None = None
         self._closed = False
@@ -153,7 +155,14 @@ class NCCLM2NCopyService(CopyService):
         logger.info("NCCLM2NCopyService initialized on rank %d/%d", self.rank, self.world_size)
 
     def set_model_roles(self, *, is_source: bool, is_destination: bool) -> None:
-        """Set this rank's source/destination participation for the next run."""
+        """Set this rank's fixed source/destination participation."""
+        current = (self._is_source, self._is_destination)
+        requested = (is_source, is_destination)
+        if current != (None, None) and current != requested:
+            raise RuntimeError(
+                "NCCL M2N model roles cannot change while reusing a copy service; "
+                "create a new service or clear the service cache before changing meshes"
+            )
         self._is_source = is_source
         self._is_destination = is_destination
 
@@ -191,26 +200,34 @@ class NCCLM2NCopyService(CopyService):
             pair_bytes.append(sum(_tensor_nbytes(op.tensor) for op in ops))
         return sends, recvs, max(pair_bytes, default=0)
 
-    def _collect_topology_and_slot_bytes(
-        self, local_max_pair_bytes: int
-    ) -> tuple[_M2NTopology, int]:
+    def _get_topology_and_slot_bytes(self, local_max_pair_bytes: int) -> tuple[_M2NTopology, int]:
         if self._is_source is None or self._is_destination is None:
             raise RuntimeError(
                 "NCCLM2NCopyService model roles were not configured; call set_model_roles() "
                 "or use swap_model_weights()"
             )
-        state = torch.tensor(
-            [int(self._is_source), int(self._is_destination), local_max_pair_bytes],
-            dtype=torch.int64,
-            device=self._device,
-        )
-        gathered = [torch.empty_like(state) for _ in range(self.world_size)]
-        dist.all_gather(gathered, state, group=self.group)
-        host_states = [tuple(int(value) for value in item.cpu().tolist()) for item in gathered]
-        topology = _validate_role_roster(
-            [(bool(is_src), bool(is_dst)) for is_src, is_dst, _size in host_states]
-        )
-        return topology, max(size for _is_src, _is_dst, size in host_states)
+        topology = self._topology
+        if topology is None:
+            # The source and destination meshes are fixed for the service lifetime.
+            state = torch.tensor(
+                [int(self._is_source), int(self._is_destination), local_max_pair_bytes],
+                dtype=torch.int64,
+                device=self._device,
+            )
+            gathered = [torch.empty_like(state) for _ in range(self.world_size)]
+            dist.all_gather(gathered, state, group=self.group)
+            host_states = [tuple(int(value) for value in item.cpu().tolist()) for item in gathered]
+            topology = _validate_role_roster(
+                [(bool(is_src), bool(is_dst)) for is_src, is_dst, _size in host_states]
+            )
+            self._topology = topology
+            slot_bytes = max(size for _is_src, _is_dst, size in host_states)
+        else:
+            # Payload sizes may vary, so only their scalar maximum remains per-run.
+            self._slot_bytes_tensor.fill_(local_max_pair_bytes)
+            dist.all_reduce(self._slot_bytes_tensor, op=dist.ReduceOp.MAX, group=self.group)
+            slot_bytes = int(self._slot_bytes_tensor.item())
+        return topology, slot_bytes
 
     def _validate_peers(
         self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
@@ -254,7 +271,7 @@ class NCCLM2NCopyService(CopyService):
     ) -> None:
         if self._buffer is None:
             raise RuntimeError("NCCL M2N refit buffer is not allocated")
-        self._buffer.zero_()
+        self._buffer[: len(topology.dst_ranks) * slot_bytes].zero_()
         dst_index = {rank: index for index, rank in enumerate(topology.dst_ranks)}
         with torch.no_grad():
             for peer, ops in sends.items():
@@ -310,13 +327,18 @@ class NCCLM2NCopyService(CopyService):
 
         try:
             sends, recvs, local_max_pair_bytes = self._prepare_ops()
-            topology, slot_bytes = self._collect_topology_and_slot_bytes(local_max_pair_bytes)
+            topology, slot_bytes = self._get_topology_and_slot_bytes(local_max_pair_bytes)
             self._validate_peers(topology, sends, recvs)
             if slot_bytes == 0:
                 return
 
             comm = self._get_comm()
-            required_size = max(len(topology.src_ranks), len(topology.dst_ranks)) * slot_bytes
+            peer_count = (
+                len(topology.dst_ranks)
+                if self.rank in topology.src_ranks
+                else len(topology.src_ranks)
+            )
+            required_size = peer_count * slot_bytes
             self._ensure_buffer(required_size)
             if self.rank in topology.src_ranks:
                 self._pack_sends(topology, sends, slot_bytes)
