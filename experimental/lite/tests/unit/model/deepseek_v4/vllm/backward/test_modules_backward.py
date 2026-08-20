@@ -60,6 +60,32 @@ def test_visible_linear_value_and_master_vjp(fused: bool) -> None:
         torch.testing.assert_close(actual.grad.float(), reference.grad, rtol=1e-5, atol=1e-6)
 
 
+def test_forward_only_uses_visible_path_without_autograd_owner() -> None:
+    x = torch.randn(3, 4, requires_grad=True)
+    weight = torch.randn(5, 4, requires_grad=True)
+    visible = lambda value, master: F.linear(value, master) + 0.25
+
+    with torch.inference_mode():
+        output = block_fp8_linear(visible, x, weight)
+        projected = o_projection(
+            lambda value, *_weights: value.sum(dim=1),
+            torch.randn(3, 2, 4),
+            torch.randn(2, 8),
+            torch.randn(4, 2),
+            positions=torch.arange(3),
+            cos_sin_cache=torch.randn(3, 4),
+            n_groups=1,
+            heads_per_group=2,
+            nope_dim=2,
+            rope_dim=2,
+            o_lora_rank=2,
+        )
+
+    assert output.is_inference()
+    assert projected.is_inference()
+    torch.testing.assert_close(output, visible(x, weight), rtol=0, atol=0)
+
+
 def test_gate_linear_uses_bound_master_vjp() -> None:
     x = torch.randn(4, 6, requires_grad=True)
     weight = torch.randn(9, 6, requires_grad=True)

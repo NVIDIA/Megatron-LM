@@ -36,6 +36,8 @@ class _VLLMFixedRouteFunction(torch.autograd.Function):
 
 
 def fixed_route_vjp(visible_op, logits, *, renormalize: bool, route_scale: float):
+    if not torch.is_grad_enabled():
+        return visible_op(logits)
     return _VLLMFixedRouteFunction.apply(
         logits, visible_op, renormalize, route_scale
     )

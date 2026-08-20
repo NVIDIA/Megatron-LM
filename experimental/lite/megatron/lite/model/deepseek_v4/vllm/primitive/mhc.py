@@ -24,6 +24,11 @@ def _pre_graph(x, fn, scale, base, *, mult, iters, eps):
     return residual, post.unsqueeze(-1), comb, hidden
 
 
+def _post_graph(x, residual, post, comb):
+    """Shared differentiable definition behind the vLLM-visible post kernel."""
+    return HyperConnection.post(x, residual, post.squeeze(-1), comb)
+
+
 def mhc_pre_broadcast(
     visible_op: Callable,
     x: torch.Tensor,
@@ -55,9 +60,7 @@ def mhc_pre_broadcast(
 def mhc_post(visible_op: Callable, x, residual, post, comb):
     return visible_functional_vjp(
         visible_op,
-        lambda x_, residual_, post_, comb_: HyperConnection.post(
-            x_, residual_, post_.squeeze(-1), comb_
-        ),
+        _post_graph,
         (x, residual, post, comb),
     )
 

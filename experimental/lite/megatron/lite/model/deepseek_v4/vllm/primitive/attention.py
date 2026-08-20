@@ -483,6 +483,11 @@ def attention_core(
     compressor_workspace_slots=None,
     query_start_loc=None,
 ):
+    if not torch.is_grad_enabled():
+        result = visible_op(q, kv)
+        if not isinstance(result, (tuple, list)) or not result:
+            raise RuntimeError("visible attention must return an output tensor")
+        return result[0]
     if compressor_kv_score is None:
         compressor_kv_score = q.new_empty((0, workspace.shape[-1]))
         compressor_ape = q.new_empty((0, workspace.shape[-1]))
@@ -573,6 +578,11 @@ def visible_sparse_attention(
     softmax_scale: float,
     backward_op=None,
 ):
+    if not torch.is_grad_enabled():
+        result = visible_op(q, kv)
+        if not isinstance(result, (tuple, list)) or not result:
+            raise RuntimeError("visible sparse attention must return an output tensor")
+        return result[0]
     return _VisibleSparseAttentionFunction.apply(
         visible_op,
         backward_op,

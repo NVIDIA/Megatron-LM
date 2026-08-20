@@ -64,6 +64,11 @@ def visible_functional_vjp(
     *,
     version_indices: tuple[int, ...] = (),
 ):
+    # Forward-only callers (including VERL old-logprob evaluation) should use
+    # the visible implementation exactly as ordinary MCore modules do.  The
+    # custom autograd owner exists only to attach the functional backward.
+    if not torch.is_grad_enabled():
+        return visible_op(*inputs)
     return _VisibleFunctionalVJP.apply(
         visible_op, functional_op, version_indices, *inputs
     )
