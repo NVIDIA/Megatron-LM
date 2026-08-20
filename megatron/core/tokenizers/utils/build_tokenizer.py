@@ -76,8 +76,15 @@ def build_tokenizer(args, **kwargs):
         kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
     elif args.tokenizer_type == 'MultimodalTokenizer':
         tokenizer_library = 'multimodal'
+        tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.tokenizer_prompt_format
-        kwargs['special_tokens'] = args.special_tokens
+        # Fall back to the pre-rename attribute name when the checkpoint or CLI
+        # populated only args.special_tokens.
+        kwargs['special_tokens'] = (
+            getattr(args, 'tokenizer_special_tokens', None)
+            or getattr(args, 'special_tokens', None)
+            or []
+        )
         kwargs['image_tag_type'] = args.image_tag_type
         kwargs['force_system_message'] = args.force_system_message
     elif args.tokenizer_type == 'SFTTokenizer':

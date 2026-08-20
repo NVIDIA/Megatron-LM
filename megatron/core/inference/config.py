@@ -43,6 +43,11 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    gdp_num_householder: int = 0
+    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
+    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    kernels, whose Householder-expanded token stream is this many times longer."""
+
     @classmethod
     def from_model(
         cls,
@@ -56,7 +61,7 @@ class MambaInferenceStateConfig:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:
@@ -77,6 +82,20 @@ class MambaInferenceStateConfig:
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
+            # Gated Delta Product layers register as Mamba layers but carry a
+            # Householder count, which sizes their (separate) chunk descriptors.
+            gdp_num_householder = 0
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    num_householder = getattr(layer.mixer, 'num_householder', None)
+                    if num_householder is not None:
+                        # The descriptors are shared across layers, so one count
+                        # has to cover every GDP layer.
+                        assert gdp_num_householder in (0, num_householder), (
+                            "every GDP layer must use the same num_householder; got "
+                            f"{gdp_num_householder} and {num_householder}"
+                        )
+                        gdp_num_householder = num_householder
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -84,6 +103,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                gdp_num_householder=gdp_num_householder,
             )
         return None
 
@@ -151,6 +171,27 @@ class AsyncScheduleMode(str, Enum):
 
     ASYNC = "async"
     """Overlap asynchronous scheduling phases by reordering them to prepare-before-resolve."""
+
+
+@dataclass
+class ImageProcessingConfig:
+    """Configuration for converting raw images into model input tensors."""
+
+    patch_dim: int
+    dynamic_resolution: bool = False
+    use_tiling: bool = False
+    pixel_shuffle: bool = False
+    spatial_merge_size: int = 1
+    dynamic_resolution_min_patches: int = 1
+    dynamic_resolution_max_patches: int = 128
+    vision_model_type: str = "radio"
+    pixel_mean: Optional[List[float]] = None
+    pixel_std: Optional[List[float]] = None
+    img_h: Optional[int] = None
+    img_w: Optional[int] = None
+    max_num_tiles: int = 1
+    use_thumbnail: bool = False
+    num_img_embeddings_per_tile: int = 0
 
 
 @dataclass
@@ -286,6 +327,9 @@ class InferenceConfig:
 
     pg_collection: Optional[ProcessGroupCollection] = None
     """A `ProcessGroupCollection` for distributed execution."""
+
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None
+    """Configuration for preprocessing raw image payloads."""
 
     use_flashinfer_fused_rope: Optional[bool] = False
     """

@@ -35,9 +35,11 @@ class GroupedRolloutRequest(Request):
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
-    streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
+
+
+KNOWN_ROLLOUT_STATUSES = ('ok', 'placeholder', 'masked', 'graded')
 
 
 class Rollout(AgentBaseModel):
@@ -48,6 +50,8 @@ class Rollout(AgentBaseModel):
     reward: float = None
     env_id: str = ''
     problem_id: str | None = None
+    rollout_status: str = 'ok'
+    failure_reason: str | None = None
 
 
 class TokenRollout(AgentBaseModel):
@@ -60,6 +64,9 @@ class TokenRollout(AgentBaseModel):
     env_id: str = ''
     problem_id: str | None = None
     completion_ids: list[str] = []
+    generation_cap: int | None = None
+    rollout_status: str = 'ok'
+    failure_reason: str | None = None
 
 
 Rollouts = list[TokenRollout | Rollout]

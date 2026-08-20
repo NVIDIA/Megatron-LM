@@ -551,6 +551,25 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
+def _wgrad_gemm(out, grad_output, total_input):
+    """Weight-gradient GEMM into ``out``, which may be wider than the inputs (bf16 -> fp32).
+
+    Returns ``out``, filled with the weight gradient.
+    """
+    # Import here to avoid circular import
+    from megatron.core.extensions.transformer_engine import te_general_gemm
+
+    if te_general_gemm is not None:
+        # torch.matmul cannot widen via out=, so TE's GEMM does the mixed-precision output.
+        te_general_gemm(
+            total_input, grad_output, out_dtype=out.dtype, layout="NT", out=out, grad=True
+        )
+    else:
+        # matmul rejects an out= of a different dtype, so land in the compute dtype and cast.
+        out.copy_(grad_output.t().matmul(total_input))
+    return out
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -689,23 +708,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
                 if hasattr(weight, "__fsdp_param__"):
                     weight.main_grad = weight.get_main_grad()
-                    # Import here to avoid circular import
-                    from megatron.core.extensions.transformer_engine import te_general_gemm
-
-                    if te_general_gemm is not None:
-                        # Use TE general_gemm to support mixed-precision output
-                        # (e.g. bf16 input -> fp32 main_grad) which torch.matmul
-                        # does not support via the out= parameter.
-                        te_general_gemm(
-                            total_input,
-                            grad_output,
-                            out_dtype=weight.main_grad.dtype,
-                            layout="NT",
-                            out=weight.main_grad,
-                            grad=True,
-                        )
-                    else:
-                        torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
+                    _wgrad_gemm(weight.main_grad, grad_output, total_input)
                 else:
                     if weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
@@ -752,6 +755,17 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
+        elif ctx.gtp_remat_size > 1 and sharded_weight.main_grad.dtype != total_input.dtype:
+            # Fusion is off for GTP (main_grad is SHARDED, the GEMM output is not), so the wgrad
+            # takes three hops, and get_wgrad_tensor() types it from main_grad:
+            #
+            #                                          epilogue     RS       accum
+            #   --accumulate-allreduce-grads-in-fp32     fp32  --->  fp32 --->  fp32   <- here
+            #   --grad-reduce-in-bf16                    bf16  --->  bf16 --->  bf16   <- else
+            #
+            # This branch widens the epilogue to main_grad's dtype, so the RS no longer rounds
+            # across ranks before the fp32 accum sees the value.
+            grad_weight = _wgrad_gemm(sharded_weight.get_wgrad_tensor(), grad_output, total_input)
         else:
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None

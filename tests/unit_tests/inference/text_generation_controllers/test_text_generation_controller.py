@@ -282,6 +282,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         max_requests=metadata_len,
         max_tokens=32,
         request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
+        kv_block_allocator=SimpleNamespace(enable_handoff_pinning=False),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
     return context
@@ -1007,6 +1008,71 @@ def test_build_async_sched_request_state_keeps_partial_chunk_active():
     assert finished_request_ids.tolist() == [11]
 
 
+def test_legacy_bookkeeping_keeps_partial_chunk_active():
+    """Legacy bookkeeping must not finish a request midway through its prompt."""
+    context = _make_async_sched_context(total_request_count=1)
+    context.chunked_prefill_request_id = 10
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=0)
+    context.get_active_sequence_lengths.return_value = torch.tensor([3])
+    context.get_max_sequence_lengths.return_value = torch.tensor([4])
+    context.kv_block_allocator = SimpleNamespace(block_routing=False, enable_handoff_pinning=True)
+    context.request_to_kv_block_ids = torch.tensor([[1, 2, -1]], dtype=torch.int32)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda[0] = 7
+
+    result = controller._dynamic_step_context_bookkeeping()
+
+    assert result["finished_request_ids"].numel() == 0
+    assert result["finished_handoff_block_ids"] == {}
+    context.update_requests.assert_called_once()
+
+
+def test_async_bookkeeping_retains_finished_handoff_state():
+    context = _make_async_sched_context(total_request_count=3, paused_request_count=1)
+    context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor(
+        [[8, 9, -1], [10, 11, -1], [12, 13, -1]], dtype=torch.int32
+    )
+    controller = _make_async_sched_controller(context)
+    sample_result = SimpleNamespace(
+        sampled_tokens_cpu_view=torch.tensor([99, 7]),
+        sampled_mtp_tokens_cpu_view=None,
+        accepted_tokens_cpu_view=None,
+    )
+
+    result = controller._run_async_sched_update_requests(
+        sample_result, resolved_sequence_lengths=torch.tensor([3, 3])
+    )
+
+    assert result.finished_handoff_block_ids == {11: [10, 11]}
+    assert result.finished_handoff_ssm_slots == {}
+    assert result.finished_handoff_decode_tokens == {11: [99]}
+    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([10, 11])
+
+
+def test_finished_hybrid_handoff_detaches_live_ssm_slot():
+    context = _make_async_sched_context(total_request_count=2)
+    context.is_hybrid_model = True
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
+    context.mamba_metadata = SimpleNamespace(detach_state_slot=mock.Mock(return_value=7))
+    controller = _make_async_sched_controller(context)
+
+    blocks, ssm_slots, decode_tokens = controller._collect_finished_handoff_state(
+        torch.tensor([1]), torch.tensor([91, 92]), None
+    )
+
+    assert blocks == {11: [12, 13]}
+    assert ssm_slots == {11: 7}
+    assert decode_tokens == {11: [92]}
+    context.mamba_metadata.detach_state_slot.assert_called_once_with(1)
+
+
 @pytest.mark.parametrize(
     "termination_ids, stop_word_finished_ids",
     [([99, 99, 99], set()), ([99, 2, 99], set()), ([99, 99, 99], {11})],
@@ -1034,7 +1100,9 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
     controller._compact_async_sched_logits = mock.Mock()
 
     sample_result = SimpleNamespace(
-        sampled_tokens_cpu_view=sample_tokens, accepted_tokens_cpu_view=None
+        sampled_tokens_cpu_view=sample_tokens,
+        sampled_mtp_tokens_cpu_view=None,
+        accepted_tokens_cpu_view=None,
     )
     result = controller._run_async_sched_resolve(
         sample_result, context.get_active_sequence_lengths() + 1
@@ -1113,6 +1181,9 @@ def test_async_sched_step_overlap_order():
             survivor_idxs=torch.tensor([0, 2]),
             newly_paused_request_ids=None,
             evict_request_ids=None,
+            finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
+            finished_handoff_decode_tokens={},
         )
     )
 
@@ -1240,6 +1311,9 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             survivor_idxs=torch.tensor([0]),
             newly_paused_request_ids=None,
             evict_request_ids=None,
+            finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
+            finished_handoff_decode_tokens={},
         )
     )
     observed = []
@@ -1288,6 +1362,27 @@ def test_async_sched_initial_no_overlap_step_launches_primer_only():
     )
     assert call_order == ["admit", "primer", "wait:bookkeeping"]
     assert context.async_sched_step_count == 0
+
+
+def test_async_sched_no_overlap_admission_can_finish_without_launching_a_primer():
+    """An admission callback may resolve its request without adding model work."""
+
+    context = _make_async_sched_context(total_request_count=0)
+    context.active_token_count = 0
+    controller = _make_async_sched_controller(context)
+    controller._async_sched_logits = AsyncScheduleLogitsState()
+    admit_request = mock.Mock()
+    controller._run_async_sched_forward_primer = mock.Mock()
+
+    result = asyncio.run(
+        controller._run_async_sched_step_no_overlap(schedule_waiting_requests=admit_request)
+    )
+
+    assert result == DynamicBatchControllerStepResult(
+        decode_only=DecodeOnly(consumed=None, launched=None)
+    )
+    admit_request.assert_called_once_with()
+    controller._run_async_sched_forward_primer.assert_not_called()
 
 
 def test_run_async_sched_update_requests_preserves_pre_update_output():
@@ -1360,6 +1455,9 @@ def test_async_sched_no_overlap_updates_before_admission(
         survivor_idxs=None,
         newly_paused_request_ids=torch.tensor([10]),
         evict_request_ids=torch.tensor([11]),
+        finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
+        finished_handoff_decode_tokens={},
     )
     input_ids = torch.empty(1, dtype=torch.int64)
     position_ids = torch.empty(1, dtype=torch.int64)
@@ -1464,6 +1562,9 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         survivor_idxs=None,
         newly_paused_request_ids=None,
         evict_request_ids=None,
+        finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
+        finished_handoff_decode_tokens={},
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
     controller._synchronize_async_sched_event = mock.Mock()
@@ -1514,6 +1615,9 @@ def test_async_sched_mtp_overlap_step_order():
         survivor_idxs=torch.tensor([2, 1]),
         newly_paused_request_ids=None,
         evict_request_ids=None,
+        finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
+        finished_handoff_decode_tokens={},
     )
     input_ids = torch.empty(9, dtype=torch.int64)
     position_ids = torch.empty(9, dtype=torch.int64)

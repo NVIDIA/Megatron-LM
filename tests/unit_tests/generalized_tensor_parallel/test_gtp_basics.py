@@ -307,6 +307,75 @@ class TestLayerNormLinearGTP:
 
 
 # ---------------------------------------------------------------------------
+# Megatron linear: the wgrad handed to the reduce-scatter carries main_grad's dtype
+# ---------------------------------------------------------------------------
+
+
+def _worker_wgrad_rs_dtype(rank, world_size, port):
+    """With an FP32 main_grad, the gtp_remat reduce-scatter must run in FP32, not the compute dtype.
+
+    Guards a SILENT failure: a bf16 wgrad makes the RS round at every rank, which leaves gradients
+    finite and merely less precise, so the value-based tests here pass either way.
+
+    Covers Megatron's linear (layers.py); TE types its wgrad from main_grad via grad_buffer().
+    """
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
+    from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
+    from megatron.core.tensor_parallel.layers import (
+        linear_with_grad_accumulation_and_async_allreduce,
+    )
+
+    torch.manual_seed(0)
+    batch, in_f, out_f = 16, 64, 128  # out_f % (16*world_size)==0 -> no padding
+    layer = nn.Linear(in_f, out_f, bias=False, dtype=torch.bfloat16, device="cuda")
+    wrap_module_params_gtp(layer, ["weight"], dist.new_group(list(range(world_size))))
+    layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=torch.float32, device="cuda")
+
+    seen = []
+    captured = []
+    original = GTPShardedParam.wgrad_reduce_scatter
+
+    def recording_rs(self, wgrad, nvtx_label=None):
+        seen.append(wgrad.dtype)
+        captured.append(wgrad.detach().float().clone())
+        return original(self, wgrad, nvtx_label=nvtx_label)
+
+    try:
+        GTPShardedParam.wgrad_reduce_scatter = recording_rs
+        inp = torch.randn(batch, in_f, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        linear_with_grad_accumulation_and_async_allreduce(
+            input=inp,
+            weight=layer.weight,
+            bias=None,
+            gradient_accumulation_fusion=True,
+            allreduce_dgrad=False,
+            sequence_parallel=False,
+            gtp_remat_size=world_size,
+        ).sum().backward()
+    finally:
+        GTPShardedParam.wgrad_reduce_scatter = original
+
+    # Every rank asserts: the tally is rank-local.
+    assert seen, "wgrad_reduce_scatter was never reached -- the weight is not GTP-sharded"
+    assert set(seen) == {torch.float32}, (
+        f"gtp_remat reduce-scatter ran in {set(seen)} with an FP32 main_grad. The wgrad must carry "
+        f"main_grad's dtype, or the cross-rank sum rounds before main_grad ever sees it."
+    )
+    # The widened branch is the only caller of _wgrad_gemm here, so pin the VALUE too: a wrong
+    # layout/operand order would still be FP32 and still reduce-scatter cleanly. grad_output is
+    # all ones (loss = .sum()), so every wgrad row is just the input column sum -- computed in
+    # FP32 without a GEMM, the reference carries no BF16 rounding and the tolerance stays tight.
+    expected = inp.detach().float().sum(dim=0).expand(out_f, in_f)
+    torch.testing.assert_close(captured[0], expected, rtol=1e-5, atol=1e-4)
+
+
+class TestGTPWgradRSDtype:
+    def test_wgrad_rs_follows_main_grad_dtype(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_wgrad_rs_dtype, 4)
+
+
+# ---------------------------------------------------------------------------
 # GroupedLinear forward/backward smoke test
 # ---------------------------------------------------------------------------
 

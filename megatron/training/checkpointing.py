@@ -24,6 +24,11 @@ import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
@@ -62,8 +67,11 @@ try:
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
+        handle_mla_down_proj_in_state_dict,
+        handle_mtp_in_state_dict,
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
+        validate_fsdp_dtensor_model_load,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -783,17 +791,18 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        state_dict = generate_state_dict(
-            args,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            rng_state,
-            iteration=iteration,
-            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            rerun_state=rerun_state,
-        )
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
+            state_dict = generate_state_dict(
+                args,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                rng_state,
+                iteration=iteration,
+                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                rerun_state=rerun_state,
+            )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
@@ -853,6 +862,8 @@ def save_checkpoint(
                         process_group,
                         args.ckpt_assume_constant_structure,
                         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
+                        pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+                        pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
                     )
             # Allow opting out of save-side sharding validation entirely (even on
             # the first save) via --no-ckpt-load-validate-sharding-integrity. This
@@ -866,17 +877,18 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            async_save_request = dist_checkpointing.save(
-                state_dict,
-                checkpoint_name,
-                save_strategy,
-                async_sharded_save=args.async_save,
-                validate_access_integrity=validate_sharding_integrity,
-                preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
-                content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                async_strategy=args.async_strategy,
-                verify_integrity=args.verify_integrity,
-            )
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
+                async_save_request = dist_checkpointing.save(
+                    state_dict,
+                    checkpoint_name,
+                    save_strategy,
+                    async_sharded_save=args.async_save,
+                    validate_access_integrity=validate_sharding_integrity,
+                    preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
+                    content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
+                    async_strategy=args.async_strategy,
+                    verify_integrity=args.verify_integrity,
+                )
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -1688,18 +1700,26 @@ def _localize_redundant_extra_states(state_dict):
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
-    if args.swiglu:
+
+    def apply(handler):
+        """Run a state dict handler over the model and, when present, the optimizer state."""
+        model_state_dict, optimizer_state_dict = handler(
+            model, state_dict['model'], state_dict.get('optimizer')
+        )
+        state_dict['model'] = model_state_dict
         if 'optimizer' in state_dict:
-            model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
-                model, state_dict['model'], state_dict['optimizer']
-            )
-            state_dict['model'] = model_state_dict
             state_dict['optimizer'] = optimizer_state_dict
-        else:
-            model_state_dict, _ = handle_swiglu_in_state_dict(model, state_dict['model'], None)
-            state_dict['model'] = model_state_dict
+
+    if args.swiglu:
+        apply(handle_swiglu_in_state_dict)
+    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
+    # layout used on disk. No-op for unfused models.
+    apply(handle_mla_down_proj_in_state_dict)
     if args.num_experts:
         state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
+    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
+    # above resolve keys against live module paths, which still use the new name.
+    apply(handle_mtp_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -1905,6 +1925,8 @@ def _load_global_dist_base_checkpoint(
             per_rank_object_load=getattr(
                 args, 'ckpt_fully_parallel_load_per_rank_objects', False
             ),
+            pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+            pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
@@ -2117,6 +2139,16 @@ def _load_base_checkpoint(
 
             _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
             print_diff_in_state_dicts(state_dict_metadata, state_dict)
+            # A partial load silently skips model weights the checkpoint does not have,
+            # leaving them at their initialized values. Report that, unless this is a
+            # fine-tune where loading only part of the model is the intent.
+            if not getattr(args, 'finetune', False):
+                validate_fsdp_dtensor_model_load(
+                    state_dict_metadata,
+                    state_dict,
+                    checkpoint_name,
+                    strict=args.dist_ckpt_strictness,
+                )
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         torch.distributed.checkpoint.load_state_dict(
@@ -2319,9 +2351,13 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
         # ``module`` but are intentionally not handled by the regular
-        # ``unwrap_model`` helper.
+        # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
+        # the language model under ``language_model`` instead.
         while module is not None:
             if isinstance(module, HybridModel):
+                return True
+            inner = getattr(module, 'language_model', None)
+            if inner is not None and isinstance(inner, HybridModel):
                 return True
             module = getattr(module, 'module', None)
         return False
@@ -2445,9 +2481,10 @@ def load_checkpoint(
     state_dict = None
     release = False
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
-        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-            load_dir, args, rank0=True, checkpointing_context=checkpointing_context
-        )
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
+            state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+                load_dir, args, rank0=True, checkpointing_context=checkpointing_context
+            )
 
         ckpt_format = None
         if ckpt_type == CheckpointType.TORCH_DCP:
@@ -2936,6 +2973,47 @@ def load_checkpoint(
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+
+            # Optimizer state dict can overwrite per-group max_lr/min_lr values.
+            # If scheduler override is requested, re-apply runtime lr bounds from
+            # args so scheduler math does not stay pinned to checkpoint lr settings.
+            if getattr(args, "override_opt_param_scheduler", False):
+                if (
+                    optimizer is None
+                    or getattr(optimizer, "is_stub_optimizer", False)
+                    or opt_param_scheduler is None
+                ):
+                    print_rank_0(
+                        " > WARNING: --override-opt-param-scheduler is set, but optimizer or "
+                        "opt_param_scheduler is not available; skipping override of scheduler "
+                        "and optimizer param_group max_lr/min_lr."
+                    )
+                else:
+                    for param_group in optimizer.param_groups:
+                        if param_group.get("is_decoupled_lr", False):
+                            max_lr = getattr(args, "decoupled_lr", None)
+                            min_lr = getattr(args, "decoupled_min_lr", None)
+                        else:
+                            max_lr = args.lr
+                            min_lr = args.min_lr
+                        if max_lr is not None:
+                            param_group["max_lr"] = max_lr
+                        if min_lr is not None:
+                            param_group["min_lr"] = min_lr
+                    # Synchronize scheduler num_steps with consumed_train_samples
+                    # to ensure lr calculation is based on current training progress
+                    if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                        print_rank_0(
+                            f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
+                            f"differs from consumed_train_samples ({args.consumed_train_samples}). "
+                            f"Resetting scheduler num_steps to match consumed_train_samples."
+                        )
+                        opt_param_scheduler.num_steps = args.consumed_train_samples
+                    opt_param_scheduler.step(increment=0)
+                    print_rank_0(
+                        " > restored optimizer param_group max_lr/min_lr from runtime config "
+                        "because --override-opt-param-scheduler is set"
+                    )
         except KeyError as e:
             print_rank_0(
                 'Unable to load optimizer from checkpoint {}. '
