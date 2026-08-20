@@ -8,6 +8,7 @@ import argparse
 from typing import List
 
 from examples.mimo.training.topology import ModuleGridSpec
+from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
 
@@ -61,6 +62,7 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
+    gtp_weight_remat_size, _ = resolve_hetero_gtp_degrees(args)
     if args.llm_cp != 1:
         raise ValueError("hetero MIMO training currently supports CP=1 only")
 
@@ -76,7 +78,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"--num-experts ({num_experts}) must be divisible by --llm-ep ({args.llm_ep})"
         )
 
-    llm_size = args.llm_tp * args.llm_cp * args.llm_pp * args.llm_dp
+    llm_size = args.llm_tp * gtp_weight_remat_size * args.llm_cp * args.llm_pp * args.llm_dp
 
     if args.llm_only:
         if getattr(args, "encoder_ddp_overlap", False):
@@ -94,12 +96,14 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             )
         return 0, llm_size
 
-    # Fan-out divisibility: the bridge splits (mbs * llm_dp) LLM lanes across
+    # Fan-out divisibility: the bridge splits every LLM data lane across
     # encoder_dp encoder lanes; the split must be exact.
-    if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
+    llm_data_parallel_size = args.llm_dp * gtp_weight_remat_size
+    if (args.micro_batch_size * llm_data_parallel_size) % args.encoder_dp != 0:
         raise ValueError(
-            "--micro-batch-size * --llm-dp must be divisible by --encoder-dp "
-            f"(got {args.micro_batch_size} * {args.llm_dp} % {args.encoder_dp} != 0)"
+            "--micro-batch-size * --llm-dp * GTP must be divisible by --encoder-dp "
+            f"(got {args.micro_batch_size} * {args.llm_dp} * "
+            f"{gtp_weight_remat_size} % {args.encoder_dp} != 0)"
         )
 
     encoder_size = args.encoder_tp * args.encoder_dp
@@ -126,6 +130,7 @@ def build_module_grid_specs(
 ) -> List[ModuleGridSpec]:
     """Map grid args to the ModuleGridSpec list create_topology consumes."""
     encoder_size, llm_size = validate_hetero_grid_args(args, world_size)
+    gtp_weight_remat_size, expert_gtp_weight_remat_size = resolve_hetero_gtp_degrees(args)
 
     language_grid_spec = ModuleGridSpec(
         name=MIMO_LANGUAGE_MODULE_KEY,
@@ -134,8 +139,10 @@ def build_module_grid_specs(
         cp=args.llm_cp,
         pp=args.llm_pp,
         ep=args.llm_ep,
+        gtp_remat=gtp_weight_remat_size,
         rank_offset=args.llm_offset,
         expt_tp=args.llm_expt_tp or 1,
+        expt_gtp_remat=expert_gtp_weight_remat_size,
     )
 
     if args.llm_only:
@@ -152,6 +159,23 @@ def build_module_grid_specs(
         expt_tp=1,
     )
     return [encoder_grid_spec, language_grid_spec]
+
+
+def resolve_hetero_gtp_degrees(args: argparse.Namespace) -> tuple[int, int]:
+    """Return the language dense and expert GTP degrees."""
+    _, gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+        args.llm_tp,
+        getattr(args, "tensor_parallel_num_weight_shards", None),
+        getattr(args, "gtp_weight_remat_size", 1),
+    )
+    _, expert_gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
+        args.llm_expt_tp or 1,
+        getattr(args, "expert_tensor_parallel_num_weight_shards", None),
+        getattr(args, "expert_gtp_weight_remat_size", 1),
+        shards_field="expert_tensor_parallel_num_weight_shards",
+        tp_field="expert_tensor_parallel_size",
+    )
+    return gtp_weight_remat_size, expert_gtp_weight_remat_size
 
 
 def _num_experts(args: argparse.Namespace) -> int:

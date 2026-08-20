@@ -1,12 +1,70 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.datasets.data_schedule_utils import (
+    _get_global_seqlens_and_ids,
+    broadcast_scalars,
+    broadcast_tensor,
+)
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
+
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn't installed or the torch wrapper is missing
+    tex = None
+
+
+def _build_thd_padding_mask(
+    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
+) -> torch.Tensor:
+    """Build a 1D THD padding mask from scheduler sequence metadata."""
+    assert cu_seqlens.dim() == 1
+    assert cu_seqlens_padded.dim() == 1
+    assert cu_seqlens.numel() == cu_seqlens_padded.numel()
+
+    total_tokens = int(cu_seqlens_padded[-1].item())
+    if total_tokens == 0:
+        return torch.empty((0,), dtype=torch.bool, device=cu_seqlens.device)
+
+    num_sequences = cu_seqlens.numel() - 1
+    if num_sequences <= 0:
+        return torch.ones((total_tokens,), dtype=torch.bool, device=cu_seqlens.device)
+
+    positions = torch.arange(
+        total_tokens, dtype=cu_seqlens_padded.dtype, device=cu_seqlens_padded.device
+    )
+    seq_indices = torch.searchsorted(cu_seqlens_padded[1:].contiguous(), positions, right=True)
+
+    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).clamp(min=0)
+    valid_ends = cu_seqlens_padded[:-1] + valid_lengths
+    return positions >= valid_ends[seq_indices]
+
+
+def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tensor) -> None:
+    """Replace padded token-like slots with safe neutral values in-place."""
+    assert padding_mask.dim() == 1
+    pad_values = {'tokens': 0, 'labels': 0, 'loss_mask': 0.0, 'position_ids': 0}
+    for key, pad_value in pad_values.items():
+        tensor = batch.get(key)
+        if tensor is None:
+            continue
+        assert tensor.dim() == 1, f"{key} must be 1D before CP slicing, got {tensor.dim()}D"
+        assert tensor.numel() == padding_mask.numel(), (
+            f"{key} length ({tensor.numel()}) must match padding_mask length "
+            f"({padding_mask.numel()}) before CP slicing."
+        )
+        batch[key] = tensor.masked_fill(padding_mask, pad_value)
 
 
 class HybridCPDataLoaderWrapper:
@@ -57,56 +115,28 @@ class HybridCPDataLoaderWrapper:
         Gathers the sequence lengths of all subsamples from all DP ranks.
         Each DP rank loads the same number of microbatches but each microbatch
         may have a different number of subsamples.
-
         We find the number of subsamples each rank holds and then gather the
         sequence lengths of all subsamples from all ranks.
+
+        Delegates to ``data_schedule_utils._get_global_seqlens_and_ids``. The
+        shared helper returns ``offsets`` with one extra trailing entry (the
+        total subsample count); this method preserves the original contract of
+        returning per-rank start offsets only.
         """
-        # Collect the number of subsamples from all ranks
-        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
-        dp_subsample_count = [torch.zeros_like(local_len) for _ in range(self.dp_group.size())]
-        torch.distributed.all_gather(dp_subsample_count, local_len, group=self.dp_group)
-
-        # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
-        dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
-        max_sub_samples = int(dp_subsample_counts.max().item())
-
-        if local_len.item() < max_sub_samples:
-            subsample_seqlens_padded = torch.cat(
-                [
-                    subsample_seqlens,
-                    torch.zeros(max_sub_samples - local_len.item(), dtype=torch.int32).cuda(),
-                ],
-                dim=0,
-            )
-        else:
-            subsample_seqlens_padded = subsample_seqlens
-
-        # Gather the subsample_seqlens from all ranks
-        seqlens_gathered = [
-            torch.empty_like(subsample_seqlens_padded) for _ in range(self.dp_group.size())
-        ]
-        torch.distributed.all_gather(
-            seqlens_gathered, subsample_seqlens_padded, group=self.dp_group
+        _, _, offsets, seqlens_gathered = _get_global_seqlens_and_ids(
+            subsample_seqlens, self.dp_group
         )
-
-        # Trim each seqlens_gathered to the length of the correct sample
-        for dp_rank, seqlen in enumerate(seqlens_gathered):
-            seqlens_gathered[dp_rank] = seqlen[: dp_subsample_counts[dp_rank]]
-
-        seqlens_gathered = torch.cat(seqlens_gathered, dim=0)
-        seqlens_gathered = seqlens_gathered.cpu().tolist()
-
-        # Calculate the offsets to assign unique global ID to each subsample.
-        csum = torch.cumsum(dp_subsample_counts, dim=0, dtype=torch.int32)
-        offsets = torch.cat([torch.zeros(1, dtype=torch.int32), csum[:-1]], dim=0)
-
-        return seqlens_gathered, offsets
+        return seqlens_gathered, offsets[:-1]
 
     def get_global_id_seqlens(self, num_local_subsamples, offsets, seqlens_gathered):
         """
         Calculates the global ID for each subsample.
 
         We assign a unique global ID to each subsample.
+
+        Kept as a local implementation: the shared helper fuses this pure
+        indexing step with the collective gather, so delegating here would
+        re-run the all-gathers.
 
         Returns:
         global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
@@ -133,6 +163,16 @@ class HybridCPDataLoaderWrapper:
         )
         return hdp_rank
 
+    # NOTE: data_schedule_utils.reroute_samples_to_dcp_ranks is the sequence-
+    # packing generalization of this method. It is intentionally NOT used here
+    # because it is not behavior-preserving for the hybrid-CP path:
+    #   * its empty-send fallback allocates a 1-element (not 0-element) buffer,
+    #     which fails all_to_all_single split validation when a rank has
+    #     nothing to send (reachable here);
+    #   * it transports the "original_seq_len"/"padded_seq_len" metadata keys
+    #     with count-based splits, keys the hybrid-CP batch does not carry;
+    #   * its rank mapping applies "% dp_cp_group.size()" for PP support,
+    #     while hybrid CP asserts pipeline_model_parallel_size == 1.
     def reroute_samples_to_hdp_ranks(
         self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
     ):
@@ -242,6 +282,13 @@ class HybridCPDataLoaderWrapper:
         }
         return recv_sample_with_id
 
+    # NOTE: data_schedule_utils._unpack_batch is the sequence-packing variant
+    # of this method. It is intentionally NOT used here because it changes the
+    # sub-sample contract for the hybrid-CP path: it copies a fixed key list
+    # (dropping any extra dataset keys), squeezes 2-D tensors in place, and
+    # adds synthesized "original_seq_len"/"padded_seq_len" keys, which would
+    # alter the all-to-all key set in reroute_samples_to_hdp_ranks and the
+    # samples returned from __next__.
     def unpack_batch(self, batch):
         """
         Unpacks the packed samples into a list of sub-samples.
@@ -284,10 +331,8 @@ class HybridCPDataLoaderWrapper:
         subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
         subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
-        seqlens_gathered, offsets = self.get_global_seqlens(subsample_seqlens)
-
-        global_id_seqlens, global_ids_this_rank = self.get_global_id_seqlens(
-            subsample_seqlens.shape[0], offsets, seqlens_gathered
+        global_id_seqlens, global_ids_this_rank, offsets, _ = _get_global_seqlens_and_ids(
+            subsample_seqlens, self.dp_group
         )
 
         groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(
@@ -299,3 +344,189 @@ class HybridCPDataLoaderWrapper:
             batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
         )
         return samples_this_rank_with_id, sample_id_groups
+
+
+def get_batch_on_this_rank_for_sequence_packing(
+    data_iterator,
+    vpp_size: Optional[int] = None,
+    mtp_on_this_rank: bool = False,
+    vp_stage: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """
+    Get a batch of data for sequence packing.
+    Args:
+        data_iterator (Iterator): The data iterator to get the batch from.
+        mtp_on_this_rank (bool): Whether to use multi-token prediction.
+        vp_stage (Optional[int]): The stage of the pipeline.
+    Returns:
+        tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
+        packed_seq_params, padding_mask)
+    """
+
+    if pg_collection is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+    else:
+        tp_group = pg_collection.tp
+        pp_group = pg_collection.pp
+        cp_group = pg_collection.cp
+
+    tp_src_rank = torch.distributed.get_process_group_ranks(tp_group)[0]
+
+    is_tp_rank_0 = tp_group.rank() == 0
+    is_first_stage = pp_group.rank() == 0 and (vp_stage is None or vp_stage == 0)
+    is_last_stage = pp_group.rank() == pp_group.size() - 1 and (
+        vp_stage is None or vp_stage == vpp_size - 1
+    )
+
+    is_first_or_last_stage = is_first_stage or is_last_stage
+    dev = torch.cuda.current_device()
+
+    # data_iterator should return a batch including the following keys.
+    batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
+    if is_first_stage:
+        batch_keys.append('tokens')
+        batch_keys.append('position_ids')
+    if is_last_stage:
+        batch_keys.append('labels')
+        batch_keys.append('loss_mask')
+
+    # Get a batch from data_iterator or create an emtpy batch.
+    if is_tp_rank_0:
+        assert data_iterator is not None
+        batch = next(data_iterator)
+        for key in batch_keys:
+            assert key in batch, f"{key} is missing in current batch."
+    else:
+        assert data_iterator is None, "Non TP 0 rank should not have data_iterator"
+        batch = {}
+
+    # Build padding_mask before CP slicing while tensors still have the full
+    # packed length represented by cu_seqlens_padded[-1].
+    if is_tp_rank_0:
+        batch['padding_mask'] = _build_thd_padding_mask(
+            batch['cu_seqlens'], batch['cu_seqlens_padded']
+        )
+        _sanitize_thd_padding_values(batch, batch['padding_mask'])
+
+    # Partition padding_mask for context parallel on every PP stage. Partition
+    # token-like tensors only on stages that own them.
+    if is_tp_rank_0:
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
+        # If cp_size == 1, no need to do further processing.
+        if cp_size > 1:
+            # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
+            # cu_seqlens to get the correct result.
+            # TODO: Revert this workaround once TE fixes the issue.
+            cu_seqlens = batch["cu_seqlens_padded"]
+            total_tokens = int(cu_seqlens[-1].item())
+            assert (
+                tex is not None
+            ), "Transformer Engine is required to use Context Parallel with THD format data."
+            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            cp_slice_keys = ['padding_mask']
+            if is_first_or_last_stage:
+                cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
+            for key in cp_slice_keys:
+                batch[key] = batch[key].index_select(0, index)
+
+    # Broadcast the receive-buffer shapes inside the TP group:
+    # - cu_seqlen_size is needed to allocate cu_seqlens / cu_seqlens_padded on non TP 0 ranks.
+    # - total_tokens is needed because padding_mask is prepared on every PP stage, and
+    #   tokens/labels/loss_mask/position_ids use the same length on stages that own them.
+    shapes = (
+        [batch['cu_seqlens'].size(0), batch['padding_mask'].size(0)] if is_tp_rank_0 else [0, 0]
+    )
+    cu_seqlen_size, total_tokens = broadcast_scalars(shapes, tp_group, dev, dtype=torch.int32)
+
+    # Step1: Prepare "tokens", "position_ids" on all ranks.
+    if is_first_stage or mtp_on_this_rank:
+        if is_tp_rank_0:
+            assert batch['tokens'].dtype == torch.int64
+            assert batch['position_ids'].dtype == torch.int64
+            batch['tokens'] = batch['tokens'].view(1, total_tokens)
+            batch['position_ids'] = batch['position_ids'].view(1, total_tokens)
+        else:
+            batch['tokens'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
+            batch['position_ids'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
+    else:
+        # Non first stage rank doesn't need tokens and position_ids.
+        batch['tokens'] = None
+        batch['position_ids'] = None
+
+    # Step2: Prepare "labels", "loss_mask" on all ranks.
+    if is_last_stage:
+        if is_tp_rank_0:
+            assert batch['labels'].dtype == torch.int64
+            assert batch['loss_mask'].dtype == torch.float32
+            batch['labels'] = batch['labels'].view(1, total_tokens)
+            batch['loss_mask'] = batch['loss_mask'].view(1, total_tokens)
+        else:
+            batch['labels'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
+            batch['loss_mask'] = torch.empty([1, total_tokens], dtype=torch.float32, device=dev)
+    else:
+        # Non last stage rank doesn't need labels and loss_mask.
+        batch['labels'] = None
+        batch['loss_mask'] = None
+
+    # Step3: Prepare "padding_mask" on all TP ranks.
+    if is_tp_rank_0:
+        assert batch['padding_mask'].dtype == torch.bool
+        batch['padding_mask'] = batch['padding_mask'].view(1, total_tokens)
+    else:
+        batch['padding_mask'] = torch.empty([1, total_tokens], dtype=torch.bool, device=dev)
+
+    # Step4: Prepare "cu_seqlens", "cu_seqlens_padded", "max_seqlen" on all ranks.
+    if is_tp_rank_0:
+        assert batch['cu_seqlens'].dtype == torch.int32
+        assert batch['cu_seqlens_padded'].dtype == torch.int32
+        assert batch['cu_seqlens'].dim() == 1
+        assert batch['cu_seqlens_padded'].dim() == 1
+        if type(batch['max_seqlen']) == int:
+            batch['max_seqlen'] = torch.tensor(batch['max_seqlen'], dtype=torch.int32, device=dev)
+        else:
+            assert batch['max_seqlen'].dtype == torch.int32
+            assert batch['max_seqlen'].numel() == 1
+    else:
+        batch['cu_seqlens'] = torch.empty([cu_seqlen_size], dtype=torch.int32, device=dev)
+        batch['cu_seqlens_padded'] = torch.empty([cu_seqlen_size], dtype=torch.int32, device=dev)
+        batch['max_seqlen'] = torch.empty(1, dtype=torch.int32, device=dev)
+
+    # Broadcast batch inside TP group.
+    broadcast_tensor(batch['tokens'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['position_ids'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['labels'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['loss_mask'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['padding_mask'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
+
+    # Extract the data from batch after broadcasting.
+    tokens = batch['tokens']
+    position_ids = batch['position_ids']
+    labels = batch['labels']
+    loss_mask = batch['loss_mask']
+    padding_mask = batch['padding_mask']
+    cu_seqlens = batch['cu_seqlens']
+    cu_seqlens_padded = batch['cu_seqlens_padded']
+    max_seqlen = batch['max_seqlen'].item()
+
+    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
+    # get the correct result.
+    # TODO: Revert this workaround once TE fixes the issue.
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
+
+    # "attention_mask" is not valid for sequence packing, so set it to None.
+    return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask

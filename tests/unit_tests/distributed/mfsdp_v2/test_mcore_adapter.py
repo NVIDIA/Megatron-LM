@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -137,7 +138,8 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
-    def test_build_train_and_step(self):
+    @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
+    def test_build_train_and_step(self, optimizer_cuda_graph):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -156,16 +158,19 @@ class TestMcoreAdapterDense:
         # DistributedOptimizer path that expects DDP/FSDP buffer metadata.
         reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
 
+        ddp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        )
+        if optimizer_cuda_graph:
+            # Capturable TE FusedAdam requires the main-gradient and main-weight dtypes
+            # to match (https://github.com/NVIDIA/TransformerEngine/issues/3358).
+            ddp_config.megatron_fsdp_main_grads_dtype = ddp_config.megatron_fsdp_main_params_dtype
+
         model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
+            config=config, ddp_config=ddp_config, module=model, pg_collection=self.pg_collection
         )
 
         reference_optimizer_config = OptimizerConfig(
@@ -180,7 +185,13 @@ class TestMcoreAdapterDense:
         reference_optimizer = get_megatron_optimizer(
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
-        optimizer_config = replace(reference_optimizer_config)
+        optimizer_config = replace(
+            reference_optimizer_config,
+            optimizer_cuda_graph=optimizer_cuda_graph,
+            use_precision_aware_optimizer=True,
+            exp_avg_dtype=torch.bfloat16,
+            exp_avg_sq_dtype=torch.bfloat16,
+        )
         with pytest.raises(
             ValueError, match="MFSDP v2 currently requires use_distributed_optimizer=False"
         ):
@@ -192,6 +203,8 @@ class TestMcoreAdapterDense:
         optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
+        if optimizer_cuda_graph:
+            optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
 
         steps = [
             [
@@ -215,24 +228,87 @@ class TestMcoreAdapterDense:
             reference_losses.append(torch.stack(microbatch_losses).mean())
 
         losses = []
-        for microbatches in steps:
-            model.zero_grad_buffer()
-            optimizer.zero_grad(set_to_none=True)
-            microbatch_losses = []
-            for batch in microbatches:
-                output = model(hidden_states=batch, attention_mask=None)
-                loss = output.float().square().mean()
-                (loss / len(microbatches)).backward()
-                microbatch_losses.append(loss.detach())
-            success, _, _ = optimizer.step()
-            assert success
-            losses.append(torch.stack(microbatch_losses).mean())
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            for microbatches in steps:
+                model.zero_grad_buffer()
+                optimizer.zero_grad(set_to_none=True)
+                microbatch_losses = []
+                for batch in microbatches:
+                    output = model(hidden_states=batch, attention_mask=None)
+                    loss = output.float().square().mean()
+                    (loss / len(microbatches)).backward()
+                    microbatch_losses.append(loss.detach())
+                success, _, _ = optimizer.step()
+                assert success
+                losses.append(torch.stack(microbatch_losses).mean())
+
+        if optimizer_cuda_graph:
+            # The first step is eager; capture replays once and every subsequent step replays.
+            graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
+            assert graph_launches == len(steps) - 1
+
+        for state in optimizer.optimizer.state.values():
+            assert state["exp_avg"].dtype == torch.bfloat16
+            assert state["exp_avg_sq"].dtype == torch.bfloat16
 
         losses = torch.stack(losses)
         reference_losses = torch.stack(reference_losses)
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+
+    def test_fused_sgd_casts_mismatched_grads(self):
+        """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=_build_block(config),
+            pg_collection=self.pg_collection,
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer="sgd",
+            lr=1.0e-3,
+            weight_decay=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        )
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=self.pg_collection,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        output = model(
+            hidden_states=torch.randn(
+                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
+            ),
+            attention_mask=None,
+        )
+        output.float().square().mean().backward()
+
+        success, _, _ = optimizer.step()
+        assert success
 
 
 class TestMcoreAdapterExpertParallel:
