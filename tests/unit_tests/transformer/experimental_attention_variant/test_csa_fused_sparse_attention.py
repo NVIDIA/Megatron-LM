@@ -1858,7 +1858,7 @@ class TestFusedIndexerSparseAttn:
             ratio=4,
             softmax_scale=0.5,
             indexer_softmax_scale=0.125,
-            loss_coeff=0.0,
+            loss_coeff=1.0,
             sparse_loss=True,
             kv_offset=s['skv'] - s['n_comp'],
         )
@@ -4340,13 +4340,14 @@ class TestRealKernelFusedIndexerSparseAttnThd:
 
 
 # ---------------------------------------------------------------------------
-# THD padding-row masking: cu_seqlens_q_unpadded excludes padding from loss
+# THD padding-row masking for sparse-attention backward and indexer loss
 # ---------------------------------------------------------------------------
 
 
 class TestThdPaddingRowMasking:
-    """Verify that **per-segment** padding rows do NOT contribute to the
-    indexer KL loss when ``cu_seqlens_q_unpadded`` is supplied.
+    """Verify that **per-segment** padding rows are safe for sparse-attention
+    backward and do not contribute to indexer loss or gradients when
+    ``cu_seqlens_q_unpadded`` is supplied.
     """
 
     SHAPES = dict(
@@ -4581,6 +4582,35 @@ class TestThdPaddingRowMasking:
             # instead divide by the padded row count and dilute the loss.
             calculate_per_token_loss=True,
         )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_protects_attention_backward_when_loss_disabled(
+        self, reset_lazy_kernel_state
+    ):
+        """Padding repair must not depend on the indexer loss coefficient."""
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        dev = 'cuda'
+
+        # The second sequence has zero real tokens but four physical padding
+        # rows. Invalidating its window indices leaves early rows with
+        # topk_length == 0 before the backward-only placeholder is installed.
+        real = self._build_multi_seg_inputs([4, 0], self.SHAPES, dev)
+        padded, cu_q_unpadded = self._build_per_seg_padded(
+            real, [4, 4], self.SHAPES, dev, fill_pad_random=True
+        )
+        padded['win_idxs'][4:] = -1
+        padded['query'] = padded['query'].detach().requires_grad_(True)
+
+        output, _ = self._run_fused(
+            padded,
+            self.SHAPES,
+            sparse_loss=True,
+            loss_coeff=0.0,
+            cu_seqlens_q_unpadded=cu_q_unpadded,
+        )
+        output.sum().backward()
+
+        assert torch.all(padded['query'].grad[4:] == 0)
 
     @pytest.mark.parametrize('sparse_loss', [False, True], ids=['dense_loss', 'sparse_loss'])
     def test_per_seg_padding_excluded_from_loss(self, sparse_loss, reset_lazy_kernel_state):

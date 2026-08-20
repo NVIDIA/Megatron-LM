@@ -2402,16 +2402,17 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         # avoid keeping a second TopK-sized tensor for backward.
         global_idxs.clamp_min_(0)
 
-        # ---- 4b. Derive padding-row mask for loss exclusion. -----------------
+        # ---- 4b. Derive padding-row mask for backward safety and loss. -------
         # When CUDA-graph padding makes cu_seqlens_q cover all total_q rows
         # (including padding), cu_seqlens_q_unpadded supplies the true
-        # boundaries.  Padding rows must not contribute to the indexer KL
-        # loss or backward gradients — only the sparse-attention output
-        # needs them for static-shape compatibility.
+        # boundaries. Padding rows must not contribute to the indexer KL loss
+        # or backward gradients. Sparse-attention backward also needs a
+        # non-empty placeholder row because cuDNN DSA does not accept zero
+        # ``topk_length`` even though FlashMLA forward accepts sink-only rows.
         # The caller only passes cu_seqlens_q_unpadded when it differs from
         # cu_seqlens_q (checked via data_ptr), so no GPU→CPU sync is needed.
-        padding_row_mask: Optional[Tensor] = None  # True = padding (excluded from loss)
-        if loss_coeff > 0 and is_thd and cu_seqlens_q_unpadded is not None:
+        padding_row_mask: Optional[Tensor] = None  # True = padding
+        if is_thd and cu_seqlens_q_unpadded is not None:
             real_seg_lens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
             row_idx = torch.arange(total_q, device=query.device, dtype=torch.int32)
             row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
@@ -3307,8 +3308,9 @@ def fused_csa_indexer_sparse_attn(
             the *unpadded* cumulative Q sequence lengths.  When CUDA-graph
             padding makes ``cu_seqlens_q`` cover all ``total_q`` rows
             (including padding), this tensor supplies the true boundaries
-            so padding rows are excluded from the indexer KL loss and
-            backward gradients.  Ignored when ``None`` or when it equals
+            so padding rows are excluded from the indexer KL loss and backward
+            gradients, and receive the non-empty placeholder required by
+            sparse-attention backward. Ignored when ``None`` or when it equals
             ``cu_seqlens_q``.
         compact_workspace: optional caller-owned BSHD or THD compact buffers.
             A matching workspace is required during compact CUDA-graph capture;
