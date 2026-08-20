@@ -7,9 +7,13 @@ import time
 import traceback
 import uuid
 import warnings
+from functools import partial
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
@@ -355,6 +359,25 @@ def _replace_prefix_tokens(
     return previous_turn_token_ids + current_turn_additional_token_ids
 
 
+def _apply_chat_template_sync(
+    tokenizer, messages, tools, chat_template_kwargs, add_generation_prompt=True
+):
+    """Apply the chat template and coerce to `list[int]`, for use in a worker thread.
+
+    The coercion runs here too: it walks every token, so leaving it on the event loop
+    would keep part of the stall this offload exists to remove.
+    """
+    return _coerce_to_token_id_list(
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            **chat_template_kwargs,
+        )
+    )
+
+
 def _coerce_to_token_id_list(result):
     """Convert the return value of `tokenizer.apply_chat_template` to `list[int]`.
 
@@ -476,14 +499,15 @@ try:
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
-                prompt_tokens = _coerce_to_token_id_list(
-                    tokenizer.apply_chat_template(
+                prompt_tokens = await asyncio.get_running_loop().run_in_executor(
+                    current_app.config['tokenize_executor'],
+                    partial(
+                        _apply_chat_template_sync,
+                        current_app.config['tokenize_tokenizer'],
                         template_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=template_tools,
-                        **chat_template_kwargs,
-                    )
+                        template_tools,
+                        chat_template_kwargs,
+                    ),
                 )
 
                 if req.get("prevent_retokenization", True):
@@ -524,13 +548,17 @@ try:
                         ]
 
                         # Get the templated tokenization of just the previous generation
-                        retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                            tokenizer.apply_chat_template(
-                                messages_to_last_assistant_message,
-                                tokenize=True,
-                                add_generation_prompt=False,
-                                tools=template_tools,
-                                **chat_template_kwargs,
+                        retokenized_previous_turn_token_ids = (
+                            await asyncio.get_running_loop().run_in_executor(
+                                current_app.config['tokenize_executor'],
+                                partial(
+                                    _apply_chat_template_sync,
+                                    current_app.config['tokenize_tokenizer'],
+                                    messages_to_last_assistant_message,
+                                    template_tools,
+                                    chat_template_kwargs,
+                                    add_generation_prompt=False,
+                                ),
                             )
                         )
 
@@ -623,6 +651,9 @@ try:
                 termination_id=-1 if ignore_eos else None,
                 return_prompt_tokens=return_prompt_tokens,
                 streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
+                # This frontend detokenizes its own output below. Keeping it off the
+                # coordinator matters because that is one process shared by all DP ranks.
+                detokenize_generations=False,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
@@ -759,7 +790,11 @@ try:
             if response_uid is None:
                 response_uid = result["uid"]
 
-            text_output = result["generated_text"]
+            text_output = TextGenerationController.detokenize(
+                tokenizer,
+                result["generated_tokens"],
+                remove_EOD=not sampling_params.detokenize_stop_sequence,
+            )
             # The engine always reports prompt_length (for usage), but drops the
             # prompt_tokens tensor unless return_prompt_tokens was set.
             prompt_tokens_count = result.get("prompt_length")
