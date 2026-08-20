@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
+
 import logging
 import os
 import random
@@ -190,6 +191,7 @@ def _compile_dependencies():
 
     torch.distributed.barrier()
 
+
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
     communication overlap"""
@@ -268,8 +270,9 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+def _initialize_distributed(
+    get_embedding_ranks, get_position_embedding_ranks, store, skip_model_parallel_init=False
+):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -388,6 +391,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 hybrid_context_parallel=args.hybrid_context_parallel,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                # MFSDP v2's hybrid mesh is dense-only: expert parameters retain
+                # their full expert-DP group, including configurations with EDP=1.
+                expert_num_distributed_optimizer_instances=(
+                    1
+                    if args.use_megatron_fsdp and args.megatron_fsdp_version == 2
+                    else args.num_distributed_optimizer_instances
+                ),
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
@@ -443,11 +453,17 @@ def _set_random_seed(
     """
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+        pp_rank = (
+            get_pg_rank(pp_group)
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_rank()
+        )
         seed = seed_ + (100 * pp_rank)
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            dp_rank = (
+                get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            )
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)

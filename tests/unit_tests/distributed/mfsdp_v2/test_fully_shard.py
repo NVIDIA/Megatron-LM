@@ -23,7 +23,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpModule,
+    _fine_grained_pre_backward_hook,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_kernels
 
@@ -42,6 +45,51 @@ class TinyModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the tiny model."""
         return self.fc2(self.relu(self.fc1(x)))
+
+
+class _FusedWgradLinearFunction(torch.autograd.Function):
+    """Small stand-in for TE's direct-to-main-grad autograd contract."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: nn.Parameter, bias: nn.Parameter) -> torch.Tensor:
+        """Capture the getter during forward, as standard TE modules do."""
+        ctx.save_for_backward(x)
+        ctx.weight = weight
+        ctx.get_main_grad = weight.get_main_grad
+        return torch.nn.functional.linear(x, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Write wgrad into the MFSDP staging view and return a dummy hook grad."""
+        (x,) = ctx.saved_tensors
+        weight = ctx.weight
+        main_grad = ctx.get_main_grad()
+        torch.mm(grad_output.t(), x, out=main_grad)
+        weight.grad_added_to_main_grad = True
+        dummy_wgrad = torch.zeros_like(weight)
+        grad_bias = grad_output.sum(dim=0)
+        return None, dummy_wgrad, grad_bias
+
+
+class FusedWgradLinear(nn.Linear):
+    """Linear module that follows TE's fused-wgrad parameter protocol."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the test fused-wgrad autograd function."""
+        assert self.bias is not None
+        return _FusedWgradLinearFunction.apply(x, self.weight, self.bias)
+
+
+class MixedWgradLinear(FusedWgradLinear):
+    """Exercise one weight through both fused and ordinary autograd paths."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__(in_features, out_features)
+        self.weight.zero_out_wgrad = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Model the tied embedding/output-weight accumulation contract."""
+        return super().forward(x) + torch.nn.functional.linear(x, self.weight)
 
 
 class CheckpointedTinyModel(TinyModel):
@@ -255,6 +303,212 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
+@pytest.mark.parametrize("mixed_wgrad", [False, True], ids=["fused_only", "fused_and_ordinary"])
+def test_fused_wgrad_mixed_group_matches_baseline(distributed_setup, mixed_wgrad):
+    """A fused weight and ordinary bias in one group should train correctly."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = nn.Linear(8, 4).to(device)
+    model_cls = MixedWgradLinear if mixed_wgrad else FusedWgradLinear
+    model = model_cls(8, 4).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fuse_wgrad_accumulation=True)
+
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    inputs = [torch.randn(3, 8, device=device) for _ in range(3)]
+    targets = [torch.randn(3, 4, device=device) for _ in range(3)]
+    baseline_losses = []
+    losses = []
+
+    for x, target in zip(inputs, targets):
+        baseline_optimizer.zero_grad()
+        baseline_output = baseline(x)
+        if mixed_wgrad:
+            baseline_output = baseline_output + torch.nn.functional.linear(x, baseline.weight)
+        baseline_loss = torch.nn.functional.mse_loss(baseline_output, target)
+        baseline_loss.backward()
+        baseline_optimizer.step()
+        baseline_losses.append(baseline_loss.detach())
+
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(x), target)
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.detach())
+
+        parameter_group = model.parameter_groups[0]
+        assert parameter_group._fused_wgrad_buffer is None
+        for fsdp_parameter in parameter_group.fsdp_parameters:
+            assert fsdp_parameter.unsharded.main_grad is None
+            assert not fsdp_parameter.unsharded.grad_added_to_main_grad
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
+def test_fine_grained_fused_wgrad_matches_baseline(distributed_setup):
+    """A submodule-driven 1F1B backward must prepare fused-wgrad storage."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = nn.Linear(8, 4).to(device)
+    fused_linear = FusedWgradLinear(8, 4).to(device)
+    fused_linear.load_state_dict(baseline.state_dict())
+    model = nn.Sequential(fused_linear)
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            fine_grained=True,
+            skip_backward_callback=True,
+            fuse_wgrad_accumulation=True,
+        )
+
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    inputs = [torch.randn(3, 8, device=device) for _ in range(3)]
+    targets = [torch.randn(3, 4, device=device) for _ in range(3)]
+    baseline_losses = []
+    losses = []
+
+    for x, target in zip(inputs, targets):
+        baseline_optimizer.zero_grad()
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
+        baseline_loss.backward()
+        baseline_optimizer.step()
+        baseline_losses.append(baseline_loss.detach())
+
+        optimizer.zero_grad()
+        # The combined 1F1B schedule calls fine-grained nodes directly instead
+        # of invoking the containing FsdpModule's forward method.
+        loss = torch.nn.functional.mse_loss(model[0](x), target)
+        loss.backward()
+        model.post_backward()
+        # The production manual schedule waits for gradient synchronization
+        # before the optimizer consumes the sharded gradients. This test uses
+        # raw torch.optim directly, so reproduce that final stream dependency.
+        model.context.current_stream().wait_stream(model.context.reduce_scatter_stream)
+        optimizer.step()
+        losses.append(loss.detach())
+
+        assert model.phase is FsdpModule.Phase.RESTING
+        assert model.parameter_groups[0]._fused_wgrad_buffer is None
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
+def test_fine_grained_pre_backward_rejects_forward_phase(distributed_setup):
+    """A backward hook must not silently unshard a target still in forward."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(nn.Linear(8, 4)).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    model.phase = FsdpModule.Phase.FORWARD
+    with pytest.raises(RuntimeError, match="expected its FSDP target to be RESTING or BACKWARD"):
+        _fine_grained_pre_backward_hook(model[0], ())
+
+
+def test_fused_wgrad_zero_token_expert_overwrites_staging_buffer(distributed_setup):
+    """A zero-token TE grouped GEMM must overwrite its poisoned wgrad view with zero."""
+    import transformer_engine.pytorch as te
+
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    layer = te.GroupedLinear(
+        num_gemms=2,
+        in_features=8,
+        out_features=8,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device=device,
+        fuse_wgrad_accumulation=True,
+    )
+    with fully_shard_context(device=device):
+        fully_shard(layer, mesh=mesh, placements=_flat_placements(), fuse_wgrad_accumulation=True)
+
+    def poison_staging_buffer(module, _grad_output):
+        for parameter_group in module.parameter_groups:
+            assert parameter_group._fused_wgrad_buffer is not None
+            parameter_group._fused_wgrad_buffer.local_buffer.fill_(torch.nan)
+
+    # FSDP's hook was registered by fully_shard() first, so the staging buffer
+    # exists before this hook poisons it and TE's backward overwrites its views.
+    layer.register_full_backward_pre_hook(poison_staging_buffer)
+
+    inputs = torch.randn(4, 8, dtype=torch.bfloat16, device=device, requires_grad=True)
+    layer(inputs, [0, 4]).sum().backward()
+
+    active_grad = layer.weight1.grad.to_local()
+    zero_token_grad = layer.weight0.grad.to_local()
+    assert torch.isfinite(active_grad).all()
+    assert torch.count_nonzero(zero_token_grad) == 0
+
+
+def test_trace_pool_losses_match_baseline_after_planning(distributed_setup):
+    """Trace-planned storage must preserve saved weight views and optimizer parity."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = TinyModel().to(device)
+    model = TinyModel().to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device, enable_trace_pool=True) as context:
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+
+    x = torch.randn(2, 8, device=device)
+    target = torch.randn(2, 4, device=device)
+    baseline_losses = []
+    pooled_losses = []
+    for _ in range(4):
+        baseline_optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
+        pooled_loss = torch.nn.functional.mse_loss(model(x), target)
+        baseline_loss.backward()
+        pooled_loss.backward()
+        baseline_optimizer.step()
+        optimizer.step()
+        context.complete_trace()
+        baseline_losses.append(baseline_loss.detach())
+        pooled_losses.append(pooled_loss.detach())
+
+        assert context.trace_pool_allocator is not None
+        assert not context.trace_pool_allocator.active_keys
+
+    assert context.trace_pool_allocator is not None
+    assert context.trace_pool_allocator.phase == "optimized"
+    torch.testing.assert_close(torch.stack(pooled_losses), torch.stack(baseline_losses))
+
+
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
     """Activation recomputation should leave every FSDP module resharded.
@@ -453,6 +707,83 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
         torch.stack(baseline_losses),
         msg="HFSDP losses did not match baseline losses.",
     )
+
+
+def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
+    """Sharded-parameter .grad DTensor shells should be stable across microbatches.
+
+    After the first backward of a step, subsequent microbatches rebind the cached
+    DTensor's local storage instead of building fresh DTensors. Assert the
+    DTensor *object identity* of each sharded parameter's .grad stays the same
+    across microbatches (the CPU-side ``_FromTorchTensor`` cost is eliminated),
+    and that numerical parity with a baseline optimizer is preserved.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    dim = 8
+    model = MultiChildModel(dim=dim, num_children=2).to(device)
+    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
+    model.load_state_dict(baseline.state_dict())
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    micro_batch_size = 2
+    num_microbatches = 3
+    # Identical inputs on every rank (same seed as the model), so all ranks see
+    # the same data and the averaged FSDP gradient matches single-rank SGD.
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    sharded_params = [p for p in model.parameters() if getattr(p, "__fsdp_param__", False)]
+    assert sharded_params, "expected sharded parameters in the model"
+
+    def train(model, optimizer):
+        losses = []
+        grad_identities: list[list[int]] = []
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            step_identities = []
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                is_last = microbatch_index == num_microbatches - 1
+                with microbatch(context, is_last=is_last):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    (loss / num_microbatches).backward()
+                losses.append(loss.detach())
+                step_identities.append(
+                    [id(parameter.grad) for parameter in sharded_params if parameter.grad is not None]
+                )
+            grad_identities.append(step_identities)
+            optimizer.step()
+        return losses, grad_identities
+
+    baseline_losses, _ = train(baseline, baseline_optimizer)
+    sharded_losses, grad_identities = train(model, optimizer)
+
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg="Sharded losses did not match baseline losses with DTensor grad reuse.",
+    )
+
+    # Within each step, the grad DTensor object identity must be stable across
+    # microbatches after the first (the cache rebinds storage in place).
+    for step, step_identities in enumerate(grad_identities):
+        first = step_identities[0]
+        for microbatch_identities in step_identities[1:]:
+            assert microbatch_identities == first, (
+                f"step {step}: sharded grad DTensor identity changed across microbatches "
+                f"(first={first}, later={microbatch_identities})."
+            )
 
 
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):

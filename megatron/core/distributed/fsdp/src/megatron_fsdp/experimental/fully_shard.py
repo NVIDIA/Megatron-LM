@@ -34,34 +34,61 @@ _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 def fully_shard_context(
     device: torch.device | None = None,
     *,
+    reuse_existing: bool = False,
+    use_trace_replay: bool = False,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    enable_trace_pool: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
     Construction must finish before any of the registered modules run forward.
 
+    When ``reuse_existing`` is set, a same-device ambient context is yielded
+    instead of creating a nested one. This lets per-chunk adapters join an
+    outer VPP construction scope; only the outermost scope finalizes it.
+
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
+        reuse_existing: Join a compatible already-active context instead of
+            creating a new one. Defaults to False, preserving nesting rejection.
+        use_trace_replay: Trace the first batch's actual execution order and replay
+            it for prefetch. Defaults to static forward/backward-order lookahead.
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        enable_trace_pool: Trace temporary-buffer lifetimes for one global batch,
+            then reuse fixed physical slots. Incompatible with symmetric memory.
     """
-    if _FSDP_CONTEXT.get() is not None:
+    requested_device = torch.device(device) if device is not None else torch.device("cuda")
+    if requested_device.type == "cuda" and requested_device.index is None:
+        requested_device = torch.device("cuda", torch.cuda.current_device())
+    existing = _FSDP_CONTEXT.get()
+    if existing is not None:
+        if (
+            reuse_existing
+            and existing.device == requested_device
+            and existing.runner.use_trace_replay == use_trace_replay
+            and existing.use_symmetric_memory == use_symmetric_memory
+            and (existing.trace_pool_allocator is not None) == enable_trace_pool
+        ):
+            yield existing
+            return
         raise RuntimeError("fully_shard_context does not support nesting.")
 
-    device = device or torch.device("cuda", torch.cuda.current_device())
-    if device.type != "cuda":
-        raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
+    if requested_device.type != "cuda":
+        raise ValueError(f"fully_shard_context requires a CUDA device, got {requested_device}.")
 
     context = FsdpContext(
-        device=device,
+        device=requested_device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        use_trace_replay=use_trace_replay,
+        enable_trace_pool=enable_trace_pool,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
@@ -79,7 +106,10 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
+    fine_grained: bool = False,
+    skip_backward_callback: bool = False,
     grad_divisor: int = 1,
+    fuse_wgrad_accumulation: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -92,6 +122,13 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
+        fine_grained: Register pre-forward and pre-backward hooks on every sub-module
+            so the 1F1B EP overlap schedule can call sub-modules directly.
+        skip_backward_callback: Skip per-param post_accumulate_grad_hook. Required
+            when ``delay_wgrad_compute=True`` so gradient reduction waits for
+            ``backward_dw()`` to complete.
+        fuse_wgrad_accumulation: Let TE write weight gradients directly into a
+            full staging buffer that MFSDP subsequently reduce-scatters.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -103,6 +140,10 @@ def fully_shard(
             the expert-data-parallel mesh alone therefore divides by too little, and
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
+
+        Parameters that are TE MXFP8 primary weights (detected via
+        ``is_float8tensor`` + ``fp8_need_transpose_data``) are grouped into
+        ``Fp8ParameterGroup`` automatically; no flag is needed.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -128,8 +169,11 @@ def fully_shard(
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
+            fine_grained=fine_grained,
+            skip_backward_callback=skip_backward_callback,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
     except Exception:
         module.__class__ = original_cls

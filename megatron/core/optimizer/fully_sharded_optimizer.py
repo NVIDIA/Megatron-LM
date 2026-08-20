@@ -57,14 +57,18 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             if self.ddp_config != model_chunk.ddp_config:
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
+        contexts = {model_chunk.context for model_chunk in self.model_chunks}
+        if len(contexts) != 1:
+            raise ValueError("All MFSDP v2 model chunks must share one FsdpContext.")
+        self.context = contexts.pop()
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
 
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
-        if len(model_chunks) != 1:
-            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
+        if not model_chunks:
+            raise ValueError("MFSDP v2 requires at least one model chunk.")
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
         if config.loss_scale is not None:
@@ -116,6 +120,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             model_chunk.zero_grad(set_to_none=set_to_none)
 
+    @torch.no_grad()
+    def step(self):
+        """Step the optimizer, then mark the FSDP execution-trace boundary."""
+        result = super().step()
+        self.context.complete_trace()
+        return result
+
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""
         if self.config.use_precision_aware_optimizer:
@@ -147,7 +158,16 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     def _copy_main_params_to_model_params(self) -> None:
         """Refresh MFSDP V2 compute weights after updating optimizer weights."""
-        sync_model_weights_from_main_weights(self.get_parameters())
+        # Walk the model hierarchy instead of the base optimizer's parameter
+        # list. Empty local DTensor shards are intentionally omitted from TE
+        # FusedAdam, so optimizer parameters can expose FSDP groups in a
+        # rank-dependent order. Weight refresh launches collectives and must
+        # visit every FSDP group in the same order on every rank. Deliberately
+        # do not filter on requires_grad: traversal must remain rank-invariant
+        # even when a parameter is locally empty or frozen.
+        sync_model_weights_from_main_weights(
+            parameter for model_chunk in self.model_chunks for parameter in model_chunk.parameters()
+        )
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""
