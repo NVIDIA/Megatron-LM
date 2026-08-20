@@ -269,7 +269,18 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+                parameter = fsdp_parameter.unsharded
+                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+                # gradients are materialized by ``backward_dw()``, not autograd.
+                if not getattr(parameter, "skip_backward_post_hook", False):
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    continue
+
+                module_fqn, _, _ = fsdp_parameter.fqns[0].rpartition(".")
+                parameter_module = module.get_submodule(module_fqn) if module_fqn else module
+                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+                    lambda parameter=parameter: grad_hook(parameter)
+                )
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
