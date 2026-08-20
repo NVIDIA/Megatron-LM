@@ -312,6 +312,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         )
 
     def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
+        """Encodes whole jsonl file."""
         if self.use_gigatoken:
             return self.tokenizer.tokenizer.encode_files(
                 gt.JsonlFileSource(paths, field="text"), parallel=True
