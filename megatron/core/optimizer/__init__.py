@@ -56,6 +56,7 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
+from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
@@ -66,6 +67,7 @@ from .emerging_optimizers import (
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
 )
+from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
@@ -571,7 +573,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                 # Otherwise, master weight will be managed by TransformerEngine.
                 # Delayed scaling is an exception because casting as well as the computation
                 # of the scaling factor can be conducted in the adam kernel.
-                if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not isinstance(
+                    model_chunks[0], FullyShardedDataParallelV2
+                ):
                     kwargs.update(
                         {
                             "master_weights": True,
@@ -631,56 +635,54 @@ def _get_megatron_optimizer_based_on_param_groups(
     if skip_megatron_wrapping:
         return optimizer, init_state_fn
 
-    # Mixed precision optimizer.
-    # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
-    #   from the MixedPrecisionOptimizer, which manages any optimizer where
-    #   the model params and main params are distinct.
+    # Grad scaler:
+    #    if loss-scale is provided, instantiate the constant scaler.
+    #    if we are using fp16 and loss-scale is not present, use a
+    #       dynamic scaler.
+    #    otherwise we are running in bf16 with no loss-scale so
+    #       leave it as None.
+    grad_scaler = None
     if config.fp16 or config.bf16 or config.use_distributed_optimizer:
-
-        # Grad scaler:
-        #    if loss-scale is provided, instantiate the constant scaler.
-        #    if we are using fp16 and loss-scale is not present, use a
-        #       dynamic scaler.
-        #    otherwise we are running in bf16 with no loss-scale so
-        #       leave it as None.
-        grad_scaler = None
-
-        # Constant loss scale.
         if config.loss_scale:
             grad_scaler = ConstantGradScaler(config.loss_scale)
-
-        # Dynamic loss scale.
-        else:
-            if config.fp16:
-                grad_scaler = DynamicGradScaler(
-                    initial_scale=config.initial_loss_scale,
-                    min_scale=config.min_loss_scale,
-                    growth_factor=2.0,
-                    backoff_factor=0.5,
-                    growth_interval=config.loss_scale_window,
-                    hysteresis=config.hysteresis,
-                )
-
-        optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
-        if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
-                *optimizer_args,
-                model_chunks=model_chunks,
-                per_model_buffers=per_model_buffers,
-                data_parallel_group=data_parallel_group,
-                data_parallel_group_gloo=data_parallel_group_gloo,
-                data_parallel_group_idx=data_parallel_group_idx,
-                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+        elif config.fp16:
+            grad_scaler = DynamicGradScaler(
+                initial_scale=config.initial_loss_scale,
+                min_scale=config.min_loss_scale,
+                growth_factor=2.0,
+                backoff_factor=0.5,
+                growth_interval=config.loss_scale_window,
+                hysteresis=config.hysteresis,
             )
-            # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
-            # weight gradients are all-reduced across optimizer instances, so each instance has
-            # the duplicated weight gradients, need to reduce gradient stats inside each instance.
-            setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
-        else:
-            optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
-            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+
+    if config.use_distributed_optimizer:
+        optimizer = DistributedOptimizer(
+            optimizer,
+            config,
+            grad_scaler,
+            init_state_fn,
+            model_chunks=model_chunks,
+            per_model_buffers=per_model_buffers,
+            data_parallel_group=data_parallel_group,
+            data_parallel_group_gloo=data_parallel_group_gloo,
+            data_parallel_group_idx=data_parallel_group_idx,
+            distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+        )
+        # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
+        # weight gradients are all-reduced across optimizer instances, so each instance has
+        # the duplicated weight gradients, need to reduce gradient stats inside each instance.
+        setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
+    elif isinstance(model_chunks[0], FullyShardedDataParallelV2):
+        optimizer = FullyShardedOptimizer(
+            optimizer, config, grad_scaler, init_state_fn, model_chunks=model_chunks
+        )
+        setattr(optimizer, 'grad_stats_parallel_group', data_parallel_group)
+    elif config.fp16 or config.bf16:
+        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, grad_scaler, init_state_fn)
+        setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
+        assert grad_scaler is None
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
@@ -752,6 +754,9 @@ def _get_megatron_emerging_optimizer(
         )
         eopt_name = bare_name
         use_layer_wise = True
+
+    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
+        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -1033,6 +1038,7 @@ def get_megatron_optimizer(
 
     check_config_overrides_consistency(config, config_overrides)
 
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
@@ -1044,6 +1050,14 @@ def get_megatron_optimizer(
         )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
+
+    if is_mfsdp_v2:
+        if config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
+    elif config.use_precision_aware_optimizer and not config.use_distributed_optimizer:
+        raise ValueError(
+            "--use-precision-aware-optimizer only supported with distributed optimizer"
+        )
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -1091,14 +1105,32 @@ def get_megatron_optimizer(
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
-            param_groups, buffers = _get_param_groups_and_buffers(
-                model_chunk,
-                model_chunk_offset=model_chunk_offset,
-                config=config,
-                config_overrides=config_overrides,
-                filter_fn=lambda g: True,
-                buffer_name='buffers',
-            )
+            if is_mfsdp_v2:
+                param_groups = _get_param_groups(model_chunk, config, config_overrides)
+                # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
+                # https://github.com/NVIDIA/TransformerEngine/issues/3207.
+                # Empty local shards have no optimizer state or data to update, so omit them.
+                for param_group in param_groups:
+                    param_group['params'] = [
+                        parameter
+                        for parameter in param_group['params']
+                        if parameter.to_local().numel() > 0
+                    ]
+                param_groups = [
+                    param_group for param_group in param_groups if param_group['params']
+                ]
+                # MFSDP v2 owns its sharded parameter and gradient storage, so
+                # FullyShardedOptimizer does not need DDP param-and-grad buffers.
+                buffers = None
+            else:
+                param_groups, buffers = _get_param_groups_and_buffers(
+                    model_chunk,
+                    model_chunk_offset=model_chunk_offset,
+                    config=config,
+                    config_overrides=config_overrides,
+                    filter_fn=lambda g: True,
+                    buffer_name='buffers',
+                )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
                 config=config,
@@ -1116,6 +1148,7 @@ def get_megatron_optimizer(
             if (
                 not USING_PYTORCH_OPTIMIZER
                 and config.use_precision_aware_optimizer
+                and not is_mfsdp_v2
                 and getattr(optimizer_part.optimizer, "master_weights", None) is not None
             ):
                 # NOTE(@cspades): FusedAdam is provided Megatron-FSDP's main weights as
@@ -1220,5 +1253,12 @@ def get_megatron_optimizer(
         torch.distributed.checkpoint.save(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
+
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            getter_fn = getattr(param, 'get_high_precision_init_val', None)
+            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
+            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
+                clearer_fn()
 
     return ChainedOptimizer(optimizers)

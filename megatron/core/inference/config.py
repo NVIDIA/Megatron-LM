@@ -38,10 +38,15 @@ class MambaInferenceStateConfig:
     """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
 
     ssm_states_dtype: torch.dtype
-    """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
+    """The dtype to use for Mamba SSM state. Batch-invariant mode requires FP32."""
 
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
+
+    gdp_num_householder: int = 0
+    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
+    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    kernels, whose Householder-expanded token stream is this many times longer."""
 
     @classmethod
     def from_model(
@@ -56,18 +61,41 @@ class MambaInferenceStateConfig:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:
                 conv_states_dtype = model.config.params_dtype
-            if ssm_states_dtype is None:
+            if model.config.batch_invariant_mode:
+                if ssm_states_dtype not in (None, torch.float32):
+                    raise ValueError(
+                        "batch_invariant_mode requires FP32 Mamba SSM states; "
+                        f"got {ssm_states_dtype}."
+                    )
+                # State passing carries an unrounded FP32 boundary value across
+                # chunks. Rounding the cache to BF16 changes the next transition.
+                ssm_states_dtype = torch.float32
+            elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
             mamba_chunk_size = 128
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
+            # Gated Delta Product layers register as Mamba layers but carry a
+            # Householder count, which sizes their (separate) chunk descriptors.
+            gdp_num_householder = 0
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    num_householder = getattr(layer.mixer, 'num_householder', None)
+                    if num_householder is not None:
+                        # The descriptors are shared across layers, so one count
+                        # has to cover every GDP layer.
+                        assert gdp_num_householder in (0, num_householder), (
+                            "every GDP layer must use the same num_householder; got "
+                            f"{gdp_num_householder} and {num_householder}"
+                        )
+                        gdp_num_householder = num_householder
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -75,6 +103,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                gdp_num_householder=gdp_num_householder,
             )
         return None
 
@@ -160,16 +189,18 @@ class InferenceConfig:
 
     buffer_size_gb: int = 20
     """
-    Buffer size reserved on the GPU for the KV cache.
+    On-GPU portion of the shared KV cache block pool.
     If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
     """
 
     paused_buffer_size_gb: Optional[int] = None
     """
-    Portion of buffer reserved for paused requests. Active requests are paused when there are not
-    enough active blocks available to continue generating a request. The total buffer size
-    (active + paused) depends on `unified_memory_level` (uvm):
+    Memory used to derive the paused-request block retention budget. This does not reserve blocks
+    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    When the pool cannot satisfy new allocations, paused requests retain blocks only within this
+    budget and excess paused requests may be evicted. The total buffer size depends on
+    `unified_memory_level` (uvm):
         - uvm 0: buffer_size_gb (paused buffer is inclusive)
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """

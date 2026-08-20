@@ -548,6 +548,14 @@ class CheckpointConfig:
     "gather_object": Gather the checkpoint from all ranks in a single operation.
     """
 
+    ckpt_fully_parallel_load_per_rank_objects: bool = False
+    """Load ShardedObjects per-rank during fully parallel load of distributed checkpoints.
+    When True, every rank reads all of its own ShardedObjects (RNG states,
+    TE `_extra_state`, ...) directly from storage, which removes the WORLD-wide
+    `all_gather_object` that otherwise exchanges them. Objects are
+    content-addressable by `unique_key`, so the loaded values are identical.
+    When False (default), the legacy gather-based object exchange is used."""
+
     ckpt_fully_parallel_save_process_group: Literal["dp", "ep_dp"] = "dp"
     """Process group for fully parallel save of distributed checkpoints.
     "dp"(default): Data parallel process group.
@@ -563,10 +571,31 @@ class CheckpointConfig:
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_pg_tensors_cache_path: Optional[str] = None
+    """Directory of the parallelization-group distribution cache for fully parallel
+    save/load of distributed checkpoints. When set, the expensive
+    ``all_gather_object`` in ``determine_main_replica_uniform_distribution`` is
+    replaced by a single per-group file read (the load and save distributions are
+    loaded from this directory). Only safe when the config and world size match the
+    run that created the cache (see ``--ckpt-pg-tensors-cache-create``); no
+    existence/validity checks are performed, for the lowest possible latency.
+    Default (None) preserves the original collective-based behaviour."""
+
+    ckpt_pg_tensors_cache_create: bool = False
+    """Create (rather than read) the parallelization-group distribution cache at
+    ``--ckpt-pg-tensors-cache-path``. Set this for a single run with a matching
+    config/world size: the collective runs as usual but both the save and load
+    distributions are derived from that single gather and written to disk, one
+    file per parallelization group. Subsequent runs set only
+    ``--ckpt-pg-tensors-cache-path`` (leave this False) to skip the collective.
+    Default: False."""
+
     ckpt_load_validate_sharding_integrity: bool = True
-    """Whether to validate sharding access integrity when loading a distributed checkpoint.
-    When True (default), each tensor shard is checked to be accessed exactly once as main
-    replica by some rank. Disabling skips this validation"""
+    """Whether to validate sharding access integrity when loading *and saving* a distributed
+    checkpoint. When True (default), each tensor shard is checked to be accessed exactly once as
+    main replica by some rank. Disabling skips this validation; on save this also skips the
+    world-wide determine_global_metadata all_gather_object (otherwise run on the first save of a
+    job)."""
 
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
@@ -582,7 +611,10 @@ class CheckpointConfig:
         "ignore_all",
     ] = "assume_ok_unexpected"
     """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model.
+    For fsdp_dtensor checkpoints it covers model weights a partial load cannot supply, and
+    assume_ok_unexpected raises like raise_unexpected there because a partial load never raises
+    on its own. Use ignore_all to opt out."""
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.
@@ -615,13 +647,6 @@ class CheckpointConfig:
 
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
-
-    stream_ckpt_dequant: bool = True
-    """Per-tensor streaming dequantize when loading checkpoints with quantized model params
-    (FP8, MXFP8, blockwise FP8, NVFP4). The LoadPlanner dequantizes one destination at a time,
-    instead of dequantizing the entire state dict to high precision before the load starts
-    (which allocates N simultaneous scratch tensors and can OOM on large models). On by
-    default; pass --no-stream-ckpt-dequant to fall back to the legacy upfront pass."""
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support

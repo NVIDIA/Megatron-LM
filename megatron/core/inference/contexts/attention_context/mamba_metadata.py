@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -8,6 +8,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
+from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 
 
 class MambaMetadata:
@@ -21,6 +22,8 @@ class MambaMetadata:
         max_intermediate_count: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
+        decode_indices_dtype: torch.dtype = torch.int64,
+        gdp_num_householder: int = 0,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -36,12 +39,24 @@ class MambaMetadata:
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
+            decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
+            gdp_num_householder (int): Number of Householder copies of the Gated
+                Delta Product layers, or 0 if the model has none. When non-zero,
+                the GDP chunk descriptors are allocated and maintained alongside
+                the Mamba ones. They are kept separate rather than derived from
+                the Mamba chunk metadata: the forked GDP kernels chunk at a fixed
+                64 tokens (independent of `mamba_chunk_size`), index chunks as
+                `(sequence, chunk-within-sequence)` pairs rather than by token
+                boundary, and additionally need a chunking of the Householder-
+                expanded stream, which no Mamba2 buffer describes.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv
         self.device = torch.cuda.current_device()
+        assert decode_indices_dtype in (torch.int32, torch.int64)
+        self.decode_indices_dtype = decode_indices_dtype
 
         # Maximum possible chunks across all batch configurations
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
@@ -52,9 +67,10 @@ class MambaMetadata:
         )
 
         # Map from requests to slots in the static Mamba state buffer for active decode requests.
-        # int64 so selective_state_update can index directly without a per-layer upcast kernel;
+        # Non-BIK decode uses int64 for selective_state_update; BIK uses int32
+        # for the exact causal-conv1d update kernel.
         self._batch_indices_decode_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int64, device=self.device
+            (self.max_requests,), -1, dtype=self.decode_indices_dtype, device=self.device
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
@@ -91,6 +107,22 @@ class MambaMetadata:
         self._seq_idx_for_varlen_buffer = torch.zeros(
             self.max_chunks, dtype=torch.int32, device=self.device
         )
+
+        # Gated Delta Product chunk descriptors (see the constructor docstring).
+        self.gdp_num_householder = gdp_num_householder
+        if gdp_num_householder > 0:
+            self.max_gdp_chunks, self.max_gdp_chunks_dp = max_gdp_chunk_counts(
+                max_tokens, max_requests, gdp_num_householder
+            )
+            self._gdp_chunk_indices_buffer = torch.zeros(
+                (self.max_gdp_chunks, 2), dtype=torch.int32, device=self.device
+            )
+            self._gdp_chunk_indices_dp_buffer = torch.zeros(
+                (self.max_gdp_chunks_dp, 2), dtype=torch.int32, device=self.device
+            )
+            self._gdp_chunk_offsets_buffer = torch.zeros(
+                max_requests + 1, dtype=torch.int32, device=self.device
+            )
 
         # Conv1d per-token metadata (request ID and request start position)
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
@@ -150,10 +182,7 @@ class MambaMetadata:
 
         self.reset_varlen_metadata()
 
-        # Re-initialize the free slot pool
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
-        )
+        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
         self.mamba_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:
@@ -170,6 +199,11 @@ class MambaMetadata:
         self.seq_idx_for_varlen = None
         self.conv_seq_idx = None
         self.conv_seq_start = None
+
+        # Gated Delta Product chunk descriptor views
+        self.gdp_chunk_indices = None
+        self.gdp_chunk_indices_dp = None
+        self.gdp_chunk_offsets = None
 
         # Python-side precomputed values
         self.real_prefill_token_count = 0
@@ -327,6 +361,11 @@ class MambaMetadata:
             )
             self.last_chunk_indices = self._last_chunk_indices_buffer[:padded_prefill_count]
 
+            if self.gdp_num_householder > 0:
+                self._fill_gdp_chunk_descriptors(
+                    cu_seqlens_all, padded_prefill_count, padded_token_count
+                )
+
             self._seq_idx_for_varlen_buffer[:padded_max_chunks].copy_(
                 torch.tensor(chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32)
             )
@@ -476,7 +515,7 @@ class MambaMetadata:
                 # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1].
                 #   These are within bounds only when the prefill has at least
                 #   d_conv tokens; shorter sequences (e.g. small CUDA-graph warmup
-                #   buckets) would overrun the token axis, so _ssm_prefill clamps
+                #   buckets) would overrun the token axis, so ssm_prefill clamps
                 #   the gather positions into range. The gathered state is unused.
                 if real_count < max_count:
                     self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
@@ -501,7 +540,7 @@ class MambaMetadata:
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
             # (same rationale as padding comment above; abs_positions=d_conv may
-            # exceed a sub-d_conv warmup sequence, so _ssm_prefill clamps the
+            # exceed a sub-d_conv warmup sequence, so ssm_prefill clamps the
             # gather positions into range and the gathered state is unused)
             self._intermediate_chunk_indices_buffer[:max_count] = 0
             self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
@@ -511,6 +550,77 @@ class MambaMetadata:
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
             self._intermediate_real_count_buffer.fill_(0)
             self.intermediate_real_count = self._intermediate_real_count_buffer
+
+    def _build_gdp_descriptor_tensors(
+        self, cu_seqlens_all: list, padded_prefill_count: int, padded_token_count: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Build the GDP chunk descriptors as CPU int32 tensors.
+
+        Shared by both destinations (the standalone device buffers and the bound
+        pinned CPU views) so the two layouts cannot drift apart.
+
+        Returns:
+            `(chunk_indices, chunk_indices_dp, chunk_offsets, num_chunks,
+            num_chunks_dp)`, the three tensors ready to copy into either
+            destination plus the per-step array lengths.
+        """
+        chunk_indices, chunk_indices_dp, chunk_offsets, num_chunks, num_chunks_dp = (
+            build_gdp_chunk_descriptors(
+                cu_seqlens_all, padded_prefill_count, self.gdp_num_householder, padded_token_count
+            )
+        )
+        return (
+            torch.tensor(chunk_indices, dtype=torch.int32).view(num_chunks, 2),
+            torch.tensor(chunk_indices_dp, dtype=torch.int32).view(num_chunks_dp, 2),
+            torch.tensor(chunk_offsets, dtype=torch.int32),
+            num_chunks,
+            num_chunks_dp,
+        )
+
+    def _fill_gdp_chunk_descriptors(
+        self, cu_seqlens_all: list, padded_prefill_count: int, padded_token_count: int
+    ) -> None:
+        """Build the GDP chunk descriptors into the standalone device buffers.
+
+        The `update()` path only, i.e. callers that construct a MambaMetadata
+        with no context to bind buffers from. A context goes through
+        `_write_gdp_cpu_buffers` and the coalesced H2D instead.
+        """
+        chunk_indices, chunk_indices_dp, chunk_offsets, num_chunks, num_chunks_dp = (
+            self._build_gdp_descriptor_tensors(
+                cu_seqlens_all, padded_prefill_count, padded_token_count
+            )
+        )
+        self._gdp_chunk_indices_buffer[:num_chunks].copy_(chunk_indices)
+        self._gdp_chunk_indices_dp_buffer[:num_chunks_dp].copy_(chunk_indices_dp)
+        self._gdp_chunk_offsets_buffer[: padded_prefill_count + 1].copy_(chunk_offsets)
+        self.gdp_chunk_indices = self._gdp_chunk_indices_buffer[:num_chunks]
+        self.gdp_chunk_indices_dp = self._gdp_chunk_indices_dp_buffer[:num_chunks_dp]
+        self.gdp_chunk_offsets = self._gdp_chunk_offsets_buffer[: padded_prefill_count + 1]
+
+    def _write_gdp_cpu_buffers(
+        self, bufs: dict, cu_seqlens_all: list, padded_prefill_count: int, padded_token_count: int
+    ) -> dict:
+        """Build the GDP chunk descriptors into the bound pinned CPU views.
+
+        Runs on the host, outside any CUDA graph; the values land on the device
+        via the single coalesced H2D. The descriptor lengths depend only on the
+        padded batch shape, so a replayed graph sees the same grid sizes it was
+        captured with.
+
+        Returns:
+            The per-step array lengths `load_from_cpu` needs to slice the
+            GPU views after the transfer.
+        """
+        chunk_indices, chunk_indices_dp, chunk_offsets, num_chunks, num_chunks_dp = (
+            self._build_gdp_descriptor_tensors(
+                cu_seqlens_all, padded_prefill_count, padded_token_count
+            )
+        )
+        bufs['gdp_chunk_indices'][:num_chunks] = chunk_indices
+        bufs['gdp_chunk_indices_dp'][:num_chunks_dp] = chunk_indices_dp
+        bufs['gdp_chunk_offsets'][: padded_prefill_count + 1] = chunk_offsets
+        return {"gdp_num_chunks": num_chunks, "gdp_num_chunks_dp": num_chunks_dp}
 
     def compute_cpu_metadata(
         self,
@@ -646,6 +756,12 @@ class MambaMetadata:
                 chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32
             )
             result["padded_max_chunks"] = padded_max_chunks
+            if self.gdp_num_householder > 0:
+                result.update(
+                    self._write_gdp_cpu_buffers(
+                        bufs, cu_seqlens_all, padded_prefill_count, padded_token_count
+                    )
+                )
 
             # Conv1d per-token metadata (CPU repeat_interleave).
             conv_seq_idx_view = bufs['conv_seq_idx']
@@ -715,6 +831,11 @@ class MambaMetadata:
             self.conv_seq_idx = v.mamba_conv_seq_idx[:padded_token_count]
             self.conv_seq_start = v.mamba_conv_seq_start[:padded_token_count]
 
+            if self.gdp_num_householder > 0:
+                self.gdp_chunk_indices = v.gdp_chunk_indices[: d["gdp_num_chunks"]]
+                self.gdp_chunk_indices_dp = v.gdp_chunk_indices_dp[: d["gdp_num_chunks_dp"]]
+                self.gdp_chunk_offsets = v.gdp_chunk_offsets[: padded_prefill_count + 1]
+
             # Intermediate metadata reads from the just-transferred cu_seqlens
             # to compute chunk indices & absolute positions for state extraction.
             self._update_intermediate_metadata(
@@ -745,7 +866,26 @@ class MambaMetadata:
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
 
+        return int(mamba_idx)
+
+    def detach_state_slot(self, request_idx: int) -> int:
+        """Detach and return a request's live state slot without freeing it."""
+
+        mamba_idx = int(self.request_to_mamba_state_idx[request_idx].item())
+        if mamba_idx < 0:
+            raise RuntimeError(f"Request index {request_idx} has no live Mamba state slot")
+        self.request_to_mamba_state_idx[request_idx] = -1
         return mamba_idx
+
+    def free_slot(self, mamba_idx: int) -> None:
+        """Return one unbound slot to the live Mamba state pool."""
+
+        if not 0 <= mamba_idx < self.max_requests:
+            raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
+        if self.mamba_state_free_slot_count >= self.max_requests:
+            raise RuntimeError("Cannot free a Mamba state slot when the pool is already full")
+        self.mamba_state_free_slots[self.mamba_state_free_slot_count] = mamba_idx
+        self.mamba_state_free_slot_count += 1
 
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
@@ -764,7 +904,19 @@ class MambaMetadata:
             self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
         ]
 
-        return mamba_idx
+        return mamba_idx.clone()
+
+    def _return_slots(self, mamba_indices: torch.Tensor) -> None:
+        """Return live state slots to the free-slot stack."""
+
+        if mamba_indices.numel() == 0:
+            return
+        start = self.mamba_state_free_slot_count
+        end = start + mamba_indices.numel()
+        if end > self.max_requests:
+            raise RuntimeError("Mamba state free-slot pool overflow")
+        self.mamba_state_free_slots[start:end] = mamba_indices.to(torch.int32)
+        self.mamba_state_free_slot_count = end
 
     def free_slots(self, request_indices: torch.Tensor) -> None:
         """
@@ -778,14 +930,7 @@ class MambaMetadata:
 
         # Filter out any invalid indices (e.g., -1)
         mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
-        num_to_free = len(mamba_indices_to_free)
-
-        if num_to_free > 0:
-            # Add the freed indices back to the free slot pool
-            start_idx = self.mamba_state_free_slot_count
-            end_idx = start_idx + num_to_free
-            self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
-            self.mamba_state_free_slot_count = end_idx
+        self._return_slots(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1

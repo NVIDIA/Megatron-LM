@@ -58,3 +58,4 @@ METRICS:
   - "generated_tokens"
   - "logprobs"
   - "throughput"
+LAUNCHER: ft_launcher
