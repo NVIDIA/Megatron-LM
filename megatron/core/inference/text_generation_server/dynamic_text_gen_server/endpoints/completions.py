@@ -13,6 +13,20 @@ from ..openai_streaming import openai_stream
 logger = logging.getLogger(__name__)
 
 
+def _detokenize_top_n_keys(top_n_logprobs, tokenizer):
+    """Re-key id-keyed top-n logprob dicts by detokenized string for the OpenAI wire format.
+
+    The engine keys these by token id so that byte-fallback tokens don't collide.
+    This endpoint's response schema is string-keyed, so convert back at the edge.
+    Distinct ids that detokenize to the same string (byte fallbacks) still collide
+    here; use /raw_completions when exact token identity matters.
+    """
+    return [
+        {tokenizer.detokenize([int(token_id)]): logprob for token_id, logprob in entry.items()}
+        for entry in top_n_logprobs
+    ]
+
+
 try:
     from quart import Blueprint, Response, current_app, jsonify, request
 
@@ -234,12 +248,16 @@ try:
                 prompt_tokens_list = result["prompt_tokens"] or []
 
                 prompt_log_probs = result.get('prompt_log_probs') or []
-                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
+                prompt_top_n_logprobs = _detokenize_top_n_keys(
+                    result.get('prompt_top_n_logprobs') or [], tokenizer
+                )
 
                 # Get generated tokens and logprobs
                 generated_tokens_list = result["generated_tokens"] or []
                 generated_log_probs = result.get('generated_log_probs') or []
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
+                generated_top_n_logprobs = _detokenize_top_n_keys(
+                    result.get('generated_top_n_logprobs') or [], tokenizer
+                )
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
