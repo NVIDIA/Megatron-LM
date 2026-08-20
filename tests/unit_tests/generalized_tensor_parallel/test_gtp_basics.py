@@ -1591,3 +1591,40 @@ class TestActivationRecomputePhaseFlag:
             f"expected [original fwd=False, recompute fwd=True], got {observed}: "
             "in_activation_recompute_phase no longer tracks BF16 activation recompute"
         )
+
+
+class TestGTPCaptureParamReadiness:
+    def test_forward_gather_registers_params_before_ensuring_readiness(self, monkeypatch):
+        class StopAfterReadiness(Exception):
+            pass
+
+        first = object()
+        second = object()
+        param = type("Param", (), {"_debug_name": "weight", "_weights": (first, second)})()
+        readiness_calls = []
+
+        monkeypatch.setattr(gtp_module, "nvtx_range_push", lambda _: None)
+        monkeypatch.setattr(gtp_module, "in_activation_recompute_phase", lambda: False)
+
+        def stop_after_readiness(params):
+            readiness_calls.append(tuple(params))
+            raise StopAfterReadiness
+
+        monkeypatch.setattr(gtp_module, "ensure_params_ready", stop_after_readiness)
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture:
+            with pytest.raises(StopAfterReadiness):
+                GTPShardedParam._all_gather_weight(param, async_op=False, fwd=True)
+
+        assert readiness_calls == [(first, second)]
+        assert capture.params_to_ensure_ready == [first, second]
+
+    def test_param_readiness_records_unique_parameters(self):
+        first = object()
+        second = object()
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture:
+            gtp_cuda_graphs.register_capture_params_to_ensure_ready((first, second, first))
+            gtp_cuda_graphs.register_capture_params_to_ensure_ready((second,))
+
+        assert capture.params_to_ensure_ready == [first, second]
