@@ -767,7 +767,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # across ranks before the fp32 accum sees the value.
             grad_weight = _wgrad_gemm(sharded_weight.get_wgrad_tensor(), grad_output, total_input)
         else:
-            if ctx.gtp_remat_size > 1 and sharded_weight.main_grad.dtype == grad_output.dtype:
+            if ctx.gtp_remat_size > 1 and sharded_weight.use_zero_copy_wgrad(grad_output.dtype):
                 # GTP: write the wgrad straight into the reduce-scatter send buffer.
                 grad_weight = sharded_weight.get_wgrad_tensor()
                 torch.matmul(grad_output.t(), total_input, out=grad_weight)

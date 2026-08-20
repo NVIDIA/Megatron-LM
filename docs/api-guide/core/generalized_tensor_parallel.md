@@ -379,8 +379,8 @@ it** — a different collective over a different process group, so enable either
 ### 2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)
 
 ```bash
---gtp-remat-nccl-ub        # dense gtp_remat group          default: off
---gtp-expert-remat-nccl-ub       # routed-expert egtp_remat group  default: off
+--gtp-remat-nccl-ub         # dense gtp_remat group           default: off
+--gtp-expert-remat-nccl-ub  # routed-expert egtp_remat group  default: off
 ```
 
 **Allocates the wgrad reduce-scatter send buffers from an NCCL-window-registered memory pool on the gtp_remat / egtp_remat group, so NCCL runs the reduce-scatter as a single symmetric device kernel — NVLS multimem within an NVLink domain, rail kernels when the group spans domains — instead of a ring.** Only the send side needs registration; the sharded output lands in the ordinary `main_grad`.
@@ -399,10 +399,10 @@ it** — a different collective over a different process group, so enable either
   (when the wgrad dtype matches `main_grad`). The untied embedding's wgrad is materialized by
   `F.embedding`'s own backward and pays one copy into the buffer.
 - **FP32-accumulation interplay.** A registered pool takes precedence over §2.6 on its group:
-  NCCL symmetric reduce-scatters provide equivalent numerics with better performance, so the
-  group keeps the symmetric reduce-scatter and the fp32-accum all-to-all applies only to axes
-  without a pool. E.g. `--gtp-remat-nccl-ub` + §2.6 gives a symmetric dense-GTP reduce-scatter and
-  the fp32-accum all-to-all on the EGTP axis.
+  NVLS symmetric reduce-scatters accumulate in fp32 in-switch (NCCL's `multimem.ld_reduce` uses
+  `.acc::f32` for bf16), so the group keeps the symmetric reduce-scatter and the fp32-accum
+  all-to-all applies only to axes without a pool. E.g. `--gtp-remat-nccl-ub` + §2.6 gives a
+  symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis.
 - **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
   flags cover the gtp_remat axes only.
 

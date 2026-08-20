@@ -38,6 +38,7 @@ from packaging.version import Version
 
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     allocate_graph_wgrad_rings,
+    clear_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
     register_capture_params_to_ensure_ready,
@@ -1750,6 +1751,14 @@ class GTPShardedParam(torch.nn.Parameter):
         assert self.is_routed_expert and self.weight_list is not None
         return self.all_gather_and_prefetch(**kwargs)
 
+    def use_zero_copy_wgrad(self, wgrad_dtype) -> bool:
+        """True when the wgrad GEMM should write straight into this weight's symmetric
+        RS send buffer (dtype permitting): direct writes keep the RS send out of the
+        copy-into-registered-memory path. Deliberately symm-only so behavior off the
+        --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
+        _prepare_wgrad_reduce_scatter_inputs."""
+        return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(self.group)
+
     def get_wgrad_tensor(self):
         """Return a logical-shape view of stable ring storage or ordinary scratch."""
         ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)
@@ -1869,8 +1878,8 @@ class GTPShardedParam(torch.nn.Parameter):
                     _wgrad_pool_put(buf)
             for buf in bufs:
                 # Return symm pool buffers (tag-gated no-op for plain and ring buffers).
-                # Unconditional on chain kind: the pool's captured alloc/free pops replay
-                # at stable addresses.
+                # Unconditional on chain kind: free() is captured, so replayed reuse keeps
+                # the eager wait edges, and replays serialize on the launch stream.
                 symmetric_wgrad_pool.free(buf)
             setattr(self, attr, None)
 
@@ -2052,12 +2061,14 @@ class GTPShardedParam(torch.nn.Parameter):
 
             if slot is None:
 
-                # With SMR, send the padded parent tensor of the logical view
-                # that get_wgrad_tensor handed the GEMM.
+                # With symmetric memory registration, send the padded parent tensor of the
+                # logical view that get_wgrad_tensor handed the GEMM.
                 if is_gtp_symm_pool_registered(weight.group):
                     symm_slot = weight._wgrad_symm_slot
                     weight._wgrad_symm_slot = None
                     if symm_slot is None:
+                        # wgrad.dtype on purpose: a foreign wgrad reduce-scatters in its own
+                        # dtype (upstream behavior); main_grad.add_ upcasts on mismatch.
                         symm_slot = _alloc_symmetric_wgrad_buffer(weight, wgrad.dtype, wgrad.device)
 
                     # Alias check and copy
@@ -2152,6 +2163,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 pass  # next_w has not reduce-scattered yet, or something already finalized it
             elif getattr(self.next_w, "_already_finalized", False):
                 self.next_w._already_finalized = False
+                # No compute-stream fence needed: only MTP's double-RS weights
+                # (embedding/output) reach the force-finalize path, no other weight
+                # shares their vocab-sized LIFO bucket, and their next pop is behind
+                # the end-of-backward flush fence -- the buffers freed there cannot
+                # be re-popped within this backward.
             else:
                 self.next_w.rs_event.wait()
                 cache = get_global_GTP_cache()
@@ -2577,6 +2593,7 @@ def reset_gtp_state():
     GTPShardedParam._link_tables_flushed = False
     GTPShardedParam._recompute_link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
+    clear_graph_wgrad_rings()
 
 
 # ------------------------------------------------------------------------

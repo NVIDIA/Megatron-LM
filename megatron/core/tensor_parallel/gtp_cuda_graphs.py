@@ -186,6 +186,10 @@ def allocate_graph_wgrad_rings(
         slot_count = min(ring_size, len(matching_params))
         slots = []
         exemplar = matching_params[0]
+        assert all(p.group is exemplar.group for p in matching_params), (
+            "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
+            "every param sharing a ring key must share its process group"
+        )
         symm = is_gtp_symm_pool_registered(exemplar.group)
         for slot_index in range(slot_count):
             with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
@@ -232,6 +236,16 @@ def allocate_graph_wgrad_rings(
         f"[GTP Wgrad Ring] allocated {buffer_count} buffers "
         f"({total_bytes / 1024**2:.1f} MB), ring_size={ring_size}",
     )
+
+
+def clear_graph_wgrad_rings() -> None:
+    """Drop every ring slot so a rebuilt model reallocates them.
+
+    Without this, the stale non-empty dict makes allocate_graph_wgrad_rings a silent
+    no-op on the next build, leaving slots keyed by the old model's groups and shapes.
+    GPU work must be idle (callers synchronize).
+    """
+    _GRAPH_WGRAD_RINGS.clear()
 
 
 _CG_MEMPOOL_DEVICE = None

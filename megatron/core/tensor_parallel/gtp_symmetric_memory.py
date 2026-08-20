@@ -121,9 +121,9 @@ class RegisteredLIFOPool:
     reduce-scatters instead of one buffer per weight.
 
     CUDA graphs: the eager warmup iterations run the same reduce-scatter overlap as
-    the captured steps, so by capture time the free lists already hold enough buffers
-    and ``alloc`` only ever pops. Allocating a new buffer during capture would be
-    illegal, so that case raises a clear error instead.
+    the captured steps and are expected to pre-populate the free lists, so that during
+    capture ``alloc`` only ever pops. Allocating a new buffer during capture would be
+    illegal, so ``alloc`` raises if that expectation did not hold.
 
     Buffers are stored 1-D, so one free list serves every shape with the same element
     count. ``alloc`` returns a view tagged with ``_gtp_symm_group``; ``free`` ignores
@@ -140,12 +140,13 @@ class RegisteredLIFOPool:
     def __init__(self) -> None:
         # (numel, dtype, group_name) -> list of free 1-D buffers.
         self._free: dict[tuple, list] = defaultdict(list)
+        self._warned_unregistered: set = set()
 
     def alloc(
         self,
         shape: torch.Size | tuple[int, ...],
         dtype: torch.dtype,
-        device: torch.device,
+        device: torch.device | str,
         group: dist.ProcessGroup,
     ) -> torch.Tensor:
         """Return a buffer of ``shape`` from ``group``'s free list, allocating one if empty.
@@ -158,20 +159,35 @@ class RegisteredLIFOPool:
             flat = bucket.pop()
         else:
             if torch.cuda.is_current_stream_capturing():
+                mine = sum(len(v) for k, v in self._free.items() if k[2] == group.group_name)
+                others = sum(len(v) for k, v in self._free.items() if k[2] != group.group_name)
+                hint = (
+                    "this group's free lists are empty while other groups have "
+                    f"{others} free buffer(s) -- likely stranded send buffers from "
+                    "backwards that never reduce-scattered"
+                    if mine == 0 and others > 0
+                    else "likely the warmup depth or RS concurrency changed between "
+                    "warmup and capture -- run more warmup iters"
+                )
                 raise RuntimeError(
                     "[GTP] RegisteredLIFOPool exhausted during CUDA-graph capture "
-                    f"(group={group.group_name}, numel={numel}, dtype={dtype}). The "
-                    "eager warmup did not pre-populate enough RS send buffers for "
-                    "the reduce-scatter overlap depth -- run more warmup iters, or "
-                    "the RS concurrency changed between warmup and capture, or "
-                    "symmetric send buffers were stranded by backwards that never "
-                    "reduce-scattered."
+                    f"(group={group.group_name}, numel={numel}, dtype={dtype}): {hint}."
                 )
             # Allocate from the group's registered pool when it has one; else plain memory.
             if is_gtp_symm_pool_registered(group):
                 with gtp_symm_pool_ctx(group):
                     flat = torch.empty(numel, dtype=dtype, device=device)
             else:
+                # Unreachable in production (callers gate on registration); the buffer
+                # would be sent with regular kernels, so make a misconfiguration visible.
+                if group.group_name not in self._warned_unregistered:
+                    self._warned_unregistered.add(group.group_name)
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"[GTP] RegisteredLIFOPool.alloc on unregistered group "
+                        f"{group.group_name}: buffer will not be window-registered.",
+                    )
                 flat = torch.empty(numel, dtype=dtype, device=device)
         out = flat.view(shape)
         out._gtp_symm_group = group  # marks the buffer as pool-owned; free() keys on this
