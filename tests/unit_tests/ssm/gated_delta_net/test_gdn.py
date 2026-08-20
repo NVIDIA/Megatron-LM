@@ -102,6 +102,16 @@ def test_gdn_norm_out_recompute_accepts_gdn_variant():
     assert "gdn_norm_out" in config.recompute_modules
 
 
+def test_gdn_norm_out_recompute_rejects_non_hybrid_non_gdn_config():
+    with pytest.raises(ValueError, match="gdn_norm_out in recompute_modules"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            recompute_granularity="selective",
+            recompute_modules=["gdn_norm_out"],
+        )
+
+
 def test_gdn_and_norm_out_recompute_are_mutually_exclusive():
     with pytest.raises(ValueError, match="'gdn' and 'gdn_norm_out'"):
         _make_gdn_config(
@@ -114,6 +124,7 @@ def test_gdn_norm_out_recompute_accepts_non_experimental_hybrid_config():
     # experimental_attention_variant, so the selector must remain valid here.
     config = _make_gdn_config(
         experimental_attention_variant=None,
+        is_hybrid_model=True,
         linear_attention_freq=None,
         recompute_granularity="selective",
         recompute_modules=["gdn_norm_out"],

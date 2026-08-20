@@ -70,9 +70,13 @@ def _make_config(
     )
 
 
-def test_kda_norm_out_recompute_config_accepts_gdn_family_selector():
+def test_kda_norm_out_recompute_config_accepts_hybrid_model():
     config = replace(
-        _make_config(), recompute_granularity="selective", recompute_modules=["gdn_norm_out"]
+        _make_config(),
+        experimental_attention_variant=None,
+        is_hybrid_model=True,
+        recompute_granularity="selective",
+        recompute_modules=["gdn_norm_out"],
     )
 
     assert config.recompute_modules == ["gdn_norm_out"]
