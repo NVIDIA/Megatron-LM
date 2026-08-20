@@ -2368,7 +2368,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'mlm'" },
     { name = "tiktoken", marker = "extra == 'training'" },
     { name = "torch", specifier = ">=2.6.0" },
-    { name = "torch-memory-saver", marker = "extra == 'dev'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=be4164360e50e297540c0b7c9c28c8b5dd3f90ab" },
+    { name = "torch-memory-saver", marker = "extra == 'dev'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?tag=v0.0.10b1" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4329ff84bfbdaa778a33cba02a15fb0807c64689" },
     { name = "transformers", marker = "extra == 'mlm'" },
@@ -5306,7 +5306,7 @@ wheels = [
 [[package]]
 name = "torch-memory-saver"
 version = "0.0.10b1"
-source = { git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=be4164360e50e297540c0b7c9c28c8b5dd3f90ab#be4164360e50e297540c0b7c9c28c8b5dd3f90ab" }
+source = { git = "https://github.com/fzyzcjy/torch_memory_saver.git?tag=v0.0.10b1#9bc9a442e6d108c7b7903def199896a005143aaf" }
 
 [[package]]
 name = "torchx"
