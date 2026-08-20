@@ -8,6 +8,7 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -66,6 +67,27 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, _ = check_fp8_support()
+
+
+def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
+    created_streams = []
+
+    class FakeStream:
+        def __init__(self):
+            self.cuda_stream = len(created_streams) + 1
+            created_streams.append(self)
+
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32")
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOLS", None)
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_NEXT_SLOT", 0)
+
+    pool_size = cuda_graphs_module._CUDA_GRAPH_STREAM_POOL_SIZE
+    assigned = [cuda_graphs_module._get_cuda_graph_stream() for _ in range(2 * pool_size)]
+
+    assert len(created_streams) == pool_size
+    assert len({stream.cuda_stream for stream in created_streams}) == pool_size
+    assert assigned[:pool_size] == assigned[pool_size:]
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
