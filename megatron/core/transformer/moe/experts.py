@@ -389,6 +389,11 @@ class TEGroupedMLP(MegatronModule):
             from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
         except ImportError:
             return False  # Transformer Engine version is too old
+        if self.config.moe_use_transformer_engine_fused_moe:
+            try:
+                from transformer_engine.pytorch.ops import Combine, Dispatch  # noqa: F401
+            except ImportError:
+                return False  # Transformer Engine does not provide fusible NCCL-EP ops
 
         if not is_te_min_version("2.14.0"):
             return False
@@ -455,8 +460,18 @@ class TEGroupedMLP(MegatronModule):
             return False
         return True
 
-    def _make_fused_ops(self) -> torch.nn.Module:
-        """Construct fused module for FC1, activation, and FC2."""
+    def _make_fused_ops(
+        self,
+        ep_buffer=None,
+        num_local_tokens: Optional[int] = None,
+    ) -> torch.nn.Module:
+        """Construct the TE operation-fuser module.
+
+        When ``ep_buffer`` is provided, dispatch and combine are included around
+        the grouped MLP. The routing metadata is connected through internal
+        channels so Transformer Engine can replace the five-op sequence with
+        MegaMOE when its runtime gates pass.
+        """
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
 
@@ -488,8 +503,15 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
-        # Container for fusible ops
-        ops = te.pytorch.ops.Sequential()
+        # Build standalone operations first. Channel routing must be bound
+        # before Sequential constructs an OperationFuser and locks it.
+        op_list = []
+        dispatch_op = None
+        if ep_buffer is not None:
+            if num_local_tokens is None:
+                raise ValueError("num_local_tokens is required for a full MoE Sequential.")
+            dispatch_op = te.pytorch.ops.Dispatch(ep_buffer)
+            op_list.append(dispatch_op)
 
         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
         fc1_single_grouped_weight = self.linear_fc1.single_grouped_weight
@@ -533,7 +555,8 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
-        ops.append(op)
+        op_list.append(op)
+        fc1_op = op
 
         # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
         glu_interleave = self.config.moe_mlp_glu_interleave_size
@@ -610,7 +633,8 @@ class TEGroupedMLP(MegatronModule):
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
-        ops.append(op)
+        op_list.append(op)
+        activation_op = op
 
         # FC2
         fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
@@ -634,12 +658,58 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
-        ops.append(op)
+        op_list.append(op)
+        fc2_op = op
+
+        if dispatch_op is not None:
+            combine_op = te.pytorch.ops.Combine(
+                ep_buffer,
+                num_local_tokens=num_local_tokens,
+            )
+            op_list.append(combine_op)
+            dispatch_op.set_extra_output_channel(
+                0, "tokens_per_expert", output_to_caller=False
+            )
+            dispatch_op.set_extra_output_channel(
+                1, "routing_weights", output_to_caller=False
+            )
+            fc1_op.set_extra_input_channel(0, "tokens_per_expert")
+            activation_op.set_extra_input_channel(0, "routing_weights")
+            fc2_op.set_extra_input_channel(0, "tokens_per_expert")
+
+        ops = te.pytorch.ops.Sequential(*op_list)
 
         # Emulate submodule pre-forward hooks
         ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())
 
         return ops
+
+    def fused_moe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        ep_buffer,
+    ) -> torch.Tensor:
+        """Run dispatch, routed experts, and combine in one TE Sequential."""
+        if not self.config.moe_use_transformer_engine_fused_moe:
+            raise RuntimeError(
+                "fused_moe_forward requires moe_use_transformer_engine_fused_moe=True."
+            )
+        if hidden_states.dtype is not torch.bfloat16:
+            raise TypeError(
+                "Transformer Engine Dispatch requires BF16 hidden states, "
+                f"got {hidden_states.dtype}."
+            )
+
+        ops = self._make_fused_ops(
+            ep_buffer=ep_buffer,
+            num_local_tokens=hidden_states.shape[0],
+        )
+        # Keep the most recent sequence available for diagnostics without
+        # registering duplicate parameter aliases as child modules.
+        self._last_fused_moe_ops = (ops,)
+        return ops(hidden_states, topk_idx, topk_weights.float())
 
     def _make_fused_impl_pre_forward_hook(self) -> Callable:
         """Make function that calls submodule pre-forward callback hooks.
