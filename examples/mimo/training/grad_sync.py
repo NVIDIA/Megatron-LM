@@ -47,12 +47,12 @@ def reset_modality_participation(mimo_model: MimoModel) -> None:
             setattr(submodule, _PARTICIPATED_ATTR, False)
 
 
-def _vision_participation_count(submodule, vision_dp_group) -> float:
+def _vision_participation_count(submodule, vision_dp_group) -> torch.Tensor:
     """Number of vision-DP ranks that processed image input this step."""
     val = 1.0 if getattr(submodule, _PARTICIPATED_ATTR, False) else 0.0
     indicator = torch.tensor([val], dtype=torch.float32, device="cuda")
     dist.all_reduce(indicator, op=dist.ReduceOp.SUM, group=vision_dp_group)
-    return float(indicator.item())
+    return indicator
 
 
 def _is_pg_member(pg) -> bool:
@@ -98,7 +98,7 @@ def _token_source_global_rank(language_grid) -> int:
     )
 
 
-def _global_token_count(num_tokens, language_pg, src_global_rank) -> float:
+def _global_token_count(num_tokens, language_pg, src_global_rank) -> torch.Tensor:
     """Total non-padded tokens in the global batch, visible on every rank.
 
     Only the LLM token-source ranks compute the count by summing over all LLM data lanes;
@@ -114,7 +114,7 @@ def _global_token_count(num_tokens, language_pg, src_global_rank) -> float:
         if dist.get_rank(group=data_group) == 0:
             global_num_tokens.copy_(token_count)
     dist.broadcast(global_num_tokens, src=src_global_rank)
-    return float(global_num_tokens.item())
+    return global_num_tokens
 
 
 def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -> None:
@@ -150,7 +150,7 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
         # N_global is the global token count, published to every rank (including the
         # non-colocated encoder grid) so both modules divide by the same per-token mean.
         n_global = _global_token_count(num_tokens, language_pg, src_global_rank)
-        inv = 1.0 / n_global if n_global > 0 else 0.0
+        inv = torch.where(n_global > 0, n_global.reciprocal(), torch.zeros_like(n_global))
 
         if mimo_model.language_model is not None:
             finalize_model_grads(
@@ -159,8 +159,7 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
                 pg_collection=language_pg,
                 force_all_reduce=force_all_reduce,
             )
-            if inv != 0.0:
-                mimo_model.language_model.scale_gradients(inv)
+            mimo_model.language_model.scale_gradients(inv)
 
         for name, submodule in mimo_model.modality_submodules.items():
             if submodule is None:
@@ -180,11 +179,14 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
                     vision_dp_size = dist.get_world_size(vision_dp_group)
                     if vision_dp_size > 1:
                         participation = _vision_participation_count(submodule, vision_dp_group)
-                        if 0.0 < participation < vision_dp_size:
-                            vision_scale *= vision_dp_size / participation
+                        participation_scale = torch.where(
+                            (participation > 0) & (participation < vision_dp_size),
+                            vision_dp_size * participation.reciprocal(),
+                            torch.ones_like(participation),
+                        )
+                        vision_scale = vision_scale * participation_scale
 
-            if vision_scale != 0.0:
-                submodule.scale_gradients(vision_scale)
+            submodule.scale_gradients(vision_scale)
 
     mimo_model.config.finalize_model_grads_func = finalize_grads_func
     # The schedule always calls grad_scale_func with a Tensor loss; the per-token
