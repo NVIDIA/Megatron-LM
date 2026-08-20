@@ -2697,8 +2697,8 @@ class CompressedSparseAttention(MegatronModule):
             return_softmax=indexer_loss_coeff > 0 and sparse_loss,
         )
 
-        # Supply unpadded cu_seqlens so padding rows are excluded from
-        # the indexer KL loss (mirrors the unfused path's cu_seqlens_q_for_loss).
+        # Supply unpadded cu_seqlens so padding rows are excluded from the
+        # indexer KL loss and handled safely by sparse-attention backward.
         # Only pass when they actually differ (by reference or storage) to avoid
         # unnecessary mask computation inside the fused kernel.
         cu_seqlens_q_unpadded = None
