@@ -9,6 +9,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
+    CSA_OPERATION_DETERMINISM,
     CompressedSparseAttention,
     CompressedSparseAttentionSubmodules,
     Compressor,
@@ -17,6 +18,9 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexerSubmodules,
     _apply_rope,
     _compute_unfused_csa_non_compressed_lse,
+    _get_compress_causal_mask_cached,
+    _get_compress_valid_counts_cached,
+    _pool_compressor_values,
     get_compress_topk_idxs,
     get_window_topk_idxs,
     unfused_compressed_sparse_attn,
@@ -98,12 +102,53 @@ class _SingleRankPG:
     tp = _SingleRankTP()
 
 
+class _TwoRankTP:
+    @staticmethod
+    def size():
+        return 2
+
+
+class _TwoRankPG:
+    tp = _TwoRankTP()
+
+
 def test_csa_rejects_explicit_attention_mask():
     """The native SBHD slice must not silently ignore padding or document boundaries."""
     with pytest.raises(ValueError, match="implicit causal mask"):
         CompressedSparseAttention.forward(
             None, query=None, key=None, value=None, attention_mask=torch.zeros(1, 1, 1, 1)
         )
+
+
+def test_all_csa_operations_declare_determinism():
+    """Every eager CSA operation declares a valid bit-exact determinism status."""
+    valid_statuses = {"deterministic", "nondeterministic", "unknown"}
+    assert set(CSA_OPERATION_DETERMINISM) == {
+        "unfused_sparse_attention",
+        "non_compressed_lse",
+        "compressor_pooling",
+    }
+    assert set(CSA_OPERATION_DETERMINISM.values()) <= valid_statuses
+
+
+def test_compressed_causal_metadata_is_cached_and_correct():
+    ratio, seqlen, n_compressed = 4, 12, 3
+    device_str = "cpu"
+    _get_compress_causal_mask_cached.cache_clear()
+    _get_compress_valid_counts_cached.cache_clear()
+
+    mask = _get_compress_causal_mask_cached(ratio, seqlen, n_compressed, device_str)
+    valid_counts = _get_compress_valid_counts_cached(ratio, seqlen, device_str)
+
+    assert mask is _get_compress_causal_mask_cached(ratio, seqlen, n_compressed, device_str)
+    assert valid_counts is _get_compress_valid_counts_cached(ratio, seqlen, device_str)
+    expected_counts = torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
+    expected_mask = torch.where(
+        torch.arange(n_compressed).unsqueeze(0) >= expected_counts, float("-inf"), 0.0
+    )
+    torch.testing.assert_close(valid_counts, expected_counts)
+    torch.testing.assert_close(mask, expected_mask)
+    assert mask.unsqueeze(0).expand(2, -1, -1).stride(0) == 0
 
 
 def test_unfused_csa_non_compressed_lse_matches_window_and_sink_oracle():
@@ -344,6 +389,17 @@ class TestGetCompressTopkIdxs:
 # ===========================================================================
 
 
+def test_unfused_sparse_attention_rejects_sink_head_mismatch():
+    with pytest.raises(ValueError, match="one value per query head"):
+        unfused_compressed_sparse_attn(
+            query=torch.zeros(2, 1, 2, 4),
+            kv_full=torch.zeros(2, 1, 4),
+            attn_sink=torch.zeros(1),
+            topk_indices=torch.zeros(1, 2, 1, dtype=torch.int32),
+            softmax_scale=1.0,
+        )
+
+
 class TestUnfusedCompressedSparseAttn:
     """Test the unfused compressed sparse attention kernel."""
 
@@ -419,10 +475,90 @@ class TestUnfusedCompressedSparseAttn:
         assert kv_full.grad is not None
         assert attn_sink.grad is not None
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_batched_repeated_and_invalid_indices_match_loop_oracle(self):
+        """Batch-flattened gather preserves forward and backward sparse-attention semantics."""
+        torch.manual_seed(41)
+        sq, b, np_, hn, n_kv = 3, 2, 2, 4, 5
+        topk_indices = torch.tensor(
+            [[[0, 0, -1], [1, 3, 1], [4, -1, 2]], [[2, -1, 2], [4, 0, -1], [1, 1, 3]]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        query = torch.randn(sq, b, np_, hn, device="cuda", requires_grad=True)
+        kv_full = torch.randn(n_kv, b, hn, device="cuda", requires_grad=True)
+        attn_sink = torch.randn(np_, device="cuda", requires_grad=True)
+        grad_output = torch.randn(sq, b, np_ * hn, device="cuda")
+
+        with patch("torch.gather", side_effect=AssertionError("expanded gather must not be used")):
+            actual = unfused_compressed_sparse_attn(
+                query, kv_full, attn_sink, topk_indices, softmax_scale=0.5
+            )
+        (actual * grad_output).sum().backward()
+        actual_grads = (query.grad.clone(), kv_full.grad.clone(), attn_sink.grad.clone())
+
+        query_ref = query.detach().clone().requires_grad_(True)
+        kv_ref = kv_full.detach().clone().requires_grad_(True)
+        sink_ref = attn_sink.detach().clone().requires_grad_(True)
+        rows = []
+        for row in range(sq):
+            batches = []
+            for batch in range(b):
+                heads = []
+                for head in range(np_):
+                    valid_indices = topk_indices[batch, row]
+                    valid_indices = valid_indices[valid_indices >= 0].long()
+                    logits = (
+                        torch.einsum(
+                            "h,kh->k", query_ref[row, batch, head], kv_ref[valid_indices, batch]
+                        )
+                        * 0.5
+                    )
+                    probabilities = torch.softmax(
+                        torch.cat([logits, sink_ref[head : head + 1]]), dim=0
+                    )
+                    heads.append(
+                        torch.einsum("k,kh->h", probabilities[:-1], kv_ref[valid_indices, batch])
+                    )
+                batches.append(torch.cat(heads))
+            rows.append(torch.stack(batches))
+        expected = torch.stack(rows)
+        (expected * grad_output).sum().backward()
+
+        torch.testing.assert_close(actual, expected)
+        for actual_grad, expected_grad in zip(
+            actual_grads, (query_ref.grad, kv_ref.grad, sink_ref.grad)
+        ):
+            torch.testing.assert_close(actual_grad, expected_grad)
+
 
 # ===========================================================================
 # Compressor tests
 # ===========================================================================
+
+
+def test_compressor_pooling_matches_fp32_forward_and_backward_oracle():
+    torch.manual_seed(43)
+    kv = torch.randn(2, 4, 2, 6, dtype=torch.bfloat16, requires_grad=True)
+    score = torch.randn(2, 4, 2, 6, dtype=torch.bfloat16, requires_grad=True)
+    grad_output = torch.randn(2, 2, 6, dtype=torch.bfloat16)
+
+    actual = _pool_compressor_values(kv, score, torch.bfloat16)
+    (actual * grad_output).sum().backward()
+    actual_grads = (kv.grad.clone(), score.grad.clone())
+
+    kv_ref = kv.detach().clone().requires_grad_(True)
+    score_ref = score.detach().clone().requires_grad_(True)
+    expected = (
+        (kv_ref.float() * torch.softmax(score_ref, dim=1, dtype=torch.float32))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+    (expected * grad_output).sum().backward()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_grads[0], kv_ref.grad, rtol=0, atol=0)
+    torch.testing.assert_close(actual_grads[1], score_ref.grad, rtol=0, atol=0)
 
 
 def _make_mla_config(
@@ -506,6 +642,38 @@ def _make_csa_submodules():
         compressor=ModuleSpec(module=Compressor, submodules=_make_compressor_submodules()),
         indexer=ModuleSpec(module=CSAIndexer, submodules=_make_csa_indexer_submodules()),
     )
+
+
+def test_compressed_sparse_attention_rejects_tensor_parallelism():
+    config = _make_mla_config(num_attention_heads=2, csa_compress_ratios=[0] * 4)
+    with pytest.raises(ValueError, match="tensor-parallel size 1"):
+        CompressedSparseAttention(
+            config=config,
+            submodules=CompressedSparseAttentionSubmodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=_TwoRankPG(),
+            compress_ratio=0,
+        )
+
+
+def test_compressed_sparse_attention_rejects_query_head_mismatch():
+    config = _make_mla_config(num_attention_heads=2, csa_compress_ratios=[0] * 4)
+    attention = CompressedSparseAttention(
+        config=config,
+        submodules=CompressedSparseAttentionSubmodules(),
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        pg_collection=_SingleRankPG(),
+        compress_ratio=0,
+    )
+
+    with pytest.raises(ValueError, match="query head count"):
+        attention(
+            query=torch.zeros(2, 1, 1, config.v_head_dim), key=None, value=None, attention_mask=None
+        )
 
 
 # ===========================================================================

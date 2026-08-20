@@ -356,6 +356,9 @@ class TransformerConfig(ModelParallelConfig):
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
+    # TODO(#6402): consumed by DSv4 Hybrid attention orchestration, which selects the
+    # per-layer compression ratio and builds the compressed-KV rotary embedding.
+    # Neither field has a production reader in this primitive-only PR.
     csa_compress_ratios: Optional[List[int]] = None
     """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
 

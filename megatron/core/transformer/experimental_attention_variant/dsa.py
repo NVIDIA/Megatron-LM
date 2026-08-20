@@ -524,11 +524,13 @@ def _compute_indexer_teacher_probabilities(
     attention_valid_mask: torch.Tensor,
     non_compressed_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Normalize selected teacher logits, optionally with omitted attention mass.
+    """Return selected-key teacher mass, optionally including omitted mass.
 
     ``non_compressed_lse`` is a sufficient statistic for teacher logits that
     must participate in the softmax denominator but must not appear in the
-    compressed-key target returned by this helper.
+    compressed-key target returned by this helper. When the absolute compressed
+    mass underflows FP32, all heads in a row receive the same log-domain shift;
+    the returned weights remain proportional and the caller L1-normalizes them.
     """
     b, np, sq, sk = attention_scores.shape
     expanded_valid_mask = attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk)
@@ -551,9 +553,30 @@ def _compute_indexer_teacher_probabilities(
 
     masked_scores = attention_scores.float().masked_fill(~expanded_valid_mask, float("-inf"))
     compressed_lse = torch.logsumexp(masked_scores, dim=-1)
+    row_has_compressed_keys = expanded_valid_mask.any(dim=-1)
+    # Avoid the undefined ``-inf - -inf`` intermediate on fully masked rows.
+    # This is only a [batch, heads, seqlen] tensor, so it does not recreate the
+    # full-size temporary that the log-domain formulation is designed to avoid.
+    safe_compressed_lse = torch.where(
+        row_has_compressed_keys, compressed_lse, torch.zeros_like(compressed_lse)
+    )
+    conditional_probabilities = torch.exp(masked_scores - safe_compressed_lse.unsqueeze(-1))
+    del masked_scores
+
     full_lse = torch.logaddexp(non_compressed_lse.float(), compressed_lse)
-    probabilities = torch.exp(masked_scores - full_lse.unsqueeze(-1))
-    return torch.where(expanded_valid_mask, probabilities, torch.zeros_like(probabilities))
+    log_compressed_mass = (compressed_lse - full_lse).masked_fill(
+        ~row_has_compressed_keys, float("-inf")
+    )
+
+    # The external window/sink mass can put every head's compressed mass below
+    # the FP32 normal range. A common per-row shift across heads
+    # preserves all relative teacher weights and cancels in the downstream L1
+    # normalization. CSA currently requires TP1, so no cross-rank MAX is needed.
+    row_max = log_compressed_mass.amax(dim=1, keepdim=True)
+    needs_rescale = torch.isfinite(row_max) & (row_max < math.log(torch.finfo(torch.float32).tiny))
+    common_shift = torch.where(needs_rescale, row_max, torch.zeros_like(row_max))
+    compressed_mass = torch.exp(log_compressed_mass - common_shift)
+    return conditional_probabilities * compressed_mass.unsqueeze(-1)
 
 
 def _normalize_indexer_teacher_target(
@@ -562,7 +585,12 @@ def _normalize_indexer_teacher_target(
     """L1-normalize teacher mass without changing the legacy DSA path."""
     if non_compressed_lse is None:
         return dsa_indexer_loss.normalize_indexer_target(target)
-    return target / target.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    row_mass = target.sum(dim=-1, keepdim=True)
+    # External teacher mass can legitimately make the compressed mass smaller
+    # than INDEXER_LOSS_EPS (or even float32 tiny). Only an exactly zero row is
+    # degenerate; keep it zero rather than imposing a numerical floor.
+    safe_row_mass = torch.where(row_mass > 0, row_mass, torch.ones_like(row_mass))
+    return target / safe_row_mass
 
 
 def _compute_index_scores(
@@ -862,11 +890,12 @@ def bwd_fused_indexer_loss_naive(
             dtype=grad_kl_per_element.dtype
         )
 
-    # For KL(target || softmax(logits)), the exact logit gradient is predict - target.
-    # Computing it through -target / (predict + eps) incorrectly suppresses gradients when
-    # valid predicted probabilities are smaller than eps.
+    # For KL(target || softmax(logits)), the exact logit gradient is
+    # predict * target.sum(-1) - target. Positive teacher rows are L1-normalized,
+    # while a fully masked zero-mass row must have zero gradient.
+    attention_target_mass = attention_scores_normalized.sum(dim=-1, keepdim=True)
     grad_index_scores_logits = (
-        index_scores_softmax - attention_scores_normalized
+        index_scores_softmax * attention_target_mass - attention_scores_normalized
     ) * grad_kl_per_element
     del index_scores_softmax, attention_scores_normalized
 

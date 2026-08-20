@@ -25,6 +25,15 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
+#: Bit-exact determinism status for the eager CSA operations introduced here.
+#: The operations use CUDA reductions and indexed accumulation, but bit-exact
+#: repeatability has not been certified, so the conservative status is unknown.
+CSA_OPERATION_DETERMINISM: dict[str, str] = {
+    "unfused_sparse_attention": "unknown",
+    "non_compressed_lse": "unknown",
+    "compressor_pooling": "unknown",
+}
+
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
 # ---------------------------------------------------------------------------
@@ -74,6 +83,22 @@ def get_compress_topk_idxs(
     """All-compressed-position indices [batch, seqlen, seqlen // ratio]."""
     matrix = _get_compress_topk_idxs_cached(ratio, seqlen, offset, str(device))
     return matrix.unsqueeze(0).expand(batch_size, -1, -1)
+
+
+@lru_cache(maxsize=8)
+def _get_compress_causal_mask_cached(
+    ratio: int, seqlen: int, n_compressed: int, device_str: str
+) -> torch.Tensor:
+    """Return the additive causal mask for compressed positions (cached)."""
+    compressed_positions = torch.arange(n_compressed, device=device_str).unsqueeze(0)
+    valid_counts = torch.arange(1, seqlen + 1, device=device_str).unsqueeze(1) // ratio
+    return torch.where(compressed_positions >= valid_counts, float("-inf"), 0.0)
+
+
+@lru_cache(maxsize=8)
+def _get_compress_valid_counts_cached(ratio: int, seqlen: int, device_str: str) -> torch.Tensor:
+    """Return the number of causally valid compressed positions per query (cached)."""
+    return torch.arange(1, seqlen + 1, device=device_str).unsqueeze(1) // ratio
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +211,9 @@ def unfused_compressed_sparse_attn(
 ) -> torch.Tensor:
     """Differentiable sparse attention with MQA and attention sink.
 
+    Determinism:
+        Unknown. Bit-exact forward and backward repeatability has not been certified.
+
     Args:
         query:        [sq, b, np, hn]   multi-head query.
         kv_full:      [n_kv, b, hn]     single-head KV (original + compressed).
@@ -197,17 +225,22 @@ def unfused_compressed_sparse_attn(
         output:       [sq, b, np * hn]
     """
     sq, b, np_, hn = query.size()
+    if attn_sink.ndim != 1 or attn_sink.numel() != np_:
+        raise ValueError(
+            f"attn_sink must contain one value per query head ({np_}), "
+            f"got shape {tuple(attn_sink.shape)}."
+        )
 
     # --- Gather KV at topk positions ---
-    # kv_full: [n_kv, b, hn] -> [b, n_kv, hn]
-    kv_t = kv_full.permute(1, 0, 2)
-
-    safe_indices = topk_indices.clamp(min=0).long()  # [b, sq, topk]
-    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, -1, hn)  # [b, sq, topk, hn]
-    # [b, n_kv, hn] -> [b, 1, n_kv, hn] -> gather -> [b, sq, topk, hn]
-    kv_gathered = torch.gather(
-        kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=safe_indices_exp
-    )
+    # Flatten batch and KV position before gathering. Gathering from a logical
+    # [b, sq, n_kv, hn] expanded view makes gather backward allocate that entire
+    # dense shape before reducing the stride-0 query dimension.
+    n_kv = kv_full.size(0)
+    topk = topk_indices.size(-1)
+    kv_flat = kv_full.permute(1, 0, 2).reshape(b * n_kv, hn)
+    batch_offsets = (torch.arange(b, device=kv_full.device, dtype=torch.int64) * n_kv).view(b, 1, 1)
+    safe_indices = topk_indices.clamp(min=0).to(dtype=torch.int64) + batch_offsets
+    kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(b, sq, topk, hn)
 
     # --- Attention scores ---
     # query: [sq, b, np, hn] -> [b, np, sq, hn]
@@ -252,6 +285,9 @@ def _compute_unfused_csa_non_compressed_lse(
     chunk_size: int = 512,
 ) -> torch.Tensor:
     """Return the detached sliding-window-plus-sink log mass for the CSA teacher.
+
+    Determinism:
+        Unknown. Bit-exact CUDA reduction behavior has not been certified.
 
     Args:
         query: Query tensor in ``[sq, batch, heads, head_dim]`` layout.
@@ -331,6 +367,14 @@ class CompressorSubmodules:
     linear_wkv: Union[ModuleSpec, type] = None
     linear_wgate: Union[ModuleSpec, type] = None
     norm: Union[ModuleSpec, type] = None
+
+
+def _pool_compressor_values(
+    kv: torch.Tensor, score: torch.Tensor, output_dtype: torch.dtype
+) -> torch.Tensor:
+    """Pool compressor values with FP32 weights, products, and reduction."""
+    weights = torch.softmax(score, dim=1, dtype=torch.float32)
+    return (kv.float() * weights).sum(dim=1).to(output_dtype)
 
 
 class Compressor(MegatronModule):
@@ -443,6 +487,9 @@ class Compressor(MegatronModule):
     def forward(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         """Compress hidden states into shorter KV sequence.
 
+        Determinism:
+            Unknown. Bit-exact CUDA pooling and gradient reductions have not been certified.
+
         Args:
             x: [sq, b, hidden_size]
 
@@ -478,10 +525,9 @@ class Compressor(MegatronModule):
             kv = self._overlap_transform(kv, fill_value=0)
             score = self._overlap_transform(score, fill_value=float("-inf"))
 
-        weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
-        kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
+        kv = _pool_compressor_values(kv, score, x.dtype)  # [n_compressed, b, head_dim]
 
-        kv = self.norm(kv.to(x.dtype))
+        kv = self.norm(kv)
 
         kv = _apply_rope(
             kv,
@@ -672,13 +718,15 @@ class CompressedSparseAttentionSubmodules:
 class CompressedSparseAttention(MegatronModule):
     """Sparse core attention for CompressedSparseAttention.
 
-    Combines sliding window attention with compressed KV attention.  The spec always
-    provides compressor and indexer submodule specs; this ``__init__`` inspects
-    ``config.csa_compress_ratios[layer_idx]`` and conditionally builds them:
+    Combines sliding-window attention with compressed KV attention. The spec always
+    provides compressor and indexer submodule specs; which are built depends on the
+    ``compress_ratio`` passed by the caller:
 
-    * ``ratio == 0``:  window-only (compressor and indexer NOT built)
-    * ``ratio == 4``:  window + 4x compressed + learned Indexer (both built)
-    * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
+    * ``ratio <= 1``: window-only (neither compressor nor indexer is built).
+    * ``ratio > 1``: window + compressed KV via ``Compressor``.
+    * ``ratio == 4`` and not ``config.csa_dense_mode``: additionally builds
+      ``CSAIndexer`` for learned top-k retrieval over compressed positions. Otherwise,
+      all causally valid compressed positions are attended.
     """
 
     def __init__(
@@ -711,12 +759,19 @@ class CompressedSparseAttention(MegatronModule):
             )
         self.pg_collection = pg_collection
 
+        tp_size = self.pg_collection.tp.size()
+        if tp_size != 1:
+            raise ValueError(
+                "CompressedSparseAttention supports only tensor-parallel size 1 in the "
+                f"native SBHD slice, got tp_size={tp_size}."
+            )
+
         self.layer_number = layer_number + self.config.num_layers if is_mtp_layer else layer_number
         self.compress_ratio = compress_ratio
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
-        self.n_local_heads = config.num_attention_heads
+        self.num_attention_heads = config.num_attention_heads
 
         if softmax_scale is None:
             softmax_scale = config.v_head_dim**-0.5
@@ -724,7 +779,7 @@ class CompressedSparseAttention(MegatronModule):
 
         # Learnable attention sink per head, kept in reference-checkpoint FP32.
         self.attn_sink = mark_keep_in_fp32(
-            nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
+            nn.Parameter(torch.zeros(self.num_attention_heads, dtype=torch.float32))
         )
 
         # Conditionally build Compressor (ratio > 1)
@@ -796,6 +851,16 @@ class CompressedSparseAttention(MegatronModule):
                 "CompressedSparseAttention supports only an implicit causal mask in the "
                 "native SBHD slice; padding and document-boundary masks are not supported."
             )
+        if query.ndim != 4:
+            raise ValueError(
+                "CompressedSparseAttention query must have shape [seq, batch, heads, dim], "
+                f"got {tuple(query.shape)}."
+            )
+        if query.size(2) != self.num_attention_heads:
+            raise ValueError(
+                "CompressedSparseAttention query head count must match the unsharded "
+                f"attention sink ({self.num_attention_heads}), got {query.size(2)}."
+            )
         nvtx_range_push("compressed_sparse_attn")
         assert (
             packed_seq_params is None
@@ -834,14 +899,12 @@ class CompressedSparseAttention(MegatronModule):
                 qr_det = qr.detach()
 
                 causal_mask = (
-                    torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
-                )
-                positions = torch.arange(1, sq + 1, device=x.device).unsqueeze(1)
-                causal_mask = (
-                    torch.where(causal_mask >= positions // self.compress_ratio, float("-inf"), 0.0)
+                    _get_compress_causal_mask_cached(
+                        self.compress_ratio, sq, n_compressed, str(x.device)
+                    )
                     .unsqueeze(0)
                     .expand(b, -1, -1)
-                )  # [b, sq, n_compressed]
+                )
 
                 if self.training and torch.is_grad_enabled():
                     q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
@@ -853,6 +916,13 @@ class CompressedSparseAttention(MegatronModule):
                     non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
                         query, kv, self.attn_sink, window_idxs, self.softmax_scale
                     )
+                    # The native reference intentionally recomputes sliding-window
+                    # logits in the final attention call below. The teacher needs its
+                    # detached denominator before indexer top-k is available; sharing
+                    # it without materializing the full window gather requires a larger
+                    # data-flow change. TODO(#6404): its fused training backend avoids
+                    # this duplicate, but the native fallback should share the gathered
+                    # window KV/logits instead of retaining this correctness-first helper.
                     topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
                         q_indexer,
                         weights_for_unfused,
@@ -882,11 +952,11 @@ class CompressedSparseAttention(MegatronModule):
                 else:
                     _, topk_indices_compressed = self.indexer(x_det, qr_det, mask=causal_mask)
 
-                n_valid_per_pos = positions // self.compress_ratio  # [sq, 1]
-                valid = (topk_indices_compressed >= 0) & (topk_indices_compressed < n_valid_per_pos)
-                compress_topk_idxs = torch.where(
-                    valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
+                n_valid_per_pos = _get_compress_valid_counts_cached(
+                    self.compress_ratio, sq, str(x.device)
                 )
+                valid = (topk_indices_compressed >= 0) & (topk_indices_compressed < n_valid_per_pos)
+                compress_topk_idxs = torch.where(valid, topk_indices_compressed + offset, -1)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
                     self.compress_ratio, b, sq, offset, query.device
