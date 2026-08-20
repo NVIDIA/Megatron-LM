@@ -150,6 +150,22 @@ param_group_identifier_keys = (
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
+_MOK_HIGH_PRECISION_INIT_ATTR = "_mok_high_precision_init_val"
+
+
+def _pop_high_precision_init_val(param: torch.Tensor) -> torch.Tensor | None:
+    """Consume a preserved pre-quantization value used to seed an FP32 master."""
+    mok_init_val = getattr(param, _MOK_HIGH_PRECISION_INIT_ATTR, None)
+    if mok_init_val is not None:
+        delattr(param, _MOK_HIGH_PRECISION_INIT_ATTR)
+        return mok_init_val
+
+    get_high_precision_init_val = getattr(param, "get_high_precision_init_val", None)
+    if callable(get_high_precision_init_val):
+        init_val = get_high_precision_init_val()
+        param.clear_high_precision_init_val()
+        return init_val
+    return None
 
 
 def _get_param_grad_norm_group(param: torch.nn.Parameter) -> Optional[str]:
@@ -1002,24 +1018,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Native quantized parameters may retain their pre-quantization
-                            # BF16/FP16 initializer on CPU. Build the FP32 master from that value
-                            # so primary-weight and non-primary-weight runs start identically.
-                            # Falling back to the model parameter is correct for ordinary
-                            # BF16/FP16 parameters and older quantized-tensor implementations.
-                            get_high_precision_init_val = getattr(
-                                param, 'get_high_precision_init_val', None
-                            )
-                            high_precision_init_val = (
-                                get_high_precision_init_val()
-                                if get_high_precision_init_val is not None
-                                else None
-                            )
+                            # Seed the fp32 master from the high-precision pre-quantization init
+                            # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
+                            # fp8_param_gather ON/OFF hold an identical master at iter 0.
+                            high_precision_init_val = _pop_high_precision_init_val(param)
                             if high_precision_init_val is not None:
-                                main_param = high_precision_init_val.to(
-                                    device=param.device, dtype=torch.float32, copy=True
+                                main_param = (
+                                    high_precision_init_val.detach()
+                                    .clone()
+                                    .to(param.device)
+                                    .float()
                                 )
-                                param.clear_high_precision_init_val()
                             else:
                                 main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
