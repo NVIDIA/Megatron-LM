@@ -807,12 +807,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 ep_group=self.expert_model_parallel_group,
             )
 
-        # Pre-allocate the vLLM fused-MoE intermediates (default-on) so no allocation
-        # happens inside CUDA graph capture; one buffer set is shared by all MoE
-        # layers and graphs.
+        # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
+        # inside CUDA graph capture; one buffer set is shared by all MoE layers
+        # and graphs. Like the dispatcher buffers above, these persist across
+        # engine suspend/resume.
         if (
-            getattr(model_config, 'inference_moe_persistent_intermediate_buffers', True)
-            and model_config.num_moe_experts
+            model_config.num_moe_experts
             and model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
         ):
             ep_size = get_pg_size(self.expert_model_parallel_group)

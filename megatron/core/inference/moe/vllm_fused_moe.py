@@ -238,10 +238,11 @@ class VllmFusedMoeBuffers:
     serialized on one stream and each buffer is fully rewritten (gated by the
     indirection tables) before it is read within a single vllm_fused_moe call.
 
-    Default-on for the vllm backend via
-    TransformerConfig.inference_moe_persistent_intermediate_buffers. When not
-    allocated (opt-out, eager/standalone use, tests), get() falls back to
-    torch.empty.
+    Like the dispatcher symmetric-memory buffers, these persist for the process
+    lifetime, including across engine suspend/resume: suspend deletes the CUDA
+    graphs (whose captures bake in these addresses), and resume re-captures
+    against the same live buffers. When not allocated (eager/standalone use,
+    tests), get() falls back to torch.empty.
     """
 
     # name -> flat 1D tensor; requests are served as sliced views.
