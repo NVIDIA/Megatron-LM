@@ -30,6 +30,11 @@ export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 export ROLLOUT_N="${ROLLOUT_N:-1}"
 export ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.55}"
 export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-2048}"
+# Weight synchronization owns both an IPC buffer and a producer staging
+# buffer. Keep each at 1 GiB in the deliberately dense PP1 four-GPU gate so a
+# sleeping vLLM layer can be materialized without overlapping two 2-GiB
+# transport buffers. This does not change model or kernel numerics.
+export UPDATE_WEIGHTS_BUCKET_MEGABYTES="${UPDATE_WEIGHTS_BUCKET_MEGABYTES:-1024}"
 export TOTAL_EPOCHS=1
 export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-1}"
 export SAVE_FREQ=-1
@@ -91,6 +96,7 @@ exec bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "actor_rollout_ref.rollout.agent.num_workers=4" \
   "actor_rollout_ref.rollout.max_num_seqs=4" \
   "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096" \
+  "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=${UPDATE_WEIGHTS_BUCKET_MEGABYTES}" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.all2all_backend=deepep_low_latency" \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.linear_backend=deep_gemm" \
   "actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=deep_gemm" \
