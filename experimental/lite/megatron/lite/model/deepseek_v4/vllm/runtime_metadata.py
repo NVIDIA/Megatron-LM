@@ -950,12 +950,7 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             ),
             indexer_metadata=indexer_runtime,
         )
-        prepared = False
-
         def prepare_flash() -> None:
-            nonlocal prepared
-            if prepared:
-                return
             gather = _symbol(
                 "vllm.models.deepseek_v4.common.ops",
                 "dequantize_and_gather_k_cache",
@@ -988,7 +983,11 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
                 "combine_topk_swa_indices",
             )
             indices, lengths = combine(
-                metadata.indices.squeeze(1),
+                # ``topk`` is the per-forward source layout.  ``metadata.indices``
+                # is the derived FlashMLA layout and is overwritten below; using
+                # it as input on activation recompute would combine twice.  The
+                # indexer updates ``topk`` in place for C4 layers.
+                topk,
                 base.runtime_layout.query_start_loc,
                 base.runtime_layout.seq_lens,
                 torch.tensor(gathered_lens, dtype=torch.int32, device=self.device),
@@ -1001,7 +1000,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             )
             metadata.indices = indices.unsqueeze(1)
             metadata.topk_length = lengths
-            prepared = True
 
         metadata.prepare_flash = prepare_flash
         metadata.runtime_layout = SimpleNamespace(

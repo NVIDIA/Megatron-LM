@@ -48,6 +48,7 @@ class ImplConfig(LiteImplConfig):
     mtp_enable: bool = False
     dsa_indexer_loss_coeff: float = 0.0
     max_tokens_per_rank: int = 8192
+    logprob_chunk_size: int = 8192
 
 
 def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
@@ -55,6 +56,8 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
         raise ValueError("dsa_indexer_loss_coeff must be >= 0")
     if impl_cfg.max_tokens_per_rank <= 0:
         raise ValueError("max_tokens_per_rank must be positive")
+    if impl_cfg.logprob_chunk_size <= 0:
+        raise ValueError("logprob_chunk_size must be positive")
     if not 0 <= model_cfg.num_hash_layers <= model_cfg.num_hidden_layers:
         raise ValueError(
             "num_hash_layers is a zero-based prefix length and must be between "
@@ -203,6 +206,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         ps=parallel_state,
         use_deepep=impl_cfg.use_deepep,
         indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
+        logprob_chunk_size=impl_cfg.logprob_chunk_size,
     )
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:

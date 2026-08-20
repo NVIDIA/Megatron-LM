@@ -342,6 +342,56 @@ def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
     assert metadata.kv_workspace.shape == (22, 1, 512)
 
 
+def test_prepare_flash_rebuilds_derived_layout_for_activation_recompute(
+    monkeypatch,
+) -> None:
+    combine_inputs = []
+    gather = Mock()
+
+    def combine(topk, *_args, out):
+        combine_inputs.append(topk)
+        indices, lengths = out
+        indices.fill_(len(combine_inputs))
+        lengths.fill_(topk.shape[-1])
+        return indices, lengths
+
+    def symbol(_module, name):
+        if name == "DeepseekV32IndexerMetadata":
+            return lambda **kwargs: SimpleNamespace(**kwargs)
+        if name == "DeepseekV32IndexerPrefillMetadata":
+            return lambda chunks: SimpleNamespace(chunks=chunks)
+        if name == "build_prefill_chunk_metadata":
+            return lambda *_args: None
+        if name == "dequantize_and_gather_k_cache":
+            return gather
+        if name == "combine_topk_swa_indices":
+            return combine
+        raise AssertionError(name)
+
+    monkeypatch.setattr(runtime, "_symbol", symbol)
+    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+        _config(),
+        layer_idx=2,
+        device="cpu",
+        cos_sin_cache=torch.empty(256, 128),
+    ).build_prefill_batch([5, 9])
+    source_topk = metadata.indices[:, 0]
+
+    metadata.prepare_flash()
+    assert metadata.indices.ndim == 3
+    assert metadata.indices[0, 0, 0].item() == 1
+    metadata.prepare_flash()
+    assert metadata.indices.ndim == 3
+    assert metadata.indices[0, 0, 0].item() == 2
+
+    assert gather.call_count == 4
+    assert len(combine_inputs) == 2
+    assert combine_inputs[0] is combine_inputs[1]
+    assert combine_inputs[0].untyped_storage().data_ptr() == source_topk.untyped_storage().data_ptr()
+    assert combine_inputs[0].shape == source_topk.shape
+    assert combine_inputs[0].ndim == 2
+
+
 def test_layer3_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
     metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
         _config(max_position_embeddings=512),

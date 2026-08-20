@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import torch
@@ -8,6 +9,11 @@ from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm import model as model_module
 from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Model
+
+
+def test_model_constructor_owns_logprob_chunk_size() -> None:
+    parameters = inspect.signature(DeepseekV4Model.__init__).parameters
+    assert parameters["logprob_chunk_size"].default == 8192
 
 
 class _Layer(nn.Module):
@@ -44,7 +50,7 @@ def _head_graph(x, fn, scale, base, eps):
 def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) -> None:
     torch.manual_seed(29)
     device = torch.device("cuda")
-    tokens, hidden, mult, vocab = 5, 8, 2, 17
+    tokens, hidden, mult, vocab = 5, 128, 2, 17
     config = SimpleNamespace(
         num_hidden_layers=1,
         vocab_size=vocab,
@@ -66,7 +72,7 @@ def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) 
     model.hc_head.hc_scale = nn.Parameter(torch.randn(mult))
     model.hc_head.hc_base = nn.Parameter(torch.randn(mult))
     model.lm_head = nn.Linear(hidden, vocab, bias=False)
-    model._head_weight_for_fused_ce = lambda _hidden: model.lm_head.weight
+    model._logprob_chunk_size = 2
     model.ps = SimpleNamespace(tp_group=None)
     model._input_tensor = None
     model._shared_projection_streams = None
@@ -111,3 +117,120 @@ def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) 
     for parameter in expected_parameters:
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
+
+    rollout_value = -labels.float()
+    monkeypatch.setattr(
+        model_module,
+        "_rollout_selected_log_probs",
+        lambda _logits, chunk_labels, _temperature: -chunk_labels.float(),
+    )
+    with torch.no_grad():
+        forward_only = model(
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            temperature=1.0,
+            calculate_entropy=False,
+        )
+    torch.testing.assert_close(
+        forward_only["log_probs"], rollout_value, rtol=0, atol=0
+    )
+
+
+def test_aligned_chunked_logprob_uses_rollout_value_and_same_head_vjp(
+    monkeypatch,
+) -> None:
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    tokens, hidden, vocab = 5, 64, 19
+    temperature = 0.7
+    labels = torch.tensor([1, 3, 5, 7, 9], device=device)
+
+    head = nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.bfloat16)
+    value = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16, requires_grad=True)
+    reference_value = value.detach().clone().requires_grad_()
+    reference_weight = head.weight.detach().clone().requires_grad_()
+    calls = []
+
+    def rollout_value(logits, chunk_labels, chunk_temperature):
+        calls.append(logits.shape[0])
+        assert chunk_temperature == temperature
+        return 1000.0 + chunk_labels.float()
+
+    monkeypatch.setattr(model_module, "_rollout_selected_log_probs", rollout_value)
+    actual, entropy = model_module._aligned_selected_log_probs(
+        value,
+        head,
+        labels,
+        temperature,
+        2,
+        calculate_entropy=False,
+    )
+    assert entropy is None
+    torch.testing.assert_close(actual, 1000.0 + labels.float(), rtol=0, atol=0)
+    actual.sum().backward()
+
+    reference_chunks = []
+    for start in range(0, tokens, 2):
+        stop = min(start + 2, tokens)
+        reference_logits = F.linear(
+            reference_value[start:stop], reference_weight
+        )
+        reference = F.log_softmax(
+            reference_logits.float() / temperature, dim=-1
+        )
+        reference_chunks.append(
+            reference.gather(
+                -1, labels[start:stop].unsqueeze(-1)
+            ).squeeze(-1)
+        )
+    reference = torch.cat(reference_chunks, dim=0)
+    reference.sum().backward()
+
+    assert calls[:3] == [2, 2, 1]
+    torch.testing.assert_close(value.grad, reference_value.grad, rtol=0, atol=0)
+    torch.testing.assert_close(head.weight.grad, reference_weight.grad, rtol=0, atol=0)
+
+    calls.clear()
+    with torch.no_grad():
+        forward_only, _ = model_module._aligned_selected_log_probs(
+            value,
+            head,
+            labels,
+            temperature,
+            2,
+            calculate_entropy=False,
+        )
+    torch.testing.assert_close(
+        forward_only, 1000.0 + labels.float(), rtol=0, atol=0
+    )
+    assert calls == [2, 2, 1]
+
+
+def test_supported_local_head_chunk_matches_unchunked_vllm_logprob() -> None:
+    torch.manual_seed(37)
+    device = torch.device("cuda")
+    tokens, hidden, vocab = 4096, 128, 257
+    labels = torch.randint(0, vocab, (tokens,), device=device)
+    value = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    head = nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        chunked, _ = model_module._aligned_selected_log_probs(
+            value,
+            head,
+            labels,
+            1.0,
+            8192,
+            calculate_entropy=False,
+        )
+        unchunked, _ = model_module._aligned_selected_log_probs(
+            value,
+            head,
+            labels,
+            1.0,
+            tokens,
+            calculate_entropy=False,
+        )
+
+    torch.testing.assert_close(chunked, unchunked, rtol=0, atol=0)
