@@ -132,11 +132,6 @@ class SharedExpertMLP(MLP):
             name=name,
             pg_collection=pg_collection,
         )
-        set_glu_linear_fc1_attributes(
-            self.linear_fc1,
-            self.config.gated_linear_unit,
-            self.config.moe_shared_expert_glu_interleave_size,
-        )
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -396,6 +391,11 @@ class FusedSharedExpertMLP(SharedExpertMLP):
     ):
         super().__init__(
             config=config, submodules=submodules, gate=gate, pg_collection=pg_collection, name=name
+        )
+        set_glu_linear_fc1_attributes(
+            self.linear_fc1,
+            self.config.gated_linear_unit,
+            self.config.moe_shared_expert_glu_interleave_size,
         )
         self._fused_grouped_swiglu_ops = None
         self._fused_grouped_swiglu_recipe = None
