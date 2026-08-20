@@ -2244,6 +2244,47 @@ class TestMultiTokenPredictionHybrid:
                 assert param.main_grad is not None
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    def test_full_recompute_with_multi_layer_chunks_mamba(self):
+        """Hybrid MTP accepts decoder-sized uniform recompute chunks."""
+        args = self.create_test_args(
+            tp=1,
+            cp=1,
+            sequence_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            full_recompute=True,
+        )
+        # The main pattern has four symbols and each MTP pattern has two. A chunk
+        # size larger than both should checkpoint each nested HybridStack once.
+        args.recompute_num_layers = 8
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model, _, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
+        )
+
+        output = model[0].forward(
+            input_ids=batch['tokens'],
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+        )
+        output.mean().backward()
+
+        for name, param in model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     def test_attention_mask_validation_mamba(self):
         """Test that attention mask type validation works for Mamba hybrid models."""
         tp = 1
