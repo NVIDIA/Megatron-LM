@@ -417,6 +417,18 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     assert db.dtype == beta.dtype and dg.dtype == g.dtype
 
 
+def test_gdn_pre_gdr_producers_emit_fp32_beta():
+    package = Path(__file__).parents[3] / "megatron/core"
+    gdn_source = (package / "ssm/gated_delta_net/gdn.py").read_text()
+    fused_pre_source = (package / "fusions/fused_pre_gated_delta_rule.py").read_text()
+
+    assert "beta = beta.sigmoid().to(torch.float32)" in gdn_source
+    assert (
+        "beta = torch.empty(batch, seq_len, num_value_heads, dtype=torch.float32"
+        in fused_pre_source
+    )
+
+
 def test_bf16_output_h_initialization_moves_to_kernel():
     package = (
         Path(__file__).parents[3]

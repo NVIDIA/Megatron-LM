@@ -95,7 +95,7 @@ class GatedDeltaNet(_GDNBase):
         # ``gate_feats`` arrives in ``in_proj_split_names`` order: beta, then alpha.
         beta, alpha = gate_feats
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
+        beta = beta.sigmoid().to(torch.float32)
         return g, {"beta": beta.contiguous()}
 
     def forward(
