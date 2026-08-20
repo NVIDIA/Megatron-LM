@@ -50,6 +50,12 @@ export VERL_LOCAL_TASK_RUNNER=1
 export VERL_ENGINE_LAZY_IMPORTS=1
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
+# This is an NVIDIA-only recipe. Some Slurm/Pyxis versions export the ROCm
+# visibility aliases alongside CUDA_VISIBLE_DEVICES; VERL correctly rejects
+# that ambiguous pair. Remove the inapplicable aliases before Ray snapshots
+# the worker environment.
+unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
+
 # Keep this release gate free of tensor dumps, forced synchronization, and
 # validation probes so its timings remain representative.
 unset MLITE_CUDA_SYNC_BOUNDARIES MLITE_CUDA_SYNC_BOUNDARY_STAGES
