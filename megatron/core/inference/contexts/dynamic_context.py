@@ -449,18 +449,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             for global_layer_idx, layer_config in enumerate(
                 mamba_inference_state_config.layer_config_list
             ):
-                if type(layer_config) is AttentionLayerConfig:
+                if isinstance(layer_config, AttentionLayerConfig):
                     attention_layer_map[global_layer_idx] = len(attention_layer_map)
-                elif type(layer_config) is DSALayerConfig:
+                elif isinstance(layer_config, DSALayerConfig):
                     dsa_layer_map[global_layer_idx] = len(dsa_layer_map)
-                elif type(layer_config) is MambaLayerConfig:
+                elif isinstance(layer_config, MambaLayerConfig):
                     mamba_layer_map[global_layer_idx] = len(mamba_layer_map)
-                elif type(layer_config) is GDNLayerConfig:
+                elif isinstance(layer_config, GDNLayerConfig):
                     raise NotImplementedError("GDN layers are not supported for inference.")
-                elif type(layer_config) is MLALayerConfig:
+                elif isinstance(layer_config, MLALayerConfig):
                     # Hybrid MLA cache mapping was not supported by the legacy path.
                     continue
-                elif type(layer_config) in (MLPLayerConfig, MoELayerConfig):
+                elif isinstance(layer_config, (MLPLayerConfig, MoELayerConfig)):
                     continue
                 else:
                     raise ValueError(

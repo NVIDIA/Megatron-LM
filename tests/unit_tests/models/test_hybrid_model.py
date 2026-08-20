@@ -248,7 +248,7 @@ class TestHybridModel:
         assert all(config is not self.model.config for config in decoder.layer_config_list)
         assert all(
             layer.config is layer_config
-            for layer, layer_config in zip(decoder.layers, decoder.layer_config_list)
+            for layer, layer_config in zip(decoder.layers, decoder.layer_config_list, strict=True)
         )
 
         num_weights = sum([p.numel() for p in self.model.parameters()])

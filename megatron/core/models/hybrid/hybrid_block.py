@@ -159,7 +159,7 @@ class HybridStack(MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if type(layer_config) is MambaLayerConfig:
+                if isinstance(layer_config, MambaLayerConfig):
                     layer = build_module(
                         submodules.mamba_layer,
                         config=layer_config,
@@ -168,7 +168,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif type(layer_config) is AttentionLayerConfig:
+                elif isinstance(layer_config, AttentionLayerConfig):
                     layer = build_module(
                         submodules.attention_layer,
                         config=layer_config,
@@ -179,7 +179,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif type(layer_config) is DSALayerConfig:
+                elif isinstance(layer_config, DSALayerConfig):
                     layer = build_module(
                         submodules.dsa_layer,
                         config=layer_config,
@@ -190,7 +190,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif type(layer_config) is MLALayerConfig:
+                elif isinstance(layer_config, MLALayerConfig):
                     layer = build_module(
                         submodules.mla_layer,
                         config=layer_config,
@@ -200,7 +200,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
                     )
-                elif type(layer_config) is MLPLayerConfig:
+                elif isinstance(layer_config, MLPLayerConfig):
                     layer = build_module(
                         submodules.mlp_layer,
                         config=layer_config,
@@ -209,7 +209,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif type(layer_config) is MoELayerConfig:
+                elif isinstance(layer_config, MoELayerConfig):
                     layer = build_module(
                         submodules.moe_layer,
                         config=layer_config,
@@ -218,7 +218,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif type(layer_config) is GDNLayerConfig:
+                elif isinstance(layer_config, GDNLayerConfig):
                     gdn_layer_spec = submodules.gdn_layer
                     if layer_config.experimental_attention_variant == "gdn2":
                         # 'G' layers build the GDN2 variant when the gdn2 experimental
@@ -315,8 +315,8 @@ class HybridStack(MegatronModule):
         Returns the Mamba conv and ssm states shapes per input sequence
         if this block contains Mamba layers (this may not be the case with PP > 1).
         """
-        for layer_config, layer in zip(self.layer_config_list, self.layers):
-            if type(layer_config) is MambaLayerConfig:
+        for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
+            if isinstance(layer_config, MambaLayerConfig):
                 return layer.mamba_state_shapes_per_request()
         return None
 
@@ -421,7 +421,7 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
-                for layer_config, layer in zip(self.layer_config_list, self.layers):
+                for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         layer_config, layer.layer_number - 1

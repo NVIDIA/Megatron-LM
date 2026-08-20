@@ -193,7 +193,16 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_hybrid_cache_maps_use_exact_layer_config_types(self):
+    def test_hybrid_cache_maps_accept_layer_config_subclasses(self):
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        class CustomDSALayerConfig(DSALayerConfig):
+            pass
+
+        class CustomMoELayerConfig(MoELayerConfig):
+            pass
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=3,
@@ -204,7 +213,9 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=True,
-            layer_config_list=make_layer_configs(MambaLayerConfig, DSALayerConfig, MoELayerConfig),
+            layer_config_list=make_layer_configs(
+                CustomMambaLayerConfig, CustomDSALayerConfig, CustomMoELayerConfig
+            ),
         )
 
         assert dynamic_context.num_attention_layers == 1

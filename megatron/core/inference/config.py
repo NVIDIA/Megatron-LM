@@ -55,7 +55,7 @@ class MambaInferenceStateConfig:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_config_list = getattr(decoder, "layer_config_list", None)
         if layer_config_list is not None and any(
-            type(layer_config) is MambaLayerConfig for layer_config in layer_config_list
+            isinstance(layer_config, MambaLayerConfig) for layer_config in layer_config_list
         ):
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
@@ -74,8 +74,8 @@ class MambaInferenceStateConfig:
             elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
             mamba_chunk_size = 128
-            for layer_config, layer in zip(layer_config_list, decoder.layers):
-                if type(layer_config) is MambaLayerConfig and hasattr(layer, 'mixer'):
+            for layer_config, layer in zip(layer_config_list, decoder.layers, strict=True):
+                if isinstance(layer_config, MambaLayerConfig) and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
             return cls(
