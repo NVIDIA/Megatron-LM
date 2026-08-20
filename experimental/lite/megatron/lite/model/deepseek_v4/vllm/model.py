@@ -208,6 +208,11 @@ class _AttentionState(CompressedSparseAttention):
         self._projection_streams: list[torch.cuda.Stream] | None = None
         self._projection_events: list[torch.cuda.Event] | None = None
 
+    def clear_deployment_weight_cache(self) -> None:
+        self.adapters.fused_linear.clear_cache()
+        self.adapters.q_linear.clear_cache()
+        self.adapters.indexer_q_linear.clear_cache()
+
     def _input_projections(self, hidden_states: torch.Tensor):
         def fused_projection():
             return fused_block_fp8_linear(

@@ -129,6 +129,10 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         self.shared_gate_up_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
         self.shared_down_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
 
+    def clear_deployment_weight_cache(self) -> None:
+        self.shared_gate_up_fp8.clear_cache()
+        self.shared_down_fp8.clear_cache()
+
     def _build_experts(self, config: DeepseekV4Config, ps: ParallelState) -> nn.Module:
         return _VLLMVisibleExperts(config, ps)
 

@@ -214,3 +214,23 @@ def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
     assert bundle.chunks == [captured["wrapped"]]
     assert bundle.chunks[0].module is captured["raw"]
     assert bundle.extras["optimizer_backend"] == "dist_opt"
+
+
+def test_post_optimizer_step_invalidates_all_deployment_weights() -> None:
+    class CacheOwner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleared = 0
+
+        def clear_deployment_weight_cache(self) -> None:
+            self.cleared += 1
+
+    model = nn.Sequential(CacheOwner(), CacheOwner())
+    model._fp8_source_scales_valid = True
+    model._fp8_source_scales_by_name = {"weight": torch.ones(1)}
+
+    protocol._post_optimizer_step(model)
+
+    assert model._fp8_source_scales_valid is False
+    assert model._fp8_source_scales_by_name == {}
+    assert [module.cleared for module in model] == [1, 1]

@@ -51,6 +51,14 @@ class ImplConfig(LiteImplConfig):
     logprob_chunk_size: int = 8192
 
 
+def _post_optimizer_step(model: nn.Module) -> None:
+    invalidate_bound_source_scales(model)
+    for module in model.modules():
+        clear_cache = getattr(module, "clear_deployment_weight_cache", None)
+        if clear_cache is not None:
+            clear_cache()
+
+
 def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
     if impl_cfg.dsa_indexer_loss_coeff < 0.0:
         raise ValueError("dsa_indexer_loss_coeff must be >= 0")
@@ -366,9 +374,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         from vllm.v1.worker.workspace import reset_workspace_manager
 
         extras["close_hook"] = reset_workspace_manager
-    extras["post_optimizer_step_hook"] = lambda: invalidate_bound_source_scales(
-        model
-    )
+    extras["post_optimizer_step_hook"] = lambda: _post_optimizer_step(model)
     if post_model_load_hook is not None:
         extras["post_model_load_hook"] = post_model_load_hook
 
