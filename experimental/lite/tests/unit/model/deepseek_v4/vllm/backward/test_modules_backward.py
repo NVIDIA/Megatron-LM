@@ -86,6 +86,16 @@ def test_forward_only_uses_visible_path_without_autograd_owner() -> None:
     torch.testing.assert_close(output, visible(x, weight), rtol=0, atol=0)
 
 
+def test_linear_backward_rejects_master_mutation_after_forward() -> None:
+    value = torch.randn(2, 4, requires_grad=True)
+    weight = torch.randn(3, 4, requires_grad=True)
+    output = block_fp8_linear(F.linear, value, weight)
+    with torch.no_grad():
+        weight.add_(1)
+    with pytest.raises(RuntimeError, match="changed between forward and backward"):
+        output.sum().backward()
+
+
 def test_gate_linear_uses_bound_master_vjp() -> None:
     x = torch.randn(4, 6, requires_grad=True)
     weight = torch.randn(9, 6, requires_grad=True)
@@ -208,6 +218,27 @@ def test_fixed_route_vjp_uses_visible_ids() -> None:
     weights.backward(_grad_like(weights))
     reference = logits.detach().requires_grad_(True)
     visible(reference)[0].backward(_grad_like(weights))
+    torch.testing.assert_close(logits.grad, reference.grad)
+
+
+def test_router_backward_keeps_ids_snapshot_when_consumer_mutates_output() -> None:
+    torch.manual_seed(31)
+    logits = torch.randn(2, 5, requires_grad=True)
+    original_ids = torch.tensor([[4, 1], [0, 3]], dtype=torch.int32)
+
+    def visible(value):
+        scores = torch.sqrt(F.softplus(value)).gather(-1, original_ids.long())
+        return scores / scores.sum(-1, keepdim=True), original_ids.clone()
+
+    weights, returned_ids = fixed_route_vjp(
+        visible, logits, renormalize=True, route_scale=1.0
+    )
+    returned_ids.fill_(99)
+    grad = _grad_like(weights)
+    weights.backward(grad)
+
+    reference = logits.detach().requires_grad_(True)
+    visible(reference)[0].backward(grad)
     torch.testing.assert_close(logits.grad, reference.grad)
 
 
