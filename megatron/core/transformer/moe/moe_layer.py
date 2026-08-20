@@ -10,6 +10,7 @@ import torch
 
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
@@ -353,12 +354,11 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            if config.inference_grouped_gemm_backend == 'auto':
+            if config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
                 assert HAVE_FLASHINFER, (
-                    "inference_grouped_gemm_backend='auto'"
-                    "requires flashinfer-python. "
+                    "inference_grouped_gemm_backend='flashinfer' requires flashinfer-python. "
                     "Install flashinfer-python or set "
-                    "inference_grouped_gemm_backend to 'torch' or 'te'."
+                    "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
@@ -368,14 +368,14 @@ class MoELayer(BaseMoELayer):
                 from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                 check_flashinfer_jit_cache_installed()
-            elif config.inference_grouped_gemm_backend == 'torch':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
-            elif config.inference_grouped_gemm_backend == 'vllm':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."

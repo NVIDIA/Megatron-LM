@@ -1,0 +1,252 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: ~Build CI containers
+
+on:
+  workflow_call:
+    inputs:
+      is-maintainer:
+        description: Whether the workflow is running with maintainer resources
+        required: true
+        type: boolean
+      selected-runner:
+        description: Runner label for the H100 build
+        required: false
+        default: nvidia-ci-aws-gpu-x8
+        type: string
+      selected-runner-gb200:
+        description: Runner label for the GB200 build
+        required: false
+        default: nvidia-ci-aws-use2-gpu-x4
+        type: string
+      registry-aws:
+        description: Registry for H100 images and caches
+        required: false
+        # Keep registry defaults aligned with the image registries in cicd-main.yml.
+        default: 766267172432.dkr.ecr.us-east-1.amazonaws.com
+        type: string
+      registry-gb200:
+        description: Registry for GB200 images and caches
+        required: false
+        default: 766267172432.dkr.ecr.us-east-2.amazonaws.com
+        type: string
+      source-sha:
+        description: Immutable source commit to check out and build
+        required: true
+        type: string
+      lts:
+        description: Build the LTS container instead of the development container
+        required: false
+        default: false
+        type: boolean
+      timeout-minutes:
+        description: Maximum time allowed for the container build
+        required: false
+        default: 360
+        type: number
+      verify-cache:
+        description: Verify the exported BuildKit cache and add it to the job summary
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  cicd-compute-build-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
+    steps:
+      - name: Compute build matrix
+        id: compute
+        env:
+          IS_MAINTAINER: ${{ inputs.is-maintainer }}
+          ENABLE_GB_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
+          SELECTED_RUNNER: ${{ inputs.selected-runner }}
+          SELECTED_RUNNER_GB_GPU: ${{ inputs.selected-runner-gb200 }}
+          REGISTRY_AWS: ${{ inputs.registry-aws }}
+          REGISTRY_GB_GPU: ${{ inputs.registry-gb200 }}
+        run: |
+          AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
+            '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+          if [ "$IS_MAINTAINER" = "true" ] && [ "$ENABLE_GB_TESTING" = "true" ]; then
+            GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
+              '{"cloud": "gb-gpu", "registry": $registry, "runner": $runner}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
+              '{"include": [$aws, $gb_gpu]}')
+          else
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" '{"include": [$aws]}')
+          fi
+          echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
+
+  build-container:
+    name: Build CI container (${{ matrix.cloud }})
+    needs: cicd-compute-build-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source-sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.12
+
+      - name: Download test data
+        shell: bash
+        env:
+          NEMO_TEST_DATA_ROOT: /mnt/datadrive/TestData/nemo-fw/TestData
+        run: |
+          echo "::group::Download test data"
+          for attempt in 1 2 3; do
+            if pip install --no-cache-dir click requests \
+              && python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets; then
+              break
+            fi
+            echo "Download test data attempt ${attempt} failed, retrying..." >&2
+            if [ "${attempt}" -eq 3 ]; then
+              echo "Download test data failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::endgroup::"
+
+      - name: Compute cache config
+        id: cache_keys
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref || github.ref_name }}
+          CACHE_VARIANT: ${{ inputs.lts && 'lts' || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          REF: ${{ github.ref }}
+        run: |
+          BASE_REF="${BASE_REF#refs/heads/}"
+          CACHE_NAMESPACE=$(printf '%s' "$BASE_REF" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+          if [ -z "$CACHE_NAMESPACE" ]; then
+            echo "Unable to derive a cache namespace from base ref: $BASE_REF" >&2
+            exit 1
+          fi
+
+          if [ "$PR_NUMBER" = "0" ] && [ -n "$MERGE_GROUP_HEAD_REF" ]; then
+            PR_NUMBER=$(printf '%s' "$MERGE_GROUP_HEAD_REF" | sed -nE 's#.*pr-([0-9]+)-.*#\1#p')
+          fi
+
+          BASELINE_KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-baseline"
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "0" ]; then
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${PR_NUMBER}"
+          elif [ "$REF" = "refs/heads/$BASE_REF" ] || [ "$EVENT_NAME" = "schedule" ]; then
+            KEY="$BASELINE_KEY"
+          else
+            BRANCH_NAMESPACE=$(printf '%s' "$GITHUB_REF_NAME" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${BRANCH_NAMESPACE}"
+          fi
+
+          if [ "${#KEY}" -gt 100 ]; then
+            KEY="${KEY:0:83}-$(printf '%s' "$KEY" | sha256sum | cut -c1-16)"
+          fi
+          if [ "${#BASELINE_KEY}" -gt 100 ]; then
+            BASELINE_KEY="${BASELINE_KEY:0:83}-$(printf '%s' "$BASELINE_KEY" | sha256sum | cut -c1-16)"
+          fi
+
+          echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "baseline=$BASELINE_KEY" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Parse base image
+        id: base-image
+        shell: bash
+        env:
+          LTS: ${{ inputs.lts }}
+        run: |
+          if [ "$LTS" = "true" ]; then
+            NGC_VERSION=$(cat docker/.ngc_version.lts)
+            echo "version=$NGC_VERSION" | tee -a "$GITHUB_OUTPUT"
+            echo "image_type=lts" | tee -a "$GITHUB_OUTPUT"
+            echo "dockerfile=./docker/Dockerfile.ci.lts" | tee -a "$GITHUB_OUTPUT"
+          else
+            NGC_VERSION=$(cat docker/.ngc_version.dev)
+            echo "version=$NGC_VERSION" | tee -a "$GITHUB_OUTPUT"
+            echo "image_type=dev" | tee -a "$GITHUB_OUTPUT"
+            echo "dockerfile=./docker/Dockerfile.ci.dev" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Select cache donor
+        id: cache_from
+        shell: bash
+        env:
+          BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
+          LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
+          RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+        run: |
+          DONOR_CACHE="$RUN_CACHE"
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$BASELINE_CACHE"
+          fi
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$LEGACY_CACHE"
+          fi
+          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        env:
+          BUILDX_NO_DEFAULT_OCI_ARTIFACT: "true"
+        with:
+          file: ${{ steps.base-image.outputs.dockerfile }}
+          push: true
+          context: .
+          target: main
+          build-args: |
+            FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
+            IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
+          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
+          cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
+          no-cache: false
+          tags: |
+            ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
+            ${{ matrix.registry }}/megatron-lm:${{ inputs.source-sha }}-${{ matrix.cloud }}
+
+      - name: Verify exported cache
+        if: inputs.verify-cache
+        shell: bash
+        env:
+          CACHE_IMAGE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+        run: |
+          docker buildx imagetools inspect "$CACHE_IMAGE"
+          {
+            echo "### Build cache populated"
+            echo "- Platform: \`${{ matrix.cloud }}\`"
+            echo "- Cache: \`$CACHE_IMAGE\`"
+            echo "- Source: \`${{ inputs.source-sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
