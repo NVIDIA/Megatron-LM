@@ -40,8 +40,10 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     Status,
+    resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -1034,7 +1036,20 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                self._add_request(self.get_request(request_id))
+                request = self.get_request(request_id)
+                self._add_request(request)
+                # Buffer reinit above wipes the context's per-request image
+                # maps. Re-register them from the preserved VLM request fields
+                # so the resumed request sees its own image_embeddings /
+                # image_token_mask when the controller calls
+                # current_image_token_mask on the next step, rather than
+                # falling through to the text-only path.
+                if isinstance(request, DynamicVLMInferenceRequest):
+                    self.context.add_vlm_request_data(
+                        request_id,
+                        image_embeddings=request.image_embeddings,
+                        image_token_mask=request.image_token_mask,
+                    )
 
             # Ensure chunked prefill request remains at the head of the waiting queue
             if self.context.chunked_prefill_request_id != -1:
@@ -1141,6 +1156,35 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 request.generated_text = ""
         request_entry.future.set_result(request_entry.record)
+
+    def _fail_submission(
+        self, request_id: int, sampling_params: Optional[SamplingParams], exc: BaseException
+    ) -> None:
+        """Register a minimal failed request so a rejected admission still
+        produces a client-visible failure reply.
+
+        Called from the SUBMIT_REQUEST handler when image preprocessing or
+        add_request raises. Registering a placeholder record with
+        Status.FAILED lets ``_handle_failed_request`` publish the ENGINE_REPLY
+        without leaving the client hanging or killing the engine loop.
+        """
+        if self.rank == 0:
+            warnings.warn(
+                f"Request {request_id} rejected before admission: " f"{type(exc).__name__}: {exc}"
+            )
+        # Empty prompt tokens are safe — the reply short-circuits at
+        # Status.FAILED and the client sees the failure, not a completion.
+        placeholder_request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=torch.empty(0, dtype=torch.int64),
+            sampling_params=(sampling_params or SamplingParams()),
+        )
+        placeholder_request.status = Status.FAILED
+        self.requests[request_id] = RequestEntry(
+            record=DynamicInferenceRequestRecord.from_request(placeholder_request),
+            future=self._loop.create_future(),
+        )
+        self._handle_failed_request(request_id)
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
@@ -1301,8 +1345,24 @@ class DynamicInferenceEngine(AbstractEngine):
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
         precomputed_block_hashes: Optional[List[int]] = None,
+        *,
+        imgs: Optional[Tensor] = None,
+        num_tiles: Optional[Tensor] = None,
+        num_img_embeddings_per_tile: int = 0,
+        imgs_sizes: Optional[Tensor] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
+
+        Supports both text-only and multimodal requests. For text-only, call
+        with just (request_id, prompt, sampling_params). For multimodal, also
+        pass imgs and either (num_tiles + num_img_embeddings_per_tile) for static
+        resolution or imgs_sizes for dynamic resolution.
+
+        When multimodal kwargs are provided the method will:
+        1. Expand image tokens in the prompt (replace <image> with padding).
+        2. Run the vision encoder to produce image embeddings.
+        3. Store the embeddings and mask in the context for later use by the
+           controller's forward step.
 
         Args:
             request_id (int): Unique ID of request.
@@ -1311,6 +1371,14 @@ class DynamicInferenceEngine(AbstractEngine):
             precomputed_block_hashes (Optional[List[int]]): Prefix-cache hashes already
                 computed for the prompt's complete blocks. Values must match
                 ``compute_block_hashes_batched(prompt_tokens, block_size_tokens)``.
+            imgs (Optional[Tensor]): Image tensor [num_tiles, C, H, W] or
+                [1, total_patches, patch_features] (or None).
+            num_tiles (Optional[Tensor]): Number of tiles per image (1-D tensor, or None).
+                Static resolution.
+            num_img_embeddings_per_tile (int): Number of image embeddings per tile.
+                Static resolution.
+            imgs_sizes (Optional[Tensor]): Per-image sizes [N, 2] with [H, W].
+                Dynamic resolution.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1345,19 +1413,172 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        # Initialize request.
-        request = DynamicInferenceRequest(
+        if imgs is not None or num_tiles is not None or imgs_sizes is not None:
+            request = self._build_vlm_request(
+                request_id=request_id,
+                prompt_str=prompt_str,
+                tokens=tokens,
+                sampling_params=sampling_params,
+                imgs=imgs,
+                num_tiles=num_tiles,
+                num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                imgs_sizes=imgs_sizes,
+                precomputed_block_hashes=precomputed_block_hashes,
+            )
+            # _build_vlm_request has already registered the image embeddings
+            # and token mask into the context (add_vlm_request_data). If
+            # _add_request now rejects the request (oversized prompt, cache
+            # exhaustion, ...), those tensors would linger in the context
+            # dicts and leak GPU memory. Clean them up on failure.
+            try:
+                return self._add_request(request)
+            except Exception:
+                self.context.remove_vlm_request_data(request_id)
+                raise
+        else:
+            request = DynamicInferenceRequest(
+                request_id=request_id,
+                prompt=prompt_str,
+                prompt_tokens=tokens,
+                sampling_params=sampling_params,
+                block_size_tokens=self.context.block_size_tokens,
+                enable_prefix_caching=self.context.enable_prefix_caching,
+                precomputed_block_hashes=precomputed_block_hashes or [],
+            )
+
+        return self._add_request(request)
+
+    def _resolve_image_token_id(self) -> Optional[int]:
+        """Return the model's image token id, whichever wrapper level holds it.
+
+        None when the model marks images with a negative sentinel instead of a
+        real vocabulary entry (LLaVA's DEFAULT_IMAGE_TOKEN_INDEX), since such an
+        id is no more decodable than the padding it would replace.
+        """
+        module = getattr(self.controller.inference_wrapped_model, "model", None)
+        while module is not None:
+            image_token_index = getattr(module, "image_token_index", None)
+            if image_token_index is not None:
+                image_token_index = int(image_token_index)
+                return image_token_index if image_token_index >= 0 else None
+            module = getattr(module, "module", None)
+        return None
+
+    def _build_vlm_request(
+        self,
+        *,
+        request_id: int,
+        prompt_str: Optional[str],
+        tokens: Tensor,
+        sampling_params: Optional[SamplingParams],
+        imgs: Optional[Tensor],
+        num_tiles: Optional[Tensor],
+        num_img_embeddings_per_tile: int,
+        imgs_sizes: Optional[Tensor],
+        precomputed_block_hashes: Optional[List[int]] = None,
+    ) -> DynamicVLMInferenceRequest:
+        """Expand image tokens, run the vision encoder, register per-request
+        image data on the context, and return a DynamicVLMInferenceRequest.
+        """
+        # PP>1 needs a non-first-stage embedding recv path (the wrapper's
+        # _recv_only_vision_embeds TODO). Until that lands, only PP=1 is
+        # correct: non-first stages would see None embeddings but a non-None
+        # mask and silently skip image splicing.
+        pp_group = self.controller.pp_group
+        if pp_group is not None and torch.distributed.is_initialized():
+            pp_world_size = torch.distributed.get_world_size(pp_group)
+            if pp_world_size > 1:
+                raise NotImplementedError(
+                    "Dynamic VLM inference does not support pipeline parallel. "
+                    "PP>1 requires the non-first-stage embedding recv path "
+                    "which is not yet available upstream."
+                )
+
+        device = torch.cuda.current_device()
+        if imgs is not None:
+            imgs = imgs.to(device=device)
+        if num_tiles is not None:
+            num_tiles = num_tiles.to(device=device)
+        if imgs_sizes is not None:
+            imgs_sizes = imgs_sizes.to(device=device)
+
+        is_dynamic_resolution = imgs_sizes is not None and imgs is not None
+        # Dynamic-resolution requests derive their embedding count from
+        # imgs_sizes downstream and don't need num_tiles.sum() at admission.
+        # Static-tiling requests do; only pay the D2H sync on that path so
+        # dynamic-res admissions stay sync-free here.
+        if is_dynamic_resolution:
+            total_num_tiles = 0
+            num_img_embeddings = 0
+            has_images = True
+        else:
+            total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
+            num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
+            has_images = num_img_embeddings > 0
+
+        mask_tensor: Optional[Tensor] = None
+        image_embeddings: Optional[Tensor] = None
+
+        if has_images:
+            token_list: List[List[int]] = [tokens.tolist()]
+            expanded_tokens_list, mask_list = (
+                self.controller.inference_wrapped_model.expand_image_tokens(
+                    token_list, num_tiles=num_tiles, imgs_sizes=imgs_sizes
+                )
+            )
+            # expand_image_tokens pads the embedding slots with -1, but the mask
+            # below is what splices the embeddings in, so keep a real token id in
+            # prompt_tokens where the model has one: they are echoed to HTTP
+            # clients, detokenized for raw_text and hashed for prefix caching, and
+            # none of those accept a negative id.
+            expanded_tokens = expanded_tokens_list[0]
+            image_token_id = self._resolve_image_token_id()
+            if image_token_id is not None:
+                expanded_tokens = [
+                    image_token_id if token < 0 else token for token in expanded_tokens
+                ]
+            tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
+            mask_tensor = torch.tensor(
+                [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
+            )
+
+        # PP>1 is rejected above, so we're on the (only) stage that owns the
+        # vision encoder — no is_pipeline_first_stage check needed here.
+        if has_images and imgs is not None:
+            with torch.inference_mode():
+                image_embeddings = self.controller.inference_wrapped_model._forward_vision_encoder(
+                    imgs, num_image_tiles=num_tiles, imgs_sizes=imgs_sizes
+                )
+
+        self.context.add_vlm_request_data(
+            request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor
+        )
+
+        # Image-bearing requests: skip prefix caching. After image expansion,
+        # two requests with the same text but different images produce
+        # identical token sequences (runs of -1 pads), so KV block hashes
+        # collide and the second request would serve completions conditioned
+        # on the first request's image. Disabling caching at the request
+        # level is a correctness fix; a follow-up could mix an image digest
+        # into the block hash for cross-request reuse of identical (text,
+        # image) pairs.
+        request_has_images = has_images
+        enable_prefix_caching = self.context.enable_prefix_caching and not request_has_images
+        return DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
-            enable_prefix_caching=self.context.enable_prefix_caching,
+            enable_prefix_caching=enable_prefix_caching,
             precomputed_block_hashes=precomputed_block_hashes or [],
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            decoder_seq_length=0,
+            image_embeddings=image_embeddings,
+            image_token_mask=mask_tensor,
         )
-
-        # Add request.
-        return self._add_request(request)
 
     def post_process_requests(
         self,
@@ -1724,6 +1945,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
+
+        # Remove VLM data for finished requests from the context.
+        for record in finished_request_records:
+            req = record[-1]
+            self.context.remove_vlm_request_data(req.request_id)
 
         return active_request_ids, finished_request_records
 
@@ -2849,10 +3075,42 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                # Payload is [request_id, prompt, sampling_params, multi_modal_data].
+                fields = data[1:]
+                if len(fields) == 3:
+                    request_id, prompt, sampling_params = fields
+                    multi_modal_data = None
+                else:
+                    request_id, prompt, sampling_params, multi_modal_data = fields[:4]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
-                self.add_request(request_id, prompt, sampling_params)
+                # TODO(perf): image preprocessing (PIL decode / resize /
+                # normalize / patchify) runs synchronously on the engine step
+                # loop, adding directly to inter-token latency for every
+                # in-flight request. Move off the engine thread — either via a
+                # bounded ThreadPoolExecutor here or, better, on the
+                # server/coordinator side before the ZMQ hop so the engine
+                # receives ready tensors.
+                try:
+                    if multi_modal_data is None:
+                        # Skip the config-attribute lookup for text-only
+                        # requests so test fixtures (DummyContext) without an
+                        # image_preprocessing_config don't AttributeError on
+                        # every SUBMIT_REQUEST and desync the ranks.
+                        vlm_kwargs = {}
+                    else:
+                        vlm_kwargs = resolve_multimodal_data_for_engine(
+                            multi_modal_data,
+                            image_preprocessing_config=(
+                                self.context.config.image_preprocessing_config
+                            ),
+                        )
+                    if vlm_kwargs:
+                        self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
+                    else:
+                        self.add_request(request_id, prompt, sampling_params)
+                except Exception as error:  # pylint: disable=broad-except
+                    self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side KV import.

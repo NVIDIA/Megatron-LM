@@ -2351,9 +2351,13 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
         # ``module`` but are intentionally not handled by the regular
-        # ``unwrap_model`` helper.
+        # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
+        # the language model under ``language_model`` instead.
         while module is not None:
             if isinstance(module, HybridModel):
+                return True
+            inner = getattr(module, 'language_model', None)
+            if inner is not None and isinstance(inner, HybridModel):
                 return True
             module = getattr(module, 'module', None)
         return False
