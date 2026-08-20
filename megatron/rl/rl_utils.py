@@ -1009,11 +1009,12 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
-    # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
-    # When sequence_packing is disabled, construct a single-sequence default so the CUDA
-    # graph signature matches the training forward_step in train_rl.py.
-    # This is necessary because reference logprobs steps will reuse the training forward graph.
+    # packed_seq_params is only needed for CUDA graph signature consistency: with
+    # sequence packing the reference logprobs reuse the packed training forward graph,
+    # and without packing a single-sequence thd (== dense) matches the graph signature
+    # when RL training CUDA graphs are enabled. When they are disabled, leave it None
+    # so the non-TE (unfused) DotProductAttention path is used -- that path rejects
+    # packed_seq_params.
     if packed_seq_params is None:
         if sequence_packing:
             packed_seq_params = get_default_packed_seq_params(
@@ -1021,7 +1022,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
                 device=tokens.device,
             )
-        else:
+        elif args.rl_training_cuda_graphs:
             cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
             # Make sure to omit `total_tokens` to prevent `seq_idx` from being auto-computed.
             # That would cause a sequence packing kernel to be incorrectly used.
