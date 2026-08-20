@@ -240,7 +240,12 @@ class TransformerConfig(ModelParallelConfig):
     is quick_gelu or SwiGLU (MoE only)."""
 
     activation_func_tanh_clamp_scale: Optional[float] = None
-    """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s` is this value."""
+    """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s`
+    is this value. For a gated activation (silu only) this instead selects SiTU-GLU."""
+
+    activation_func_tanh_clamp_scale_linear: Optional[float] = None
+    """Soft clamp scale for the linear (up) half of a gated activation, decoupled from the gate
+    scale in activation_func_tanh_clamp_scale. Requires activation_func_tanh_clamp_scale."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -2632,15 +2637,45 @@ class TransformerConfig(ModelParallelConfig):
                     "activation_func_tanh_clamp_scale must be positive, got "
                     f"{self.activation_func_tanh_clamp_scale}."
                 )
-            if self.gated_linear_unit:
-                raise ValueError(
-                    "activation_func_tanh_clamp_scale is not supported with gated_linear_unit. "
-                    "Use activation_func_clamp_value to clamp a gated activation instead."
-                )
-            if self.bias_activation_fusion or self.use_te_activation_func:
+            if self.use_te_activation_func:
                 raise ValueError(
                     "activation_func_tanh_clamp_scale is not supported with "
-                    "bias_activation_fusion or use_te_activation_func."
+                    "use_te_activation_func, since the TE activation modules cannot clamp."
+                )
+            if self.gated_linear_unit and self.activation_func != F.silu:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale with a gated activation is implemented as "
+                    "SiTU-GLU, which replaces the swish gate, so it requires silu."
+                )
+            if self.bias_activation_fusion and not (
+                self.activation_func == F.silu and self.gated_linear_unit
+            ):
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale with bias_activation_fusion is only "
+                    "implemented for SwiGLU. The fused gelu, geglu and quick_geglu kernels do not "
+                    "apply the clamp, so set bias_activation_fusion to False."
+                )
+            if self.activation_func_clamp_value is not None:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale and activation_func_clamp_value both clamp "
+                    "the activation input; set only one of them."
+                )
+
+        if self.activation_func_tanh_clamp_scale_linear is not None:
+            if self.activation_func_tanh_clamp_scale_linear <= 0.0:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear must be positive, got "
+                    f"{self.activation_func_tanh_clamp_scale_linear}."
+                )
+            if self.activation_func_tanh_clamp_scale is None:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear only clamps the linear half of "
+                    "SiTU-GLU, so it requires activation_func_tanh_clamp_scale for the gate half. "
+                    "Clamping the linear half alone would leave the gate unbounded."
+                )
+            if not self.gated_linear_unit:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear requires gated_linear_unit."
                 )
 
         if self.activation_func_fp8_input_store:

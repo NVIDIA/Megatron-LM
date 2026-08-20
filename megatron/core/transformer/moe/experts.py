@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import squared_relu, tanh_soft_clamp
+from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -975,6 +975,8 @@ class TEGroupedMLP(MegatronModule):
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
                         self.config.activation_func_clamp_value,
+                        gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                        linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -1001,25 +1003,36 @@ class TEGroupedMLP(MegatronModule):
                     self.config.activation_func_tanh_clamp_scale,
                 )
             else:
+                tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
                 if self.config.gated_linear_unit:
-
-                    def glu(x):
-                        if with_glu_interleaving:
-                            x = self._remove_glu_interleaving(
-                                x, self.config.moe_mlp_glu_interleave_size
-                            )
-                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        if (val := self.config.activation_func_clamp_value) is not None:
-                            x_glu = x_glu.clamp(min=None, max=val)
-                            x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
+                    if with_glu_interleaving:
+                        intermediate_parallel = self._remove_glu_interleaving(
+                            intermediate_parallel, self.config.moe_mlp_glu_interleave_size
                         )
+                    if tanh_clamp_scale is not None:
+                        intermediate_parallel = situ_glu(
+                            intermediate_parallel,
+                            tanh_clamp_scale,
+                            self.config.activation_func_tanh_clamp_scale_linear,
+                            self.config.glu_linear_offset,
+                        )
+                    else:
 
-                    intermediate_parallel = glu(intermediate_parallel)
+                        def glu(x):
+                            x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                            if (val := self.config.activation_func_clamp_value) is not None:
+                                x_glu = x_glu.clamp(min=None, max=val)
+                                x_linear = x_linear.clamp(min=-val, max=val)
+                            return self.config.activation_func(x_glu) * (
+                                x_linear + self.config.glu_linear_offset
+                            )
+
+                        intermediate_parallel = glu(intermediate_parallel)
                 else:
-                    if (val := self.config.activation_func_tanh_clamp_scale) is not None:
-                        intermediate_parallel = tanh_soft_clamp(intermediate_parallel, val)
+                    if tanh_clamp_scale is not None:
+                        intermediate_parallel = tanh_soft_clamp(
+                            intermediate_parallel, tanh_clamp_scale
+                        )
                     intermediate_parallel = self.activation_func(intermediate_parallel)
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * permuted_probs

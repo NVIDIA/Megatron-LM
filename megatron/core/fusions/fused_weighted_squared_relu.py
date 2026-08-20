@@ -61,14 +61,7 @@ def weighted_squared_relu_back(g: torch.Tensor, x: torch.Tensor, weights: torch.
 
 @jit_fuser
 def _tanh_relu_over_scale(x: torch.Tensor, clamp_scale: float) -> torch.Tensor:
-    """``tanh(ReLU(x) / clamp_scale)`` in fp32, the shared term of the clamped forward/backward.
-
-    The ReLU is applied before the tanh rather than after the soft clamp. The two orderings agree
-    exactly: ReLU commutes with any non-decreasing ``g`` satisfying ``g(0) == 0``, and
-    ``s * tanh(x / s)`` is such a ``g``, so ``ReLU(s * tanh(x / s)) == s * tanh(ReLU(x) / s)``.
-    The derivatives agree too, including at the kink, because the factor the chain rule pairs the
-    ReLU subgradient with is ``sech^2(0) == 1`` under either ordering.
-    """
+    """``tanh(ReLU(x) / clamp_scale)`` in fp32, the shared term of the clamped forward/backward."""
     return torch.tanh(F.relu(x.float()) / clamp_scale)
 
 
@@ -77,12 +70,6 @@ def weighted_clamped_squared_relu(
     x: torch.Tensor, weights: torch.Tensor, clamp_scale: float
 ) -> torch.Tensor:
     """Element-wise weight applied after tanh soft-clamped Squared-ReLU.
-
-    Computes ``squared_relu(s * tanh(x / s)) * weights``, bounding the activation output by
-    ``s**2``. This is a faithful fusion of the unfused composition: the clamped pre-activation is
-    rounded back to the input dtype exactly as ``tanh_soft_clamp`` does, and is then squared in
-    that dtype exactly as ``squared_relu`` does, so the forward is bit-identical to the unfused
-    path and toggling ``use_fused_weighted_squared_relu`` does not change results.
 
     Args:
         x (torch.Tensor): Input tensor.
