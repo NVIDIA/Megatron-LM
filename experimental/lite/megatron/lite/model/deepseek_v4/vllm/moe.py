@@ -102,6 +102,15 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         layer_idx: int,
         use_deepep: bool = False,
     ):
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            require_batch_invariant_quant_kernel,
+        )
+
+        # ``deepseek_v4.vllm`` is an alignment implementation, not a generic
+        # MoE backend.  Validate its required numerical kernel while building
+        # the model so a missing or incompatible library can never turn into a
+        # later, layout-dependent fallback.
+        require_batch_invariant_quant_kernel()
         ps = ps or ParallelState()
         super().__init__(
             config,

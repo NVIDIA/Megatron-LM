@@ -18,6 +18,23 @@ backend as `mlite`, while Megatron Lite model implementations still use
 - `scripts/run_qwen3moe_gsm8k_sft.sh`: GSM8K wrapper around the SFT launcher.
 - `scripts/run_qwen3moe_gsm8k_grpo.sh`: GSM8K GRPO launcher with MLite actor
   training and a standard VERL rollout backend.
+- `scripts/run_deepseek_v4_4layer_alignment.sh`: four-GPU DeepSeek-V4 gate with
+  EP4 mLite training and EP4 deterministic vLLM rollout.
+
+## DeepSeek-V4 four-layer alignment gate
+
+The release gate runs one DAPO step by default and records VERL's compact
+train/inference consistency metrics. It requires the standalone
+batch-invariant kernel and fails before model execution when the library is
+missing or incompatible.
+
+```bash
+MODEL_PATH=/models/DeepSeek-V4-Flash-4L \
+TRAIN_FILES=/data/dapo-train.parquet \
+VAL_FILES=/data/dapo-val.parquet \
+VLLM_BATCH_INVARIANT_KERNEL_LIB=/opt/batch-invariant-kernel/_vllm_batch_invariant_C.so \
+bash experimental/lite/examples/verl/scripts/run_deepseek_v4_4layer_alignment.sh
+```
 
 ## Prerequisites
 

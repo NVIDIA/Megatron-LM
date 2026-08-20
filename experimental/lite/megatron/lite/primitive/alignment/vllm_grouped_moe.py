@@ -99,50 +99,21 @@ def _vllm_silu_mul_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         fused_silu_mul_per_token_group_quant_fp8,
-        is_batch_invariant_quant_kernel_enabled,
-        per_token_group_quant_fp8_packed_for_deepgemm,
-        silu_mul_per_token_group_quant_fp8_colmajor,
-        silu_mul_quant_fp8_packed_triton,
     )
     from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 
     scale_format = DeepGemmQuantScaleFMT.from_oracle()
-    if is_batch_invariant_quant_kernel_enabled():
-        if swiglu_limit > 0:
-            # BatchedDeepGemmExperts, which is the rollout reference for this
-            # DS4 path, exposes plain SiLU*up at this fused quant boundary.
-            # Keep the argument for the BF16 fallback/VJP contract, but do not
-            # introduce a training-only clamp into the visible forward.
-            pass
-        return fused_silu_mul_per_token_group_quant_fp8(
-            gate_up,
-            output_q=output,
-            use_ue8m0=(scale_format == DeepGemmQuantScaleFMT.UE8M0),
-            round_scale=(scale_format != DeepGemmQuantScaleFMT.FLOAT32),
-            masked_m=None,
-            group_size=128,
-        )
-    if scale_format == DeepGemmQuantScaleFMT.UE8M0:
-        return silu_mul_quant_fp8_packed_triton(
-            input=gate_up,
-            output_q=output,
-            group_size=128,
-            clamp_limit=swiglu_limit,
-            alpha=1.0,
-            beta=0.0,
-        )
-    if gate_up.shape[0] == 0:
-        return per_token_group_quant_fp8_packed_for_deepgemm(
-            gate_up[:, : gate_up.shape[1] // 2], 128, out_q=output
-        )
-    return silu_mul_per_token_group_quant_fp8_colmajor(
-        input=gate_up,
-        output=output,
-        use_ue8m0=(scale_format == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0),
-        clamp_limit=swiglu_limit,
+    # This implementation exists specifically to expose vLLM's BI numerical
+    # contract during training.  Never silently substitute a layout-dependent
+    # activation/quantization kernel when its standalone library is absent.
+    del swiglu_limit
+    return fused_silu_mul_per_token_group_quant_fp8(
+        gate_up,
+        output_q=output,
+        use_ue8m0=(scale_format == DeepGemmQuantScaleFMT.UE8M0),
+        round_scale=(scale_format != DeepGemmQuantScaleFMT.FLOAT32),
+        masked_m=None,
         group_size=128,
-        alpha=1.0,
-        beta=0.0,
     )
 
 

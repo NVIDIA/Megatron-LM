@@ -27,6 +27,35 @@ def _reference(
     return torch.cat(outputs)
 
 
+def test_vllm_visible_silu_quant_has_no_layout_dependent_fallback(monkeypatch):
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+    calls = []
+
+    def fused(value, **kwargs):
+        calls.append((value, kwargs))
+        return kwargs["output_q"], torch.ones(1)
+
+    monkeypatch.setattr(
+        DeepGemmQuantScaleFMT,
+        "from_oracle",
+        staticmethod(lambda: DeepGemmQuantScaleFMT.FLOAT32),
+    )
+    monkeypatch.setattr(fp8_utils, "fused_silu_mul_per_token_group_quant_fp8", fused)
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT_KERNEL_LIB", raising=False)
+    value = torch.randn(2, 256, dtype=torch.bfloat16)
+    output = torch.empty(2, 128, dtype=torch.float8_e4m3fn)
+
+    quantized, _scales = vllm_grouped_moe._vllm_silu_mul_quant(
+        value, output=output, swiglu_limit=0.0
+    )
+
+    assert quantized is output
+    assert len(calls) == 1
+    assert calls[0][1]["masked_m"] is None
+
+
 def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     monkeypatch,
 ) -> None:
