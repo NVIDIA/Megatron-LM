@@ -24,6 +24,34 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def _preserve_gtp_forward_prefetch_state(params: Iterable):
+    """Preserve cross-graph forward-AG handoffs while a local graph warms up.
+
+    A local graph's first GTP weight can be prefetched and drained by the preceding graph.
+    Runner-local warmup consumes that readiness without rerunning the producer, and can create
+    outgoing readiness of its own. Capture must therefore see the same ``_already_ag_drained``
+    state that existed before warmup. Completed Work handles are intentionally not restored; the
+    producer's external ``ag_event`` carries the device-side dependency into the consumer graph.
+    """
+    prefetch_state = tuple(
+        (param, getattr(param, "_already_ag_drained", False))
+        for param in params
+        if getattr(param, "is_gtp_weight_remat", False)
+    )
+    try:
+        yield
+    finally:
+        for param, already_drained in prefetch_state:
+            # Warmup must consume every forward AG it issues. Restoring a completed Work handle
+            # would be invalid; restore only the host flag describing the cross-graph handoff.
+            assert getattr(param, "_prefetch_handle", None) is None, (
+                "GTP warmup left an undrained forward AG for "
+                f"{getattr(param, '_debug_name', '') or id(param)}"
+            )
+            param._already_ag_drained = already_drained
+
+
 @dataclass
 class GraphWgradRingSlot:
     """One persistent wgrad slot guarded by its reduce-scatter completion event."""

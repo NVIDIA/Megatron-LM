@@ -1490,13 +1490,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 )
         _was_drained = getattr(self, "_already_ag_drained", False)
         if _was_drained:
-            # Producer already drained via wait_async_comms; skip the captured cross-graph
-            # wait (a CUDA no-op anyway). Correctness comes from the eager main_stream sync.
+            # The producer consumed the Work handle and recorded ag_event. Clear the host-side
+            # handoff marker, but retain the event wait that orders this consumer after the AG.
             self._already_ag_drained = False
         else:
             # Intra-graph or eager consume: drain inline.
             self._wait_param_gather()
-            self.ag_event.wait()
+        self.ag_event.wait()
 
         # Retrieve prefetched results from cache
         result = []
@@ -2341,12 +2341,14 @@ def wait_async_comms(
     finalize_after_drain: bool = False,
     params: Optional[List[GTPShardedParam]] = None,
 ):
-    """Drain in-flight GTP async AG / RS handles.
+    """Drain in-flight GTP asynchronous communication.
 
-    Inside CUDA graph capture the drains are captured into the graph — the producer-side hook
-    for cross-graph overlap. A captured cudaStreamWaitEvent on another capture session's event is
-    a CUDA no-op, so consumers can't wait cross-graph; instead the producer drains here and flags
-    the param, and the consumer skips its captured wait.
+    This drains AG and recompute-AG handles and, unless ``skip_rs`` is set, wgrad RS handles.
+    During CUDA graph capture, draining a handle materializes its wait in the producer graph and
+    records the corresponding external event. An AG handoff marker prevents a consumer from
+    draining the same Work handle again; the consumer still waits on the event to preserve the
+    producer-to-consumer dependency across local CUDA graphs. When requested, an RS result is also
+    accumulated into ``main_grad`` before its graph completes.
 
     Args:
         chain_id: If specified, only drain params on this chain.
@@ -2360,8 +2362,9 @@ def wait_async_comms(
                 capture, the process-global in-flight set remains the default.
 
     Per-param side effects:
-        * _already_ag_drained = True   (if an AG handle was drained)
-        * _already_finalized  = True   (if finalize_after_drain=True)
+        * _already_ag_drained = True          (if an AG handle was drained)
+        * _recompute_already_drained = True   (if a recompute AG handle was drained)
+        * _already_finalized = True           (if an RS result was finalized)
     """
     comm_params = list(_inflight_comm_params) if params is None else params
     for param in comm_params:

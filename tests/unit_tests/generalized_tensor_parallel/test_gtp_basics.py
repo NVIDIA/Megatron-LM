@@ -53,6 +53,7 @@ from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPWeightCache,
     wrap_module_params_gtp,
 )
+from megatron.core.tensor_parallel.gtp_cuda_graphs import _preserve_gtp_forward_prefetch_state
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
@@ -1628,3 +1629,52 @@ class TestGTPCaptureParamReadiness:
             gtp_cuda_graphs.register_capture_params_to_ensure_ready((second,))
 
         assert capture.params_to_ensure_ready == [first, second]
+
+    def test_warmup_preserves_cross_graph_prefetch_state(self):
+        class FakeParam:
+            is_gtp_weight_remat = True
+            _prefetch_handle = None
+
+            def __init__(self, already_drained):
+                self._already_ag_drained = already_drained
+
+        incoming = FakeParam(already_drained=True)
+        ordinary = FakeParam(already_drained=False)
+
+        with _preserve_gtp_forward_prefetch_state(iter((incoming, ordinary))):
+            # Warmup consumes the incoming handoff and produces unrelated outgoing readiness.
+            incoming._already_ag_drained = False
+            ordinary._already_ag_drained = True
+
+        assert incoming._already_ag_drained is True
+        assert ordinary._already_ag_drained is False
+        assert incoming._prefetch_handle is None
+
+    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch):
+        class ExpectedEventWait(Exception):
+            pass
+
+        calls = []
+
+        class FakeEvent:
+            def wait(self):
+                calls.append("event_wait")
+                raise ExpectedEventWait
+
+        param = type(
+            "Param",
+            (),
+            {
+                "_already_ag_drained": True,
+                "_weights": (),
+                "ag_event": FakeEvent(),
+                "_wait_param_gather": lambda self: calls.append("handle_wait"),
+            },
+        )()
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
+
+        with pytest.raises(ExpectedEventWait):
+            GTPShardedParam._get_prefetched_weight(param, fwd=True)
+
+        assert calls == ["event_wait"]
+        assert param._already_ag_drained is False
