@@ -81,6 +81,78 @@ def _attach_high_precision_init(param: nn.Parameter, init_val: torch.Tensor | No
     setattr(param, _MOK_HIGH_PRECISION_INIT_ATTR, init_val.detach().contiguous())
 
 
+def _deinterleave_glu_weight(
+    weight: torch.Tensor,
+    *,
+    intermediate_size: int,
+    interleave_size: int,
+) -> torch.Tensor:
+    """Convert ``[gate block, up block, ...]`` rows to contiguous ``[gate; up]``."""
+    if interleave_size <= 0 or intermediate_size % interleave_size != 0:
+        raise ValueError(
+            "MOK source GLU interleave size must be positive and divide the "
+            f"intermediate size, got interleave={interleave_size}, "
+            f"intermediate={intermediate_size}"
+        )
+    if weight.ndim < 2 or weight.shape[-2] != 2 * intermediate_size:
+        raise RuntimeError(
+            "MOK source routed-FC1 shape mismatch: expected the penultimate "
+            f"dimension to be {2 * intermediate_size}, got {tuple(weight.shape)}"
+        )
+
+    prefix = weight.shape[:-2]
+    hidden_size = weight.shape[-1]
+    return (
+        weight.reshape(
+            *prefix,
+            intermediate_size // interleave_size,
+            2,
+            interleave_size,
+            hidden_size,
+        )
+        .transpose(-4, -3)
+        .contiguous()
+        .reshape(weight.shape)
+    )
+
+
+@torch.no_grad()
+def _convert_native_fc1_init_to_mok_layout(
+    param: nn.Parameter,
+    *,
+    intermediate_size: int,
+    interleave_size: int | None,
+) -> None:
+    """Reorder one native FC1 initialization before DDP/optimizer construction."""
+    if interleave_size is None:
+        return
+
+    source, has_preserved_init = _materialize_parameter_init(param)
+    converted = _deinterleave_glu_weight(
+        source,
+        intermediate_size=intermediate_size,
+        interleave_size=interleave_size,
+    )
+
+    from megatron.core.fp8_utils import (
+        copy_back_gathered_bf16_into_fp8_param,
+        copy_tensor_to_quantized_param,
+        is_float8tensor,
+        is_grouped_tensor_with_quantized_storage,
+    )
+
+    converted_bf16 = converted.to(dtype=torch.bfloat16)
+    if is_grouped_tensor_with_quantized_storage(param):
+        copy_tensor_to_quantized_param(param, converted_bf16)
+    elif is_float8tensor(param):
+        copy_back_gathered_bf16_into_fp8_param(param, converted_bf16)
+    else:
+        param.copy_(converted_bf16)
+
+    if has_preserved_init:
+        _attach_high_precision_init(param, converted)
+
+
 def _indexed_grouped_weight(linear: nn.Module, index: int, num_experts: int) -> torch.Tensor:
     """Return one logical expert weight from either TE grouped layout."""
     if not getattr(linear, "single_grouped_weight", False):
@@ -787,6 +859,7 @@ class MoKMegakernel(nn.Module):
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
         self.use_mxfp8_weights = config.mok_use_mxfp8_weights
+        self.source_mlp_glu_interleave_size = config.mok_source_mlp_glu_interleave_size
         self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
         self.mok_config = MoKConfig(
@@ -810,6 +883,11 @@ class MoKMegakernel(nn.Module):
             )
 
         if self.native_single_grouped_weights:
+            _convert_native_fc1_init_to_mok_layout(
+                fc1.weight,
+                intermediate_size=self.intermediate_size,
+                interleave_size=self.source_mlp_glu_interleave_size,
+            )
             # Register aliases of the same Parameter objects so DDP's MOK forward
             # pre-hook waits for their overlap-param-gather buckets. named_parameters
             # deduplicates them; no additional payload storage is allocated.
@@ -836,6 +914,11 @@ class MoKMegakernel(nn.Module):
                     raise RuntimeError(
                         "MOK non-single integration requires registered per-expert Parameters"
                     )
+                _convert_native_fc1_init_to_mok_layout(
+                    fc1_param,
+                    intermediate_size=self.intermediate_size,
+                    interleave_size=self.source_mlp_glu_interleave_size,
+                )
                 fc1_name = f"routed_fc1_weight{expert_idx}"
                 down_name = f"routed_down_weight{expert_idx}"
                 self.register_parameter(fc1_name, fc1_param)

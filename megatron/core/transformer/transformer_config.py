@@ -802,6 +802,12 @@ class TransformerConfig(ModelParallelConfig):
     """Apply router probabilities before routed FC2-input MXFP8 quantization to match
     MCore GroupedMLP numerical ordering. This is ignored by the BF16 path."""
 
+    mok_source_mlp_glu_interleave_size: Optional[int] = None
+    """Optional GLU block size used to convert routed-FC1 initialization into MOK's
+    contiguous ``[gate; up]`` layout. This makes a MOK random initialization logically
+    identical to an MCore initialization whose FC1 is interpreted with the specified
+    interleave size. It does not yet convert interleaved checkpoints."""
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
