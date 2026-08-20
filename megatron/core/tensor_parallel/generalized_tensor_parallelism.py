@@ -313,8 +313,8 @@ _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 
 
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
-    """Padded send buffer from the registered LIFO, pad tail zeroed (the RS sends the
-    whole buffer, and recycled LIFO storage may hold stale rows)."""
+    """Padded send buffer from the registered recycling pool, pad tail zeroed (the RS
+    sends the whole buffer, and a recycled buffer may hold stale rows)."""
     buf = symmetric_wgrad_pool.alloc(weight._unsharded_shape_padded, dtype, device, weight.group)
     if weight.pad_length:
         buf[weight._unsharded_shape[0] :].zero_()
@@ -1868,8 +1868,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 for buf in bufs:
                     _wgrad_pool_put(buf)
             for buf in bufs:
-                # Return symm LIFO parents (tag-gated no-op for plain and ring buffers).
-                # Unconditional on chain kind: the LIFO's captured alloc/free pops replay
+                # Return symm pool buffers (tag-gated no-op for plain and ring buffers).
+                # Unconditional on chain kind: the pool's captured alloc/free pops replay
                 # at stable addresses.
                 symmetric_wgrad_pool.free(buf)
             setattr(self, attr, None)
