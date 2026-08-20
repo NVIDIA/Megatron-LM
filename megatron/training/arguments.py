@@ -707,9 +707,15 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
-    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
+    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
+    # divides eval_global_batch_size by the same product to get its microbatch count, and without
+    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
+    assert args.eval_global_batch_size % (
+        args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+    ) == 0, \
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
-        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})" \
+        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
 
     if args.perform_rl_step:
         num_generated_samples_per_inference_iteration = (
