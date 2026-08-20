@@ -411,7 +411,9 @@ class MLP(MegatronModule):
                             v = apply_swiglu_sharded_factory(
                                 v, sharded_offsets, singleton_local_shards
                             )
-                            sub_sd[k] = _gtp_slice_rows_on_load(v, weight)
+                            v = _gtp_slice_rows_on_load(v, weight)
+                            v.gtp_source_param = weight
+                            sub_sd[k] = v
                         else:
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 v, sharded_offsets, singleton_local_shards

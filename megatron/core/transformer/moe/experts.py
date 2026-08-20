@@ -55,6 +55,16 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
+
+try:
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, is_gtp_param
+except ImportError:  # pragma: no cover - TE-less environments have no GTP
+    HAVE_GTP = False
+
+    def is_gtp_param(_param):
+        return False
+
+
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import is_te_min_version
 
@@ -199,6 +209,10 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        # Replicate group for expert weights in sharded_state_dict. expt_dp EXCLUDES the
+        # egtp_remat axis (expt_dp_gtp_remat is the inclusive one), which is what writer
+        # election needs: EGTP peers are separated by replica_id[1], not by this rank.
+        self.expt_dp_group = pg_collection.expt_dp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -936,7 +950,72 @@ class TEGroupedMLP(MegatronModule):
                             (ep_axis, local_expert_indices_offset + i, num_global_experts),
                         )
                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
-                        if k in sub_sd:
+                        if k not in sub_sd:
+                            continue
+                        expert_w = getattr(module, f'weight{i}', None)
+                        if (
+                            k.endswith(f'weight{i}')
+                            and HAVE_GTP
+                            and expert_w is not None
+                            and is_gtp_param(expert_w)
+                            and getattr(expert_w, 'gtp_remat_size', 1) > 1
+                        ):
+                            # EGTP shards dim0 of this expert's fused [gate|up] weight, and the
+                            # gate/up boundary does not line up with the shard boundaries. Use
+                            # the same logical-layout wiring the non-grouped fc1 uses (see
+                            # transformer/mlp.py): gather the shards back to the ETP-local
+                            # tensor (pad stripped), run the SAME swiglu split a non-EGTP run
+                            # writes, and slice this rank's contiguous rows back out on load.
+                            # This also pins "a shard is a contiguous row slice of [gate|up]",
+                            # so the runtime all-gather is already in logical order.
+                            from megatron.core.tensor_parallel.gtp_ckpt import (
+                                _gtp_gather_rows_for_save,
+                                _gtp_slice_rows_on_load,
+                            )
+
+                            target_rows = (
+                                expert_w.shape[0] * expert_w.group.size() - expert_w.pad_length
+                            )
+                            v = _gtp_gather_rows_for_save(
+                                sub_sd[k],
+                                # The CHECKPOINT key, not the dict key: TEGroupedLinear keys
+                                # every local expert as `...linear_fc1.weight` and carries the
+                                # expert index as a sharded offset, while the dict key keeps the
+                                # `weight{i}` suffix. Passing the dict key invents per-expert
+                                # checkpoint keys that no non-EGTP run ever writes.
+                                sub_sd[k].key,
+                                expert_w,
+                                target_rows,
+                                self.tp_group,
+                                # The EXPERT data-parallel group, not the dense dp_cp one: its
+                                # rank varies across EP ranks, so using it here left every
+                                # expert outside ep_rank 0 without a main replica and DCP
+                                # rejected the plan for incomplete coverage. Exclude the GTP
+                                # axis -- EGTP peers are already separated by replica_id[1].
+                                self.expt_dp_group,
+                                new_sharded_offsets,
+                            )
+                            # A fused gate|up fc1 under GTP/EGTP stores each shard as a
+                            # CONTIGUOUS row slice of the logical [gate | up] weight, and this
+                            # gather-then-split-then-slice sequence is what pins that mapping.
+                            # The gather above restores the logical tensor, the factory runs the
+                            # same swiglu split a non-GTP run writes, and the slice below takes
+                            # this rank's rows back out -- so the gathered weight is already in
+                            # logical order and no runtime permutation is needed. The dense
+                            # (non-grouped) counterpart is the same sequence in
+                            # transformer/mlp.py.
+                            v = apply_swiglu_sharded_factory(
+                                v, new_sharded_offsets, singleton_local_shards
+                            )
+                            v = _gtp_slice_rows_on_load(v, expert_w)
+                            # The factory exposes the GATHERED tensor, so it never matches this
+                            # per-shard param by identity and its key is rewritten by the prefix
+                            # replacement below -- name matching is fragile. Leave a backlink so
+                            # the optimizer resolves it by identity instead (same lesson as
+                            # gtp_pad_src / _gtp_dequant_src).
+                            v.gtp_source_param = expert_w
+                            sub_sd[k] = v
+                        else:
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards
                             )
