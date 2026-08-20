@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import struct
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -116,6 +117,94 @@ async def test_all_reduce_max_async_handles_zmq_again_retries(rank, world_size, 
 
     result = await comm.all_reduce_max(7, async_op=True)
     assert result == 9
+
+
+def _make_socket_comm(context, rank, world_size, addresses):
+    """Build a communicator over real loopback sockets, skipping the PG rendezvous.
+
+    Mirrors what __init__ does once the socket addresses are known, so the
+    handshake can be exercised without a torch.distributed process group.
+    """
+    import zmq
+
+    comm = AsyncZMQCommunicator.__new__(AsyncZMQCommunicator)
+    comm.rank = rank
+    comm.world_size = world_size
+    comm.is_leader = rank == 0
+
+    if comm.is_leader:
+        comm.gather_sock = context.socket(zmq.PULL)
+        comm.gather_sock.bind_to_random_port("tcp://127.0.0.1")
+        addresses["gather"] = comm.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
+
+        comm.bcast_sock = context.socket(zmq.PUB)
+        comm.bcast_sock.bind_to_random_port("tcp://127.0.0.1")
+        addresses["bcast"] = comm.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT)
+    else:
+        comm.gather_sock = context.socket(zmq.PUSH)
+        comm.gather_sock.connect(addresses["gather"])
+        comm.bcast_sock = context.socket(zmq.SUB)
+        comm.bcast_sock.connect(addresses["bcast"])
+        comm.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
+
+    comm._bcast_socket_addr = addresses["bcast"]
+    return comm
+
+
+@pytest.mark.parametrize("follower_connect_delay", [0.0, 0.5])
+async def test_handshake_keeps_late_subscribers_from_missing_broadcasts(follower_connect_delay):
+    """A reduction issued as soon as the leader is ready must reach every follower.
+
+    ZMQ discards published messages for any subscriber whose subscription has
+    not yet reached the publisher, and nothing in the PUB/SUB pattern reports
+    that. A leader that publishes the moment it is ready therefore loses the
+    reduced value for every follower still connecting, and those followers then
+    wait for it forever. `_synchronize_subscribers` closes that window by
+    republishing until each follower acknowledges over the reliable gather
+    channel, so subscribers connecting late (as they do from another node) still
+    see the first broadcast.
+    """
+    import zmq
+
+    world_size = 4
+    context = zmq.Context()
+    addresses = {}
+    leader_ready = threading.Event()
+    results: dict[int, object] = {}
+    errors: dict[int, BaseException] = {}
+
+    def run_rank(rank):
+        try:
+            if rank == 0:
+                comm = _make_socket_comm(context, rank, world_size, addresses)
+                leader_ready.set()
+            else:
+                assert leader_ready.wait(30)
+                # Connect after the leader is already ready to publish, which is
+                # the window where an unsynchronized broadcast gets dropped.
+                if follower_connect_delay:
+                    threading.Event().wait(follower_connect_delay)
+                comm = _make_socket_comm(context, rank, world_size, addresses)
+
+            comm._synchronize_subscribers(timeout=60.0)
+            results[rank] = comm.sync_all_reduce_max(rank, rank * 3)
+            comm.close()
+        except BaseException as error:  # surface failures instead of hanging the suite
+            errors[rank] = error
+            leader_ready.set()
+
+    threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in range(world_size)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        # A dropped broadcast shows up as a thread that never finishes.
+        thread.join(timeout=90)
+        assert not thread.is_alive(), "a rank never completed its reduction"
+
+    context.term()
+    assert not errors, f"ranks raised: {errors}"
+    expected = (world_size - 1, (world_size - 1) * 3)
+    assert results == {rank: expected for rank in range(world_size)}
 
 
 @pytest.mark.parametrize("method_name", ["all_reduce_max", "sync_all_reduce_max"])
