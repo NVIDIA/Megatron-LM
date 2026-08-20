@@ -107,5 +107,5 @@ products:
     products:
       # Enable after the official H100 functional run produces golden values.
       - environment: [dev]
-        scope: [mr-broken, mr-github-broken]
+        scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
