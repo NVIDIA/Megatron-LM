@@ -37,26 +37,10 @@ done
 : "${CHECKPOINT_LOAD_PATH:?CHECKPOINT_LOAD_PATH is required}"
 : "${RESULTS_ROOT:?RESULTS_ROOT is required}"
 
+source "$(dirname "${BASH_SOURCE[0]}")/perf_common.sh"
+
 # Resolve PLATFORM. Caller can override via env; otherwise inspect the first GPU.
-# baseline_values.json is a {platform: {batch_key: {metrics}}} mapping, so this
-# value picks which subtree to read / write.
-if [[ -z "${PLATFORM:-}" ]]; then
-    GPU_NAME=$(nvidia-smi -L 2>/dev/null | head -1 || true)
-    case "$GPU_NAME" in
-        *GB200*|*"Grace Blackwell"*) PLATFORM=gb200 ;;
-        *B200*)                      PLATFORM=b200  ;;
-        *H100*)                      PLATFORM=h100  ;;
-        *A100*)                      PLATFORM=a100  ;;
-        *)
-            echo "[run_perf_test] error: could not auto-detect PLATFORM from nvidia-smi (\"$GPU_NAME\")." >&2
-            echo "                  Pass PLATFORM=<h100|gb200|b200|a100> explicitly." >&2
-            exit 2
-            ;;
-    esac
-    echo "[run_perf_test] auto-detected PLATFORM=$PLATFORM from \"$GPU_NAME\""
-else
-    echo "[run_perf_test] using caller-provided PLATFORM=$PLATFORM"
-fi
+PLATFORM=$(detect_platform "${PLATFORM:-}")
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PERF_DIR="$ROOT_DIR/tests/performance_tests"
@@ -291,43 +275,4 @@ echo "[run_perf_test] benchmark complete. Results written to $RESULTS_JSON"
 
 # ── Baseline comparison or recording ──────────────────────────────────────────
 
-CASE_DIR="$(dirname "$CONFIG_PATH")"
-BASELINE_PATH="$CASE_DIR/baseline_values.json"
-
-if [[ "${RECORD_BASELINE:-0}" == "1" ]]; then
-    echo "[run_perf_test] RECORD_BASELINE=1 → merging results.json into $BASELINE_PATH under key '$PLATFORM'"
-    uv run --no-sync python - "$RESULTS_JSON" "$BASELINE_PATH" "$PLATFORM" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-results_path, baseline_path, platform = sys.argv[1], sys.argv[2], sys.argv[3]
-results = json.loads(Path(results_path).read_text())
-baseline = {}
-if Path(baseline_path).exists():
-    baseline = json.loads(Path(baseline_path).read_text())
-# Merge: overwrite only the current platform's subtree, leave others intact.
-baseline[platform] = results
-Path(baseline_path).write_text(json.dumps(baseline, indent=2) + "\n")
-print(f"[run_perf_test] wrote {len(results)} batch entries under '{platform}' "
-      f"({sorted(baseline.keys())} platforms recorded total)")
-PY
-    exit 0
-fi
-
-if [[ "${SKIP_COMPARE:-0}" == "1" ]]; then
-    echo "[run_perf_test] SKIP_COMPARE=1 → not running baseline comparison"
-    exit 0
-fi
-
-if [[ ! -f "$BASELINE_PATH" ]]; then
-    echo "[run_perf_test] error: no baseline_values.json at $BASELINE_PATH." >&2
-    echo "                  Run once with RECORD_BASELINE=1 to bootstrap." >&2
-    exit 3
-fi
-
-uv run --no-sync python "$PERF_DIR/shell_test_utils/compare_to_baseline.py" \
-    --results "$RESULTS_JSON" \
-    --baseline "$BASELINE_PATH" \
-    --config "$CONFIG_PATH" \
-    --platform "$PLATFORM"
+compare_or_record "$RESULTS_JSON" "$CONFIG_PATH" "$PLATFORM"
