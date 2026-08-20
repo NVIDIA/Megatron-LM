@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
-from megatron.core.activations import squared_relu
+from megatron.core.activations import situlu, squared_relu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -516,6 +516,14 @@ def _make_fake_te_namespace():
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
+    class FakeScaledSiTUGLU(torch.nn.Module):
+        def __init__(self, glu_interleave_size, *, beta1, beta2, activation_recompute_in_mlp=False):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.beta1 = beta1
+            self.beta2 = beta2
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+
     class FakeScaledClampedQGeGLU(torch.nn.Module):
         def __init__(
             self,
@@ -549,6 +557,7 @@ def _make_fake_te_namespace():
                 ops=SimpleNamespace(
                     GroupedLinear=FakeGroupedLinear,
                     ScaledSwiGLU=FakeScaledSwiGLU,
+                    ScaledSiTUGLU=FakeScaledSiTUGLU,
                     ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
                     ScaledSReLU=FakeScaledSReLU,
                     Sequential=FakeSequential,
@@ -670,7 +679,7 @@ def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch)
     module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
     module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
 
-    with pytest.raises(RuntimeError, match="expected SwiGLU, quick_gelu"):
+    with pytest.raises(RuntimeError, match="expected SwiGLU, SiTU-GLU, quick_gelu"):
         module._make_fused_ops()
 
 
@@ -709,6 +718,10 @@ def _make_fused_impl_support_module(
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
         moe_apply_probs_on_input=False,
+        moe_mlp_glu_interleave_size=32,
+        delay_wgrad_compute=False,
+        situ_glu_beta1=4.0,
+        situ_glu_beta2=25.0,
     )
     module.activation_func = object()
     module.tp_group = SimpleNamespace(size=lambda: 1)
@@ -723,6 +736,28 @@ def _make_fused_impl_support_module(
     module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
     module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
     return module
+
+
+def test_make_fused_ops_selects_scaled_situ_glu(monkeypatch):
+    """The routed-expert op-fuser passes SiTU betas and recompute to TE."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=situlu, gated_linear_unit=True
+    )
+    module.activation_recompute = True
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.weight0 = torch.nn.Parameter(torch.ones(linear.out_features, linear.in_features))
+        linear.weight1 = torch.nn.Parameter(torch.ones(linear.out_features, linear.in_features))
+
+    ops = module._make_fused_ops()
+
+    activation = ops[1]
+    assert type(activation).__name__ == "FakeScaledSiTUGLU"
+    assert activation.glu_interleave_size == 32
+    assert activation.beta1 == 4.0
+    assert activation.beta2 == 25.0
+    assert activation.activation_recompute_in_mlp is True
 
 
 def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):

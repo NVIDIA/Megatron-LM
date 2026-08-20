@@ -1710,7 +1710,7 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
         if 'optimizer' in state_dict:
             state_dict['optimizer'] = optimizer_state_dict
 
-    if args.swiglu:
+    if args.swiglu or getattr(args, "situ_glu", False):
         apply(handle_swiglu_in_state_dict)
     # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
     # layout used on disk. No-op for unfused models.

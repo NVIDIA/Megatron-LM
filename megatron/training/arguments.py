@@ -1299,8 +1299,16 @@ def validate_args(args, defaults={}):
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    use_situ_glu = getattr(args, 'situ_glu', False)
+    if use_situ_glu:
+        if args.swiglu or args.quick_geglu or args.squared_relu:
+            raise ValueError(
+                "--situ-glu is mutually exclusive with --swiglu, --quick-geglu, "
+                "and --squared-relu."
+            )
+
     if args.ffn_hidden_size is None:
-        if args.swiglu:
+        if args.swiglu or use_situ_glu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -2416,6 +2424,15 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument(
+        '--situ-glu',
+        '--moe-use-situ-glu',
+        action='store_true',
+        help=(
+            'Use SiTU-GLU in all dense and MoE FFNs. TE-backed paths select SiTUGLU '
+            'or ScaledSiTUGLU; other paths use the PyTorch reference.'
+        ),
+    )
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,
