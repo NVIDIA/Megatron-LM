@@ -21,7 +21,12 @@ import torch
 
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
-ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"cross_entropy_loss_fusion": False, "tp_comm_overlap": False}
+#
+# Cross entropy is no longer listed here. Its backends declare DETERMINISM themselves and
+# megatron.core.ops.resolve rejects a non-deterministic one, which is both closer to the code
+# and finer grained: this table could only ban the whole fusion flag, not the specific
+# implementation that is not bit-exact.
+ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"tp_comm_overlap": False}
 
 # Env-var defaults required for bit-exact reproducibility.
 DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {

@@ -3,19 +3,14 @@
 from functools import partial
 from typing import Optional
 
-from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-from megatron.core.models.backends import (
-    BackendSpecProvider,
-    InferenceSpecProvider,
-    LocalSpecProvider,
-)
+from megatron.core.ops import BackendSpecProvider, get_backend
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
-from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MlpBuilder
+from megatron.core.typed_torch import not_none
 
 
 def _build_shared_experts(
@@ -53,10 +48,7 @@ def get_moe_module_spec(
         moe_grouped_gemm: Whether to use grouped GEMM.
         moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
     """
-    if use_te is not None and use_te:
-        backend: BackendSpecProvider = TESpecProvider()
-    else:
-        backend = LocalSpecProvider()
+    backend = get_backend("transformer_engine" if use_te else "local")
     return get_moe_module_spec_for_backend(
         backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
@@ -83,10 +75,10 @@ def get_moe_module_spec_for_backend(
     # shared experts spec
     shared_experts = partial(_build_shared_experts, submodules=mlp)
 
-    # The inference-optimized backend needs InferenceTopKRouter (compact [tokens, topk]
-    # index routing); other backends keep the MoESubmodules default (training TopKRouter,
-    # dense [tokens, num_experts] map). Mirrors get_inference_optimized_moe_spec().
-    router = InferenceTopKRouter if isinstance(backend, InferenceSpecProvider) else None
+    # The router is an operation the backend owns: the inference backend needs compact
+    # [tokens, topk] index routing, and every other backend keeps the MoESubmodules default
+    # (training TopKRouter, dense [tokens, num_experts] map).
+    router = backend.moe_router()
     submodule_kwargs = {"router": router} if router is not None else {}
 
     # MoE module spec
@@ -101,14 +93,15 @@ def get_moe_module_spec_for_backend(
 def get_inference_optimized_moe_spec() -> MlpBuilder:
     """MoE module spec for inference-optimized transformer impl.
 
-    Uses InferenceSpecProvider to select inference-optimized modules:
+    Uses the inference backend to select inference-optimized modules:
     InferenceTopKRouter, InferenceGroupedMLP. MoELayer detects inference mode
     via config.transformer_impl and sets up the inference dispatcher internally.
 
     Called by hybrid_layer_specs.py and gpt_layer_specs.py.
     """
-    backend = InferenceSpecProvider()
+    backend = get_backend("inference_optimized")
     activation_func = backend.activation_func()
+    router = not_none(backend.moe_router())
 
     experts = backend.grouped_mlp_modules(True)
     shared_experts = partial(
@@ -122,7 +115,5 @@ def get_inference_optimized_moe_spec() -> MlpBuilder:
 
     return partial(
         MoELayer,
-        submodules=MoESubmodules(
-            router=InferenceTopKRouter, experts=experts, shared_experts=shared_experts
-        ),
+        submodules=MoESubmodules(router=router, experts=experts, shared_experts=shared_experts),
     )

@@ -1288,6 +1288,15 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    op_backend_overrides: dict[str, str] = field(default_factory=dict)
+    """Per-operation backend choices layered on top of ``transformer_impl``.
+
+    Maps an operation name to a backend name, for example
+    ``{"layer_norm": "apex", "vocab_parallel_cross_entropy": "te_fused"}``. Backend names are
+    scoped to the operation's family, so ``megatron.core.ops.backends_for(operation)`` lists
+    the valid choices. Selecting the same operation both here and through an older setting is
+    an error."""
+
     #####################################
     # Fine-grained Activation Offloading
     #####################################
