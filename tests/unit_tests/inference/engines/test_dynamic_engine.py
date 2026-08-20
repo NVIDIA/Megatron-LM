@@ -44,6 +44,7 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -72,6 +73,13 @@ try:
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
+
+
+def teardown_module(module):
+    # inference_optimized MoE parametrizations use the default 'vllm' grouped-GEMM
+    # backend, which allocates class-level persistent intermediate buffers at
+    # context init. Release them so no GPU memory or state leaks across modules.
+    VllmFusedMoeBuffers._delete_buffers()
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
