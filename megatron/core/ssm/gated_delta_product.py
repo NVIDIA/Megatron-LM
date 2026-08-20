@@ -996,7 +996,12 @@ class GatedDeltaProductMixer(MegatronModule):
             # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
             # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
             # full TP-local size so the [z|V*|K*|Q|b*|a] split below matches a non-GTP run.
-            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
+            # Gather the UNTRIMMED shard: the checkpoint entry drops its alignment-pad tail,
+            # which shortens it on the trailing GTP rank only, and an all-gather sized off that
+            # local length makes the ranks disagree (the job hangs). Pad is stripped below.
+            from megatron.core.tensor_parallel.gtp_ckpt import untrimmed_gtp_shard
+
+            local = untrimmed_gtp_shard(sharded_state_dict[f"{prefix}in_proj.weight"]).contiguous()
             gathered = torch.empty(
                 (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
                 dtype=local.dtype,

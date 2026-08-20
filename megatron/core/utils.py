@@ -971,6 +971,95 @@ def check_param_hashes_across_dp_replicas(
     return all_param_hashes_match
 
 
+def _make_gtp_logical_sharded_tensor(
+    tensor,
+    key,
+    *,
+    tp_axis,
+    tp_rank,
+    tp_size,
+    gtp_rank,
+    gtp_remat_size,
+    pad_length,
+    prepend_offsets,
+    prepend_axis_num,
+    other_offsets,
+    replica_id,
+    **kwargs,
+):
+    """Map an alignment-padded GTP shard onto the LOGICAL global tensor.
+
+    GTP pads dim 0 of the TP-local weight up to ``pad_for_alignment * gtp_remat`` and only then
+    splits it into ``gtp_remat`` contiguous shards, so a local shard is a slice of a *padded*
+    tensor. Describing that with the uniform ``from_rank_offsets`` grid is wrong: that grid
+    places chunk ``tp_rank * gtp_remat + gtp_rank`` at ``chunk_index * padded_shard_rows``,
+    which shifts every TP rank past 0 by ``tp_rank * pad_length`` and inflates the global shape
+    by ``tp_size * pad_length``. Such a rank then loads weights offset by pad_length, and its
+    last pad_length logical rows -- outside the saved data -- come back as zeros.
+
+    The pad rows are a local allocation detail and must never reach the checkpoint, so place
+    each shard at its true logical offset and drop the pad tail. Shards stop being equal-sized
+    (the last GTP rank of each TP window is short), hence ``axis_fragmentations=None``.
+    """
+    shard_rows = tensor.shape[0]
+    logical_rows = shard_rows * gtp_remat_size - pad_length
+
+    # A trailing shard can be entirely padding -- e.g. dim0 1152 with alignment 128*4 pads by
+    # 384 into 4 shards of 384, so the last shard covers [1152, 1536). It holds no logical rows,
+    # which is a legal (if wasteful) configuration, not an error: `start` clamps to the logical
+    # end and `keep` becomes 0, contributing an empty slice. ShardedTensor's own validation
+    # anticipates zero-sized shards.
+    start = min(gtp_rank * shard_rows, logical_rows)
+    keep = min(shard_rows, max(0, logical_rows - start))
+
+    if keep == shard_rows:
+        # Nothing to trim: hand back the SAME object. The optimizer maps its params to model
+        # entries by object identity (dist_checkpointing/optimizer.py), and a narrowed view --
+        # even a full-length one -- is a new object that would silently stop matching.
+        local = tensor
+    else:
+        local = tensor[:keep]
+    if tp_axis == 0:
+        global_dim0 = logical_rows * tp_size
+        offset_dim0 = tp_rank * logical_rows + start
+    else:
+        global_dim0 = logical_rows
+        offset_dim0 = start
+
+    sharded = ShardedTensor.from_rank_offsets(
+        key,
+        local,
+        *prepend_offsets,
+        *other_offsets,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
+        **kwargs,
+    )
+    global_shape = list(sharded.global_shape)
+    global_offset = list(sharded.global_offset)
+    global_shape[prepend_axis_num] = global_dim0
+    global_offset[prepend_axis_num] = offset_dim0
+    sharded.global_shape = tuple(global_shape)
+    sharded.global_offset = tuple(global_offset)
+    # Uneven shards: the regular-grid divisibility rule no longer applies.
+    sharded.axis_fragmentations = None
+    # Trimming breaks object identity with the live param, which several consumers rely on.
+    # The backlink lives on the ShardedTensor, NOT on its data: ``data`` is reassigned
+    # (``sh_ten.data = sh_ten.data.detach()`` in the torch strategy) and detach/clone/to all
+    # produce a fresh tensor that silently drops attributes.
+    if keep != shard_rows:
+        # Point at the LIVE param, which is what the optimizer holds and matches against.
+        # For a native-FP8 GTP weight `tensor` is already the dequantized BF16 copy carrying
+        # `_gtp_dequant_src`; slicing it drops that attribute, so without this hop both
+        # backlinks would break on exactly the trimmed rank and the param's optimizer state
+        # would vanish from the checkpoint with only a debug log.
+        # Explicit None check, not `a or b`: these are tensors.
+        _live = getattr(tensor, "_gtp_dequant_src", None)
+        sharded.gtp_pad_src = tensor if _live is None else _live
+    sharded.validate_metadata_integrity()
+    return sharded
+
+
 def make_tp_sharded_tensor_for_checkpoint(
     tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
 ):
@@ -1032,6 +1121,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    gtp_pad_length = 0
     # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
     # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
     # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
@@ -1059,9 +1149,10 @@ def make_tp_sharded_tensor_for_checkpoint(
             dp_replica_id = parallel_state.get_data_parallel_rank(
                 with_context_parallel=True, with_gtp_remat=False
             )
-            # Saved global is the padded shape when GTP padded out_features for alignment.
-            if getattr(tensor, "pad_length", 0):
-                kwargs.setdefault("allow_shape_mismatch", True)
+            # Alignment padding is a local allocation detail: it is stripped below and the
+            # shard is placed at its logical offset, so the saved global shape is exact and
+            # needs no allow_shape_mismatch waiver (that waiver used to hide the shift).
+            gtp_pad_length = int(getattr(tensor, "pad_length", 0) or 0)
             # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
             # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
             # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
@@ -1078,6 +1169,25 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
+
+    if gtp_pad_length:
+        # dim 0 is described explicitly by the helper; keep only the offsets for other axes.
+        other_offsets = [off for off in new_offsets if off[0] != prepend_axis_num]
+        return _make_gtp_logical_sharded_tensor(
+            tensor,
+            key,
+            tp_axis=tp_axis,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            gtp_rank=gtp_rank,
+            gtp_remat_size=gtp_remat_size,
+            pad_length=gtp_pad_length,
+            prepend_offsets=prepend_offsets,
+            prepend_axis_num=prepend_axis_num,
+            other_offsets=other_offsets,
+            replica_id=replica_id,
+            **kwargs,
+        )
 
     return ShardedTensor.from_rank_offsets(
         key,

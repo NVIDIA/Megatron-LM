@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -107,16 +108,20 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
             is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
+        from megatron.core.tensor_parallel.gtp_ckpt import gtp_entry_backlink
     except ImportError:
         return None  # GTP not built in.
 
     if not is_gtp_param(model_param):
         return None
 
-    # Case 1: the dequantized copy's backlink.
+    # Case 1: the entry carries a backlink saying it stands for this param -- see
+    # gtp_entry_backlink for the two kinds and why they exist. Missing the padding one sends the
+    # trailing GTP shard down the Case 3 rebuild, which keys it by ``_debug_name`` -- a DIFFERENT
+    # checkpoint FQN -- so the real tensor silently loses those rows and DCP rejects the plan for
+    # incomplete coverage.
     for entry in nested_values(model_sharded_state_dict):
-        src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
-        if src is model_param:
+        if gtp_entry_backlink(entry) is model_param:
             return entry
 
     # Case 2: a factory-backed weight (GDN / Mamba in_proj). The model gathers the GTP
@@ -129,6 +134,13 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
     # Return the model's own factory; the caller gathers the state tensors across the GTP
     # group to the shape the factory expects. Match by name, since the factory's data is
     # the gathered tensor and therefore never identical to this shard.
+    # Case 2a: the factory carries a backlink to the per-shard param it was built from. This is
+    # exact, unlike the name match below -- a grouped-expert factory's key is rewritten by the
+    # prefix replacement in experts.py, so it does not equal the param's stripped _debug_name.
+    for entry in nested_values(model_sharded_state_dict):
+        if getattr(entry, 'gtp_source_param', None) is model_param:
+            return entry
+
     name = _strip_module_prefix(getattr(model_param, '_debug_name', '') or '')
     if name:
         for entry in nested_values(model_sharded_state_dict):
@@ -2036,7 +2048,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if gathered.shape[0] != want_rows:
                                 gathered = gathered[:want_rows]
                             state_ten = gathered.contiguous().to(host_device)
-                        state_ten = state_ten.reshape(sharded_metadata.data.shape)
+                        want_shape = tuple(sharded_metadata.data.shape)
+                        if getattr(
+                            sharded_metadata, 'gtp_pad_src', None
+                        ) is not None and state_ten.numel() > math.prod(want_shape):
+                            # GTP trimmed the alignment-pad rows out of the model entry; the
+                            # flat state still spans the padded shard. Drop the same tail.
+                            state_ten = state_ten.reshape((-1,) + want_shape[1:])[: want_shape[0]]
+                        state_ten = state_ten.reshape(want_shape)
                         replace_kwargs = dict(
                             key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                             data=state_ten,
@@ -2618,6 +2637,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # Handle torch Adam "step" state separately.
                             continue
                         v_flat = v.flatten()
+                        # GTP alignment-pad rows are excluded from the checkpoint (they are
+                        # the trailing rows of the shard and hold no parameter), while the
+                        # flat param ranges below are expressed over the PADDED shard.
+                        # Restore them as zeros -- the same value a freshly built shard has --
+                        # so the ranges line up. Mirrors the trim on the save side.
+                        _want_numel = model_param.numel()
+                        if v_flat.numel() < _want_numel:
+                            v_flat = torch.cat(
+                                [v_flat, v_flat.new_zeros(_want_numel - v_flat.numel())]
+                            )
                         v_flat = v_flat[
                             param_range_map["param"].start : param_range_map["param"].end
                         ]
