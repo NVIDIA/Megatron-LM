@@ -257,7 +257,7 @@ class FsdpModule:
         # before that when module inputs do not require grad.
         module_ref = ref(self)
 
-        def grad_hook(_parameter: nn.Parameter) -> None:
+        def grad_hook(_: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
                 return
