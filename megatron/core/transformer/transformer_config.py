@@ -3195,24 +3195,6 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 # The replay half of the same gap is fixed, not rejected: see
                 # _replay_mhc_attention_consumer.
-            if self.virtual_pipeline_model_parallel_size is not None:
-                # VPP is admitted only together with EP overlap. Interleaving used
-                # to diverge here (grad norms ~1e8 from the first iteration) on a
-                # caching-allocator use-after-free: mHC post-processing ran inside
-                # the communication-stream combine node, so the recompute subgraph
-                # was allocated on the compute stream and read from another, a
-                # window the allocator cannot track. The fix -- the post node owning
-                # a compute-stream schedule node -- lives in the overlap schedule,
-                # so the non-overlap VPP path has never carried it and stays
-                # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
-                # pre_process chunk carries a data iterator.
-                if not self.overlap_moe_expert_parallel_comm:
-                    raise ValueError(
-                        "mHC recompute supports interleaved pipeline (VPP) "
-                        "schedules only together with "
-                        "overlap_moe_expert_parallel_comm: the non-overlap VPP "
-                        "path is unvalidated."
-                    )
 
         if self.cuda_graph_impl != "none":
 
