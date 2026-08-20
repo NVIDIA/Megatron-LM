@@ -3418,9 +3418,14 @@ class TextGenerationController:
 
         This function goes through the topn logprobs generated for each, and for whichever
         batch has started generating tokens, it updates the top_n_logprobs_dict with the
-        decoded token (string) as the key and the logit as the value.
+        token id (as a decimal string) as the key and the logit as the value.
         top_n_logprobs_dict has as keys the batch idx, the values is a list, where each element
-        represents a dictionary of decoded token as key and logit as value generated at each step
+        represents a dictionary of token id as key and logit as value generated at each step
+
+        Keyed by token id rather than by the detokenized string: a single token rarely
+        holds a whole character, so byte-fallback tokens all detokenize to U+FFFD and
+        would collide into one dict entry. Strings (not ints) because these dicts cross
+        the msgpack coordinator hop, which rejects int map keys.
 
         Args:
             top_n_logprobs_this_step (torch.Tensor): The top n logprob values
@@ -3434,8 +3439,7 @@ class TextGenerationController:
             if mask[batch_idx]:
                 logit_dict = {}
                 for logprob, logprob_index in zip(logprob_values, logprob_indices):
-                    key = self.tokenizer.detokenize([logprob_index.item()])
-                    logit_dict[key] = logprob.item()
+                    logit_dict[str(logprob_index.item())] = logprob.item()
                 top_n_logprobs_dict[batch_idx].append(logit_dict)
 
     @torch.inference_mode()
