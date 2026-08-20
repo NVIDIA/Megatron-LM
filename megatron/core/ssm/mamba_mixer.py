@@ -1023,17 +1023,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         return y
 
     @torch.no_grad()
-    def _refresh_A_neg_exp_cache(self) -> None:
+    def refresh_cache(self) -> None:
         """Refresh the existing decode-cache storage from the current ``A_log``."""
         self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
         self._A_neg_exp_cache_stale = False
-
-    def post_refit(self) -> None:
-        """Refresh the decode cache after refit updates ``A_log`` in place.
-
-        Keeping the cache tensor itself preserves addresses captured by CUDA graphs.
-        """
-        self._refresh_A_neg_exp_cache()
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
@@ -1048,7 +1041,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
         # Inference path. Refill when stale
         if self._A_neg_exp_cache_stale:
-            self._refresh_A_neg_exp_cache()
+            self.refresh_cache()
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
     def _get_batch_invariant_decoder(self) -> MambaBatchInvariantDecode:
@@ -1058,12 +1051,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         return self._batch_invariant_decoder
 
     def train(self, mode: bool = True):
-        """Mark the decode cache stale; weights may have updated."""
+        """Mark the decode cache stale in training and refresh it for evaluation."""
         if mode:
             self._A_neg_exp_cache_stale = True
         elif self._A_neg_exp_cache_stale:
             # CUDA graph replay bypasses the Python lazy-refresh path.
-            self._refresh_A_neg_exp_cache()
+            self.refresh_cache()
         return super().train(mode)
 
     def ssm_decode(

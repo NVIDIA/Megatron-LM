@@ -42,11 +42,11 @@ class MegatronModule(torch.nn.Module):
         super().__init__()
         self.config = config
 
-    def post_refit(self) -> None:
+    def refresh_cache(self) -> None:
         """Refresh state derived from parameters after an in-place weight refit.
 
         Refit bypasses the normal checkpoint-load and train/eval lifecycles. Modules
-        that cache values derived from parameters can override this hook; the refit
+        that cache values derived from parameters can override this method; the refit
         receiver calls it after all parameter and buffer transfers have completed.
         """
 
