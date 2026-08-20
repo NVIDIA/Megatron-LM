@@ -1229,7 +1229,7 @@ def test_nccl_handoff_reuses_decode_cached_prefix(handoff_loop):
     _drain_loop(handoff_loop)
 
     assert engine._kv_transfer_agent.calls == [(kv_meta, [101], [10])]
-    assert events == ["prepare", "receive", "ready"]
+    assert events == ["prepare", "ready", "receive"]
 
 
 def test_decode_role_rejects_prompt_scheduling(handoff_loop):

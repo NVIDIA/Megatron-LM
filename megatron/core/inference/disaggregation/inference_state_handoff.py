@@ -942,9 +942,11 @@ class InferenceStateHandoffMixin:
                                 ssm_meta[state_kind], [], [ssm_import.live_slot]
                             )
                         )
-                handle = self._kv_transfer_agent.start_prepared(plans)
-                # Notify prefill only after the matching receives are posted.
+                # NCCL may rendezvous while posting a first-use P2P batch. Let
+                # prefill post the matching sends after all receive resources
+                # have been reserved and validated, but before entering that call.
                 self._notify_kv_transfer_ready(handoff.request_id, len(cached_blocks))
+                handle = self._kv_transfer_agent.start_prepared(plans)
             else:
                 handle = self._kv_transfer_agent.begin_pull_blocks(
                     transfer_meta, transfer_src_blocks, imported_blocks
