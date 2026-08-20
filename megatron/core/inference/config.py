@@ -15,24 +15,24 @@ from megatron.core.utils import get_attr_wrapped_model
 @dataclass
 class MambaInferenceStateConfig:
     """
-    Config for initializing Mamba model inference state tensors.
+    Config for initializing recurrent mixer inference state tensors.
 
     Note that we maintain separate metadata for decode, regular prefill, and
-    chunked prefill requests because the Mamba kernels do not yet support mixing
-    these. Once the kernels have been updated we can simplify this code.
+    chunked prefill requests because the recurrent kernels do not yet support
+    mixing these. Once the kernels have been updated we can simplify this code.
     """
 
     layer_type_list: List[str]
     """
-    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
+    A list of strings that indicates the layer type (Mamba / GDN / Attention / MLP) for each layer.
     See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
-    """Mamba conv states shape per request."""
+    """Recurrent mixer's conv state shape per request."""
 
     ssm_states_shape: Tuple[int]
-    """Mamba SSM states shape per request."""
+    """Recurrent mixer state shape per request."""
 
     conv_states_dtype: torch.dtype
     """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
@@ -55,12 +55,29 @@ class MambaInferenceStateConfig:
         conv_states_dtype: Optional[torch.dtype] = None,
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
-        """Returns Mamba inference state config from the model if it is a hybrid model."""
+        """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        recurrent_symbols = (Symbols.MAMBA, Symbols.GDN)
+        if layer_type_list is not None and any(
+            symbol in layer_type_list for symbol in recurrent_symbols
+        ):
+            present_recurrent_symbols = {
+                symbol for symbol in recurrent_symbols if symbol in layer_type_list
+            }
+            if len(present_recurrent_symbols) > 1:
+                raise ValueError(
+                    "Dynamic inference does not support mixing Mamba and GDN layers; "
+                    "the recurrent-state cache and prefill metadata use one shared shape "
+                    "and chunk size."
+                )
+            if (
+                Symbols.GDN in present_recurrent_symbols
+                and model.config.experimental_attention_variant == "gdn2"
+            ):
+                raise NotImplementedError("GDN2 does not support dynamic inference.")
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
@@ -81,6 +98,9 @@ class MambaInferenceStateConfig:
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
+                    break
+                if layer_type == Symbols.GDN and hasattr(layer, 'self_attention'):
+                    mamba_chunk_size = layer.self_attention.chunk_size
                     break
             # Gated Delta Product layers register as Mamba layers but carry a
             # Householder count, which sizes their (separate) chunk descriptors.
