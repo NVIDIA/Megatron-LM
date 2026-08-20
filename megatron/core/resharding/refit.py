@@ -26,13 +26,14 @@ from . import build_local_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
+from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
-RefitBackendName = Literal["nccl", "gloo", "nvshmem", "nixl"]
+RefitBackendName = Literal["nccl", "nccl_m2n", "gloo", "nvshmem", "nixl"]
 
 
 @dataclass(frozen=True)
@@ -122,14 +123,16 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     when swap_model_weights is called multiple times with the same backend.
 
     Args:
-        backend: Backend name ("nccl", "gloo", "nvshmem", or "nixl").
-        group: Optional process group for NCCL backend.
+        backend: Backend name ("nccl", "nccl_m2n", "gloo", "nvshmem", or "nixl").
+        group: Optional process group for the backend.
     """
     if backend in _service_cache:
         return _service_cache[backend]
 
     if backend == "nccl":
         service = NCCLCopyService(group=group)
+    elif backend == "nccl_m2n":
+        service = NCCLM2NCopyService(group=group)
     elif backend == "gloo":
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
@@ -490,6 +493,7 @@ def reshard_model_weights(
         src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index
     )
     _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
+    service.set_model_roles(is_source=src_core is not None, is_destination=tgt_core is not None)
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )

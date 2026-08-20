@@ -34,6 +34,8 @@ try:
 except Exception:
     has_nvshmem = False
 
+has_nccl_m2n = bool(os.getenv("NCCL_M2N_LIBRARY"))
+
 try:
     import mamba_ssm  # noqa: F401
 
@@ -611,6 +613,13 @@ def test_router_expert_bias_refit(
     "refit_backend",
     [
         pytest.param(
+            "nccl_m2n",
+            marks=pytest.mark.skipif(
+                not has_nccl_m2n,
+                reason="NCCL_M2N_LIBRARY is not set",
+            ),
+        ),
+        pytest.param(
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
@@ -638,6 +647,9 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
     if world < src_world + dst_world:
         Utils.destroy_model_parallel()
         pytest.skip(f"Non-collocated test requires WORLD_SIZE >= {src_world + dst_world}")
+    if refit_backend == "nccl_m2n" and world != src_world + dst_world:
+        Utils.destroy_model_parallel()
+        pytest.skip("NCCL M2N requires a world containing exactly the source and destination ranks")
 
     try:
         import transformer_engine  # noqa: F401

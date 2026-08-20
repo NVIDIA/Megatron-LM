@@ -67,6 +67,14 @@ class CopyService(ABC):
     def close(self) -> None:
         """Release backend-owned resources.  Default no-op; NVSHMEM overrides."""
 
+    def set_model_roles(self, *, is_source: bool, is_destination: bool) -> None:
+        """Provide this rank's model participation to topology-aware backends.
+
+        Point-to-point backends infer everything they need from submitted
+        operations and keep this default no-op. Collective cross-group
+        backends may override it to construct their source/destination meshes.
+        """
+
 
 def match_local_ops_by_task_id(
     local_sends: list, local_recvs: list, backend_name: str, rank: int

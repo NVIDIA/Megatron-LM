@@ -2811,9 +2811,10 @@ def _add_rl_args(parser):
         ),
     )
     group.add_argument('--refit-method', type=str, default='gloo',
-                       choices=['nccl', 'gloo', 'nvshmem'],
+                       choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem'],
                        help=('Method to refit the model weights between training and inference models during RL. '
                              'nccl: use NCCLCopyService to refit using NCCL; '
+                             'nccl_m2n: use hierarchical NCCL M2N for non-collocated refit; '
                              'gloo: use GlooCopyService over CPU; '
                              'nvshmem: use NVSHMEMCopyService to refit using the NVSHMEM.'))
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,

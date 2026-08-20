@@ -17,6 +17,7 @@ execution.py        Submits send/recv ops to a CopyService, handles writebacks
     |
 copy_services/      Pluggable transport backends
     ├── nccl         GPU-to-GPU via torch.distributed P2P
+    ├── nccl_m2n     Hierarchical cross-group transfer via NCCL M2N
     ├── gloo         CPU-staged via Gloo process group
     └── nvshmem      NVSHMEM pipelined GPU-to-GPU (requires nvshmem library)
 
@@ -34,7 +35,7 @@ from megatron.core.resharding import swap_model_weights
 swap_model_weights(
     src_model=training_model,
     target_model=inference_model,
-    refit_method="nccl",  # or "gloo" or "nvshmem"
+    refit_method="nccl",  # or "nccl_m2n", "gloo", "nvshmem", or "nixl"
 )
 ```
 
@@ -78,13 +79,42 @@ swap_model_weights(None, None, "nccl",
 | Backend | Transport | Best for | Notes |
 |---------|-----------|----------|-------|
 | `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
+| `nccl_m2n` | NCCL M2N hierarchical ring + NCCL windows | Large non-collocated source/destination groups | Requires `libnccl_m2n.so`; source ranks must precede destination ranks |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
 | `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
 
-All backends detect same-rank (local) transfers via `task_id` and
-short-circuit them into direct `tensor.copy_()` instead of going
-through the network stack.
+Backends that support collocated models detect same-rank (local) transfers via
+`task_id` and short-circuit them into direct `tensor.copy_()` instead of going
+through the network stack. NCCL M2N is the exception because its source and
+destination meshes must be disjoint.
+
+### NCCL M2N backend
+
+Build and install the experimental `contrib/nccl_m2n` library from the
+[NVIDIA NCCL repository](https://github.com/NVIDIA/nccl/tree/master/contrib/nccl_m2n),
+then make the shared library discoverable:
+
+```bash
+export NCCL_M2N_LIBRARY=/path/to/nccl_m2n/build/lib/libnccl_m2n.so
+```
+
+Select it with `refit_method="nccl_m2n"` or `--refit-method nccl_m2n`.
+The backend preserves the existing ReFIT planner and packs its operations into
+one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
+0, destination ranks shard dimension 1, and one cross-dimension M2N reshard
+moves the entire batch through the hierarchical ring.
+
+NCCL M2N v0.1 only supports non-collocated layouts. The communication group
+must contain a contiguous source interval starting at group rank 0, immediately
+followed by a contiguous destination interval, with no overlapping or idle
+ranks. Use a process group scoped to exactly one source/destination pool when
+the application has extra ranks. Tensor data is staged through a reusable
+NCCL symmetric-memory window; model parameter storage itself is not replaced.
+The v0.1 build caps RING meshes at 16 source and 64 destination ranks, and
+DIRECT meshes at 32 source and 64 destination ranks. A custom build with
+larger bounds can be used by constructing `NCCLM2NCopyService` with
+`enforce_mesh_limits=False`.
 
 ## How the Reshard Plan Works
 
@@ -162,6 +192,7 @@ attribute with the following groups:
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |
 | `copy_services/nccl_copy_service.py` | NCCL backend |
+| `copy_services/nccl_m2n_copy_service.py` | Hierarchical NCCL M2N backend |
 | `copy_services/gloo_copy_service.py` | Gloo backend |
 | `copy_services/nixl_copy_service.py` | NIXL/UCX backend |
 | `copy_services/nvshmem_copy_service.py` | NVSHMEM backend (delegates to `nvshmem_copy_service/`) |
