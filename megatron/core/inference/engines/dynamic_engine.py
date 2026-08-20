@@ -1681,14 +1681,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 top_n_data_list = top_n_logprobs[req_idx]
                 prompt_length = len(request.prompt_tokens)
 
-                # Process each token's top-n logprobs
+                # Process each token's top-n logprobs.
+                # Keyed by the token id as a decimal string, not by the detokenized
+                # string: a single token rarely holds a whole character, so
+                # byte-fallback tokens all detokenize to U+FFFD and would collide
+                # into one dict entry. Strings (not ints) because these dicts cross
+                # the msgpack coordinator hop, which rejects int map keys.
                 for top_n_values, top_n_indices in top_n_data_list:
                     logit_dict = {}
                     for logprob, logprob_index in zip(
                         top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
                     ):
-                        key = self.controller.tokenizer.detokenize([logprob_index])
-                        logit_dict[key] = logprob
+                        logit_dict[str(logprob_index)] = logprob
 
                     # Simple decision: check total count accumulated so far
                     total_accumulated = len(request.prompt_top_n_logprobs) + len(

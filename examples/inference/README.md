@@ -91,6 +91,36 @@ Send requests with any OpenAI-compatible client. The dynamic server
 currently returns `"model": "EMPTY"` and does not validate the request
 `model` field — pass anything you like.
 
+### Evaluation server
+
+For token-based evaluation runners, use
+`tools/run_megatron_checkpoint_eval_server.py`. It is the same dynamic
+serving path as `tools/run_dynamic_text_generation_server.py`, with
+eval-oriented defaults: optimizer/RNG state is not loaded, a missing
+checkpoint is fatal, and prompt logprobs are enabled for
+`echo=True, logprobs=...` requests.
+
+```bash
+torchrun --nproc-per-node <NPROC> \
+    -m tools.run_megatron_checkpoint_eval_server \
+    --load /path/to/megatron_ckpt \
+    --use-checkpoint-args \
+    --tokenizer-type <TOKENIZER_TYPE> \
+    --tokenizer-model /path/to/tokenizer \
+    --inference-max-seq-length 4096 \
+    --micro-batch-size 1 \
+    --port 5000 \
+    --host 0.0.0.0 \
+    <other model/inference args>
+```
+
+Point the eval runner at `http://<host>:5000` or `http://<host>:5000/v1`.
+The server exposes `/v1/health`, `/v1/completions`, `/v1/chat/completions`,
+`/v1/raw_completions`, and their non-`/v1` aliases. Prefer
+`/v1/raw_completions` for Megatron checkpoint evals: callers send prompt token
+ids and receive generated token ids plus optional sampled logprobs, so
+tokenization and decoding stay in the eval client.
+
 ### Advanced examples
 
 `advanced/` contains scripts that drive the lower-level

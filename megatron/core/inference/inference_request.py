@@ -157,6 +157,9 @@ class InferenceRequest:
     generated_tokens: Optional[torch.Tensor] = None
     prompt_log_probs: Optional[torch.Tensor] = None
     generated_log_probs: Optional[torch.Tensor] = None
+    # Keyed by the token id as a decimal string, not by detokenized string:
+    # byte-fallback tokens all detokenize to U+FFFD and would collide into a
+    # single dict entry.
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None

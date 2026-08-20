@@ -24,8 +24,10 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_inference_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     parser.add_argument(
-        "--host", type=str, default=None,
-        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces)."
+        "--host",
+        type=str,
+        default=None,
+        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
     )
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
@@ -35,7 +37,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int, hostname: str | None = None,
+    engine: DynamicInferenceEngine,
+    coordinator_port: int | None,
+    server_port: int,
+    hostname: str | None = None,
+    parsers: list[str] | None = None,
+    verbose: bool = False,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -50,7 +57,8 @@ async def run_text_generation_server(
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True,
+        inference_coordinator_port=coordinator_port,
+        launch_inference_coordinator=True,
         hostname=hostname,
     )
 
@@ -59,10 +67,10 @@ async def run_text_generation_server(
             start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
-                parsers=args.parsers,
+                parsers=parsers or [],
                 rank=rank,
                 server_port=server_port,
-                verbose=args.inference_text_gen_server_logging,
+                verbose=verbose,
                 hostname=hostname,
             )
 
@@ -75,11 +83,19 @@ async def run_text_generation_server(
             stop_text_gen_server()
 
 
-if __name__ == "__main__":
+def main(
+    args_defaults: dict | None = None,
+    force_return_log_probs: bool = True,
+    force_prompt_log_probs: bool = False,
+):
+    """Run the dynamic text generation server."""
+    default_args = {'no_load_rng': True, 'no_load_optim': True}
+    if args_defaults:
+        default_args.update(args_defaults)
+
     with torch.inference_mode():
         parse_and_validate_args(
-            extra_args_provider=add_text_generation_server_args,
-            args_defaults={'no_load_rng': True, 'no_load_optim': True},
+            extra_args_provider=add_text_generation_server_args, args_defaults=default_args
         )
         initialize_megatron()
 
@@ -92,16 +108,26 @@ if __name__ == "__main__":
         if args.profile and args.nvtx_ranges:
             configure_nvtx_profiling(True)
 
-        # Enable return_log_probs to allow prompt logprobs computation for echo=True requests
-        # This sets materialize_only_last_token_logits=False in the inference context,
-        # which is required for lm-eval compatibility (loglikelihood evaluation tasks)
-        args.return_log_probs = True
+        # Enable return_log_probs to allow prompt logprobs computation for echo=True requests.
+        # This sets materialize_only_last_token_logits=False in the inference context when
+        # prompt logprobs are not skipped, which is required for loglikelihood evaluation tasks.
+        if force_return_log_probs:
+            args.return_log_probs = True
+        if force_prompt_log_probs:
+            args.skip_prompt_log_probs = False
 
         engine = get_dynamic_inference_engine()
 
         try:
             asyncio.run(
-                run_text_generation_server(engine, args.inference_coordinator_port, args.port, args.host)
+                run_text_generation_server(
+                    engine,
+                    args.inference_coordinator_port,
+                    args.port,
+                    args.host,
+                    args.parsers,
+                    args.inference_text_gen_server_logging,
+                )
             )
         except KeyboardInterrupt:
             # Catching at the top level ensures clean stdout without spamming the traceback
@@ -110,3 +136,7 @@ if __name__ == "__main__":
             # Clean up PyTorch distributed groups properly
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
