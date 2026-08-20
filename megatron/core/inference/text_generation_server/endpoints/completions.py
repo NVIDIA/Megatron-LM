@@ -21,6 +21,20 @@ from megatron.core.inference.text_generation_server.endpoints.common import LOCK
 from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
 
 
+def _detokenize_top_n_keys(top_n_logprobs, tokenizer):
+    """Re-key id-keyed top-n logprob dicts by detokenized string for the OpenAI wire format.
+
+    The engine keys these by token id so that byte-fallback tokens don't collide.
+    This endpoint's response schema is string-keyed, so convert back at the edge.
+    Distinct ids that detokenize to the same string (byte fallbacks) still collide
+    here; use /raw_completions when exact token identity matters.
+    """
+    return [
+        {tokenizer.detokenize([int(token_id)]): logprob for token_id, logprob in entry.items()}
+        for entry in top_n_logprobs
+    ]
+
+
 def detokenize(prompt, tok) -> list[str]:
     """Detokenizes the given prompt."""
     if isinstance(prompt, str):
@@ -183,7 +197,9 @@ class MegatronCompletions(Resource):
             truncated_generation_logprobs = output_log_probs[batch_idx][tok_idx_start:tok_idx_end]
             truncated_generation_tokens = tokens[batch_idx][tok_idx_start:tok_idx_end]
             truncated_generation_topk_logprobs = (
-                logprobs_topk[batch_idx][tok_idx_start:tok_idx_end]
+                _detokenize_top_n_keys(
+                    logprobs_topk[batch_idx][tok_idx_start:tok_idx_end], tokenizer
+                )
                 if logprobs_topk is not None
                 else None
             )
