@@ -82,6 +82,7 @@ def chunk_gated_delta_rule_prefill_cute(
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     output_A: Optional[torch.Tensor] = None,
+    output_g: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
@@ -89,12 +90,15 @@ def chunk_gated_delta_rule_prefill_cute(
     checkpoint_every_n_tokens: int = 0,
     assume_valid_cu_seqlens: bool = False,
     gate_is_log_cumsum: bool = False,
+    gate_is_log_decay: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Run the local SM100 GDN prefill kernel.
 
     The accepted signature mirrors the FlashInfer API used by Megatron, but the
     implementation is local to Megatron Core and only supports the SM100 path.
     """
+    if gate_is_log_cumsum and gate_is_log_decay:
+        raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
     if use_qk_l2norm_in_kernel:
         raise NotImplementedError("QK L2 norm inside the GDN prefill kernel is not supported")
     if initial_state is not None:
@@ -144,6 +148,16 @@ def chunk_gated_delta_rule_prefill_cute(
         if output_A.dtype != q.dtype:
             raise ValueError("output_A dtype must match q dtype")
         output_A = _require_contiguous("output_A", output_A)
+
+    if output_g is not None:
+        expected_g_shape = (total_tokens, num_o_heads)
+        if tuple(output_g.shape) != expected_g_shape:
+            raise ValueError(
+                f"output_g shape mismatch: expected {expected_g_shape}, got {tuple(output_g.shape)}"
+            )
+        if output_g.dtype != torch.float32:
+            raise ValueError("output_g dtype must be torch.float32")
+        output_g = _require_contiguous("output_g", output_g)
 
     if output_h is not None:
         expected_h_shape = (total_tokens // _BT, num_o_heads, head_size, head_size)
@@ -226,7 +240,9 @@ def chunk_gated_delta_rule_prefill_cute(
         cu_checkpoints=cu_checkpoints,
         output_checkpoints=state_checkpoints,
         output_A=output_A,
+        output_g=output_g,
         output_h=output_h,
         gate_is_log_cumsum=gate_is_log_cumsum,
+        gate_is_log_decay=gate_is_log_decay,
     )
     return (output, output_state) if output_final_state else output

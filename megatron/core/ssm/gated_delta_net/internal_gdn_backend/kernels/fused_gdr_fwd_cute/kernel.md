@@ -50,7 +50,9 @@ launcher directly.
 - Contiguous `q`, `k`, and `v` with shape `[total_tokens, heads, 128]`.
 - `q`, `k`, and `v` must share the same FP16 or BF16 dtype.
 - `g` and `beta` have shape `[total_tokens, output_heads]` and are converted
-  to contiguous FP32 tensors before launch.
+  to contiguous FP32 tensors before launch. Megatron training passes raw
+  log-decay `g` with `gate_is_log_decay=True`; the kernel converts it to
+  chunk-local cumulative base-2 log gates in registers.
 - `cu_seqlens` is required; every sequence length must be a multiple of the
   64-token chunk size.
 - In-kernel QK L2 normalization and non-empty initial state are not supported
@@ -107,10 +109,14 @@ chunk can be prefetched while the current chunk is processed.
 - The token dimension is dynamic, while head counts, dtypes, and optional
   output features are part of the CuTe DSL compilation-cache key.
 - Dense BTHD inputs are flattened to packed THD layout by the Megatron adapter.
-- The adapter supplies chunk-local cumulative log2 gates to the kernel. With
-  `gdn_gdr_recompute_h=False`, it requests both `A` and per-chunk input state
-  `h` and passes them directly to the fused backward kernel. With the flag set,
-  it requests only `A` and drops `h` after producing the forward output.
+- The adapter passes raw Megatron log-decay gates to the kernel and requests a
+  transformed-g side output. The kernel writes the same chunk-local cumulative
+  base-2 log gate tensor that the old external `chunk_local_cumsum` call
+  produced, and autograd saves that tensor for backward. With
+  `gdn_gdr_recompute_h=False`, the adapter also requests `A` and per-chunk
+  input state `h` and passes them directly to the fused backward kernel. With
+  the flag set, it requests only `A` and transformed `g`, then recomputes `h`
+  during backward.
 - Native partial chunk tails are not enabled by the public wrapper; supported
   sequence lengths are 64-token aligned.
 - This document does not record performance numbers. Benchmark results should

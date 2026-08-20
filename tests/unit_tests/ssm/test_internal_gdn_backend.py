@@ -260,9 +260,30 @@ def test_cutedsl_forward_controls_fused_backward_h(monkeypatch, save_fused_bwd_s
     )
 
     assert seen["output_h"] is saved_h
+    assert seen["output_g"].shape == (64, 3)
+    assert seen["output_g"].dtype == torch.float32
+    assert seen["g"] is not seen["output_g"]
+    assert seen["gate_is_log_decay"] is True
+    assert seen.get("gate_is_log_cumsum", False) is False
     assert seen["checkpoint_every_n_tokens"] == (64 if save_fused_bwd_state else 0)
     assert seen["assume_valid_cu_seqlens"] is True
     assert (saved_h is None) is not save_fused_bwd_state
+
+
+def test_fused_forward_rejects_conflicting_gate_modes():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_fwd_cute import (
+        chunk_gated_delta_rule_prefill_cute,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        chunk_gated_delta_rule_prefill_cute(
+            q=torch.empty(1, 1, 128),
+            k=torch.empty(1, 1, 128),
+            v=torch.empty(1, 1, 128),
+            cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+            gate_is_log_cumsum=True,
+            gate_is_log_decay=True,
+        )
 
 
 def test_cutedsl_forward_trusts_validated_varlen_cu_seqlens(monkeypatch):
@@ -345,6 +366,22 @@ def test_cutedsl_forward_reuses_packed_chunk_metadata(monkeypatch):
     assert actual_indices is chunk_indices
     assert torch.equal(chunk_offsets, torch.tensor([0, 1, 2], dtype=torch.int32))
     assert seen["checkpoint_cu_starts"] is chunk_offsets
+    assert seen["output_g"].shape == (128, 3)
+    assert seen["gate_is_log_decay"] is True
+
+
+def test_cutedsl_forward_uses_kernel_gate_cumsum_side_output():
+    package = Path(__file__).parents[3] / "megatron/core/ssm/gated_delta_net/internal_gdn_backend"
+    implementation_source = (package / "implementation.py").read_text()
+    wrapper_source = (package / "kernels/fused_gdr_fwd_cute/fused_fwd.py").read_text()
+    kernel_source = (package / "kernels/fused_gdr_fwd_cute/kernel.py").read_text()
+
+    assert "flat_raw_g = _reshape_bth_to_th(g.detach())" in implementation_source
+    assert "output_g=flat_g" in implementation_source
+    assert "gate_is_log_decay=True" in implementation_source
+    assert "output_g: Optional[torch.Tensor] = None" in wrapper_source
+    assert "tGrGate[i] = tGrGate[i] * 1.4426950408889634" in kernel_source
+    assert "cute.copy(tiled_copy_gate_g2r, tGrGate, tGgGateOut" in kernel_source
 
 
 def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch):

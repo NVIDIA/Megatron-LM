@@ -694,9 +694,6 @@ def _cutedsl_forward(
                 cu_seqlens, _CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu
             )
     chunk_offsets = packed_metadata.chunk_offsets if packed_metadata is not None else None
-    g = chunk_local_cumsum(
-        g, chunk_size=_CHUNK_SIZE, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
-    )
     launch_cu_seqlens = (
         _dense_cu_seqlens(batch_size, seqlen, q.device)
         if cu_seqlens is None
@@ -705,7 +702,8 @@ def _cutedsl_forward(
     flat_q = _reshape_bthd_to_thd(q.detach())
     flat_k = _reshape_bthd_to_thd(k.detach())
     flat_v = _reshape_bthd_to_thd(v.detach())
-    flat_g = _reshape_bth_to_th(g.detach())
+    flat_raw_g = _reshape_bth_to_th(g.detach())
+    flat_g = torch.empty((batch_size * seqlen, num_heads), dtype=torch.float32, device=q.device)
     flat_beta = _reshape_bth_to_th(beta.detach())
     flat_A = torch.empty(
         (batch_size * seqlen, num_heads, _CHUNK_SIZE), dtype=q.dtype, device=q.device
@@ -728,20 +726,21 @@ def _cutedsl_forward(
         q=flat_q,
         k=flat_k,
         v=flat_v,
-        g=flat_g,
+        g=flat_raw_g,
         beta=flat_beta,
         scale=scale,
         cu_seqlens=launch_cu_seqlens,
         output=output,
         output_A=flat_A,
+        output_g=flat_g,
         assume_valid_cu_seqlens=True,
         output_h=flat_h,
         checkpoint_every_n_tokens=_CHUNK_SIZE if save_fused_bwd_state else 0,
         checkpoint_cu_starts=checkpoint_cu_starts,
-        gate_is_log_cumsum=True,
+        gate_is_log_decay=True,
     )
     return (
-        g,
+        flat_g.reshape(batch_size, seqlen, num_heads),
         output.reshape(batch_size, seqlen, num_heads, head_size),
         flat_A.reshape(batch_size, seqlen, num_heads, _CHUNK_SIZE),
         flat_h,

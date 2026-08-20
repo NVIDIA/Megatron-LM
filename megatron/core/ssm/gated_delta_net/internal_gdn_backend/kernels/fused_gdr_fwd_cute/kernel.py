@@ -224,12 +224,14 @@ class GatedDeltaNetChunkedKernel:
         enable_checkpoints: bool = False,
         input_A: bool = False,
         store_A: bool = False,
+        store_g: bool = False,
         store_v_new: bool = False,
         store_w: bool = False,
         store_h: bool = False,
         w_rhs_precomputed: bool = False,
         training_side_outputs_only: bool = False,
         gate_is_log_cumsum: bool = False,
+        gate_is_log_decay: bool = False,
         is_persistent: bool = True,
         enable_timeline: bool = False,
         enable_varlen_tail: bool = False,
@@ -247,8 +249,11 @@ class GatedDeltaNetChunkedKernel:
         self.use_initial_state = use_initial_state
         self.store_final_state = store_final_state
         self.enable_checkpoints = enable_checkpoints
+        if gate_is_log_cumsum and gate_is_log_decay:
+            raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
         self.use_input_A = input_A
         self.store_A = store_A
+        self.store_g = store_g
         self.store_v_new = store_v_new
         self.store_w = store_w
         self.store_h = store_h
@@ -267,6 +272,7 @@ class GatedDeltaNetChunkedKernel:
         self.drop_output_store_only = training_side_outputs_only
         self.training_side_outputs_only = False
         self.gate_is_log_cumsum = gate_is_log_cumsum
+        self.gate_is_log_decay = gate_is_log_decay
         self.enable_varlen_tail = enable_varlen_tail
         self.is_persistent = is_persistent
         self.enable_timeline = enable_timeline
@@ -456,6 +462,7 @@ class GatedDeltaNetChunkedKernel:
         w_rhs: Optional[cute.Tensor],
         gate: cute.Tensor,
         beta: cute.Tensor,
+        output_g: Optional[cute.Tensor],
         o: cute.Tensor,
         input_A: Optional[cute.Tensor],
         output_A: Optional[cute.Tensor],
@@ -593,6 +600,20 @@ class GatedDeltaNetChunkedKernel:
                 stride=(beta.stride[0], (beta.stride[1], h_r * beta.stride[1])),
             ),
         )
+        if cutlass.const_expr(self.store_g):
+            assert output_g is not None, "output_g must be provided when store_g is True"
+            output_g = cute.make_tensor(
+                output_g.iterator,
+                cute.make_layout(
+                    (output_g.shape[0], (h_r, h_qv)),
+                    stride=(
+                        output_g.stride[0],
+                        (output_g.stride[1], h_r * output_g.stride[1]),
+                    ),
+                ),
+            )
+        else:
+            assert output_g is None, "output_g must be None when store_g is False"
         o = cute.make_tensor(
             o.iterator,
             cute.make_layout(
@@ -1170,6 +1191,7 @@ class GatedDeltaNetChunkedKernel:
             tma_A,
             gate,
             beta,
+            output_g,
             tma_o,
             tma_v_new_out,
             tma_w_out,
@@ -1243,6 +1265,7 @@ class GatedDeltaNetChunkedKernel:
         tma_A: TmaInfo,
         mGate: cute.Tensor,
         mBeta: cute.Tensor,
+        mGateOut: Optional[cute.Tensor],
         tma_o: TmaInfo,
         tma_v_new_out: TmaInfo,
         tma_w_out: TmaInfo,
@@ -2259,7 +2282,7 @@ class GatedDeltaNetChunkedKernel:
                     )
                     load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
                         tidx,
-                        (mGate, mBeta),
+                        (mGate, mBeta, mGateOut),
                         (sCumsumlog, sCumprod, sBeta),
                         (load_gate_producer, load_beta_producer),
                         (chunk_offset, head_idx, False, batch_end),
@@ -2285,7 +2308,7 @@ class GatedDeltaNetChunkedKernel:
                 )
                 load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
                     tidx,
-                    (mGate, mBeta),
+                    (mGate, mBeta, mGateOut),
                     (sCumsumlog, sCumprod, sBeta),
                     (load_gate_producer, load_beta_producer),
                     (
@@ -2767,7 +2790,7 @@ class GatedDeltaNetChunkedKernel:
 
         Thread tidx (lane 0..31) owns positions tidx, tidx+32, tidx+64, tidx+96.
         """
-        gate, beta = gmem_args
+        gate, beta, gate_out = gmem_args
         sCumsumlog, sCumprod, sBeta = smem_args
         load_gate_producer, load_beta_producer = pipeline_args
         chunk_offset, head_idx, is_last_tile, batch_end = work_args
@@ -2781,6 +2804,13 @@ class GatedDeltaNetChunkedKernel:
             (chunk_offset,), cute.make_identity_tensor(mGateHead.shape)
         )
         gBeta = cute.domain_offset((chunk_offset,), beta[None, head_idx])
+        if cutlass.const_expr(self.store_g):
+            assert gate_out is not None, "gate_out must be provided when store_g is True"
+            mGateOutHead = gate_out[None, head_idx]
+            gGateOut = cute.domain_offset((chunk_offset,), mGateOutHead)
+            gGateOut = cute.flat_divide(gGateOut, (self.b_t,))[None, 0]
+        else:
+            gGateOut = None
         gGate = cute.flat_divide(gGate, (self.b_t,))[None, 0]
         cGate = cute.flat_divide(cGate, (self.b_t,))[None, 0]
         gBeta = cute.flat_divide(gBeta, (self.b_t,))[None, 0]
@@ -2816,6 +2846,11 @@ class GatedDeltaNetChunkedKernel:
         tGgGate = thr_copy_gate_g2r.partition_S(gGate)
         tGsCumsumlog = thr_copy_gate_g2r.partition_D(sCumsumlog)
         tGsCumprod = thr_copy_gate_g2r.partition_D(sCumprod)
+        if cutlass.const_expr(self.store_g):
+            assert gGateOut is not None, "gGateOut must be available when store_g is True"
+            tGgGateOut = thr_copy_gate_g2r.partition_D(gGateOut)
+        else:
+            tGgGateOut = None
 
         thr_copy_beta_g2s = tiled_copy_beta_g2s.get_slice(lidx)
         tBgBeta = thr_copy_beta_g2s.partition_S(gBeta)
@@ -2848,8 +2883,12 @@ class GatedDeltaNetChunkedKernel:
                 else:
                     tGrGate.fill(0.0)
             else:
-                # OOB neutral: 1.0 -> log2 ~= 0.0 (no decay contribution).
-                tGrGate.fill(1.0)
+                if cutlass.const_expr(self.gate_is_log_decay):
+                    # OOB neutral for raw Megatron log-decay: 0.0 contributes no decay.
+                    tGrGate.fill(0.0)
+                else:
+                    # OOB neutral: 1.0 -> log2 ~= 0.0 (no decay contribution).
+                    tGrGate.fill(1.0)
             cute.copy(tiled_copy_gate_g2r, tGgGate, tGrGate, pred=tGpGate)
         else:
             cute.copy(tiled_copy_gate_g2r, tGgGate, tGrGate)
@@ -2857,7 +2896,10 @@ class GatedDeltaNetChunkedKernel:
         # --- Convert gate to chunk-local cumulative log2 if needed ---
         if not cutlass.const_expr(self.gate_is_log_cumsum):
             for i in range(cute.size(tGrGate)):
-                tGrGate[i] = cute.math.log2(tGrGate[i] + 1e-10, fastmath=True)
+                if cutlass.const_expr(self.gate_is_log_decay):
+                    tGrGate[i] = tGrGate[i] * 1.4426950408889634
+                else:
+                    tGrGate[i] = cute.math.log2(tGrGate[i] + 1e-10, fastmath=True)
             for offset in [1, 2, 4, 8, 16]:
                 for col in range(cute.size(tGrGate)):
                     n = cute.arch.shuffle_sync_up(
@@ -2874,6 +2916,12 @@ class GatedDeltaNetChunkedKernel:
                     mask_and_clamp=self.threads_per_warp - 1,
                 )
                 tGrGate[col] += last_v
+        if cutlass.const_expr(self.store_g):
+            assert tGgGateOut is not None, "tGgGateOut must be available when store_g is True"
+            if cutlass.const_expr(is_last_tile):
+                cute.copy(tiled_copy_gate_g2r, tGrGate, tGgGateOut, pred=tGpGate)
+            else:
+                cute.copy(tiled_copy_gate_g2r, tGrGate, tGgGateOut)
         for col in range(cute.size(tGrGate)):
             tGrCumprod[col] = cute.math.exp2(tGrGate[col], fastmath=True)
         cute.copy(

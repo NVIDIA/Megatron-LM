@@ -65,12 +65,14 @@ def _get_compiled_cache(
     enable_checkpoints: bool,
     input_A: bool,
     store_A: bool,
+    store_g: bool,
     store_v_new: bool,
     store_w: bool,
     store_h: bool,
     w_rhs_precomputed: bool,
     training_side_outputs_only: bool,
     gate_is_log_cumsum: bool,
+    gate_is_log_decay: bool,
     enable_varlen_tail: bool,
     enable_timeline: bool,
 ):
@@ -121,12 +123,14 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
     output_checkpoints: Optional[torch.Tensor] = None,
     input_A: Optional[torch.Tensor] = None,
     output_A: Optional[torch.Tensor] = None,
+    output_g: Optional[torch.Tensor] = None,
     output_v_new: Optional[torch.Tensor] = None,
     output_w: Optional[torch.Tensor] = None,
     output_h: Optional[torch.Tensor] = None,
     w_rhs: Optional[torch.Tensor] = None,
     training_side_outputs_only: bool = False,
     gate_is_log_cumsum: bool = False,
+    gate_is_log_decay: bool = False,
     debug_timing: Optional[torch.Tensor] = None,
     enable_varlen_tail: bool = False,
 ) -> None:
@@ -150,6 +154,7 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16, or None
         input_A: optional saved unscaled ``A`` side input, shape ``(total_tokens, HO, 64)``
         output_A: optional ``(total_tokens, HO, 64)`` float16/bfloat16 side output
+        output_g: optional ``(total_tokens, HO)`` float32 transformed-g side output
         output_v_new: optional ``(total_tokens, HO, DK)`` float16/bfloat16 side output
         output_w: optional ``(total_tokens, HO, DK)`` float16/bfloat16 side output
         output_h: optional ``(total_chunks, HO, DK, DK)`` float16/bfloat16 FLA-layout h side output
@@ -158,6 +163,8 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
             from k and gate cumprod
         training_side_outputs_only: when True, skip the forward-only Q/O path and materialize only training side outputs
         gate_is_log_cumsum: when True, gate is already chunk-local cumulative log2 ``g``
+        gate_is_log_decay: when True, gate is raw Megatron log-decay and must be
+            prefix-summed with the base-2 conversion in-kernel
         debug_timing: optional ``(6, 2, 32)`` int64 tensor for debug globaltimer tags
         enable_varlen_tail: compile native partial-tile handling for packed lengths
     """
@@ -169,7 +176,10 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
     store_final_state = output_state is not None
     enable_checkpoints = checkpoint_every_n_tokens > 0 and output_checkpoints is not None
     use_input_A = input_A is not None
+    if gate_is_log_cumsum and gate_is_log_decay:
+        raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
     store_A = output_A is not None
+    store_g = output_g is not None
     store_v_new = output_v_new is not None
     store_w = output_w is not None
     store_h = output_h is not None
@@ -216,12 +226,14 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         enable_checkpoints,
         use_input_A,
         store_A,
+        store_g,
         store_v_new,
         store_w,
         store_h,
         w_rhs_precomputed,
         training_side_outputs_only,
         gate_is_log_cumsum,
+        gate_is_log_decay,
         enable_varlen_tail,
         enable_timeline,
     )
@@ -247,12 +259,14 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
             enable_checkpoints=enable_checkpoints,
             input_A=use_input_A,
             store_A=store_A,
+            store_g=store_g,
             store_v_new=store_v_new,
             store_w=store_w,
             store_h=store_h,
             w_rhs_precomputed=w_rhs_precomputed,
             training_side_outputs_only=training_side_outputs_only,
             gate_is_log_cumsum=gate_is_log_cumsum,
+            gate_is_log_decay=gate_is_log_decay,
             enable_varlen_tail=enable_varlen_tail,
             is_persistent=True,
             enable_timeline=enable_timeline,
@@ -287,6 +301,12 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         beta_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1), divisibility=1
         )
+        gate_out_cute = None
+        if store_g:
+            gate_out_cute = from_dlpack(output_g, assumed_align=16)
+            gate_out_cute.mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1), divisibility=1
+            )
         o_cute = from_dlpack(output, assumed_align=16)
         o_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1, 2), divisibility=1
@@ -368,6 +388,7 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
             w_rhs_cute,
             gate_cute,
             beta_cute,
+            gate_out_cute,
             o_cute,
             input_A_cute,
             A_cute,
@@ -410,6 +431,7 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         w_rhs if w_rhs_precomputed else None,
         gate,
         beta,
+        output_g if store_g else None,
         output,
         input_A if use_input_A else None,
         output_A if store_A else None,
