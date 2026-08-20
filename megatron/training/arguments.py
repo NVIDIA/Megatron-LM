@@ -859,9 +859,12 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
-    if getattr(args, 'mtp_hsm', False) and not (
-        args.mtp_num_layers and args.mtp_num_layers >= 2
-    ):
+    if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
+        warn_rank_0(
+            "--mtp-hsm needs at least two MTP layers to mix anything, but "
+            f"--mtp-num-layers is {args.mtp_num_layers}. Disabling Hidden State Mixing.",
+            args.rank,
+        )
         args.mtp_hsm = False
 
     # Validate MTP args for hybrid vs non-hybrid models
