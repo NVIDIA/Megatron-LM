@@ -2896,6 +2896,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)
+                        if hasattr(model_param, "_mok_lifecycle_name"):
+                            from megatron.core.mok_param_lifecycle_debug import record
+
+                            record(
+                                "optimizer.after_step_staged_shard",
+                                model_param,
+                                tensors={
+                                    "optimizer_master_shard": shard_main_param,
+                                    "param_ag_staging_shard": shard_model_param,
+                                },
+                            )
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
@@ -2940,6 +2951,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
 
                 shard_param_buffer.copy_(shard_main_param)
+                if hasattr(model_param, "_mok_lifecycle_name"):
+                    from megatron.core.mok_param_lifecycle_debug import record
+
+                    record(
+                        "optimizer.pre_forward_staged_shard",
+                        model_param,
+                        tensors={
+                            "optimizer_master_shard": shard_main_param,
+                            "param_ag_staging_shard": shard_param_buffer,
+                        },
+                    )
 
         # Staging params into the DDP param buffer invalidates any prior "already
         # dispatched" state. The next forward pre-hook must run post-sync cleanup,

@@ -3191,6 +3191,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if save_wgrads_in_this_iteration:
         _save_state_dict(attr_name="main_grad", label="wgrads")
 
+    if os.environ.get("MOK_DEBUG_TRAIN_FINGERPRINT_PATH"):
+        from megatron.core.mok_param_lifecycle_debug import record_training_fingerprint
+
+        record_training_fingerprint(
+            "after_backward",
+            [unwrap_model(model_chunk) for model_chunk in model],
+            iteration=iteration,
+        )
+
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
@@ -3217,6 +3226,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             _otel_set_attrs(_opt_span, {
                 "megatron.update_successful": bool(update_successful),
             })
+
+    if os.environ.get("MOK_DEBUG_TRAIN_FINGERPRINT_PATH"):
+        from megatron.core.mok_param_lifecycle_debug import record_training_fingerprint
+
+        record_training_fingerprint(
+            "after_optimizer",
+            [unwrap_model(model_chunk) for model_chunk in model],
+            iteration=iteration,
+        )
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -4581,6 +4599,15 @@ def train(
             ), "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+
+    if os.environ.get("MOK_DEBUG_TRAIN_FINGERPRINT_PATH"):
+        from megatron.core.mok_param_lifecycle_debug import record_training_fingerprint
+
+        record_training_fingerprint(
+            "initial",
+            [unwrap_model(model_chunk) for model_chunk in model],
+            iteration=iteration,
+        )
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
