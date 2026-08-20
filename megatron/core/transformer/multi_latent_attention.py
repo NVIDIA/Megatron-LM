@@ -19,6 +19,7 @@ except ImportError:
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -531,12 +532,11 @@ class MultiLatentAttention(Attention):
     @staticmethod
     @jit_fuser
     def _apply_mla_output_gate(core_attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Apply one native-dtype sigmoid gate per local MLA attention head."""
+        """Apply an FP32 sigmoid gate per local MLA attention head."""
         output_shape = core_attn_out.shape
         core_attn_out = core_attn_out.view(*output_shape[:2], gate.size(-1), -1)
-        # Preserve the Tiny/native BF16 autograd contract.  Casting to FP32 before
-        # sigmoid can produce the same BF16 forward values while changing the
-        # gate-input and gate-weight VJP.
+        # Compute the sigmoid in FP32 for a stable gate VJP, then cast back to the
+        # attention output dtype.
         gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
         core_attn_out = core_attn_out * gate.unsqueeze(-1)
         return core_attn_out.reshape(output_shape)
