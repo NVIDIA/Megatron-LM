@@ -966,9 +966,8 @@ class _DispatchManager(ABC):
     """
     A manager class to handle dispatch and combine processes for MoE models.
 
-    DispatcherManager handles token dispatching according to the routing_map of format
-    [num_local_tokens, world_size, num_instances]. The routing_map is a 3D tensor where each
-    element indicates whether a token should be sent to a specific rank.
+    DispatcherManager handles token dispatching from either a bool routing map of shape
+    [num_local_tokens, world_size, num_instances] or dense top-k expert indices.
 
     num_instances is the maximum number of tokens instances dispatched into a target rank, it
     can be the number of local experts, or the size of sub_group.
