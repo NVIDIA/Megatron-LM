@@ -23,11 +23,6 @@ class TestMambaMetadata:
             max_intermediate_count=max_intermediate_count,
         )
 
-        # Manually allocate some slots to simulate a running state.
-        # We assume request_id i maps to mamba_slot i for simplicity in assertions.
-        for i in range(max_requests):
-            metadata.request_to_mamba_state_idx[i] = i
-
         yield metadata
         metadata.reset()
 
@@ -61,12 +56,14 @@ class TestMambaMetadata:
         assert isinstance(allocated_slot, int)
         assert allocated_slot == 1
 
+        metadata.request_to_mamba_state_idx[0] = allocated_slot
         metadata.reset()
         slot_to_release = metadata.allocate_slot()
         allocated_slots = metadata.batch_allocate_slots(2)
         metadata.free_slot(slot_to_release)
 
-        assert torch.equal(allocated_slots, torch.tensor([0, 1], dtype=torch.int32))
+        assert int(slot_to_release) == 1
+        assert set(allocated_slots.tolist()) == {0, 2}
 
     def test_detached_live_slot_survives_request_cleanup(self):
         metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
@@ -83,6 +80,23 @@ class TestMambaMetadata:
 
         assert metadata.mamba_state_free_slot_count == 1
         assert int(metadata.allocate_slot()) == slot
+
+    def test_reset_preserves_detached_live_slot(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        detached_slot = int(metadata.allocate_slot())
+        request_slot = int(metadata.allocate_slot())
+        metadata.request_to_mamba_state_idx[:2] = torch.tensor(
+            [detached_slot, request_slot], dtype=torch.int32
+        )
+        assert metadata.detach_state_slot(0) == detached_slot
+
+        metadata.reset()
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == request_slot
+        metadata.free_slot(detached_slot)
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == detached_slot
 
     def _run_update_test(
         self,

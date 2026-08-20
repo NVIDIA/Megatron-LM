@@ -220,6 +220,16 @@ class InferenceConfig:
     This is primarily limited by the combination of `buffer_size_gb` and `max_sequence_length`.
     """
 
+    reserve_recurrent_state_dummy_slot: bool = False
+    """
+    Reserve one recurrent-state buffer for expert-parallel dummy forwards.
+
+    Disaggregated handoff can retain every request-owned recurrent-state slot after its request
+    leaves the active batch. An idle EP rank still needs a state buffer for the dummy forward that
+    joins its peers' expert collectives. The reserved entry is outside normal request capacity and
+    is only allocated for hybrid models with expert parallelism.
+    """
+
     max_tokens: Optional[int] = None
     """
     Max number of tokens to use for forward passes. This is primarily limited by prefill activation

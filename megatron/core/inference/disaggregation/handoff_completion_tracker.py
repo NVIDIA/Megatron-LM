@@ -22,7 +22,7 @@ else:
 class HandoffCompletionTracker:
     """Aggregate per-rank transfer results at the model-parallel coordinator."""
 
-    _REPORT_FORMAT = "!qi?"
+    _REPORT_FORMAT = "!qi??"
 
     def __init__(self, zmq_context, process_group: dist.ProcessGroup, hostname: str | None = None):
         if not HAVE_ZMQ:
@@ -31,7 +31,7 @@ class HandoffCompletionTracker:
         self.rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
         self.is_coordinator = self.rank == 0
-        self._reports: dict[int, dict[int, bool]] = {}
+        self._reports: dict[int, dict[int, tuple[bool, bool]]] = {}
         self._failure_notified: set[int] = set()
         self._socket: Any = None
         self.sockets = []
@@ -52,15 +52,17 @@ class HandoffCompletionTracker:
             self._socket.connect(address_holder[0])
         self.sockets.append(self._socket)
 
-    def report(self, request_id: int, failed: bool) -> None:
-        """Report this rank's terminal transfer result once for a request."""
+    def report(self, request_id: int, failed: bool, source_safe: bool) -> None:
+        """Report this rank's transfer result and source-storage safety."""
 
         if self.is_coordinator:
-            self._record(request_id, self.rank, failed)
+            self._record(request_id, self.rank, failed, source_safe)
             return
-        self._socket.send(struct.pack(self._REPORT_FORMAT, request_id, self.rank, failed))
+        self._socket.send(
+            struct.pack(self._REPORT_FORMAT, request_id, self.rank, failed, source_safe)
+        )
 
-    def drain_completed(self) -> list[tuple[int, bool]]:
+    def drain_completed(self) -> list[tuple[int, bool, bool]]:
         """Return requests that failed or completed on every model-parallel rank."""
 
         if not self.is_coordinator:
@@ -68,30 +70,43 @@ class HandoffCompletionTracker:
         if self._socket is not None:
             while True:
                 try:
-                    request_id, rank, failed = struct.unpack(
+                    request_id, rank, failed, source_safe = struct.unpack(
                         self._REPORT_FORMAT, self._socket.recv(flags=zmq.NOBLOCK)
                     )
-                    self._record(request_id, rank, failed)
+                    self._record(request_id, rank, failed, source_safe)
                 except zmq.Again:
                     break
 
         completed = []
         for request_id, reports in list(self._reports.items()):
-            failed = any(reports.values())
+            failed = any(report[0] for report in reports.values())
+            source_safe = len(reports) == self.world_size and all(
+                report[1] for report in reports.values()
+            )
             if failed and request_id not in self._failure_notified:
-                completed.append((request_id, failed))
+                completed.append((request_id, True, source_safe))
                 self._failure_notified.add(request_id)
-            if len(reports) == self.world_size:
-                if request_id not in self._failure_notified:
-                    completed.append((request_id, False))
+            elif failed and source_safe:
+                completed.append((request_id, True, True))
+            elif not failed and source_safe:
+                completed.append((request_id, False, True))
+            if source_safe:
                 del self._reports[request_id]
                 self._failure_notified.discard(request_id)
         return completed
 
-    def _record(self, request_id: int, rank: int, failed: bool) -> None:
+    def _record(self, request_id: int, rank: int, failed: bool, source_safe: bool) -> None:
         reports = self._reports.setdefault(request_id, {})
-        previous = reports.setdefault(rank, failed)
-        if previous != failed:
+        previous = reports.get(rank)
+        if previous is None:
+            reports[rank] = (failed, source_safe)
+            return
+        if previous[0] != failed:
             raise RuntimeError(
                 f"Conflicting KV handoff results for request {request_id} from rank {rank}"
             )
+        if previous[1] and not source_safe:
+            raise RuntimeError(
+                f"KV handoff source safety regressed for request {request_id} from rank {rank}"
+            )
+        reports[rank] = (failed, previous[1] or source_safe)

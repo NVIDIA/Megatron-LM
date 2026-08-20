@@ -189,8 +189,10 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
     engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
     engine._initialize_disaggregation_state()
     engine.waiting_request_ids = deque()
-    engine._pending_kv_imports.append(SimpleNamespace(request_id=7, resume_tokens=[55]))
-    engine._handoff_completion_notifications[7] = False
+    engine._pending_kv_imports.append(
+        SimpleNamespace(request_id=7, resume_tokens=[55], cancel_requested=False)
+    )
+    engine._handoff_completion_notifications[7] = (False, True)
 
     assert not engine._should_run_async_sched_overlap()
 

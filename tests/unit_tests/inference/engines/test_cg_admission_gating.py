@@ -30,6 +30,7 @@ def _create_engine(
         engine
     )
     engine._find_cg_chunk_size = DynamicInferenceEngine._find_cg_chunk_size.__get__(engine)
+    engine._select_cg_chunk_size = DynamicInferenceEngine._select_cg_chunk_size.__get__(engine)
     engine._matches_cg_admission = DynamicInferenceEngine._matches_cg_admission.__get__(engine)
     engine._cg_admission_check = DynamicInferenceEngine._cg_admission_check.__get__(engine)
     engine._register_cg_wait = DynamicInferenceEngine._register_cg_wait.__get__(engine)
@@ -96,7 +97,7 @@ class TestGatingActivation:
 
 
 class TestFindCgChunkSize:
-    """_find_cg_chunk_size should snap to the largest CG-aligned chunk within budget."""
+    """_find_cg_chunk_size should return the largest chunk covered by a graph."""
 
     def test_picks_largest_chunk_in_budget(self):
         # Empty active state, large budget — should pick the largest captured token_count.
@@ -104,11 +105,11 @@ class TestFindCgChunkSize:
         assert engine._find_cg_chunk_size(max_chunk_tokens=500) == 256
 
     def test_respects_budget_ceiling(self):
-        # Budget below largest CG — should pick the largest CG that still fits.
+        # A larger graph can pad a chunk up to the scheduler's token budget.
         engine = _create_engine(SAMPLE_CG_LIST)
-        assert engine._find_cg_chunk_size(max_chunk_tokens=100) == 64
-        assert engine._find_cg_chunk_size(max_chunk_tokens=20) == 16
-        assert engine._find_cg_chunk_size(max_chunk_tokens=5) == 4
+        assert engine._find_cg_chunk_size(max_chunk_tokens=100) == 100
+        assert engine._find_cg_chunk_size(max_chunk_tokens=20) == 20
+        assert engine._find_cg_chunk_size(max_chunk_tokens=5) == 5
 
     def test_accounts_for_active_tokens(self):
         # Already 50 tokens in flight; chunk + active must land on a CG boundary.
@@ -135,13 +136,12 @@ class TestFindCgChunkSize:
         )
         assert engine._find_cg_chunk_size(max_chunk_tokens=300) == 256
 
-    def test_strict_mode_no_match_returns_none(self):
-        # Active D=200, only (256, *, 252) and (256, *, 255) have D >= 200, requiring
-        # chunk=256. With smaller budget no CG matches in strict mode.
+    def test_strict_mode_pads_smaller_chunk(self):
+        # Active D=200 is covered by the 256-token graph, which pads this smaller chunk.
         engine = _create_engine(
             SAMPLE_CG_LIST, active_tok=0, num_prefill=0, num_decode=200, is_hybrid=True
         )
-        assert engine._find_cg_chunk_size(max_chunk_tokens=100) is None
+        assert engine._find_cg_chunk_size(max_chunk_tokens=100) == 100
 
     def test_empty_cg_list_returns_none(self):
         engine = _create_engine([], active_tok=0)
@@ -445,106 +445,37 @@ class TestSchedulerDeferralInteraction:
         assert req_blocked.cg_wait_iters == 0
 
 
-_CHUNKED_PREFILL_CG_CASES = [
-    # parameters are label, active_tok, num_prefill, num_decode, max_chunk, is_hybrid,
-    # is_continuing, expected_chunk
-    # - is_continuing=True  -> gating is skipped entirely; result is max_chunk
-    # - CG match found      -> result is the snapped CG-aligned) chunk
-    # - No CG match         -> eager fallback: result is max_chunk, not a deferral
-    pytest.param(
-        # Fresh batch, large budget — gating active, CG match at 256.
-        0,
-        0,
-        0,
-        300,
-        False,
-        False,
-        256,
-        id="new_request_cg_match",
-    ),
-    pytest.param(
-        # Budget below the smallest CG (min token_count=2) — no match.
-        # Chunked prefill falls back to eager: uses max_chunk=1, not deferred.
-        0,
-        0,
-        0,
-        1,
-        False,
-        False,
-        1,
-        id="new_request_no_cg_match_eager_fallback",
-    ),
-    pytest.param(
-        # Continuing chunked prefill: gating is bypassed regardless of CG coverage.
-        # Expected result equals max_chunk.
-        50,
-        1,
-        0,
-        100,
-        False,
-        True,
-        100,
-        id="continuing_chunked_prefill_gating_skipped",
-    ),
-]
-
-
 class TestChunkedPrefillCgGating:
-    """Parametrized coverage for the CG-gating decision inside schedule_chunked_prefill.
+    """Chunked-prefill graph selection must preserve liveness."""
 
-    Exercises three distinct paths:
-    - is_continuing=True  : gating is skipped; result = max_chunk
-    - CG hit              : result = snapped (CG-aligned) chunk size
-    - CG miss             : eager fallback; result = max_chunk (not a deferral)
-    """
+    def test_idle_engine_rejects_missing_graph_coverage(self):
+        engine = _create_engine([_get_cudagraph(8, 0, 8)])
+        req = _make_request()
 
-    @pytest.mark.parametrize(
-        "active_tok,num_prefill,num_decode,max_chunk,is_hybrid,is_continuing,expected_chunk",
-        _CHUNKED_PREFILL_CG_CASES,
-    )
-    def test_chunk_size_decision(
-        self,
-        active_tok,
-        num_prefill,
-        num_decode,
-        max_chunk,
-        is_hybrid,
-        is_continuing,
-        expected_chunk,
-    ):
+        with pytest.raises(RuntimeError, match="No captured CUDA graph"):
+            engine._select_cg_chunk_size(req, max_chunk_tokens=7)
+
+    def test_hybrid_continuation_retries_after_batch_shape_changes(self):
+        # At full request occupancy, the next geometric P bucket (4P + 28D)
+        # cannot cover 3P + 29D. The active prefills become decodes after the
+        # current step. Once the resident shape changes, a 1P + 31D graph can
+        # admit the continuation on a later scheduler pass.
+        cg_list = [
+            _get_cudagraph(116, 1, 31),
+            _get_cudagraph(256, 1, 31),
+            _get_cudagraph(256, 2, 30),
+            _get_cudagraph(256, 4, 28),
+        ]
         engine = _create_engine(
-            SAMPLE_CG_LIST,
-            active_tok=active_tok,
-            num_prefill=num_prefill,
-            num_decode=num_decode,
-            is_hybrid=is_hybrid,
+            cg_list, active_tok=171, num_prefill=2, num_decode=29, is_hybrid=True
         )
+        req = _make_request()
 
-        if engine._cg_admission_gating_active() and not is_continuing:
-            snapped = engine._find_cg_chunk_size(max_chunk)
-            chunk = snapped if snapped is not None else max_chunk
-        else:
-            # Gating skipped (is_continuing) or gating inactive.
-            chunk = max_chunk
+        assert engine._select_cg_chunk_size(req, max_chunk_tokens=85) is None
+        assert req.cg_wait_iters == 1
 
-        assert chunk == expected_chunk
-
-    def test_no_cg_match_does_not_defer(self):
-        # Core invariant: when CG gating is active and no graph matches the budget,
-        # the chunked-prefill path uses max_chunk (eager), never defers.
-        # SAMPLE_CG_LIST smallest token_count=2; budget=1 guarantees no match.
-        engine = _create_engine(SAMPLE_CG_LIST, active_tok=0, num_prefill=0, num_decode=0)
-        result = engine._find_cg_chunk_size(max_chunk_tokens=1)
-        assert result is None  # confirms the miss path
-        # Caller's eager fallback: chunk = max_chunk, not deferred.
-        chunk = result if result is not None else 1
-        assert chunk == 1
-
-    def test_cg_match_resets_wait_counter(self):
-        # On a CG hit the wait counter must be reset to 0 (matches non-chunked behaviour).
-        engine = _create_engine(SAMPLE_CG_LIST, active_tok=0, num_prefill=0, num_decode=0)
-        req = _make_request(cg_wait_iters=7)
-        snapped = engine._find_cg_chunk_size(max_chunk_tokens=300)
-        assert snapped is not None  # hit
-        req.cg_wait_iters = 0  # as the engine does on a hit
+        engine.context.active_token_count = 31
+        engine.context.num_prefill_requests = 0
+        engine.context.num_decode_requests = 31
+        assert engine._select_cg_chunk_size(req, max_chunk_tokens=85) == 85
         assert req.cg_wait_iters == 0
