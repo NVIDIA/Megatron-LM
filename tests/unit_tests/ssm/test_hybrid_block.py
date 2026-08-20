@@ -256,6 +256,52 @@ class TestHybridBlock:
             gb, gr = base_grads[name], rec_grads[name]
             assert torch.equal(gr, gb), f"Grad should be bitwise matched for {name}"
 
+    @pytest.mark.timeout(60)
+    def test_hash_moe_hyper_connection_full_recompute(self):
+        """Full recompute preserves input IDs through the hybrid mHC wrapper."""
+        block = self.get_hybrid_block(
+            Symbols.MOE,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=64,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.0,
+            moe_router_dtype="fp32",
+            moe_n_hash_layers=1,
+            actual_vocab_size=128,
+            add_bias_linear=False,
+        ).cuda()
+        block.train()
+
+        sequence_length, micro_batch_size = 8, 2
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            block.config.hidden_size,
+            device="cuda",
+            requires_grad=True,
+        )
+        input_ids = torch.randint(
+            0, block.config.actual_vocab_size, (micro_batch_size, sequence_length), device="cuda"
+        )
+
+        assert isinstance(block.layers[0], HyperConnectionHybridLayer)
+        assert block.layers[0].inner_layer.mlp.router.is_hash_layer
+
+        output = block(hidden_states, attention_mask=None, input_ids=input_ids)
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+
+        output.float().sum().backward()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+
     def test_layer_types(self):
         """
         Make sure that the layer types specified with layer_pattern
