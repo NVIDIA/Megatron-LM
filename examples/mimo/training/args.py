@@ -61,7 +61,12 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
-    """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
+    """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``.
+
+    The stock FLOP estimator covers the language model, so record its rank count
+    for per-GPU throughput reporting.
+    """
+
     gtp_weight_remat_size, _ = resolve_hetero_gtp_degrees(args)
     if args.llm_cp != 1:
         raise ValueError("hetero MIMO training currently supports CP=1 only")
@@ -94,6 +99,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
                 "--llm-only requires the language grid to cover every torchrun rank exactly "
                 f"once; covered={sorted(llm_ranks)}, world={sorted(all_ranks)}"
             )
+        args.throughput_world_size = llm_size
         return 0, llm_size
 
     # Fan-out divisibility: the bridge splits every LLM data lane across
@@ -122,6 +128,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"covered={sorted(encoder_ranks | llm_ranks)}, world={sorted(all_ranks)}"
         )
 
+    args.throughput_world_size = llm_size
     return encoder_size, llm_size
 
 
