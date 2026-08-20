@@ -35,14 +35,17 @@ class MambaMetadata:
                 buffers. Computed once by DynamicInferenceContext (as
                 max_mamba_intermediate_states_per_step) and shared with
                 MambaSlotAllocator.
-            reserve_dummy_state_slot (bool): Whether a dedicated slot is available for
-                expert-parallel dummy forwards.
+            reserve_dummy_state_slot (bool): Whether the state buffers include a dedicated
+                expert-parallel dummy slot at index ``max_requests``. Normal requests allocate
+                only lower indices, so they cannot consume this slot.
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
             decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
         """
         self.max_requests = max_requests
+        # Request-owned slots are [0, max_requests). The optional final entry is reused by
+        # EP dummy forwards and never enters the request free-slot pool.
         self.dummy_state_idx = max_requests if reserve_dummy_state_slot else None
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size

@@ -385,7 +385,14 @@ def get_dynamic_inference_engine(
     engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
     reserve_recurrent_state_dummy_slot: bool = False,
 ) -> DynamicInferenceEngine:
-    """Builds a `DynamicInferenceEngine`."""
+    """Build a dynamic inference engine.
+
+    Args:
+        model: Model to serve. Builds and loads one when omitted.
+        engine_class: Engine implementation to construct.
+        reserve_recurrent_state_dummy_slot: Reserve the hybrid EP dummy state entry needed when
+            disaggregated handoff can retain all request-owned state slots.
+    """
     args = get_args()
     if model is None:
         model = get_model_for_inference()

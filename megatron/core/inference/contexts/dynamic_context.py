@@ -566,7 +566,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         mamba_max_requests = float('inf')
-        # Keep one EP dummy state outside request capacity so handoff pins cannot starve it.
+        # Handoff may retain every request-owned recurrent-state slot after the requests leave
+        # the batch. An idle EP rank must still run a dummy forward to join its peers' expert
+        # collectives, so disaggregated callers can reserve one slot outside request capacity.
         self.reserve_recurrent_state_dummy_slot = bool(
             self.is_hybrid_model
             and inference_config.reserve_recurrent_state_dummy_slot
@@ -2322,7 +2324,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_query_lengths[0:N],
             )
 
-            # 5. Use the reserved slot when live request slots may remain pinned by handoff.
+            # 5. An EP dummy step has one synthetic decode request. Its output is discarded, so
+            # the dedicated slot can be reused without request allocation or handoff retention.
             if self.mamba_metadata.dummy_state_idx is not None:
                 assert N == 1, "The reserved recurrent-state dummy slot supports one request"
                 self.mamba_metadata.request_to_mamba_state_idx[0] = (
