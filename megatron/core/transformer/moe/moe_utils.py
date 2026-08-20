@@ -751,7 +751,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -817,7 +818,7 @@ def topk_routing_with_score_function(
                 qb_bin_bounds=qb_bin_bounds,
                 qb_histogram_mode="fused_atomic",
             )
-        if fused_topk_with_score_function_supports_topk_indices:
+        if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
             kwargs["topk_indices"] = topk_indices
         return fused_topk_with_score_function(**kwargs)
 
@@ -916,11 +917,6 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
-
-    if topk_indices is not None:
-        topk_indices.copy_(top_indices.to(topk_indices.dtype))
-        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
-        return routing_probs, topk_indices
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
