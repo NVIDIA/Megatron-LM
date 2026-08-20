@@ -36,6 +36,7 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -3381,8 +3382,6 @@ def te_checkpoint(
         if initial_forward:
             initial_forward = False
             return forward_func(*forward_args, **forward_kwargs)
-
-        from megatron.core.tensor_observation import suspend_tensor_observations
 
         with suspend_tensor_observations():
             return forward_func(*forward_args, **forward_kwargs)

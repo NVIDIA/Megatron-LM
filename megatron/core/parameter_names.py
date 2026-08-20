@@ -14,6 +14,9 @@ from megatron.core.utils import unwrap_model
 _GROUPED_EXPERT_PATTERN = re.compile(
     r"^((?:.*\.)?mlp\.experts\.linear_fc\d\.(?:weight|bias))(\d+)(.*)$"
 )
+_SINGLE_GROUPED_EXPERT_PATTERN = re.compile(
+    r"^(?:.*\.)?mlp\.experts\.linear_fc\d\.(?:weight|bias)$"
+)
 _SEQUENTIAL_EXPERT_PATTERN = re.compile(r"^((?:.*\.)?mlp\.experts\.local_experts\.)(\d+)(\..*)$")
 
 
@@ -24,7 +27,8 @@ class CanonicalParameterNameMap(Mapping[torch.nn.Parameter, str]):
     assigned to their owning layer module. This includes MTP layers, whose names
     retain their distinct ``mtp.layers`` prefix. Expert-local indices are
     replaced with global expert indices when an expert-parallel rank and size
-    are supplied.
+    are supplied. Single grouped expert tensors are labeled with their half-open
+    global expert range.
 
     The map contains original model parameters only. Consumers are responsible
     for mapping optimizer copies or shards back to those parameters.
@@ -92,7 +96,7 @@ class CanonicalParameterNameMap(Mapping[torch.nn.Parameter, str]):
 
             for local_name, param in model_chunk.named_parameters():
                 canonical_name = _canonical_parameter_name(
-                    local_name, layer_prefixes, num_experts, expert_offset
+                    local_name, layer_prefixes, num_experts, expert_offset, expert_parallel_size
                 )
 
                 previous_name = param_to_name.get(param)
@@ -141,10 +145,14 @@ def _build_global_layer_prefixes(model_chunk: torch.nn.Module) -> dict[str, str]
 
 
 def _canonical_parameter_name(
-    local_name: str, layer_prefixes: Mapping[str, str], num_experts: int | None, expert_offset: int
+    local_name: str,
+    layer_prefixes: Mapping[str, str],
+    num_experts: int | None,
+    expert_offset: int,
+    expert_parallel_size: int,
 ) -> str:
     name = _replace_longest_prefix(local_name, layer_prefixes)
-    return _global_expert_parameter_name(name, num_experts, expert_offset)
+    return _global_expert_parameter_name(name, num_experts, expert_offset, expert_parallel_size)
 
 
 def _replace_longest_prefix(name: str, replacements: Mapping[str, str]) -> str:
@@ -160,9 +168,16 @@ def _replace_longest_prefix(name: str, replacements: Mapping[str, str]) -> str:
 
 
 def _global_expert_parameter_name(
-    local_name: str, num_experts: int | None, expert_offset: int
+    local_name: str, num_experts: int | None, expert_offset: int, expert_parallel_size: int
 ) -> str:
-    if not num_experts or expert_offset == 0:
+    if not num_experts:
+        return local_name
+
+    if expert_parallel_size > 1 and _SINGLE_GROUPED_EXPERT_PATTERN.match(local_name):
+        local_expert_count = num_experts // expert_parallel_size
+        return f"{local_name}[experts={expert_offset}:{expert_offset + local_expert_count}]"
+
+    if expert_offset == 0:
         return local_name
 
     for pattern in (_GROUPED_EXPERT_PATTERN, _SEQUENTIAL_EXPERT_PATTERN):

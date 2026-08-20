@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
@@ -19,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
+    compute_normalized_router_scores,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
@@ -818,17 +820,18 @@ class TopKRouter(Router):
 
         # Reuse the unbiased aux-loss routing calculation for due router diagnostics.
         aux_loss_enabled = self.is_aux_loss_enabled()
-        compute_aux_inputs = self.training and (
-            observe_router_diagnostics or (torch.is_grad_enabled() and aux_loss_enabled)
-        )
+        apply_aux_loss = torch.is_grad_enabled() and aux_loss_enabled
+        compute_aux_inputs = self.training and (observe_router_diagnostics or apply_aux_loss)
         if compute_aux_inputs:
-            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                self.score_function,
-                fused=self.config.moe_router_fusion,
-                padding_mask=padding_mask,
-            )
+            score_context = nullcontext() if apply_aux_loss else torch.no_grad()
+            with score_context:
+                routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                    logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_fusion,
+                    padding_mask=padding_mask,
+                )
             if observe_router_diagnostics:
                 diagnostics = build_router_diagnostics(
                     scores_for_aux_loss,
@@ -842,7 +845,7 @@ class TopKRouter(Router):
                 observe_tensor(
                     self, "router_diagnostics", "router_diagnostics", diagnostics, tp_shard_dim=None
                 )
-            if aux_loss_enabled and torch.is_grad_enabled():
+            if apply_aux_loss:
                 probs = self._apply_aux_loss(
                     probs,
                     scores_for_aux_loss,
@@ -895,16 +898,7 @@ class TopKRouter(Router):
         # Materialize the full decision distribution only when a due metric requests it.
         if is_observing_tensor("router_scores"):
             with torch.no_grad():
-                if self.score_function == "softmax":
-                    scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-                elif self.score_function == "sigmoid":
-                    scores = torch.sigmoid(logits.float())
-                    scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-                elif self.score_function == "sqrtsoftplus":
-                    scores = torch.nn.functional.softplus(logits.float()).sqrt()
-                    scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-                else:
-                    raise ValueError(f"Invalid score_function: {self.score_function}")
+                scores = compute_normalized_router_scores(logits, self.score_function)
             observe_tensor(
                 self, "router_scores", "router_scores", scores, tp_shard_dim=tp_shard_dim
             )

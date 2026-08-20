@@ -624,7 +624,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
         logits = self._scale_logits(logits)
         gather_output = (
-            getattr(self.output_layer, "gather_output", False)
+            self.output_layer.gather_output
             if runtime_gather_output is None
             else runtime_gather_output
         )
