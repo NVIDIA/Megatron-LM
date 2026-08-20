@@ -65,7 +65,6 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
-    _get_glu_split_shapes,
     _get_qkv_split_shapes,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
@@ -778,7 +777,8 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv, is_glu).
+    # Tag optimizer-specific attributes. GLU layout metadata is model-owned; retain a
+    # conservative name-based fallback for modules that have not adopted the marker yet.
     for model_chunk in model_chunks:
         qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
@@ -800,20 +800,39 @@ def _get_megatron_emerging_optimizer(
                         f"Emerging optimizer QKV split skipped for {name}: "
                         f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
                     )
-            if (
+            name_fallback_is_glu = (
                 model_chunk.config.gated_linear_unit
                 and 'linear_fc1.weight' in name
                 and len(param.shape) == 2
-            ):
-                if param.shape[0] % 2 == 0:
+                and getattr(model_chunk.config, 'moe_mlp_glu_interleave_size', None) is None
+                and getattr(
+                    model_chunk.config, 'moe_shared_expert_glu_interleave_size', None
+                ) is None
+            )
+            if getattr(param, 'is_glu', False) or name_fallback_is_glu:
+                interleave_size = getattr(param, 'glu_interleave_size', None)
+                is_gtp_weight = getattr(param, 'is_gtp_weight_remat', False)
+                gtp_remat_size = getattr(param, 'gtp_remat_size', 1) if is_gtp_weight else 1
+                pad_length = getattr(param, 'pad_length', 0) if is_gtp_weight else 0
+                logical_rows = param.shape[0] * gtp_remat_size - pad_length
+                valid_interleave = interleave_size is None or interleave_size > 0
+                layout_multiple = 2 if interleave_size is None else 2 * interleave_size
+                if (
+                    valid_interleave
+                    and logical_rows > 0
+                    and logical_rows % layout_multiple == 0
+                ):
                     param.is_glu = True
-                    param.glu_split_shapes = _get_glu_split_shapes(param)
+                    param.glu_gtp_remat_size = gtp_remat_size
+                    param.glu_gtp_pad_length = pad_length
                 else:
+                    param.is_glu = False
                     log_single_rank(
                         logger,
                         logging.DEBUG,
                         f"Emerging optimizer GLU split skipped for {name}: "
-                        f"shape={tuple(param.shape)}",
+                        f"shape={tuple(param.shape)}, gtp_remat_size={gtp_remat_size}, "
+                        f"pad_length={pad_length}, interleave_size={interleave_size}",
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
