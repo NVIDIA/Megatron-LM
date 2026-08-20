@@ -564,3 +564,40 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str,
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx
     return layer_maps
+
+
+def _get_layer_symbol_from_config(layer_config: HybridLayerConfig) -> str:
+    """Return the canonical symbol for a layer config, including subclasses."""
+    matching_symbols = [
+        layer_symbol
+        for layer_symbol, config_class in LAYER_SYMBOL_TO_CONFIG_CLASS.items()
+        if isinstance(layer_config, config_class)
+    ]
+    if not matching_symbols:
+        raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
+    if len(matching_symbols) > 1:
+        raise ValueError(
+            f"Ambiguous hybrid layer config type: {type(layer_config).__name__} "
+            f"matches symbols {matching_symbols}"
+        )
+    return matching_symbols[0]
+
+
+def get_layer_maps_from_layer_config_list(
+    layer_config_list: list[HybridLayerConfig],
+) -> dict[str, dict[int, int]]:
+    """Return per-type layer maps for a list of layer configs.
+
+    Config subclasses are normalized to their canonical layer symbol before delegating
+    to ``get_layer_maps_from_layer_type_list`` so both APIs share one indexing implementation.
+
+    Args:
+        layer_config_list: Per-layer configs in global layer order.
+
+    Returns:
+        Maps from global layer index to type-local layer index, keyed by layer symbol.
+    """
+    layer_type_list = [
+        _get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list
+    ]
+    return get_layer_maps_from_layer_type_list(layer_type_list)
