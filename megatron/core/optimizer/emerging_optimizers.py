@@ -162,14 +162,6 @@ def _get_qkv_split_shapes(model_cfg) -> list[int]:
     return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
 
 
-def _get_glu_split_shapes(param: torch.Tensor) -> list[int]:
-    """Compute the local gate and up split shapes for a fused GLU FC1 weight."""
-    if param.shape[0] % 2 != 0:
-        raise ValueError(f"GLU FC1 output dimension must be even, got shape={tuple(param.shape)}")
-    split_size = param.shape[0] // 2
-    return [split_size, split_size]
-
-
 # ===========================================================================
 # Registry – populated below only when emerging_optimizers is installed.
 # ===========================================================================
@@ -269,9 +261,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
-        gated_linear_unit: bool = False,
-        is_glu_fn: Callable[[torch.Tensor], bool] | None = None,
-        glu_split_shapes: list[int] | None = None,
+        split_glu: bool = False,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -332,9 +322,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
-        self.gated_linear_unit = gated_linear_unit
-        self.is_glu_fn = is_glu_fn
-        self.glu_split_shapes = glu_split_shapes
+        self.split_glu = split_glu
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -358,6 +346,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         shards = [torch.empty_like(t) for _ in range(get_pg_size(group))]
         torch.distributed.all_gather(shards, t.contiguous(), group)
         return torch.cat(shards, dim=dim)
+
+    def _get_gtp_remat_group(self, p):
+        """Return the weight-rematerialization group for ``p`` when configured."""
+        if self.pg_collection is None:
+            return None
+        group_name = 'expt_gtp_remat' if getattr(p, 'expert_tp', False) else 'gtp_remat'
+        return getattr(self.pg_collection, group_name, None)
 
     @staticmethod
     def _strip_pad(t, pad_length):
@@ -414,13 +409,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         distributed does not: it stays row-sharded through its own collective, where
         stripping isn't safe (known limitation).
         """
-        # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
-        is_expert = getattr(p, 'expert_tp', False)
-        gtp_remat_group = (
-            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
-            if self.pg_collection
-            else None
-        )
+        gtp_remat_group = self._get_gtp_remat_group(p)
 
         # Parameters with is_gtp_weight_remat=False are not sharded along the
         # GTP process group, and do not require all-gathering prior to
@@ -521,6 +510,122 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             smaller_dim, reshard_rank * shard_size, shard_size
         ).contiguous()
 
+    def _gather_glu_grad(self, p, grad):
+        """Gather a GTP-local GLU shard and remove tail padding before layout transforms."""
+        if not getattr(p, 'is_gtp_weight_remat', False):
+            return grad, None
+
+        gtp_remat_group = self._get_gtp_remat_group(p)
+        expected_size = getattr(p, 'glu_gtp_remat_size', 1)
+        if gtp_remat_group is None:
+            if expected_size > 1:
+                raise RuntimeError(
+                    "Muon GLU split requires the GTP-remat process group to reconstruct "
+                    f"a {expected_size}-way weight shard"
+                )
+            gtp_remat_size = 1
+            gtp_rank = 0
+            gathered_grad = grad
+        else:
+            gtp_remat_size = get_pg_size(gtp_remat_group)
+            gtp_rank = get_pg_rank(gtp_remat_group)
+            if gtp_remat_size != expected_size:
+                raise RuntimeError(
+                    "Muon GLU split GTP size mismatch: "
+                    f"parameter metadata={expected_size}, process group={gtp_remat_size}"
+                )
+            if gtp_remat_size > 1:
+                shards = [torch.empty_like(grad) for _ in range(gtp_remat_size)]
+                torch.distributed.all_gather(shards, grad, gtp_remat_group)
+                gathered_grad = torch.cat(shards, dim=0)
+            else:
+                gathered_grad = grad
+
+        pad_length = getattr(p, 'glu_gtp_pad_length', 0)
+        if pad_length < 0 or pad_length >= gathered_grad.shape[0]:
+            raise RuntimeError(
+                f"Muon GLU split has invalid GTP padding: grad_shape={tuple(gathered_grad.shape)}, "
+                f"pad_length={pad_length}"
+            )
+        logical_grad = gathered_grad[:-pad_length] if pad_length else gathered_grad
+        restore_info = (gtp_rank, gtp_remat_size, grad.shape[0], pad_length)
+        return logical_grad, restore_info
+
+    @staticmethod
+    def _restore_local_glu_grad(grad, restore_info):
+        """Restore GTP tail padding and return this rank's original dim-0 shard."""
+        if restore_info is None:
+            return grad
+        gtp_rank, gtp_remat_size, shard_size, pad_length = restore_info
+        if pad_length:
+            grad = torch.nn.functional.pad(grad, (0, 0, 0, pad_length))
+        expected_rows = gtp_remat_size * shard_size
+        if grad.shape[0] != expected_rows:
+            raise RuntimeError(
+                f"Muon GLU GTP restore shape mismatch: grad_shape={tuple(grad.shape)}, "
+                f"expected_rows={expected_rows}"
+            )
+        start = gtp_rank * shard_size
+        return grad[start : start + shard_size].contiguous()
+
+    @staticmethod
+    def _deinterleave_glu_grad(grad, interleave_size):
+        """Convert alternating gate/up blocks to contiguous gate and up halves."""
+        if interleave_size is None:
+            return grad
+        if interleave_size <= 0 or grad.shape[0] % (2 * interleave_size) != 0:
+            raise RuntimeError(
+                f"Muon GLU interleave shape mismatch: grad_shape={tuple(grad.shape)}, "
+                f"interleave_size={interleave_size}"
+            )
+        num_blocks = grad.shape[0] // (2 * interleave_size)
+        return (
+            grad.view(num_blocks, 2, interleave_size, grad.shape[1])
+            .transpose(0, 1)
+            .contiguous()
+            .view_as(grad)
+        )
+
+    @staticmethod
+    def _interleave_glu_grad(grad, interleave_size):
+        """Restore alternating gate/up blocks after separate orthogonalization."""
+        if interleave_size is None:
+            return grad
+        num_blocks = grad.shape[0] // (2 * interleave_size)
+        return (
+            grad.view(2, num_blocks, interleave_size, grad.shape[1])
+            .transpose(0, 1)
+            .contiguous()
+            .view_as(grad)
+        )
+
+    def _orthogonalize_split_glu(self, p, grad, tp_group, partition_dim):
+        """Orthogonalize gate and up matrices independently for all supported GLU layouts."""
+        gathered_grad, restore_info = self._gather_glu_grad(p, grad)
+        if gathered_grad.ndim != 2 or gathered_grad.shape[0] % 2 != 0:
+            raise RuntimeError(
+                f"Muon GLU split requires a 2D gradient with even rows, got "
+                f"shape={tuple(gathered_grad.shape)}"
+            )
+
+        interleave_size = getattr(p, 'glu_interleave_size', None)
+        contiguous_grad = self._deinterleave_glu_grad(gathered_grad, interleave_size)
+        split_size = contiguous_grad.shape[0] // 2
+        log_single_rank(
+            logger,
+            logging.DEBUG,
+            f'glu split grad shape {tuple(contiguous_grad.shape)}, '
+            f'split shapes {[split_size, split_size]}, interleave size {interleave_size}',
+        )
+        gate_grad, up_grad = torch.split(contiguous_grad, split_size, dim=0)
+        gate_grad = self.scaled_orthogonalize_fn(gate_grad, tp_group, partition_dim)
+        up_grad = self.scaled_orthogonalize_fn(up_grad, tp_group, partition_dim)
+        orthogonalized_grad = torch.cat((gate_grad, up_grad), dim=0)
+        orthogonalized_grad = self._interleave_glu_grad(
+            orthogonalized_grad, interleave_size
+        )
+        return self._restore_local_glu_grad(orthogonalized_grad, restore_info)
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -577,31 +682,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 for g in qkv_grads
             ]
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
-        elif self.gated_linear_unit and (
-            self.is_glu_fn(p) if self.is_glu_fn is not None else getattr(p, "is_glu", False)
-        ):
-            grad_shape = grad.shape
-            glu_split_shapes = getattr(p, "glu_split_shapes", None)
-            if glu_split_shapes is None:
-                glu_split_shapes = self.glu_split_shapes
-            if glu_split_shapes is None:
-                raise RuntimeError("Muon GLU split requested but glu_split_shapes is not set")
-            if len(glu_split_shapes) != 2 or sum(glu_split_shapes) != grad_shape[0]:
-                raise RuntimeError(
-                    f"Muon GLU split shape mismatch: grad_shape={tuple(grad_shape)}, "
-                    f"split_shapes={glu_split_shapes}"
-                )
-            log_single_rank(
-                logger,
-                logging.DEBUG,
-                f'glu split grad shape {grad_shape}, split shapes {glu_split_shapes}',
-            )
-            glu_grads = torch.split(grad, glu_split_shapes, dim=0)
-            glu_grads = [
-                self.scaled_orthogonalize_fn_with_gtp_remat(p, glu_grad, tp_group, partition_dim)
-                for glu_grad in glu_grads
-            ]
-            grad = torch.cat(glu_grads, dim=0).view(grad_shape)
+        elif self.split_glu and getattr(p, "is_glu", False):
+            grad = self._orthogonalize_split_glu(p, grad, tp_group, partition_dim)
         else:
             grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
         return grad
@@ -626,9 +708,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         split_qkv: Whether to split QKV weights for orthogonalization.
         is_qkv_fn: Function to determine if a tensor is a QKV weight.
         qkv_split_shapes: Shapes for splitting QKV weights.
-        gated_linear_unit: Whether the model uses fused GLU FC1 weights.
-        is_glu_fn: Function to determine if a tensor is a fused GLU FC1 weight.
-        glu_split_shapes: Local gate and up shapes for splitting GLU FC1 weights.
+        split_glu: Whether to split fused GLU FC1 weights for orthogonalization.
         fp32_matmul_prec: Precision for FP32 matrix multiplication.
         coefficient_type: The type of coefficient set to use for the Newton-Schulz iteration.
         num_ns_steps: The number of iteration steps to use in the Newton-Schulz iteration.
@@ -654,9 +734,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
-        gated_linear_unit: bool = False,
-        is_glu_fn: Callable[[torch.Tensor], bool] | None = None,
-        glu_split_shapes: list[int] | None = None,
+        split_glu: bool = False,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -680,9 +758,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             split_qkv=split_qkv,
             is_qkv_fn=is_qkv_fn,
             qkv_split_shapes=qkv_split_shapes,
-            gated_linear_unit=gated_linear_unit,
-            is_glu_fn=is_glu_fn,
-            glu_split_shapes=glu_split_shapes,
+            split_glu=split_glu,
             fp32_matmul_prec=fp32_matmul_prec,
             coefficient_type=coefficient_type,
             num_ns_steps=num_ns_steps,
@@ -732,8 +808,6 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
-    kwargs["gated_linear_unit"] = model_chunks[0].config.gated_linear_unit
-    kwargs["is_glu_fn"] = lambda p: getattr(p, "is_glu", False)
     kwargs["pg_collection"] = pg_collection
     return kwargs
 

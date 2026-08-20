@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,7 +17,6 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
-    _get_glu_split_shapes,
     _get_qkv_split_shapes,
     _select_tp_mode,
     get_supported_coefficient_types,
@@ -24,7 +24,10 @@ from megatron.core.optimizer.emerging_optimizers import (
 )
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
@@ -332,26 +335,13 @@ def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
             local_grad[:true_dim0], (0, 0, 0, expected_local_pad_length)
         )
         torch.testing.assert_close(result, expected)
-
-
-def test_muon_glu_split_shapes():
-    param = torch.empty(16, 8)
-
-    assert _get_glu_split_shapes(param) == [8, 8]
-
-    with pytest.raises(ValueError, match="output dimension must be even"):
-        _get_glu_split_shapes(torch.empty(15, 8))
-
-
 def test_muon_optimizer_glu_split(monkeypatch):
     """Muon orthogonalizes the fused gate and up FC1 weights independently."""
     param = torch.nn.Parameter(torch.zeros(8, 4, device='cuda'))
     param.is_glu = True
-    param.glu_split_shapes = [4, 4]
     optimizer = TensorParallelMuon(
         params=[param],
-        gated_linear_unit=True,
-        is_glu_fn=lambda p: getattr(p, 'is_glu', False),
+        split_glu=True,
         num_ns_steps=1,
         pg_collection=None,
         tp_mode="duplicated",
@@ -359,11 +349,11 @@ def test_muon_optimizer_glu_split(monkeypatch):
     grad = torch.arange(32, dtype=torch.float32, device='cuda').view(8, 4)
     orthogonalized_grads = []
 
-    def fake_orthogonalize(_param, split_grad, _tp_group, _partition_dim):
+    def fake_orthogonalize(split_grad, _tp_group, _partition_dim):
         orthogonalized_grads.append(split_grad.clone())
         return split_grad + len(orthogonalized_grads)
 
-    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn_with_gtp_remat", fake_orthogonalize)
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn", fake_orthogonalize)
 
     result = optimizer.orthogonalize(param, grad)
 
@@ -371,6 +361,120 @@ def test_muon_optimizer_glu_split(monkeypatch):
     torch.testing.assert_close(orthogonalized_grads[0], grad[:4])
     torch.testing.assert_close(orthogonalized_grads[1], grad[4:])
     torch.testing.assert_close(result, torch.cat((grad[:4] + 1, grad[4:] + 2)))
+def test_muon_optimizer_glu_split_opt_out(monkeypatch):
+    """The GLU marker does not change the existing whole-matrix path when splitting is disabled."""
+    param = torch.nn.Parameter(torch.zeros(8, 4, device='cuda'))
+    param.is_glu = True
+    optimizer = TensorParallelMuon(params=[param], split_glu=False, num_ns_steps=1)
+    grad = torch.arange(32, dtype=torch.float32, device='cuda').view(8, 4)
+    calls = []
+
+    def fake_orthogonalize(_param, whole_grad, _tp_group, _partition_dim):
+        calls.append(whole_grad.clone())
+        return whole_grad + 1
+
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn_with_gtp_remat", fake_orthogonalize)
+
+    result = optimizer.orthogonalize(param, grad)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], grad)
+    torch.testing.assert_close(result, grad + 1)
+
+
+def test_muon_optimizer_interleaved_glu_split(monkeypatch):
+    """Muon de-interleaves alternating GLU blocks and restores the stored layout."""
+    param = torch.nn.Parameter(torch.zeros(8, 1, device='cuda'))
+    param.is_glu = True
+    param.glu_interleave_size = 2
+    optimizer = TensorParallelMuon(params=[param], split_glu=True, num_ns_steps=1)
+    grad = torch.tensor(
+        [10, 11, 20, 21, 12, 13, 22, 23], dtype=torch.float32, device='cuda'
+    ).view(8, 1)
+    orthogonalized_grads = []
+
+    def fake_orthogonalize(split_grad, _tp_group, _partition_dim):
+        orthogonalized_grads.append(split_grad.clone())
+        return split_grad + len(orthogonalized_grads) * 100
+
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn", fake_orthogonalize)
+
+    result = optimizer.orthogonalize(param, grad)
+
+    torch.testing.assert_close(
+        orthogonalized_grads[0], grad.new_tensor([10, 11, 12, 13]).view(4, 1)
+    )
+    torch.testing.assert_close(
+        orthogonalized_grads[1], grad.new_tensor([20, 21, 22, 23]).view(4, 1)
+    )
+    expected = grad.new_tensor([110, 111, 220, 221, 112, 113, 222, 223])
+    torch.testing.assert_close(result, expected.view(8, 1))
+
+
+@pytest.mark.parametrize("gtp_rank", [0, 1])
+@pytest.mark.parametrize("layout", ["contiguous", "interleaved_padded"])
+def test_muon_optimizer_glu_gtp_gathers_before_split(monkeypatch, gtp_rank, layout):
+    """GTP reconstructs FC1 before separating gate and up rows in either layout."""
+    gtp_group = object()
+    pg_collection = SimpleNamespace(
+        tp=None, expt_tp=None, gtp_remat=gtp_group, expt_gtp_remat=gtp_group
+    )
+    if layout == "contiguous":
+        full_values = [10, 11, 12, 13, 20, 21, 22, 23]
+        interleave_size = None
+        pad_length = 0
+        gate_values = [10, 11, 12, 13]
+        up_values = [20, 21, 22, 23]
+        expected_values = [110, 111, 112, 113, 220, 221, 222, 223]
+    else:
+        full_values = [10, 20, 11, 21, 12, 22, 90, 91]
+        interleave_size = 1
+        pad_length = 2
+        gate_values = [10, 11, 12]
+        up_values = [20, 21, 22]
+        expected_values = [110, 220, 111, 221, 112, 222, 0, 0]
+
+    full_grad = torch.tensor(full_values, dtype=torch.float32, device='cuda').view(8, 1)
+    local_grad = full_grad[gtp_rank * 4 : (gtp_rank + 1) * 4].clone()
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_glu = True
+    param.glu_interleave_size = interleave_size
+    param.is_gtp_weight_remat = True
+    param.glu_gtp_remat_size = 2
+    param.glu_gtp_pad_length = pad_length
+    optimizer = TensorParallelMuon(
+        params=[param], split_glu=True, num_ns_steps=1, pg_collection=pg_collection
+    )
+    orthogonalized_grads = []
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2
+    )
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: gtp_rank
+    )
+
+    def fake_all_gather(shards, _local_grad, _group):
+        shards[0].copy_(full_grad[:4])
+        shards[1].copy_(full_grad[4:])
+
+    def fake_orthogonalize(split_grad, _tp_group, _partition_dim):
+        orthogonalized_grads.append(split_grad.clone())
+        return split_grad + len(orthogonalized_grads) * 100
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn", fake_orthogonalize)
+
+    result = optimizer.orthogonalize(param, local_grad)
+
+    torch.testing.assert_close(
+        orthogonalized_grads[0], full_grad.new_tensor(gate_values).view(-1, 1)
+    )
+    torch.testing.assert_close(
+        orthogonalized_grads[1], full_grad.new_tensor(up_values).view(-1, 1)
+    )
+    expected = full_grad.new_tensor(expected_values).view(8, 1)
+    torch.testing.assert_close(result, expected[gtp_rank * 4 : (gtp_rank + 1) * 4])
 def test_muon_optimizer_smoke():
     """Smoke test for TensorParallelMuon optimizer."""
     # Create a simple linear model for testing
@@ -556,7 +660,7 @@ class TestMuonOptimizerMultiRank:
         optimizer.load_state_dict(state_dict)
 
     def test_get_megatron_optimizer_tags_glu_fc1(self):
-        """The optimizer factory marks fused GLU FC1 weights with their local split shapes."""
+        """The optimizer factory keeps a compatibility fallback for fused GLU FC1 weights."""
         transformer_config = TransformerConfig(
             num_layers=1,
             hidden_size=4,
@@ -584,14 +688,14 @@ class TestMuonOptimizerMultiRank:
             param for name, param in model.named_parameters() if 'linear_fc1.weight' in name
         )
         assert fc1_param.is_glu is True
-        assert fc1_param.glu_split_shapes == [4, 4]
+        assert fc1_param.glu_gtp_pad_length == 0
         raw_optimizers = [
             child.optimizer
             for child in optimizer.chained_optimizers
             if isinstance(getattr(child, 'optimizer', None), TensorParallelMuon)
         ]
         assert len(raw_optimizers) == 1
-        assert raw_optimizers[0].gated_linear_unit is True
+        assert raw_optimizers[0].split_glu is True
 
     def test_get_megatron_optimizer_validation(self):
         """Test validation logic for get_megatron_optimizer."""
@@ -842,6 +946,54 @@ class TestMuonOptimizerMultiRankTP:
         assert not torch.equal(
             model.weight.data, original_weight
         ), "Weight should be updated with mode=blockwise"
+
+    def test_muon_swiglu_fc1_real_tp_layout(self):
+        """A real TP-sharded SwiGLU FC1 is marked and split by Newton-Schulz."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(42)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            ffn_hidden_size=16,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            params_dtype=torch.float32,
+        )
+        mlp = MLP(
+            config=config,
+            submodules=MLPSubmodules(
+                linear_fc1=ColumnParallelLinear,
+                linear_fc2=RowParallelLinear,
+            ),
+            pg_collection=pg_collection,
+        )
+        fc1_weight = mlp.linear_fc1.weight
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
+        assert fc1_weight.shape == (2 * config.ffn_hidden_size // tp_size, config.hidden_size)
+        assert fc1_weight.is_glu is True
+        assert fc1_weight.glu_interleave_size is None
+
+        optimizer = TensorParallelMuon(
+            params=[fc1_weight],
+            lr=0.01,
+            weight_decay=0.0,
+            split_glu=True,
+            num_ns_steps=1,
+            pg_collection=pg_collection,
+            tp_mode="duplicated",
+        )
+        hidden_states = torch.randn(4, config.hidden_size, device=fc1_weight.device)
+        output, _ = mlp(hidden_states)
+        output.float().sum().backward()
+        original_weight = fc1_weight.detach().clone()
+
+        assert fc1_weight.grad.shape == fc1_weight.shape
+        optimizer.step()
+
+        assert torch.isfinite(fc1_weight).all()
+        assert not torch.equal(fc1_weight, original_weight)
 
 
 # All non-custom coefficient types supported by emerging_optimizers.

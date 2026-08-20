@@ -20,7 +20,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.mlp import MLP, MLPSubmodules, set_glu_linear_fc1_attributes
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -131,6 +131,11 @@ class SharedExpertMLP(MLP):
             tp_group=pg_collection.tp,
             name=name,
             pg_collection=pg_collection,
+        )
+        set_glu_linear_fc1_attributes(
+            self.linear_fc1,
+            self.config.gated_linear_unit,
+            self.config.moe_shared_expert_glu_interleave_size,
         )
 
         self.use_shared_expert_gate = gate

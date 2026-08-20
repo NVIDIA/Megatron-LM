@@ -34,6 +34,7 @@ from megatron.core.transformer.mlp import (
     MLPSubmodules,
     TEActivationFunctionBuilder,
     apply_swiglu_sharded_factory,
+    set_glu_linear_fc1_attributes,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -226,6 +227,11 @@ class TEGroupedMLP(MegatronModule):
             tp_comm_buffer_name='fc1',
             pg_collection=pg_collection,
             name=(name + ".linear_fc1") if name is not None else None,
+        )
+        set_glu_linear_fc1_attributes(
+            self.linear_fc1,
+            self.config.gated_linear_unit,
+            self.config.moe_mlp_glu_interleave_size,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):

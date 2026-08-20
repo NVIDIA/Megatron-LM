@@ -98,14 +98,18 @@ def test_copy_tensor_model_parallel_attributes_preserves_optimizer_split_shapes(
     source.is_qkv = True
     source.qkv_split_shapes = [256, 64, 64]
     source.is_glu = True
-    source.glu_split_shapes = [128, 128]
+    source.glu_interleave_size = 32
+    source.glu_gtp_remat_size = 2
+    source.glu_gtp_pad_length = 16
 
     copy_tensor_model_parallel_attributes(destination, source)
 
     assert destination.is_qkv is True
     assert destination.qkv_split_shapes == source.qkv_split_shapes
     assert destination.is_glu is True
-    assert destination.glu_split_shapes == source.glu_split_shapes
+    assert destination.glu_interleave_size == source.glu_interleave_size
+    assert destination.glu_gtp_remat_size == source.glu_gtp_remat_size
+    assert destination.glu_gtp_pad_length == source.glu_gtp_pad_length
 
 
 def test_copy_gtp_attributes_preserves_pad_length():
