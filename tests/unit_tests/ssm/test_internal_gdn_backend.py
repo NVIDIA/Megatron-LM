@@ -261,7 +261,43 @@ def test_cutedsl_forward_controls_fused_backward_h(monkeypatch, save_fused_bwd_s
 
     assert seen["output_h"] is saved_h
     assert seen["checkpoint_every_n_tokens"] == (64 if save_fused_bwd_state else 0)
+    assert seen["assume_valid_cu_seqlens"] is True
     assert (saved_h is None) is not save_fused_bwd_state
+
+
+def test_cutedsl_forward_trusts_validated_varlen_cu_seqlens(monkeypatch):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
+
+    shape = (1, 128, 3, 4)
+    q = torch.empty(shape)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(shape[:-1]),
+        "beta": torch.empty(shape[:-1]),
+    }
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    seen = {}
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(implementation, "prepare_chunk_indices", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda g, **_kwargs: g)
+    monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
+
+    implementation._cutedsl_forward(
+        **inputs,
+        scale=0.5,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens,
+        save_fused_bwd_state=False,
+    )
+
+    assert seen["cu_seqlens"].dtype == torch.int32
+    assert seen["assume_valid_cu_seqlens"] is True
 
 
 def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch):
@@ -379,6 +415,48 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     assert db.shape == beta.shape and torch.all(db == 5)
     assert dg.shape == g.shape and torch.all(dg == 4)
     assert db.dtype == beta.dtype and dg.dtype == g.dtype
+
+
+def test_fused_backward_varlen_metadata_avoids_host_sync_for_device_offsets():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
+        fused_bwd,
+    )
+
+    fused_bwd._clear_metadata_cache_for_test()
+    cu_seqlens = torch.empty(3, dtype=torch.int32, device="meta")
+
+    metadata = fused_bwd._prepare_varlen_metadata(cu_seqlens, total_tokens=128, chunk_size=64)
+
+    assert metadata.chunk_offsets.device.type == "meta"
+    assert metadata.num_sequences == 2
+    assert metadata.num_chunks == 2
+    assert metadata.uniform_sequence_length == 0
+
+
+def test_fused_backward_support_reason_trusts_device_offsets_only_when_requested():
+    implementation = _implementation()
+    shape = (1, 128, 64, 128)
+    scalar_shape = shape[:-1]
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    kwargs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(scalar_shape, dtype=torch.float32),
+        "beta": torch.empty(scalar_shape, dtype=torch.float32),
+        "A": torch.empty((*scalar_shape, 64), dtype=torch.bfloat16),
+        "do": torch.empty_like(q),
+        "dht": None,
+        "cu_seqlens": torch.empty(3, dtype=torch.int32, device="meta"),
+    }
+
+    assert (
+        implementation._fused_bwd_support_reason(**kwargs)
+        == "packed cu_seqlens host metadata is required for validation"
+    )
+    assert implementation._fused_bwd_support_reason(
+        **kwargs, trust_device_cu_seqlens=True
+    ) is None
 
 
 @pytest.mark.parametrize(

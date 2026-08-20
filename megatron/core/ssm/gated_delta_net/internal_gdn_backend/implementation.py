@@ -183,6 +183,8 @@ def _fused_bwd_support_reason(
     do: torch.Tensor,
     dht: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    trust_device_cu_seqlens: bool = False,
 ) -> str | None:
     """Return why the verified latest-main fused backward cannot run."""
     if q.dtype != torch.bfloat16:
@@ -215,14 +217,23 @@ def _fused_bwd_support_reason(
             or cu_seqlens.numel() < 2
         ):
             return "cu_seqlens must be contiguous int32 with at least two offsets"
-        bounds = cu_seqlens.detach().cpu().tolist()
-        if bounds[0] != 0 or bounds[-1] != q.shape[1]:
-            return "cu_seqlens bounds do not match the packed token count"
-        if any(
-            end <= start or (end - start) % _CHUNK_SIZE for start, end in zip(bounds, bounds[1:])
-        ):
-            return "every packed sequence length must be a positive multiple of 64"
-        num_sequences = len(bounds) - 1
+        offsets = _host_cu_seqlens(cu_seqlens, cu_seqlens_cpu)
+        if offsets is not None:
+            bounds = offsets.detach().tolist()
+            if bounds[0] != 0 or bounds[-1] != q.shape[1]:
+                return "cu_seqlens bounds do not match the packed token count"
+            if any(
+                end <= start or (end - start) % _CHUNK_SIZE
+                for start, end in zip(bounds, bounds[1:])
+            ):
+                return "every packed sequence length must be a positive multiple of 64"
+            num_sequences = len(bounds) - 1
+        elif trust_device_cu_seqlens:
+            if q.shape[1] % _CHUNK_SIZE:
+                return "packed token count must be divisible by 64"
+            num_sequences = cu_seqlens.numel() - 1
+        else:
+            return "packed cu_seqlens host metadata is required for validation"
     if dht is not None and (
         dht.dtype != torch.float32
         or dht.shape != (num_sequences, _FUSED_BWD_HEADS, _FUSED_BWD_HEAD_DIM, _FUSED_BWD_HEAD_DIM)
@@ -334,10 +345,25 @@ def _module_available(name: str) -> bool:
         return False
 
 
-def _aligned_sequence_lengths(
+def _host_cu_seqlens(
     cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None
+) -> torch.Tensor | None:
+    if cu_seqlens_cpu is not None:
+        return cu_seqlens_cpu
+    if cu_seqlens.device.type == "cpu":
+        return cu_seqlens
+    return None
+
+
+def _aligned_sequence_lengths(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: torch.Tensor | None,
+    *,
+    trust_device_cu_seqlens: bool = False,
 ) -> bool:
-    offsets = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+    offsets = _host_cu_seqlens(cu_seqlens, cu_seqlens_cpu)
+    if offsets is None:
+        return trust_device_cu_seqlens
     if offsets.numel() < 2:
         return False
     lengths = offsets[1:] - offsets[:-1]
@@ -361,6 +387,7 @@ def _cutedsl_support_reason(
     cu_seqlens_cpu: torch.Tensor | None,
     cp_context: object | None,
     kwargs: dict[str, Any],
+    trust_device_cu_seqlens: bool = False,
 ) -> str | None:
     if not _module_available("cutlass") or not _module_available("cuda.bindings.driver"):
         return "CuTe DSL runtime is not installed"
@@ -415,7 +442,11 @@ def _cutedsl_support_reason(
     else:
         if q.shape[0] != 1:
             return "packed variable length inputs require batch size 1"
-        if not _aligned_sequence_lengths(cu_seqlens, cu_seqlens_cpu):
+        if not _aligned_sequence_lengths(
+            cu_seqlens,
+            cu_seqlens_cpu,
+            trust_device_cu_seqlens=trust_device_cu_seqlens,
+        ):
             return "every packed sequence length must be a positive multiple of 64"
     return None
 
@@ -440,6 +471,7 @@ def _can_use_fused_bwd_forward(
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_cpu: torch.Tensor | None,
+    trust_device_cu_seqlens: bool = False,
 ) -> bool:
     if q.dtype != torch.bfloat16 or q.ndim != 4:
         return False
@@ -458,7 +490,11 @@ def _can_use_fused_bwd_forward(
         and cu_seqlens.dtype == torch.int32
         and cu_seqlens.is_contiguous()
         and cu_seqlens.numel() >= 2
-        and _aligned_sequence_lengths(cu_seqlens, cu_seqlens_cpu)
+        and _aligned_sequence_lengths(
+            cu_seqlens,
+            cu_seqlens_cpu,
+            trust_device_cu_seqlens=trust_device_cu_seqlens,
+        )
     )
 
 
@@ -611,7 +647,7 @@ def _cutedsl_forward(
         cu_seqlens=launch_cu_seqlens,
         output=output,
         output_A=flat_A,
-        assume_valid_cu_seqlens=cu_seqlens is None,
+        assume_valid_cu_seqlens=True,
         output_h=flat_h,
         checkpoint_every_n_tokens=_CHUNK_SIZE if save_fused_bwd_state else 0,
         checkpoint_cu_starts=checkpoint_cu_starts,
@@ -639,9 +675,21 @@ def _cutedsl_backward(
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None,
     h: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    trust_device_cu_seqlens: bool = False,
 ):
     reason = _fused_bwd_support_reason(
-        q=q, k=k, v=v, g=g, beta=beta, A=A, do=do, dht=dht, cu_seqlens=cu_seqlens
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A=A,
+        do=do,
+        dht=dht,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        trust_device_cu_seqlens=trust_device_cu_seqlens,
     )
     if reason is None:
         return _call_fused_gdr_bwd_cute(
@@ -692,10 +740,14 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens_cpu: torch.LongTensor | None,
         recompute_h: bool,
     ):
-        use_fused_bwd = _can_use_fused_bwd_forward(q, k, v, g, beta, cu_seqlens, cu_seqlens_cpu)
+        mode = _backend_mode()
+        trust_device_cu_seqlens = True
+        use_fused_bwd = _can_use_fused_bwd_forward(
+            q, k, v, g, beta, cu_seqlens, cu_seqlens_cpu, trust_device_cu_seqlens
+        )
         save_fused_bwd_state = use_fused_bwd and not recompute_h
         saved_h = None
-        if _backend_mode() != "cute" and use_fused_bwd:
+        if mode != "cute" and use_fused_bwd:
             g, output, A, saved_h, chunk_indices = _fla_forward_for_fused_bwd(
                 q=q,
                 k=k,
@@ -726,6 +778,8 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
             )
         ctx.save_for_backward(q, k, v, g, beta, A, saved_h, cu_seqlens, chunk_indices)
         ctx.scale = scale
+        ctx.cu_seqlens_cpu = cu_seqlens_cpu
+        ctx.trust_device_cu_seqlens = trust_device_cu_seqlens
         return output.to(q.dtype), None
 
     @staticmethod
@@ -746,6 +800,8 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             h=saved_h,
+            cu_seqlens_cpu=ctx.cu_seqlens_cpu,
+            trust_device_cu_seqlens=ctx.trust_device_cu_seqlens,
         )
         return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, None, None, None
 
@@ -816,6 +872,7 @@ def chunk_gated_delta_rule(
         cu_seqlens_cpu=cu_seqlens_cpu,
         cp_context=cp_context,
         kwargs=kwargs,
+        trust_device_cu_seqlens=True,
     )
     if reason is not None:
         if mode == "cute":

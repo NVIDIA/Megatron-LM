@@ -77,20 +77,35 @@ def _prepare_varlen_metadata(
     ):
         return cached.metadata
 
-    values = cu_seqlens.detach().cpu().tolist()
-    if len(values) < 2 or values[0] != 0 or values[-1] != total_tokens:
-        raise ValueError(
-            "cu_seqlens must contain at least one sequence and span "
-            f"[0, {total_tokens}], got {values}"
+    if cu_seqlens.device.type == "cpu":
+        values = cu_seqlens.detach().tolist()
+        if len(values) < 2 or values[0] != 0 or values[-1] != total_tokens:
+            raise ValueError(
+                "cu_seqlens must contain at least one sequence and span "
+                f"[0, {total_tokens}], got {values}"
+            )
+        lengths = [end - start for start, end in zip(values, values[1:])]
+        if any(length <= 0 or length % chunk_size for length in lengths):
+            raise ValueError(
+                "sequence lengths must be positive multiples of " f"{chunk_size}, got {lengths}"
+            )
+        chunk_offsets = torch.tensor(
+            [offset // chunk_size for offset in values], dtype=torch.int32, device=cu_seqlens.device
         )
-    lengths = [end - start for start, end in zip(values, values[1:])]
-    if any(length <= 0 or length % chunk_size for length in lengths):
-        raise ValueError(
-            "sequence lengths must be positive multiples of " f"{chunk_size}, got {lengths}"
+        num_sequences = len(lengths)
+        num_chunks = sum(lengths) // chunk_size
+        uniform_sequence_length = (
+            lengths[0] if lengths and all(length == lengths[0] for length in lengths) else 0
         )
-    chunk_offsets = torch.tensor(
-        [offset // chunk_size for offset in values], dtype=torch.int32, device=cu_seqlens.device
-    )
+    else:
+        num_sequences = cu_seqlens.numel() - 1
+        if num_sequences < 1:
+            raise ValueError("cu_seqlens must contain at least one sequence")
+        if total_tokens % chunk_size:
+            raise ValueError(f"total_tokens must be divisible by {chunk_size}")
+        chunk_offsets = (cu_seqlens // chunk_size).contiguous()
+        num_chunks = total_tokens // chunk_size
+        uniform_sequence_length = total_tokens if num_sequences == 1 else 0
 
     def remove_cached_owner(owner_ref):
         current = _METADATA_CACHE.get(key)
@@ -101,11 +116,9 @@ def _prepare_varlen_metadata(
     metadata = _VarlenMetadata(
         _cu_seqlens_ref=owner_ref,
         chunk_offsets=chunk_offsets,
-        num_sequences=len(lengths),
-        num_chunks=sum(lengths) // chunk_size,
-        uniform_sequence_length=(
-            lengths[0] if lengths and all(length == lengths[0] for length in lengths) else 0
-        ),
+        num_sequences=num_sequences,
+        num_chunks=num_chunks,
+        uniform_sequence_length=uniform_sequence_length,
     )
     _METADATA_CACHE[key] = _MetadataEntry(
         owner=owner_ref,
