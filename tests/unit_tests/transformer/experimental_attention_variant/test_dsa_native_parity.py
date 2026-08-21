@@ -1109,6 +1109,8 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        varlen_is_plain_causal=False,
+        scoring_plan=None,
     ):
         seen["q_shape"] = q_bshd.shape
         seen["k_shape"] = k_bsd.shape
@@ -1256,6 +1258,8 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        varlen_is_plain_causal=False,
+        scoring_plan=None,
     ):
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
@@ -1611,6 +1615,8 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        varlen_is_plain_causal=False,
+        scoring_plan=None,
     ):
         del (
             single_packed_thd_sequence,

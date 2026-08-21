@@ -16,6 +16,11 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan import (
+    IndexerScoringDecision,
+    IndexerScoringPlan,
+    resolve_indexer_scoring_plan,
+)
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 if TYPE_CHECKING:
@@ -224,19 +229,19 @@ def run_fused_dsa_attention(
         return None
     if not torch.is_grad_enabled():
         loss_coeff = 0.0
-    # build_dsattention_forward_mask emits explicit varlen bounds even for the plain (non-packed,
-    # non-CP) causal case and flags them via ``varlen_is_plain_causal``. Those bounds are exactly
-    # equivalent to the no-varlen causal path the dense fused indexer loss was written for, so
-    # normalize them back to None: plain causal then takes the same fused path (relying on the
-    # kernel's internal causal masking) it took before that mask change, instead of declining
-    # dense loss and falling back to the slow reference-loss path. The flag carries the mask
-    # builder's structural knowledge, so we avoid the per-forward host/device sync a ``torch.equal``
-    # bounds comparison would force on this common path. Genuine packed/CP/custom-position varlen
-    # is left untouched (``varlen_is_plain_causal`` is False there) and is gated below, where it
-    # would otherwise trip the padded-row assert in FusedIndexerSparseAttnFunc.forward.
-    if cp_size == 1 and packed_seq_params is None and varlen_is_plain_causal:
-        varlen_starts = None
-        varlen_ends = None
+    # Plain causal bounds are equivalent to the no-varlen causal path the dense fused indexer
+    # loss was written for, so normalize them away: plain causal then takes the same fused path
+    # (relying on the kernel's internal causal masking) it took before that mask change, instead
+    # of declining dense loss and falling back to the slow reference-loss path. Genuine
+    # packed/CP/custom-position varlen is left untouched and is gated below, where it would
+    # otherwise trip the padded-row assert in FusedIndexerSparseAttnFunc.forward.
+    varlen_starts, varlen_ends = _normalize_plain_causal_bounds(
+        varlen_starts,
+        varlen_ends,
+        cp_size=cp_size,
+        packed_seq_params=packed_seq_params,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+    )
     has_varlen = varlen_starts is not None or varlen_ends is not None or key_positions is not None
     if has_varlen:
         if varlen_starts is None or varlen_ends is None:
@@ -413,6 +418,36 @@ def _bytes_to_chunk_rows(n_rows: int, bytes_per_row: int, max_bytes: int, alignm
 def _causal_seq_lens(q_positions: Tensor, ratio: int, sk: int) -> Tensor:
     """Per-query causal key length under the indexer ``ratio``, clamped to ``sk``."""
     return ((q_positions + 1) // ratio).clamp(max=sk)
+
+
+def _normalize_plain_causal_bounds(
+    starts: Optional[Tensor],
+    ends: Optional[Tensor],
+    *,
+    cp_size: int,
+    packed_seq_params: Optional["PackedSeqParams"],
+    varlen_is_plain_causal: bool,
+) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+    """Drop plain-causal varlen bounds so the single-kernel indexer scorer stays reachable.
+
+    ``build_dsattention_forward_mask`` emits explicit bounds even for the plain
+    (non-packed, non-CP) causal case and flags them via ``varlen_is_plain_causal``.
+    Those bounds are ``starts = 0`` and ``ends = arange(1, sq + 1).clamp(max=sk)``,
+    which is exactly what :func:`_causal_seq_lens` reconstructs internally under
+    ``_INDEXER_RATIO == 1``. Returning ``None`` here is therefore a no-op on
+    semantics, but it lets :func:`_indexer_topk_bshd` take its ``starts is None``
+    branch, which reaches the fused single-kernel ``indexer_forward_wrapper``
+    instead of the per-head scoring loop in
+    :func:`_compute_indexer_scores_chunk_with_global_rows`.
+
+    The flag carries the mask builder's structural knowledge, so we avoid the
+    per-forward host/device sync that a ``torch.equal`` bounds comparison would
+    force on this common path. Genuine packed/CP/custom-position varlen is left
+    untouched (``varlen_is_plain_causal`` is False there).
+    """
+    if cp_size == 1 and packed_seq_params is None and varlen_is_plain_causal:
+        return None, None
+    return starts, ends
 
 
 def _topk_tie_break_bias(positions: Tensor, key_count: int, dtype: torch.dtype) -> Tensor:
@@ -826,9 +861,16 @@ def _indexer_topk_single_packed_cp_segments(
     local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
     local_query_start = local_packed_cp_query_start
     local_query_end = local_query_start + sq
-    if b != 1 or local_query_len % 2 != 0 or _INDEXER_RATIO != 1:
+    # Halving is what the zigzag context-parallel layout needs: every rank owns a front
+    # and a back chunk of equal length. A rank holding the whole sequence has no zigzag
+    # to undo, so it needs neither the split nor the even length that the split implies.
+    whole_sequence_local = sk == local_query_len and local_packed_cp_rank == 0
+    if b != 1 or _INDEXER_RATIO != 1:
+        raise RuntimeError("single packed CP cuDNN fast path requires b=1, ratio=1")
+    if not whole_sequence_local and local_query_len % 2 != 0:
         raise RuntimeError(
-            "single packed CP cuDNN fast path requires b=1, even local query length, ratio=1"
+            "single packed CP cuDNN fast path requires an even local query length when the "
+            "sequence is split across context-parallel ranks"
         )
     if local_query_start < 0 or local_query_end > local_query_len:
         raise RuntimeError(
@@ -837,7 +879,12 @@ def _indexer_topk_single_packed_cp_segments(
         )
 
     half = local_query_len // 2
-    if sk == local_query_len:
+    if whole_sequence_local:
+        # One causal segment over the whole local sequence; per-row key lengths are still
+        # built from arange inside the loop, so this is the same masking as the split form
+        # and it does not require an even length.
+        segment_specs = ((0, local_query_len, local_query_len),)
+    elif sk == local_query_len:
         segment_specs = ((0, half, half), (half, local_query_len, local_query_len))
     else:
         segment_specs = (
@@ -1102,6 +1149,55 @@ def _topk_in_bounds(
     return in_range & valid_bounds
 
 
+def _segment_kernel_applicable(
+    b: int, sq: int, local_packed_cp_query_len: Optional[int], cp_size: int = 1
+) -> bool:
+    """Whether ``_indexer_topk_single_packed_cp_segments`` can take this shape.
+
+    That kernel raises rather than returning None when its preconditions fail, so the
+    scoring plan has to ask before promising it. Kept next to the kernel so the two
+    cannot drift apart.
+    """
+    local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
+    if b != 1 or _INDEXER_RATIO != 1:
+        return False
+    # An odd local length only rules out the halved zigzag form; a rank holding the whole
+    # sequence takes the single-segment form, which has no parity requirement.
+    return local_query_len % 2 == 0 or cp_size == 1
+
+
+def _resolve_scoring_plan_for_call(
+    *,
+    starts: Optional[Tensor],
+    ends: Optional[Tensor],
+    varlen_is_plain_causal: bool,
+    packed_thd: bool,
+    cp_size: int,
+    use_local_indexer_varlen: bool,
+    single_packed_thd_sequence: bool,
+    packed_metadata_available: bool,
+    segment_kernel_applicable: bool = True,
+) -> IndexerScoringDecision:
+    """Map this call's layout facts onto a scoring plan.
+
+    ``use_local_indexer_varlen`` already encodes "packed, CP>1, causal, no custom key
+    positions" -- it is how the caller reports a layout the packed kernels can accept.
+    It is unpacked here rather than re-tested downstream, so each resolver argument
+    keeps exactly one meaning.
+    """
+    return resolve_indexer_scoring_plan(
+        bounds_available=starts is not None and ends is not None,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        packed_thd=packed_thd,
+        cp_size=cp_size,
+        mask_is_causal=use_local_indexer_varlen or not packed_thd,
+        explicit_key_positions=False,
+        single_sequence_pack=single_packed_thd_sequence,
+        packed_metadata_available=packed_metadata_available,
+        segment_kernel_applicable=segment_kernel_applicable,
+    )
+
+
 def _indexer_topk_bshd(
     q_bshd: Tensor,
     k_bsd: Tensor,
@@ -1122,6 +1218,8 @@ def _indexer_topk_bshd(
     packed_max_seqlen_q: Optional[int] = None,
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
+    scoring_plan: Optional[IndexerScoringDecision] = None,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -1169,7 +1267,30 @@ def _indexer_topk_bshd(
 
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
-    if starts is None:
+    if scoring_plan is None:
+        scoring_plan = _resolve_scoring_plan_for_call(
+            segment_kernel_applicable=_segment_kernel_applicable(
+                b, sq, local_packed_cp_query_len, packed_cp_size
+            ),
+            starts=starts,
+            ends=ends,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd=use_local_indexer_varlen or packed_cu_seqlens_q is not None,
+            cp_size=packed_cp_size,
+            use_local_indexer_varlen=use_local_indexer_varlen,
+            single_packed_thd_sequence=single_packed_thd_sequence,
+            packed_metadata_available=(
+                packed_cu_seqlens_q is not None
+                and packed_cu_seqlens_k is not None
+                and packed_max_seqlen_q is not None
+                and packed_max_seqlen_k is not None
+            ),
+        )
+    plan = scoring_plan.plan
+
+    # PLAIN_CAUSAL means the bounds, if any, are the trivial whole-sequence causal ones
+    # that ``_causal_seq_lens`` rebuilds exactly, so the single-kernel scorer applies.
+    if starts is None or plan is IndexerScoringPlan.PLAIN_CAUSAL:
         q_idx = torch.arange(sq, device=device)
         seq_lens = _causal_seq_lens(q_idx, _INDEXER_RATIO, sk).to(torch.int32).repeat(b)
         if not return_scores:
@@ -1184,7 +1305,7 @@ def _indexer_topk_bshd(
             ]  # (b, sq, sk) fp32, -inf on masked positions
     else:
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
-        if not return_scores and use_local_indexer_varlen and single_packed_thd_sequence:
+        if not return_scores and plan is IndexerScoringPlan.PACKED_CP_SINGLE:
             topk_indices, topk_scores = _indexer_topk_single_packed_cp_segments(
                 q_bshd,
                 k_bshd,
@@ -1195,14 +1316,7 @@ def _indexer_topk_bshd(
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
             )
-        elif (
-            not return_scores
-            and use_local_indexer_varlen
-            and packed_cu_seqlens_q is not None
-            and packed_cu_seqlens_k is not None
-            and packed_max_seqlen_q is not None
-            and packed_max_seqlen_k is not None
-        ):
+        elif not return_scores and plan is IndexerScoringPlan.PACKED_CP_MULTI:
             topk_indices, topk_scores = _indexer_topk_multi_packed_cp_thd(
                 q_bshd,
                 k_bshd,
@@ -1359,6 +1473,7 @@ def run_fused_qk_topk(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
     _assert_supported_indexer_scoring(use_relu)
@@ -1369,6 +1484,9 @@ def run_fused_qk_topk(
         return None
     if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
         return None
+    # Bounds the caller could not build at all are a genuine decline, which is a
+    # different thing from bounds that exist but describe a layout a fused kernel can
+    # rebuild for itself. The scoring plan distinguishes the two.
     if starts is None or ends is None:
         return None
 
@@ -1398,6 +1516,7 @@ def run_fused_qk_topk(
         packed_max_seqlen_q=packed_max_seqlen_q,
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
+        varlen_is_plain_causal=varlen_is_plain_causal,
     )
     return topk_indices, topk_length
 
@@ -1426,6 +1545,7 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
     del block_size
@@ -1445,6 +1565,9 @@ def run_fused_qk_topk_with_loss(
         return None
     if query.size(3) != key.size(3):
         return None
+    # Bounds the caller could not build at all are a genuine decline, which is a
+    # different thing from bounds that exist but describe a layout a fused kernel can
+    # rebuild for itself. The scoring plan distinguishes the two.
     if starts is None or ends is None:
         return None
 
@@ -1472,8 +1595,8 @@ def run_fused_qk_topk_with_loss(
         loss_coeff,
         calculate_per_token_loss,
         latent_v_channels,
-        starts.contiguous(),
-        ends.contiguous(),
+        starts.contiguous() if starts is not None else None,
+        ends.contiguous() if ends is not None else None,
         query_valid_rows,
         use_local_indexer_varlen,
         single_packed_thd_sequence,
@@ -1486,6 +1609,7 @@ def run_fused_qk_topk_with_loss(
         packed_max_seqlen_k,
         cp_size,
         tp_group,
+        varlen_is_plain_causal,
     )
 
 
@@ -2174,6 +2298,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        varlen_is_plain_causal: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -2211,6 +2336,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            varlen_is_plain_causal=varlen_is_plain_causal,
         )
 
         prepared_topk_length = (
@@ -2401,6 +2527,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # varlen_is_plain_causal
         )
 
 
@@ -2420,8 +2547,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         loss_coeff: float,
         calculate_per_token_loss: bool,
         d_v: int,
-        varlen_starts: Tensor,
-        varlen_ends: Tensor,
+        varlen_starts: Optional[Tensor],
+        varlen_ends: Optional[Tensor],
         query_valid_rows: Optional[Tensor],
         use_local_indexer_varlen: bool,
         single_packed_thd_sequence: bool,
@@ -2434,6 +2561,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        varlen_is_plain_causal: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -2464,6 +2592,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            varlen_is_plain_causal=varlen_is_plain_causal,
         )
 
         if indexer_score_payload is None:
@@ -2550,6 +2679,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # varlen_is_plain_causal
         )
 
 
