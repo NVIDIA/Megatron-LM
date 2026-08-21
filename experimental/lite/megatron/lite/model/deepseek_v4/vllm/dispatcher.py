@@ -22,9 +22,8 @@ from megatron.lite.primitive.modules.dispatcher import (
 class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
     """Match vLLM route identity while using only normal DeepEP transport."""
 
-    def __init__(self, *args, capacity_factor: float | None = None, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.capacity_factor = capacity_factor
         if self.ep_size > 1 and not self.use_deepep:
             raise RuntimeError("vLLM alignment at EP>1 requires normal DeepEP")
 
@@ -33,24 +32,8 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         hidden_states: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_indices: torch.Tensor,
-        *,
-        router_token_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        source_fixed_topk_valid = (
-            self.capacity_factor is None and router_token_masks is None
-        )
-        if self.capacity_factor is not None:
-            topk_indices = topk_indices.masked_fill(topk_scores == 0, -1)
-        if router_token_masks is not None:
-            topk_indices = topk_indices.masked_fill(
-                router_token_masks.view(-1, 1), -1
-            )
-        return self._dispatch_aligned(
-            hidden_states,
-            topk_scores,
-            topk_indices,
-            source_fixed_topk_valid=source_fixed_topk_valid,
-        )
+        return self._dispatch_aligned(hidden_states, topk_scores, topk_indices)
 
     def combine(self, expert_output: torch.Tensor) -> torch.Tensor:
         route_outputs = expert_output.index_select(0, self._metadata_route_rows)
@@ -70,7 +53,6 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             self._source_weights,
             self._source_output_index,
             True,
-            self._source_all_routes_valid,
         )
         for name in (
             "_metadata_route_rows",
@@ -78,7 +60,6 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             "_source_indices",
             "_source_weights",
             "_source_output_index",
-            "_source_all_routes_valid",
         ):
             delattr(self, name)
         self._local_tpe_list = None
@@ -89,8 +70,6 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         hidden_states: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_indices: torch.Tensor,
-        *,
-        source_fixed_topk_valid: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.use_deepep:
             self._ensure_deepep_buffer(hidden_states)
@@ -124,12 +103,10 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
                 route_weights,
                 route_fingerprints,
                 source_output_index,
-                source_all_routes_valid,
             ) = _compact_route_preserving_metadata_inputs(
                 hidden_states,
                 topk_indices,
                 topk_scores,
-                assume_all_routes_valid=source_fixed_topk_valid,
             )
             (
                 received_fingerprints,
@@ -154,16 +131,15 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             positions = torch.nonzero(topk_indices >= 0, as_tuple=False)
             token_rows = positions[:, 0]
             topk_slots = positions[:, 1]
-            received_fingerprints = hidden_states.detach().narrow(
-                1, 0, 16
-            ).index_select(0, token_rows)
+            received_fingerprints = (
+                hidden_states.detach().narrow(1, 0, 16).index_select(0, token_rows)
+            )
             received_route_indices = topk_indices[token_rows, topk_slots]
             received_route_weights = topk_scores[token_rows, topk_slots]
             route_handle = None
             source_output_index = torch.arange(
                 topk_indices.numel(), device=topk_indices.device, dtype=torch.long
             ).reshape_as(topk_indices)
-            source_all_routes_valid = True
             received_per_expert = torch.bincount(
                 received_route_indices.reshape(-1).long(),
                 minlength=self.num_local_experts,
@@ -208,6 +184,5 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         self._source_indices = topk_indices
         self._source_weights = topk_scores
         self._source_output_index = source_output_index
-        self._source_all_routes_valid = source_all_routes_valid
         self._local_tpe_list = received_per_expert.tolist()
         return expert_hidden, received_per_expert, expert_probs

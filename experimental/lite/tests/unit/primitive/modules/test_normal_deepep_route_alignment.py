@@ -78,9 +78,7 @@ def test_deepep_buffer_is_created_lazily_at_dispatch(monkeypatch) -> None:
         types.SimpleNamespace(ep_size=2, tp_ep_group=group),
         use_deepep=True,
     )
-    dispatcher._ensure_deepep_buffer(
-        torch.zeros(2, 16, dtype=torch.bfloat16)
-    )
+    dispatcher._ensure_deepep_buffer(torch.zeros(2, 16, dtype=torch.bfloat16))
 
     assert dispatcher.buffer is sentinel
 
@@ -88,9 +86,8 @@ def test_deepep_buffer_is_created_lazily_at_dispatch(monkeypatch) -> None:
 def _capture_aligned_dispatch_contract(dispatcher, monkeypatch):
     captured = {}
 
-    def fake_aligned(self, hidden, scores, indices, *, source_fixed_topk_valid):
+    def fake_aligned(self, hidden, scores, indices):
         captured["indices"] = indices
-        captured["source_fixed_topk_valid"] = source_fixed_topk_valid
         return hidden, torch.empty(0, dtype=torch.int64), scores
 
     monkeypatch.setattr(
@@ -105,7 +102,6 @@ def test_aligned_dispatch_fixed_topk_contract_matches_slime(monkeypatch) -> None
     dispatcher = VLLMAlignedNormalDeepEPDispatcher.__new__(
         VLLMAlignedNormalDeepEPDispatcher
     )
-    dispatcher.capacity_factor = None
     captured = _capture_aligned_dispatch_contract(dispatcher, monkeypatch)
     hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
     scores = torch.ones(2, 2, dtype=torch.float32)
@@ -113,33 +109,7 @@ def test_aligned_dispatch_fixed_topk_contract_matches_slime(monkeypatch) -> None
 
     dispatcher.dispatch(hidden, scores, indices)
 
-    assert captured["source_fixed_topk_valid"] is True
     assert captured["indices"] is indices
-
-
-def test_aligned_dispatch_masks_routes_like_slime(monkeypatch) -> None:
-    dispatcher = VLLMAlignedNormalDeepEPDispatcher.__new__(
-        VLLMAlignedNormalDeepEPDispatcher
-    )
-    dispatcher.capacity_factor = 1.0
-    captured = _capture_aligned_dispatch_contract(dispatcher, monkeypatch)
-    hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
-    scores = torch.tensor([[1.0, 0.0], [0.5, 0.5]], dtype=torch.float32)
-    indices = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
-    token_mask = torch.tensor([False, True])
-
-    dispatcher.dispatch(
-        hidden,
-        scores,
-        indices,
-        router_token_masks=token_mask,
-    )
-
-    assert captured["source_fixed_topk_valid"] is False
-    assert torch.equal(
-        captured["indices"],
-        torch.tensor([[0, -1], [-1, -1]], dtype=torch.int64),
-    )
 
 
 def test_aligned_deepep_buffer_matches_mcore_process_wide_reuse(monkeypatch) -> None:
@@ -172,7 +142,9 @@ def test_aligned_deepep_buffer_matches_mcore_process_wide_reuse(monkeypatch) -> 
             self.runtime = object()
 
     group = object()
-    monkeypatch.setattr(dispatcher_module, "deep_ep", type("FakeDeepEP", (), {"Buffer": FakeBuffer}))
+    monkeypatch.setattr(
+        dispatcher_module, "deep_ep", type("FakeDeepEP", (), {"Buffer": FakeBuffer})
+    )
     monkeypatch.setattr(dispatcher_module.dist, "get_world_size", lambda *, group: 4)
     monkeypatch.setattr(dispatcher_module.torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(dispatcher_module, "_deepep_buffer", None)
@@ -199,7 +171,9 @@ def test_deepep_receive_counts_keep_mcore_cpu_contract(monkeypatch) -> None:
         def dispatch(self, hidden, **_kwargs):
             return hidden, None, None, [3, 5], (), None
 
-    monkeypatch.setattr(dispatcher_module, "_get_deepep_buffer", lambda *_args: FakeBuffer())
+    monkeypatch.setattr(
+        dispatcher_module, "_get_deepep_buffer", lambda *_args: FakeBuffer()
+    )
     ctx = types.SimpleNamespace()
     hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
     indices = torch.zeros(2, 1, dtype=torch.int64)
@@ -249,9 +223,7 @@ def test_route_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) 
     indices = torch.tensor([[0, 0], [1, 0]], dtype=torch.int64)
     weights = torch.tensor([[0.25, 0.75], [0.4, 0.6]], dtype=torch.float32)
 
-    dispatched, tokens_per_expert, _ = dispatcher.dispatch(
-        hidden, weights, indices
-    )
+    dispatched, tokens_per_expert, _ = dispatcher.dispatch(hidden, weights, indices)
 
     assert tokens_per_expert.tolist() == [3, 1]
     torch.testing.assert_close(dispatched[0], hidden[0])
@@ -289,14 +261,12 @@ def test_normal_deepep_finish_deduplicates_hash_routes() -> None:
     indices = torch.tensor([[0, 0], [1, 0]], dtype=torch.int64)
     weights = torch.tensor([[0.25, 0.75], [0.4, 0.6]], dtype=torch.float32)
 
-    dispatched, tokens_per_expert, routed_weights = (
-        dispatcher._finish_deepep_dispatch(
-            hidden,
-            indices,
-            weights,
-            # DeepEP counts top-k slots before duplicate expert IDs are folded.
-            [3, 1],
-        )
+    dispatched, tokens_per_expert, routed_weights = dispatcher._finish_deepep_dispatch(
+        hidden,
+        indices,
+        weights,
+        # DeepEP counts top-k slots before duplicate expert IDs are folded.
+        [3, 1],
     )
 
     assert tokens_per_expert.tolist() == [2, 1]
