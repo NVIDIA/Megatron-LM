@@ -270,6 +270,63 @@ def test_cutedsl_forward_controls_fused_backward_h(monkeypatch, save_fused_bwd_s
     assert (saved_h is None) is not save_fused_bwd_state
 
 
+def test_dense_chunk_metadata_cache_reuses_offsets(monkeypatch):
+    implementation = _implementation()
+
+    implementation._clear_dense_chunk_metadata_cache_for_test()
+    arange_calls = []
+    original_arange = torch.arange
+
+    def arange(*args, **kwargs):
+        arange_calls.append((args, kwargs))
+        return original_arange(*args, **kwargs)
+
+    monkeypatch.setattr(implementation.torch, "arange", arange)
+
+    first = implementation._dense_chunk_metadata(2, 128, torch.device("cpu"))
+    second = implementation._dense_chunk_metadata(2, 128, torch.device("cpu"))
+
+    assert second is first
+    assert len(arange_calls) == 2
+    assert first.cu_seqlens.tolist() == [0, 128, 256]
+    assert first.chunk_offsets.tolist() == [0, 2, 4]
+
+
+def test_cutedsl_forward_uses_cached_dense_chunk_offsets(monkeypatch):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
+
+    implementation._clear_dense_chunk_metadata_cache_for_test()
+    shape = (2, 64, 3, 4)
+    q = torch.empty(shape)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(shape[:-1]),
+        "beta": torch.empty(shape[:-1]),
+    }
+    dense_metadata = implementation._dense_chunk_metadata(2, 64, q.device)
+    seen = {}
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
+
+    _g, _output, _A, _saved_h, _chunk_indices, chunk_offsets = implementation._cutedsl_forward(
+        **inputs,
+        scale=0.5,
+        cu_seqlens=None,
+        cu_seqlens_cpu=None,
+        save_fused_bwd_state=True,
+    )
+
+    assert seen["cu_seqlens"] is dense_metadata.cu_seqlens
+    assert seen["checkpoint_cu_starts"] is dense_metadata.chunk_offsets
+    assert chunk_offsets is dense_metadata.chunk_offsets
+
+
 def test_fused_forward_rejects_conflicting_gate_modes():
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_fwd_cute import (
         chunk_gated_delta_rule_prefill_cute,
@@ -517,6 +574,8 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
         recompute_calls.append(True)
         return h
 
+    implementation._clear_dense_chunk_metadata_cache_for_test()
+    dense_metadata = implementation._dense_chunk_metadata(batch_size, 64, q.device)
     monkeypatch.setattr(implementation, "_recompute_fused_bwd_h", recompute)
     monkeypatch.setattr(fused_gdr_bwd_cute, "fused_gdr_bwd", fused)
 
@@ -543,6 +602,8 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     assert seen["h"].shape == (1, batch_size, 64, 128, 128)
     assert seen["dht"].shape == (batch_size, 64, 128, 128)
     assert torch.count_nonzero(seen["dht"]) == 0
+    assert seen["cu_seqlens"] is dense_metadata.cu_seqlens
+    assert seen["chunk_offsets"] is dense_metadata.chunk_offsets
     assert seen["cu_seqlens"].tolist() == [index * 64 for index in range(batch_size + 1)]
     assert dq.shape == q.shape and torch.all(dq == 1)
     assert dk.shape == k.shape and torch.all(dk == 2)

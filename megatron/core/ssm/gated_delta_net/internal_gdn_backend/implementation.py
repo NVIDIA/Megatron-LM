@@ -67,13 +67,26 @@ class _PackedChunkMetadataEntry:
     metadata: _PackedChunkMetadata
 
 
+@dataclass(frozen=True)
+class _DenseChunkMetadata:
+    cu_seqlens: torch.Tensor
+    chunk_offsets: torch.Tensor
+
+
 _packed_chunk_metadata_cache: dict[
     tuple[int, tuple[int, int] | None], _PackedChunkMetadataEntry
+] = {}
+_dense_chunk_metadata_cache: dict[
+    tuple[str, int | None, int, int, int, tuple[int, int] | None], _DenseChunkMetadata
 ] = {}
 
 
 def _clear_packed_chunk_metadata_cache_for_test() -> None:
     _packed_chunk_metadata_cache.clear()
+
+
+def _clear_dense_chunk_metadata_cache_for_test() -> None:
+    _dense_chunk_metadata_cache.clear()
 
 
 def _current_stream_cache_key(tensor_or_device: torch.Tensor | torch.device) -> tuple[int, int] | None:
@@ -347,6 +360,14 @@ def _fused_bwd_support_reason(
     return None
 
 
+def _device_cache_key(device: torch.device) -> tuple[str, int | None]:
+    device = torch.device(device)
+    device_index = device.index
+    if device.type == "cuda" and device_index is None:
+        device_index = torch.cuda.current_device()
+    return (device.type, device_index)
+
+
 def _fused_bwd_zero_dht(device: torch.device, num_sequences: int) -> torch.Tensor:
     device = torch.device(device)
     device_index = device.index
@@ -396,9 +417,14 @@ def _call_fused_gdr_bwd_cute(
 
     batch_size, seqlen, num_heads, head_size = q.shape
     total_tokens = batch_size * seqlen
-    launch_cu_seqlens = (
-        _dense_cu_seqlens(batch_size, seqlen, q.device) if cu_seqlens is None else cu_seqlens
-    )
+    dense_metadata = None
+    if cu_seqlens is None:
+        dense_metadata = _dense_chunk_metadata(batch_size, seqlen, q.device)
+        launch_cu_seqlens = dense_metadata.cu_seqlens
+        if chunk_offsets is None:
+            chunk_offsets = dense_metadata.chunk_offsets
+    else:
+        launch_cu_seqlens = cu_seqlens
     num_sequences = launch_cu_seqlens.numel() - 1
     if h is None:
         h = _recompute_fused_bwd_h(
@@ -558,8 +584,42 @@ def _cutedsl_support_reason(
     return None
 
 
+def _dense_chunk_metadata(
+    batch_size: int, seqlen: int, device: torch.device
+) -> _DenseChunkMetadata:
+    if seqlen % _CHUNK_SIZE:
+        raise ValueError("dense sequence length must be a multiple of 64")
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (
+        *_device_cache_key(device),
+        batch_size,
+        seqlen,
+        _CHUNK_SIZE,
+        _current_stream_cache_key(device),
+    )
+    cached = _dense_chunk_metadata_cache.get(key)
+    if cached is not None and cached.cu_seqlens.device == device:
+        return cached
+    cu_seqlens = torch.arange(
+        0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32
+    )
+    chunks_per_sequence = seqlen // _CHUNK_SIZE
+    chunk_offsets = torch.arange(
+        0,
+        (batch_size + 1) * chunks_per_sequence,
+        chunks_per_sequence,
+        device=device,
+        dtype=torch.int32,
+    )
+    metadata = _DenseChunkMetadata(cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets)
+    _dense_chunk_metadata_cache[key] = metadata
+    return metadata
+
+
 def _dense_cu_seqlens(batch_size: int, seqlen: int, device: torch.device) -> torch.Tensor:
-    return torch.arange(0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32)
+    return _dense_chunk_metadata(batch_size, seqlen, device).cu_seqlens
 
 
 def _reshape_bthd_to_thd(tensor: torch.Tensor) -> torch.Tensor:
@@ -723,6 +783,9 @@ def _cutedsl_forward(
     from .kernels.fused_gdr_fwd_cute import chunk_gated_delta_rule_prefill_cute
 
     batch_size, seqlen, num_heads, head_size = q.shape
+    dense_metadata = (
+        _dense_chunk_metadata(batch_size, seqlen, q.device) if cu_seqlens is None else None
+    )
     chunk_indices = None
     if cu_seqlens is not None:
         if packed_metadata is not None:
@@ -733,8 +796,8 @@ def _cutedsl_forward(
             )
     chunk_offsets = packed_metadata.chunk_offsets if packed_metadata is not None else None
     launch_cu_seqlens = (
-        _dense_cu_seqlens(batch_size, seqlen, q.device)
-        if cu_seqlens is None
+        dense_metadata.cu_seqlens
+        if dense_metadata is not None
         else cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
     )
     flat_q = _reshape_bthd_to_thd(q.detach())
@@ -758,7 +821,13 @@ def _cutedsl_forward(
             device=q.device,
         )
         checkpoint_cu_starts = (
-            chunk_offsets if chunk_offsets is not None else launch_cu_seqlens // _CHUNK_SIZE
+            chunk_offsets
+            if chunk_offsets is not None
+            else (
+                dense_metadata.chunk_offsets
+                if dense_metadata is not None
+                else launch_cu_seqlens // _CHUNK_SIZE
+            )
         )
     chunk_gated_delta_rule_prefill_cute(
         q=flat_q,
@@ -783,7 +852,11 @@ def _cutedsl_forward(
         flat_A.reshape(batch_size, seqlen, num_heads, _CHUNK_SIZE),
         flat_h,
         chunk_indices,
-        chunk_offsets,
+        (
+            chunk_offsets
+            if chunk_offsets is not None
+            else (dense_metadata.chunk_offsets if dense_metadata is not None else None)
+        ),
     )
 
 
