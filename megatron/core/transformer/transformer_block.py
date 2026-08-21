@@ -30,6 +30,10 @@ from megatron.core.transformer.hyper_connection import (
     finalize_mhc_recompute_layer,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.residual_recompute import (
+    build_residual_stream_recompute_plan,
+    residual_stream_recompute_enabled,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -675,6 +679,23 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             mhc_recompute_layer_num=self.config.mhc_recompute_layer_num,
             use_mhc_recompute=use_mhc_recompute,
         )
+        use_residual_stream_recompute = residual_stream_recompute_enabled(
+            self.config, self.training
+        )
+        if use_residual_stream_recompute and len(extract_layer_indices) > 0:
+            raise NotImplementedError(
+                "'residual_stream' in recompute_modules is not supported together with "
+                "extract_layer_indices. The unified replay hook is registered on the block "
+                "boundary, so gradients from an extracted intermediate activation could reach "
+                "discarded storage before it is restored."
+            )
+        residual_stream_recompute_plan = (
+            build_residual_stream_recompute_plan(
+                len(self.layers), self.config.residual_stream_recompute_num_layers
+            )
+            if use_residual_stream_recompute
+            else [None] * len(self.layers)
+        )
 
         with rng_context, outer_quantization_context:
             # Forward pass.
@@ -718,6 +739,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         inner_quantization_context = nullcontext()
 
                     mhc_manager = mhc_layer_managers[l_no]
+                    residual_stream_recompute_context = residual_stream_recompute_plan[l_no]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = (
                             mhc_is_last_in_recompute_block[l_no]
@@ -727,9 +749,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # manager actually exists. Plain TransformerLayer (and its
                     # MoETransformerLayer subclass) doesn't accept this kwarg, and
                     # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
-                    extra_layer_kwargs = (
-                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
-                    )
+                    extra_layer_kwargs = {}
+                    if mhc_manager is not None:
+                        extra_layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                    if residual_stream_recompute_context is not None:
+                        extra_layer_kwargs["residual_stream_recompute_context"] = (
+                            residual_stream_recompute_context
+                        )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -752,6 +778,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         hidden_states=hidden_states,
                         is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
                     )
+                    if residual_stream_recompute_context is not None:
+                        residual_stream_recompute_context.finalize(hidden_states)
 
                     if (
                         torch.is_grad_enabled()
