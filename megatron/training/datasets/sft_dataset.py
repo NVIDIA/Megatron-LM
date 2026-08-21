@@ -6,7 +6,6 @@ import math
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-import pandas as pd
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
@@ -246,6 +245,13 @@ class MockSFTLowLevelDataset:
         np.random.seed(self.seed)
 
         if mode == "file":
+            try:
+                import pandas as pd
+            except ImportError:
+                raise ImportError(
+                    "MockSFTLowLevelDataset(mode='file') requires `pandas` to read "
+                    "the sequence-length CSV (pip install pandas)."
+                )
             self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
             self.size = len(self.sequence_lengths)
         elif mode == "distribution":
