@@ -7,6 +7,7 @@ from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    copy_gtp_attributes,
     copy_tensor_model_parallel_attributes,
     param_is_not_tensor_parallel_duplicate,
 )
@@ -91,16 +92,36 @@ class TestTPAttributesWithoutInitialization:
         assert hasattr(w, "partition_stride") and w.partition_stride == 1
 
 
-def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
+def test_copy_tensor_model_parallel_attributes_preserves_optimizer_split_shapes():
     source = torch.empty(4, 4)
     destination = torch.empty_like(source)
     source.is_qkv = True
     source.qkv_split_shapes = [256, 64, 64]
+    source.is_glu = True
+    source.glu_interleave_size = 32
 
     copy_tensor_model_parallel_attributes(destination, source)
 
     assert destination.is_qkv is True
     assert destination.qkv_split_shapes == source.qkv_split_shapes
+    assert destination.is_glu is True
+    assert destination.glu_interleave_size == source.glu_interleave_size
+
+
+def test_copy_gtp_attributes_preserves_layout_metadata():
+    source = torch.empty(4, 4)
+    destination = torch.empty_like(source)
+    source.is_gtp_weight_remat = True
+    source.allreduce = False
+    source.gtp_remat_size = 2
+    source.pad_length = 16
+
+    copy_gtp_attributes(destination, source)
+
+    assert destination.is_gtp_weight_remat is True
+    assert destination.allreduce is False
+    assert destination.gtp_remat_size == source.gtp_remat_size
+    assert destination.pad_length == source.pad_length
 
 
 def test_non_allreduce_param_uses_expert_tp_group_for_duplicate_filter():

@@ -84,6 +84,25 @@ class LinearFc1Builder(Protocol):
         ...
 
 
+def set_glu_linear_fc1_attributes(
+    linear_fc1: object, enabled: bool, interleave_size: int | None = None
+) -> None:
+    """Describe the gate/up row layout on fused GLU FC1 weights."""
+    if not enabled:
+        return
+
+    for name, param in cast(torch.nn.Module, linear_fc1).named_parameters():
+        leaf_name = name.rsplit('.', maxsplit=1)[-1]
+        is_weight = leaf_name == 'weight' or (
+            leaf_name.startswith('weight') and leaf_name[len('weight') :].isdigit()
+        )
+        # TE single-grouped expert weights are 3D containers. Muon rejects that
+        # configuration explicitly until it can maintain per-expert state within them.
+        if is_weight and param.ndim == 2:
+            param.is_glu = True
+            param.glu_interleave_size = interleave_size
+
+
 class TEActivationFunctionInterface(Protocol):
     """Interface for activation_function module in MLP."""
 
@@ -231,6 +250,7 @@ class MLP(MegatronModule):
             stride=fc1_stride,
             name=(name + ".linear_fc1") if name is not None else None,
         )
+        set_glu_linear_fc1_attributes(self.linear_fc1, self.config.gated_linear_unit)
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))

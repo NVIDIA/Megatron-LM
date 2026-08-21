@@ -773,13 +773,23 @@ def _get_megatron_emerging_optimizer(
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
+    if eopt_name in ('muon', 'adaptive_muon') and any(
+        getattr(model_chunk.config, 'moe_single_grouped_weight', False)
+        for model_chunk in model_chunks
+    ):
+        raise ValueError(
+            "Muon does not support --moe-single-grouped-weight: Transformer Engine stores "
+            "local-expert weights as 3D GroupedTensor parameters, while Muon currently "
+            "requires individual 2D matrix parameters. Disable --moe-single-grouped-weight."
+        )
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag optimizer-specific attributes. GLU layout metadata is model-owned; retain a
+    # conservative name-based fallback for modules that have not adopted the marker yet.
     for model_chunk in model_chunks:
         qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
@@ -800,6 +810,34 @@ def _get_megatron_emerging_optimizer(
                         logging.DEBUG,
                         f"Emerging optimizer QKV split skipped for {name}: "
                         f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                    )
+            # Model-owned ``is_glu=True`` is authoritative. Tensor-parallel attribute
+            # initialization can install ``is_glu=False`` before this pass, so retain the
+            # name fallback for unannotated 2D FC1 modules. Interleave metadata remains
+            # per-parameter; MoE config values must not suppress dense FC1 weights.
+            name_fallback_is_glu = (
+                model_chunk.config.gated_linear_unit
+                and 'linear_fc1.weight' in name
+                and len(param.shape) == 2
+            )
+            if getattr(param, 'is_glu', False) or name_fallback_is_glu:
+                interleave_size = getattr(param, 'glu_interleave_size', None)
+                is_gtp_weight = getattr(param, 'is_gtp_weight_remat', False)
+                gtp_remat_size = getattr(param, 'gtp_remat_size', 1) if is_gtp_weight else 1
+                pad_length = getattr(param, 'pad_length', 0) if is_gtp_weight else 0
+                logical_rows = param.shape[0] * gtp_remat_size - pad_length
+                valid_interleave = interleave_size is None or interleave_size > 0
+                layout_multiple = 2 if interleave_size is None else 2 * interleave_size
+                if valid_interleave and logical_rows > 0 and logical_rows % layout_multiple == 0:
+                    param.is_glu = True
+                else:
+                    param.is_glu = False
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"Emerging optimizer GLU split skipped for {name}: "
+                        f"shape={tuple(param.shape)}, gtp_remat_size={gtp_remat_size}, "
+                        f"pad_length={pad_length}, interleave_size={interleave_size}",
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).

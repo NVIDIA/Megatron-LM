@@ -64,6 +64,8 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
     "qkv_split_shapes": None,
+    "is_glu": False,
+    "glu_interleave_size": None,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -111,9 +113,8 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
 
 
 def copy_gtp_attributes(destination, source):
-    """Copy the GTP dedup tags (is_gtp_weight_remat, allreduce) onto a param view/copy, so the
-    optimizer's master shards stay classifiable by param_is_not_gtp_duplicate."""
-    for attr in ("is_gtp_weight_remat", "allreduce"):
+    """Copy GTP metadata onto a parameter view or optimizer-owned copy."""
+    for attr in ("is_gtp_weight_remat", "allreduce", "gtp_remat_size", "pad_length"):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
 

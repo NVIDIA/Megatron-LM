@@ -188,6 +188,47 @@ def test_shared_expert_builder_selects_implementation_from_config(monkeypatch):
     assert fused.kwargs["submodules"] is submodules
 
 
+@pytest.mark.parametrize(
+    ("shared_expert_cls", "expected_interleave_size"),
+    [(SharedExpertMLP, None), (FusedSharedExpertMLP, 2)],
+)
+def test_shared_expert_glu_metadata_matches_stored_layout(
+    monkeypatch, shared_expert_cls, expected_interleave_size
+):
+    """Only the fused shared-expert path stores interleaved FC1 rows."""
+
+    def fake_mlp_init(self, config, *_args, **_kwargs):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.linear_fc1 = torch.nn.Linear(4, 8, bias=False)
+        self.linear_fc2 = torch.nn.Linear(4, 4, bias=False)
+        shared_experts_module.set_glu_linear_fc1_attributes(
+            self.linear_fc1, config.gated_linear_unit
+        )
+
+    monkeypatch.setattr(shared_experts_module.MLP, "__init__", fake_mlp_init)
+    monkeypatch.setattr(FusedSharedExpertMLP, "_validate_fused_grouped_swiglu", lambda self: None)
+    config = SimpleNamespace(
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        moe_shared_expert_intermediate_size=4,
+        moe_shared_expert_glu_interleave_size=2,
+        fp8=False,
+        fp4=False,
+        moe_shared_expert_overlap=False,
+    )
+
+    shared_expert = shared_expert_cls(
+        config=config,
+        submodules=SimpleNamespace(),
+        gate=False,
+        pg_collection=SimpleNamespace(tp=None),
+    )
+
+    assert shared_expert.linear_fc1.weight.is_glu is True
+    assert shared_expert.linear_fc1.weight.glu_interleave_size == expected_interleave_size
+
+
 def test_validate_fused_grouped_swiglu_requires_te(monkeypatch):
     shared_expert = _fake_shared_expert()
     monkeypatch.setattr(shared_experts_module, "HAVE_TE", False)
