@@ -514,22 +514,20 @@ class TopKRouter(Router):
             and packed_seq_params.local_cp_size is not None
             and packed_seq_params.cp_group is not None
         ):
-            capture_parent_group = (
-                self.dp_cp_group
-                if getattr(self.config, '_cuda_graph_capture_dynamic_cp', None) is not None
-                else None
+            use_parent_group = (
+                getattr(self.config, 'dynamic_context_parallel', False)
+                and getattr(self.config, 'cuda_graph_impl', 'none') == 'transformer_engine'
+                and getattr(self.config, 'cuda_graph_dynamic_microbatches', False)
             )
-            if (
-                capture_parent_group is None
-                and getattr(self.config, '_cuda_graph_capture_dynamic_cp', None) is not None
-            ):
-                raise RuntimeError("Dynamic-CP CUDA graph capture requires a dp_cp process group.")
+            dynamic_cp_parent_group = self.dp_cp_group if use_parent_group else None
+            if use_parent_group and dynamic_cp_parent_group is None:
+                raise RuntimeError("Dynamic-CP CUDA graphs require a dp_cp process group.")
             return _AuxLossGroupConfig(
                 loss_reduce_groups=(packed_seq_params.cp_group, self.tp_group),
                 metric_reduce_group=None,
                 metric_avg_group=self.tp_dp_cp_group,
                 metric_needs_dp_avg=False,
-                dynamic_cp_parent_group=capture_parent_group,
+                dynamic_cp_parent_group=dynamic_cp_parent_group,
             )
 
         return _AuxLossGroupConfig(

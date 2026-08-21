@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -28,6 +29,34 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+@pytest.mark.internal
+def test_dynamic_cp_graph_aux_loss_uses_parent_group_during_eager_warmup():
+    """Eager graph warmup must not initialize a logical-CP communicator."""
+    router = TopKRouter.__new__(TopKRouter)
+    logical_cp_group = object()
+    parent_dp_cp_group = object()
+    object.__setattr__(
+        router,
+        "config",
+        SimpleNamespace(
+            dynamic_context_parallel=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_dynamic_microbatches=True,
+        ),
+    )
+    object.__setattr__(router, "tp_group", object())
+    object.__setattr__(router, "tp_cp_group", object())
+    object.__setattr__(router, "tp_dp_cp_group", object())
+    object.__setattr__(router, "dp_cp_group", parent_dp_cp_group)
+
+    groups = router._get_aux_loss_groups(
+        SimpleNamespace(local_cp_size=2, cp_group=logical_cp_group)
+    )
+
+    assert groups.loss_reduce_groups[0] is logical_cp_group
+    assert groups.dynamic_cp_parent_group is parent_dp_cp_group
 
 
 class TestTop2Router:

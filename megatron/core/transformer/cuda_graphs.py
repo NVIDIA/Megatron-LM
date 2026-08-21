@@ -1861,8 +1861,8 @@ class TECudaGraphHelper:
         self._reuse_parent_cp_transport = self._should_share_dynamic_cp_pool()
         self._dynamic_cp_transport_contexts = ()
         if self._reuse_parent_cp_transport:
-            self._dynamic_cp_transport_contexts = tuple(self._get_dynamic_cp_capture_contexts())
             try:
+                self._dynamic_cp_transport_contexts = tuple(self._get_dynamic_cp_capture_contexts())
                 self._set_dynamic_cp_p2p_transport(
                     self._dynamic_cp_transport_contexts, self.dp_cp_group
                 )
@@ -1873,6 +1873,7 @@ class TECudaGraphHelper:
                 self._set_dynamic_cp_p2p_transport(self._dynamic_cp_transport_contexts, None)
                 self._dynamic_cp_transport_contexts = ()
                 self._reuse_parent_cp_transport = False
+                self._clear_thd_rotary_seq_lens()
                 raise
 
     def _discover_layers(self):
@@ -1975,6 +1976,15 @@ class TECudaGraphHelper:
         for model_chunk in self.chunks_with_decoder:
             if model_chunk is not None:
                 model_chunk.config._cuda_graph_thd_rotary_seq_lens = rotary_seq_lens
+
+    def _clear_thd_rotary_seq_lens(self):
+        """Remove capture-only RoPE limits from every VPP config copy."""
+        configs = {id(self.config): self.config}
+        for model_chunk in self.chunks_with_decoder:
+            if model_chunk is not None:
+                configs[id(model_chunk.config)] = model_chunk.config
+        for config in configs.values():
+            vars(config).pop('_cuda_graph_thd_rotary_seq_lens', None)
 
     def _get_thd_capture_rotary_layout(self, capture_cp_size):
         """Return the RoPE length and packed boundaries used for THD capture."""
@@ -2104,9 +2114,7 @@ class TECudaGraphHelper:
                     capture_cp_group = None
                     if packed_seq:
                         capture_cp_size, capture_cp_group = layer._get_thd_cuda_graph_capture_cp()
-                        rotary_seq_len, _ = self._get_thd_capture_rotary_layout(
-                            capture_cp_size
-                        )
+                        rotary_seq_len, _ = self._get_thd_capture_rotary_layout(capture_cp_size)
                     else:
                         rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                             None, transformer_module.decoder, transformer_input, self.config, None
@@ -2440,6 +2448,7 @@ class TECudaGraphHelper:
         max_sequence_length,
         microbatch_group_size_per_vp_stage=None,
         max_num_seqs=None,
+        max_subsamples_per_item=1,
     ):
         """Return the packed-microbatch upper bound for dp_balanced THD packing."""
         assert global_batch_size >= 1
@@ -2447,13 +2456,15 @@ class TECudaGraphHelper:
         assert cp_size >= 1
         assert max_seqlen_per_dp_cp_rank >= 1
         assert max_sequence_length >= 1
+        assert max_subsamples_per_item >= 1
 
         max_seq_len_all_ranks = max_seqlen_per_dp_cp_rank * cp_size
         seqs_per_pack = max(1, max_seq_len_all_ranks // max_sequence_length)
         if max_num_seqs is not None:
             seqs_per_pack = min(seqs_per_pack, max(1, int(max_num_seqs)))
 
-        num_packed_sequences = math.ceil(global_batch_size / seqs_per_pack)
+        max_subsamples = global_batch_size * max_subsamples_per_item
+        num_packed_sequences = math.ceil(max_subsamples / seqs_per_pack)
         multiple = dp_size * (
             microbatch_group_size_per_vp_stage
             if microbatch_group_size_per_vp_stage is not None
@@ -2565,6 +2576,7 @@ class TECudaGraphHelper:
                     else microbatch_group_size_per_vp_stage
                 ),
                 max_num_seqs=max_num_seqs,
+                max_subsamples_per_item=int(getattr(self.config, 'thd_max_subsamples_per_item', 1)),
             ),
             "thd_varlen_upper_bound",
         )
@@ -2594,39 +2606,28 @@ class TECudaGraphHelper:
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
         elif self._should_use_dynamic_microbatch_slots():
-            probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
-            from megatron.core.pipeline_parallel.schedules import (
-                get_pp_rank_microbatches as _probe_get_pp,
-            )
-            from megatron.core.pipeline_parallel.schedules import (
-                get_schedule_table as _probe_get_st,
-            )
-
-            _, _, _probe_warmup, _ = _probe_get_pp(
-                probe_num_microbatches,
-                self.num_model_chunks,
-                microbatch_group_size_per_vp_stage,
-                False,
-                overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
-            )
-            _probe_st = _probe_get_st(
-                probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
-            )
-            _probe_order = convert_schedule_table_to_order(
-                _probe_warmup, self.num_model_chunks, _probe_st
-            )
-            auto_num_slots = self._get_required_num_microbatch_slots_from_order(
-                _probe_order, self.num_model_chunks
-            )
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
-            if pp_group is not None and pp_group.size() > 1:
-                auto_num_slots_tensor = torch.tensor(
-                    [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
+            share_dynamic_cp_pool = self._should_share_dynamic_cp_pool()
+            auto_num_slots = None
+            if not share_dynamic_cp_pool:
+                probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
+                _, _, probe_warmup, _ = get_pp_rank_microbatches(
+                    probe_num_microbatches,
+                    self.num_model_chunks,
+                    microbatch_group_size_per_vp_stage,
+                    False,
+                    overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
                 )
-                torch.distributed.all_reduce(
-                    auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                probe_schedule = get_schedule_table(
+                    probe_num_microbatches,
+                    self.num_model_chunks,
+                    microbatch_group_size_per_vp_stage,
                 )
-                auto_num_slots = int(auto_num_slots_tensor.item())
+                probe_order = convert_schedule_table_to_order(
+                    probe_warmup, self.num_model_chunks, probe_schedule
+                )
+                auto_num_slots = self._get_required_num_microbatch_slots_from_order(
+                    probe_order, self.num_model_chunks
+                )
             runtime_num_microbatches = get_num_microbatches()
             max_num_microbatches, capture_mode = self._get_thd_varlen_max_num_microbatches(
                 runtime_num_microbatches, microbatch_group_size_per_vp_stage
@@ -2635,13 +2636,12 @@ class TECudaGraphHelper:
                 self.num_microbatches = runtime_num_microbatches
                 capture_mode = "runtime"
                 fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
-            elif self._should_share_dynamic_cp_pool():
+            elif share_dynamic_cp_pool:
                 # A callable can be replayed after its matching backward has completed. Capture
-                # only the topology-sized ring, and prove its saved-tensor aliases against every
-                # microbatch count the dynamic scheduler may produce.
+                # the exact largest ring required by every scheduler-reachable microbatch count,
+                # then prove its saved-tensor aliases against the same schedule union.
                 liveness_num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
                 self._dynamic_slot_liveness_limit = liveness_num_microbatches
-                self.num_microbatches = auto_num_slots
                 possible_orders = []
                 candidate_num_microbatches_values = (
                     self._get_dynamic_slot_liveness_microbatch_counts(
@@ -2674,6 +2674,22 @@ class TECudaGraphHelper:
                         )
                     )
                 self._dynamic_slot_liveness_orders = tuple(possible_orders)
+                auto_num_slots = max(
+                    self._get_required_num_microbatch_slots_from_order(
+                        possible_order, self.num_model_chunks
+                    )
+                    for possible_order in possible_orders
+                )
+                pp_group = self.pp_group
+                if pp_group is not None and pp_group.size() > 1:
+                    auto_num_slots_tensor = torch.tensor(
+                        [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                    torch.distributed.all_reduce(
+                        auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                    )
+                    auto_num_slots = int(auto_num_slots_tensor.item())
+                self.num_microbatches = auto_num_slots
                 capture_mode = f"{capture_mode}_physical_slots"
                 fallback_reason = None
             else:
@@ -3145,46 +3161,26 @@ class TECudaGraphHelper:
         # never simultaneously live, while CP alternatives for one frame are mutually exclusive.
         graph_memory_slots = []
         liveness_orders = getattr(self, '_dynamic_slot_liveness_orders', (base_order,))
-        saved_tensor_liveness_colors, saved_tensor_liveness_conflicts = (
-            self._build_saved_tensor_liveness_colors(
-                liveness_orders,
-                self.num_microbatches,
-                self.num_layers_per_chunk,
-                return_conflicts=True,
-            )
+        saved_tensor_liveness_colors = self._build_saved_tensor_liveness_colors(
+            liveness_orders, self.num_microbatches, self.num_layers_per_chunk
         )
-        frame_ids = {
-            frame: frame_id
-            for frame_id, frame in enumerate(sorted(saved_tensor_liveness_conflicts))
-        }
-        conflict_masks = {
-            frame: sum(1 << frame_ids[other] for other in conflicts)
-            for frame, conflicts in saved_tensor_liveness_conflicts.items()
-        }
-        num_saved_tensor_frames = self.num_microbatches * sum(self.num_layers_per_chunk)
         for variant in range(len(capture_banks)):
             layer_offset = 0
             for model_chunk, num_layers in enumerate(self.num_layers_per_chunk):
                 for physical_slot in range(self.num_microbatches):
                     io_branch_id = variant * self.num_microbatches + physical_slot
                     for layer in range(num_layers):
-                        frame_id = (layer_offset + layer) * self.num_microbatches + physical_slot
-                        saved_branch_id = variant * num_saved_tensor_frames + frame_id
                         saved_arena_id = saved_tensor_liveness_colors[
                             (model_chunk, physical_slot, layer)
                         ]
-                        frame = (model_chunk, physical_slot, layer)
                         graph_memory_slots.append(
                             (
                                 saved_arena_id,
-                                saved_branch_id,
                                 physical_slot,
                                 io_branch_id,
                                 model_chunk,
                                 layer,
                                 variant * len(self.flattened_callables) + layer_offset + layer,
-                                frame_ids[frame],
-                                conflict_masks[frame],
                             )
                         )
                 layer_offset += num_layers
@@ -3345,6 +3341,8 @@ class TECudaGraphHelper:
         for cleanup in (self._reset_after_capture, gc.collect, torch.cuda.empty_cache):
             with suppress(BaseException):
                 cleanup()
+        with suppress(BaseException):
+            self._clear_thd_rotary_seq_lens()
 
     def _install_captured_graphs(
         self, capture_contexts, captured_graphs, captured_sample_args=None
@@ -3489,25 +3487,49 @@ class TECudaGraphHelper:
 
     def delete_cuda_graphs(self):
         """
-        Delete all CUDA graphs.
+        Delete all CUDA graphs and release capture-only state.
         """
-        assert self._graphs_created, "No CUDA Graphs were created to delete."
-
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0
-        for layers in self.callables_per_chunk:
-            for layer in layers:
-                graph_bank = layer.cuda_graphs_by_dynamic_cp_size
-                graph_lists = graph_bank.values() if graph_bank else (layer.cuda_graphs,)
-                for graph in chain.from_iterable(graph_lists):
-                    if graph_resettable:
-                        graph.reset()
-                        graphs_reset += 1
-                    else:
-                        graphs_not_reset += 1
-                self._clear_cuda_graph_state(layer)
-
-        vars(self.config).pop('_cuda_graph_num_microbatches', None)
+        reset_error = None
+        try:
+            for layers in self.callables_per_chunk:
+                for layer in layers:
+                    try:
+                        graph_bank = layer.cuda_graphs_by_dynamic_cp_size
+                        graph_lists = graph_bank.values() if graph_bank else (layer.cuda_graphs,)
+                        for graph in chain.from_iterable(graph_lists):
+                            try:
+                                if graph_resettable:
+                                    graph.reset()
+                                    graphs_reset += 1
+                                else:
+                                    graphs_not_reset += 1
+                            except BaseException as error:
+                                if reset_error is None:
+                                    reset_error = error
+                    except BaseException as error:
+                        if reset_error is None:
+                            reset_error = error
+                    finally:
+                        try:
+                            self._clear_cuda_graph_state(layer)
+                        except BaseException as error:
+                            if reset_error is None:
+                                reset_error = error
+        finally:
+            self._graphs_created = False
+            cleanup_callbacks = (
+                lambda: vars(self.config).pop('_cuda_graph_num_microbatches', None),
+                self._clear_thd_rotary_seq_lens,
+                self._release_dynamic_cp_p2p_transport,
+            )
+            for cleanup in cleanup_callbacks:
+                try:
+                    cleanup()
+                except BaseException as error:
+                    if reset_error is None:
+                        reset_error = error
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -3518,7 +3540,8 @@ class TECudaGraphHelper:
             f'{graphs_reset} graphs deleted with explicit reset, '
             f'{graphs_not_reset} graphs deleted without explicit reset.',
         )
-        self._graphs_created = False
+        if reset_error is not None:
+            raise reset_error
 
 
 def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):

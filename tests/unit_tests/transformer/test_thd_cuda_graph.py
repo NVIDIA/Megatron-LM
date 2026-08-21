@@ -1132,6 +1132,127 @@ class TestDynamicMicrobatchSlots:
         for config in (helper.config, *chunk_configs):
             assert config._cuda_graph_thd_rotary_seq_lens is rotary_seq_lens
 
+        helper._clear_thd_rotary_seq_lens()
+        for config in (helper.config, *chunk_configs):
+            assert not hasattr(config, '_cuda_graph_thd_rotary_seq_lens')
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("reset_fails", (False, True))
+    def test_delete_graphs_releases_capture_only_state(self, monkeypatch, reset_fails):
+        from megatron.core.transformer import cuda_graphs
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        class Graph:
+            reset_count = 0
+
+            def reset(self):
+                self.reset_count += 1
+                if reset_fails:
+                    raise RuntimeError("reset failed")
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper._graphs_created = True
+        helper.config = SimpleNamespace(
+            _cuda_graph_num_microbatches=8, _cuda_graph_thd_rotary_seq_lens={2: 4096}
+        )
+        chunk_config = SimpleNamespace(_cuda_graph_thd_rotary_seq_lens={2: 4096})
+        helper.chunks_with_decoder = [SimpleNamespace(config=chunk_config)]
+        layer = torch.nn.Identity()
+        graph = Graph()
+        later_graph = Graph()
+        layer.cuda_graphs = [graph, later_graph]
+        layer.cuda_graphs_by_dynamic_cp_size = {}
+        layer.cuda_graph_manual_hooks = []
+        helper.callables_per_chunk = [[layer]]
+        helper.tp_group = object()
+        helper.dp_cp_group = object()
+        released = []
+        helper._release_dynamic_cp_p2p_transport = lambda: released.append(True)
+        monkeypatch.setattr(cuda_graphs, 'is_te_min_version', lambda version: True)
+        monkeypatch.setattr(cuda_graphs, 'log_on_each_pipeline_stage', lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+
+        if reset_fails:
+            with pytest.raises(RuntimeError, match="reset failed"):
+                helper.delete_cuda_graphs()
+        else:
+            helper.delete_cuda_graphs()
+
+        assert graph.reset_count == 1
+        assert later_graph.reset_count == 1
+        assert released == [True]
+        assert helper._graphs_created is False
+        assert layer.cuda_graphs == []
+        assert layer.cuda_graphs_by_dynamic_cp_size == {}
+        assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
+        assert not hasattr(helper.config, '_cuda_graph_thd_rotary_seq_lens')
+        assert not hasattr(chunk_config, '_cuda_graph_thd_rotary_seq_lens')
+
+    @pytest.mark.internal
+    def test_delete_graphs_without_graphable_layers_releases_state(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper._graphs_created = False
+        helper.config = SimpleNamespace(
+            _cuda_graph_num_microbatches=8, _cuda_graph_thd_rotary_seq_lens={2: 4096}
+        )
+        helper.chunks_with_decoder = []
+        helper.callables_per_chunk = []
+        helper.tp_group = object()
+        helper.dp_cp_group = object()
+        released = []
+        helper._release_dynamic_cp_p2p_transport = lambda: released.append(True)
+        monkeypatch.setattr(cuda_graphs, 'is_te_min_version', lambda version: True)
+        monkeypatch.setattr(cuda_graphs, 'log_on_each_pipeline_stage', lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+
+        helper.delete_cuda_graphs()
+
+        assert released == [True]
+        assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
+        assert not hasattr(helper.config, '_cuda_graph_thd_rotary_seq_lens')
+
+    @pytest.mark.internal
+    def test_delete_graphs_preserves_first_error_and_runs_remaining_cleanup(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        class Graph:
+            def reset(self):
+                raise RuntimeError("reset failed")
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper._graphs_created = True
+        helper.config = SimpleNamespace(_cuda_graph_num_microbatches=8)
+        helper.chunks_with_decoder = []
+        layer = torch.nn.Identity()
+        layer.cuda_graphs = [Graph()]
+        layer.cuda_graphs_by_dynamic_cp_size = {}
+        layer.cuda_graph_manual_hooks = []
+        helper.callables_per_chunk = [[layer]]
+        helper.tp_group = object()
+        helper.dp_cp_group = object()
+        cleanup_calls = []
+
+        def fail_rope_cleanup():
+            cleanup_calls.append("rope")
+            raise RuntimeError("rope cleanup failed")
+
+        helper._clear_thd_rotary_seq_lens = fail_rope_cleanup
+        helper._release_dynamic_cp_p2p_transport = lambda: cleanup_calls.append("transport")
+        monkeypatch.setattr(cuda_graphs, 'is_te_min_version', lambda version: True)
+        monkeypatch.setattr(cuda_graphs, 'log_on_each_pipeline_stage', lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+
+        with pytest.raises(RuntimeError, match="reset failed"):
+            helper.delete_cuda_graphs()
+
+        assert cleanup_calls == ["rope", "transport"]
+        assert not hasattr(helper.config, '_cuda_graph_num_microbatches')
+        assert layer.cuda_graphs == []
+
     @pytest.mark.internal
     def test_thd_graph_runtime_rope_uses_capture_sample_limit(self):
         from megatron.core.models.gpt.gpt_model import GPTModel
@@ -1141,20 +1262,28 @@ class TestDynamicMicrobatchSlots:
             model,
             'config',
             SimpleNamespace(
-                context_parallel_size=4,
-                _cuda_graph_thd_rotary_seq_lens={4: 16384, 8: 16384},
+                context_parallel_size=4, _cuda_graph_thd_rotary_seq_lens={4: 16384, 8: 16384}
             ),
         )
 
-        assert model._bound_thd_rotary_seq_len(
-            32768, SimpleNamespace(qkv_format='thd', local_cp_size=8)
-        ) == 16384
-        assert model._bound_thd_rotary_seq_len(
-            32768, SimpleNamespace(qkv_format='thd', local_cp_size=None)
-        ) == 16384
-        assert model._bound_thd_rotary_seq_len(
-            32768, SimpleNamespace(qkv_format='sbhd', local_cp_size=8)
-        ) == 32768
+        assert (
+            model._bound_thd_rotary_seq_len(
+                32768, SimpleNamespace(qkv_format='thd', local_cp_size=8)
+            )
+            == 16384
+        )
+        assert (
+            model._bound_thd_rotary_seq_len(
+                32768, SimpleNamespace(qkv_format='thd', local_cp_size=None)
+            )
+            == 16384
+        )
+        assert (
+            model._bound_thd_rotary_seq_len(
+                32768, SimpleNamespace(qkv_format='sbhd', local_cp_size=8)
+            )
+            == 32768
+        )
         assert model._bound_thd_rotary_seq_len(32768, None) == 32768
 
     @pytest.mark.internal
@@ -1239,6 +1368,18 @@ class TestDynamicMicrobatchSlots:
                 max_num_seqs=8,
             )
             == 32
+        )
+        assert (
+            TECudaGraphHelper._get_dp_balanced_thd_max_num_microbatches(
+                global_batch_size=2,
+                dp_size=1,
+                cp_size=1,
+                max_seqlen_per_dp_cp_rank=4096,
+                max_sequence_length=4096,
+                max_num_seqs=8,
+                max_subsamples_per_item=4,
+            )
+            == 8
         )
 
     @pytest.mark.internal
@@ -1422,22 +1563,14 @@ class TestDynamicMicrobatchSlots:
         banks = [make_bank(2, 0), make_bank(1, 10)]
         callables, sample_args, kwargs = helper._get_dynamic_cp_variant_capture_data(banks)
         colors = TECudaGraphHelper._build_saved_tensor_liveness_colors(order, 2, [1])
-        _, conflicts = TECudaGraphHelper._build_saved_tensor_liveness_colors(
-            order, 2, [1], return_conflicts=True
-        )
-        frames = sorted(conflicts)
-        frame_ids = {frame: index for index, frame in enumerate(frames)}
         expected_slots = tuple(
             (
                 colors[(0, logical_slot % 2, 0)],
-                variant * 2 + logical_slot,
                 logical_slot,
                 variant * 2 + logical_slot,
                 0,
                 0,
                 variant,
-                frame_ids[(0, logical_slot, 0)],
-                sum(1 << frame_ids[other] for other in conflicts[(0, logical_slot, 0)]),
             )
             for variant in range(2)
             for logical_slot in range(2)
