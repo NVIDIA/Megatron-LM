@@ -16,6 +16,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -70,6 +71,36 @@ class TestInferenceConfig:
     def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
             resolve_mxfp8_backend(grouped_gemm_backend)
+
+    @staticmethod
+    def _hybrid_model(layer_config_types, experimental_attention_variant="gdn"):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                params_dtype=torch.bfloat16,
+                batch_invariant_mode=False,
+                experimental_attention_variant=experimental_attention_variant,
+            ),
+            decoder=SimpleNamespace(
+                layer_config_list=[
+                    object.__new__(layer_config_type) for layer_config_type in layer_config_types
+                ],
+                layers=[],
+            ),
+        )
+
+    def test_mamba_inference_state_config_rejects_mixed_recurrent_layers(self):
+        """Mamba and GDN cannot share one state shape and prefill chunk size."""
+        model = self._hybrid_model([MambaLayerConfig, GDNLayerConfig])
+
+        with pytest.raises(ValueError, match="mixing Mamba and GDN"):
+            MambaInferenceStateConfig.from_model(model)
+
+    def test_mamba_inference_state_config_rejects_gdn2(self):
+        """GDN2 should fail explicitly instead of missing the GDN inference hooks."""
+        model = self._hybrid_model([GDNLayerConfig], experimental_attention_variant="gdn2")
+
+        with pytest.raises(NotImplementedError, match="GDN2"):
+            MambaInferenceStateConfig.from_model(model)
 
     def test_mutual_exclusivity_with_transformer_config(self):
         """

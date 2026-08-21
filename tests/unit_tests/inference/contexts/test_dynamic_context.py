@@ -224,20 +224,25 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_hybrid_cache_maps_reject_gdn_layer_configs(self):
-        with pytest.raises(NotImplementedError, match="GDN layers are not supported"):
-            self._get_dynamic_context(
-                params_dtype=torch.float32,
-                num_layers=2,
-                kv_channels=8,
-                num_attention_heads=2,
-                max_sequence_length=512,
-                buffer_size_gb=0.03,
-                block_size_tokens=128,
-                max_tokens=None,
-                is_hybrid_model=True,
-                layer_config_list=make_layer_configs(MambaLayerConfig, GDNLayerConfig),
-            )
+    def test_hybrid_cache_maps_share_recurrent_indices_for_mamba_and_gdn(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=3,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_config_list=make_layer_configs(
+                MambaLayerConfig, AttentionLayerConfig, GDNLayerConfig
+            ),
+        )
+
+        assert dynamic_context.num_attention_layers == 1
+        assert dynamic_context.num_mamba_layers == 2
+        assert dynamic_context.layer_map == {0: 0, 1: 0, 2: 1}
 
     @pytest.mark.internal
     def test_is_static_batching(self):

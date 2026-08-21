@@ -13,6 +13,7 @@ from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
@@ -96,6 +97,7 @@ class MimoModel(MegatronModule):
         # Initialize modality submodules from specifications
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
+        self._finish_init_quantization()
         self._initialize_language_model()
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
@@ -236,6 +238,13 @@ class MimoModel(MegatronModule):
             )
 
             self.modality_submodules[modality_name] = submodule
+
+    def _finish_init_quantization(self) -> None:
+        """Apply per-module quantization recipes to initialized modality submodules."""
+        for name, module in self.modality_submodules.named_modules(prefix="modality_submodules"):
+            if hasattr(module, 'finish_init'):
+                quant_config = get_quant_config_or_none(name, module.config.quant_recipe)
+                module.finish_init(quant_config)
 
     def _initialize_language_model(self) -> None:
         """Initialize the language model.

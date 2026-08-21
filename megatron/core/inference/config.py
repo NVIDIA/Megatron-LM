@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
@@ -17,11 +18,11 @@ from megatron.core.utils import get_attr_wrapped_model
 @dataclass
 class MambaInferenceStateConfig:
     """
-    Config for initializing Mamba model inference state tensors.
+    Config for initializing recurrent mixer inference state tensors.
 
     Note that we maintain separate metadata for decode, regular prefill, and
-    chunked prefill requests because the Mamba kernels do not yet support mixing
-    these. Once the kernels have been updated we can simplify this code.
+    chunked prefill requests because the recurrent kernels do not yet support
+    mixing these. Once the kernels have been updated we can simplify this code.
     """
 
     layer_config_list: List[HybridLayerConfig]
@@ -30,10 +31,10 @@ class MambaInferenceStateConfig:
     """
 
     conv_states_shape: Tuple[int]
-    """Mamba conv states shape per request."""
+    """Recurrent mixer's conv state shape per request."""
 
     ssm_states_shape: Tuple[int]
-    """Mamba SSM states shape per request."""
+    """Recurrent mixer state shape per request."""
 
     conv_states_dtype: torch.dtype
     """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
@@ -44,6 +45,11 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    gdp_num_householder: int = 0
+    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
+    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    kernels, whose Householder-expanded token stream is this many times longer."""
+
     @classmethod
     def from_model(
         cls,
@@ -51,12 +57,28 @@ class MambaInferenceStateConfig:
         conv_states_dtype: Optional[torch.dtype] = None,
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
-        """Returns Mamba inference state config from the model if it is a hybrid model."""
+        """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_config_list = getattr(decoder, "layer_config_list", None)
-        if layer_config_list is not None and any(
-            isinstance(layer_config, MambaLayerConfig) for layer_config in layer_config_list
-        ):
+        if layer_config_list is not None:
+            has_mamba = any(
+                isinstance(layer_config, MambaLayerConfig) for layer_config in layer_config_list
+            )
+            has_gdn = any(
+                isinstance(layer_config, GDNLayerConfig) for layer_config in layer_config_list
+            )
+            if has_mamba and has_gdn:
+                raise ValueError(
+                    "Dynamic inference does not support mixing Mamba and GDN layers; "
+                    "the recurrent-state cache and prefill metadata use one shared shape "
+                    "and chunk size."
+                )
+            if has_gdn and model.config.experimental_attention_variant == "gdn2":
+                raise NotImplementedError("GDN2 does not support dynamic inference.")
+
+            if not (has_mamba or has_gdn):
+                return None
+
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
@@ -78,6 +100,23 @@ class MambaInferenceStateConfig:
                 if isinstance(layer_config, MambaLayerConfig) and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
+                if isinstance(layer_config, GDNLayerConfig) and hasattr(layer, 'self_attention'):
+                    mamba_chunk_size = layer.self_attention.chunk_size
+                    break
+            # Gated Delta Product layers register as Mamba layers but carry a
+            # Householder count, which sizes their (separate) chunk descriptors.
+            gdp_num_householder = 0
+            for layer_config, layer in zip(layer_config_list, decoder.layers, strict=True):
+                if isinstance(layer_config, MambaLayerConfig) and hasattr(layer, 'mixer'):
+                    num_householder = getattr(layer.mixer, 'num_householder', None)
+                    if num_householder is not None:
+                        # The descriptors are shared across layers, so one count
+                        # has to cover every GDP layer.
+                        assert gdp_num_householder in (0, num_householder), (
+                            "every GDP layer must use the same num_householder; got "
+                            f"{gdp_num_householder} and {num_householder}"
+                        )
+                        gdp_num_householder = num_householder
             return cls(
                 layer_config_list=list(layer_config_list),
                 conv_states_shape=mamba_conv_states_shape,
@@ -85,6 +124,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                gdp_num_householder=gdp_num_householder,
             )
         return None
 
@@ -152,6 +192,27 @@ class AsyncScheduleMode(str, Enum):
 
     ASYNC = "async"
     """Overlap asynchronous scheduling phases by reordering them to prepare-before-resolve."""
+
+
+@dataclass
+class ImageProcessingConfig:
+    """Configuration for converting raw images into model input tensors."""
+
+    patch_dim: int
+    dynamic_resolution: bool = False
+    use_tiling: bool = False
+    pixel_shuffle: bool = False
+    spatial_merge_size: int = 1
+    dynamic_resolution_min_patches: int = 1
+    dynamic_resolution_max_patches: int = 128
+    vision_model_type: str = "radio"
+    pixel_mean: Optional[List[float]] = None
+    pixel_std: Optional[List[float]] = None
+    img_h: Optional[int] = None
+    img_w: Optional[int] = None
+    max_num_tiles: int = 1
+    use_thumbnail: bool = False
+    num_img_embeddings_per_tile: int = 0
 
 
 @dataclass
@@ -287,6 +348,9 @@ class InferenceConfig:
 
     pg_collection: Optional[ProcessGroupCollection] = None
     """A `ProcessGroupCollection` for distributed execution."""
+
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None
+    """Configuration for preprocessing raw image payloads."""
 
     use_flashinfer_fused_rope: Optional[bool] = False
     """
