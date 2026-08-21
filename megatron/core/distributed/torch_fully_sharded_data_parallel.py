@@ -96,6 +96,8 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                     # micro-batch id, thus removing unnecessary memory stores
                     attrs['_fp8_attrs']['transpose_invalid'] = False
                     del attrs['_fp8_attrs']['transpose']
+                # Mark this parameter as an FSDP2 parameter.
+                attrs["is_torch_fsdp2_param"] = True
                 custom_attrs[name] = {k: v for k, v in attrs.items()}
             return custom_attrs
 

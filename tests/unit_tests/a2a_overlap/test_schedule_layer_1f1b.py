@@ -3,6 +3,7 @@ from contextlib import nullcontext
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
@@ -26,9 +27,33 @@ from tests.unit_tests.a2a_overlap.utils import (
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp8_dispatch_available
 
 # Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
 pytestmark = pytest.mark.flaky_in_dev
+
+
+def is_nccl_ep_zero_copy_available():
+    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), absent in a plain
+    NCCL-EP build."""
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    if not HAVE_TE_EP:
+        return False
+    try:
+        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def is_op_fuser_available():
+    """The static-shape/zero-copy path runs the TE op-fuser grouped GEMM (needs TE>=2.14 ops)."""
+    try:
+        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+    except ImportError:
+        return False
+    return is_te_min_version("2.14.0")
 
 
 def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
@@ -446,6 +471,93 @@ class TestA2AOverlap:
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.skipif(
+        not is_nccl_ep_zero_copy_available(), reason="NCCL EP zero-copy TE API is not available"
+    )
+    @pytest.mark.skipif(
+        not is_op_fuser_available(), reason="op-fuser (static-shape/zero-copy) needs TE>=2.14"
+    )
+    @pytest.mark.parametrize(
+        "wire_dtype", ["bf16", pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200)]
+    )
+    def test_transformer_layer_overlap_zero_copy(self, wire_dtype):
+        """ncclEP zero-copy under 1F1B a2a overlap must match the non-overlap reference.
+
+        Zero-copy stays enabled in both runs, so this isolates the overlap schedule. It also
+        compares the two ways zero-copy makes the dispatch-backward gradient symm-mem-backed:
+        the reference gets it from the op-fuser's ``grad_input_buffer``, the overlap run from
+        ``StageDispatchBwdGrad`` staging into the same buffer (plus the free_input symm guard).
+        bf16 op-fuser (SwiGLU, tp=1) -- wire_dtype="bf16" has no fp8/Blackwell dependency.
+
+        wire_dtype="mxfp8" additionally sends the dispatch-fwd / combine-bwd payloads as the
+        opaque MXFP8 carrier. Both captures use the same wire dtype, so quantization is
+        common-mode; what this asserts is that the overlap schedule's staging/detach/free of
+        node-boundary tensors preserves the carrier bytes.
+        """
+        if wire_dtype == "mxfp8" and not is_nccl_ep_fp8_dispatch_available():
+            pytest.skip("NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware")
+        extra_kwargs = {}
+        apply_flex_backend_kwargs(extra_kwargs, "flex", "ncclep")
+        extra_kwargs.update(
+            moe_ncclep_zero_copy=True,
+            # zero-copy needs the static path; generous factor since the small test token
+            # counts make routing imbalance high and overflow hard-traps.
+            moe_expert_rank_capacity_factor=8.0,
+            use_transformer_engine_op_fuser=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            overlap_moe_expert_parallel_comm=True,
+            moe_dispatch_fwd_dtype=wire_dtype,
+            moe_combine_bwd_dtype=wire_dtype,
+        )
+        config = get_test_config(extra_kwargs=extra_kwargs)
+        microbatches = 4
+        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+        from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
+
+        try:
+            with deterministic_mode():
+                transformer_layer_spec = get_gpt_decoder_block_spec(
+                    config=config, use_transformer_engine=True
+                )
+                gpt_model = GPTModel(
+                    config=config,
+                    transformer_layer_spec=transformer_layer_spec,
+                    vocab_size=100,
+                    pre_process=True,
+                    post_process=True,
+                    max_sequence_length=300,
+                )
+                params = reset_model(gpt_model)
+                input_tensors = [build_data() for _ in range(microbatches)]
+
+                # The reference runs the layer directly instead of through the 1F1B schedule, so it
+                # must declare overlap=False: that is what makes get_expert_zero_copy_buffers hand
+                # the op-fuser the symm grad_input_buffer for the fc1 dgrad. Under overlap=True the
+                # buffer is withheld (the schedule detaches the dispatch output, so autograd would
+                # discard it) and StageDispatchBwdGrad supplies the symm gradient instead.
+                config.overlap_moe_expert_parallel_comm = False
+                capture_ref = run_transformer_layer_ref_with_capture(
+                    gpt_model, input_tensors, microbatches
+                )
+                config.overlap_moe_expert_parallel_comm = True
+
+                reset_model(gpt_model, params)
+                capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
+                    gpt_model, input_tensors, microbatches
+                )
+                comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
+                assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+        finally:
+            # zero-copy sets process-global ncclEP state (ep bootstrap mode + shared symm
+            # classvars). Reset in a finally: on failure the leaked classvars would otherwise make
+            # every later ncclEP test in this process fail too, hiding the real error.
+            nccl_ep_finalize()
+            _NCCLEPManager._zc_fwd_token_buf = None
+            _NCCLEPManager._zc_bwd_token_buf = None
+            _NCCLEPManager._zc_recv_topk_weights_buf = None
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     def test_mtp_layer_overlap(self, dispatcher_type, flex_backend, fp8_flag):
@@ -453,7 +565,12 @@ class TestA2AOverlap:
         Verifies all-to-all overlap optimization in MTP layer produces
         the same results as the reference implementation.
         """
-        extra_kwargs = {"mtp_num_layers": 1, "mtp_loss_scaling_factor": 1.1}
+        qk_layernorm = True
+        extra_kwargs = {
+            "mtp_num_layers": 1,
+            "mtp_loss_scaling_factor": 1.1,
+            "qk_layernorm": qk_layernorm,
+        }
         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
@@ -466,7 +583,7 @@ class TestA2AOverlap:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
                 num_experts=16,
                 moe_grouped_gemm=True,
-                qk_layernorm=True,
+                qk_layernorm=qk_layernorm,
                 multi_latent_attention=True,
             )
             mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, True)

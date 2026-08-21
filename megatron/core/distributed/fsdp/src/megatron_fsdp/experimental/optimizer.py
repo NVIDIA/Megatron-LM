@@ -14,20 +14,24 @@
 
 """Optimizer adapter for the minimal Megatron-FSDP path."""
 
+from itertools import chain
 from typing import Any, NamedTuple
 
 import torch
 from torch import nn
 
-from .parameter_group import contained_in_parameter_group
+from .parameter_group import get_containing_parameter_group, sync_model_weights_from_main_weights
 
 
-def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
+def fully_shard_optimizer(
+    optimizer: torch.optim.Optimizer, *, precision_aware: bool = False
+) -> None:
     """Attach FSDP-aware step hooks to an optimizer instance.
 
-    The adapted optimizer preserves its existing parameter groups and only adds
-    temporary gradient casting around optimizer steps for FSDP sharded
-    parameters whose data dtype differs from their grad dtype.
+    The adapted optimizer preserves its existing parameter groups, temporarily
+    casts gradients around optimizer steps for FSDP sharded parameters whose
+    data dtype differs from their grad dtype unless the optimizer is precision
+    aware, and refreshes compute weights after each optimizer step.
 
     Alternatives considered:
         - Monkey-patching optimizer methods directly on the instance. This is
@@ -46,6 +50,8 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
 
     Args:
         optimizer: Optimizer instance to adapt in place.
+        precision_aware: Whether the optimizer accepts FSDP's mixed-precision
+            gradients without temporary casting.
     """
 
     class CastedGrad(NamedTuple):
@@ -86,7 +92,7 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
                         "fully_shard_optimizer expected optimizer param groups to contain "
                         f"nn.Parameter values, got {type(parameter)!r}."
                     )
-                if not contained_in_parameter_group(parameter):
+                if precision_aware or get_containing_parameter_group(parameter) is None:
                     continue
                 if parameter.grad is None:
                     continue
@@ -99,10 +105,14 @@ def fully_shard_optimizer(optimizer: torch.optim.Optimizer) -> None:
     def step_post_hook(
         hooked_optimizer: torch.optim.Optimizer, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
-        del hooked_optimizer, args, kwargs
+        del args, kwargs
         for parameter, original_grad in casted_grads:
             set_grad(parameter, original_grad)
         casted_grads.clear()
+
+        sync_model_weights_from_main_weights(
+            chain.from_iterable(group["params"] for group in hooked_optimizer.param_groups)
+        )
 
     optimizer.register_step_pre_hook(step_pre_hook)
     optimizer.register_step_post_hook(step_post_hook)
