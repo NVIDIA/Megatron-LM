@@ -127,3 +127,26 @@ def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
 
     combined.sum().backward()
     torch.testing.assert_close(hidden.grad, torch.ones_like(hidden))
+
+
+def test_ep_token_dispatcher_local_sums_duplicate_route_weights(
+    transformer_engine_import_stub,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+
+    ps = ParallelState(ep_size=1, ep_rank=0)
+    dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
+    hidden = torch.tensor([[2.0, 4.0]])
+    topk_indices = torch.tensor([[1, 1, 1]])
+    topk_scores = torch.tensor([[0.2, 0.3, 0.4]])
+
+    dispatched, tokens_per_expert, dispatched_probs = dispatcher.dispatch(
+        hidden, topk_scores, topk_indices
+    )
+    combined = dispatcher.combine(dispatched * dispatched_probs.unsqueeze(-1))
+
+    torch.testing.assert_close(tokens_per_expert, torch.tensor([0, 1, 0]))
+    torch.testing.assert_close(dispatched, hidden)
+    torch.testing.assert_close(dispatched_probs, torch.tensor([0.9]))
+    torch.testing.assert_close(combined, hidden * 0.9)
