@@ -136,7 +136,7 @@ def _get_cuda_graph_stream() -> torch.cuda.Stream:
                 if max_connections_value < 16:
                     warning_reason = f"is {max_connections_value}"
 
-        if warning_reason is not None and GTP_CONFIG.is_active():
+        if warning_reason is not None:
             logger.warning(
                 "CUDA_DEVICE_MAX_CONNECTIONS %s. For GTP workloads, consider setting it to "
                 "16 or 32 before process startup to avoid implicit stream aliasing.",
