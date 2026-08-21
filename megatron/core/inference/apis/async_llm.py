@@ -2,12 +2,18 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.shards_spec import InferenceShardSpec
 
@@ -41,7 +47,12 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         coordinator_port: Optional[int] = None,
         inference_shards: Optional[Union[str, Sequence[InferenceShardSpec], Sequence[dict]]] = None,
         kv_transport_backend: str = "nixl",
+        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
     ) -> None:
+        # Resolve the default at call time so tests can monkey-patch
+        # ``GPTInferenceWrapper`` on this module.
+        if inference_wrapper_cls is None:
+            inference_wrapper_cls = GPTInferenceWrapper
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
         # synchronous ``engine.generate()`` from inside the caller's asyncio
         # loop, which collides with the engine's loop-bound internal state
@@ -65,12 +76,14 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             coordinator_port=coordinator_port,
             inference_shards=inference_shards,
             kv_transport_backend=kv_transport_backend,
+            inference_wrapper_cls=inference_wrapper_cls,
         )
 
     async def generate(
         self,
         prompts: Union[str, List[int], List[str], List[List[int]]],
         sampling_params: Optional[SamplingParams] = None,
+        multi_modal_data=None,
     ) -> Union["DynamicInferenceRequest", List["DynamicInferenceRequest"]]:
         """Run inference for one prompt or a batch of prompts.
 
@@ -78,6 +91,18 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         ``DynamicInferenceRequest``; batched input (``list[str]`` or
         ``list[list[int]]``) returns ``list[DynamicInferenceRequest]`` in
         input order.
+
+        ``multi_modal_data`` follows vLLM's modality-dictionary shape.
+
+        Images:
+            ``"image"`` accepts raw image bytes, a list of raw image bytes, or
+            a preprocessed image tensor dictionary.
+        Video:
+            Video does not yet have any supported data preprocessing or
+            modeling formats.
+        Audio:
+            Audio does not yet have any supported data preprocessing or
+            modeling formats.
 
         Raises:
             RuntimeError: if called on a non-primary rank.
@@ -93,9 +118,13 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             # here since single input is wrapped to a one-element list.
             return []
 
+        per_prompt_multi_modal_data = self._normalize_multi_modal_data_list(
+            multi_modal_data, num_prompts=len(normalized), is_batch=is_batch
+        )
+
         assert self._loop_manager is not None
         results = await self._loop_manager.run_async(
-            self._generate_impl(normalized, sampling_params)
+            self._generate_impl(normalized, sampling_params, per_prompt_multi_modal_data)
         )
         return results if is_batch else results[0]
 

@@ -40,6 +40,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     allocate_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
+    register_capture_params_to_ensure_ready,
     register_capture_wgrad_ring_slot,
 )
 from megatron.core.utils import ensure_params_ready, log_single_rank
@@ -1297,6 +1298,7 @@ class GTPShardedParam(torch.nn.Parameter):
         #    Forward only: backward re-reads what forward published, and recompute runs inside
         #    backward where a dispatch could gather into the grad-aliased buffer.
         if fwd and not in_activation_recompute_phase():
+            register_capture_params_to_ensure_ready(weights)
             ensure_params_ready(weights)
 
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers

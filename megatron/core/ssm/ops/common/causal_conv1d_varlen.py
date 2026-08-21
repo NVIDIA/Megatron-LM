@@ -45,6 +45,7 @@ def _causal_conv1d_varlen_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
     HAS_INITIAL_STATES: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     """Depthwise causal conv1d over packed varlen sequences with initial states and SiLU.
 
@@ -59,8 +60,10 @@ def _causal_conv1d_varlen_kernel(
     t_mask = t_off < total_tokens
 
     # Load bias: (BLOCK_C,) broadcast to (BLOCK_T, BLOCK_C)
-    bias = tl.load(bias_ptr + c_off, mask=c_mask, other=0.0).to(tl.float32)
-    acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32) + bias[None, :]
+    acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + c_off, mask=c_mask, other=0.0).to(tl.float32)
+        acc += bias[None, :]
 
     # Load per-token request ID and request start position
     req_id = tl.load(seq_idx_ptr + t_off, mask=t_mask, other=0)  # (BLOCK_T,)
@@ -139,7 +142,8 @@ def causal_conv1d_varlen_fn(
     Args:
         x: Input tensor of shape (total_tokens, conv_dim), channels-last packed.
         weight: Convolution weights of shape (conv_dim, d_conv).
-        bias: Bias of shape (conv_dim,).
+        bias: Bias of shape (conv_dim,), or None for a bias-free convolution
+            (Gated Delta Product layers default to ``conv_bias=False``).
         cu_seqlens: Cumulative sequence lengths of shape (num_requests + 1,), int32.
         initial_states: Per-request initial conv states of shape
             (num_requests, conv_dim, d_conv - 1). If None, uses zeros.
@@ -168,6 +172,10 @@ def causal_conv1d_varlen_fn(
     # otherwise compute from cu_seqlens via repeat_interleave.
     if precomputed_seq_idx is not None:
         assert precomputed_seq_start is not None
+        assert (
+            precomputed_seq_idx.shape[0] >= total_tokens
+            and precomputed_seq_start.shape[0] >= total_tokens
+        ), "precomputed conv metadata must cover every token in x"
         seq_idx = precomputed_seq_idx
         seq_start = precomputed_seq_start
     else:
@@ -177,14 +185,17 @@ def causal_conv1d_varlen_fn(
         )
         seq_start = torch.repeat_interleave(cu_seqlens[:-1], seq_lengths).to(torch.int32)
 
+    has_bias = bias is not None
+    if not has_bias:
+        bias = x  # Dummy pointer; HAS_BIAS gates every read of it.
+
     has_initial_states = initial_states is not None
     if not has_initial_states:
         initial_states = torch.empty((1, 1, 1), dtype=x.dtype, device=x.device)
         is_stride_req = 1
         is_stride_dim = 1
     else:
-        if precomputed_seq_idx is None:
-            assert initial_states.shape == (num_requests, conv_dim, d_conv - 1)
+        assert initial_states.shape == (num_requests, conv_dim, d_conv - 1)
         is_stride_req = initial_states.stride(0)
         is_stride_dim = initial_states.stride(1)
 
@@ -207,6 +218,7 @@ def causal_conv1d_varlen_fn(
         is_stride_dim,
         WIDTH=d_conv,
         HAS_INITIAL_STATES=has_initial_states,
+        HAS_BIAS=has_bias,
     )
 
     return out
@@ -245,7 +257,10 @@ def _causal_conv1d_varlen_simple(
         x_seq = x[start:end]  # (seq_len, conv_dim)
 
         for t in range(seq_len):
-            acc = bias.float()  # (conv_dim,)
+            if bias is not None:
+                acc = bias.float()  # (conv_dim,)
+            else:
+                acc = torch.zeros(conv_dim, dtype=torch.float32, device=x.device)
             for j in range(d_conv):
                 src_pos = t - (d_conv - 1) + j
                 if src_pos < 0:

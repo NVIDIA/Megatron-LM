@@ -8,7 +8,7 @@ import os
 import time
 import unittest.mock
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import msgpack
 import numpy as np
@@ -138,6 +138,7 @@ class DummyEngine(DynamicInferenceEngine):
     def __init__(self):
         """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
+        self.failed_request_ids: List[int] = []
         self.requests: Dict[int, RequestEntry] = {}
         self._loop = get_asyncio_loop()
         self.context = DummyContext()

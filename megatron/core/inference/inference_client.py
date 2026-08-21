@@ -7,7 +7,10 @@ import time
 from typing import List, Optional, Union
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    serialize_multimodal_data,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -100,7 +103,11 @@ class InferenceClient:
         self.listener_task: asyncio.Task | None = None
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data=None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -114,6 +121,17 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
+            multi_modal_data: Optional vLLM-style modality dictionary.
+
+                Images:
+                    ``"image"`` accepts raw image bytes, a list of raw image
+                    bytes, or a preprocessed image tensor dictionary.
+                Video:
+                    Video does not yet have any supported data preprocessing
+                    or modeling formats.
+                Audio:
+                    Audio does not yet have any supported data preprocessing
+                    or modeling formats.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
@@ -122,7 +140,13 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        payload = [
+            Headers.SUBMIT_REQUEST.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            serialize_multimodal_data(multi_modal_data),
+        ]
         return self._submit_request(payload, request_id)
 
     def _make_kv_handoff_request(
@@ -250,7 +274,11 @@ class InferenceClient:
             self.abort_futures.pop(request_id)
 
     def add_request_streaming(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data=None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -270,6 +298,17 @@ class InferenceClient:
             prompt: A string or list of token IDs.
             sampling_params: Sampling parameters. ``streaming`` is set to True
                 in-place.
+            multi_modal_data: Optional vLLM-style modality dictionary.
+
+                Images:
+                    ``"image"`` accepts raw image bytes, a list of raw image
+                    bytes, or a preprocessed image tensor dictionary.
+                Video:
+                    Video does not yet have any supported data preprocessing
+                    or modeling formats.
+                Audio:
+                    Audio does not yet have any supported data preprocessing
+                    or modeling formats.
 
         Returns:
             AsyncStream[dict]: Per-step partial and final reply frames.
@@ -277,7 +316,13 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        payload = [
+            Headers.SUBMIT_REQUEST.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            serialize_multimodal_data(multi_modal_data),
+        ]
         return self._submit_stream(payload, request_id)
 
     def _submit_request(self, payload: list, request_id: int) -> asyncio.Future:

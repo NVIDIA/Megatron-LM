@@ -2619,11 +2619,8 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-        kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
-        if args.use_megatron_fsdp and args.megatron_fsdp_version == 2:
-            # MFSDP v2 gathers parameters from module hooks rather than the V1
-            # start_param_sync path, so disable the V1-only startup all-gather knob.
-            kwargs["fsdp_all_gather_in_start_param_sync"] = False
+        if args.use_megatron_fsdp and args.megatron_fsdp_version == 1:
+            kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
         if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
             # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
             # operations (such as pointer dereferencing) that can break CUDA graph replay.
@@ -5068,6 +5065,11 @@ def evaluate(
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
+    # gtp_remat-inclusive, mirroring train_step: gtp_remat peers hold distinct micro-batches, so
+    # the reduction must cover every distinct-data rank. Reducing over the replicate dp_cp would
+    # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
+    # dp=6/gtp_remat=64) while consumed_valid_samples still books the full eval_batch_size.
+    eval_dp_cp_group = getattr(eval_pgc, 'dp_cp_gtp_remat', None) or eval_pgc.dp_cp
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -5146,13 +5148,13 @@ def evaluate(
                             val = torch.vstack(val)
                             val = val[:, 0] / val[:, 1].clamp(min=1)
                             val = val.mean()
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
-                            val /= torch.distributed.get_world_size(group=eval_pgc.dp_cp)
+                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
+                            val /= torch.distributed.get_world_size(group=eval_dp_cp_group)
                             total_loss_dict[key][0] += val
                             total_loss_dict[key][1] += 1
                         else :
                             val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
+                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
                             total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()

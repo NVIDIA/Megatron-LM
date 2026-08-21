@@ -611,7 +611,10 @@ class CheckpointConfig:
         "ignore_all",
     ] = "assume_ok_unexpected"
     """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model.
+    For fsdp_dtensor checkpoints it covers model weights a partial load cannot supply, and
+    assume_ok_unexpected raises like raise_unexpected there because a partial load never raises
+    on its own. Use ignore_all to opt out."""
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.
