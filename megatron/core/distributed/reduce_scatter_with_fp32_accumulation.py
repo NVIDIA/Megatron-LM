@@ -16,12 +16,14 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
         all_to_all_output_tensor: torch.Tensor,
         output_tensor: torch.Tensor,
         world_size: int,
+        fp32_accumulation_output_tensor: Optional[torch.Tensor] = None,
     ):
         """Initialize WorkHandle object."""
         self.all_to_all_handle = all_to_all_handle
         self.all_to_all_output_tensor = all_to_all_output_tensor
         self.output_tensor = output_tensor
         self.world_size = world_size
+        self.fp32_accumulation_output_tensor = fp32_accumulation_output_tensor
 
     def wait(self):
         """Wait until communication (and associated computation) is completed."""
@@ -30,9 +32,14 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
             self.all_to_all_handle.wait()
 
         # Accumulate into a fp32 sum.
-        output_tensor_in_fp32 = torch.sum(
-            self.all_to_all_output_tensor.view((self.world_size, -1)), dim=0, dtype=torch.float32
-        )
+        all_to_all_output = self.all_to_all_output_tensor.view((self.world_size, -1))
+        if self.fp32_accumulation_output_tensor is None:
+            output_tensor_in_fp32 = torch.sum(all_to_all_output, dim=0, dtype=torch.float32)
+        else:
+            output_tensor_in_fp32 = self.fp32_accumulation_output_tensor
+            torch.sum(
+                all_to_all_output, dim=0, dtype=torch.float32, out=output_tensor_in_fp32.view(-1)
+            )
         assert output_tensor_in_fp32.dtype == torch.float32
 
         # Copy downcasted sum into output_tensor.
@@ -46,6 +53,7 @@ def reduce_scatter_with_fp32_accumulation(
     group: torch.distributed.ProcessGroup,
     async_op: bool,
     all_to_all_output_tensor: Optional[torch.Tensor] = None,
+    fp32_accumulation_output_tensor: Optional[torch.Tensor] = None,
 ):
     """Reduce-scatter with FP32 accumulation.
 
@@ -62,6 +70,9 @@ def reduce_scatter_with_fp32_accumulation(
         all_to_all_output_tensor (torch.Tensor, optional): Caller-provided scratch matching
             input_tensor's shape and dtype, for callers with their own buffer pool. Allocated
             internally when omitted; must stay alive until .wait() returns.
+        fp32_accumulation_output_tensor (torch.Tensor, optional): Caller-provided FP32 scratch
+            matching output_tensor's shape. Allocated internally when omitted; must stay alive
+            until .wait() returns.
     """
     # Make sure arguments conform to the implementation.
     assert op == torch.distributed.ReduceOp.SUM
@@ -86,13 +97,22 @@ def reduce_scatter_with_fp32_accumulation(
             f"match input_tensor shape {tuple(input_tensor.shape)}"
         )
         assert all_to_all_output_tensor.dtype == input_tensor.dtype
+    if fp32_accumulation_output_tensor is not None:
+        assert fp32_accumulation_output_tensor.shape == output_tensor.shape
+        assert fp32_accumulation_output_tensor.dtype == torch.float32
+        assert fp32_accumulation_output_tensor.device == output_tensor.device
+        assert fp32_accumulation_output_tensor.is_contiguous()
     all_to_all_handle = torch.distributed.all_to_all_single(
         output=all_to_all_output_tensor, input=input_tensor, group=group, async_op=async_op
     )
 
     # Create a work handle to finish communication and reduction.
     reduce_scatter_handle = _ReduceScatterWithFP32AccumulationWorkHandle(
-        all_to_all_handle, all_to_all_output_tensor, output_tensor, world_size
+        all_to_all_handle,
+        all_to_all_output_tensor,
+        output_tensor,
+        world_size,
+        fp32_accumulation_output_tensor,
     )
     if async_op:
         # Return work handle; consumers can call .wait() to ensure communication and associated

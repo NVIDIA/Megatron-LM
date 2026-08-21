@@ -92,10 +92,10 @@ class TestReduceScatterWithFP32Accumulation:
             f"{(prescaled != scaled_sum).sum().item()} elements differ"
         )
 
-    def test_caller_provided_all_to_all_output_tensor(self):
-        """A caller-supplied scratch (GTP passes one from its wgrad pool) must be honored.
+    def test_caller_provided_workspace_tensors(self):
+        """Caller-supplied A2A and FP32 scratch tensors must be honored.
 
-        A mis-sized one must be rejected before the all-to-all: bailing out mid-flight
+        A mis-sized workspace must be rejected before the all-to-all: bailing out mid-flight
         desynchronizes the group.
         """
         rank, world_size = Utils.rank, Utils.world_size
@@ -107,10 +107,12 @@ class TestReduceScatterWithFP32Accumulation:
             shard_buffer(internal, world_size)[rank], internal, **kwargs
         )
         provided = tensor.clone()
+        provided_output = shard_buffer(provided, world_size)[rank]
         reduce_scatter_with_fp32_accumulation(
-            shard_buffer(provided, world_size)[rank],
+            provided_output,
             provided,
             all_to_all_output_tensor=torch.empty_like(tensor),
+            fp32_accumulation_output_tensor=torch.empty_like(provided_output, dtype=torch.float32),
             **kwargs,
         )
         torch.testing.assert_close(
@@ -125,5 +127,15 @@ class TestReduceScatterWithFP32Accumulation:
                 shard_buffer(tensor, world_size)[rank],
                 tensor,
                 all_to_all_output_tensor=torch.empty_like(tensor)[:-world_size],
+                **kwargs,
+            )
+
+        with pytest.raises(AssertionError):
+            reduce_scatter_with_fp32_accumulation(
+                shard_buffer(tensor, world_size)[rank],
+                tensor,
+                fp32_accumulation_output_tensor=torch.empty(
+                    tensor.numel() // world_size - 1, device=tensor.device, dtype=torch.float32
+                ),
                 **kwargs,
             )
