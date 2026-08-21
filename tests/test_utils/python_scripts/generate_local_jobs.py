@@ -89,6 +89,12 @@ def main(
         magic_values["artifacts_dir"] = "$OUTPUT_PATH"
         magic_values["environment"] = environment
         magic_values["test_case"] = workload.spec["test_case"]
+        # Local recipe generation keeps the historical exhaustive behavior.
+        # These placeholders are consumed only by unit-test recipes and the
+        # full runner never reads either Testmon path.
+        magic_values["unit_testmon_mode"] = "full"
+        magic_values["unit_testmon_cache_dir"] = "$OUTPUT_PATH/testmon"
+        magic_values["unit_testmon_selected_manifest"] = "$OUTPUT_PATH/testmon/selected.json"
         magic_values["name"] = workload.spec["name"].format(**magic_values)
 
         file_path = (

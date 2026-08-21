@@ -146,6 +146,27 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
 @click.option("--hf-home", required=False, type=str, help="HF home directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
+    "--unit-testmon-mode",
+    type=click.Choice(["full", "enforce", "baseline"]),
+    default="full",
+    show_default=True,
+    help="Selective unit-test mode.",
+)
+@click.option(
+    "--unit-testmon-cache-dir",
+    type=str,
+    default="assets_dir/testmon",
+    show_default=True,
+    help="Workspace-relative Testmon database directory.",
+)
+@click.option(
+    "--unit-testmon-selected-manifest",
+    type=str,
+    default="assets_dir/testmon/selected.json",
+    show_default=True,
+    help="Workspace-relative selected-test manifest.",
+)
+@click.option(
     "--enable-lightweight-mode",
     is_flag=True,
     show_default=True,
@@ -175,6 +196,9 @@ def main(
     data_dir: Optional[str] = None,
     hf_home: Optional[str] = None,
     tag: Optional[str] = None,
+    unit_testmon_mode: str = "full",
+    unit_testmon_cache_dir: str = "assets_dir/testmon",
+    unit_testmon_selected_manifest: str = "assets_dir/testmon/selected.json",
     enable_lightweight_mode: Optional[bool] = False,
     cadence: Optional[str] = None,
 ):
@@ -203,6 +227,9 @@ def main(
     magic_values["environment"] = environment
     magic_values["n_repeat"] = n_repeat
     magic_values["test_case"] = workload.spec["test_case"]
+    magic_values["unit_testmon_mode"] = unit_testmon_mode
+    magic_values["unit_testmon_cache_dir"] = unit_testmon_cache_dir
+    magic_values["unit_testmon_selected_manifest"] = unit_testmon_selected_manifest
     magic_values["name"] = workload.spec["name"].format(**magic_values)
     workload.spec["script"] = workload.spec["script"].format(**magic_values)
 

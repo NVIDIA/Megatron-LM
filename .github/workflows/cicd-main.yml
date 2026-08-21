@@ -186,6 +186,10 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
+      pr_base_sha:    ${{ steps.configure.outputs.pr_base_sha }}
+      pr_head_sha:    ${{ steps.configure.outputs.pr_head_sha }}
+      unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
+      unit_testmon_reason:   ${{ steps.configure.outputs.unit_testmon_reason }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -229,11 +233,24 @@ jobs:
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          RESOLVED_SHA: ${{ steps.resolve-sha.outputs.sha }}
+          PR_BASE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          PR_HEAD_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
+          PR_MERGE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          ENABLE_PR_UNIT_TESTMON: ${{ vars.ENABLE_PR_UNIT_TESTMON }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
-          # Fetch all labels in a single API call; fall back to empty list if no PR
-          LABELS=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json labels --jq '[.labels[].name]') || LABELS='[]'
+          # Fetch all labels in a single API call. A failed lookup is safe for
+          # the existing scope defaults, but must disable selective unit tests.
+          LABELS_VALID=true
+          if ! LABELS=$(gh pr view "$PR_NUMBER" --repo ${{ github.repository }} --json labels --jq '[.labels[].name]'); then
+            LABELS='[]'
+            LABELS_VALID=false
+          fi
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
@@ -308,6 +325,47 @@ jobs:
 
           DEV=true
 
+          # Selective unit tests are exclusively a synthetic PR-push
+          # optimization. Keep this gate inline: Configure holds a PAT for the
+          # existing label lookup and must never execute code from the PR
+          # checkout. The equivalent pure-Python decision table is unit-tested,
+          # while all PR-controlled selector code runs only in downstream jobs
+          # after the existing approval gate.
+          UNIT_TESTMON_ELIGIBLE=false
+          UNIT_TESTMON_REASON="Selective unit tests are disabled or this is not a synthetic PR push"
+          METADATA_VALID=false
+          if [[ "$LABELS_VALID" == "true" \
+            && -n "$PR_BASE_SHA" \
+            && -n "$PR_HEAD_SHA" \
+            && -n "$PR_MERGE_SHA" \
+            && "$PR_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ \
+            && "$PR_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ \
+            && "$PR_MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ \
+            && "$PR_MERGE_SHA" == "$RESOLVED_SHA" ]]; then
+            METADATA_VALID=true
+          fi
+
+          if [[ "$ENABLE_PR_UNIT_TESTMON" != "true" ]]; then
+            UNIT_TESTMON_REASON="ENABLE_PR_UNIT_TESTMON is not true"
+          elif [[ "$EVENT_NAME" != "push" ]]; then
+            UNIT_TESTMON_REASON="Event is not a synthetic PR push"
+          elif [[ ! "$REF" =~ ^refs/heads/pull-request/[0-9]+$ ]]; then
+            UNIT_TESTMON_REASON="Ref is not a synthetic numeric PR ref"
+          elif [[ "$METADATA_VALID" != "true" ]]; then
+            UNIT_TESTMON_REASON="PR metadata is invalid or stale"
+          elif [[ ! "$EVENT_SHA" =~ ^[0-9a-fA-F]{40}$ || "$PR_HEAD_SHA" != "$EVENT_SHA" ]]; then
+            UNIT_TESTMON_REASON="PR head SHA does not match the pushed SHA"
+          elif [[ "$HAS_RUN_TESTS" == "true" || "$HAS_RUN_FUNCTIONAL" == "true" ]]; then
+            UNIT_TESTMON_REASON="A full-test label is attached"
+          elif [[ "$FORCE_RUN_ALL" == "true" ]]; then
+            UNIT_TESTMON_REASON="force_run_all is true"
+          elif [[ "$HAS_LTS" == "true" ]]; then
+            UNIT_TESTMON_REASON="LTS-container validation always runs the full suite"
+          else
+            UNIT_TESTMON_ELIGIBLE=true
+            UNIT_TESTMON_REASON="Eligible synthetic PR push"
+          fi
+
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -318,6 +376,10 @@ jobs:
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
+          echo "pr_base_sha=$PR_BASE_SHA"       | tee -a $GITHUB_OUTPUT
+          echo "pr_head_sha=$PR_HEAD_SHA"       | tee -a $GITHUB_OUTPUT
+          echo "unit_testmon_eligible=$UNIT_TESTMON_ELIGIBLE" | tee -a $GITHUB_OUTPUT
+          echo "unit_testmon_reason=$UNIT_TESTMON_REASON"     | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -346,6 +408,8 @@ jobs:
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
+          | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
+          | \`unit_testmon_reason\` | \`$UNIT_TESTMON_REASON\` |
 
           ### Decision tree
 
@@ -698,11 +762,116 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && '0' || '1' }}
+
+      - name: Compute H100 Testmon environment
+        id: unit-testmon-environment
+        if: needs.configure.outputs.unit_testmon_eligible == 'true'
+        shell: bash -e -u -o pipefail {0}
+        run: |
+          HASH=""
+          if CANDIDATE=$(python tests/unit_tests/testmon/tooling.py environment-hash \
+            --repo-root . --platform h100 --testmon-version 2.2.0) \
+            && [[ "$CANDIDATE" =~ ^[0-9a-f]{64}$ ]]; then
+            HASH="$CANDIDATE"
+          else
+            echo "::warning::Unable to compute the H100 Testmon environment hash; using full tests."
+          fi
+          echo "hash=$HASH" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Restore latest compatible H100 Testmon index
+        id: restore-unit-testmon-index
+        if: needs.configure.outputs.unit_testmon_eligible == 'true' && steps.unit-testmon-environment.outputs.hash != ''
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        continue-on-error: true
+        with:
+          path: assets_dir/testmon-index/h100
+          key: unit-testmon-v1-main-h100-r8-dev-index-${{ steps.unit-testmon-environment.outputs.hash }}-${{ github.run_id }}
+          restore-keys: |
+            unit-testmon-v1-main-h100-r8-dev-index-${{ steps.unit-testmon-environment.outputs.hash }}-
+
       - name: Parse unit tests
         id: parse-unit-tests
+        shell: bash -e -u -o pipefail {0}
+        env:
+          TESTMON_ELIGIBLE: ${{ needs.configure.outputs.unit_testmon_eligible }}
+          TESTMON_DEFAULT_REASON: ${{ needs.configure.outputs.unit_testmon_reason }}
+          TESTMON_INDEX_RESTORED: ${{ steps.restore-unit-testmon-index.outcome == 'success' && steps.restore-unit-testmon-index.outputs.cache-matched-key != '' }}
+          BASE_SHA: ${{ needs.configure.outputs.pr_base_sha }}
+          CURRENT_SHA: ${{ needs.configure.outputs.sha }}
         run: |
-          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          yq -o json '[.products[].test_case[] | {"bucket": .}] | sort_by(.model, .test_case)' \
+            tests/test_utils/recipes/h100/unit-tests.yaml | jq -c > unit-tests-base.json
+
+          MODE=full
+          REASON="$TESTMON_DEFAULT_REASON"
+          if [[ "$TESTMON_ELIGIBLE" == "true" ]]; then
+            if [[ "$TESTMON_INDEX_RESTORED" == "true" \
+              && -f assets_dir/testmon-index/h100/index.json ]]; then
+              set +e
+              python tests/unit_tests/testmon/tooling.py prepare-matrix \
+                --index assets_dir/testmon-index/h100/index.json \
+                --repo-root . \
+                --platform h100 \
+                --world-size 8 \
+                --base-sha "$BASE_SHA" \
+                --current-sha "$CURRENT_SHA" \
+                --recipe tests/test_utils/recipes/h100/unit-tests.yaml \
+                --output unit-testmon-prepared.json
+              PREPARE_RC=$?
+              set -e
+              if [[ "$PREPARE_RC" -eq 0 ]]; then
+                MODE=$(jq -r '.mode' unit-testmon-prepared.json)
+                REASON=$(jq -r '.reason' unit-testmon-prepared.json)
+              else
+                REASON="Testmon index validation or diff classification failed"
+              fi
+            else
+              REASON="No trusted compatible H100 Testmon platform index was restored"
+            fi
+          fi
+
+          if [[ "$MODE" == "enforce" ]]; then
+            jq -c --slurpfile prepared unit-testmon-prepared.json '
+              map(. + {
+                "unit_testmon_mode": "enforce",
+                "unit_testmon_cache_key": ($prepared[0].buckets[.bucket].cache_key // ""),
+                "unit_testmon_direct_tests": (($prepared[0].buckets[.bucket].direct_tests // []) | tojson),
+                "unit_testmon_manifest_sha256": ($prepared[0].buckets[.bucket].manifest_sha256 // ""),
+                "unit_testmon_database_checksums": (($prepared[0].buckets[.bucket].database_checksums // []) | tojson)
+              })
+            ' unit-tests-base.json > unit-tests.json
+            if jq -e 'any(.[];
+              .unit_testmon_cache_key == ""
+              or (.unit_testmon_manifest_sha256 | test("^[0-9a-f]{64}$") | not)
+              or .unit_testmon_database_checksums == "[]"
+            )' unit-tests.json >/dev/null; then
+              MODE=full
+              REASON="Validated H100 index omitted trusted bucket identity metadata"
+            fi
+          fi
+
+          if [[ "$MODE" != "enforce" ]]; then
+            jq -c 'map(. + {
+              "unit_testmon_mode": "full",
+              "unit_testmon_cache_key": "",
+              "unit_testmon_direct_tests": "[]",
+              "unit_testmon_manifest_sha256": "",
+              "unit_testmon_database_checksums": "[]"
+            })' unit-tests-base.json > unit-tests.json
+          fi
+
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+          {
+            echo "### H100 unit Testmon preparation"
+            echo
+            echo "- Mode: \`$MODE\`"
+            echo "- Reason: $REASON"
+            if [[ "$MODE" == "enforce" ]]; then
+              echo "- Producer: \`$(jq -r '.producer_sha' unit-testmon-prepared.json)\`"
+              echo "- Cache age: \`$(jq -r '.cache_age_hours' unit-testmon-prepared.json)h\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   cicd-unit-tests-latest:
     strategy:
@@ -753,6 +922,11 @@ jobs:
           is_unit_test: "true"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ matrix.unit_testmon_mode }}
+          unit_testmon_cache_key: ${{ matrix.unit_testmon_cache_key }}
+          unit_testmon_direct_tests: ${{ matrix.unit_testmon_direct_tests }}
+          unit_testmon_manifest_sha256: ${{ matrix.unit_testmon_manifest_sha256 }}
+          unit_testmon_database_checksums: ${{ matrix.unit_testmon_database_checksums }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -783,11 +957,116 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && '0' || '1' }}
+
+      - name: Compute GB200 Testmon environment
+        id: unit-testmon-environment
+        if: needs.configure.outputs.unit_testmon_eligible == 'true'
+        shell: bash -e -u -o pipefail {0}
+        run: |
+          HASH=""
+          if CANDIDATE=$(python tests/unit_tests/testmon/tooling.py environment-hash \
+            --repo-root . --platform gb200 --testmon-version 2.2.0) \
+            && [[ "$CANDIDATE" =~ ^[0-9a-f]{64}$ ]]; then
+            HASH="$CANDIDATE"
+          else
+            echo "::warning::Unable to compute the GB200 Testmon environment hash; using full tests."
+          fi
+          echo "hash=$HASH" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Restore latest compatible GB200 Testmon index
+        id: restore-unit-testmon-index
+        if: needs.configure.outputs.unit_testmon_eligible == 'true' && steps.unit-testmon-environment.outputs.hash != ''
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        continue-on-error: true
+        with:
+          path: assets_dir/testmon-index/gb200
+          key: unit-testmon-v1-main-gb200-r4-dev-index-${{ steps.unit-testmon-environment.outputs.hash }}-${{ github.run_id }}
+          restore-keys: |
+            unit-testmon-v1-main-gb200-r4-dev-index-${{ steps.unit-testmon-environment.outputs.hash }}-
+
       - name: Parse unit tests
         id: parse-unit-tests
+        shell: bash -e -u -o pipefail {0}
+        env:
+          TESTMON_ELIGIBLE: ${{ needs.configure.outputs.unit_testmon_eligible }}
+          TESTMON_DEFAULT_REASON: ${{ needs.configure.outputs.unit_testmon_reason }}
+          TESTMON_INDEX_RESTORED: ${{ steps.restore-unit-testmon-index.outcome == 'success' && steps.restore-unit-testmon-index.outputs.cache-matched-key != '' }}
+          BASE_SHA: ${{ needs.configure.outputs.pr_base_sha }}
+          CURRENT_SHA: ${{ needs.configure.outputs.sha }}
         run: |
-          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
+          yq -o json '[.products[].test_case[] | {"bucket": .}] | sort_by(.model, .test_case)' \
+            tests/test_utils/recipes/gb200/unit-tests.yaml | jq -c > unit-tests-gb200-base.json
+
+          MODE=full
+          REASON="$TESTMON_DEFAULT_REASON"
+          if [[ "$TESTMON_ELIGIBLE" == "true" ]]; then
+            if [[ "$TESTMON_INDEX_RESTORED" == "true" \
+              && -f assets_dir/testmon-index/gb200/index.json ]]; then
+              set +e
+              python tests/unit_tests/testmon/tooling.py prepare-matrix \
+                --index assets_dir/testmon-index/gb200/index.json \
+                --repo-root . \
+                --platform gb200 \
+                --world-size 4 \
+                --base-sha "$BASE_SHA" \
+                --current-sha "$CURRENT_SHA" \
+                --recipe tests/test_utils/recipes/gb200/unit-tests.yaml \
+                --output unit-testmon-prepared-gb200.json
+              PREPARE_RC=$?
+              set -e
+              if [[ "$PREPARE_RC" -eq 0 ]]; then
+                MODE=$(jq -r '.mode' unit-testmon-prepared-gb200.json)
+                REASON=$(jq -r '.reason' unit-testmon-prepared-gb200.json)
+              else
+                REASON="Testmon index validation or diff classification failed"
+              fi
+            else
+              REASON="No trusted compatible GB200 Testmon platform index was restored"
+            fi
+          fi
+
+          if [[ "$MODE" == "enforce" ]]; then
+            jq -c --slurpfile prepared unit-testmon-prepared-gb200.json '
+              map(. + {
+                "unit_testmon_mode": "enforce",
+                "unit_testmon_cache_key": ($prepared[0].buckets[.bucket].cache_key // ""),
+                "unit_testmon_direct_tests": (($prepared[0].buckets[.bucket].direct_tests // []) | tojson),
+                "unit_testmon_manifest_sha256": ($prepared[0].buckets[.bucket].manifest_sha256 // ""),
+                "unit_testmon_database_checksums": (($prepared[0].buckets[.bucket].database_checksums // []) | tojson)
+              })
+            ' unit-tests-gb200-base.json > unit-tests-gb200.json
+            if jq -e 'any(.[];
+              .unit_testmon_cache_key == ""
+              or (.unit_testmon_manifest_sha256 | test("^[0-9a-f]{64}$") | not)
+              or .unit_testmon_database_checksums == "[]"
+            )' unit-tests-gb200.json >/dev/null; then
+              MODE=full
+              REASON="Validated GB200 index omitted trusted bucket identity metadata"
+            fi
+          fi
+
+          if [[ "$MODE" != "enforce" ]]; then
+            jq -c 'map(. + {
+              "unit_testmon_mode": "full",
+              "unit_testmon_cache_key": "",
+              "unit_testmon_direct_tests": "[]",
+              "unit_testmon_manifest_sha256": "",
+              "unit_testmon_database_checksums": "[]"
+            })' unit-tests-gb200-base.json > unit-tests-gb200.json
+          fi
+
           echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
+          {
+            echo "### GB200 unit Testmon preparation"
+            echo
+            echo "- Mode: \`$MODE\`"
+            echo "- Reason: $REASON"
+            if [[ "$MODE" == "enforce" ]]; then
+              echo "- Producer: \`$(jq -r '.producer_sha' unit-testmon-prepared-gb200.json)\`"
+              echo "- Cache age: \`$(jq -r '.cache_age_hours' unit-testmon-prepared-gb200.json)h\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   cicd-unit-tests-latest-gb200:
     strategy:
@@ -841,6 +1120,11 @@ jobs:
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ matrix.unit_testmon_mode }}
+          unit_testmon_cache_key: ${{ matrix.unit_testmon_cache_key }}
+          unit_testmon_direct_tests: ${{ matrix.unit_testmon_direct_tests }}
+          unit_testmon_manifest_sha256: ${{ matrix.unit_testmon_manifest_sha256 }}
+          unit_testmon_database_checksums: ${{ matrix.unit_testmon_database_checksums }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:

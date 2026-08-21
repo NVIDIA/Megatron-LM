@@ -56,14 +56,21 @@ spec:
       --environment $ENVIRONMENT \
       --bucket $BUCKET \
       --unit-test-repeat $UNIT_TEST_REPEAT \
+      --unit-testmon-mode {unit_testmon_mode} \
+      --unit-testmon-cache-dir {unit_testmon_cache_dir} \
+      --unit-testmon-selected-manifest {unit_testmon_selected_manifest} \
       --log-dir {assets_dir}/logs/1/
 
     ls -al 
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml 
-    cp .coverage {assets_dir}/coverage_report
-    cp coverage.xml {assets_dir}
+    if [[ -f .coverage ]]; then
+        /opt/venv/bin/coverage xml
+        cp .coverage {assets_dir}/coverage_report
+        cp coverage.xml {assets_dir}
+    else
+        echo "No unit-test coverage data was produced; skipping coverage export."
+    fi
 
 products:
   - test_case: [tests/unit_tests/test_model_configs.py]

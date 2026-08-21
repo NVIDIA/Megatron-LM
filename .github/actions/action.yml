@@ -24,7 +24,8 @@ inputs:
     default: "30"
   script:
     description: "Test script to execute"
-    required: true
+    required: false
+    default: ""
   is-optional:
     description: "Pass this job on failure."
     required: false
@@ -66,6 +67,34 @@ inputs:
     description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
     required: false
     default: ""
+  unit_testmon_mode:
+    description: "Unit-test selection mode: full, enforce, or baseline."
+    required: false
+    default: "full"
+  unit_testmon_cache_key:
+    description: "Exact immutable cache key for an enforce-mode Testmon baseline."
+    required: false
+    default: ""
+  unit_testmon_cache_dir:
+    description: "Workspace-relative directory containing per-rank Testmon databases."
+    required: false
+    default: "assets_dir/testmon"
+  unit_testmon_selected_manifest:
+    description: "Workspace-relative JSON manifest written by selection and consumed by pytest."
+    required: false
+    default: "assets_dir/testmon/selected.json"
+  unit_testmon_direct_tests:
+    description: "JSON array of changed unit-test files to add to Testmon's selection."
+    required: false
+    default: "[]"
+  unit_testmon_manifest_sha256:
+    description: "Trusted platform-index checksum of the restored bucket manifest."
+    required: false
+    default: ""
+  unit_testmon_database_checksums:
+    description: "Trusted platform-index JSON array of per-rank database checksums."
+    required: false
+    default: "[]"
 runs:
   using: "composite"
   steps:
@@ -113,6 +142,116 @@ runs:
           sleep 10
         done
 
+    # Restore-only is intentional: PR jobs must never mutate or publish the
+    # trusted database produced by unit-testmon-baseline.yml.
+    - name: Restore unit Testmon baseline
+      id: restore-unit-testmon
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_cache_key != ''
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+      continue-on-error: true
+      with:
+        path: ${{ inputs.unit_testmon_cache_dir }}
+        key: ${{ inputs.unit_testmon_cache_key }}
+
+    - name: Resolve unit Testmon mode
+      id: unit-testmon
+      if: inputs.is_unit_test == 'true'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
+        CACHE_KEY: ${{ inputs.unit_testmon_cache_key }}
+        CACHE_HIT: ${{ steps.restore-unit-testmon.outputs.cache-hit }}
+        CACHE_RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
+      run: |
+        case "$REQUESTED_MODE" in
+          full|baseline) EFFECTIVE_MODE="$REQUESTED_MODE" ;;
+          enforce)
+            if [[ -n "$CACHE_KEY" \
+              && "$CACHE_HIT" == "true" \
+              && "$CACHE_RESTORE_OUTCOME" == "success" ]]; then
+              EFFECTIVE_MODE=enforce
+            else
+              EFFECTIVE_MODE=full
+              echo "::warning::Testmon cache was unavailable; running the full unit-test bucket."
+            fi
+            ;;
+          *)
+            echo "Unsupported unit_testmon_mode: $REQUESTED_MODE" >&2
+            exit 2
+            ;;
+        esac
+        echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
+        {
+          echo "### Unit Testmon"
+          echo ""
+          echo "- Requested mode: \`$REQUESTED_MODE\`"
+          echo "- Effective mode: \`$EFFECTIVE_MODE\`"
+          if [[ "$REQUESTED_MODE" == "enforce" ]]; then
+            echo "- Exact cache hit: \`${CACHE_HIT:-false}\`"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Stage directly changed unit tests
+      id: stage-unit-testmon-direct-tests
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'enforce'
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        CACHE_DIR: ${{ inputs.unit_testmon_cache_dir }}
+        DIRECT_TESTS: ${{ inputs.unit_testmon_direct_tests }}
+        MANIFEST_SHA256: ${{ inputs.unit_testmon_manifest_sha256 }}
+        DATABASE_CHECKSUMS: ${{ inputs.unit_testmon_database_checksums }}
+      run: |
+        mkdir -p "$CACHE_DIR"
+        jq -e '
+          if type == "array" and all(.[]; type == "string")
+          then unique | sort
+          else error("unit_testmon_direct_tests must be a JSON array of strings")
+          end
+        ' <<< "$DIRECT_TESTS" > "$CACHE_DIR/direct-tests.json.tmp"
+        mv "$CACHE_DIR/direct-tests.json.tmp" "$CACHE_DIR/direct-tests.json"
+
+        jq -n -e \
+          --arg manifest_sha256 "$MANIFEST_SHA256" \
+          --argjson database_checksums "$DATABASE_CHECKSUMS" '
+            if ($manifest_sha256 | test("^[0-9a-f]{64}$"))
+              and ($database_checksums | type == "array")
+              and ($database_checksums | length > 0)
+              and all($database_checksums[]; type == "string" and test("^[0-9a-f]{64}$"))
+            then {
+              manifest_sha256: $manifest_sha256,
+              database_checksums: $database_checksums
+            }
+            else error("trusted Testmon index record is malformed")
+            end
+          ' > "$CACHE_DIR/expected-index-record.json.tmp"
+        mv "$CACHE_DIR/expected-index-record.json.tmp" "$CACHE_DIR/expected-index-record.json"
+
+    - name: Resolve final unit Testmon mode
+      id: final-unit-testmon
+      if: inputs.is_unit_test == 'true'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        CACHE_RESOLVED_MODE: ${{ steps.unit-testmon.outputs.mode }}
+        DIRECT_TESTS_OUTCOME: ${{ steps.stage-unit-testmon-direct-tests.outcome }}
+        CACHE_DIR: ${{ inputs.unit_testmon_cache_dir }}
+      run: |
+        EFFECTIVE_MODE="$CACHE_RESOLVED_MODE"
+        if [[ "$CACHE_RESOLVED_MODE" == "enforce" \
+          && "$DIRECT_TESTS_OUTCOME" != "success" ]]; then
+          EFFECTIVE_MODE=full
+          echo "::warning::Changed-test manifest staging failed; running the full unit-test bucket."
+          {
+            echo "- Final effective mode: \`full\`"
+            echo "- Fallback reason: \`changed-test/index-record staging failed\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        # Baseline caches include their producer summary. Clear that restored
+        # copy so a pre-run full fallback cannot publish stale baseline text.
+        mkdir -p "$CACHE_DIR"
+        : > "$CACHE_DIR/summary.md"
+        echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
+
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'true'
@@ -137,6 +276,9 @@ runs:
           --environment dev \
           --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \
+          --unit-testmon-mode ${{ steps.final-unit-testmon.outputs.mode }} \
+          --unit-testmon-cache-dir ${{ inputs.unit_testmon_cache_dir }} \
+          --unit-testmon-selected-manifest ${{ inputs.unit_testmon_selected_manifest }} \
           --container-image ${{ inputs.container-image }} \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
@@ -219,6 +361,16 @@ runs:
         echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
         exit $EXIT_CODE
+
+    - name: Publish unit Testmon summary
+      if: always() && inputs.is_unit_test == 'true'
+      shell: bash
+      env:
+        SUMMARY_FILE: ${{ inputs.unit_testmon_cache_dir }}/summary.md
+      run: |
+        if [[ -f "$SUMMARY_FILE" ]]; then
+          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Check result
       id: check
