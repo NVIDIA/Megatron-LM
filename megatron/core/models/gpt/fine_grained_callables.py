@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -17,8 +17,13 @@ from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
+    _scatter_mtp_padding_mask,
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import (
@@ -285,6 +290,7 @@ class PostProcessNode(ScheduleNode):
             extra_block_kwargs=self.chunk_state.extra_block_kwargs,
             output_processor=self.chunk_state.output_processor,
             output_processor_context=self.chunk_state.output_processor_context,
+            sequence_roll_context=getattr(self.chunk_state, "mtp_sequence_roll_context", None),
         )
 
         # For now, 1f1b only supports fp16 module
@@ -347,6 +353,7 @@ class TransformerLayerNode(ScheduleNode):
         self.detached = tuple()
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
+        self.mtp_absolute_depth = extra_args.get("mtp_absolute_depth")
         self.mhc_recompute_manager = extra_args.get("mhc_recompute_manager")
         self.is_last_layer_in_mhc_recompute_group = extra_args.get(
             "is_last_layer_in_mhc_recompute_group", False
@@ -581,7 +588,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     is_hyper_connection_layer = isinstance(layer, HyperConnectionTransformerLayer)
     is_mhc_layer = is_moe and is_hyper_connection_layer
 
-    def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+    # A repeated MTP layer builds one callable set per logical depth while sharing
+    # the same physical TransformerLayer. Keep the delayed-wgrad wrapper owned by
+    # this callable invocation; ``layer.backward_dw_wrapper`` is overwritten when
+    # the next logical depth is built.
+    layer.init_backward_dw_wrapper()
+    backward_dw_wrapper = layer.backward_dw_wrapper
+
+    def submodule_attn_forward(
+        node: ScheduleNode, hidden_states: torch.Tensor, padding_mask: Optional[Tensor] = None
+    ):
         """
         Performs same attnention forward logic as GPT Model and forward pass for
         computations between attention and dispatch:
@@ -592,6 +608,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         is_last_in_mhc_recompute_group = getattr(
             node, "is_last_layer_in_mhc_recompute_group", False
         )
+        effective_padding_mask = (
+            padding_mask if padding_mask is not None else node.chunk_state.padding_mask
+        )
         if mhc_recompute_manager is not None:
             mhc_recompute_manager.is_last_layer_in_recompute_block = is_last_in_mhc_recompute_group
 
@@ -601,7 +620,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             and layer.cuda_graphs
         )
         if using_cuda_graph_replay:
-            layer.set_te_cuda_graph_backward_dw_wrapper()
+            backward_dw_wrapper.set_graphed_backward_dw_callable(
+                partial(layer._te_cuda_graph_backward_dw_graph, layer.current_microbatch)
+            )
             forward_func = layer._te_cuda_graph_replay
         else:
             # wrapper function that keeps consistent api with cuda graph replay
@@ -613,6 +634,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 rotary_pos_sin: Optional[Tensor] = None,
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
+                padding_mask: Optional[Tensor] = None,
                 mhc_recompute_manager=None,
             ):
                 attention_kwargs = dict(
@@ -673,7 +695,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(
-                    pre_mlp_layernorm_output, padding_mask=node.chunk_state.padding_mask
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
                 )
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
@@ -698,6 +720,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
+        if is_moe and effective_padding_mask is not None:
+            forward_kwargs["padding_mask"] = effective_padding_mask
         if is_hyper_connection_layer and (
             not using_cuda_graph_replay
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
@@ -881,10 +905,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
 
-    layer.init_backward_dw_wrapper()
-
     forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None]
-    backward_dw = {"attn": layer.backward_dw_wrapper, "mlp": layer.mlp}
+    backward_dw = {"attn": backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 
 
@@ -914,6 +936,66 @@ def build_mtp_layer_callables(layer):
     is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
+    def prepare_roll_rows(node):
+        """Prepare this microbatch's immutable MTP fields and materialize them once."""
+        chunk_state = node.chunk_state
+        materialized = getattr(chunk_state, "mtp_materialized_roll_rows", None)
+        if materialized is not None:
+            return materialized
+
+        model = chunk_state.model
+        input_ids = chunk_state.input_ids
+        labels = chunk_state.labels
+        reference = input_ids if input_ids is not None else labels
+        cp_group = resolve_cp_group(layer.cp_group, chunk_state.packed_seq_params)
+        sequence_roll_context = prepare_mtp_sequence_roll_context(
+            tensor=reference, cp_group=cp_group, packed_seq_params=chunk_state.packed_seq_params
+        )
+
+        fields = []
+        if input_ids is not None:
+            fields.append(MTPSequenceRollField("input_ids", input_ids, -1, 0, 0))
+        roll_position_ids = getattr(model.embedding, "add_position_embedding", True)
+        if roll_position_ids and chunk_state.position_ids is not None:
+            fields.append(MTPSequenceRollField("position_ids", chunk_state.position_ids, -1, 0, 0))
+        if model.post_process and labels is not None:
+            fields.append(MTPSequenceRollField("labels", labels, -1, 0, 0))
+        if model.post_process and chunk_state.loss_mask is not None:
+            fields.append(MTPSequenceRollField("loss_mask", chunk_state.loss_mask, -1, 0, 0))
+        mtp_padding_mask = getattr(chunk_state, "mtp_padding_mask", chunk_state.padding_mask)
+        if mtp_padding_mask is not None:
+            fields.append(MTPSequenceRollField("padding_mask", mtp_padding_mask, -1, 0, True))
+
+        max_offset = int(layer.config.mtp_num_layers or 0) + int(
+            model.post_process and labels is None
+        )
+        if sequence_roll_context is not None and fields and max_offset > 0:
+            if not (
+                sequence_roll_context.max_offset >= max_offset
+                and sequence_roll_context.is_prepared_for_fields(fields)
+            ):
+                sequence_roll_context = sequence_roll_context.prepare_fields(
+                    fields, max_offset=max_offset
+                )
+            if (
+                sequence_roll_context.max_offset >= max_offset
+                and sequence_roll_context.is_prepared_for_fields(fields)
+            ):
+                forward_keys = ("input_ids", "position_ids", "padding_mask")
+                materialized = {
+                    key: sequence_roll_context.materialize_all(key)
+                    for key in forward_keys
+                    if key in sequence_roll_context.keys
+                }
+            else:
+                materialized = {}
+        else:
+            materialized = {}
+
+        chunk_state.mtp_sequence_roll_context = sequence_roll_context
+        chunk_state.mtp_materialized_roll_rows = materialized
+        return materialized
+
     def submodule_mtp_attn_forward(node, hidden_states):
         # MTP Block Preprocess
         if node.is_first_layer:
@@ -925,26 +1007,55 @@ def build_mtp_layer_callables(layer):
             else:
                 hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
+        materialized_rows = prepare_roll_rows(node)
+        absolute_depth = getattr(node, "mtp_absolute_depth", None) or layer.layer_number
+        use_prepared_rows = "input_ids" in materialized_rows
+        if use_prepared_rows:
+            input_ids = materialized_rows["input_ids"][absolute_depth - 1]
+            position_ids = (
+                materialized_rows["position_ids"][absolute_depth - 1]
+                if "position_ids" in materialized_rows
+                else node.chunk_state.position_ids
+            )
+            padding_mask = (
+                materialized_rows["padding_mask"][absolute_depth - 1]
+                if "padding_mask" in materialized_rows
+                else None
+            )
+        else:
+            input_ids = node.chunk_state.input_ids
+            position_ids = node.chunk_state.position_ids
+            padding_mask = node.chunk_state.padding_mask
+
         input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
-            input_ids=node.chunk_state.input_ids,
-            position_ids=node.chunk_state.position_ids,
+            input_ids=input_ids,
+            position_ids=position_ids,
             embedding=node.chunk_state.model.embedding,
             hidden_states=hidden_states,
             packed_seq_params=node.chunk_state.packed_seq_params,
-            padding_mask=node.chunk_state.padding_mask,
+            padding_mask=padding_mask,
+            sequence_roll_context=getattr(node.chunk_state, "mtp_sequence_roll_context", None),
+            roll_depth=absolute_depth - 1,
+            _inputs_pre_aligned=use_prepared_rows,
         )
-        node.chunk_state.input_ids = input_ids
-        node.chunk_state.position_ids = position_ids
-        node.chunk_state.padding_mask = padding_mask
+        if use_prepared_rows:
+            padding_mask = _scatter_mtp_padding_mask(
+                padding_mask,
+                sequence_parallel=layer.config.sequence_parallel,
+                tp_group=layer.tp_group,
+            )
+        else:
+            # Preserve the established cumulative-roll fallback for unsupported
+            # layouts. The prepared path keeps all source fields immutable.
+            node.chunk_state.input_ids = input_ids
+            node.chunk_state.position_ids = position_ids
+            node.chunk_state.padding_mask = padding_mask
 
         # MTP Layer Preprocess
         # norm, linear projection and transformer
         assert (
             node.chunk_state.context is None
         ), f"multi token prediction + cross attention is not yet supported."
-        assert (
-            node.chunk_state.packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
 
         if layer.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -954,7 +1065,7 @@ def build_mtp_layer_callables(layer):
         # fp8 context is added in 1f1b schedule, so we don't need to add it here
         with rng_context:
             hidden_states = layer._concat_embeddings(hidden_states, decoder_input)
-            return attn_forward(node, hidden_states)
+            return attn_forward(node, hidden_states, padding_mask=padding_mask)
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
         # Save pre-contraction multi-stream; _postprocess contracts for mtp_hidden_states.

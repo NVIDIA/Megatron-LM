@@ -221,6 +221,7 @@ def _pack_sequences(
     original_lengths: torch.Tensor,
     local_cp_size: Optional[torch.Tensor],
     dev: torch.device,
+    zigzag_cp_min_chunk_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
@@ -251,6 +252,10 @@ def _pack_sequences(
 
     if local_cp_size is not None:
         new_sample["local_cp_size"] = local_cp_size
+    if zigzag_cp_min_chunk_size is not None:
+        new_sample["zigzag_cp_min_chunk_size"] = torch.tensor(
+            zigzag_cp_min_chunk_size, dtype=torch.int32, device=dev
+        )
 
     return new_sample
 
@@ -316,7 +321,12 @@ def create_data_iterator(
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
         if tp_group.rank() == 0:
-            metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
+            metadata_keys = [
+                "max_seqlen",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "zigzag_cp_min_chunk_size",
+            ]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
             new_data_iterator = []
@@ -466,6 +476,7 @@ def build_packed_microbatches(
     dcp_rank: int,
     dev: torch.device,
     is_dynamic_cp: bool = False,
+    global_id_seqlens: Optional[List[Tuple[int, int]]] = None,
 ) -> List[Dict[str, torch.Tensor]]:
     """Build packed samples for each microbatch.
 
@@ -476,6 +487,10 @@ def build_packed_microbatches(
         dcp_rank: This rank's index within the DP×CP group.
         dev: Target device.
         is_dynamic_cp: Whether dynamic context parallel is enabled.
+        global_id_seqlens: Optional host mapping from global sample ID to its
+            physical padded length. When present, it emits the minimum zigzag
+            half-chunk size without a model-forward D2H copy; zero means the
+            physical lengths do not admit one-hop certification.
     """
     num_micro_batches = len(sample_id_groups)
     seg_starts: List[int] = [0]
@@ -491,20 +506,16 @@ def build_packed_microbatches(
     ]
 
     local_cp_sizes_gpu = None
+    effective_cp_sizes_cpu: List[int] = []
+    for i in range(num_micro_batches):
+        sample_ids_this_group = sample_id_groups[i][dcp_rank]
+        effective_cp_sizes_cpu.append(
+            len([1 for sample_ids in sample_id_groups[i] if sample_ids_this_group[0] in sample_ids])
+        )
     if is_dynamic_cp:
-        local_cp_sizes_cpu: List[int] = []
-        for i in range(num_micro_batches):
-            sample_ids_this_group = sample_id_groups[i][dcp_rank]
-            local_cp_sizes_cpu.append(
-                len(
-                    [
-                        1
-                        for sample_ids in sample_id_groups[i]
-                        if sample_ids_this_group[0] in sample_ids
-                    ]
-                )
-            )
-        local_cp_sizes_gpu = torch.tensor(local_cp_sizes_cpu, dtype=torch.int32, device=dev)
+        local_cp_sizes_gpu = torch.tensor(effective_cp_sizes_cpu, dtype=torch.int32, device=dev)
+
+    padded_length_by_id = dict(global_id_seqlens) if global_id_seqlens is not None else None
 
     for i in range(num_micro_batches):
         samples = grouped_samples[i]
@@ -521,7 +532,24 @@ def build_packed_microbatches(
         lens_padded = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         lens_original = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         local_cp_size = local_cp_sizes_gpu[i] if is_dynamic_cp else None
-        new_sample = _pack_sequences(samples, lens_padded, lens_original, local_cp_size, dev)
+        zigzag_cp_min_chunk_size = None
+        if padded_length_by_id is not None:
+            divisor = 2 * effective_cp_sizes_cpu[i]
+            padded_lengths_host = [
+                padded_length_by_id[sample_id] for sample_id in sample_id_groups[i][dcp_rank]
+            ]
+            if any(length % divisor != 0 for length in padded_lengths_host):
+                zigzag_cp_min_chunk_size = 0
+            else:
+                zigzag_cp_min_chunk_size = min(length // divisor for length in padded_lengths_host)
+        new_sample = _pack_sequences(
+            samples,
+            lens_padded,
+            lens_original,
+            local_cp_size,
+            dev,
+            zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
+        )
         new_samples.append(new_sample)
 
     return new_samples
