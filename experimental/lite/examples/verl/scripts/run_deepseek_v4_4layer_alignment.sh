@@ -76,7 +76,6 @@ bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "+actor_rollout_ref.actor.engine.full_determinism=True" \
   "actor_rollout_ref.actor.engine.attention_backend_override=null" \
   "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=True" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.cache_deployment_weights=${CACHE_DEPLOYMENT_WEIGHTS:-false}" \
   "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096" \
   "actor_rollout_ref.rollout.full_determinism=True" \
   "actor_rollout_ref.rollout.seed=${SEED:-42}" \
