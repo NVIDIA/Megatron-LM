@@ -41,13 +41,10 @@ def test_batch_invariance_initialization_is_mandatory(monkeypatch) -> None:
 
     monkeypatch.setattr(runtime.importlib, "import_module", lambda name: deep_gemm)
     monkeypatch.setattr(runtime, "_symbol", symbol)
-    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
-
     runtime.initialize_ds4_vllm_batch_invariance()
 
     assert state["enabled"] is True
-    assert runtime.os.environ["VLLM_BATCH_INVARIANT"] == "1"
-    init.assert_called_once_with()
+    init.assert_called_once_with(force=True)
 
 
 def test_vllm_forward_context_gathers_tokens_on_ep_group(monkeypatch) -> None:

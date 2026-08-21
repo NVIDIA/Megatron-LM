@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import math
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,14 +98,10 @@ def _local_num_tokens(batch: Any) -> int:
 
 
 def initialize_ds4_vllm_batch_invariance() -> None:
-
-    # This model implementation is the batch-invariant vLLM alignment path;
-    # the environment must not select a second mathematical implementation.
-    os.environ["VLLM_BATCH_INVARIANT"] = "1"
     _symbol(
         "vllm.model_executor.layers.batch_invariant",
         "init_batch_invariance",
-    )()
+    )(force=True)
 
     deep_gemm = importlib.import_module("deep_gemm")
     setter = getattr(deep_gemm, "set_batch_invariant", None)
