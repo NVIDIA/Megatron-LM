@@ -199,10 +199,28 @@ def _set_main_grad(parameter):
 
 def _set_main_grads(layer):
     for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
-        _set_main_grad(linear.get_parameter("weight"))
+        if getattr(linear, "single_grouped_weight", False):
+            parameters = (linear.get_parameter("weight"),)
+        else:
+            parameters = tuple(
+                linear.get_parameter(f"weight{i}") for i in range(linear.num_gemms)
+            )
+        for parameter in parameters:
+            _set_main_grad(parameter)
     if layer.config.moe_latent_size is not None:
         _set_main_grad(layer.fc1_latent_proj.weight)
         _set_main_grad(layer.fc2_latent_proj.weight)
+
+
+def _stack_linear_main_grad(linear):
+    if getattr(linear, "single_grouped_weight", False):
+        return linear.get_parameter("weight").main_grad.detach().clone()
+    return torch.stack(
+        tuple(
+            linear.get_parameter(f"weight{i}").main_grad.detach()
+            for i in range(linear.num_gemms)
+        )
+    )
 
 
 def _run_replica_hybridep_full_layer_parity(
@@ -213,6 +231,7 @@ def _run_replica_hybridep_full_layer_parity(
     weighted_squared_relu,
     glu_interleave,
     moe_latent_size,
+    single_grouped_weight=True,
 ):
     """Compare full expert/router fwd+bwd and grouped main_grads on 4 NVLink GPUs."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
@@ -226,7 +245,9 @@ def _run_replica_hybridep_full_layer_parity(
 
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
-    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+    monkeypatch.setenv(
+        "NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1" if single_grouped_weight else "0"
+    )
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
         expert_model_parallel_size=4,
@@ -246,7 +267,7 @@ def _run_replica_hybridep_full_layer_parity(
         "moe_router_load_balancing_type": "none",
         "moe_router_dtype": "fp32",
         "moe_grouped_gemm": True,
-        "moe_single_grouped_weight": True,
+        "moe_single_grouped_weight": single_grouped_weight,
         "use_transformer_engine_op_fuser": True,
         "gradient_accumulation_fusion": True,
         "add_bias_linear": False,
@@ -294,12 +315,17 @@ def _run_replica_hybridep_full_layer_parity(
                 (bridge.runtime_fc1_weights, bridge.runtime_fc2_weights),
             ):
                 assert len(runtime_weights) == bridge.num_runtime_experts
-                native_weights = projection.parameter.rowwise_data.view(
-                    bridge.num_local_experts, *projection.member_shape
-                )
-                native_grads = projection.parameter.main_grad.view(
-                    bridge.num_local_experts, *projection.member_shape
-                )
+                native_weights = projection.source_tensors
+                if len(projection.parameters) == 1:
+                    native_grads = tuple(
+                        projection.parameters[0].main_grad.view(
+                            bridge.num_local_experts, *projection.member_shape
+                        )
+                    )
+                else:
+                    native_grads = tuple(
+                        parameter.main_grad for parameter in projection.parameters
+                    )
                 for index, runtime_weight in enumerate(runtime_weights):
                     if index < bridge.num_local_experts:
                         expected_weight = native_weights[index]
@@ -324,8 +350,8 @@ def _run_replica_hybridep_full_layer_parity(
                 output.detach(),
                 hidden.grad.detach(),
                 layer.router.weight.grad.detach().clone(),
-                layer.experts.linear_fc1.weight.main_grad.detach().clone(),
-                layer.experts.linear_fc2.weight.main_grad.detach().clone(),
+                _stack_linear_main_grad(layer.experts.linear_fc1),
+                _stack_linear_main_grad(layer.experts.linear_fc2),
             ]
             if layer.config.moe_latent_size is not None:
                 values.extend(
@@ -401,7 +427,9 @@ def _run_replica_hybridep_full_layer_parity(
                 for runtime_weights in runtime_weight_tuples
             )
             for projection in bridge.projections:
-                projection.parameter.rowwise_data.add_(1000)
+                for parameter in projection.parameters:
+                    rowwise_data = getattr(parameter, "rowwise_data", parameter.data)
+                    rowwise_data.add_(1000)
             for runtime_weights, previous in zip(
                 runtime_weight_tuples, before_source_update
             ):
@@ -478,10 +506,20 @@ def _run_replica_hybridep_full_layer_parity(
     not torch.cuda.is_available() or not fused_a2a.HAVE_HYBRIDEP,
     reason="CUDA and HybridEP are required",
 )
-def test_replica_hybridep_full_layer_gradients_match_alltoall(monkeypatch):
+@pytest.mark.parametrize("single_grouped_weight", [True, False])
+def test_replica_hybridep_full_layer_gradients_match_alltoall(
+    monkeypatch, single_grouped_weight
+):
     """Check replica-planned HybridEP output and all training gradients."""
     _run_replica_hybridep_full_layer_parity(
-        monkeypatch, "replica_hybridep", F.silu, True, False, None, None
+        monkeypatch,
+        "replica_hybridep",
+        F.silu,
+        True,
+        False,
+        None,
+        None,
+        single_grouped_weight,
     )
 
 
