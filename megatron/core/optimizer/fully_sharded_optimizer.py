@@ -105,6 +105,63 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Build a sharded optimizer state dict."""
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
+    def get_grad_norm(self):
+        """Compute the global gradient L2 norm from each gradient's own DTensor layout.
+
+        MFSDP v2 gradients are DTensors that record how they are distributed, and the
+        dense and expert gradients do not share a device mesh: with EP=2 over eight
+        ranks the dense gradients live on all eight while the expert gradients live on
+        the four-rank expert-DP stripe. Reading the layout off each gradient keeps the
+        norm correct without assuming a single mesh for all of them.
+
+        Each rank contributes ``||local||^2`` divided by the product of its replicated
+        mesh-axis sizes. A sharded axis holds disjoint pieces that must all be added; a
+        replicated axis holds identical copies that must be counted once. Summing that
+        over the grad-stats group is then exact, because every shard is held by exactly
+        one rank in that group.
+
+        No duplicate filtering is needed here. ``get_grad_norm_fp32``'s shared/TP/GTP
+        filters exist to count replicas once along the model-parallel axes, and MFSDP v2
+        rejects TP, PP and CP sizes above 1 (see ``mcore_fsdp_adapter``), so those axes
+        are trivial and every parameter is unique. Revisit if v2 gains TP composability.
+
+        ``get_grad_norm_fp32`` cannot do this: ``get_main_grads_for_grad_norm``
+        replaces each DTensor with ``grad._local_tensor`` before it runs, so
+        ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
+        and the layout is gone by the time the norm is taken.
+        """
+        from torch.distributed.tensor import DTensor
+
+        total_sq = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
+        for parameter in self.get_parameters():
+            # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
+            # which is a v1 param-and-grad-buffer concept.
+            grad = parameter.grad
+            if grad is None:
+                continue
+            replication = 1
+            if isinstance(grad, DTensor):
+                for axis, placement in enumerate(grad.placements):
+                    if placement.is_replicate():
+                        replication *= grad.device_mesh.size(axis)
+                    elif placement.is_partial():
+                        raise RuntimeError(
+                            "MFSDP v2 gradient is still Partial when the norm is taken; "
+                            "the reduction must be finalized first."
+                        )
+                local = grad.to_local()
+            else:
+                local = grad
+            if local.numel():
+                total_sq += local.float().pow(2).sum() / replication
+
+        torch.distributed.all_reduce(
+            total_sq,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.get_grad_stats_parallel_group(),
+        )
+        return total_sq.sqrt()
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear optimizer-visible sharded grads and any grads filtered from local groups."""
         if not self.is_stub_optimizer:

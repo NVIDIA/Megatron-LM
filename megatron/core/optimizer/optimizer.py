@@ -379,13 +379,11 @@ class MegatronOptimizer(ABC):
         """
         self.grad_norms_by_group = {}
         params = self.get_parameters()
-        if params:
-            grads_for_norm = self.get_grads_for_grad_norm()
-        else:
-            grads_for_norm = []
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
+        # Go through get_grad_norm() so a subclass that computes the norm differently
+        # clips by the value it reports. The base implementation is unchanged. Called
+        # unconditionally: it reduces over the grad-stats group even with no local
+        # parameters, and skipping it on a param-less rank would strand the others.
+        grad_norm = self.get_grad_norm()
 
         if clip_grad > 0.0 and params:
             # Only reduce group grad norms when clipping can use them.
