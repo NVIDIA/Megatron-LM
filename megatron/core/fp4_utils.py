@@ -225,11 +225,9 @@ if HAVE_TE:
                         fp8_dpa=config.fp8_dot_product_attention
                     )
                 except AttributeError:
-                    raise ValueError(
-                        """NVFP4BlockScaling recipe is not available in this version of 
-                        Transformer Engine. Please make sure you are using TE version 
-                        >= 2.7.0.dev0."""
-                    )
+                    raise ValueError("""NVFP4BlockScaling recipe is not available in this version of
+                        Transformer Engine. Please make sure you are using TE version
+                        >= 2.7.0.dev0.""")
             elif config.fp4_recipe == Fp4Recipe.custom:
                 fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
             else:
@@ -238,10 +236,14 @@ if HAVE_TE:
                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
                 )
         else:
-            raise ValueError(
-                """FP4 support requires TransformerEngine version >= 2.7.0.dev0 
-                for NVFP4BlockScaling."""
-            )
+            raise ValueError("""FP4 support requires TransformerEngine version >= 2.7.0.dev0
+                for NVFP4BlockScaling.""")
+
+        # Set recipe attrs
+        if fp4_recipe is not None and config.fp4_recipe_attrs is not None:
+            for key, val in config.fp4_recipe_attrs.items():
+                setattr(fp4_recipe, key, val)
+
         return fp4_recipe
 
     def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):

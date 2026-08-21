@@ -11,6 +11,8 @@ import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp4_utils import get_fp4_recipe
+from megatron.core.fp8_utils import get_fp8_recipe
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -451,18 +453,13 @@ class FusedSharedExpertMLP(SharedExpertMLP):
     def _get_fused_grouped_swiglu_recipe(self):
         """Create the TE recipe used to select the fused grouped MLP kernel."""
         if self._fused_grouped_swiglu_recipe is None:
-            fp4_recipe = getattr(self.config.fp4_recipe, "value", self.config.fp4_recipe)
-            fp8_recipe = getattr(self.config.fp8_recipe, "value", self.config.fp8_recipe)
-            if self.config.fp4 and fp4_recipe == "nvfp4":
-                self._fused_grouped_swiglu_recipe = te.common.recipe.NVFP4BlockScaling()
-            elif self.config.fp8 and fp8_recipe == "mxfp8":
-                self._fused_grouped_swiglu_recipe = te.common.recipe.MXFP8BlockScaling()
+            if self.config.fp8:
+                self._fused_grouped_swiglu_recipe = get_fp8_recipe(self.config)
+            elif self.config.fp4:
+                self._fused_grouped_swiglu_recipe = get_fp4_recipe(self.config)
             else:
                 raise ValueError(
-                    f"{self.__class__.__name__} requires fp4_recipe='nvfp4' or "
-                    f"fp8_recipe='mxfp8', but got fp4={self.config.fp4}, "
-                    f"fp4_recipe={self.config.fp4_recipe}, fp8={self.config.fp8}, "
-                    f"fp8_recipe={self.config.fp8_recipe}."
+                    f"{self.__class__.__name__} requires either FP8 or FP4 to be enabled."
                 )
         return self._fused_grouped_swiglu_recipe
 
