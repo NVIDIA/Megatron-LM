@@ -35,6 +35,15 @@ from megatron.core.transformer.moe.fused_a2a import (
     new_nccl_ep_buffer,
     set_deepep_num_sms,
 )
+from megatron.core.transformer.moe.replica_planner import (
+    HybridEPReplicaWeightBridge,
+    ReplicaPlannerWorkspace,
+    plan_replica_routes,
+    start_replica_grad_reduce_after_expert_backward,
+    start_replica_weight_prefetch_before_combine_backward,
+    wait_replica_grad_reduce_after_dispatch_backward,
+    wait_replica_weight_prefetch_before_expert_backward,
+)
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -59,6 +68,26 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_replica_rank_layout(
+    group: torch.distributed.ProcessGroup,
+    *,
+    num_tokens: int,
+    hidden_dim: int,
+    backend_name: str,
+) -> None:
+    """Validate the fixed input shape required by the CUDA-graph-safe planner."""
+    world_size = torch.distributed.get_world_size(group=group)
+    rank_metadata = [None] * world_size
+    torch.distributed.all_gather_object(
+        rank_metadata, (num_tokens, hidden_dim), group=group
+    )
+    if any(metadata != rank_metadata[0] for metadata in rank_metadata):
+        raise ValueError(
+            f"{backend_name} requires equal local token counts and hidden dimensions across "
+            f"its communication group, got {rank_metadata}."
+        )
 
 
 class MoETokenDispatcher:
@@ -95,6 +124,10 @@ class MoETokenDispatcher:
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = []
         self.valid_cudagraph_attrs = None
+
+    def set_experts(self, experts) -> None:
+        """Bind the expert module when a dispatcher backend needs runtime expert state."""
+        del experts
 
     @abstractmethod
     def dispatch_preprocess(
@@ -1047,6 +1080,7 @@ class _HybridEPManager(_DispatchManager):
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
+        self.token_indices: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
         # Used for padding the output for each expert
@@ -1066,6 +1100,7 @@ class _HybridEPManager(_DispatchManager):
         self._padded_num_tokens: Optional[int] = None
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        self.token_indices = None
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
 
@@ -1151,7 +1186,7 @@ class _HybridEPManager(_DispatchManager):
             hybrid_ep_dispatch(
                 x=hidden_states,
                 routing_map=self.routing_map,
-                probs=self.token_probs,
+                probs=self.token_probs if self.token_indices is None else None,
                 group=self.group,
                 num_local_experts=self.num_local_experts,
                 num_sms_dispatch_api=self.config.moe_flex_dispatcher_num_sms,
@@ -1162,6 +1197,9 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
                 fused=self.config.moe_permute_fusion_into_hybridep,
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
+                topk_idx=self.token_indices,
+                topk_weights=self.token_probs if self.token_indices is not None else None,
+                num_experts=self.num_experts if self.token_indices is not None else None,
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
@@ -1220,6 +1258,270 @@ class _HybridEPManager(_DispatchManager):
         Get the number of tokens per expert.
         '''
         return self.tokens_per_expert
+
+
+class _ReplicaPlanLifetime(torch.autograd.Function):
+    """Retain a replica plan until the activation-dispatch backward completes."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, token_probs, fc1_parameter, fc2_parameter, manager):
+        del token_probs, fc1_parameter, fc2_parameter
+        ctx.manager = manager
+        return hidden_states
+
+    @staticmethod
+    def backward(ctx, grad_hidden_states):
+        ctx.manager._replica_plan_in_use = False
+        ctx.manager._replica_lifetime_tracked = False
+        return grad_hidden_states, None, None, None, None
+
+
+class _ReplicaPlannedManagerMixin:
+    """Replica planning and asynchronous weight lifecycle for a transport manager."""
+
+    def _init_replica_planner(
+        self,
+        *,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        num_experts: int,
+        backend_name: str,
+    ) -> None:
+        world_size = torch.distributed.get_world_size(group=group)
+        if int(num_experts) != world_size * int(num_local_experts):
+            raise ValueError(
+                f"{backend_name} requires an even expert distribution: "
+                f"num_experts={num_experts}, world_size={world_size}, "
+                f"num_local_experts={num_local_experts}."
+            )
+        self._replica_backend_name = backend_name
+        self.semantic_num_experts = int(num_experts)
+        self.num_owned_experts = int(num_local_experts)
+        self.num_slots = self.num_owned_experts
+        self.semantic_token_probs: Optional[torch.Tensor] = None
+        self.semantic_token_indices: Optional[torch.Tensor] = None
+        self.semantic_tokens_per_expert: Optional[torch.Tensor] = None
+        self._bridge: Optional[HybridEPReplicaWeightBridge] = None
+        self._planner_num_tokens: Optional[int] = None
+        self._replica_planner_workspace: Optional[ReplicaPlannerWorkspace] = None
+        self._plan = None
+        self._replica_plan_in_use = False
+        self._replica_lifetime_tracked = False
+
+    def bind_experts(self, experts) -> None:
+        """Bind the dispatcher-independent runtime weights to the expert MLP."""
+        self._bridge = HybridEPReplicaWeightBridge(
+            experts=experts,
+            group=self.group,
+            num_experts=self.semantic_num_experts,
+            num_local_experts=self.num_owned_experts,
+            num_sms=self.config.moe_flex_dispatcher_num_sms,
+            num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
+            num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+            num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
+        )
+        experts.set_replica_weight_bridge(self._bridge)
+
+    def _ensure_replica_planner_shape(self, hidden_states: torch.Tensor) -> None:
+        if self._bridge is None:
+            raise RuntimeError(
+                f"{self._replica_backend_name} experts must be bound before the first dispatch."
+            )
+        num_tokens = int(hidden_states.shape[0])
+        if self._planner_num_tokens is not None:
+            if num_tokens != self._planner_num_tokens:
+                raise ValueError(
+                    f"{self._replica_backend_name} requires a fixed local token count: "
+                    f"initialized with {self._planner_num_tokens}, got {num_tokens}."
+                )
+            return
+        _validate_replica_rank_layout(
+            self.group,
+            num_tokens=num_tokens,
+            hidden_dim=int(hidden_states.shape[1]),
+            backend_name=self._replica_backend_name,
+        )
+        self._planner_num_tokens = num_tokens
+
+    def _start_replica_weight_prefetch(self, plan) -> None:
+        self._bridge.last_plan = plan
+        self._bridge.prepare_source_weights()
+        self._bridge.start_prefetch(plan)
+
+    def _prepare_replica_plan(self, hidden_states: torch.Tensor):
+        if self._replica_plan_in_use:
+            raise RuntimeError(
+                f"{self._replica_backend_name}'s fixed planner workspace is retained by an "
+                "outstanding forward. This path supports one in-flight forward per layer."
+            )
+        if self._plan is not None:
+            raise RuntimeError(
+                f"{self._replica_backend_name} dispatch requires the previous dispatch to "
+                "be combined first."
+            )
+        if self.semantic_token_indices is None or self.semantic_tokens_per_expert is None:
+            raise RuntimeError(
+                f"{self._replica_backend_name} routing metadata was not initialized."
+            )
+        self._ensure_replica_planner_shape(hidden_states)
+        if self._replica_planner_workspace is None:
+            self._replica_planner_workspace = ReplicaPlannerWorkspace.allocate(
+                num_tokens=int(self.semantic_token_indices.shape[0]),
+                router_topk=int(self.semantic_token_indices.shape[1]),
+                num_experts=self.semantic_num_experts,
+                ep_size=torch.distributed.get_world_size(group=self.group),
+                device=self.semantic_token_indices.device,
+            )
+        self._plan = plan_replica_routes(
+            self.semantic_token_indices,
+            self.semantic_tokens_per_expert,
+            self.group,
+            self._replica_planner_workspace,
+            on_placement_ready=self._start_replica_weight_prefetch,
+        )
+        self._replica_plan_in_use = True
+        self._replica_lifetime_tracked = False
+        return self._plan
+
+    def _wrap_replica_dispatch_output(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
+        return start_replica_grad_reduce_after_expert_backward(
+            dispatched_hidden, self._bridge, self._plan
+        )
+
+    def _wrap_replica_dispatch_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not torch.is_grad_enabled():
+            return hidden_states
+        hidden_states = _ReplicaPlanLifetime.apply(
+            hidden_states,
+            self.semantic_token_probs,
+            *self._bridge.source_parameters,
+            self,
+        )
+        self._replica_lifetime_tracked = hidden_states.requires_grad
+        return wait_replica_grad_reduce_after_dispatch_backward(
+            hidden_states, self._bridge, self._plan
+        )
+
+    def _wrap_replica_combine_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._plan is None:
+            raise RuntimeError(
+                f"{self._replica_backend_name} combine requires a matching dispatch plan."
+            )
+        return wait_replica_weight_prefetch_before_expert_backward(
+            hidden_states, self._bridge, self._plan
+        )
+
+    def _wrap_replica_combine_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not torch.is_grad_enabled() or not hidden_states.requires_grad:
+            return hidden_states
+        return start_replica_weight_prefetch_before_combine_backward(
+            hidden_states, self._bridge, self._plan
+        )
+
+    def _finish_replica_plan(self) -> None:
+        self._plan = None
+        if not self._replica_lifetime_tracked:
+            self._replica_plan_in_use = False
+
+
+class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
+    """Deterministically replica-planned routes transported by HybridEP."""
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ):
+        if hybrid_ep_dispatch is None:
+            raise ImportError(
+                "HybridEP is unavailable. The 'replica_hybridep' backend requires "
+                "a DeepEP build with HybridEP support."
+            )
+        world_size = torch.distributed.get_world_size(group=group)
+        _HybridEPManager.__init__(
+            self,
+            group=group,
+            num_local_experts=2 * int(num_local_experts),
+            num_experts=world_size * 2 * int(num_local_experts),
+            config=config,
+        )
+        self.router_topk = int(router_topk)
+        self._init_replica_planner(
+            group=group,
+            num_local_experts=num_local_experts,
+            num_experts=num_experts,
+            backend_name="Replica-HybridEP",
+        )
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        num_tokens = int(routing_map.shape[0])
+        semantic_probs = probs.reshape(num_tokens, self.semantic_num_experts)
+        self.semantic_token_probs, self.semantic_token_indices = torch.topk(
+            semantic_probs, self.router_topk, dim=-1
+        )
+        self.semantic_token_indices = self.semantic_token_indices.to(torch.int32)
+        self.semantic_tokens_per_expert = torch.zeros(
+            self.semantic_num_experts, dtype=torch.int32, device=semantic_probs.device
+        )
+        self.semantic_tokens_per_expert.scatter_add_(
+            0,
+            self.semantic_token_indices.reshape(-1).to(torch.int64),
+            torch.ones_like(self.semantic_token_indices.reshape(-1), dtype=torch.int32),
+        )
+        self.num_local_tokens = num_tokens
+        self.token_indices = None
+        self.token_probs = self.semantic_token_probs
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        plan = self._prepare_replica_plan(hidden_states)
+        self.token_indices = plan.virtual_experts
+        self.token_probs = self.semantic_token_probs
+        self.routing_map = None
+        self._original_num_tokens = self.num_local_tokens
+        self._padded_num_tokens = self.num_local_tokens
+        budget = int(
+            self.num_local_tokens * self.router_topk * self.moe_expert_rank_capacity_factor
+        )
+        alignment = get_align_size_for_quantization(self.config)
+        if alignment > 1:
+            budget += -budget % alignment
+        self.num_permuted_tokens = budget
+        hidden_states = self._wrap_replica_dispatch_input(hidden_states)
+        dispatched_hidden = _HybridEPManager.dispatch(
+            self,
+            hidden_states,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        return self._wrap_replica_dispatch_output(dispatched_hidden)
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        hidden_states = self._wrap_replica_combine_input(hidden_states)
+        hidden_states = _HybridEPManager.combine(
+            self,
+            hidden_states,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        hidden_states = self._wrap_replica_combine_output(hidden_states)
+        self.token_indices = None
+        self.token_probs = None
+        self.routing_map = None
+        self._finish_replica_plan()
+        return hidden_states
 
 
 class _DeepepManager(_DispatchManager):
@@ -1850,6 +2152,15 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
+        elif self.config.moe_flex_dispatcher_backend == "replica_hybridep":
+            self._comm_manager = _ReplicaHybridEPManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "ncclep":
             assert self.tp_size * self.ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
             self._comm_manager = _NCCLEPManager(
@@ -1863,8 +2174,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
+                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, "
+                "replica_hybridep, or ncclep"
             )
+
+    def set_experts(self, experts) -> None:
+        """Bind expert parameters for backends with dispatcher-owned runtime weights."""
+        super().set_experts(experts)
+        bind_experts = getattr(self._comm_manager, "bind_experts", None)
+        if bind_experts is not None:
+            bind_experts(experts)
 
     def get_expert_zero_copy_buffers(self):
         """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the
