@@ -44,6 +44,19 @@ The fused TV kernel supports FP16, BF16, and FP32 logits. Softmax statistics,
 vocabulary reductions, and the TV and prefix loss outputs use FP32; draft-logit
 gradients are returned in the draft logits' dtype.
 
+## Sequence-Roll Alignment
+
+MTP reuses an immutable sequence-roll context to align input tokens, learned
+positions, padding masks, labels, and loss masks at absolute prediction offsets.
+Supported local, contiguous packed CP, and scheduler-certified one-hop zigzag or
+dynamic CP layouts share their alignment geometry. Unsupported layouts retain
+the existing cumulative-roll implementation for the complete consumer field group.
+
+Under sequence parallelism, GPT and Hybrid models preserve the unsharded padding
+mask for alignment while decoder and MTP routing consume their TP-local masks.
+The E2E-TV path reads addressed target rows directly from the source logits and
+their compact communication halo instead of materializing a full-vocabulary roll.
+
 ## Pipeline Parallel Layout for MTP
 
 MTP supports user-defined placement of MTP layers across pipeline stages through `pipeline_model_parallel_layout`. By default, all MTP layers sit on the last pipeline stage; you can override placement in the layout string.
@@ -74,4 +87,5 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 
 ## Unsupported Combinations
 
-Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
+Arbitrary `AttnMaskType` is not supported with MTP. Sequence layouts that cannot
+use absolute row addressing retain the cumulative-roll fallback.
