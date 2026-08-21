@@ -43,6 +43,12 @@ class Qwen35VLModel(MultimodalModel):
         mtp_block_spec: Optional MTP block spec.
         parallel_output: Keep outputs split across TP.
         share_embeddings_and_output_weights: Tie embeddings.
+        pre_process: First PP stage flag — build the embedding and the
+            vision encoder here.
+        post_process: Last PP stage flag — build the output layer and
+            compute loss here.
+        vp_stage: Virtual pipeline stage index, or ``None`` when VPP is
+            disabled (selects the non-VPP ``is_pipeline_*_stage`` path).
     """
 
     def __init__(
@@ -60,6 +66,9 @@ class Qwen35VLModel(MultimodalModel):
         mtp_block_spec: ModuleSpec = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: Optional[int] = None,
     ):
         if vision_spec is None:
             vision_spec = get_qwen35_vl_vision_spec()
@@ -68,20 +77,24 @@ class Qwen35VLModel(MultimodalModel):
         self.vision_start_token_id = vision_start_token_id
         self.spatial_merge_size = spatial_merge_size
 
-        vkw = dict(VISION_KWARGS)
-        vkw["spatial_merge_size"] = spatial_merge_size
-        vkw["out_hidden_size"] = language_config.hidden_size
+        # Vision encoder lives on the first PP stage only.
+        if pre_process:
+            vkw = dict(VISION_KWARGS)
+            vkw["spatial_merge_size"] = spatial_merge_size
+            vkw["out_hidden_size"] = language_config.hidden_size
 
-        vision_encoder = Qwen35VLVisionEncoder(
-            config=vision_config,
-            transformer_layer_spec=vision_spec,
-            in_channels=vkw["in_channels"],
-            patch_size=vkw["patch_size"],
-            temporal_patch_size=vkw["temporal_patch_size"],
-            spatial_merge_size=vkw["spatial_merge_size"],
-            out_hidden_size=vkw["out_hidden_size"],
-            max_num_positions=vkw["max_num_positions"],
-        )
+            vision_encoder = Qwen35VLVisionEncoder(
+                config=vision_config,
+                transformer_layer_spec=vision_spec,
+                in_channels=vkw["in_channels"],
+                patch_size=vkw["patch_size"],
+                temporal_patch_size=vkw["temporal_patch_size"],
+                spatial_merge_size=vkw["spatial_merge_size"],
+                out_hidden_size=vkw["out_hidden_size"],
+                max_num_positions=vkw["max_num_positions"],
+            )
+        else:
+            vision_encoder = None
 
         super().__init__(
             language_config=language_config,
@@ -99,6 +112,9 @@ class Qwen35VLModel(MultimodalModel):
             share_embeddings_and_output_weights=(
                 share_embeddings_and_output_weights
             ),
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
         )
 
     def compute_position_ids(
