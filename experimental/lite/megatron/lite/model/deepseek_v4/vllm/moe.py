@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import MoEKernelMetadata
+from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
+    VLLMAlignedNormalDeepEPDispatcher,
+)
 from megatron.lite.model.deepseek_v4.vllm.primitive import (
     block_fp8_linear,
     fixed_route_vjp,
@@ -94,6 +97,8 @@ class _VLLMVisibleExperts(Experts):
 
 class DeepseekV4MoE(LiteDeepseekV4MoE):
 
+    dispatcher_cls = VLLMAlignedNormalDeepEPDispatcher
+
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -121,7 +126,6 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
             ps,
             layer_idx=layer_idx,
             use_deepep=use_deepep,
-            deepep_align_to_low_latency=True,
         )
         self.config = config
         self.ps = ps
@@ -229,7 +233,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
 
         if not self.use_deepep:
             raise NotImplementedError(
-                "MoE requires normal DeepEP transport aligned to low-latency semantics"
+                "MoE requires normal DeepEP transport aligned to rollout route semantics"
             )
         dispatched, tokens_per_expert, permuted_probs = self.dispatcher.dispatch(
             hidden_states,

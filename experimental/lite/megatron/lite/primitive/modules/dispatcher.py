@@ -12,14 +12,6 @@ from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.moe import permute, unpermute
-from megatron.lite.primitive.alignment.deepep_route import (
-    _VLLMEPGatherWithBF16Backward,
-    _compact_route_preserving_metadata_inputs,
-    _deepep_route_handle_received_rows,
-    _scatter_deepep_routes_with_padding,
-    _validate_and_order_route_preserving_outputs,
-)
-
 try:
     import deep_ep  # pyright: ignore[reportMissingImports]
     from deep_ep.utils import EventHandle, EventOverlap  # pyright: ignore[reportMissingImports]
@@ -296,9 +288,7 @@ class TokenDispatcher:
         ps: ParallelState,
         *,
         use_deepep: bool = True,
-        deepep_align_to_low_latency: bool = False,
         moe_permute_fusion: bool | None = None,
-        capacity_factor: float | None = None,
     ):
         self.ps = ps
         self.num_experts = num_experts
@@ -309,12 +299,6 @@ class TokenDispatcher:
         )
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
-        self.deepep_align_to_low_latency = bool(deepep_align_to_low_latency)
-        self.capacity_factor = capacity_factor
-        if self.deepep_align_to_low_latency and ps.ep_size > 1 and not self.use_deepep:
-            raise RuntimeError(
-                "low-latency semantic alignment at EP>1 requires normal DeepEP"
-            )
         if self.use_deepep:
             assert ps.tp_ep_group is not None
             self._deepep_group = ps.tp_ep_group
@@ -361,28 +345,7 @@ class TokenDispatcher:
         hidden_states: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_indices: torch.Tensor,
-        *,
-        router_token_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        # Match slime's _DeepepManager.setup_metadata contract.  The fixed-topk
-        # route path is valid only when neither expert-capacity dropping nor a
-        # router token mask can introduce -1 sentinels.
-        source_fixed_topk_valid = (
-            self.capacity_factor is None and router_token_masks is None
-        )
-        if self.capacity_factor is not None:
-            topk_indices = topk_indices.masked_fill(topk_scores == 0, -1)
-        if router_token_masks is not None:
-            topk_indices = topk_indices.masked_fill(
-                router_token_masks.view(-1, 1), -1
-            )
-        if self.deepep_align_to_low_latency:
-            return self._dispatch_low_latency_aligned(
-                hidden_states,
-                topk_scores,
-                topk_indices,
-                source_fixed_topk_valid=source_fixed_topk_valid,
-            )
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
         if self.use_deepep:
@@ -393,195 +356,11 @@ class TokenDispatcher:
         return dispatched, tpe, sorted_scores
 
     def combine(self, expert_output: torch.Tensor) -> torch.Tensor:
-        if self.deepep_align_to_low_latency:
-            return self._combine_low_latency_aligned(expert_output)
         if self.ep_size <= 1:
             return self._combine_local(expert_output)
         if self.use_deepep:
             return self._combine_deepep(expert_output)
         return self._combine_alltoall(expert_output)
-
-    def _dispatch_low_latency_aligned(
-        self,
-        hidden_states: torch.Tensor,
-        topk_scores: torch.Tensor,
-        topk_indices: torch.Tensor,
-        *,
-        source_fixed_topk_valid: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Normal DeepEP transport with vLLM LL route/layout semantics."""
-
-        if self.use_deepep:
-            self._ensure_deepep_buffer(hidden_states)
-
-        if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
-            raise TypeError("aligned DeepEP requires BF16 [tokens, hidden]")
-        if hidden_states.shape[1] < 16:
-            raise ValueError("aligned DeepEP requires hidden size >= 16")
-        if topk_indices.shape != topk_scores.shape:
-            raise ValueError("top-k IDs and scores must have identical shapes")
-        topk_indices = topk_indices.long().contiguous()
-        topk_scores = topk_scores.float().contiguous()
-
-        if self.ep_size > 1:
-            (
-                received_hidden,
-                received_indices,
-                received_weights,
-                received_per_expert,
-                _,
-            ) = _DeepEPDispatch.apply(
-                self._deepep_group,
-                hidden_states,
-                topk_indices,
-                topk_scores,
-                self.num_experts,
-                False,
-                False,
-            )
-            (
-                route_indices,
-                route_weights,
-                route_fingerprints,
-                source_output_index,
-                source_all_routes_valid,
-            ) = _compact_route_preserving_metadata_inputs(
-                hidden_states,
-                topk_indices,
-                topk_scores,
-                assume_all_routes_valid=source_fixed_topk_valid,
-            )
-            (
-                received_fingerprints,
-                received_route_indices,
-                received_route_weights,
-                _,
-                route_handle,
-                _,
-            ) = _dispatch_deepep_raw(
-                self._deepep_group,
-                route_fingerprints,
-                route_indices,
-                route_weights,
-                self.num_experts,
-                async_finish=False,
-                allocate_on_comm_stream=False,
-            )
-        else:
-            received_hidden = hidden_states
-            received_indices = topk_indices
-            received_weights = topk_scores
-            positions = torch.nonzero(topk_indices >= 0, as_tuple=False)
-            token_rows = positions[:, 0]
-            topk_slots = positions[:, 1]
-            received_fingerprints = hidden_states.detach().narrow(
-                1, 0, 16
-            ).index_select(0, token_rows)
-            received_route_indices = topk_indices[token_rows, topk_slots]
-            received_route_weights = topk_scores[token_rows, topk_slots]
-            route_handle = None
-            source_output_index = torch.arange(
-                topk_indices.numel(), device=topk_indices.device, dtype=torch.long
-            ).reshape_as(topk_indices)
-            source_all_routes_valid = True
-            received_per_expert = torch.bincount(
-                received_route_indices.reshape(-1).long(),
-                minlength=self.num_local_experts,
-            )
-
-        expected_route_count = (
-            _deepep_route_handle_received_rows(route_handle)
-            if route_handle is not None
-            else int((received_indices >= 0).sum().item())
-        )
-        (
-            expert_hidden,
-            expert_probs,
-            output_index,
-            sanitized_indices,
-            _,
-            all_routes_valid,
-            device_tokens_per_expert,
-            positions,
-        ) = _scatter_deepep_routes_with_padding(
-            received_hidden,
-            received_indices,
-            received_weights,
-            received_per_expert,
-            return_route_positions=True,
-            expected_route_count=expected_route_count,
-        )
-        metadata_route_rows = _validate_and_order_route_preserving_outputs(
-            expert_hidden,
-            received_hidden,
-            sanitized_indices,
-            received_weights,
-            output_index,
-            received_fingerprints,
-            received_route_indices.reshape(-1),
-            received_route_weights.reshape(-1),
-            order_outputs=False,
-            route_positions=positions,
-            return_route_rows=True,
-        )
-        self._aligned_received_output_index = output_index
-        self._aligned_received_positions = positions
-        self._aligned_metadata_route_rows = metadata_route_rows
-        self._aligned_route_handle = route_handle
-        self._aligned_source_indices = topk_indices
-        self._aligned_source_weights = topk_scores
-        self._aligned_source_shape = hidden_states.shape
-        self._aligned_source_output_index = source_output_index
-        self._aligned_source_all_routes_valid = source_all_routes_valid
-        self._aligned_device_tokens_per_expert = device_tokens_per_expert
-        self._local_tpe_list = received_per_expert.tolist()
-        return expert_hidden, received_per_expert, expert_probs
-
-    def _combine_low_latency_aligned(
-        self, expert_output: torch.Tensor
-    ) -> torch.Tensor:
-        route_outputs = expert_output.index_select(
-            0, self._aligned_metadata_route_rows
-        )
-        if self.ep_size > 1:
-            # Match Slime's route-preserving DeepEP lifecycle in both training
-            # and forward-only execution: submit combine asynchronously through
-            # the autograd wrapper, then make the current stream wait for the
-            # returned event.  Calling Buffer.combine synchronously only in
-            # no-grad mode leaves a different channel/handle completion order
-            # across pipeline microbatches.
-            source_routes = _DeepEPCombine.apply(
-                self._deepep_group,
-                route_outputs,
-                self._aligned_route_handle,
-                True,
-                False,
-            )
-        else:
-            source_routes = route_outputs
-        output = _VLLMEPGatherWithBF16Backward.apply(
-            source_routes,
-            self._aligned_source_indices,
-            self._aligned_source_weights,
-            self._aligned_source_output_index,
-            True,
-            self._aligned_source_all_routes_valid,
-        )
-        for name in (
-            "_aligned_received_output_index",
-            "_aligned_received_positions",
-            "_aligned_metadata_route_rows",
-            "_aligned_route_handle",
-            "_aligned_source_indices",
-            "_aligned_source_weights",
-            "_aligned_source_shape",
-            "_aligned_source_output_index",
-            "_aligned_source_all_routes_valid",
-            "_aligned_device_tokens_per_expert",
-        ):
-            delattr(self, name)
-        self._local_tpe_list = None
-        return output
 
     def submit_deepep_combine(
         self, expert_output: torch.Tensor, *, allocate_on_comm_stream: bool = False

@@ -17,6 +17,8 @@ class DeepseekV4MoE(nn.Module):
     Allowlist reason: this owns DS4 hash routing wiring, while expert compute stays shared.
     """
 
+    dispatcher_cls = TokenDispatcher
+
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -24,7 +26,6 @@ class DeepseekV4MoE(nn.Module):
         *,
         layer_idx: int,
         use_deepep: bool = False,
-        deepep_align_to_low_latency: bool = False,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -51,12 +52,11 @@ class DeepseekV4MoE(nn.Module):
             if config.n_shared_experts > 0
             else None
         )
-        self.dispatcher = TokenDispatcher(
+        self.dispatcher = self.dispatcher_cls(
             config.n_routed_experts,
             config.hidden_size,
             ps,
             use_deepep=use_deepep,
-            deepep_align_to_low_latency=deepep_align_to_low_latency,
         )
 
     def _build_experts(self, config: DeepseekV4Config, ps: ParallelState) -> nn.Module:

@@ -1,4 +1,4 @@
-"""Normal-DeepEP route alignment for the vLLM low-latency MoE layout.
+"""Normal-DeepEP route alignment for the vLLM rollout MoE layout.
 
 Route ordering follows THUDM/slime a74ae3a0; execution uses vLLM primitives.
 """

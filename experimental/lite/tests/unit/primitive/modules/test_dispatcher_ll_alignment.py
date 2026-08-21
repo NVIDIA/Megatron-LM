@@ -5,6 +5,9 @@ import torch
 
 import megatron.lite.primitive.modules.dispatcher as dispatcher_module
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
+    VLLMAlignedNormalDeepEPDispatcher,
+)
 from megatron.lite.primitive.parallel import ParallelState
 
 
@@ -74,7 +77,6 @@ def test_deepep_buffer_is_created_lazily_at_dispatch(monkeypatch) -> None:
         16,
         types.SimpleNamespace(ep_size=2, tp_ep_group=group),
         use_deepep=True,
-        deepep_align_to_low_latency=True,
     )
     dispatcher._ensure_deepep_buffer(
         torch.zeros(2, 16, dtype=torch.bfloat16)
@@ -93,16 +95,17 @@ def _capture_aligned_dispatch_contract(dispatcher, monkeypatch):
 
     monkeypatch.setattr(
         dispatcher,
-        "_dispatch_low_latency_aligned",
+        "_dispatch_aligned",
         types.MethodType(fake_aligned, dispatcher),
     )
     return captured
 
 
 def test_aligned_dispatch_fixed_topk_contract_matches_slime(monkeypatch) -> None:
-    dispatcher = TokenDispatcher.__new__(TokenDispatcher)
+    dispatcher = VLLMAlignedNormalDeepEPDispatcher.__new__(
+        VLLMAlignedNormalDeepEPDispatcher
+    )
     dispatcher.capacity_factor = None
-    dispatcher.deepep_align_to_low_latency = True
     captured = _capture_aligned_dispatch_contract(dispatcher, monkeypatch)
     hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
     scores = torch.ones(2, 2, dtype=torch.float32)
@@ -115,9 +118,10 @@ def test_aligned_dispatch_fixed_topk_contract_matches_slime(monkeypatch) -> None
 
 
 def test_aligned_dispatch_masks_routes_like_slime(monkeypatch) -> None:
-    dispatcher = TokenDispatcher.__new__(TokenDispatcher)
+    dispatcher = VLLMAlignedNormalDeepEPDispatcher.__new__(
+        VLLMAlignedNormalDeepEPDispatcher
+    )
     dispatcher.capacity_factor = 1.0
-    dispatcher.deepep_align_to_low_latency = True
     captured = _capture_aligned_dispatch_contract(dispatcher, monkeypatch)
     hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
     scores = torch.tensor([[1.0, 0.0], [0.5, 0.5]], dtype=torch.float32)
@@ -228,12 +232,11 @@ def test_ll_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> 
             output[token].copy_(accumulator.to(output.dtype))
 
     monkeypatch.setattr(deep_gemm_utils, "ep_gather", fake_ep_gather)
-    dispatcher = TokenDispatcher(
+    dispatcher = VLLMAlignedNormalDeepEPDispatcher(
         num_experts=2,
         hidden_size=16,
         ps=ParallelState(ep_size=1, ep_rank=0),
         use_deepep=False,
-        deepep_align_to_low_latency=True,
     )
     hidden = torch.stack(
         (

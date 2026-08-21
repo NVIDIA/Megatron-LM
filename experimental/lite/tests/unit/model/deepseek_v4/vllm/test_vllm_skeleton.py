@@ -10,8 +10,13 @@ import torch.nn as nn
 
 from megatron.lite.model import registry
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm import protocol
+from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
+    VLLMAlignedNormalDeepEPDispatcher,
+)
 from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
@@ -42,6 +47,11 @@ def _tiny_config(*, layers: int = 2) -> DeepseekV4Config:
 def test_registry_exposes_vllm_training_runtime() -> None:
     assert registry.resolve_runtime_model_name("deepseek_v4", "vllm") == "deepseek_v4_vllm"
     assert registry.TRAIN_RUNTIME_MODULES["deepseek_v4_vllm"].endswith(".vllm.protocol")
+
+
+def test_vllm_owns_alignment_without_changing_lite_dispatcher() -> None:
+    assert LiteDeepseekV4MoE.dispatcher_cls is TokenDispatcher
+    assert DeepseekV4MoE.dispatcher_cls is VLLMAlignedNormalDeepEPDispatcher
 
 
 def test_r3_uses_contiguous_cp_layout_and_live_actor_weights() -> None:
