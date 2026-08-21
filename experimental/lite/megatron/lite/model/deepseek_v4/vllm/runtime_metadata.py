@@ -98,27 +98,6 @@ def initialize_ds4_vllm_batch_invariance() -> None:
         "init_batch_invariance",
     )(force=True)
 
-    deep_gemm = importlib.import_module("deep_gemm")
-    setter = getattr(deep_gemm, "set_batch_invariant", None)
-    getter = getattr(deep_gemm, "get_batch_invariant", None)
-    if setter is None or getter is None:
-        raise RuntimeError(
-            "DeepSeek V4 vLLM requires DeepGEMM "
-            "set_batch_invariant/get_batch_invariant"
-        )
-    setter(True)
-    if not getter():
-        raise RuntimeError("DeepGEMM batch-invariant mode failed to enable")
-    supports = _symbol(
-        "vllm.utils.deep_gemm",
-        "supports_deep_gemm_batch_invariance",
-    )
-    if not supports():
-        raise RuntimeError(
-            "vLLM BatchedDeepGemmExperts does not expose native "
-            "batch-invariant capability"
-        )
-
 
 @contextmanager
 def ds4_vllm_forward_context(

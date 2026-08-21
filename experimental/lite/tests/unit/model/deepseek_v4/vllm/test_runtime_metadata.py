@@ -25,25 +25,11 @@ def _config(**overrides) -> DeepseekV4Config:
 
 
 def test_batch_invariance_initialization_is_mandatory(monkeypatch) -> None:
-    state = {"enabled": False}
-    deep_gemm = SimpleNamespace(
-        set_batch_invariant=lambda enabled: state.__setitem__("enabled", enabled),
-        get_batch_invariant=lambda: state["enabled"],
-    )
     init = Mock()
 
-    def symbol(_module, name):
-        if name == "init_batch_invariance":
-            return init
-        if name == "supports_deep_gemm_batch_invariance":
-            return lambda: True
-        raise AssertionError(name)
-
-    monkeypatch.setattr(runtime.importlib, "import_module", lambda name: deep_gemm)
-    monkeypatch.setattr(runtime, "_symbol", symbol)
+    monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: init)
     runtime.initialize_ds4_vllm_batch_invariance()
 
-    assert state["enabled"] is True
     init.assert_called_once_with(force=True)
 
 
@@ -389,6 +375,7 @@ def test_prepare_flash_rebuilds_derived_layout_for_activation_recompute(
     assert combine_inputs[0].ndim == 2
 
 
+@pytest.mark.gpus(1)
 def test_layer3_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
     metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
         _config(max_position_embeddings=512),

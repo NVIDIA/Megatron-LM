@@ -215,7 +215,7 @@ def test_deepep_receive_counts_keep_mcore_cpu_contract(monkeypatch) -> None:
     assert counts.tolist() == [3, 5]
 
 
-def test_ll_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> None:
+def test_route_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> None:
     import vllm.model_executor.layers.fused_moe.deep_gemm_utils as deep_gemm_utils
 
     def fake_ep_gather(
@@ -244,8 +244,8 @@ def test_ll_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> 
             torch.full((16,), 2, dtype=torch.bfloat16),
         )
     )
-    # Token 0 deliberately selects expert 0 twice.  Ordinary boolean routing
-    # maps collapse these two slots; LL semantics must retain both.
+    # Token 0 deliberately selects expert 0 twice. Ordinary boolean routing
+    # maps collapse these slots; rollout-aligned routing must retain both.
     indices = torch.tensor([[0, 0], [1, 0]], dtype=torch.int64)
     weights = torch.tensor([[0.25, 0.75], [0.4, 0.6]], dtype=torch.float32)
 
