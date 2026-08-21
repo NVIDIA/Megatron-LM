@@ -229,9 +229,7 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc1") if name is not None else None,
         )
         set_glu_linear_fc1_attributes(
-            self.linear_fc1,
-            self.config.gated_linear_unit,
-            self.config.moe_mlp_glu_interleave_size,
+            self.linear_fc1, self.config.gated_linear_unit, self.config.moe_mlp_glu_interleave_size
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
