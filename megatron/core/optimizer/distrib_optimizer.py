@@ -1758,13 +1758,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 world_tensors = dp_zero_state_dict[gbuf_idx][dtype]
                 world_tensor_keys = world_tensors.keys()
+
+                # world_tensors has bucket-end padding stripped, but param_index_map
+                # indices include bucket-end padding. Track the padding removed before
+                # each bucket so the parameter ranges can be translated accordingly.
+                cumulative_padding_stripped = [0]
+                for bucket in buffer.buckets[:-1]:
+                    bucket_padding = bucket.grad_data.numel() - bucket.numel_unpadded
+                    cumulative_padding_stripped.append(
+                        cumulative_padding_stripped[-1] + bucket_padding
+                    )
+
                 # Note: for NVFP4, param_index_map uses unpacked (full numel)
                 # offsets, which is correct here since optimizer states
                 # (fp32_param, exp_avg, exp_avg_sq) are in unpacked space.
                 for model_param, (
                     param_world_start,
                     param_world_end,
-                    _,
+                    bucket_id,
                 ) in buffer.param_index_map.items():
                     try:
                         sharded_metadata = param_to_sharded_metadata[model_param]
@@ -1780,6 +1791,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Note: replica_id is exactly the same as in the model param
                     replica_id = sharded_metadata.replica_id
 
+                    padding_adjustment = cumulative_padding_stripped[bucket_id]
+                    adjusted_start = param_world_start - padding_adjustment
+                    adjusted_end = param_world_end - padding_adjustment
+
                     tensors = {}
                     for state_key in world_tensor_keys:
                         if state_key == 'step' or state_key == 'numel_unpadded':
@@ -1787,7 +1802,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # specifically and is read from param_groups.
                             # Numel unpadded is not needed.
                             continue
-                        state_ten = world_tensors[state_key][param_world_start:param_world_end]
+                        state_ten = world_tensors[state_key][adjusted_start:adjusted_end]
                         missing_elems_num = (param_world_end - param_world_start) - len(state_ten)
 
                         if missing_elems_num > 0:
