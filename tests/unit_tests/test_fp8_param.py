@@ -226,6 +226,7 @@ class TestFP8Param:
         # Test-only knob: not a model arg, so pop before create_test_args (which asserts every
         # kwarg is a real arg attribute).
         save_at_steps_kw = kwargs.pop("save_at_steps", ())
+        num_steps = kwargs.pop("num_steps", 100)
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -275,6 +276,12 @@ class TestFP8Param:
                 pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
+        if getattr(args, "use_layer_wise_distributed_optimizer", False):
+            has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
+            assert has_param_layout == args.use_layer_wise_param_layout, (
+                "LayerWise test did not enter the requested parameter-layout path: "
+                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
+            )
 
         # Hard coded to use cuda_graph_impl="transformer_engine"
         cuda_graph_impl = "transformer_engine"
@@ -343,7 +350,7 @@ class TestFP8Param:
         # the subsequent training step (regression guard for GTP native-FP8 save corruption).
         save_at_steps = set(save_at_steps_kw or ())
 
-        for i in range(100):
+        for i in range(num_steps):
             if not inference:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
@@ -532,6 +539,7 @@ class TestFP8Param:
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test_with_cuda_graph(tp_size, "blockwise", **kwargs)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -546,6 +554,7 @@ class TestFP8Param:
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -561,7 +570,7 @@ class TestFP8Param:
             "overlap_param_gather": dp_overlap[0],
             "overlap_grad_reduce": dp_overlap[1],
             "num_layers": 4,
-            "vocal_size": 128800,
+            "padded_vocab_size": 128800,
             "hidden_size": 128,
             "num_attention_heads": 8,
             "expert_model_parallel_size": 2,
@@ -576,6 +585,7 @@ class TestFP8Param:
         }
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
@@ -586,6 +596,7 @@ class TestFP8Param:
         kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
         self.run_test_with_eval_transition(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
