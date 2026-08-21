@@ -39,6 +39,18 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
+def test_post_wrap_assign_true_load_raises(distributed_setup):
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    checkpoint = nn.Linear(4, 4, bias=False, device=device).state_dict()
+    model = nn.Linear(4, 4, bias=False, device=device)
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    with pytest.raises(RuntimeError, match=r"load_state_dict\(assign=True\)"):
+        model.load_state_dict(checkpoint, assign=True)
+
+
 def _build_sharded(
     mesh: DeviceMesh, device: torch.device, *, param_dtype: torch.dtype, zero_init: bool
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
