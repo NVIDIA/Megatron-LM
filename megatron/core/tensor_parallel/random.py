@@ -711,6 +711,15 @@ class CheckpointFunction(torch.autograd.Function):
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
 
+        # Release the recomputation-leaf gradients: they were harvested into
+        # `grads` above, but the detached leaves can outlive this call (e.g.
+        # kept alive by saved-variable references from the recomputation
+        # subgraph), retaining a stale copy of the segment's input gradients
+        # across iterations.
+        for inp in detached_inputs:
+            if isinstance(inp, torch.Tensor):
+                inp.grad = None
+
         _unset_checkpointing()
         return (None, None) + grads
 
