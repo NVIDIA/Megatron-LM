@@ -172,7 +172,7 @@ def test_cp1_forward_inputs_use_shared_packing_and_roll_targets() -> None:
 
 def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
     captured = {}
-    monkeypatch.setattr(protocol, "init_batch_invariance", lambda **_kwargs: None)
+    monkeypatch.setattr(protocol, "init_batch_invariance", lambda: None)
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
     monkeypatch.setattr(
         protocol,
@@ -224,7 +224,7 @@ def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
         captured["wrapped"] = chunks[0]
         return None, None, None, "dist_opt"
 
-    monkeypatch.setattr(protocol, "init_batch_invariance", lambda **_kwargs: None)
+    monkeypatch.setattr(protocol, "init_batch_invariance", lambda: None)
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
     monkeypatch.setattr(protocol, "build_training_backend", fake_build_training_backend)
     monkeypatch.setitem(sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object()))

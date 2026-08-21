@@ -176,7 +176,7 @@ def _prepare_cp_forward_inputs(
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     _validate_contract(model_cfg, impl_cfg)
-    init_batch_invariance(force=True)
+    init_batch_invariance()
     from megatron.lite.model.deepseek_v4.vllm.model import (
         DeepseekV4Layer,
         DeepseekV4Model,
