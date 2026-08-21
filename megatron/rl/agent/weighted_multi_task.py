@@ -252,8 +252,7 @@ class WeightedMultiTask(
         ]
 
     async def prepare_group_rollout(
-        self,
-        request: GroupedRolloutRequest,
+        self, request: GroupedRolloutRequest, *, problem_state: dict | None = None
     ) -> GroupRolloutParams:
         raise NotImplementedError(
             "WeightedMultiTask only routes; the pipeline prepares each group via the "
