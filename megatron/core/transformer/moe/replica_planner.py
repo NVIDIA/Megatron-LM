@@ -191,45 +191,69 @@ class ReplicaPlannerWorkspace:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ReplicaProjectionSpec:
+    """Optimizer parameters and one CUDA storage tensor per local expert."""
+
+    parameters: tuple[torch.nn.Parameter, ...]
+    source_tensors: tuple[torch.Tensor, ...]
+    member_shape: tuple[int, int]
+
+
+def _parameter_storage(parameter: torch.nn.Parameter) -> torch.Tensor:
+    """Return the BF16 storage used by a TE parameter, including tensor subclasses."""
+    rowwise_data = getattr(parameter, "rowwise_data", None)
+    return rowwise_data if rowwise_data is not None else parameter.data
+
+
 def _collect_replica_projection_specs(
     experts: torch.nn.Module, *, num_local_experts: int, backend_name: str
-) -> tuple[
-    list[tuple[torch.nn.Parameter, torch.Tensor, tuple[int, int]]], torch.device
-]:
-    """Validate the two contiguous grouped parameters used by the shared bridge."""
+) -> tuple[list[_ReplicaProjectionSpec], torch.device]:
+    """Collect either packed or independently allocated TE expert weights."""
     projection_specs = []
     device: torch.device | None = None
     for linear in (experts.linear_fc1, experts.linear_fc2):
-        parameter = dict(linear.named_parameters(recurse=False)).get("weight")
-        if parameter is None:
-            raise ValueError(
-                f"{backend_name} weights require one contiguous grouped weight parameter. "
-                "Ensure moe_single_grouped_weight=True and "
-                "NVTE_GROUPED_LINEAR_SINGLE_PARAM is not explicitly disabled."
-            )
-        rowwise_data = getattr(parameter, "rowwise_data", None)
-        if rowwise_data is None or rowwise_data.dtype != torch.bfloat16:
-            raise ValueError(
-                f"{backend_name} weights require BF16 moe_single_grouped_weight parameters "
-                "with contiguous rowwise_data."
-            )
         member_shape = (int(linear.out_features), int(linear.in_features))
-        expected_numel = num_local_experts * math.prod(member_shape)
-        if rowwise_data.numel() != expected_numel or not rowwise_data.is_contiguous():
-            raise ValueError(
-                f"{backend_name} grouped parameter storage has an unexpected layout: expected "
-                f"{num_local_experts}x{member_shape}, got numel={rowwise_data.numel()}, "
-                f"contiguous={rowwise_data.is_contiguous()}."
+        expected_numel = math.prod(member_shape)
+        if getattr(linear, "single_grouped_weight", False):
+            parameters = (linear.get_parameter("weight"),)
+            storage = _parameter_storage(parameters[0])
+            if storage.numel() != num_local_experts * expected_numel:
+                raise ValueError(
+                    f"{backend_name} grouped parameter storage has an unexpected layout: "
+                    f"expected {num_local_experts}x{member_shape}, got numel={storage.numel()}."
+                )
+            source_tensors = tuple(storage.view(num_local_experts, *member_shape))
+        else:
+            parameters = tuple(
+                linear.get_parameter(f"weight{index}") for index in range(num_local_experts)
             )
-        if device is None:
-            device = rowwise_data.device
-        elif rowwise_data.device != device:
-            raise ValueError(
-                f"{backend_name} FC1 and FC2 weights must share one device."
+            source_tensors = tuple(_parameter_storage(parameter) for parameter in parameters)
+
+        for index, source in enumerate(source_tensors):
+            if source.dtype != torch.bfloat16 or source.numel() != expected_numel:
+                raise ValueError(
+                    f"{backend_name} weights require contiguous BF16 tensors with shape "
+                    f"{member_shape}; expert {index} has dtype={source.dtype}, "
+                    f"numel={source.numel()}."
+                )
+            if not source.is_contiguous():
+                raise ValueError(
+                    f"{backend_name} expert weight {index} must have contiguous storage."
+                )
+            if device is None:
+                device = source.device
+            elif source.device != device:
+                raise ValueError(f"{backend_name} FC1 and FC2 weights must share one device.")
+        projection_specs.append(
+            _ReplicaProjectionSpec(
+                parameters=parameters,
+                source_tensors=source_tensors,
+                member_shape=member_shape,
             )
-        projection_specs.append((parameter, rowwise_data, member_shape))
+        )
     if device is None or device.type != "cuda":
-        raise ValueError(f"{backend_name} grouped weights must be CUDA tensors.")
+        raise ValueError(f"{backend_name} expert weights must be CUDA tensors.")
     return projection_specs, device
 
 
@@ -238,14 +262,18 @@ class _CuTeDSLReplicaProjection:
     """One registered projection and its virtual symmetric-memory views."""
 
     parameter: torch.nn.Parameter
+    parameters: tuple[torch.nn.Parameter, ...]
+    source_tensors: tuple[torch.Tensor, ...]
+    source_bases: torch.Tensor
+    main_grad_bases: torch.Tensor
     member_shape: tuple[int, int]
     member_numel: int
     virtual_weight: torch.Tensor
     virtual_grad: torch.Tensor
-    dummy_grad: torch.Tensor
+    dummy_grads: tuple[torch.Tensor, ...]
     runtime_parameters: tuple[torch.nn.Parameter, ...] | None = None
-    source_data_ptr: int | None = None
-    source_main_grad_ptr: int | None = None
+    source_data_ptrs: tuple[int, ...] | None = None
+    source_main_grad_ptrs: tuple[int, ...] | None = None
 
 
 class _ReplicaCuTeDSLWorkspace:
@@ -484,7 +512,7 @@ class ReplicaCuTeDSLWeightBridge:
             num_local_experts=self.num_local_experts,
             backend_name=self._weight_backend_name,
         )
-        member_shapes = tuple(spec[2] for spec in projection_specs)
+        member_shapes = tuple(spec.member_shape for spec in projection_specs)
         self.workspace = _get_replica_cutedsl_workspace(
             group=group,
             device=self.device,
@@ -505,20 +533,29 @@ class ReplicaCuTeDSLWeightBridge:
         self.grad_reduce_ready.record(initialization_stream)
         self.grad_reduce_done.record(initialization_stream)
         self.projections: list[_CuTeDSLReplicaProjection] = []
-        for projection_index, (parameter, rowwise_data, member_shape) in enumerate(
-            projection_specs
-        ):
+        for projection_index, spec in enumerate(projection_specs):
             virtual_weight, virtual_grad = self.workspace.projection_views(
                 projection_index
             )
+            source_bases = torch.empty(
+                self.num_local_experts, dtype=torch.int64, device=self.device
+            )
+            main_grad_bases = torch.empty_like(source_bases)
             self.projections.append(
                 _CuTeDSLReplicaProjection(
-                    parameter=parameter,
-                    member_shape=member_shape,
-                    member_numel=math.prod(member_shape),
+                    parameter=spec.parameters[0],
+                    parameters=spec.parameters,
+                    source_tensors=spec.source_tensors,
+                    source_bases=source_bases,
+                    main_grad_bases=main_grad_bases,
+                    member_shape=spec.member_shape,
+                    member_numel=math.prod(spec.member_shape),
                     virtual_weight=virtual_weight,
                     virtual_grad=virtual_grad,
-                    dummy_grad=torch.zeros_like(rowwise_data).view(parameter.shape),
+                    dummy_grads=tuple(
+                        _parameter_storage(parameter).new_zeros(parameter.shape)
+                        for parameter in spec.parameters
+                    ),
                 )
             )
         _replica_cutedsl_bridges.add(self)
@@ -544,14 +581,22 @@ class ReplicaCuTeDSLWeightBridge:
         return runtime_parameters
 
     @property
-    def source_parameters(self) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    def source_parameters(self) -> tuple[torch.nn.Parameter, ...]:
         """Return the optimizer-owned FC1 and FC2 parameters."""
-        return self.projections[0].parameter, self.projections[1].parameter
+        return tuple(
+            parameter
+            for projection in self.projections
+            for parameter in projection.parameters
+        )
 
     @property
-    def dummy_grads(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def dummy_grads(self) -> tuple[torch.Tensor, ...]:
         """Return zero gradients used only to trigger registered-parameter hooks."""
-        return self.projections[0].dummy_grad, self.projections[1].dummy_grad
+        return tuple(
+            dummy_grad
+            for projection in self.projections
+            for dummy_grad in projection.dummy_grads
+        )
 
     def prepare_runtime_parameters(self) -> None:
         """Late-bind optimizer storage and validate its subsequent stability.
@@ -562,48 +607,95 @@ class ReplicaCuTeDSLWeightBridge:
         remapping would invalidate captured runtime pointers.
         """
         for projection in self.projections:
-            source = projection.parameter.rowwise_data
-            if projection.source_data_ptr is None:
-                projection.source_data_ptr = source.data_ptr()
-            elif source.data_ptr() != projection.source_data_ptr:
+            if len(projection.parameters) == 1:
+                storage = _parameter_storage(projection.parameters[0])
+                if (
+                    storage.numel() != self.num_local_experts * projection.member_numel
+                    or not storage.is_contiguous()
+                ):
+                    raise ValueError(
+                        "Replica CuTeDSL grouped weight storage must be contiguous and have "
+                        f"{self.num_local_experts * projection.member_numel} elements."
+                    )
+                source_tensors = tuple(
+                    storage.view(self.num_local_experts, *projection.member_shape)
+                )
+                main_grad = getattr(projection.parameters[0], "main_grad", None)
+                if main_grad is None:
+                    raise RuntimeError(
+                        "Replica CuTeDSL weights require gradient-accumulation fusion and an "
+                        "initialized parameter.main_grad buffer."
+                    )
+                main_grad_tensors = tuple(
+                    main_grad.view(self.num_local_experts, *projection.member_shape)
+                )
+            else:
+                source_tensors = tuple(
+                    _parameter_storage(parameter) for parameter in projection.parameters
+                )
+                main_grad_tensors = tuple(
+                    getattr(parameter, "main_grad", None)
+                    for parameter in projection.parameters
+                )
+                if any(main_grad is None for main_grad in main_grad_tensors):
+                    raise RuntimeError(
+                        "Replica CuTeDSL weights require gradient-accumulation fusion and "
+                        "initialized parameter.main_grad buffers."
+                    )
+
+            source_ptrs = []
+            for source in source_tensors:
+                if (
+                    source.dtype != torch.bfloat16
+                    or source.device != self.device
+                    or source.numel() != projection.member_numel
+                    or not source.is_contiguous()
+                ):
+                    raise ValueError(
+                        "Replica CuTeDSL requires contiguous BF16 expert weight storage on the "
+                        f"weight device with {projection.member_numel} elements per expert."
+                    )
+                source_ptrs.append(source.data_ptr())
+            source_ptrs = tuple(source_ptrs)
+            if projection.source_data_ptrs is None:
+                projection.source_data_ptrs = source_ptrs
+                projection.source_bases.copy_(
+                    torch.tensor(source_ptrs, dtype=torch.int64, device=self.device)
+                )
+            elif source_ptrs != projection.source_data_ptrs:
                 raise RuntimeError(
                     "Replica CuTeDSL parameter storage changed after runtime binding; this "
                     "would invalidate CUDA-graph source pointers."
                 )
-            main_grad = getattr(projection.parameter, "main_grad", None)
-            if main_grad is None:
-                raise RuntimeError(
-                    "Replica CuTeDSL weights require gradient-accumulation fusion and an "
-                    "initialized parameter.main_grad buffer."
+
+            main_grad_ptrs = []
+            for main_grad in main_grad_tensors:
+                if (
+                    main_grad.dtype != torch.float32
+                    or main_grad.device != self.device
+                    or main_grad.numel() != projection.member_numel
+                    or not main_grad.is_contiguous()
+                ):
+                    raise ValueError(
+                        "Replica CuTeDSL requires contiguous FP32 registered main-grad buffers "
+                        "on the weight device with one expert's shape."
+                    )
+                main_grad_ptrs.append(main_grad.data_ptr())
+            main_grad_ptrs = tuple(main_grad_ptrs)
+            if projection.source_main_grad_ptrs is None:
+                projection.source_main_grad_ptrs = main_grad_ptrs
+                projection.main_grad_bases.copy_(
+                    torch.tensor(main_grad_ptrs, dtype=torch.int64, device=self.device)
                 )
-            if (
-                main_grad.dtype != torch.float32
-                or main_grad.device != self.device
-                or main_grad.numel() != self.num_local_experts * projection.member_numel
-                or not main_grad.is_contiguous()
-            ):
-                raise ValueError(
-                    "Replica CuTeDSL requires correctly sized, contiguous FP32 registered "
-                    "main-grad buffers on the weight device; got "
-                    f"dtype={main_grad.dtype}, device={main_grad.device}, "
-                    f"numel={main_grad.numel()}, contiguous={main_grad.is_contiguous()}."
-                )
-            if projection.source_main_grad_ptr is None:
-                projection.source_main_grad_ptr = main_grad.data_ptr()
-            elif projection.source_main_grad_ptr != main_grad.data_ptr():
+            elif main_grad_ptrs != projection.source_main_grad_ptrs:
                 raise RuntimeError(
                     "Replica CuTeDSL main-grad storage changed after runtime binding; this "
                     "would invalidate CUDA-graph destination pointers."
                 )
+            projection.source_tensors = source_tensors
             if projection.runtime_parameters is None:
-                native_weights = source.view(
-                    self.num_local_experts, *projection.member_shape
-                )
-                native_grads = main_grad.view(
-                    self.num_local_experts, *projection.member_shape
-                )
                 runtime_parameters = []
-                for weight, grad in zip(native_weights, native_grads):
+                for weight, grad in zip(source_tensors, main_grad_tensors):
                     runtime_parameter = torch.nn.Parameter(weight, requires_grad=True)
                     runtime_parameter.main_grad = grad
                     runtime_parameter.grad_added_to_main_grad = True
@@ -619,12 +711,8 @@ class ReplicaCuTeDSLWeightBridge:
                     runtime_parameters.append(runtime_parameter)
                 projection.runtime_parameters = tuple(runtime_parameters)
             else:
-                expected_weights = tuple(
-                    source.view(self.num_local_experts, *projection.member_shape)
-                ) + tuple(projection.virtual_weight)
-                expected_grads = tuple(
-                    main_grad.view(self.num_local_experts, *projection.member_shape)
-                ) + tuple(projection.virtual_grad)
+                expected_weights = source_tensors + tuple(projection.virtual_weight)
+                expected_grads = main_grad_tensors + tuple(projection.virtual_grad)
                 for runtime_parameter, expected_weight, expected_grad in zip(
                     projection.runtime_parameters, expected_weights, expected_grads
                 ):
@@ -699,7 +787,7 @@ class ReplicaCuTeDSLWeightBridge:
             if not resident:
                 launch_replica_weight_prefetch(
                     sources=tuple(
-                        projection.parameter.rowwise_data
+                        projection.source_bases
                         for projection in self.projections
                     ),
                     arena=self.workspace.weight_arena,
@@ -755,7 +843,7 @@ class ReplicaCuTeDSLWeightBridge:
             launch_replica_grad_reduce(
                 arena=self.workspace.grad_arena,
                 main_grads=tuple(
-                    projection.parameter.main_grad for projection in self.projections
+                    projection.main_grad_bases for projection in self.projections
                 ),
                 peer_bases=self.workspace.grad_handle.buffer_ptrs_dev,
                 signal_bases=self.workspace.grad_handle.signal_pad_ptrs_dev,
@@ -769,7 +857,8 @@ class ReplicaCuTeDSLWeightBridge:
             )
             self.grad_reduce_done.record(self.workspace.grad_stream)
         for projection in self.projections:
-            projection.parameter.grad_added_to_main_grad = True
+            for parameter in projection.parameters:
+                parameter.grad_added_to_main_grad = True
         self._grad_reduce_pending = True
         self._grad_reduce_plan = plan
 
@@ -877,8 +966,8 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
     """Finalize replica gradients after activation-dispatch backward."""
 
     @staticmethod
-    def forward(ctx, hidden_states, fc1_parameter, fc2_parameter, bridge, plan):
-        del fc1_parameter, fc2_parameter
+    def forward(ctx, hidden_states, *args):
+        bridge, plan = args[-2:]
         ctx.bridge = bridge
         ctx.plan = plan
         return hidden_states
@@ -886,8 +975,12 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_hidden_states):
         ctx.bridge.wait_grad_reduce(ctx.plan)
-        dummy_fc1_grad, dummy_fc2_grad = ctx.bridge.dummy_grads
-        return grad_hidden_states, dummy_fc1_grad, dummy_fc2_grad, None, None
+        return (
+            grad_hidden_states,
+            *ctx.bridge.dummy_grads,
+            None,
+            None,
+        )
 
 
 def start_replica_weight_prefetch_before_combine_backward(

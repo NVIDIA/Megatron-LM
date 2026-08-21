@@ -1264,8 +1264,10 @@ class _ReplicaPlanLifetime(torch.autograd.Function):
     """Retain a replica plan until the activation-dispatch backward completes."""
 
     @staticmethod
-    def forward(ctx, hidden_states, token_probs, fc1_parameter, fc2_parameter, manager):
-        del token_probs, fc1_parameter, fc2_parameter
+    def forward(ctx, hidden_states, token_probs, *args):
+        manager = args[-1]
+        ctx.source_parameter_count = len(args) - 1
+        del token_probs
         ctx.manager = manager
         return hidden_states
 
@@ -1273,7 +1275,12 @@ class _ReplicaPlanLifetime(torch.autograd.Function):
     def backward(ctx, grad_hidden_states):
         ctx.manager._replica_plan_in_use = False
         ctx.manager._replica_lifetime_tracked = False
-        return grad_hidden_states, None, None, None, None
+        return (
+            grad_hidden_states,
+            None,
+            *([None] * ctx.source_parameter_count),
+            None,
+        )
 
 
 class _ReplicaPlannedManagerMixin:

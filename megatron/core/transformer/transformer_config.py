@@ -2068,6 +2068,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
 
         if self.moe_flex_dispatcher_backend == "replica_hybridep":
+            if self.moe_expert_rank_capacity_factor is None:
+                self.moe_expert_rank_capacity_factor = 1.0
             replica_errors = []
             if not self.bf16 or self.params_dtype != torch.bfloat16:
                 replica_errors.append("BF16 execution and BF16 parameters")
@@ -2077,8 +2079,6 @@ class TransformerConfig(ModelParallelConfig):
                 replica_errors.append("add_bias_linear=False")
             if not self.moe_grouped_gemm:
                 replica_errors.append("moe_grouped_gemm=True")
-            if not self.moe_single_grouped_weight:
-                replica_errors.append("moe_single_grouped_weight=True")
             if self.moe_single_grouped_bias:
                 replica_errors.append("moe_single_grouped_bias=False")
             if not self.use_transformer_engine_op_fuser:
@@ -2116,9 +2116,7 @@ class TransformerConfig(ModelParallelConfig):
                 replica_errors.append("moe_ffn_hidden_size divisible by 128")
             if self.moe_expert_capacity_factor is not None:
                 replica_errors.append("moe_expert_capacity_factor=None")
-            if self.moe_expert_rank_capacity_factor is None:
-                replica_errors.append("moe_expert_rank_capacity_factor set")
-            elif self.moe_expert_rank_capacity_factor < 1.0:
+            if self.moe_expert_rank_capacity_factor < 1.0:
                 replica_errors.append("moe_expert_rank_capacity_factor>=1.0")
             if self.moe_hybridep_pad_uneven_dispatch_inputs:
                 replica_errors.append("moe_hybridep_pad_uneven_dispatch_inputs=False")

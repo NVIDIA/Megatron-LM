@@ -312,8 +312,8 @@ class _ReplicaWeightPushKernel(_ReplicaBulkKernel):
     @cute.jit
     def __call__(
         self,
-        fc1_source_ptr: cute.Pointer,
-        fc2_source_ptr: cute.Pointer,
+        fc1_source_bases_ptr: cute.Pointer,
+        fc2_source_bases_ptr: cute.Pointer,
         peer_base_ptr: cute.Pointer,
         signal_base_ptr: cute.Pointer,
         experts_ptr: cute.Pointer,
@@ -321,18 +321,14 @@ class _ReplicaWeightPushKernel(_ReplicaBulkKernel):
         rank: Int32,
         stream: cuda.CUstream,
     ):
-        fc1_source = _tensor_1d(
-            fc1_source_ptr, self.num_local_experts * self.fc1_member_numel
-        )
-        fc2_source = _tensor_1d(
-            fc2_source_ptr, self.num_local_experts * self.fc2_member_numel
-        )
+        fc1_source_bases = _tensor_1d(fc1_source_bases_ptr, self.num_local_experts)
+        fc2_source_bases = _tensor_1d(fc2_source_bases_ptr, self.num_local_experts)
         peer_bases = _tensor_1d(peer_base_ptr, self.world_size)
         signal_bases = _tensor_1d(signal_base_ptr, self.world_size)
         experts = _tensor_1d(experts_ptr, self.world_size * self.num_local_experts)
         self.kernel(
-            fc1_source,
-            fc2_source,
+            fc1_source_bases,
+            fc2_source_bases,
             peer_bases,
             signal_bases,
             experts,
@@ -349,8 +345,8 @@ class _ReplicaWeightPushKernel(_ReplicaBulkKernel):
     @cute.kernel
     def kernel(
         self,
-        fc1_source: cute.Tensor,
-        fc2_source: cute.Tensor,
+        fc1_source_bases: cute.Tensor,
+        fc2_source_bases: cute.Tensor,
         peer_bases: cute.Tensor,
         signal_bases: cute.Tensor,
         experts: cute.Tensor,
@@ -429,16 +425,22 @@ class _ReplicaWeightPushKernel(_ReplicaBulkKernel):
                 member_chunk = work // active_count[0]
                 active = work - member_chunk * active_count[0]
                 owner_expert = owner_experts[active]
-                source = fc1_source.iterator
-                member_numel = cutlass.const_expr(self.fc1_member_numel)
+                source = cute.make_ptr(
+                    BFloat16,
+                    fc1_source_bases[owner_expert],
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
                 projection_chunk = member_chunk
                 if member_chunk >= self.fc1_member_chunks:
-                    source = fc2_source.iterator
-                    member_numel = cutlass.const_expr(self.fc2_member_numel)
+                    source = cute.make_ptr(
+                        BFloat16,
+                        fc2_source_bases[owner_expert],
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
                     projection_chunk = member_chunk - self.fc1_member_chunks
-                source_offset = Int64(owner_expert) * member_numel + Int64(
-                    projection_chunk * self.CHUNK_ELEMENTS
-                )
+                source_offset = Int64(projection_chunk * self.CHUNK_ELEMENTS)
                 load_pipe.producer_acquire(load_state)
                 stage = stage_smem[(None, load_state.index)]
                 _bulk_load_copy(
@@ -523,8 +525,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
     def __call__(
         self,
         arena_ptr: cute.Pointer,
-        fc1_main_grad_ptr: cute.Pointer,
-        fc2_main_grad_ptr: cute.Pointer,
+        fc1_main_grad_bases_ptr: cute.Pointer,
+        fc2_main_grad_bases_ptr: cute.Pointer,
         peer_base_ptr: cute.Pointer,
         signal_base_ptr: cute.Pointer,
         experts_ptr: cute.Pointer,
@@ -535,19 +537,19 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         fc1_numel = cutlass.const_expr(self.num_local_experts * self.fc1_member_numel)
         fc2_numel = cutlass.const_expr(self.num_local_experts * self.fc2_member_numel)
         arena = _tensor_1d(arena_ptr, fc1_numel + fc2_numel)
-        fc1_main_grad = _tensor_1d(
-            fc1_main_grad_ptr, self.num_local_experts * self.fc1_member_numel
+        fc1_main_grad_bases = _tensor_1d(
+            fc1_main_grad_bases_ptr, self.num_local_experts
         )
-        fc2_main_grad = _tensor_1d(
-            fc2_main_grad_ptr, self.num_local_experts * self.fc2_member_numel
+        fc2_main_grad_bases = _tensor_1d(
+            fc2_main_grad_bases_ptr, self.num_local_experts
         )
         peer_bases = _tensor_1d(peer_base_ptr, self.world_size)
         signal_bases = _tensor_1d(signal_base_ptr, self.world_size)
         experts = _tensor_1d(experts_ptr, self.world_size * self.num_local_experts)
         self.kernel(
             arena,
-            fc1_main_grad,
-            fc2_main_grad,
+            fc1_main_grad_bases,
+            fc2_main_grad_bases,
             peer_bases,
             signal_bases,
             experts,
@@ -565,8 +567,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
     def kernel(
         self,
         arena: cute.Tensor,
-        fc1_main_grad: cute.Tensor,
-        fc2_main_grad: cute.Tensor,
+        fc1_main_grad_bases: cute.Tensor,
+        fc2_main_grad_bases: cute.Tensor,
         peer_bases: cute.Tensor,
         signal_bases: cute.Tensor,
         experts: cute.Tensor,
@@ -701,17 +703,22 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                         load_pipe.producer_commit(load_state)
                         load_state.advance()
             elif warp == 1:
-                main_destination = _tensor_1d(
-                    fc1_main_grad.iterator
-                    + Int64(projection_work) * self.CHUNK_ELEMENTS,
-                    self.CHUNK_ELEMENTS,
+                main_destination = cute.make_ptr(
+                    Float32,
+                    fc1_main_grad_bases[local_expert],
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
                 )
                 if is_fc2:
-                    main_destination = _tensor_1d(
-                        fc2_main_grad.iterator
-                        + Int64(projection_work) * self.CHUNK_ELEMENTS,
-                        self.CHUNK_ELEMENTS,
+                    main_destination = cute.make_ptr(
+                        Float32,
+                        fc2_main_grad_bases[local_expert],
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
                     )
+                main_destination = _tensor_1d(
+                    main_destination + member_offset, self.CHUNK_ELEMENTS
+                )
                 source_count = Int32(0)
                 for destination in cutlass.range_constexpr(self.world_size):
                     if matches[local_expert * self.world_size + destination] >= Int32(
@@ -843,18 +850,17 @@ def _get_compiled_kernels(
         fc2_member_numel=fc2_member_numel,
         num_sms=num_sms,
     )
-    bf16_ptr = make_ptr(BFloat16, 0, cute.AddressSpace.gmem, assumed_align=16)
     f32_ptr = make_ptr(Float32, 0, cute.AddressSpace.gmem, assumed_align=16)
     i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     i64_ptr = make_ptr(Int64, 0, cute.AddressSpace.gmem, assumed_align=8)
     specifications = (
         (
             _ReplicaWeightPushKernel(**kernel_args),
-            (bf16_ptr, bf16_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr),
+            (i64_ptr, i64_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr),
         ),
         (
             _ReplicaGradReduceKernel(**kernel_args),
-            (f32_ptr, f32_ptr, f32_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr),
+            (f32_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr),
         ),
     )
     stream = cuda.CUstream(0)
@@ -894,6 +900,45 @@ def _runtime_ptr(dtype, tensor_or_address, *, assumed_align: int = 16):
     return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=assumed_align)
 
 
+def _as_pointer_table(
+    tensor: torch.Tensor, num_local_experts: int, *, dtype: torch.dtype
+) -> torch.Tensor:
+    """Return a stable device table containing one data pointer per local expert.
+
+    The public kernel helpers historically accepted one contiguous ``[expert, ...]``
+    tensor.  Replica bridges can now pass an ``int64`` pointer table instead, which
+    also represents TE's independently allocated ``weight0..weightN`` parameters.
+    """
+    if tensor.dtype == torch.int64:
+        if (
+            tensor.device.type != "cuda"
+            or tensor.ndim != 1
+            or tensor.numel() != num_local_experts
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "Replica CuTeDSL pointer tables must be contiguous CUDA int64 tensors "
+                f"with {num_local_experts} entries."
+            )
+        return tensor
+    if (
+        tensor.device.type != "cuda"
+        or tensor.dtype != dtype
+        or tensor.ndim < 2
+        or tensor.shape[0] != num_local_experts
+        or not tensor.is_contiguous()
+    ):
+        raise ValueError(
+            "Replica CuTeDSL sources and main grads must be contiguous CUDA tensors "
+            f"with shape [{num_local_experts}, ...] and dtype {dtype}."
+        )
+    return torch.tensor(
+        [tensor[index].data_ptr() for index in range(num_local_experts)],
+        dtype=torch.int64,
+        device=tensor.device,
+    )
+
+
 def launch_replica_weight_prefetch(
     *,
     sources: tuple[torch.Tensor, torch.Tensor],
@@ -921,9 +966,13 @@ def launch_replica_weight_prefetch(
         device_index,
     )
     stream = cuda.CUstream(torch.cuda.current_stream(arena.device).cuda_stream)
+    source_bases = tuple(
+        _as_pointer_table(source, num_local_experts, dtype=torch.bfloat16)
+        for source in sources
+    )
     push(
-        _runtime_ptr(BFloat16, sources[0]),
-        _runtime_ptr(BFloat16, sources[1]),
+        _runtime_ptr(Int64, source_bases[0], assumed_align=8),
+        _runtime_ptr(Int64, source_bases[1], assumed_align=8),
         _runtime_ptr(Int64, peer_bases, assumed_align=8),
         _runtime_ptr(Int64, signal_bases, assumed_align=8),
         _runtime_ptr(Int32, experts_to_copy),
@@ -960,10 +1009,14 @@ def launch_replica_grad_reduce(
         device_index,
     )
     stream = cuda.CUstream(torch.cuda.current_stream(arena.device).cuda_stream)
+    main_grad_bases = tuple(
+        _as_pointer_table(main_grad, num_local_experts, dtype=torch.float32)
+        for main_grad in main_grads
+    )
     compiled(
         _runtime_ptr(Float32, arena),
-        _runtime_ptr(Float32, main_grads[0]),
-        _runtime_ptr(Float32, main_grads[1]),
+        _runtime_ptr(Int64, main_grad_bases[0], assumed_align=8),
+        _runtime_ptr(Int64, main_grad_bases[1], assumed_align=8),
         _runtime_ptr(Int64, peer_bases, assumed_align=8),
         _runtime_ptr(Int64, signal_bases, assumed_align=8),
         _runtime_ptr(Int32, experts_to_copy),
