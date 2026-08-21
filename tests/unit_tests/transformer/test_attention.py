@@ -549,6 +549,34 @@ def _test_parallel_attention_correctness(
                 if main_grad is not None:
                     main_grad.zero_()
 
+        def assert_param_grad_close(baseline, parallel, tensor_name):
+            try:
+                torch.testing.assert_close(
+                    baseline,
+                    parallel,
+                    atol=atol,
+                    rtol=rtol,
+                    msg=lambda msg: f"Mismatch in {tensor_name}: {msg}",
+                )
+                return
+            except AssertionError as close_error:
+                baseline_flat = baseline.flatten().float()
+                parallel_flat = parallel.flatten().float()
+                cosine_sim = torch.nn.functional.cosine_similarity(
+                    baseline_flat.unsqueeze(0), parallel_flat.unsqueeze(0)
+                ).item()
+                diff_norm = torch.linalg.vector_norm(parallel_flat - baseline_flat)
+                baseline_norm = torch.linalg.vector_norm(baseline_flat).clamp_min(1e-12)
+                relative_l2 = (diff_norm / baseline_norm).item()
+                assert cosine_sim >= 0.9999, (
+                    f"Mismatch in {tensor_name}: cosine similarity {cosine_sim} < 0.9999, "
+                    f"while assert_close failed: {close_error}"
+                )
+                assert relative_l2 <= 0.1, (
+                    f"Mismatch in {tensor_name}: relative L2 {relative_l2} > 0.1, "
+                    f"while assert_close failed: {close_error}"
+                )
+
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention
         zero_param_grads(attention)
@@ -709,7 +737,7 @@ def _test_parallel_attention_correctness(
         if compare_param_grads:
             assert param_grads_baseline.keys() == param_grads_parallel.keys()
             for name, grad_baseline in param_grads_baseline.items():
-                assert_close_or_cosine_similarity(
+                assert_param_grad_close(
                     grad_baseline, param_grads_parallel[name], f"param_grad[{name}]"
                 )
 
