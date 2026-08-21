@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
-from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     pack_grouped_block_fp8_weight,
 )
 
@@ -103,9 +103,7 @@ def _vllm_silu_mul_quant(
     from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 
     scale_format = DeepGemmQuantScaleFMT.from_oracle()
-    # This implementation exists specifically to expose vLLM's BI numerical
-    # contract during training.  Never silently substitute a layout-dependent
-    # activation/quantization kernel when its standalone library is absent.
+    # The alignment kernel is mandatory; never substitute another quantizer.
     del swiglu_limit
     return fused_silu_mul_per_token_group_quant_fp8(
         gate_up,
@@ -128,12 +126,7 @@ def _vllm_grouped_forward(
 
     if hidden_states.shape[0] == 0:
         return hidden_states.new_empty((0, hidden_states.shape[1]))
-    # Slime's BI path deliberately launches contiguous DeepGEMM over at most
-    # four adjacent experts at a time.  Apart from bounding transient packed
-    # weights and activation workspaces, that is the production scheduling
-    # contract under which normal DeepEP is composed with the next layer's
-    # communication.  Keep the same grouping instead of issuing one oversized
-    # launch over every EP-local expert.
+    # Match Slime's bounded groups of four adjacent experts.
     compact_output = hidden_states.new_empty(
         (hidden_states.shape[0], w2[0].shape[0])
     )

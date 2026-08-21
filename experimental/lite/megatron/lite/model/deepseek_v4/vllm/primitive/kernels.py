@@ -21,9 +21,8 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     deep_gemm_fp8_o_proj,
 )
 from vllm.utils.deep_gemm import fp8_gemm_nt
-from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
-from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     quantize_block_fp8_weight,
 )
 
@@ -51,26 +50,8 @@ def insert_qkv(
     *,
     eps: float,
     block_size: int,
-    padded_heads: int | None = None,
-    q_out: Tensor | None = None,
-    **_unused,
+    padded_heads: int,
 ) -> Tensor:
-    if padded_heads is None:
-        raise ValueError("padded_heads is required")
-    if q_out is not None:
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out(
-            q,
-            kv,
-            q_out,
-            cache,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            padded_heads,
-            eps,
-            block_size,
-        )
-        return q_out
     return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q,
         kv,
@@ -81,27 +62,6 @@ def insert_qkv(
         padded_heads,
         eps,
         block_size,
-    )
-
-
-def sparse_attention(
-        q: Tensor,
-        kv: Tensor,
-        indices: Tensor,
-        *,
-        sm_scale: float,
-        attn_sink: Tensor | None = None,
-        topk_length: Tensor | None = None,
-        out: Tensor | None = None,
-    ):
-    return flash_mla_sparse_fwd(
-        q=q,
-        kv=kv,
-        indices=indices,
-        sm_scale=sm_scale,
-        attn_sink=attn_sink,
-        topk_length=topk_length,
-        out=out,
     )
 
 

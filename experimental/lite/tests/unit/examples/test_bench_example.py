@@ -178,44 +178,6 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
     assert result.step_traces[0].grad_norm == 3.5
 
 
-def test_pretrain_session_observes_backward_before_optimizer():
-    from examples.bench.session import PretrainSessionConfig, run_pretrain_session
-
-    events = []
-
-    class ObservedRuntime(_FakeRuntime):
-        def forward_backward(self, handle, data, loss_fn, *, num_microbatches=1):
-            events.append("backward")
-            return super().forward_backward(
-                handle, data, loss_fn, num_microbatches=num_microbatches
-            )
-
-        def optimizer_step(self, handle):
-            events.append("optimizer")
-            return super().optimizer_step(handle)
-
-    handle = ModelHandle(
-        model=object(),
-        optimizer=object(),
-        parallel_state=None,
-        config=type(
-            "Cfg", (), {"model_name": "fake", "impl": "lite", "parallel": ParallelConfig()}
-        )(),
-    )
-
-    run_pretrain_session(
-        ObservedRuntime(),
-        handle,
-        PretrainSessionConfig(steps=1, device="cpu", seq_len=4),
-        data_iter=iter([{}]),
-        post_backward_observer=lambda step, observed_handle, result: events.append(
-            ("observer", step, observed_handle is handle, float(result.model_output.loss))
-        ),
-    )
-
-    assert events == ["backward", ("observer", 0, True, 1.0), "optimizer"]
-
-
 def test_bench_main_writes_dry_run_output_json(tmp_path):
     from examples.bench.bench import main
 

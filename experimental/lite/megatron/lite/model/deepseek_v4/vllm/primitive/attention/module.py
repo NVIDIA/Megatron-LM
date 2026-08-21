@@ -5,9 +5,10 @@ from typing import Callable
 import torch
 from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
 )
@@ -22,15 +23,16 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.attention.metadata import (
 from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import (
     insert_qkv,
     o_projection_visible,
-    sparse_attention,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.linear import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     block_fp8_linear,
     fused_block_fp8_linear,
     visible_linear,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.norm import fused_qkv_rms_norm
-from megatron.lite.model.deepseek_v4.vllm.primitive.o_proj import o_projection
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
+    fused_qkv_rms_norm,
+    o_projection,
+)
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
 from megatron.lite.primitive.parallel import ParallelState
 
@@ -155,13 +157,7 @@ class VLLMAttention(CompressedSparseAttention):
             self._projection_streams,
             enable=True,
         )
-        # ``execute_in_parallel`` establishes the execution dependency with
-        # CUDA events, but the auxiliary outputs were allocated on their
-        # respective streams.  Tell the caching allocator that the current
-        # stream also owns their lifetime before they are consumed below.
-        # Without this, a later allocation can recycle their storage while a
-        # current-stream kernel is still reading it; full launch blocking hid
-        # that race in the RL integration test.
+        # Transfer allocator ownership from the auxiliary streams.
         current_stream = torch.cuda.current_stream(hidden_states.device)
         for output in aux_outputs:
             if isinstance(output, torch.Tensor):
@@ -258,7 +254,7 @@ class VLLMAttention(CompressedSparseAttention):
         from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
             compressed_compact_graph,
         )
-        from megatron.lite.model.deepseek_v4.cp import (
+        from megatron.lite.model.deepseek_v4.vllm.primitive.attention.cp import (
             gather_cp_compressed_rows,
             prepare_cp_compression_geometry,
         )
@@ -436,8 +432,7 @@ class VLLMAttention(CompressedSparseAttention):
         ).view(-1, 1, self.config.head_dim)
         indexer_topk_for_loss = compressed_topk
         if compressed_topk is not None:
-            # vLLM's BI combine canonicalizes the unordered compressed set in
-            # descending logical-index order before appending chronological SWA.
+            # Canonical compressed order followed by chronological SWA.
             compressed_topk = torch.sort(
                 compressed_topk, dim=-1, descending=True
             ).values
@@ -457,9 +452,7 @@ class VLLMAttention(CompressedSparseAttention):
         if topk_length is None:
             raise RuntimeError("DS4 CP index lowering must return lengths")
         if compressed_topk is not None:
-            # MCore's normal selected layout is compact [window | compressed].
-            # vLLM FlashMLA consumes compact [compressed | window], so rotate
-            # only the valid prefix without changing either selected set.
+            # Rotate MCore [window|compressed] into vLLM [compressed|window].
             window_count = torch.minimum(
                 positions + 1,
                 torch.tensor(
@@ -487,10 +480,10 @@ class VLLMAttention(CompressedSparseAttention):
         output_buffer = torch.empty_like(q_visible)
 
         def visible_attention(q_value, kv_value):
-            return sparse_attention(
-                q_value,
-                kv_value,
-                indices,
+            return flash_mla_sparse_fwd(
+                q=q_value,
+                kv=kv_value,
+                indices=indices,
                 sm_scale=scale,
                 attn_sink=sink,
                 topk_length=topk_length,
@@ -548,10 +541,7 @@ class VLLMAttention(CompressedSparseAttention):
             raise ValueError("layer-0 attention requires flat [tokens, hidden]")
         if metadata is None:
             raise NotImplementedError("layer-0 attention requires explicit metadata")
-        # FSDP2 mixed precision recursively casts floating forward inputs,
-        # including tensors nested in this metadata dataclass. FlashMLA's RoPE
-        # kernels require the cache to remain FP32, so restore that boundary
-        # after the FSDP pre-forward hook has run.
+        # FSDP2 may cast nested metadata; FlashMLA requires FP32 RoPE cache.
         if metadata.cos_sin_cache.dtype != torch.float32:
             metadata.cos_sin_cache = metadata.cos_sin_cache.float()
         qr_kv, projection_outputs = self._input_projections(hidden_states)

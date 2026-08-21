@@ -1,41 +1,9 @@
-import types
-
 import torch
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.primitive.parallel import ParallelState
-
-
-def _capture_aligned_dispatch_contract(dispatcher, monkeypatch):
-    captured = {}
-
-    def fake_aligned(self, hidden, scores, indices):
-        captured["indices"] = indices
-        return hidden, torch.empty(0, dtype=torch.int64), scores
-
-    monkeypatch.setattr(
-        dispatcher,
-        "_dispatch_aligned",
-        types.MethodType(fake_aligned, dispatcher),
-    )
-    return captured
-
-
-def test_aligned_dispatch_fixed_topk_contract_matches_slime(monkeypatch) -> None:
-    dispatcher = VLLMAlignedNormalDeepEPDispatcher.__new__(
-        VLLMAlignedNormalDeepEPDispatcher
-    )
-    captured = _capture_aligned_dispatch_contract(dispatcher, monkeypatch)
-    hidden = torch.zeros(2, 16, dtype=torch.bfloat16)
-    scores = torch.ones(2, 2, dtype=torch.float32)
-    indices = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
-
-    dispatcher.dispatch(hidden, scores, indices)
-
-    assert captured["indices"] is indices
-
 
 def test_route_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) -> None:
     import vllm.model_executor.layers.fused_moe.deep_gemm_utils as deep_gemm_utils
@@ -66,8 +34,6 @@ def test_route_alignment_preserves_duplicate_slots_and_fp32_gather(monkeypatch) 
             torch.full((16,), 2, dtype=torch.bfloat16),
         )
     )
-    # Token 0 deliberately selects expert 0 twice. Ordinary boolean routing
-    # maps collapse these slots; rollout-aligned routing must retain both.
     indices = torch.tensor([[0, 0], [1, 0]], dtype=torch.int64)
     weights = torch.tensor([[0.25, 0.75], [0.4, 0.6]], dtype=torch.float32)
 

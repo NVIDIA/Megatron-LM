@@ -1,89 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
-from unittest.mock import Mock
-
 import pytest
 import torch
 from torch import nn
 
-from megatron.lite.model.deepseek_v4.vllm.primitive import kernels as vllm_ds4
 from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import o_projection_visible
-from megatron.lite.model.deepseek_v4 import deployment_block_fp8
-
-
-def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) -> None:
-    calls: list[str] = []
-
-    def cast(weight, **kwargs):
-        calls.append("cast")
-        return weight.to(torch.float8_e4m3fn), torch.ones(
-            weight.shape[0] // 128,
-            weight.shape[1] // 128,
-            dtype=torch.float32,
-        )
-
-    def post_process(**kwargs):
-        calls.append("post")
-        return kwargs["wq"].clone(), kwargs["ws"].to(torch.int32)
-
-    def official(*args, **kwargs):
-        assert not torch.is_inference_mode_enabled()
-        return torch.ones(2, 128, dtype=torch.bfloat16)
-
-    official_mock = Mock(side_effect=official)
-    entries = {
-        ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"): cast,
-        (
-            "vllm.model_executor.layers.quantization.utils.fp8_utils",
-            "deepgemm_post_process_fp8_weight_block",
-        ): post_process,
-        (
-            "vllm.model_executor.layers.quantization.utils.fp8_utils",
-            "per_token_group_quant_fp8",
-        ): lambda value, *args, **kwargs: (
-            value.to(torch.float8_e4m3fn),
-            torch.ones(value.shape[0], 1, dtype=torch.float32),
-        ),
-        ("vllm.envs", "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES"): False,
-        (
-            "vllm.models.deepseek_v4.nvidia.ops.o_proj",
-            "deep_gemm_fp8_o_proj",
-        ): official_mock,
-        (
-            "vllm.models.deepseek_v4.nvidia.ops.o_proj",
-            "compute_fp8_einsum_recipe",
-        ): lambda: ((1, 128, 128), False),
-    }
-    monkeypatch.setattr(vllm_ds4, "deepgemm_post_process_fp8_weight_block", post_process)
-    monkeypatch.setattr(vllm_ds4, "per_token_group_quant_fp8", entries[(
-        "vllm.model_executor.layers.quantization.utils.fp8_utils",
-        "per_token_group_quant_fp8",
-    )])
-    monkeypatch.setattr(vllm_ds4, "deep_gemm_fp8_o_proj", official_mock)
-    monkeypatch.setattr(vllm_ds4, "compute_fp8_einsum_recipe", lambda: ((1, 128, 128), False))
-    monkeypatch.setattr(vllm_ds4.envs, "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", False)
-    monkeypatch.setattr(
-        deployment_block_fp8,
-        "_entry",
-        lambda module, name: entries[(module, name)],
-    )
-    result = o_projection_visible(
-        torch.zeros(2, 2, 128, dtype=torch.bfloat16),
-        torch.arange(2, dtype=torch.int64),
-        torch.ones(8, 64, dtype=torch.float32),
-        nn.Parameter(torch.zeros(128, 256, dtype=torch.bfloat16)),
-        nn.Parameter(torch.zeros(128, 128, dtype=torch.bfloat16)),
-        n_groups=1,
-        heads_per_group=2,
-        nope_dim=64,
-        rope_dim=64,
-        o_lora_rank=128,
-    )
-    assert torch.equal(result, torch.ones_like(result))
-    assert not result.is_inference()
-    assert calls == ["cast", "post", "cast", "post"]
-    official_mock.assert_called_once()
 
 
 @pytest.mark.gpus(1)

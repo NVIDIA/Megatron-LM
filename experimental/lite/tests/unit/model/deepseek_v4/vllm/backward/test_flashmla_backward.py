@@ -16,8 +16,6 @@ def test_real_flashmla_sparse_backward_matches_reference_direction() -> None:
     from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
     torch.manual_seed(37)
-    # Validate the production DS4 training contract.  The earlier five-row
-    # diagnostic is not representative of the required 1024-token sequence.
     sequence, physical_kv, heads, dim, topk = 1024, 1024, 64, 576, 128
     scale = dim**-0.5
     q = (

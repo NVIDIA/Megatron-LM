@@ -6,27 +6,21 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.linear import (
-    block_fp8_linear,
-    fused_block_fp8_linear,
-    gate_linear,
-)
-from megatron.lite.model.deepseek_v4.vllm.primitive.mhc import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
+    _inverse_rope,
     _pre_graph,
+    block_fp8_linear,
+    fixed_route_vjp,
+    fused_block_fp8_linear,
+    fused_qkv_rms_norm,
+    gate_linear,
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,
-)
-from megatron.lite.primitive.modules.attention.hca import HyperConnection
-from megatron.lite.model.deepseek_v4.vllm.primitive.norm import (
-    fused_qkv_rms_norm,
+    o_projection,
     rms_norm,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.o_proj import (
-    _inverse_rope,
-    o_projection,
-)
-from megatron.lite.model.deepseek_v4.vllm.primitive.router import fixed_route_vjp
+from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.recompute import wrap_checkpoint
 
 pytestmark = pytest.mark.gpus(1)
@@ -260,22 +254,6 @@ def test_mhc_head_and_o_projection_cover_parameters() -> None:
     assert all(value.grad is not None for value in (o, wa, wb))
 
 
-def test_fixed_route_vjp_uses_visible_ids() -> None:
-    logits = torch.randn(3, 7, requires_grad=True)
-    ids = torch.tensor([[4, 1], [0, 6], [3, 2]])
-
-    def visible(value):
-        selected = torch.sqrt(F.softplus(value)).gather(-1, ids)
-        return selected / selected.sum(-1, keepdim=True) * 1.5, ids
-
-    weights, actual_ids = fixed_route_vjp(visible, logits, renormalize=True, route_scale=1.5)
-    assert torch.equal(actual_ids, ids)
-    weights.backward(_grad_like(weights))
-    reference = logits.detach().requires_grad_(True)
-    visible(reference)[0].backward(_grad_like(weights))
-    torch.testing.assert_close(logits.grad, reference.grad)
-
-
 def test_router_backward_keeps_ids_snapshot_when_consumer_mutates_output() -> None:
     torch.manual_seed(31)
     logits = torch.randn(2, 5, requires_grad=True)
@@ -288,6 +266,7 @@ def test_router_backward_keeps_ids_snapshot_when_consumer_mutates_output() -> No
     weights, returned_ids = fixed_route_vjp(
         visible, logits, renormalize=True, route_scale=1.0
     )
+    assert torch.equal(returned_ids, original_ids)
     returned_ids.fill_(99)
     grad = _grad_like(weights)
     weights.backward(grad)

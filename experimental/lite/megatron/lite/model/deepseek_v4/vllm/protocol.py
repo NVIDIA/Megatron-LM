@@ -237,15 +237,10 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             recompute_spec,
             MODULE_MAP,
         )
-    # The runtime loads replicated HF tensors through NCCL before the deferred
-    # FSDP2 wrap.  Keep that lifecycle identical to the Lite protocol: masters
-    # must already live on the rank-local CUDA device during checkpoint load.
+    # Load rank-local CUDA masters before the deferred FSDP2 wrap.
     if torch.cuda.is_available():
         model = model.cuda()
-        # The production vLLM GPUWorker creates this process-global manager
-        # before constructing its model runner.  The mLite runtime directly
-        # reuses vLLM sparse-indexer and attention kernels, so it must honor
-        # the same lifecycle even though it does not instantiate GPUWorker.
+        # Official sparse kernels require vLLM's process-global workspace.
         from vllm.v1.worker.workspace import (
             init_workspace_manager,
             is_workspace_manager_initialized,
@@ -289,10 +284,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 forward_inputs=forward_inputs,
             )
 
-    # ``build_training_backend`` replaces this list in-place with Megatron DDP
-    # wrappers for dist-opt (Lite follows the same ownership contract).  Keep
-    # and return that mutated list; returning the raw model would bypass DDP's
-    # grad-accumulation hooks, leaving ``main_grad`` zero while ``.grad`` fills.
+    # dist-opt replaces this list in place with DDP-owned chunks.
     chunks = [model]
     optimizer, finalize_grads, post_model_load_hook, optimizer_backend = (
         build_training_backend(

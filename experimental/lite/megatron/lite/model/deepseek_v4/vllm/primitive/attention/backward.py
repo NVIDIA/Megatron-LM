@@ -21,11 +21,7 @@ def _default_sparse_backward(q, kv, out, grad_out, lse, sink, indices, scale, le
     from megatron.lite.primitive.kernels import dsa_kernels
 
     dsa_kernels._ensure_dsa_namespace()
-    # vLLM keeps the prefill workspace request-major even for batch=1
-    # ([S_kv, 1, D]), while the cuDNN DSA backward API consumes the flattened
-    # logical KV sequence ([total_S_kv, D]).  The query/output side is already
-    # token-major.  Flatten only the singleton/request dimension here so the
-    # visible forward layout remains untouched.
+    # cuDNN backward consumes flattened KV, unlike vLLM's request-major workspace.
     if kv.ndim > 2:
         kv = kv.reshape(-1, kv.shape[-1])
     if indices.ndim == 3 and indices.shape[1] == 1:
@@ -168,12 +164,7 @@ def attach_indexer_aux_loss(
     softmax_scale,
     loss_coeff,
 ):
-    """Attach the established sparse IndexShare loss to visible vLLM output.
-
-    The visible indexer owns selection.  This graph replays exactly those
-    indices and differentiates only the scores on that fixed active set.
-    Attention query/KV targets are detached, matching Lite DSA semantics.
-    """
+    """Differentiate IndexShare scores on the visible fixed active set."""
     from megatron.lite.primitive.kernels.dsa_kernels import cp_indexer_loss
     from megatron.lite.primitive.modules.attention.dsa import (
         DSAIndexerLossAutoScaler,
@@ -259,13 +250,7 @@ def attach_indexer_aux_loss(
 
 
 class _VisibleSparseAttentionFunction(torch.autograd.Function):
-    """Differentiate an official sparse-attention visible invocation.
-
-    Native CP constructs Q and the compact KV workspace as straight-through
-    tensors whose forward values already match vLLM.  This owner therefore
-    needs only the vendor sparse-attention VJP; communication, compaction and
-    projections remain ordinary autograd edges outside the function.
-    """
+    """Attach the vendor VJP to the official sparse-attention value."""
 
     @staticmethod
     def forward(ctx, visible_op, backward_op, scale, q, kv, indices, length, sink):

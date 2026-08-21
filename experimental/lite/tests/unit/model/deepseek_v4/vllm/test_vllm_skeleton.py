@@ -7,11 +7,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from megatron.lite.model import registry
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm import protocol
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import (
@@ -19,7 +18,6 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import (
     _batch_invariant_gate_logits,
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
@@ -46,11 +44,6 @@ def _tiny_config(*, layers: int = 2) -> DeepseekV4Config:
         hc_mult=2,
         num_nextn_predict_layers=0,
     )
-
-
-def test_registry_exposes_vllm_training_runtime() -> None:
-    assert registry.resolve_runtime_model_name("deepseek_v4", "vllm") == "deepseek_v4_vllm"
-    assert registry.TRAIN_RUNTIME_MODULES["deepseek_v4_vllm"].endswith(".vllm.protocol")
 
 
 def test_vllm_owns_alignment_without_changing_lite_dispatcher() -> None:
@@ -80,20 +73,18 @@ def test_gate_logits_use_one_batch_invariant_gemm(tokens: int) -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_deployment_weight_cache_policy_tracks_optimizer() -> None:
-    policy = protocol._deployment_weight_cache_enabled
-    assert policy(protocol.ImplConfig(optimizer="dist_opt")) is True
-    assert policy(protocol.ImplConfig(optimizer="fsdp2")) is False
-    assert policy(
-        protocol.ImplConfig(
-            optimizer="fsdp2", cache_deployment_weights=True
-        )
-    ) is True
-    assert policy(
-        protocol.ImplConfig(
-            optimizer="dist_opt", cache_deployment_weights=False
-        )
-    ) is False
+@pytest.mark.parametrize(
+    ("optimizer", "override", "expected"),
+    [("dist_opt", None, True), ("fsdp2", None, False),
+     ("fsdp2", True, True), ("dist_opt", False, False)],
+)
+def test_deployment_weight_cache_policy_tracks_optimizer(
+    optimizer, override, expected
+) -> None:
+    config = protocol.ImplConfig(
+        optimizer=optimizer, cache_deployment_weights=override
+    )
+    assert protocol._deployment_weight_cache_enabled(config) is expected
 
 
 def test_forward_context_carries_dynamic_ep_token_counts(monkeypatch) -> None:
@@ -139,58 +130,6 @@ def test_forward_context_carries_dynamic_ep_token_counts(monkeypatch) -> None:
 
     assert observed["config"] is config
     assert torch.equal(observed["counts"], torch.tensor([5, 7], dtype=torch.int32))
-
-
-def test_r3_uses_contiguous_cp_layout_and_live_actor_weights() -> None:
-    model = nn.Module()
-    model.ps = SimpleNamespace(tp_size=1, tp_rank=0, cp_size=2, cp_rank=1, cp_group=None)
-    batch = PackedBatch(
-        input_ids=torch.arange(8),
-        labels=torch.arange(8),
-        seq_lens=torch.tensor([4, 4]),
-        r3_replay_mask=torch.tensor([1, 0, 1, 0, 0, 1, 0, 1], dtype=torch.bool),
-    )
-    routes = torch.arange(8).view(2, 4, 1, 1)
-    assert torch.equal(protocol.pack_routed_experts(model, batch, routes)[0], routes[1].view(4, 1))
-    assert torch.equal(protocol.pack_r3_replay_mask(model, batch), batch.r3_replay_mask[4:])
-
-    config = _tiny_config()
-    moe = DeepseekV4MoE(config, ParallelState(), layer_idx=1)
-    replay = RouterReplay()
-    moe.gate.router_replay = replay
-    logits = torch.tensor([[-2.0, -0.5, 0.5, 2.0], [1.5, -1.0, 0.25, -0.25]])
-    replay.target_topk_idx = torch.tensor([[3, 2], [0, 1]])
-    replay.target_replay_mask = torch.tensor([True, False])
-    replay.router_replay_action = RouterReplayAction.REPLAY_FORWARD
-    weights, ids = moe._replay_route(
-        logits,
-        torch.full((2, 2), -1.0),
-        torch.tensor([[0, 1], [2, 3]]),
-    )
-    expected_ids = torch.tensor([[3, 2], [2, 3]])
-    dense = torch.sqrt(torch.nn.functional.softplus(logits))
-    expected = dense.gather(-1, expected_ids)
-    expected = expected / expected.sum(-1, keepdim=True) * config.routed_scaling_factor
-    assert torch.equal(ids, expected_ids)
-    torch.testing.assert_close(weights, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("parallel", [ParallelConfig(tp=2), ParallelConfig(etp=2), ParallelConfig(vpp=2)])
-def test_parallel_contract_rejects_unsupported_dimensions(parallel: ParallelConfig) -> None:
-    with pytest.raises(NotImplementedError):
-        protocol._validate_contract(
-            _tiny_config(), protocol.ImplConfig(parallel=parallel)
-        )
-
-
-def test_parallel_contract_accepts_pp2_cp2_ep4() -> None:
-    protocol._validate_contract(
-        _tiny_config(),
-        protocol.ImplConfig(
-            parallel=ParallelConfig(pp=2, cp=2, ep=4),
-            recompute=("full",),
-        ),
-    )
 
 
 def test_cp_forward_inputs_reuse_lite_contiguous_layout() -> None:

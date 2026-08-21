@@ -109,14 +109,7 @@ class DeepseekV4CSAAttention(nn.Module):
     def __init__(self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState):
         super().__init__()
         self.ps = ps
-        self.self_attn = self._build_attention(
-            config, layer_idx=layer_idx, ps=ps
-        )
-
-    def _build_attention(
-        self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState
-    ) -> nn.Module:
-        return CompressedSparseAttention(config, layer_idx=layer_idx, ps=ps)
+        self.self_attn = CompressedSparseAttention(config, layer_idx=layer_idx, ps=ps)
 
     def forward(
         self, x: torch.Tensor, *, position_ids: torch.Tensor, packed_seq_params: Any = None

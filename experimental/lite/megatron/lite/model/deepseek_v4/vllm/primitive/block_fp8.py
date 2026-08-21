@@ -9,20 +9,11 @@ from typing import Iterable
 import torch
 from torch import nn
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:  # CPU-only import/test environments
-    triton = tl = None
-
-BLOCK_SHAPE = (128, 128)
-
-
-@dataclass(frozen=True)
-class CanonicalBlockFP8Weight:
-    qweight: torch.Tensor
-    scales: torch.Tensor
-    block_shape: tuple[int, int] = BLOCK_SHAPE
+from megatron.lite.model.deepseek_v4.quantization import (
+    BLOCK_SHAPE,
+    CanonicalBlockFP8Weight,
+    requantize_block_fp8_weight,
+)
 
 
 @dataclass(frozen=True)
@@ -38,16 +29,6 @@ class PackedBlockFP8Activation:
     scales: torch.Tensor
 
 
-PackedGroupedBlockFP8Weight = PackedBlockFP8Weight
-
-
-def _entry(module: str, name: str):
-    try:
-        return getattr(importlib.import_module(module), name)
-    except (ImportError, AttributeError) as error:
-        raise RuntimeError(f"vLLM deployment entry point {module}.{name} is unavailable") from error
-
-
 def _key(weight: nn.Parameter):
     return (id(weight), weight._version, weight.device, weight.dtype, tuple(weight.shape))
 
@@ -59,46 +40,15 @@ def _validate_weight(weight: torch.Tensor) -> None:
         raise ValueError(f"weight shape {tuple(weight.shape)} must be divisible by {BLOCK_SHAPE}")
 
 
-if triton is not None:
-
-    @triton.jit
-    def _requantize(master, scales, output, columns, scale_columns, elements, BLOCK: tl.constexpr):
-        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < elements
-        rows = offsets // columns
-        columns_in_row = offsets - rows * columns
-        scale_offsets = (rows // 128) * scale_columns + columns_in_row // 128
-        values = tl.load(master + offsets, mask=mask).to(tl.float32)
-        tl.store(output + offsets, values / tl.load(scales + scale_offsets, mask=mask), mask=mask)
-
-
-def requantize_block_fp8_weight(weight: torch.Tensor, scales: torch.Tensor):
-    """Recover release FP8 bytes using the release scales, without rescaling."""
-    _validate_weight(weight)
-    expected = (weight.shape[0] // 128, weight.shape[1] // 128)
-    if scales.dtype != torch.float32 or tuple(scales.shape) != expected or scales.device != weight.device:
-        raise ValueError(f"fixed scales must be float32 {expected} on the weight device")
-    if not bool(torch.all(torch.isfinite(scales) & (scales > 0))):
-        raise ValueError("fixed scales must be finite and positive")
-    with torch.no_grad():
-        if weight.is_cuda and triton is not None:
-            qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
-            _requantize[(triton.cdiv(weight.numel(), 256),)](
-                weight, scales.contiguous(), qweight, weight.shape[1], scales.shape[1], weight.numel(), BLOCK=256
-            )
-        else:
-            expanded = scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
-            qweight = (weight.float() / expanded).to(torch.float8_e4m3fn)
-    return CanonicalBlockFP8Weight(qweight, scales)
-
-
 def quantize_block_fp8_weight(weight: torch.Tensor):
     _validate_weight(weight)
     scales = getattr(weight, "_fp8_source_scales", None)
     if scales is not None and getattr(weight, "_fp8_source_scale_version", None) == weight._version:
         return requantize_block_fp8_weight(weight, scales)
     with torch.no_grad():
-        qweight, scales = _entry("vllm.utils.deep_gemm", "per_block_cast_to_fp8")(
+        from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+        qweight, scales = per_block_cast_to_fp8(
             weight.detach(), block_size=list(BLOCK_SHAPE), use_ue8m0=False
         )
     return CanonicalBlockFP8Weight(qweight, scales)
@@ -106,10 +56,13 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
 
 def _post_process(qweight, scales):
     with torch.no_grad():
-        return _entry(
-            "vllm.model_executor.layers.quantization.utils.fp8_utils",
-            "deepgemm_post_process_fp8_weight_block",
-        )(wq=qweight, ws=scales, quant_block_shape=BLOCK_SHAPE, use_e8m0=True)
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            deepgemm_post_process_fp8_weight_block,
+        )
+
+        return deepgemm_post_process_fp8_weight_block(
+            wq=qweight, ws=scales, quant_block_shape=BLOCK_SHAPE, use_e8m0=True
+        )
 
 
 def pack_block_fp8_weight(weight: nn.Parameter):
@@ -133,17 +86,25 @@ def pack_grouped_block_fp8_weight(weights: Iterable[nn.Parameter]):
 def pack_block_fp8_activation(x: torch.Tensor):
     if x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] % 128 or x.stride(-1) != 1:
         raise ValueError("block-FP8 activation must be contiguous 2-D BF16 with K divisible by 128")
-    oracle = _entry("vllm.utils.deep_gemm", "DeepGemmQuantScaleFMT").from_oracle()
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+    oracle = DeepGemmQuantScaleFMT.from_oracle()
     packed = getattr(oracle, "name", "") == "UE8M0"
-    quantize = _entry(
-        "vllm.model_executor.layers.quantization.utils.fp8_utils",
-        "per_token_group_quant_fp8_packed_for_deepgemm" if packed else "per_token_group_quant_fp8",
+    fp8_utils = importlib.import_module(
+        "vllm.model_executor.layers.quantization.utils.fp8_utils"
+    )
+    quantize = getattr(
+        fp8_utils,
+        "per_token_group_quant_fp8_packed_for_deepgemm"
+        if packed
+        else "per_token_group_quant_fp8",
     )
     with torch.no_grad():
         if packed:
             qactivation, scales = quantize(x, 128, use_ue8m0=True)
         else:
-            tma = bool(_entry("vllm.envs", "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES"))
+            from vllm.envs import VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES
+
+            tma = bool(VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES)
             qactivation, scales = quantize(
                 x, 128, use_ue8m0=True, column_major_scales=True, tma_aligned_scales=tma
             )
@@ -156,7 +117,9 @@ def fp8_gemm_nt(x: torch.Tensor, weight: PackedBlockFP8Weight):
     activation = pack_block_fp8_activation(x)
     output = torch.empty((x.shape[0], weight.qweight.shape[-2]), dtype=torch.bfloat16, device=x.device)
     with torch.no_grad():
-        _entry("vllm.utils.deep_gemm", "fp8_gemm_nt")(
+        from vllm.utils.deep_gemm import fp8_gemm_nt as deep_gemm_fp8_gemm_nt
+
+        deep_gemm_fp8_gemm_nt(
             (activation.qactivation, activation.scales),
             (weight.qweight, weight.scales),
             output,
@@ -204,13 +167,3 @@ class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
 
     def __call__(self, x, *weights):
         return fp8_gemm_nt(x, self.pack_weight(weights))
-
-
-__all__ = [
-    "BLOCK_SHAPE", "CanonicalBlockFP8Weight", "DeploymentBlockFP8Adapter",
-    "DeploymentFusedBlockFP8Adapter", "PackedBlockFP8Activation",
-    "PackedBlockFP8Weight", "PackedGroupedBlockFP8Weight", "fp8_gemm_nt",
-    "pack_block_fp8_activation", "pack_block_fp8_weight",
-    "pack_grouped_block_fp8_weight", "quantize_block_fp8_weight",
-    "requantize_block_fp8_weight",
-]

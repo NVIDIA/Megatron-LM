@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
     _ordered_route_backward,
     _validate_and_order_route_preserving_outputs,
 )
@@ -37,50 +38,22 @@ def test_ordered_route_backward_ignores_padded_slots() -> None:
     assert grad_weights[1, 0] == torch.dot(grad_output[1], route_values[1])
 
 
-def test_route_metadata_preserves_primary_receive_order() -> None:
+@pytest.mark.parametrize(
+    ("metadata_to_primary", "expected_rows", "expected_values"),
+    [
+        ([0, 1, 2, 3], [0, 2, 1, 3], [10.0, 20.0, 30.0, 40.0]),
+        ([2, 0, 3, 1], [1, 0, 3, 2], [30.0, 10.0, 40.0, 20.0]),
+    ],
+)
+def test_route_metadata_recovers_primary_receive_order(
+    metadata_to_primary, expected_rows, expected_values
+) -> None:
     received_tokens = torch.arange(4 * 16, dtype=torch.bfloat16).reshape(4, 16)
     received_indices = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64)
     received_weights = torch.tensor([[0.1], [0.2], [0.3], [0.4]])
     output_index = torch.tensor([[0], [2], [1], [3]], dtype=torch.int64)
     expert_outputs = torch.tensor([[10.0], [30.0], [20.0], [40.0]])
-
-    route_fingerprints = received_tokens.clone()
-    route_indices = received_indices.reshape(-1).clone()
-    route_weights = received_weights.reshape(-1).clone()
-
-    route_rows = _validate_and_order_route_preserving_outputs(
-        expert_outputs,
-        received_tokens,
-        received_indices,
-        received_weights,
-        output_index,
-        route_fingerprints,
-        route_indices,
-        route_weights,
-        return_route_rows=True,
-    )
-    assert torch.equal(route_rows, torch.tensor([0, 2, 1, 3]))
-    ordered = _validate_and_order_route_preserving_outputs(
-        expert_outputs,
-        received_tokens,
-        received_indices,
-        received_weights,
-        output_index,
-        route_fingerprints,
-        route_indices,
-        route_weights,
-    )
-    assert torch.equal(ordered, torch.tensor([[10.0], [20.0], [30.0], [40.0]]))
-
-
-def test_route_metadata_recovers_changed_receive_order() -> None:
-    received_tokens = torch.arange(4 * 16, dtype=torch.bfloat16).reshape(4, 16)
-    received_indices = torch.tensor([[0], [1], [0], [1]], dtype=torch.int64)
-    received_weights = torch.tensor([[0.1], [0.2], [0.3], [0.4]])
-    output_index = torch.tensor([[0], [2], [1], [3]], dtype=torch.int64)
-    expert_outputs = torch.tensor([[10.0], [30.0], [20.0], [40.0]])
-
-    metadata_to_primary = torch.tensor([2, 0, 3, 1])
+    metadata_to_primary = torch.tensor(metadata_to_primary)
     route_fingerprints = received_tokens.index_select(0, metadata_to_primary)
     route_indices = received_indices.reshape(-1).index_select(0, metadata_to_primary)
     route_weights = received_weights.reshape(-1).index_select(0, metadata_to_primary)
@@ -96,7 +69,7 @@ def test_route_metadata_recovers_changed_receive_order() -> None:
         route_weights,
         return_route_rows=True,
     )
-    assert torch.equal(route_rows, torch.tensor([1, 0, 3, 2]))
+    assert torch.equal(route_rows, torch.tensor(expected_rows))
     ordered = _validate_and_order_route_preserving_outputs(
         expert_outputs,
         received_tokens,
@@ -107,4 +80,4 @@ def test_route_metadata_recovers_changed_receive_order() -> None:
         route_indices,
         route_weights,
     )
-    assert torch.equal(ordered, torch.tensor([[30.0], [10.0], [40.0], [20.0]]))
+    assert torch.equal(ordered, torch.tensor(expected_values).unsqueeze(1))

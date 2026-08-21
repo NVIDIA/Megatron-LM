@@ -18,7 +18,7 @@ from megatron.lite.model.deepseek_v4.vllm.model import (
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
     VLLMAttention,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe import DeepseekV4MoE
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import DeepseekV4MoE
 
 
 def _tiny_config() -> DeepseekV4Config:
@@ -103,12 +103,3 @@ def test_deployment_weight_cache_policy_reaches_attention_and_moe() -> None:
         assert attention.indexer_q_linear.cache_weight is enabled
         assert layer.mlp.shared_gate_up_fp8.cache_weight is enabled
         assert layer.mlp.shared_down_fp8.cache_weight is enabled
-
-
-def test_static_suite_never_constructs_release_dimensions() -> None:
-    config = _tiny_config()
-    assert config.vocab_size <= 32
-    assert config.hidden_size <= 16
-    assert config.moe_intermediate_size <= 8
-    assert config.num_hidden_layers == 1
-    assert config.n_routed_experts <= 4

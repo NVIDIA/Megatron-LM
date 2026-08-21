@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (

@@ -159,7 +159,6 @@ def run_pretrain_session(
     *,
     data_iter: Any = None,
     step_reporter: Callable[[StepTrace], None] | None = None,
-    post_backward_observer: Callable[[int, ModelHandle, Any], None] | None = None,
 ) -> RunResult:
     """Run a fixed-shape benchmark loop through the public runtime API."""
     if cfg.steps < 1:
@@ -197,8 +196,6 @@ def run_pretrain_session(
                 num_microbatches=cfg.num_microbatches,
                 forward_only=cfg.forward_only,
             )
-            if post_backward_observer is not None:
-                post_backward_observer(step, handle, result)
             if cfg.forward_only or cfg.no_optimizer:
                 grad_norm = 0.0
             else:

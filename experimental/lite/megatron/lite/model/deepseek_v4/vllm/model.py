@@ -21,13 +21,13 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import mhc_kernel
 from megatron.lite.model.deepseek_v4.vllm.primitive.logprob import (
     aligned_selected_log_probs,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.mhc import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe import DeepseekV4MoE
-from megatron.lite.model.deepseek_v4.vllm.primitive.norm import rms_norm
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import DeepseekV4MoE
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import rms_norm
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.parallel.mhc import (
@@ -200,10 +200,7 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             mtp_enable=False,
             use_deepep=True,
         )
-        # The release keeps deployment GEMM masters in BF16 while the mHC
-        # coefficients, sparse-attention sinks/APE, and router correction bias
-        # remain FP32.  Lite supplies the parameter containers; this path only
-        # applies the vLLM-visible dtype boundary before checkpoint loading.
+        # Match the release BF16-master/FP32-coefficient dtype boundary.
         self.to(torch.bfloat16)
         fp32_suffixes = (
             ".attn_hc.fn",
@@ -288,7 +285,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
                 input_ids=input_ids,
             )
         if not self.post_process:
-            # Pipeline P2P is [S, B, hc_mult*H].  Packed DS4 uses B=1.
             return {
                 "hidden_states": fold_mhc_hidden_for_pipeline(
                     hidden_states.unsqueeze(1)

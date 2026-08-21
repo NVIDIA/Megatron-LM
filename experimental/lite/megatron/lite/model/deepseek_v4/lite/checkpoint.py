@@ -38,7 +38,7 @@ from megatron.lite.model.deepseek_v4.quantization import (
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.weights import ResyncFormat
-from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.quantization import (
     BLOCK_SHAPE,
     requantize_block_fp8_weight,
 )

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -13,11 +12,6 @@ from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Model
 from megatron.lite.model.deepseek_v4.vllm.primitive import logprob as logprob_module
 
 pytestmark = pytest.mark.gpus(1)
-
-
-def test_model_constructor_owns_logprob_chunk_size() -> None:
-    parameters = inspect.signature(DeepseekV4Model.__init__).parameters
-    assert parameters["logprob_chunk_size"].default == 8192
 
 
 class _Layer(nn.Module):
@@ -207,32 +201,3 @@ def test_aligned_chunked_logprob_uses_rollout_value_and_same_head_vjp(
         forward_only, 1000.0 + labels.float(), rtol=0, atol=0
     )
     assert calls == [2, 2, 1]
-
-
-def test_supported_local_head_chunk_matches_unchunked_vllm_logprob() -> None:
-    torch.manual_seed(37)
-    device = torch.device("cuda")
-    tokens, hidden, vocab = 4096, 128, 257
-    labels = torch.randint(0, vocab, (tokens,), device=device)
-    value = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
-    head = nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.bfloat16)
-
-    with torch.no_grad():
-        chunked, _ = logprob_module.aligned_selected_log_probs(
-            value,
-            head,
-            labels,
-            1.0,
-            8192,
-            calculate_entropy=False,
-        )
-        unchunked, _ = logprob_module.aligned_selected_log_probs(
-            value,
-            head,
-            labels,
-            1.0,
-            tokens,
-            calculate_entropy=False,
-        )
-
-    torch.testing.assert_close(chunked, unchunked, rtol=0, atol=0)

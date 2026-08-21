@@ -2,10 +2,70 @@ from __future__ import annotations
 
 import math
 from copy import copy
+from dataclasses import dataclass
 
 import torch
 
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import _rope_and_qnorm
+
+
+@dataclass(frozen=True)
+class CPCompressionGeometry:
+    cu_seqlens_compressed: torch.Tensor
+    hidden_compact: torch.Tensor
+    compressed_group_ids: torch.Tensor
+    seq_to_rank_row: torch.Tensor
+
+
+def prepare_cp_compression_geometry(
+    hidden_local: torch.Tensor,
+    boundary_hidden: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    global_start: int,
+    cp_size: int,
+    ratio: int,
+) -> CPCompressionGeometry:
+    compressed_lens = torch.div(
+        cu_seqlens[1:] - cu_seqlens[:-1], ratio, rounding_mode="floor"
+    )
+    cu_seqlens_compressed = torch.cat(
+        (
+            torch.zeros_like(cu_seqlens[:1]),
+            torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
+        )
+    )
+    hidden_compact, compressed_group_ids, seq_to_rank_row = (
+        cp_utils.prepare_cp_compressor_input(
+            hidden_local,
+            boundary_hidden,
+            cu_seqlens,
+            cu_seqlens_compressed,
+            global_start,
+            cp_size,
+            ratio,
+        )
+    )
+    return CPCompressionGeometry(
+        cu_seqlens_compressed,
+        hidden_compact,
+        compressed_group_ids,
+        seq_to_rank_row,
+    )
+
+
+def gather_cp_compressed_rows(
+    local_rows: torch.Tensor,
+    seq_to_rank_row: torch.Tensor,
+    *,
+    cp_group,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rank_major = gather_from_sequence_parallel_region(local_rows, group=cp_group)
+    return rank_major, torch.index_select(
+        rank_major, 0, seq_to_rank_row.clamp_min(0).long()
+    )
 
 
 def _packed_cache(rows: int, device: torch.device, block_size: int = 64) -> torch.Tensor:
@@ -62,23 +122,11 @@ def official_compact_compressed_visible(
     ratio: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Use vLLM's official compressor value on MCore's compact CP groups.
-
-    Compact groups are represented as one synthetic request per packed
-    sequence segment.  Only compressor-boundary RoPE rows are observed, so map
-    each synthetic group boundary to its original per-sequence compressed
-    position.  The ordinary differentiable compact graph remains the sole VJP
-    owner.
-    """
+    """Evaluate compact CP groups with the official compressor kernel."""
     groups = compressed_group_ids.numel()
     if groups == 0:
         return functional_k
-    # The official overlap compressor carries state within one request.  A
-    # packed CP compact buffer is request-major and advertises each request
-    # boundary by resetting its group id to zero.  Launch each segment as an
-    # independent synthetic request so the official kernel performs its native
-    # state reset; mutating scores at the boundary would also alter the final
-    # valid group of the preceding request.
+    # Each packed request needs an independent compressor state reset.
     starts = torch.cat(
         (
             torch.zeros(1, dtype=torch.int64, device=compact_score.device),

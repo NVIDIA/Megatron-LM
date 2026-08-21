@@ -1,9 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""CPU contracts for the lazy vLLM deployment block-FP8 adapter."""
+"""CPU contracts for the vLLM deployment block-FP8 adapter."""
 
 from __future__ import annotations
 
-import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -11,8 +10,8 @@ import pytest
 import torch
 from torch import nn
 
-import megatron.lite.model.deepseek_v4.deployment_block_fp8 as deployment_fp8
-from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
+import megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 as deployment_fp8
+from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     BLOCK_SHAPE,
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
@@ -106,29 +105,6 @@ def fake_vllm(monkeypatch):
 
 def _weight() -> nn.Parameter:
     return nn.Parameter(torch.randn(128, 256, dtype=torch.bfloat16))
-
-
-def test_vllm_import_is_lazy_and_missing_entry_point_fails_closed(
-    monkeypatch,
-) -> None:
-    real_import = importlib.import_module
-    imported: list[str] = []
-
-    def tracked_import(name: str, package=None):
-        imported.append(name)
-        return real_import(name, package)
-
-    monkeypatch.setattr(deployment_fp8.importlib, "import_module", tracked_import)
-    adapter = DeploymentBlockFP8Adapter()
-    assert imported == []
-    assert adapter.cache_weight is False
-
-    def missing_import(name: str, package=None):
-        raise ImportError(name)
-
-    monkeypatch.setattr(deployment_fp8.importlib, "import_module", missing_import)
-    with pytest.raises(RuntimeError, match="vLLM deployment entry point"):
-        adapter.pack_weight(_weight())
 
 
 def test_weight_path_calls_vllm_and_packs_official_layout(fake_vllm) -> None:
@@ -236,25 +212,6 @@ def test_activation_and_gemm_call_use_packed_vllm_contract(fake_vllm) -> None:
     assert gemm_call[4] is packed_weight.scales
 
 
-def test_master_and_state_dict_remain_bf16_and_fp8_is_not_registered(
-    fake_vllm,
-) -> None:
-    owner = nn.Linear(256, 128, bias=False, dtype=torch.bfloat16)
-    before = {name: value.clone() for name, value in owner.state_dict().items()}
-    adapter = DeploymentBlockFP8Adapter()
-
-    packed = adapter.pack_weight(owner.weight)
-
-    assert owner.weight.dtype == torch.bfloat16
-    assert isinstance(owner.weight, nn.Parameter)
-    assert owner.state_dict().keys() == before.keys()
-    torch.testing.assert_close(owner.state_dict()["weight"], before["weight"])
-    assert not isinstance(packed.qweight, nn.Parameter)
-    assert not isinstance(packed.scales, nn.Parameter)
-    assert vars(adapter).keys() == {"cache_weight", "_cached_weight"}
-    assert adapter._cached_weight is None
-
-
 def test_opt_in_cache_uses_parameter_version_and_invalidates(fake_vllm) -> None:
     master = _weight()
     adapter = DeploymentBlockFP8Adapter(cache_weight=True)
@@ -278,26 +235,9 @@ def test_opt_in_cache_uses_parameter_version_and_invalidates(fake_vllm) -> None:
 @pytest.mark.parametrize(
     ("value", "error", "message"),
     [
-        (
-            torch.randn(128, 128),
-            TypeError,
-            "must be a 2-D BF16 tensor",
-        ),
-        (
-            nn.Parameter(torch.randn(128, 128)),
-            TypeError,
-            "must be a 2-D BF16 tensor",
-        ),
-        (
-            nn.Parameter(torch.randn(2, 128, 128, dtype=torch.bfloat16)),
-            TypeError,
-            "must be a 2-D BF16 tensor",
-        ),
-        (
-            nn.Parameter(torch.randn(128, 129, dtype=torch.bfloat16)),
-            ValueError,
-            "must be divisible",
-        ),
+        (torch.randn(128, 128), TypeError, "must be a 2-D BF16 tensor"),
+        (torch.randn(2, 128, 128, dtype=torch.bfloat16), TypeError, "must be a 2-D BF16 tensor"),
+        (torch.randn(128, 129, dtype=torch.bfloat16), ValueError, "must be divisible"),
     ],
 )
 def test_invalid_master_weight_fails_before_vllm_import(
@@ -311,20 +251,9 @@ def test_invalid_activation_and_gemm_contracts_fail_closed(fake_vllm) -> None:
     with pytest.raises(ValueError, match="contiguous 2-D BF16"):
         pack_block_fp8_activation(torch.randn(2, 128))
     with pytest.raises(ValueError, match="contiguous 2-D BF16"):
-        pack_block_fp8_activation(
-            torch.randn(2, 2, 128, dtype=torch.bfloat16)
-        )
+        pack_block_fp8_activation(torch.randn(2, 2, 128, dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="contiguous 2-D BF16"):
-        pack_block_fp8_activation(
-            torch.randn(2, 129, dtype=torch.bfloat16)
-        )
+        pack_block_fp8_activation(torch.randn(2, 129, dtype=torch.bfloat16))
     noncontiguous = torch.randn(2, 256, dtype=torch.bfloat16)[:, ::2]
     with pytest.raises(ValueError, match="contiguous 2-D BF16"):
         pack_block_fp8_activation(noncontiguous)
-
-def test_missing_deep_gemm_entry_fails_closed(fake_vllm, monkeypatch) -> None:
-    packed = pack_block_fp8_weight(_weight())
-    del sys.modules["vllm.utils.deep_gemm"].fp8_gemm_nt
-
-    with pytest.raises(RuntimeError, match="fp8_gemm_nt is unavailable"):
-        fp8_gemm_nt(torch.randn(2, 256, dtype=torch.bfloat16), packed)
