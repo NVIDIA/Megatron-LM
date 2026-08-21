@@ -6,15 +6,13 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-try:
-    from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
-except:
-    te_parallel_cross_entropy = None
-from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.models.backends import (
+    backend_slot,
+    get_backend_spec_provider,
+    select_cross_entropy,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -22,6 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
@@ -29,7 +28,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
-    is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
 
@@ -63,6 +61,18 @@ class LanguageModule(MegatronModule):
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
+        # Choose the cross entropy implementation once, here, rather than on every forward.
+        # Fusion settings, the Transformer Engine version check, and CUDA graph capture are
+        # all resolved inside the backend before the first step runs.
+        self.vocab_parallel_cross_entropy = backend_slot(
+            get_backend_spec_provider(config),
+            "vocab_parallel_cross_entropy",
+            lambda: select_cross_entropy(
+                getattr(config, "cross_entropy_loss_fusion", False),
+                getattr(config, "cross_entropy_fusion_impl", "native"),
+                getattr(config, "cuda_graph_impl", None),
+            ),
+        )
 
     def _setup_mtp_cuda_graphs(self):
         """Wrap `compute_mtp_single_step` with a CudaGraphManager.
@@ -170,40 +180,9 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
-        if self.config.cross_entropy_loss_fusion:
-            if self.config.cross_entropy_fusion_impl == 'te':
-                if te_parallel_cross_entropy is not None:
-                    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-                    # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
-                    is_cg_capturable = (
-                        hasattr(self.config, 'cuda_graph_impl')
-                        and self.config.cuda_graph_impl == "full_iteration"
-                    )
-                    if is_cg_capturable and not is_te_min_version("2.7.0"):
-                        from megatron.core.utils import get_te_version
-
-                        current_version = get_te_version()
-                        raise AssertionError(
-                            f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
-                            f"but found version {current_version}. Please upgrade TransformerEngine "
-                            f"or set cuda_graph_impl to a value other than 'full_iteration'."
-                        )
-
-                    loss = te_parallel_cross_entropy(
-                        logits, labels, self.pg_collection.tp, is_cg_capturable
-                    )
-                else:
-                    raise RuntimeError("Trying to use a TE block when it's not present.")
-            elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
-        else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(
-                logits, labels, tp_group=self.tp_group
-            )
-
+        loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group)
         # [s b] => [b, s]
-        loss = loss.transpose(0, 1).contiguous()
-        return loss
+        return loss.transpose(0, 1).contiguous()
 
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.
