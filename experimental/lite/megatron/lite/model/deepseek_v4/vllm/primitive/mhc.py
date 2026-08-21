@@ -15,7 +15,6 @@ def _pre_graph(x, fn, scale, base, *, mult, iters, eps):
     residual = x
     if residual.ndim == 2:
         residual = residual.unsqueeze(-2).expand(*residual.shape[:-1], mult, residual.shape[-1])
-    shape = residual.shape
     flat = residual.flatten(-2)
     rms_inv = 1.0 / (flat.norm(dim=-1, keepdim=True) / math.sqrt(flat.shape[-1]) + eps)
     mixes = F.linear(flat, fn.to(flat.dtype)) * rms_inv

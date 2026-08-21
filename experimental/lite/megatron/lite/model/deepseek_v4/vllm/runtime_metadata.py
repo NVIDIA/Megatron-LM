@@ -22,12 +22,7 @@ DS4_FLASHMLA_INDEX_ALIGNMENT = 128
 
 
 def _symbol(module: str, name: str) -> Any:
-    try:
-        return getattr(importlib.import_module(module), name)
-    except (ImportError, AttributeError) as exc:
-        raise NotImplementedError(
-            f"vLLM runtime primitive {module}.{name} is unavailable"
-        ) from exc
+    return getattr(importlib.import_module(module), name)
 
 
 def _round_up(value: int, alignment: int) -> int:

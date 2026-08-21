@@ -15,17 +15,11 @@ from megatron.lite.primitive.quantization.deployment_block_fp8 import (
 
 
 def _symbol(module: str, name: str) -> Any:
-    try:
-        return getattr(importlib.import_module(module), name)
-    except (ImportError, AttributeError) as exc:
-        raise NotImplementedError(f"missing vLLM kernel {module}.{name}") from exc
+    return getattr(importlib.import_module(module), name)
 
 
 def _op(namespace: str, name: str):
-    try:
-        return getattr(getattr(torch.ops, namespace), name)
-    except AttributeError as exc:
-        raise NotImplementedError(f"missing torch.ops.{namespace}.{name}") from exc
+    return getattr(getattr(torch.ops, namespace), name)
 
 
 class MHCKernel(str, Enum):
