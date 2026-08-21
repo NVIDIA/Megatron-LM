@@ -312,6 +312,18 @@ class TestMcoreAdapterDense:
         assert success
 
     def test_gradient_clipping_reaches_global_norm(self):
+        """MFSDP v2 reports the true global gradient norm and clips the update to it.
+
+        Clipping is measured through the optimizer update rather than through
+        parameter.grad after the step. _copy_model_grads_to_main_grads installs a
+        dtype-cast copy of each gradient, clip_grad_norm scales that copy, and
+        step_with_ready_grads restores the original afterwards, so the post-step
+        gradient is unclipped by design. Plain SGD at lr=1.0 makes the weight delta
+        exactly the gradient the optimizer stepped with, which keeps this test on the
+        default FP32-main-weight / BF16-gradient configuration.
+        """
+        clip_grad = 1.0
+        learning_rate = 1.0
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -335,23 +347,21 @@ class TestMcoreAdapterDense:
         )
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
-                optimizer="adam",
-                lr=1.0e-3,
+                optimizer="sgd",
+                lr=learning_rate,
                 weight_decay=0.0,
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 use_distributed_optimizer=False,
-                clip_grad=1.0,
+                clip_grad=clip_grad,
             ),
             [model],
         )
 
-        def global_grad_norm() -> float:
+        def global_norm(local_tensors) -> float:
             squared_norm = torch.zeros(1, dtype=torch.float32, device="cuda")
-            for parameter in optimizer.get_parameters():
-                if parameter.grad is not None:
-                    assert isinstance(parameter.grad, DTensor)
-                    squared_norm += parameter.grad.to_local().float().square().sum()
+            for local_tensor in local_tensors:
+                squared_norm += local_tensor.float().square().sum()
             torch.distributed.all_reduce(squared_norm)
             return squared_norm.sqrt().item()
 
@@ -367,17 +377,25 @@ class TestMcoreAdapterDense:
         )
         output.float().square().sum().backward()
 
-        clip_grad = optimizer.config.clip_grad
-        expected_pre_clip_norm = global_grad_norm()
+        parameters = [
+            parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
+        ]
+        assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
+        expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+        weights_before = [p.data.to_local().float().clone() for p in parameters]
+
         success, pre_clip_norm, _ = optimizer.step()
-        post_clip_norm = global_grad_norm()
+        updates = [
+            before - parameter.data.to_local().float()
+            for parameter, before in zip(parameters, weights_before)
+        ]
 
         assert success
         torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
         assert (
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
-        torch.testing.assert_close(post_clip_norm, clip_grad, rtol=1e-3, atol=0)
+        torch.testing.assert_close(global_norm(updates), clip_grad, rtol=1e-3, atol=0)
 
 
 class TestMcoreAdapterExpertParallel:
