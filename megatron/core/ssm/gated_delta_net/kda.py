@@ -121,6 +121,17 @@ class KimiDeltaAttention(_GDNBase):
     def _validate_config(config: TransformerConfig) -> None:
         """Validate the direct-projection KDA layout supported by this implementation."""
 
+        if config.kda_safe_gate:
+            if config.kda_lower_bound is None:
+                raise ValueError(
+                    "KimiDeltaAttention requires kda_lower_bound when kda_safe_gate=True."
+                )
+            if not (-5.0 <= config.kda_lower_bound < 0.0):
+                raise ValueError(
+                    "KimiDeltaAttention requires kda_lower_bound to be in [-5, 0) "
+                    "when kda_safe_gate=True."
+                )
+
         if config.linear_num_key_heads != config.linear_num_value_heads:
             raise ValueError(
                 "KimiDeltaAttention currently requires equal key and value head counts."

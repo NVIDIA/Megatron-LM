@@ -113,6 +113,33 @@ def test_kda_rejects_unsupported_head_layouts():
         KimiDeltaAttention._validate_config(config)
 
 
+@pytest.mark.parametrize("lower_bound", [None, -5.1, 0.0, 1.0, float("nan")])
+def test_kda_rejects_invalid_safe_gate_lower_bound(lower_bound):
+    config = _make_config()
+    config.kda_safe_gate = True
+    config.kda_lower_bound = lower_bound
+
+    with pytest.raises(ValueError, match="kda_lower_bound"):
+        KimiDeltaAttention._validate_config(config)
+
+
+@pytest.mark.parametrize("lower_bound", [-5.0, -1.0, -1e-6])
+def test_kda_accepts_valid_safe_gate_lower_bound(lower_bound):
+    config = _make_config()
+    config.kda_safe_gate = True
+    config.kda_lower_bound = lower_bound
+
+    KimiDeltaAttention._validate_config(config)
+
+
+def test_kda_ignores_lower_bound_when_safe_gate_is_disabled():
+    config = _make_config()
+    config.kda_safe_gate = False
+    config.kda_lower_bound = None
+
+    KimiDeltaAttention._validate_config(config)
+
+
 def test_kda_rejects_invalid_packed_boundaries():
     q = torch.tensor([0, 8, 16], dtype=torch.int32)
     KimiDeltaAttention._validate_packed_cu_seqlens(q, q.clone())
