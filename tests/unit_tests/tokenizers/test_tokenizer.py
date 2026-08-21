@@ -632,7 +632,7 @@ class TestBuildTokenizer:
 
         tokenizer_default = build_tokenizer(config)
 
-        # Verify gigatoken matches with default implemetation
+        # Verify gigatoken matches with default implementation
         text = "Hi how are you? How was your day? :)"
         ids = [128000, 13347, 1268, 527, 499, 30, 2650, 574, 701, 1938, 30, 27046]
         assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
@@ -645,8 +645,8 @@ class TestBuildTokenizer:
             tokenizer.additional_special_tokens_ids
             == tokenizer_default.additional_special_tokens_ids
         )
-        assert tokenizer.eod == tokenizer.eod
-        assert tokenizer.sep_id == tokenizer.sep_id
+        assert tokenizer.eod == tokenizer_default.eod
+        assert tokenizer.sep_id == tokenizer_default.sep_id
         assert tokenizer.vocab_size == tokenizer_default.vocab_size
         assert tokenizer.vocab == tokenizer_default.vocab
 
@@ -707,8 +707,8 @@ class TestBuildTokenizer:
             tokenizer.additional_special_tokens_ids
             == tokenizer_default.additional_special_tokens_ids
         )
-        assert tokenizer.eod == tokenizer.eod
-        assert tokenizer.sep_id == tokenizer.sep_id
+        assert tokenizer.eod == tokenizer_default.eod
+        assert tokenizer.sep_id == tokenizer_default.sep_id
         assert tokenizer.vocab_size == tokenizer_default.vocab_size
         assert tokenizer.vocab == tokenizer_default.vocab
 
