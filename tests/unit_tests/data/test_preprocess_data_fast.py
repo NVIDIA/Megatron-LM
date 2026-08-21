@@ -94,7 +94,6 @@ def test_preprocess_data_fast_megatron():
             "/opt/data/tokenizers/megatron/gpt2-vocab.json",
             "--merge-file",
             "/opt/data/tokenizers/megatron/gpt2-merges.txt",
-            "--append-eod",
             "--workers",
             "2",
             "--log-interval",
@@ -117,7 +116,6 @@ def test_preprocess_data_fast_megatron():
             "--merge-file",
             "/opt/data/tokenizers/megatron/gpt2-merges.txt",
             "--use-gigatoken",
-            "--append-eod",
         ]
         sys.argv = ["/opt/megatron-lm/tools/preprocess_data_fast.py"] + fast_args
         runpy.run_path("/opt/megatron-lm/tools/preprocess_data_fast.py", run_name="__main__")
