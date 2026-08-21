@@ -90,6 +90,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
   --v-head-dim 128 \
   --qk-layernorm \
   --attention-output-gate \
+  --gated-attention-proj-granularity headwise \
   --mtp-num-layers 1 \
   --mtp-loss-scaling-factor 0.1 \
   --recompute-granularity full \

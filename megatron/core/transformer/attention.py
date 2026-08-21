@@ -1701,6 +1701,11 @@ class SelfAttention(Attention):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
+        if config.gated_attention_proj_granularity != 'elementwise':
+            raise ValueError(
+                "Regular attention does not support headwise "
+                "gated_attention_proj_granularity; use 'elementwise'."
+            )
         super().__init__(
             config=config,
             submodules=submodules,

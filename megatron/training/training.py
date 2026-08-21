@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -578,6 +578,8 @@ def num_floating_point_operations(
         gqa=True,
         gqa_groups=8,
         kv_channels=None,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for an attention layer.
 
@@ -590,10 +592,23 @@ def num_floating_point_operations(
         """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = hidden_size * p
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # The output gate contributes one additional hidden_size -> gate_size projection.
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
             4 * total_tokens * hidden_size * p * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * total_tokens * hidden_size * gate_projection_size
             + 2 * seqlen_squared_sum * hidden_size * p
         )
 
@@ -608,6 +623,7 @@ def num_floating_point_operations(
         qk_pos_emb_head_dim,
         v_head_dim,
         attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
 
@@ -627,13 +643,24 @@ def num_floating_point_operations(
             q_term = q_lora_rank * (
                 hidden_size + num_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
             )
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = num_heads * v_head_dim
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # Token-linear part (q lora+rope+norm, kv lora+rope+norm, output proj).
         token_linear = fma * (
             q_term
             + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
             + hidden_size * qk_pos_emb_head_dim
             + (num_heads * v_head_dim) * hidden_size
-            + (hidden_size * num_heads if attention_output_gate else 0)
+            + hidden_size * gate_projection_size
         )
         # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
         core = fma * (
@@ -754,13 +781,13 @@ def num_floating_point_operations(
         kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
-        multi_latent_attention=False,
         q_lora_rank=None,
         kv_lora_rank=0,
         qk_head_dim=0,
         qk_pos_emb_head_dim=0,
         v_head_dim=0,
         attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
         experimental_attention_variant=None,
         dsv4_n_layers_r0=0,
         dsv4_n_layers_r4=0,
@@ -799,29 +826,19 @@ def num_floating_point_operations(
                 dsv4_token_term * total_tokens + dsv4_core_term * seqlen_squared_sum
             )
         else:
-            if multi_latent_attention:
-                plain_attn_layer_flops = mla_attn_layer_flops(
-                    total_tokens,
-                    seqlen_squared_sum,
-                    hidden_size,
-                    num_attn_heads,
-                    q_lora_rank,
-                    kv_lora_rank,
-                    qk_head_dim,
-                    qk_pos_emb_head_dim,
-                    v_head_dim,
-                    attention_output_gate,
-                )
-            else:
-                plain_attn_layer_flops = attn_layer_flops(
-                    total_tokens,
-                    seqlen_squared_sum,
-                    hidden_size,
-                    num_attn_heads,
-                    gqa,
-                    gqa_groups,
-                    kv_channels,
-                )
+            # HybridStack assigns '*' to regular attention and '+' to MLA independently of the
+            # model-wide multi_latent_attention flag.
+            plain_attn_layer_flops = attn_layer_flops(
+                total_tokens,
+                seqlen_squared_sum,
+                hidden_size,
+                num_attn_heads,
+                gqa,
+                gqa_groups,
+                kv_channels,
+                attention_output_gate,
+                gated_attention_proj_granularity,
+            )
             attn_flops_total = num_attn_layers * plain_attn_layer_flops
             if num_mla_layers:
                 attn_flops_total += num_mla_layers * mla_attn_layer_flops(
@@ -835,6 +852,7 @@ def num_floating_point_operations(
                     qk_pos_emb_head_dim,
                     v_head_dim,
                     attention_output_gate,
+                    gated_attention_proj_granularity,
                 )
 
         kda_flops_total = 0
@@ -996,6 +1014,20 @@ def num_floating_point_operations(
                         + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                         + 1
                     )
+                gate_projection_size = 0
+                if args.attention_output_gate:
+                    gate_granularity = getattr(
+                        args, "gated_attention_proj_granularity", "elementwise"
+                    )
+                    if gate_granularity == "elementwise":
+                        gate_projection_size = args.num_attention_heads * args.v_head_dim
+                    elif gate_granularity == "headwise":
+                        gate_projection_size = args.num_attention_heads
+                    else:
+                        raise ValueError(
+                            "gated_attention_proj_granularity must be either 'elementwise' or "
+                            f"'headwise', got {gate_granularity!r}."
+                        )
                 # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
                 standard_self_attn_term = (
                     forward_backward_expansion_factor
@@ -1013,6 +1045,8 @@ def num_floating_point_operations(
                         + args.hidden_size * args.qk_pos_emb_head_dim
                         ## o proj
                         + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                        ## output gate proj
+                        + gate_projection_size * args.hidden_size
                     )
                 )
                 # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
@@ -1328,13 +1362,15 @@ def num_floating_point_operations(
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-            multi_latent_attention=args.multi_latent_attention,
             q_lora_rank=args.q_lora_rank,
             kv_lora_rank=args.kv_lora_rank,
             qk_head_dim=args.qk_head_dim,
             qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
             v_head_dim=args.v_head_dim,
             attention_output_gate=getattr(args, "attention_output_gate", False),
+            gated_attention_proj_granularity=getattr(
+                args, "gated_attention_proj_granularity", "elementwise"
+            ),
             experimental_attention_variant=args.experimental_attention_variant,
             dsv4_n_layers_r0=dsv4_n_layers_r0,
             dsv4_n_layers_r4=dsv4_n_layers_r4,

@@ -84,6 +84,7 @@ MODEL_ARGS:
   --v-head-dim: 64
   --qk-layernorm: true
   --attention-output-gate: true
+  --gated-attention-proj-granularity: headwise
 
   # One MTP depth represented by the pattern suffix after '/'.
   --mtp-num-layers: 1
