@@ -134,7 +134,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         )
         if cp_group is not None and cp_group.size() > 1 and internal_partition_mode != "zigzag":
             raise ValueError(
-                "GatedDeltaNet with headwise CP requires zigzag layout. CP partition "
+                "GatedDeltaNet requires zigzag CP layout. CP partition "
                 "conversion must be handled before GatedDeltaNet computation."
             )
 

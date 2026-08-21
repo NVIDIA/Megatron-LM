@@ -86,7 +86,7 @@ def resolve_cp_group(
 
     Dynamic CP assigns a per-microbatch CP group that may differ from the
     process-group stored at model construction time.  This helper centralises
-    the resolution logic used by GPTModel, GatedDeltaNet, and MTP layers.
+    process-group stored at model construction time.
     """
     if packed_seq_params is not None and packed_seq_params.cp_group is not None:
         return packed_seq_params.cp_group
