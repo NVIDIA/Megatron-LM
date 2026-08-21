@@ -31,8 +31,57 @@ _BLOCK_SIZE = 1024
 if HAVE_TRITON:
 
     @triton.jit
+    def _load_tv_target_values(
+        target,
+        target_halo,
+        target_row_indices,
+        target_valid_rows,
+        row,
+        cols,
+        vocab_mask,
+        vocab_size,
+        local_target_rows,
+        target_halo_rows,
+        HAS_TARGET_ROW_MAP: tl.constexpr,
+    ):
+        """Load one target row from local storage, a compact halo, or logical zeros."""
+        if HAS_TARGET_ROW_MAP:
+            target_row = tl.load(target_row_indices + row).to(tl.int64)
+            target_is_valid = tl.load(target_valid_rows + row)
+            target_is_valid = (
+                target_is_valid
+                & (target_row >= 0)
+                & (target_row < local_target_rows + target_halo_rows)
+            )
+            safe_target_row = tl.where(target_is_valid, target_row, 0)
+            target_row_ptr = tl.where(
+                safe_target_row < local_target_rows,
+                target + safe_target_row * vocab_size,
+                target_halo + (safe_target_row - local_target_rows) * vocab_size,
+            )
+            target_values = tl.load(
+                target_row_ptr + cols, mask=vocab_mask & target_is_valid, other=-float("inf")
+            )
+            return tl.where(target_is_valid, target_values.to(tl.float32), 0.0)
+
+        return tl.load(target + row * vocab_size + cols, mask=vocab_mask, other=-float("inf")).to(
+            tl.float32
+        )
+
+    @triton.jit
     def _tv_row_stats_kernel(
-        draft, target, maxima, denominators, vocab_size, BLOCK_SIZE: tl.constexpr
+        draft,
+        target,
+        target_halo,
+        target_row_indices,
+        target_valid_rows,
+        maxima,
+        denominators,
+        vocab_size,
+        local_target_rows,
+        target_halo_rows,
+        HAS_TARGET_ROW_MAP: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
     ):
         """Compute stable local softmax maxima and denominators for one row."""
         row = tl.program_id(0).to(tl.int64)
@@ -48,8 +97,18 @@ if HAVE_TRITON:
             draft_values = tl.load(draft + row_start + cols, mask=mask, other=-float("inf")).to(
                 tl.float32
             )
-            target_values = tl.load(target + row_start + cols, mask=mask, other=-float("inf")).to(
-                tl.float32
+            target_values = _load_tv_target_values(
+                target,
+                target_halo,
+                target_row_indices,
+                target_valid_rows,
+                row,
+                cols,
+                mask,
+                vocab_size,
+                local_target_rows,
+                target_halo_rows,
+                HAS_TARGET_ROW_MAP,
             )
 
             draft_tile_max = tl.max(draft_values, axis=0)
@@ -95,12 +154,18 @@ if HAVE_TRITON:
     def _tv_overlap_kernel(
         draft,
         target,
+        target_halo,
+        target_row_indices,
+        target_valid_rows,
         maxima,
         denominators,
         overlap_and_s,
         draft_above_target_bits,
         vocab_size,
         packed_vocab_size,
+        local_target_rows,
+        target_halo_rows,
+        HAS_TARGET_ROW_MAP: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         """Compute local overlap and the draft mass at or below the target."""
@@ -120,7 +185,19 @@ if HAVE_TRITON:
             cols = col_start + byte_offsets[:, None] * 8 + bit_offsets[None, :]
             mask = cols < vocab_size
             draft_values = tl.load(draft + row_start + cols, mask=mask, other=0.0).to(tl.float32)
-            target_values = tl.load(target + row_start + cols, mask=mask, other=0.0).to(tl.float32)
+            target_values = _load_tv_target_values(
+                target,
+                target_halo,
+                target_row_indices,
+                target_valid_rows,
+                row,
+                cols,
+                mask,
+                vocab_size,
+                local_target_rows,
+                target_halo_rows,
+                HAS_TARGET_ROW_MAP,
+            )
             draft_prob = tl.exp(draft_values - draft_max) / draft_denominator
             target_prob = tl.exp(target_values - target_max) / target_denominator
             overlap += tl.sum(
@@ -217,6 +294,59 @@ def fused_mtp_tv_unavailable_reason(  # pylint: disable=too-many-return-statemen
     return None
 
 
+def _validate_target_row_addressing(
+    draft_logits: Tensor,
+    target_logits: Tensor,
+    target_row_indices: Optional[Tensor],
+    target_valid_rows: Optional[Tensor],
+    target_halo_logits: Optional[Tensor],
+) -> bool:
+    """Validate optional direct target-row addressing and return whether it is active."""
+    has_target_row_map = target_row_indices is not None
+    if has_target_row_map != (target_valid_rows is not None):
+        raise ValueError("Target row indices and validity must be provided together.")
+    if target_halo_logits is not None and not has_target_row_map:
+        raise ValueError("Target halo logits require target row indices and validity.")
+    if not has_target_row_map:
+        return False
+
+    assert target_row_indices is not None
+    assert target_valid_rows is not None
+    if target_row_indices.shape != draft_logits.shape[:-1]:
+        raise ValueError(
+            "Target row indices must match the draft leading dimensions, got "
+            f"{tuple(target_row_indices.shape)} and {tuple(draft_logits.shape[:-1])}."
+        )
+    if target_valid_rows.shape != target_row_indices.shape:
+        raise ValueError(
+            "Target row validity must match target row indices, got "
+            f"{tuple(target_valid_rows.shape)} and {tuple(target_row_indices.shape)}."
+        )
+    if target_row_indices.device != draft_logits.device:
+        raise ValueError("Target row indices must be on the logits device.")
+    if target_valid_rows.device != draft_logits.device:
+        raise ValueError("Target row validity must be on the logits device.")
+    if target_row_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Target row indices must use torch.int32 or torch.int64.")
+    if target_valid_rows.dtype != torch.bool:
+        raise ValueError("Target row validity must use torch.bool.")
+    if not target_row_indices.is_contiguous() or not target_valid_rows.is_contiguous():
+        raise ValueError("Target row metadata must be contiguous.")
+
+    if target_halo_logits is not None:
+        if target_halo_logits.device != target_logits.device:
+            raise ValueError("Target halo logits must be on the target-logits device.")
+        if target_halo_logits.dtype != target_logits.dtype:
+            raise ValueError("Target halo logits must use the target-logits dtype.")
+        if target_halo_logits.ndim != target_logits.ndim:
+            raise ValueError("Target halo logits must have the target-logits rank.")
+        if target_halo_logits.shape[1:] != target_logits.shape[1:]:
+            raise ValueError("Target halo logits must match non-sequence target dimensions.")
+        if not target_halo_logits.is_contiguous():
+            raise ValueError("Target halo logits must be contiguous.")
+    return True
+
+
 class _FusedVocabParallelTVDistance(torch.autograd.Function):
     """Triton TV distance with compact analytical-backward state."""
 
@@ -227,23 +357,44 @@ class _FusedVocabParallelTVDistance(torch.autograd.Function):
         target_logits: Tensor,
         tp_group: Optional[torch.distributed.ProcessGroup],
         logits_are_vocab_sharded: bool,
+        target_row_indices: Optional[Tensor],
+        target_valid_rows: Optional[Tensor],
+        target_halo_logits: Optional[Tensor],
     ) -> Tensor:
         """Run fused forward passes and preserve compact backward state."""
         unavailable_reason = fused_mtp_tv_unavailable_reason(draft_logits, target_logits)
         if unavailable_reason is not None:
             raise RuntimeError(f"Fused MTP TV distance is unavailable: {unavailable_reason}.")
 
+        has_target_row_map = _validate_target_row_addressing(
+            draft_logits, target_logits, target_row_indices, target_valid_rows, target_halo_logits
+        )
         vocab_size = draft_logits.size(-1)
         output_shape = draft_logits.shape[:-1]
         num_rows = draft_logits.numel() // vocab_size
         maxima = torch.empty((2, num_rows), dtype=torch.float32, device=draft_logits.device)
         denominators = torch.empty_like(maxima)
+        target_row_indices_arg = target_row_indices if has_target_row_map else draft_logits
+        target_valid_rows_arg = target_valid_rows if has_target_row_map else draft_logits
+        target_halo_logits_arg = (
+            target_halo_logits if target_halo_logits is not None else target_logits
+        )
+        local_target_rows = target_logits.numel() // vocab_size
+        target_halo_rows = (
+            target_halo_logits.numel() // vocab_size if target_halo_logits is not None else 0
+        )
         _tv_row_stats_kernel[(num_rows,)](
             draft_logits,
             target_logits,
+            target_halo_logits_arg,
+            target_row_indices_arg,
+            target_valid_rows_arg,
             maxima,
             denominators,
             vocab_size=vocab_size,
+            local_target_rows=local_target_rows,
+            target_halo_rows=target_halo_rows,
+            HAS_TARGET_ROW_MAP=has_target_row_map,
             BLOCK_SIZE=_BLOCK_SIZE,
             num_warps=8,
         )
@@ -274,12 +425,18 @@ class _FusedVocabParallelTVDistance(torch.autograd.Function):
         _tv_overlap_kernel[(num_rows,)](
             draft_logits,
             target_logits,
+            target_halo_logits_arg,
+            target_row_indices_arg,
+            target_valid_rows_arg,
             maxima,
             denominators,
             overlap_and_s,
             draft_above_target_bits,
             vocab_size=vocab_size,
             packed_vocab_size=packed_vocab_size,
+            local_target_rows=local_target_rows,
+            target_halo_rows=target_halo_rows,
+            HAS_TARGET_ROW_MAP=has_target_row_map,
             BLOCK_SIZE=_BLOCK_SIZE,
             num_warps=8,
         )
@@ -337,7 +494,7 @@ class _FusedVocabParallelTVDistance(torch.autograd.Function):
             BLOCK_SIZE=_BLOCK_SIZE,
             num_warps=8,
         )
-        return grad_draft, None, None, None
+        return grad_draft, None, None, None, None, None, None
 
 
 def _fused_vocab_parallel_tv_distance(
@@ -345,10 +502,20 @@ def _fused_vocab_parallel_tv_distance(
     target_logits: Tensor,
     tp_group: Optional[torch.distributed.ProcessGroup],
     logits_are_vocab_sharded: bool,
+    *,
+    target_row_indices: Optional[Tensor] = None,
+    target_valid_rows: Optional[Tensor] = None,
+    target_halo_logits: Optional[Tensor] = None,
 ) -> Tensor:
-    """Compute TV distance using Triton and TP collectives."""
+    """Compute TV distance using Triton, optional target-row addressing, and TP collectives."""
     return _FusedVocabParallelTVDistance.apply(
-        draft_logits, target_logits.detach(), tp_group, logits_are_vocab_sharded
+        draft_logits,
+        target_logits.detach(),
+        tp_group,
+        logits_are_vocab_sharded,
+        target_row_indices,
+        target_valid_rows,
+        target_halo_logits.detach() if target_halo_logits is not None else None,
     )
 
 
@@ -463,14 +630,23 @@ def vocab_parallel_tv_distance(
     target_logits: Tensor,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     logits_are_vocab_sharded: bool = True,
+    *,
+    target_row_indices: Optional[Tensor] = None,
+    target_valid_rows: Optional[Tensor] = None,
+    target_halo_logits: Optional[Tensor] = None,
 ) -> Tensor:
     """Compute full-vocabulary TV distance with automatic fused/reference dispatch.
 
     Args:
         draft_logits: Trainable draft logits with vocabulary in the last dimension.
-        target_logits: Detached target logits with the same local or global vocabulary layout.
+        target_logits: Detached local target-logit storage with the same vocabulary layout.
         tp_group: Tensor-parallel group owning vocabulary shards.
         logits_are_vocab_sharded: Whether the last dimension is sharded across ``tp_group``.
+        target_row_indices: Optional flattened row in ``target_logits`` or its halo for each
+            draft row.
+        target_valid_rows: Validity mask paired with ``target_row_indices``. Invalid and
+            out-of-bounds rows select a safe all-zero target-logit vector.
+        target_halo_logits: Optional compact rows logically appended to ``target_logits``.
 
     Returns:
         A FP32 tensor with the vocabulary dimension removed. Gradients flow only to
@@ -484,19 +660,60 @@ def vocab_parallel_tv_distance(
     if draft_logits.device != target_logits.device:
         raise ValueError("Draft and target logits must be on the same device.")
     _validate_vocab_parallel_tv_group(tp_group, logits_are_vocab_sharded)
+    has_target_row_map = _validate_target_row_addressing(
+        draft_logits, target_logits, target_row_indices, target_valid_rows, target_halo_logits
+    )
 
     # Materialized sequence rolls produce a noncontiguous target view. Pack only
     # that detached input when the trainable draft otherwise supports Triton.
     if (
-        not target_logits.is_contiguous()
+        not has_target_row_map
+        and not target_logits.is_contiguous()
         and fused_mtp_tv_unavailable_reason(draft_logits, draft_logits) is None
     ):
         target_logits = target_logits.detach().contiguous()
 
     if fused_mtp_tv_unavailable_reason(draft_logits, target_logits) is None:
         return _fused_vocab_parallel_tv_distance(
-            draft_logits, target_logits, tp_group, logits_are_vocab_sharded
+            draft_logits,
+            target_logits,
+            tp_group,
+            logits_are_vocab_sharded,
+            target_row_indices=target_row_indices,
+            target_valid_rows=target_valid_rows,
+            target_halo_logits=target_halo_logits,
         )
+
+    if has_target_row_map:
+        assert target_row_indices is not None
+        assert target_valid_rows is not None
+        vocab_size = draft_logits.size(-1)
+        local_targets = target_logits.detach().reshape(-1, vocab_size)
+        flat_indices = target_row_indices.reshape(-1).long()
+        flat_valid = target_valid_rows.reshape(-1)
+        num_local_rows = local_targets.size(0)
+        halo_targets = None
+        num_halo_rows = 0
+        if target_halo_logits is not None:
+            halo_targets = target_halo_logits.detach().reshape(-1, vocab_size)
+            num_halo_rows = halo_targets.size(0)
+
+        num_addressable_rows = num_local_rows + num_halo_rows
+        flat_valid = flat_valid & (flat_indices >= 0) & (flat_indices < num_addressable_rows)
+        safe_local_indices = torch.where(
+            flat_valid & (flat_indices < num_local_rows), flat_indices, 0
+        )
+        materialized_target = local_targets.index_select(0, safe_local_indices)
+        if halo_targets is not None and num_halo_rows > 0:
+            selects_halo = flat_valid & (flat_indices >= num_local_rows)
+            safe_halo_indices = torch.where(selects_halo, flat_indices - num_local_rows, 0)
+            selected_halo = halo_targets.index_select(0, safe_halo_indices)
+            materialized_target = torch.where(
+                selects_halo.unsqueeze(1), selected_halo, materialized_target
+            )
+        materialized_target.masked_fill_(~flat_valid.unsqueeze(1), 0)
+        target_logits = materialized_target.view_as(draft_logits)
+
     return _VocabParallelTVDistance.apply(
         draft_logits, target_logits.detach(), tp_group, logits_are_vocab_sharded
     )
