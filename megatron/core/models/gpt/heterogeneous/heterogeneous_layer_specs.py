@@ -1,14 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
 from functools import partial
 from typing import Optional
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.models.backends import get_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     AttentionConfig,
@@ -29,50 +26,28 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
 
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import (
-        TEDotProductAttention,
-        TELayerNormColumnParallelLinear,
-        TENorm,
-        TERowParallelLinear,
-    )
+# One provider per backend, so every choice below names a class in megatron.core.ops.
+_te = get_backend("transformer_engine")
+_local = get_backend("local")
+
+
+def _TE_LN_LINEAR_GATHERED():
+    """The heterogeneous-specific layernorm+linear, which is not a backend choice."""
     from megatron.core.transformer.heterogeneous.linear_replacements import (
         TELayerNormColumnParallelLinearGathered,
     )
-else:
-    (
-        TEDotProductAttention,
-        TELayerNormColumnParallelLinear,
-        TENorm,
-        TERowParallelLinear,
-        TELayerNormColumnParallelLinearGathered,
-    ) = (None, None, None, None, None)
+
+    return TELayerNormColumnParallelLinearGathered
+
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
-try:
-    import apex  # pylint: disable=unused-import
-
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-
-    HAVE_APEX = True
-    LNImpl = FusedLayerNorm
-except ImportError:
-    import warnings
-
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    LNImpl = WrappedTorchNorm
-    HAVE_APEX = False
 
 
 def _get_layer_norm(config: AttentionConfig | MLPConfig, use_te: bool, normalization: str):
     # RMSNorm is not supported in FusedLayerNorm
-    ln_impl = LNImpl if normalization == "LayerNorm" else WrappedTorchNorm
+    ln_impl = _local.layer_norm() if normalization == "LayerNorm" else WrappedTorchNorm
 
     # We don't use layernorm when the attention/mlp is no-op or
     # when we are using TE (the layernorm is fused with the first linear).
@@ -81,14 +56,14 @@ def _get_layer_norm(config: AttentionConfig | MLPConfig, use_te: bool, normaliza
 
 def _get_qk_layernorm(use_te: bool, normalization: str):
     # RMSNorm is not supported in FusedLayerNorm
-    ln_impl = LNImpl if normalization == "LayerNorm" else WrappedTorchNorm
+    ln_impl = _local.layer_norm() if normalization == "LayerNorm" else WrappedTorchNorm
 
     if use_te:
         if is_te_min_version("1.9.0"):
-            # TENorm significantly harms convergence when used
+            # _te.layer_norm() significantly harms convergence when used
             # for QKLayerNorm if TE Version < 1.9;
             # we instead use the Apex implementation.
-            qk_norm = TENorm
+            qk_norm = _te.layer_norm()
         else:
             qk_norm = ln_impl
     else:
@@ -104,9 +79,7 @@ def _get_heterogenous_attention_spec(
         self_attention = ModuleSpec(module=IdentityOp)
     elif attn_config.replace_with_linear:
         self_attention = ModuleSpec(
-            module=(
-                TELayerNormColumnParallelLinearGathered if use_te else ColumnParallelLinearGathered
-            ),
+            module=(_TE_LN_LINEAR_GATHERED() if use_te else ColumnParallelLinearGathered),
             params={"tp_comm_buffer_name": "linear_attn"},
         )
     else:
@@ -116,10 +89,12 @@ def _get_heterogenous_attention_spec(
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=(
-                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                    _te.column_parallel_layer_norm_linear()
+                    if use_te
+                    else _local.column_parallel_linear()
                 ),
-                core_attention=not_none(TEDotProductAttention) if use_te else DotProductAttention,
-                linear_proj=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
+                core_attention=_te.core_attention() if use_te else _local.core_attention(),
+                linear_proj=_te.row_parallel_linear() if use_te else _local.row_parallel_linear(),
                 q_layernorm=ln,
                 k_layernorm=ln,
             ),
@@ -132,11 +107,7 @@ def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
         return IdentityOp
     elif mlp_config.replace_with_linear:
         return partial(
-            (
-                not_none(TELayerNormColumnParallelLinearGathered)
-                if use_te
-                else ColumnParallelLinearGathered
-            ),
+            (_TE_LN_LINEAR_GATHERED() if use_te else ColumnParallelLinearGathered),
             tp_comm_buffer_name="linear_mlp",
         )
     else:
@@ -144,9 +115,11 @@ def _get_heterogenous_mlp_spec(mlp_config: MLPConfig, use_te: bool):
             MLP.as_mlp_submodule,
             submodules=MLPSubmodules(
                 linear_fc1=(
-                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                    _te.column_parallel_layer_norm_linear()
+                    if use_te
+                    else _local.column_parallel_linear()
                 ),
-                linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
+                linear_fc2=_te.row_parallel_linear() if use_te else _local.row_parallel_linear(),
             ),
         )
 
@@ -224,7 +197,9 @@ def get_gpt_heterogeneous_layer_spec(
 
     # Submodules layer_norm determines the type of layernorm used in the last layernorm
     if use_te:
-        layer_norm = TENorm
+        layer_norm = _te.layer_norm()
     else:
-        layer_norm = LNImpl if config.normalization == "LayerNorm" else WrappedTorchNorm
+        layer_norm = (
+            _local.layer_norm() if config.normalization == "LayerNorm" else WrappedTorchNorm
+        )
     return TransformerBlockSubmodules(layer_specs, layer_norm=layer_norm)

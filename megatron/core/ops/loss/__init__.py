@@ -24,6 +24,10 @@ The implementations are in :mod:`.backends`; a provider in
 
 from __future__ import annotations
 
+from typing import Callable, Optional
+
+import torch
+
 from megatron.core.ops.loss.backends import (
     LossMegatron,
     LossMegatronFused,
@@ -32,10 +36,16 @@ from megatron.core.ops.loss.backends import (
     vocab_parallel_cross_entropy,
 )
 
+VocabParallelCrossEntropy = Callable[
+    [torch.Tensor, torch.Tensor, Optional[torch.distributed.ProcessGroup]], torch.Tensor
+]
+"""The callable shape this family's targets have."""
+
 __all__ = [
     "LossMegatron",
     "LossMegatronFused",
     "LossTEFused",
     "fused_vocab_parallel_cross_entropy",
+    "VocabParallelCrossEntropy",
     "vocab_parallel_cross_entropy",
 ]

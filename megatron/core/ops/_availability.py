@@ -53,7 +53,7 @@ def require(module_name: str) -> ModuleType:
     """Return a selected dependency, or explain what is wrong with it.
 
     Callers that know which backend asked should catch this and add that context;
-    :mod:`megatron.core.ops.resolve` does exactly that, from its backend table.
+    A provider does exactly that, from the ``REQUIRES`` its chosen backend declares.
     """
     module, error, absent = _import_outcome(module_name)
     if module is not None:

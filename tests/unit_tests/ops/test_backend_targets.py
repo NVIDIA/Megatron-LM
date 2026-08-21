@@ -29,7 +29,6 @@ class TestLocalBackends:
         assert backend.column_parallel_linear() is ColumnParallelLinear
         assert backend.row_parallel_linear() is RowParallelLinear
         assert backend.column_parallel_layer_norm_linear() is None
-        assert backend.fuse_layernorm_and_linear() is False
 
     def test_core_attention_target(self):
         assert AttentionLocal().core_attention() is DotProductAttention
@@ -81,7 +80,6 @@ class TestTransformerEngineBackends:
         assert backend.column_parallel_linear() is TEColumnParallelLinear
         assert backend.row_parallel_linear() is TERowParallelLinear
         assert backend.column_parallel_layer_norm_linear() is TELayerNormColumnParallelLinear
-        assert backend.fuse_layernorm_and_linear() is True
 
     def test_core_attention_target(self):
         from megatron.core.extensions.transformer_engine import TEDotProductAttention

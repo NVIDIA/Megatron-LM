@@ -1,218 +1,247 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+"""The construction-time API for choosing a kernel backend.
+
+A provider answers, once while the model is built, which implementation each operation
+should use. Model code asks the provider and never branches on what it got back, so a spec
+builder needs no ``HAVE_*`` flag and no import guard of its own.
+
+The implementations themselves live in :mod:`megatron.core.ops`, one package per operation
+family. A provider is the short, readable list of which of them this configuration uses --
+reading :class:`LocalSpecProvider` tells you every backend a local run gets.
+"""
+
 from __future__ import annotations
 
-import warnings
-from abc import abstractmethod
-from functools import partial
-from typing import Literal, Optional, Protocol, cast
+from typing import Optional, Protocol
 
-from megatron.core.extensions.transformer_engine import (
-    TEColumnParallelGroupedLinear,
-    TERowParallelGroupedLinear,
-)
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer.dot_product_attention import DotProductAttention
-from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import (
-    GroupedMLPSubmodules,
-    InferenceGroupedMLP,
-    SequentialMLP,
-)
+from megatron.core.ops.attention import AttentionLocal
+from megatron.core.ops.linear import LinearLocal
+from megatron.core.ops.loss import LossMegatron, LossMegatronFused, VocabParallelCrossEntropy
+from megatron.core.ops.mlp import MlpMegatron
+from megatron.core.ops.moe import MoeLocal
+from megatron.core.transformer.mlp import TEActivationFunctionBuilder
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
-from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
-from megatron.core.typed_torch import not_none
-from megatron.core.utils import is_te_min_version
-
-try:
-    import apex  # pylint: disable=unused-import
-
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-
-    HAVE_APEX = True
-    LNImpl = FusedLayerNorm
-except ImportError:
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    FusedLayerNorm = None
-    HAVE_APEX = False
-    LNImpl = WrappedTorchNorm
-
-from megatron.core.extensions.transformer_engine import (
-    TEActivationOp,
-    TEDotProductAttention,
-    TELinear,
-    TENorm,
-)
-from megatron.core.tensor_parallel.inference_layers import (
-    InferenceColumnParallelLinear,
-    InferenceLayerNormColumnParallelLinear,
-    InferenceRowParallelLinear,
-)
-from megatron.core.utils import is_te_min_version
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 
 
 class BackendSpecProvider(Protocol):
-    """A protocol for providing the submodules used in Spec building."""
+    """A protocol for providing the submodules used in spec building."""
 
-    @abstractmethod
+    def linear(self) -> type:
+        """Which linear module the backend uses."""
+        ...
+
     def column_parallel_linear(self) -> type:
-        """Which column parallel linear module the backend uses"""
+        """Which column parallel linear module the backend uses."""
         ...
 
-    @abstractmethod
     def row_parallel_linear(self) -> type:
-        """Which row parallel linear module the backend uses"""
+        """Which row parallel linear module the backend uses."""
         ...
 
-    @abstractmethod
     def fuse_layernorm_and_linear(self) -> bool:
-        """Does the backend support a single module for layernorm and linear"""
+        """Does the backend choose a single module for layernorm and linear."""
         ...
 
-    @abstractmethod
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
-        """Which module for sequential layernorm and linear"""
+        """Which module for sequential layernorm and linear."""
         ...
 
-    @abstractmethod
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
     ) -> LayerNormBuilder:
-        """Which module for layernorm"""
+        """Which module to use for layer norm."""
         ...
 
-    @abstractmethod
     def core_attention(self) -> type:
-        """Which module to use for attention"""
+        """Which module to use for attention."""
         ...
 
-    @abstractmethod
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
-        """Which module and submodules to use for grouped mlp"""
+        """Which module and submodules to use for grouped mlp."""
         ...
 
-    @abstractmethod
     def activation_func(self) -> TEActivationFunctionBuilder | None:
-        """Which module to use for activation function"""
+        """Which module to use for activation function."""
+        ...
+
+    def mlp_module(self, grouped: bool = False) -> type:
+        """Which module to use for the dense MLP block."""
+        ...
+
+    def moe_router(self) -> Optional[type]:
+        """Which MoE router to use, or None to keep the MoESubmodules default."""
+        ...
+
+    def vocab_parallel_cross_entropy(self) -> VocabParallelCrossEntropy:
+        """Which vocab-parallel cross entropy to use."""
         ...
 
 
 class LocalSpecProvider(BackendSpecProvider):
-    """A protocol for providing Local submodules used in Spec building."""
+    """Every backend a Megatron-Core-only run uses.
+
+    Norm is Torch rather than Apex-if-installed: whether an optional package happens to be
+    present must not silently change which kernel a run gets. Apex is a deliberate choice,
+    made by passing ``use_apex_norm=True``.
+    """
+
+    def __init__(
+        self, use_apex_norm: bool = False, cross_entropy_loss_fusion: bool = False
+    ) -> None:
+        # Imported here so that selecting Apex is what pulls Apex in.
+        if use_apex_norm:
+            from megatron.core.ops.norm import NormApex
+
+            self._norm = NormApex()
+        else:
+            from megatron.core.ops.norm import NormTorch
+
+            self._norm = NormTorch()
+        self._linear = LinearLocal()
+        self._attention = AttentionLocal()
+        self._mlp = MlpMegatron()
+        self._moe = MoeLocal()
+        self._loss = LossMegatronFused() if cross_entropy_loss_fusion else LossMegatron()
+
+    def linear(self) -> type:
+        """Megatron Core has no non-parallel linear; Transformer Engine is the one that does."""
+        raise NotImplementedError(
+            "This backend has no non-parallel linear. Use --transformer-impl transformer_engine."
+        )
 
     def column_parallel_linear(self) -> type:
-        """Which column parallel linear module the backend uses"""
-        return ColumnParallelLinear
+        """Which column parallel linear module the backend uses."""
+        return self._linear.column_parallel_linear()
 
-    def row_parallel_linear(self) -> type[RowParallelLinear]:
-        """Which row parallel linear module the backend uses"""
-        return RowParallelLinear
+    def row_parallel_linear(self) -> type:
+        """Which row parallel linear module the backend uses."""
+        return self._linear.row_parallel_linear()
 
     def fuse_layernorm_and_linear(self) -> bool:
-        """Does the backend choose a single module for layernorm and linear"""
+        """Does the backend choose a single module for layernorm and linear."""
         return False
 
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
-        """Which module for sequential layernorm and linear"""
-        return None
+        """Which module for sequential layernorm and linear."""
+        return self._linear.column_parallel_layer_norm_linear()
 
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
     ) -> LayerNormBuilder:
-        """Which module to use for layer norm"""
-        if rms_norm:
-            # Matching get_gpt_layer_local_spec.
-            # Why does the global need to be updated?
-            global LNImpl
-            LNImpl = WrappedTorchNorm
-        return LNImpl
+        """Which module to use for layer norm."""
+        return self._norm.layer_norm(rms_norm=rms_norm, for_qk=for_qk, has_residual=has_residual)
 
     def core_attention(self) -> type:
-        """Which module to use for attention"""
-        return DotProductAttention
+        """Which module to use for attention."""
+        return self._attention.core_attention()
 
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
-        """Which module and submodules to use for grouped mlp"""
-        return partial(
-            SequentialMLP,
-            submodules=MLPSubmodules(
-                linear_fc1=ColumnParallelLinear,
-                linear_fc2=RowParallelLinear,
-                activation_func=self.activation_func(),
-            ),
-        )
+        """Which module and submodules to use for grouped mlp."""
+        return self._moe.grouped_mlp_modules(moe_use_grouped_gemm)
 
     def activation_func(self) -> TEActivationFunctionBuilder | None:
-        """Which module to use for activation function"""
-        return None
+        """Which module to use for activation function."""
+        return self._moe.activation_func()
+
+    def mlp_module(self, grouped: bool = False) -> type:
+        """Which module to use for the dense MLP block."""
+        return self._mlp.mlp_module(grouped=grouped)
+
+    def moe_router(self) -> Optional[type]:
+        """Which MoE router to use, or None to keep the MoESubmodules default."""
+        return self._moe.moe_router()
+
+    def vocab_parallel_cross_entropy(self) -> VocabParallelCrossEntropy:
+        """Which vocab-parallel cross entropy to use."""
+        return self._loss.vocab_parallel_cross_entropy()
 
 
-class InferenceSpecProvider(BackendSpecProvider):
-    """A protocol for providing the submodules used in Spec building."""
+class InferenceSpecProvider(LocalSpecProvider):
+    """Every backend an inference-optimized run uses.
+
+    Attention comes from Transformer Engine; the inference-specific gains are in the linear
+    and mixture-of-experts layers.
+    """
+
+    def __init__(self, cross_entropy_loss_fusion: bool = False) -> None:
+        super().__init__(cross_entropy_loss_fusion=cross_entropy_loss_fusion)
+        from megatron.core.inference.ops import LinearInference, MoeInference, NormInference
+        from megatron.core.ops.attention import AttentionTE
+
+        self._norm = NormInference()
+        self._linear = LinearInference()
+        self._attention = AttentionTE()
+        self._moe = MoeInference()
 
     def linear(self) -> type:
-        """Which linear module TE backend uses"""
-        return TELinear
-
-    def column_parallel_linear(self) -> type:
-        """Which column parallel linear module TE backend uses"""
-        return InferenceColumnParallelLinear
-
-    def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
-        """Which row parallel linear module Inference backend uses"""
-        return InferenceRowParallelLinear
+        """Which non-parallel linear module the backend uses."""
+        return self._linear.linear()
 
     def fuse_layernorm_and_linear(self) -> bool:
-        """TE backend chooses a single module for layernorm and linear"""
+        """The inference linear fuses layernorm into the column-parallel linear."""
         return True
-
-    def column_parallel_layer_norm_linear(self) -> type[InferenceLayerNormColumnParallelLinear]:
-        """Which module for sequential layernorm and linear"""
-        return InferenceLayerNormColumnParallelLinear
-
-    def layer_norm(
-        self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
-    ) -> LayerNormBuilder:
-        """Which module to use for layer norm"""
-        if for_qk and not is_te_min_version("1.9.0"):
-            # TENorm significantly harms convergence when used
-            # for QKLayerNorm if TE Version < 1.9;
-            # we instead use the Apex implementation.
-            return not_none(FusedLayerNorm)
-        return TENorm
-
-    def core_attention(self) -> type[TEDotProductAttention]:
-        """Which module to use for attention"""
-        return TEDotProductAttention
-
-    def activation_func(self) -> TEActivationFunctionBuilder | None:
-        """Which module to use for activation function"""
-        # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
-        # design these classes always meet the interface.
-        return cast(TEActivationFunctionBuilder, TEActivationOp)
-
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
-        """Which module and submodules to use for grouped mlp"""
-        return partial(
-            InferenceGroupedMLP,
-            submodules=GroupedMLPSubmodules(
-                linear_fc1=TEColumnParallelGroupedLinear,
-                linear_fc2=TERowParallelGroupedLinear,
-                activation_func=self.activation_func(),
-            ),
-        )
 
 
 def get_backend(
-    transformer_impl: Literal["local", "transformer_engine", "inference_optimized"]
+    transformer_impl: str,
+    *,
+    use_kitchen: bool = False,
+    use_kitchen_attention: bool = False,
+    kitchen_attention_backend: str = "sdpa",
+    **settings,
 ) -> BackendSpecProvider:
-    """Return the backend that's selected with the given `transformer_impl`."""
+    """Build the provider for a named backend.
+
+    The whole of backend selection is here: three names, three providers, plus Kitchen layered
+    over whichever was chosen. A caller that has a ``TransformerConfig`` should use
+    :func:`get_backend_spec_provider` instead, which reads the settings off it.
+    """
+    base = _base_backend(transformer_impl, **settings)
+    if not use_kitchen:
+        return base
+    # Kitchen takes the operations it implements and forwards the rest to the provider that
+    # would otherwise have owned them.
+    from megatron.core.extensions.kitchen import KitchenSpecProvider
+
+    return KitchenSpecProvider(
+        fallback=base,
+        use_kitchen_attention=use_kitchen_attention,
+        kitchen_attention_backend=kitchen_attention_backend,
+    )
+
+
+def _base_backend(transformer_impl: str, **settings) -> BackendSpecProvider:
     if transformer_impl == "transformer_engine":
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
-        return TESpecProvider()
-    elif transformer_impl == "inference_optimized":
-        return InferenceSpecProvider()
-    elif transformer_impl == "local":
-        return LocalSpecProvider()
-    else:
-        raise ValueError(f"unknown transformer_impl='{transformer_impl}'")
+        return TESpecProvider(**settings)
+    if transformer_impl == "inference_optimized":
+        settings.pop("use_te_op_fuser", None)
+        return InferenceSpecProvider(**settings)
+    if transformer_impl == "local":
+        settings.pop("use_te_op_fuser", None)
+        return LocalSpecProvider(**settings)
+    raise ValueError(
+        f"unknown transformer_impl='{transformer_impl}'. "
+        "Valid choices: local, transformer_engine, inference_optimized"
+    )
+
+
+def get_backend_spec_provider(
+    config: object, *, transformer_impl: Optional[str] = None
+) -> BackendSpecProvider:
+    """Build the provider a TransformerConfig asks for.
+
+    ``transformer_impl`` overrides ``config.transformer_impl``, for the callers that build a
+    Transformer Engine spec regardless of what the config says.
+    """
+    return get_backend(
+        transformer_impl or getattr(config, "transformer_impl", "local"),
+        use_kitchen=getattr(config, "use_kitchen", False),
+        use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
+        kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+        use_te_op_fuser=getattr(config, "use_transformer_engine_op_fuser", False),
+        cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
+    )
