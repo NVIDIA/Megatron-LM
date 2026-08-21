@@ -70,9 +70,7 @@ def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
         expert_model_parallel_size=2,
         moe_token_dispatcher_type="flex",
         moe_flex_dispatcher_backend="replica_hybridep",
-        moe_expert_rank_capacity_factor=1.0,
         moe_grouped_gemm=True,
-        moe_single_grouped_weight=True,
         moe_router_dtype="fp32",
         use_transformer_engine_op_fuser=True,
         gradient_accumulation_fusion=True,
@@ -86,6 +84,8 @@ def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
     )
 
     assert config.moe_flex_dispatcher_backend == "replica_hybridep"
+    assert config.moe_expert_rank_capacity_factor == 1.0
+    assert config.moe_single_grouped_weight is False
 
 
 @pytest.mark.parametrize("num_householder", [0, -1])

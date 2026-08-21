@@ -211,9 +211,14 @@ class TEGroupedMLP(MegatronModule):
         self.tp_group = pg_collection.expt_tp
 
         if self.config.moe_flex_dispatcher_backend == "replica_hybridep":
-            os.environ.setdefault("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+            # Keep TE's parameter layout aligned with the user-facing config. The
+            # replica bridge supports both one packed grouped parameter and the
+            # normal weight0..weightN layout.
+            os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = (
+                "1" if self.config.moe_single_grouped_weight else "0"
+            )
             # The replica bridge owns the runtime grouped weights and uses the registered
-            # parameter's main_grad as its source of truth for optimizer/checkpoint state.
+            # weight parameters' main_grad buffers as its source of truth for optimizer state.
             os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
