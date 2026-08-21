@@ -578,7 +578,6 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     shard_size = tensor.shape[0] // gtp_remat_size
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
     gtp_shard = GTPShardedParam(shard.clone())
-    gtp_shard.pad_length = pad_length
     # Preserve duplicate-filtering metadata dropped when wrapping into GTPShardedParam.
     from megatron.core.tensor_parallel import (
         copy_gtp_attributes,
@@ -587,6 +586,8 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
 
     copy_tensor_model_parallel_attributes(gtp_shard, param)
     copy_gtp_attributes(gtp_shard, param)
+    # This slice's computed padding is authoritative over any source metadata.
+    gtp_shard.pad_length = pad_length
     return gtp_shard
 
 

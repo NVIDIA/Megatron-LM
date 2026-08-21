@@ -436,8 +436,8 @@ def test_muon_optimizer_glu_gtp_gathers_before_split(monkeypatch, gtp_rank, layo
     param.is_glu = True
     param.glu_interleave_size = interleave_size
     param.is_gtp_weight_remat = True
-    param.glu_gtp_remat_size = 2
-    param.glu_gtp_pad_length = pad_length
+    param.gtp_remat_size = 2
+    param.pad_length = pad_length
     optimizer = TensorParallelMuon(
         params=[param], split_glu=True, num_ns_steps=1, pg_collection=pg_collection
     )
@@ -679,7 +679,6 @@ class TestMuonOptimizerMultiRank:
         )
         assert fc1_param.is_glu is True
         assert fc1_param.glu_interleave_size is None
-        assert fc1_param.glu_gtp_pad_length == 0
         raw_optimizers = [
             child.optimizer
             for child in optimizer.chained_optimizers

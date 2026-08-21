@@ -66,8 +66,6 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "qkv_split_shapes": None,
     "is_glu": False,
     "glu_interleave_size": None,
-    "glu_gtp_remat_size": 1,
-    "glu_gtp_pad_length": 0,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -118,8 +116,15 @@ def copy_gtp_attributes(destination, source):
     """Copy GTP metadata onto a param view/copy, so the optimizer's master shards stay
     classifiable by param_is_not_gtp_duplicate (is_gtp_weight_remat, allreduce), keep
     electing their checkpoint writer off the caller's own groups (gtp_replica_group), and
-    stay reconstructable by GTP_remat-aware orthogonalization (pad_length)."""
-    for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group", "pad_length"):
+    stay reconstructable by GTP_remat-aware orthogonalization (gtp_remat_size,
+    pad_length)."""
+    for attr in (
+        "is_gtp_weight_remat",
+        "allreduce",
+        "gtp_replica_group",
+        "gtp_remat_size",
+        "pad_length",
+    ):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
 
