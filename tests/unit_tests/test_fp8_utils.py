@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 
 from megatron.core import fp8_utils
+from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions import transformer_engine as te_ext
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -46,6 +48,114 @@ def test_get_fp8_disabled_context_uses_disabled_te_context(is_init, config_value
 
     assert result is disabled_context
     te_context.assert_called_once_with(enabled=False)
+
+
+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine is not available")
+class TestMXFP82DRecipe:
+    """Test MCore propagation of the MXFP8 2D quantization option."""
+
+    @pytest.mark.parametrize("mxfp8_2d_quantization", [False, True])
+    def test_get_fp8_recipe_forwards_2d_quantization_option(self, mxfp8_2d_quantization):
+        recipe = object()
+        recipe_constructor = Mock(return_value=recipe)
+
+        def mxfp8_recipe(fp8_format, fp8_dpa=False, enable_2d_quantization=False):
+            return recipe_constructor(
+                fp8_format=fp8_format,
+                fp8_dpa=fp8_dpa,
+                enable_2d_quantization=enable_2d_quantization,
+            )
+
+        config = Mock(
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_dot_product_attention=False,
+            mxfp8_2d_quantization=mxfp8_2d_quantization,
+        )
+
+        with (
+            patch.object(fp8_utils, "is_te_min_version", return_value=True),
+            patch(
+                "megatron.core.extensions.transformer_engine.te.common.recipe.MXFP8BlockScaling",
+                mxfp8_recipe,
+            ),
+        ):
+            assert fp8_utils.get_fp8_recipe(config) is recipe
+
+        expected_kwargs = {
+            "fp8_format": fp8_utils.transformer_engine.common.recipe.Format.E4M3,
+            "fp8_dpa": False,
+            "enable_2d_quantization": mxfp8_2d_quantization,
+        }
+        recipe_constructor.assert_called_once_with(**expected_kwargs)
+
+    def test_get_fp8_recipe_rejects_te_without_2d_quantization_support(self):
+        config = Mock(
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_dot_product_attention=False,
+            mxfp8_2d_quantization=True,
+        )
+
+        def old_mxfp8_recipe(fp8_format, fp8_dpa=False):
+            return Mock(fp8_format=fp8_format, fp8_dpa=fp8_dpa)
+
+        with (
+            patch.object(fp8_utils, "is_te_min_version", return_value=True),
+            patch(
+                "megatron.core.extensions.transformer_engine.te.common.recipe.MXFP8BlockScaling",
+                old_mxfp8_recipe,
+            ),
+            pytest.raises(RuntimeError, match="enable_2d_quantization"),
+        ):
+            fp8_utils.get_fp8_recipe(config)
+
+    def test_get_fp8_recipe_rejects_kwargs_only_2d_quantization_support(self):
+        config = Mock(
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_dot_product_attention=False,
+            mxfp8_2d_quantization=True,
+        )
+
+        def kwargs_only_mxfp8_recipe(**kwargs):
+            return Mock(**kwargs)
+
+        with (
+            patch.object(fp8_utils, "is_te_min_version", return_value=True),
+            patch(
+                "megatron.core.extensions.transformer_engine.te.common.recipe.MXFP8BlockScaling",
+                kwargs_only_mxfp8_recipe,
+            ),
+            pytest.raises(RuntimeError, match="enable_2d_quantization"),
+        ):
+            fp8_utils.get_fp8_recipe(config)
+
+    def test_per_module_recipe_forwards_2d_quantization_option(self):
+        recipe = object()
+        model_init_context = object()
+        quantization_recipe = te_ext.TEQuantizationRecipe(
+            fp8_quantization_recipe=Fp8Recipe.mxfp8, mxfp8_2d_quantization=True, fp8_param=True
+        )
+
+        with (
+            patch.object(te_ext, "get_mxfp8_block_scaling_recipe", return_value=recipe) as factory,
+            patch.object(te_ext, "fp8_model_init", return_value=model_init_context),
+        ):
+            assert (
+                te_ext._get_fp8_model_init_for_quant_recipe(quantization_recipe)
+                is model_init_context
+            )
+
+        factory.assert_called_once_with(
+            mxfp8_2d_quantization=True, fp8_format=te_ext.te.common.recipe.Format.E4M3
+        )
+
+    def test_per_module_recipe_rejects_2d_quantization_without_mxfp8(self):
+        with pytest.raises(ValueError, match="requires fp8_quantization_recipe='mxfp8'"):
+            te_ext.TEQuantizationRecipe.parse_from_config(
+                {"fp8_quantization_recipe": Fp8Recipe.tensorwise, "mxfp8_2d_quantization": True}
+            )
 
 
 class MockTELinear(nn.Module):

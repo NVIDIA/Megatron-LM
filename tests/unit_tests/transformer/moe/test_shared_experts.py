@@ -123,6 +123,11 @@ def _patch_fake_shared_expert_te(monkeypatch, linear_cls=_FakeTELinear):
         "get_cuda_rng_tracker",
         lambda: SimpleNamespace(is_initialized=lambda: False),
     )
+    monkeypatch.setattr(
+        shared_experts_module,
+        "get_mxfp8_block_scaling_recipe",
+        lambda **_kwargs: fake_te.common.recipe.MXFP8BlockScaling(),
+    )
     return fake_te
 
 
@@ -141,6 +146,7 @@ def _fake_shared_expert(**config_kwargs):
         fp4_recipe="nvfp4",
         fp8=True,
         fp8_recipe="mxfp8",
+        mxfp8_2d_quantization=False,
     )
     for key, value in config_kwargs.items():
         setattr(config, key, value)
@@ -334,6 +340,21 @@ def test_fused_grouped_swiglu_no_comm_flattens_and_caches_fused_ops(monkeypatch)
     torch.testing.assert_close(scales, torch.ones(1))
     assert cached_tokens_per_expert is tokens_per_expert
     assert cached_scales is scales
+
+
+def test_fused_grouped_swiglu_recipe_forwards_2d_quantization(monkeypatch):
+    _patch_fake_shared_expert_te(monkeypatch)
+    shared_expert = _fake_shared_expert(mxfp8_2d_quantization=True)
+    calls = []
+    monkeypatch.setattr(
+        shared_experts_module,
+        "get_mxfp8_block_scaling_recipe",
+        lambda **kwargs: calls.append(kwargs) or _FakeMXFP8Recipe(),
+    )
+
+    shared_expert._get_fused_grouped_swiglu_recipe()
+
+    assert calls == [{"mxfp8_2d_quantization": True}]
 
 
 def test_backward_dw_dispatches_fused_children_and_original_reduce_hooks(monkeypatch):

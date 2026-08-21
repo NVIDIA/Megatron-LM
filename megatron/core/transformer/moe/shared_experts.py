@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, get_mxfp8_block_scaling_recipe
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -456,7 +456,9 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             if self.config.fp4 and fp4_recipe == "nvfp4":
                 self._fused_grouped_swiglu_recipe = te.common.recipe.NVFP4BlockScaling()
             elif self.config.fp8 and fp8_recipe == "mxfp8":
-                self._fused_grouped_swiglu_recipe = te.common.recipe.MXFP8BlockScaling()
+                self._fused_grouped_swiglu_recipe = get_mxfp8_block_scaling_recipe(
+                    mxfp8_2d_quantization=self.config.mxfp8_2d_quantization
+                )
             else:
                 raise ValueError(
                     f"{self.__class__.__name__} requires fp4_recipe='nvfp4' or "

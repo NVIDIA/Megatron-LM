@@ -654,6 +654,16 @@ class TestArgumentGroupFactoryArgparseMeta:
 class TestMegatronNetworkArgumentGeneration:
     """Test Megatron's TransformerConfig-derived argument group."""
 
+    def test_mxfp8_2d_quantization_flag_is_registered(self):
+        """The TransformerConfig field is exposed through the generated network arguments."""
+        from megatron.training.arguments import _add_network_size_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+
+        args = parser.parse_args(["--mxfp8-2d-quantization"])
+        assert args.mxfp8_2d_quantization is True
+
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""
         from megatron.training.arguments import _add_network_size_args

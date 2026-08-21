@@ -253,12 +253,16 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
         module._fused_impl = None
         module._norm_seq = (lambda hidden_states: hidden_states,)
+        module.config = SimpleNamespace(mxfp8_2d_quantization=True)
         module.linear_fc2 = SimpleNamespace(te_return_bias=True, bias=torch.empty(0))
         object.__setattr__(module, "_make_fused_impl", lambda: fused_impl)
 
-        def make_recipe(name):
-            recipe_calls.append(name)
+        def make_recipe(name, **kwargs):
+            recipe_calls.append((name, kwargs))
             return recipe
+
+        def make_mxfp8_recipe(*, enable_2d_quantization=False):
+            return make_recipe("MXFP8BlockScaling", enable_2d_quantization=enable_2d_quantization)
 
         monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 1)
         monkeypatch.setattr(
@@ -268,10 +272,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
             raising=False,
         )
         monkeypatch.setattr(
-            te_ext.te.common.recipe,
-            "MXFP8BlockScaling",
-            lambda: make_recipe("MXFP8BlockScaling"),
-            raising=False,
+            te_ext.te.common.recipe, "MXFP8BlockScaling", make_mxfp8_recipe, raising=False
         )
         monkeypatch.setattr(
             te_ext.te.pytorch,
@@ -292,7 +293,10 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert out.shape == (2, 3, 4)
         assert bias is None
         assert module._recipe is recipe
-        assert recipe_calls == [recipe_name]
+        expected_kwargs = (
+            {"enable_2d_quantization": True} if recipe_name == "MXFP8BlockScaling" else {}
+        )
+        assert recipe_calls == [(recipe_name, expected_kwargs)]
 
     def test_dense_grouped_spec_selected_only_with_te_op_fuser(self):
         grouped_spec = gpt_layer_specs.get_mlp_module_spec_for_backend(

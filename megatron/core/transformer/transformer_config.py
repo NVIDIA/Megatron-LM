@@ -592,6 +592,10 @@ class TransformerConfig(ModelParallelConfig):
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
     4) 'blockwise' for blockwise scaling recipe, 5) 'custom' for custom quantization recipe."""
 
+    mxfp8_2d_quantization: bool = False
+    """If True, use 2D block scaling for forward-pass linear and grouped-linear weights.
+    Requires fp8_recipe='mxfp8' and a Transformer Engine build with 2D MXFP8 support."""
+
     fp8_param: bool = False
     """If set, keep the parameters in fp8 precision to save memory. This option must be used
     together with fp8 mode (i.e., TransformerConfig.fp8 is not None). Note that not all parameters
@@ -1533,6 +1537,19 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        if self.mxfp8_2d_quantization:
+            if not self.fp8:
+                raise ValueError("mxfp8_2d_quantization must be used together with fp8 mode.")
+            if self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "mxfp8_2d_quantization requires fp8_recipe='mxfp8', "
+                    f"got '{self.fp8_recipe}'."
+                )
+            if self.moe_single_grouped_weight:
+                raise ValueError(
+                    "mxfp8_2d_quantization does not support moe_single_grouped_weight."
+                )
 
         if self.fp8_output_proj:
             if not self.fp8:

@@ -347,11 +347,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
+        raise ValueError("""CustomRecipe recipe is not available in this version of 
             Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 
@@ -749,7 +747,10 @@ def is_mxfp8_output_proj_active(config) -> bool:
 
 if HAVE_TE:
     from megatron.core import parallel_state
-    from megatron.core.extensions.transformer_engine import TEDelayedScaling
+    from megatron.core.extensions.transformer_engine import (
+        TEDelayedScaling,
+        get_mxfp8_block_scaling_recipe,
+    )
 
     def get_fp8_recipe(config: TransformerConfig):
         """Return fp8 recipe.
@@ -785,8 +786,10 @@ if HAVE_TE:
                     fp8_format=fp8_format
                 )
             elif config.fp8_recipe == Fp8Recipe.mxfp8:
-                fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
-                    fp8_format=fp8_format, fp8_dpa=config.fp8_dot_product_attention
+                fp8_recipe = get_mxfp8_block_scaling_recipe(
+                    mxfp8_2d_quantization=config.mxfp8_2d_quantization,
+                    fp8_format=fp8_format,
+                    fp8_dpa=config.fp8_dot_product_attention,
                 )
             elif config.fp8_recipe == Fp8Recipe.custom:
                 assert config.fp8_quantizer_factory is not None
