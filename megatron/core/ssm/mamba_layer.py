@@ -86,6 +86,7 @@ class MambaLayer(GraphableMegatronModule):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         """Initialize Mamba Layer.
 
@@ -99,6 +100,7 @@ class MambaLayer(GraphableMegatronModule):
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -128,7 +130,9 @@ class MambaLayer(GraphableMegatronModule):
             if self.residual_connection is not None
             else self.config.hidden_size
         )
-        if self.config.wide_residual is not None:
+        # MTP inner layers consume the decoder readout at hidden_size and intentionally use
+        # ordinary residual additions even when the main decoder has a wide residual stream.
+        if self.config.wide_residual is not None and not self.is_mtp_layer:
             expected_stream_hidden_size = (
                 self.config.wide_residual.num_streams * self.config.hidden_size
             )

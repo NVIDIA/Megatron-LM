@@ -22,6 +22,7 @@ class MLPLayer(TransformerLayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         add_layer_offset: bool = True,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(
             config=config,
@@ -31,4 +32,5 @@ class MLPLayer(TransformerLayer):
             pg_collection=pg_collection,
             add_layer_offset=add_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )

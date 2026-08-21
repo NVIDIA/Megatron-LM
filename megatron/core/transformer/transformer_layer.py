@@ -560,7 +560,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else self.config.hidden_size
         )
 
-        if self.config.wide_residual is not None:
+        # MTP inner layers consume the decoder readout at hidden_size and intentionally use
+        # ordinary residual additions even when the main decoder has a wide residual stream.
+        if self.config.wide_residual is not None and not self.is_mtp_layer:
             expected_stream_hidden_size = (
                 self.config.wide_residual.num_streams * self.config.hidden_size
             )

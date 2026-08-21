@@ -1531,10 +1531,6 @@ class TransformerConfig(ModelParallelConfig):
                     "wide_residual does not yet support pipeline_model_parallel_size > 1. "
                     "Inter-stage communication buffers are still sized from hidden_size."
                 )
-            if self.mtp_num_layers is not None:
-                raise NotImplementedError(
-                    "wide_residual does not yet support Multi-Token Prediction (MTP)."
-                )
             if self.inference_fuse_tp_communication:
                 raise NotImplementedError(
                     "wide_residual is not compatible with inference_fuse_tp_communication. "

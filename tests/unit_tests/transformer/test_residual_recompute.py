@@ -689,3 +689,26 @@ class TestResidualStreamRecomputeIntegration:
         assert len(replay_inputs) == 1
         assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
         assert output.shape == hidden_states.shape
+
+    def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):
+        config = _wide_recompute_config(num_layers=1)
+        stack = HybridStack(
+            config,
+            HybridStackSubmodules(attention_layer=_recording_layer_spec()),
+            layer_type_list=[Symbols.ATTENTION],
+            post_layer_norm=False,
+            is_mtp_layer=True,
+            pg_collection=_process_groups(),
+        ).cuda()
+        hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
+
+        output = stack(hidden_states=hidden_states, attention_mask=None)
+        output.square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        assert not stack.uses_wide_residual_stream
+        assert stack.residual_stream_readout is None
+        assert stack.layers[0].residual_connection_self_attn is None
+        assert stack.layers[0].residual_connection_mlp is None
+        assert not stack.layers[0].received_residual_recompute_kwarg
+        assert hidden_states.grad is not None

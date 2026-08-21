@@ -144,7 +144,6 @@ def test_wide_residual_config_validates_bounded_retention(retention_init, max_fo
     ("override", "expected_error"),
     [
         ({"enable_mhc_connections": True}, "mutually exclusive"),
-        ({"mtp_num_layers": 1}, "Multi-Token Prediction"),
         ({"inference_fuse_tp_communication": True}, "fuse_tp_communication"),
         ({"fp32_residual_connection": True}, "fp32_residual_connection"),
         ({"heterogeneous_block_specs": True}, "heterogeneous_block_specs"),
@@ -157,6 +156,18 @@ def test_wide_residual_config_validates_bounded_retention(retention_init, max_fo
 def test_transformer_config_rejects_unsupported_wide_residual_modes(override, expected_error):
     with pytest.raises((ValueError, NotImplementedError), match=expected_error):
         _wide_config(**override)
+
+
+def test_transformer_config_accepts_mtp_with_wide_residual_replay():
+    config = _wide_config(
+        mtp_num_layers=2,
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+
+    assert config.mtp_num_layers == 2
+    assert config.residual_stream_recompute_num_layers == 1
 
 
 class TestStreamwiseSigmoidWideResidualConnection:

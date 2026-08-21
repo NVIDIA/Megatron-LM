@@ -113,7 +113,9 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
-        self.uses_wide_residual_stream = self.config.wide_residual is not None
+        # MTP consumes the main decoder readout and shifted-token embedding at hidden_size.
+        # Its auxiliary stack therefore remains ordinary width even when the decoder is wide.
+        self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -157,6 +159,8 @@ class HybridStack(MegatronModule):
                 return specialize_wide_residual_layer_spec(layer_spec, self.config)
             return layer_spec
 
+        mtp_layer_kwargs = {"is_mtp_layer": True} if is_mtp_layer else {}
+
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
@@ -176,6 +180,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        **mtp_layer_kwargs,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
@@ -217,6 +222,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        **mtp_layer_kwargs,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
@@ -246,6 +252,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        **mtp_layer_kwargs,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
