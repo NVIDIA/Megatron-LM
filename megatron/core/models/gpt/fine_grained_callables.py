@@ -2,7 +2,7 @@
 
 import weakref
 from contextlib import nullcontext
-from functools import partial
+from functools import partial, wraps
 from typing import Callable, Optional
 
 import torch
@@ -102,9 +102,34 @@ def should_free_input(name, is_moe, config, num_local_experts):
         # so they cannot be freed.
         "moe_dispatch": not (enable_deepep or enable_hybridep or enable_ncclep)
         and (CudaGraphModule.moe_preprocess not in config.cuda_graph_modules),
+        # The mHC post node feeds the combine output into fused_h_res_h_post_bda,
+        # which saves it for backward, so its storage cannot be released here.
+        # Listed explicitly rather than left to the dict fall-through: this node
+        # is new, and "not freed" is a decision, not an omission.
+        "mhc_post": False,
     }
 
     return free_input_nodes.get(name, False)
+
+
+def with_sequence_parallel_rng(func, config):
+    """Run ``func`` under the tensor-parallel RNG state when sequence parallel is on.
+
+    The fine-grained EP-overlap schedule invokes these callables directly, so it
+    never enters ``TransformerBlock.forward``'s fork. Any callable that consumes
+    randomness therefore has to establish the fork itself, or every TP rank in the
+    sequence-parallel partition draws the same mask and the recompute replay does
+    not reproduce the forward one.
+    """
+    if not config.sequence_parallel:
+        return func
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with tensor_parallel.get_cuda_rng_tracker().fork():
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def finalize_decoder_layer_output(node, hidden_states):
@@ -365,14 +390,10 @@ class TransformerLayerNode(ScheduleNode):
             )
 
     def reset_for_recompute(self):
-        """Release the forward activation tensors held by this node while keeping the
-        node reusable for a later recompute forward.
+        """Release this node's forward activations, keeping it reusable for a replay.
 
-        Used by the VPP-stage full recompute path (EP A2A overlap): after the initial
-        (no-grad) forward, the layer node's activation tensors are freed so that only
-        the stage input tensor survives the forward->backward gap. The same node
-        object is later re-run (with grad enabled) to rebuild ``inputs``/``output``/
-        ``detached`` before the backward pass.
+        Under full recompute only each segment's input survives the forward->backward
+        gap; the same node is later re-run with grad enabled to rebuild its state.
         """
         self.inputs = None
         self.output = None
@@ -545,12 +566,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
 
-    The five callable slots are:
+    The six callable slots are:
     1. Attention and routing preprocess (computation)
     2. MoE Dispatch (communication)
     3. MLP / MoE Experts (computation)
-    4. MoE Combine and MLP-side mHC post-processing (communication)
-    5. MTP post-processing (computation, MTP layers only)
+    4. MoE Combine (communication)
+    5. MTP post-processing (computation, MTP layers only; None here)
+    6. MLP-side mHC post-processing (computation, mHC layers only)
+
+    Slot 6 used to run inside slot 4. It has its own compute-stream node because
+    running it on the communication stream made the recompute's tensors
+    cross-stream; see submodule_combine_forward's early return.
 
     By assigning these functions to different CUDA streams (e.g., a compute stream
     and a communication stream), the scheduler can overlap their execution, preventing
@@ -602,6 +628,13 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         )
         if using_cuda_graph_replay:
             layer.set_te_cuda_graph_backward_dw_wrapper()
+            # The fine-grained schedule calls _te_cuda_graph_replay directly,
+            # bypassing TransformerLayer.__call__ where _mhc_recompute_manager is
+            # normally set. Thread it here so the attention-only split replay can
+            # bind its fixed-address recompute arena slot (see
+            # HyperConnectionTransformerLayer._te_cuda_graph_replay_mhc_attention_split_overlap).
+            if is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
+                layer._mhc_recompute_manager = mhc_recompute_manager
             forward_func = layer._te_cuda_graph_replay
         else:
             # wrapper function that keeps consistent api with cuda graph replay
@@ -703,6 +736,18 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
         ):
             forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
+        elif is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
+            # The attention-only split replay runs the MoE routing tail itself, so
+            # it needs the padding_mask that the eager branch above reads straight
+            # off node.chunk_state; without it the graphed path routes as if the
+            # batch were unpadded. The guard is the split predicate, not merely
+            # "hyper-connection layer": hyper connections with TE attention graphs
+            # but without mHC recompute are a supported configuration, and they
+            # fall through to GraphableMegatronModule._te_cuda_graph_replay, which
+            # copies **kwargs straight to TE. padding_mask only enters sample_kwargs
+            # on the THD path, so on SBHD it was never a capture-time argument and
+            # passing it breaks replay -- including when it is None.
+            forward_kwargs["padding_mask"] = node.chunk_state.padding_mask
         forward_outputs = forward_func(**forward_kwargs)
         if is_mhc_layer:
             hidden_states, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post = (
@@ -776,8 +821,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         Trigger token combine and the remaining layer computation.
 
-        MHC post-processing stays in this communication-stream node so it preserves the
-        existing EP overlap stream topology.
+        On mHC layers this is combine communication only: mHC post-processing has moved
+        to a dedicated compute-stream node (the ``mhc_post`` slot in
+        ``build_transformer_layer_callables``). Running it here placed compute on the
+        communication stream and made the recompute's tensors cross-stream; see the
+        comment on the early return below.
         """
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
@@ -792,7 +840,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.shared_expert_output = None
 
         if is_mhc_layer:
-            return submodule_mhc_post_forward(node, output)
+            # mHC post-processing is compute, and running it here would put it on
+            # the communication stream. That is what made the recompute's tensors
+            # cross-stream: allocated by the recompute on the compute stream, read
+            # by this node's backward on the communication stream, then freed --
+            # a window the caching allocator cannot see, which is the
+            # use-after-free behind the ~1e8 grad norms. It also parks compute in
+            # the stream whose whole purpose is to overlap communication. Hand the
+            # combine output to a compute-stream node instead.
+            return output
 
         mlp_output_with_bias = (output, None)
         with layer.bias_dropout_add_exec_handler():
@@ -883,7 +939,18 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     layer.init_backward_dw_wrapper()
 
-    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None]
+    # mHC post runs the fused H_res/H_post bias-dropout-add, so it needs the
+    # sequence-parallel RNG fork that this builder's other callables do not carry.
+    # That omission on dispatch/mlp/combine predates this PR -- the overlap
+    # schedule bypasses TransformerBlock.forward's fork for all of them -- and is
+    # left alone here rather than silently widening this PR's numerics change.
+    mhc_post_func = (
+        with_sequence_parallel_rng(submodule_mhc_post_forward, layer.config)
+        if is_mhc_layer
+        else None
+    )
+
+    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None, mhc_post_func]
     backward_dw = {"attn": layer.backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
 
@@ -891,13 +958,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 def build_mtp_layer_callables(layer):
     """Create callables for multi-token prediction layer schedule nodes.
 
-    The returned forward callables use the same five-slot layout as transformer layers:
+    The returned forward callables use the same six-slot layout as transformer layers:
 
     1. Attention with MTP preprocessing.
     2. MoE dispatch.
     3. MoE experts.
-    4. MoE combine and MLP-side mHC post-processing.
+    4. MoE combine.
     5. MTP post-processing.
+    6. mHC post-processing, inherited from the wrapped transformer layer.
 
     Args:
         layer: Multi-token prediction layer whose underlying transformer layer is decomposed.
@@ -910,7 +978,9 @@ def build_mtp_layer_callables(layer):
         AssertionError: If the underlying transformer layer is not an MoE layer.
     """
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
-    attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
+    attn_forward, dispatch_forward, mlp_forward, combine_forward, _, inner_mhc_post_forward = (
+        forward_funcs
+    )
     is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
@@ -990,7 +1060,23 @@ def build_mtp_layer_callables(layer):
     combine_func = partial(rng_context_wrapper, combine_forward)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
-    forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mtp_post_process_func]
+    # The MTP layer wraps a transformer layer, so it inherits that layer's mHC
+    # post-processing node. Dropping it here would leave the MTP layer's
+    # hyper-connection output unexpanded.
+    #
+    # Taken as-is: build_transformer_layer_callables already applied
+    # with_sequence_parallel_rng to it, and wrapping again would nest one fork
+    # inside another. None means "this layer has no mHC post node", which the
+    # schedule tests for, so it has to pass through unchanged too.
+    mhc_post_func = inner_mhc_post_forward
+    forward_funcs = [
+        attn_func,
+        dispatch_func,
+        mlp_func,
+        combine_func,
+        mtp_post_process_func,
+        mhc_post_func,
+    ]
     # Under hyper-connections the MTP layer builds separate e_proj/h_proj and
     # sets eh_proj to None; appending eh_proj unconditionally would place None
     # in the delayed-wgrad callable list (crashing backward_dw) and leave the

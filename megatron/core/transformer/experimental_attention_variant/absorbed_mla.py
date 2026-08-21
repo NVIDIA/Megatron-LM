@@ -64,11 +64,8 @@ def _restore_packed_thd_batch_dim(
     core_attn_out: torch.Tensor, hidden_states: torch.Tensor, packed_seq_params
 ) -> torch.Tensor:
     """Restore the singleton packed-THD batch dim only when core attention omitted it."""
-    if (
-        packed_seq_params is not None
-        and packed_seq_params.qkv_format == 'thd'
-        and core_attn_out.ndim == hidden_states.ndim - 1
-    ):
+    thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+    if thd_packed_seq and core_attn_out.ndim == hidden_states.ndim - 1:
         core_attn_out = core_attn_out.unsqueeze(1)
     return core_attn_out
 
@@ -464,13 +461,13 @@ class AbsorbedMLASelfAttention(Attention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -479,9 +476,11 @@ class AbsorbedMLASelfAttention(Attention):
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                rotary_pos_emb, mscale = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq=thd_packed_seq
+                )
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if thd_packed_seq:
             if packed_seq_params.cu_seqlens_q_padded is not None:
                 cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
             else:
@@ -545,7 +544,7 @@ class AbsorbedMLASelfAttention(Attention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
-        if packed_seq_params is not None:
+        if thd_packed_seq:
             assert q_compressed.ndim == 3 and q_compressed.size(1) == 1
             assert kv_compressed.ndim == 3 and kv_compressed.size(1) == 1
             assert k_pos_emb.ndim == 3 and k_pos_emb.size(1) == 1
@@ -648,7 +647,7 @@ class AbsorbedMLASelfAttention(Attention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif not thd_packed_seq or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -707,8 +706,13 @@ class AbsorbedMLASelfAttention(Attention):
             return q_absorbed, kv_compressed
 
         if self.recompute_up_proj:
+            # Quantized replay is safe here for the same reason as in MLASelfAttention:
+            # CheckpointWithoutOutput records the forward recipe/amax state and replays
+            # under the recorded fp8_autocast, and the only quantized op inside
+            # qkv_up_proj_and_rope_apply is the Q up projection. The absorption einsum
+            # reads the K up-projection weight directly, which is a persistent parameter
+            # and therefore identical between the forward pass and the replay.
             quantization = self.config.fp8 or self.config.fp4
-            assert not quantization, "FP8/FP4 is not supported for AbsorbedMLA"
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             q_absorbed, kv_compressed = self.qkv_up_checkpoint.checkpoint(
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
@@ -909,13 +913,24 @@ class AbsorbedMLASelfAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
 
-        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
-        # downstream RoPE uses self.pg_collection.cp, which must point at this
-        # microbatch's dynamic CP group. Restored before every return.
+        # Set the right cp group for dynamic-cp. Downstream RoPE and CSA core
+        # attention use self.pg_collection.cp, which must point at this
+        # microbatch's dynamic CP group. Restored before returning.
         _orig_cp_group = self.pg_collection.cp
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if (
+            thd_packed_seq
+            and self.pg_collection.cp is not None
+            and get_pg_size(self.pg_collection.cp) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            raise ValueError(
+                "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag'. "
+                "CP partition conversion must be handled before entering AbsorbedMLA."
+            )
 
         # =====================
         # Query, Key, and Value

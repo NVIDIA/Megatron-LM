@@ -15,12 +15,14 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
-from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
-from megatron.core.transformer.experimental_attention_variant.csa_fused_compressor import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels as csa_cp_layout_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_compressor import (
     maybe_compress_thd_fused,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (  # pylint: disable=line-too-long
     FusedCSAIndexerSparseAttnFromTopkFunc,
     batch_of_row,
     build_flat_topk_idxs,
@@ -203,7 +205,7 @@ def _compressed_thd_topk_to_local(
 # THD (packed) variants of the index helpers above.
 #
 # Both produce per-row local-to-segment indices in the SAME index space that
-# ``csa_kernels.local_to_global_flat(..., cu_seqlens_q=..., cu_seqlens_kv=...)``
+# ``csa_utils.fused_sparse_attention.local_to_global_flat(...)``
 # expects: each row is one query token in the packed layout, each value is
 # either ``-1`` (invalid / future position) or a non-negative local KV id in
 # ``[0, seqlen_kv_full[batch_of_row])`` where ``seqlen_kv_full[b] =
@@ -1259,7 +1261,7 @@ class Compressor(MegatronModule):
         # Additive fused fast path (CuTe DSL, one kernel per direction) for the
         # gather / overlap-window / softmax / weighted-sum region below. Returns None
         # (-> keep the eager region) for any unsupported configuration; see
-        # csa_fused_compressor.py for the gating rules.
+        # csa_utils/fused_compressor.py for the gating rules.
         compressed_thd = None
         if not pre_grouped:
             compressed_thd = maybe_compress_thd_fused(
@@ -2087,6 +2089,21 @@ class CompressedSparseAttention(MegatronModule):
         """
         nvtx_range_push("compressed_sparse_attn")
 
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
+        cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
+        qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
+        if cp_size > 1 and qkv_format != 'thd':
+            raise ValueError("CompressedSparseAttention with CP requires qkv_format='thd'.")
+        if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
+            raise ValueError(
+                "CompressedSparseAttention requires cp_partition_mode='contiguous'. "
+                "CP partition conversion must be handled before entering CSA."
+            )
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
                 output = self._forward_thd_cp(
@@ -2094,6 +2111,7 @@ class CompressedSparseAttention(MegatronModule):
                 )
             else:
                 output = self._forward_thd(query, key, x, qr, packed_seq_params)
+            self.pg_collection.cp = _orig_cp_group
             nvtx_range_pop("compressed_sparse_attn")
             return output
 
@@ -2138,6 +2156,7 @@ class CompressedSparseAttention(MegatronModule):
         if indexer_loss is not None:
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
+        self.pg_collection.cp = _orig_cp_group
         nvtx_range_pop("compressed_sparse_attn")
         return output
 
@@ -2197,7 +2216,7 @@ class CompressedSparseAttention(MegatronModule):
 
                     # Physical padded offsets define the packed address space;
                     # unpadded lengths identify the real rows within each segment.
-                    (varlen_starts, varlen_ends, query_valid_rows, compressed_offsets) = (
+                    varlen_starts, varlen_ends, query_valid_rows, compressed_offsets = (
                         _build_compressed_thd_indexer_metadata(
                             cu_seqlens_q,
                             cu_seqlens_compressed_idx,
