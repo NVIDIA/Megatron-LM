@@ -397,10 +397,10 @@ def causal_conv1d_varlen_carry_states(
     # into this request's state. The check stays on device, so no host sync.
     in_range = token_indices < total_tokens
     token_indices = torch.where(in_range, token_indices, torch.zeros_like(token_indices))
-    slice_taps = x[token_indices].transpose(1, 2)  # [N, conv_dim, d_conv]
+    slice_values = x[token_indices].transpose(1, 2)  # [N, conv_dim, d_conv]
 
-    previous_taps = previous_states.gather(
+    previous_values = previous_states.gather(
         2, prev_columns[:, None, :].expand(num_requests, conv_dim, d_conv)
     )
 
-    return torch.where(from_slice[:, None, :], slice_taps, previous_taps)
+    return torch.where(from_slice[:, None, :], slice_values, previous_values)
