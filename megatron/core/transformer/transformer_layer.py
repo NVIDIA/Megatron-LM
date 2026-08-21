@@ -2121,6 +2121,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        # Backstop for packed inputs the config gate cannot see (the gate keys
+        # on sequence_packing_scheduler): fail with a clear message instead of
+        # the TE TypeError a replay with missing captured kwargs would raise.
+        if kwargs.get("packed_seq_params") is not None:
+            raise NotImplementedError(
+                "mhc_recompute_attn_cuda_graph_split does not support packed "
+                "(THD) sequences: the split's replay does not forward the THD "
+                "captured kwargs (cu_seqlens_*, padding_mask). Disable the "
+                "switch to capture the whole attention range instead."
+            )
         return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
 
     def _forward_mhc_attention_post_cuda_graph(
