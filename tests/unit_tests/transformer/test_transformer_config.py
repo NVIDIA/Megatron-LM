@@ -55,3 +55,18 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
             num_attention_heads=4,
             gdp_num_householder=num_householder,
         )
+
+
+def test_num_query_groups_must_divide_num_attention_heads():
+    with pytest.raises(
+        ValueError, match="num_attention_heads .* must be a multiple of num_query_groups"
+    ):
+        TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, num_query_groups=3)
+
+
+@pytest.mark.parametrize("num_query_groups", [0, -1])
+def test_num_query_groups_must_be_positive(num_query_groups: int):
+    with pytest.raises(ValueError, match="num_query_groups .* must be positive"):
+        TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, num_query_groups=num_query_groups
+        )
