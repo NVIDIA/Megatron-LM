@@ -61,15 +61,43 @@ class _PackedChunkMetadata:
 class _PackedChunkMetadataEntry:
     owner: weakref.ReferenceType
     version: int
+    cu_seqlens_cpu_owner: weakref.ReferenceType | None
+    cu_seqlens_cpu_version: int | None
     chunk_size: int
     metadata: _PackedChunkMetadata
 
 
-_packed_chunk_metadata_cache: dict[int, _PackedChunkMetadataEntry] = {}
+_packed_chunk_metadata_cache: dict[
+    tuple[int, tuple[int, int] | None], _PackedChunkMetadataEntry
+] = {}
 
 
 def _clear_packed_chunk_metadata_cache_for_test() -> None:
     _packed_chunk_metadata_cache.clear()
+
+
+def _current_stream_cache_key(tensor_or_device: torch.Tensor | torch.device) -> tuple[int, int] | None:
+    device = (
+        tensor_or_device.device
+        if isinstance(tensor_or_device, torch.Tensor)
+        else torch.device(tensor_or_device)
+    )
+    if device.type != "cuda":
+        return None
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+        device = torch.device("cuda", device_index)
+    stream = torch.cuda.current_stream(device)
+    return (device_index, int(stream.cuda_stream))
+
+
+def _same_optional_tensor_owner(
+    owner: weakref.ReferenceType | None, tensor: torch.Tensor | None
+) -> bool:
+    if owner is None:
+        return tensor is None
+    return owner() is tensor
 
 
 def _packed_chunk_metadata(
@@ -77,13 +105,17 @@ def _packed_chunk_metadata(
 ) -> _PackedChunkMetadata | None:
     if cu_seqlens is None:
         return None
-    key = id(cu_seqlens)
+    stream_key = _current_stream_cache_key(cu_seqlens)
+    key = (id(cu_seqlens), stream_key)
     version = cu_seqlens._version
+    cu_seqlens_cpu_version = None if cu_seqlens_cpu is None else cu_seqlens_cpu._version
     cached = _packed_chunk_metadata_cache.get(key)
     if (
         cached is not None
         and cached.owner() is cu_seqlens
         and cached.version == version
+        and _same_optional_tensor_owner(cached.cu_seqlens_cpu_owner, cu_seqlens_cpu)
+        and cached.cu_seqlens_cpu_version == cu_seqlens_cpu_version
         and cached.chunk_size == _CHUNK_SIZE
     ):
         return cached.metadata
@@ -99,11 +131,17 @@ def _packed_chunk_metadata(
             _packed_chunk_metadata_cache.pop(key, None)
 
     owner_ref = weakref.ref(cu_seqlens, remove_cached_owner)
+    cpu_owner_ref = None if cu_seqlens_cpu is None else weakref.ref(cu_seqlens_cpu)
     metadata = _PackedChunkMetadata(
         _cu_seqlens_ref=owner_ref, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets
     )
     _packed_chunk_metadata_cache[key] = _PackedChunkMetadataEntry(
-        owner=owner_ref, version=version, chunk_size=_CHUNK_SIZE, metadata=metadata
+        owner=owner_ref,
+        version=version,
+        cu_seqlens_cpu_owner=cpu_owner_ref,
+        cu_seqlens_cpu_version=cu_seqlens_cpu_version,
+        chunk_size=_CHUNK_SIZE,
+        metadata=metadata,
     )
     return metadata
 

@@ -370,6 +370,57 @@ def test_cutedsl_forward_reuses_packed_chunk_metadata(monkeypatch):
     assert seen["gate_is_log_decay"] is True
 
 
+def test_packed_chunk_metadata_cache_is_stream_scoped(monkeypatch):
+    implementation = _implementation()
+
+    implementation._clear_packed_chunk_metadata_cache_for_test()
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    stream_keys = iter([(0, 1), (0, 2), (0, 1)])
+    prepare_calls = []
+
+    def prepare(cu_arg, *_args, **_kwargs):
+        prepare_calls.append(cu_arg)
+        return torch.full((2, 2), len(prepare_calls), dtype=torch.int32)
+
+    monkeypatch.setattr(
+        implementation, "_current_stream_cache_key", lambda _tensor: next(stream_keys)
+    )
+    monkeypatch.setattr(implementation, "prepare_chunk_indices", prepare)
+
+    first = implementation._packed_chunk_metadata(cu_seqlens, cu_seqlens)
+    second = implementation._packed_chunk_metadata(cu_seqlens, cu_seqlens)
+    third = implementation._packed_chunk_metadata(cu_seqlens, cu_seqlens)
+
+    assert len(prepare_calls) == 2
+    assert second is not first
+    assert third is first
+
+
+def test_packed_chunk_metadata_cache_tracks_cpu_metadata_owner(monkeypatch):
+    implementation = _implementation()
+
+    implementation._clear_packed_chunk_metadata_cache_for_test()
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    cu_seqlens_cpu_a = torch.tensor([0, 64, 128], dtype=torch.int32)
+    cu_seqlens_cpu_b = torch.tensor([0, 64, 128], dtype=torch.int32)
+    prepare_calls = []
+
+    def prepare(_cu_arg, *_args, **kwargs):
+        prepare_calls.append(kwargs["cu_seqlens_cpu"])
+        return torch.full((2, 2), len(prepare_calls), dtype=torch.int32)
+
+    monkeypatch.setattr(implementation, "_current_stream_cache_key", lambda _tensor: None)
+    monkeypatch.setattr(implementation, "prepare_chunk_indices", prepare)
+
+    first = implementation._packed_chunk_metadata(cu_seqlens, cu_seqlens_cpu_a)
+    second = implementation._packed_chunk_metadata(cu_seqlens, cu_seqlens_cpu_b)
+    third = implementation._packed_chunk_metadata(cu_seqlens, cu_seqlens_cpu_b)
+
+    assert prepare_calls == [cu_seqlens_cpu_a, cu_seqlens_cpu_b]
+    assert second is not first
+    assert third is second
+
+
 def test_cutedsl_forward_uses_kernel_gate_cumsum_side_output():
     package = Path(__file__).parents[3] / "megatron/core/ssm/gated_delta_net/internal_gdn_backend"
     implementation_source = (package / "implementation.py").read_text()
@@ -588,6 +639,26 @@ def test_fused_backward_varlen_metadata_avoids_host_sync_for_device_offsets():
     assert metadata.num_sequences == 2
     assert metadata.num_chunks == 2
     assert metadata.uniform_sequence_length == 0
+
+
+def test_fused_backward_varlen_metadata_cache_is_stream_scoped(monkeypatch):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
+        fused_bwd,
+    )
+
+    fused_bwd._clear_metadata_cache_for_test()
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    stream_keys = iter([(0, 1), (0, 2), (0, 1)])
+    monkeypatch.setattr(
+        fused_bwd, "_current_stream_cache_key", lambda _tensor: next(stream_keys)
+    )
+
+    first = fused_bwd._prepare_varlen_metadata(cu_seqlens, total_tokens=128, chunk_size=64)
+    second = fused_bwd._prepare_varlen_metadata(cu_seqlens, total_tokens=128, chunk_size=64)
+    third = fused_bwd._prepare_varlen_metadata(cu_seqlens, total_tokens=128, chunk_size=64)
+
+    assert second is not first
+    assert third is first
 
 
 def test_fused_backward_varlen_metadata_reuses_supplied_chunk_offsets():

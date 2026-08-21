@@ -39,14 +39,31 @@ class _MetadataEntry:
     version: int
     total_tokens: int
     chunk_size: int
+    uses_supplied_chunk_offsets: bool
     metadata: _VarlenMetadata
 
 
-_METADATA_CACHE: dict[int, _MetadataEntry] = {}
+_METADATA_CACHE: dict[tuple[int, tuple[int, int] | None], _MetadataEntry] = {}
 
 
 def _clear_metadata_cache_for_test() -> None:
     _METADATA_CACHE.clear()
+
+
+def _current_stream_cache_key(tensor_or_device: torch.Tensor | torch.device) -> tuple[int, int] | None:
+    device = (
+        tensor_or_device.device
+        if isinstance(tensor_or_device, torch.Tensor)
+        else torch.device(tensor_or_device)
+    )
+    if device.type != "cuda":
+        return None
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+        device = torch.device("cuda", device_index)
+    stream = torch.cuda.current_stream(device)
+    return (device_index, int(stream.cuda_stream))
 
 
 def _check_sm100(tensor: torch.Tensor) -> None:
@@ -89,8 +106,10 @@ def _prepare_varlen_metadata(
     if chunk_offsets is not None:
         chunk_offsets = _validate_chunk_offsets(chunk_offsets, cu_seqlens)
 
-    key = id(cu_seqlens)
+    stream_key = _current_stream_cache_key(cu_seqlens)
+    key = (id(cu_seqlens), stream_key)
     version = cu_seqlens._version
+    uses_supplied_chunk_offsets = chunk_offsets is not None
     cached = _METADATA_CACHE.get(key)
     if (
         cached is not None
@@ -98,7 +117,10 @@ def _prepare_varlen_metadata(
         and cached.version == version
         and cached.total_tokens == total_tokens
         and cached.chunk_size == chunk_size
-        and (chunk_offsets is None or cached.metadata.chunk_offsets is chunk_offsets)
+        and (
+            (not uses_supplied_chunk_offsets and not cached.uses_supplied_chunk_offsets)
+            or (uses_supplied_chunk_offsets and cached.metadata.chunk_offsets is chunk_offsets)
+        )
     ):
         return cached.metadata
 
@@ -162,6 +184,7 @@ def _prepare_varlen_metadata(
         version=version,
         total_tokens=total_tokens,
         chunk_size=chunk_size,
+        uses_supplied_chunk_offsets=uses_supplied_chunk_offsets,
         metadata=metadata,
     )
     return metadata
