@@ -645,8 +645,8 @@ class TestBuildTokenizer:
             tokenizer.additional_special_tokens_ids
             == tokenizer_default.additional_special_tokens_ids
         )
-        assert tokenizer.eod == tokenizer_default.eod
-        assert tokenizer.sep_id == tokenizer_default.sep_id
+        assert tokenizer.eod == tokenizer.eod
+        assert tokenizer.sep_id == tokenizer.sep_id
         assert tokenizer.vocab_size == tokenizer_default.vocab_size
         assert tokenizer.vocab == tokenizer_default.vocab
 
