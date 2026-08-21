@@ -207,8 +207,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
-        layer_type_list, layer_offset = select_pipeline_segment(
+        layer_config_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
+            self.config,
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
@@ -282,7 +283,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hybrid_stack_spec,
             self.config,
             pre_process=self.pre_process,
-            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
@@ -299,6 +300,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
 
+            tp_comm_overlap = self.config.tp_comm_overlap
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
                 spec=mtp_block_spec,
@@ -308,6 +310,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
+            )
+            self.decoder.synchronize_shared_config_mutation(
+                "tp_comm_overlap", tp_comm_overlap, self.config.tp_comm_overlap
             )
             self._setup_mtp_cuda_graphs()
 

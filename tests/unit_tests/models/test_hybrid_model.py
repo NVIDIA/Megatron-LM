@@ -24,8 +24,11 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
@@ -234,8 +237,53 @@ class TestHybridModel:
 
         assert self.model.max_sequence_length == 4
 
+        decoder = self.model.decoder
+        assert not hasattr(decoder, "layer_type_list")
+        assert [type(config) for config in decoder.layer_config_list] == [
+            MambaLayerConfig,
+            AttentionLayerConfig,
+            MLPLayerConfig,
+        ]
+        assert len({id(config) for config in decoder.layer_config_list}) == 3
+        assert all(config is not self.model.config for config in decoder.layer_config_list)
+        assert all(
+            layer.config is layer_config
+            for layer, layer_config in zip(decoder.layers, decoder.layer_config_list, strict=True)
+        )
+
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
+
+    def test_mtp_shared_config_mutation_reaches_decoder_configs(self, monkeypatch):
+        class MutatingMTPBlock(torch.nn.Module):
+
+            def __init__(self, config, **kwargs):
+                super().__init__()
+                assert config.tp_comm_overlap is True
+                config.tp_comm_overlap = False
+
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock", MutatingMTPBlock
+        )
+
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            tp_comm_overlap=True,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="-/M",
+        )
+
+        assert model.config.tp_comm_overlap is False
+        assert all(config.tp_comm_overlap is False for config in model.decoder.layer_config_list)
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config

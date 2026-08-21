@@ -3448,13 +3448,12 @@ def training_log(
             track_names.append("z_loss")
 
         if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
                 get_hybrid_layer_counts,
             )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+
+            layers = get_hybrid_layer_counts(args.hybrid_layer_pattern)[Symbols.MOE]
         else:
             layers = args.num_layers
 

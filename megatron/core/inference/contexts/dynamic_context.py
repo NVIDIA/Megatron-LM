@@ -2,7 +2,6 @@
 
 import logging
 import math
-import operator
 import warnings
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -32,7 +31,7 @@ from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
-    get_layer_maps_from_layer_type_list,
+    get_layer_maps_from_layer_config_list,
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
@@ -449,15 +448,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
             # one map in global layer order; independently generated per-symbol maps both
             # start at zero and would alias if they were simply unioned.
-            attention_layer_map, dsa_layer_map = operator.itemgetter(
-                Symbols.ATTENTION, Symbols.DS_ATTENTION
-            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
-            recurrent_layer_map = {}
-            for global_layer_idx, layer_type in enumerate(
-                mamba_inference_state_config.layer_type_list
-            ):
-                if layer_type in (Symbols.MAMBA, Symbols.GDN):
-                    recurrent_layer_map[global_layer_idx] = len(recurrent_layer_map)
+            layer_maps = get_layer_maps_from_layer_config_list(
+                mamba_inference_state_config.layer_config_list
+            )
+            attention_layer_map = layer_maps[Symbols.ATTENTION]
+            dsa_layer_map = layer_maps[Symbols.DS_ATTENTION]
+            recurrent_global_layer_indices = (
+                layer_maps[Symbols.MAMBA].keys() | layer_maps[Symbols.GDN].keys()
+            )
+            recurrent_layer_map = {
+                global_layer_idx: recurrent_layer_idx
+                for recurrent_layer_idx, global_layer_idx in enumerate(
+                    sorted(recurrent_global_layer_indices)
+                )
+            }
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(recurrent_layer_map)

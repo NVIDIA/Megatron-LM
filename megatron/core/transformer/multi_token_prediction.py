@@ -1030,7 +1030,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.mtp_model_layer = HybridStack(
                 config=self.config,
                 submodules=hybrid_submodules,
-                layer_type_list=validate_segment_layers(mtp_layer_pattern),
+                layer_config_list=validate_segment_layers(mtp_layer_pattern, self.config),
                 pp_layer_offset=0,
                 pre_process=True,  # Always receives input from eh_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm

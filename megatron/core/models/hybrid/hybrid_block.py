@@ -21,14 +21,24 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    HybridLayerConfig,
+    validate_segment_layers,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -61,9 +71,13 @@ class HybridStack(MegatronModule):
         submodules (HybridStackSubmodules): the submodules for the stack
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
-        layer_type_list (list, optional): pre-computed list of layer type symbols for
-            this pipeline segment. When provided (by HybridModel), pipeline stage
-            selection has already been done via '|' separators in the pattern.
+        layer_type_list (list[str], optional): backward-compatible list of layer
+            type symbols for this pipeline segment. It is immediately converted to
+            independent per-layer configs.
+        layer_config_list (list, optional): per-layer configs for this pipeline segment. When
+            provided by HybridModel, pipeline stage selection has already been done
+            via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
+            ``layer_config_list`` must be provided.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -82,7 +96,7 @@ class HybridStack(MegatronModule):
         config: TransformerConfig,
         submodules: HybridStackSubmodules,
         pre_process: bool = True,
-        layer_type_list: Optional[list[str]] = None,
+        layer_type_list: list[str] | None = None,
         pp_layer_offset: int = 0,
         post_layer_norm: bool = True,
         post_process: bool = True,
@@ -91,11 +105,23 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         name: str | None = None,
+        *,
+        layer_config_list: list[HybridLayerConfig] | None = None,
     ) -> None:
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
+        if (layer_type_list is None) == (layer_config_list is None):
+            raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
+        if layer_type_list is not None:
+            if any(
+                not isinstance(layer_symbol, str) or len(layer_symbol) != 1
+                for layer_symbol in layer_type_list
+            ):
+                raise ValueError("Each entry in layer_type_list must be a single layer symbol")
+            layer_config_list = validate_segment_layers(''.join(layer_type_list), config)
+
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
@@ -111,39 +137,41 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        assert layer_type_list is not None, (
-            "layer_type_list must be provided. It should be pre-computed from "
-            "--hybrid-layer-pattern by HybridModel."
-        )
-        self.layer_type_list = layer_type_list
+        assert layer_config_list is not None
+        self.layer_config_list = layer_config_list
 
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
-        for i, layer_type in enumerate(self.layer_type_list):
+        for i, layer_config in enumerate(self.layer_config_list):
             layer_number = i + 1 + pp_layer_offset
-            if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
-            elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, i + pp_layer_offset, is_init=True)
+            tp_comm_overlap = layer_config.tp_comm_overlap
+            if layer_config.fp8:
+                quant_init_context = get_fp8_context(
+                    layer_config, i + pp_layer_offset, is_init=True
+                )
+            elif layer_config.fp4:
+                quant_init_context = get_fp4_context(
+                    layer_config, i + pp_layer_offset, is_init=True
+                )
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if layer_type == LayerSymbols.MAMBA:
+                if isinstance(layer_config, MambaLayerConfig):
                     layer = build_module(
                         submodules.mamba_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif layer_type == LayerSymbols.ATTENTION:
+                elif isinstance(layer_config, AttentionLayerConfig):
                     layer = build_module(
                         submodules.attention_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -151,10 +179,10 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif layer_type == LayerSymbols.DS_ATTENTION:
+                elif isinstance(layer_config, DSALayerConfig):
                     layer = build_module(
                         submodules.dsa_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -162,37 +190,37 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif layer_type == LayerSymbols.MLA:
+                elif isinstance(layer_config, MLALayerConfig):
                     layer = build_module(
                         submodules.mla_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
                     )
-                elif layer_type == LayerSymbols.MLP:
+                elif isinstance(layer_config, MLPLayerConfig):
                     layer = build_module(
                         submodules.mlp_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif layer_type == LayerSymbols.MOE:
+                elif isinstance(layer_config, MoELayerConfig):
                     layer = build_module(
                         submodules.moe_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif layer_type == LayerSymbols.GDN:
+                elif isinstance(layer_config, GDNLayerConfig):
                     gdn_layer_spec = submodules.gdn_layer
-                    if self.config.experimental_attention_variant == "gdn2":
+                    if layer_config.experimental_attention_variant == "gdn2":
                         # 'G' layers build the GDN2 variant when the gdn2 experimental
                         # attention variant is selected.
                         from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
@@ -201,7 +229,7 @@ class HybridStack(MegatronModule):
                         gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
                     layer = build_module(
                         gdn_layer_spec,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
@@ -210,7 +238,15 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
-                    raise ValueError("unexpected layer_type")
+                    raise ValueError(
+                        f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
+                    )
+
+            # Some layer builders disable unsupported TP overlap by mutating their config.
+            # Preserve the shared-config behavior for configs that had the same initial value.
+            self.synchronize_shared_config_mutation(
+                "tp_comm_overlap", tp_comm_overlap, layer_config.tp_comm_overlap
+            )
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
@@ -226,6 +262,24 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+    def synchronize_shared_config_mutation(
+        self, attribute: str, old_value: object, new_value: object
+    ) -> None:
+        """Propagate a legacy shared-config mutation to configs cloned from it.
+
+        Plain lists are treated as independently supplied configs and are not synchronized.
+        Within a legacy-derived list, configs that have already diverged from the old shared
+        value are also left unchanged.
+        """
+        if old_value == new_value or not getattr(
+            self.layer_config_list, "synchronize_shared_config_mutations", False
+        ):
+            return
+
+        for config_to_update in [self.config, *self.layer_config_list]:
+            if getattr(config_to_update, attribute) == old_value:
+                setattr(config_to_update, attribute, new_value)
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
@@ -262,10 +316,10 @@ class HybridStack(MegatronModule):
         Returns the recurrent mixer's conv and SSM state shapes per input sequence
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
-        for layer_type, layer in zip(self.layer_type_list, self.layers):
-            if layer_type == LayerSymbols.MAMBA:
+        for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
+            if isinstance(layer_config, MambaLayerConfig):
                 return layer.mamba_state_shapes_per_request()
-            if layer_type == LayerSymbols.GDN:
+            if isinstance(layer_config, GDNLayerConfig):
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
@@ -370,10 +424,10 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
-                for layer in self.layers:
+                for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
-                        self.config, layer.layer_number - 1
+                        layer_config, layer.layer_number - 1
                     )
                     with inner_quant_context:
                         if isinstance(layer, TransformerLayer):

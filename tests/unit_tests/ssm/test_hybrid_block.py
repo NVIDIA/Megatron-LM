@@ -1,11 +1,19 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
+import megatron.core.transformer.utils as transformer_utils
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    LAYER_SYMBOL_TO_CONFIG_CLASS,
+    Symbols,
+    validate_segment_layers,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
@@ -13,9 +21,11 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -25,6 +35,270 @@ from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize(
+    ("layer_pattern", "expected_spec_names"),
+    [
+        (
+            Symbols.MAMBA + Symbols.GDN + Symbols.ATTENTION + Symbols.MLP + Symbols.MOE,
+            ["mamba_layer", "gdn_layer", "attention_layer", "mlp_layer", "moe_layer"],
+        ),
+        (Symbols.DS_ATTENTION + Symbols.MLA, ["dsa_layer", "mla_layer"]),
+    ],
+)
+def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, expected_spec_names):
+    """Each config marker selects its matching layer spec and config instance."""
+
+    class BuiltLayer(torch.nn.Module):
+
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+
+    build_calls = []
+
+    def fake_build_module(module_spec, **kwargs):
+        build_calls.append((module_spec, kwargs))
+        return BuiltLayer(kwargs["config"], kwargs["layer_number"])
+
+    monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
+
+    config = MLATransformerConfig(
+        num_layers=len(layer_pattern), hidden_size=64, num_attention_heads=4
+    )
+    layer_config_list = validate_segment_layers(layer_pattern, config)
+    submodules = hybrid_stack_spec.submodules
+    expected_specs = [getattr(submodules, spec_name) for spec_name in expected_spec_names]
+
+    block = HybridStack(
+        config=config,
+        submodules=submodules,
+        layer_config_list=layer_config_list,
+        pre_process=False,
+        pp_layer_offset=5,
+        post_layer_norm=False,
+        post_process=False,
+        pg_collection=SimpleNamespace(pp=None, tp=None),
+        name="decoder",
+    )
+
+    assert not hasattr(block, "layer_type_list")
+    assert [type(layer_config) for layer_config in layer_config_list] == [
+        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol] for layer_symbol in layer_pattern
+    ]
+    assert [module_spec for module_spec, _ in build_calls] == expected_specs
+    assert all(
+        kwargs["config"] is layer_config
+        for (_, kwargs), layer_config in zip(build_calls, layer_config_list)
+    )
+    expected_layer_numbers = list(range(6, 6 + len(layer_pattern)))
+    assert [kwargs["layer_number"] for _, kwargs in build_calls] == expected_layer_numbers
+    assert [layer.layer_number for layer in block.layers] == expected_layer_numbers
+
+
+def test_hybrid_stack_accepts_layer_config_subclasses(monkeypatch):
+    """Layer config subclasses retain their parent layer's routing behavior."""
+
+    class CustomMambaLayerConfig(MambaLayerConfig):
+        pass
+
+    class BuiltLayer(torch.nn.Module):
+
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+
+    build_calls = []
+
+    def fake_build_module(module_spec, **kwargs):
+        build_calls.append(module_spec)
+        return BuiltLayer(kwargs["config"], kwargs["layer_number"])
+
+    monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
+
+    root_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+    layer_config = CustomMambaLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+    block = HybridStack(
+        config=root_config,
+        submodules=hybrid_stack_spec.submodules,
+        layer_config_list=[layer_config],
+        pre_process=False,
+        post_layer_norm=False,
+        post_process=False,
+        pg_collection=SimpleNamespace(pp=None, tp=None),
+    )
+
+    assert build_calls == [hybrid_stack_spec.submodules.mamba_layer]
+    assert block.layers[0].config is layer_config
+
+
+def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
+    """The positional layer-type API converts configs and retains shared mutation behavior."""
+
+    class BuiltLayer(torch.nn.Module):
+
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+
+    submodules = hybrid_stack_spec.submodules
+
+    def fake_build_module(module_spec, **kwargs):
+        if module_spec is submodules.mla_layer:
+            kwargs["config"].tp_comm_overlap = False
+        return BuiltLayer(kwargs["config"], kwargs["layer_number"])
+
+    monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
+
+    config = MLATransformerConfig(num_layers=3, hidden_size=64, num_attention_heads=4)
+    config.tp_comm_overlap = True
+    block = HybridStack(
+        config,
+        submodules,
+        False,
+        [Symbols.MAMBA, Symbols.MLA, Symbols.MLP],
+        post_layer_norm=False,
+        post_process=False,
+        pg_collection=SimpleNamespace(pp=None, tp=None),
+    )
+    layer_config_list = block.layer_config_list
+
+    assert not hasattr(block, "layer_type_list")
+    assert [type(layer_config) for layer_config in layer_config_list] == [
+        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol]
+        for layer_symbol in (Symbols.MAMBA, Symbols.MLA, Symbols.MLP)
+    ]
+    assert len({id(layer_config) for layer_config in layer_config_list}) == len(layer_config_list)
+    assert all(layer_config is not config for layer_config in layer_config_list)
+    assert all(
+        layer.config is layer_config for layer, layer_config in zip(block.layers, layer_config_list)
+    )
+    assert config.tp_comm_overlap is False
+    assert all(layer_config.tp_comm_overlap is False for layer_config in layer_config_list)
+
+    block.position_embedding_type = "rope"
+    config.sequence_parallel = True
+    for layer_config in layer_config_list:
+        layer_config.sequence_parallel = True
+
+    monkeypatch.setattr(transformer_utils, "_sequence_parallel_attr_cache", None)
+    transformer_utils.set_model_to_sequence_parallel(block, set_to=False)
+
+    assert config.sequence_parallel is False
+    assert all(layer_config.sequence_parallel is False for layer_config in layer_config_list)
+
+    independent_root_config = MLATransformerConfig(
+        num_layers=2, hidden_size=64, num_attention_heads=4
+    )
+    independent_root_config.tp_comm_overlap = True
+    independent_layer_configs = list(
+        validate_segment_layers(Symbols.MLA + Symbols.MLP, independent_root_config)
+    )
+    HybridStack(
+        config=independent_root_config,
+        submodules=submodules,
+        layer_config_list=independent_layer_configs,
+        pre_process=False,
+        post_layer_norm=False,
+        post_process=False,
+        pg_collection=SimpleNamespace(pp=None, tp=None),
+    )
+
+    assert independent_layer_configs[0].tp_comm_overlap is False
+    assert independent_layer_configs[1].tp_comm_overlap is True
+    assert independent_root_config.tp_comm_overlap is True
+
+
+@pytest.mark.parametrize(
+    ("provide_layer_type_list", "provide_layer_config_list"),
+    [(False, False), (True, True)],
+    ids=["neither", "both"],
+)
+def test_hybrid_stack_requires_exactly_one_layer_list(
+    provide_layer_type_list, provide_layer_config_list
+):
+    """HybridStack requires exactly one legacy symbol list or per-layer config list."""
+    config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+    layer_type_list = [Symbols.MAMBA] if provide_layer_type_list else None
+    layer_config_list = (
+        validate_segment_layers(Symbols.MAMBA, config) if provide_layer_config_list else None
+    )
+
+    with pytest.raises(
+        ValueError, match="Exactly one of layer_type_list or layer_config_list must be provided"
+    ):
+        HybridStack(
+            config=config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=SimpleNamespace(pp=None, tp=None),
+        )
+
+
+def test_hybrid_stack_rejects_multi_character_layer_type():
+    """The legacy list treats each entry as one layer symbol."""
+    config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+
+    with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
+        HybridStack(
+            config=config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_type_list=[Symbols.MAMBA + Symbols.ATTENTION],
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=SimpleNamespace(pp=None, tp=None),
+        )
+
+
+def test_mamba_state_shapes_are_selected_by_layer_config_type():
+    """Mamba state shape lookup does not depend on layer symbols or module methods alone."""
+
+    class CustomMambaLayerConfig(MambaLayerConfig):
+        pass
+
+    attention_config = object.__new__(AttentionLayerConfig)
+    mamba_config = object.__new__(CustomMambaLayerConfig)
+    attention_shapes = ((1,), (2,))
+    mamba_shapes = ((3,), (4,))
+    block = SimpleNamespace(
+        layer_config_list=[attention_config, mamba_config],
+        layers=[
+            SimpleNamespace(mamba_state_shapes_per_request=lambda: attention_shapes),
+            SimpleNamespace(mamba_state_shapes_per_request=lambda: mamba_shapes),
+        ],
+    )
+
+    assert HybridStack.mamba_state_shapes_per_request(block) == mamba_shapes
+
+    block.layer_config_list = [attention_config]
+    block.layers = block.layers[:1]
+    assert HybridStack.mamba_state_shapes_per_request(block) is None
+
+
+def test_hybrid_stack_rejects_same_named_config_type():
+    root_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+    same_named_config_class = type("MambaLayerConfig", (TransformerConfig,), {})
+    layer_config = same_named_config_class(num_layers=1, hidden_size=64, num_attention_heads=4)
+
+    with pytest.raises(ValueError, match="Unexpected hybrid layer config type: MambaLayerConfig"):
+        HybridStack(
+            config=root_config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_config_list=[layer_config],
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=SimpleNamespace(pp=None, tp=None),
+        )
 
 
 @pytest.mark.internal
@@ -38,32 +312,31 @@ class TestHybridBlock:
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
     def get_hybrid_block(self, layer_pattern, **config_kwargs):
-        layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
             # will generate errors.
-            num_layers=len(layer_type_list),
+            num_layers=len(layer_pattern),
             num_attention_heads=4,
             use_cpu_initialization=True,
             **config_kwargs,
         )
+        layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
         modules = hybrid_stack_spec.submodules
         return HybridStack(
             transformer_config,
             modules,
-            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
         )
 
     def get_dsa_hybrid_block(self, layer_pattern):
-        layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = MLATransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
             # will generate errors.
-            num_layers=len(layer_type_list),
+            num_layers=len(layer_pattern),
             num_attention_heads=16,
             use_cpu_initialization=True,
             bf16=True,
@@ -81,22 +354,22 @@ class TestHybridBlock:
             dsa_indexer_topk=32,
             add_bias_linear=False,
         )
+        layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
         modules = hybrid_stack_spec.submodules
         return HybridStack(
             transformer_config,
             modules,
-            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
         )
 
     def get_mla_hybrid_block(self, layer_pattern):
-        layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = MLATransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
             # will generate errors.
-            num_layers=len(layer_type_list),
+            num_layers=len(layer_pattern),
             num_attention_heads=16,
             use_cpu_initialization=True,
             bf16=True,
@@ -110,11 +383,12 @@ class TestHybridBlock:
             rotary_base=10000,
             rotary_percent=1.0,
         )
+        layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
         modules = hybrid_stack_spec.submodules
         return HybridStack(
             transformer_config,
             modules,
-            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
         )
@@ -245,11 +519,16 @@ class TestHybridBlock:
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
+        assert len({id(config) for config in block.layer_config_list}) == len(layer_pattern)
+        assert all(
+            layer.config is layer_config
+            for layer, layer_config in zip(block.layers, block.layer_config_list)
+        )
 
     def test_invalid_layer_types_cause_failure(self):
-        invalid_symbol = 'X'
-        assert invalid_symbol not in Symbols.VALID_LAYERS  # sanity check.
-        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
+        invalid_pattern_char = 'X'
+        assert invalid_pattern_char not in Symbols.VALID_LAYERS  # sanity check.
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_pattern_char
         # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
             block = self.get_hybrid_block(layer_pattern)
@@ -277,19 +556,19 @@ class TestHybridBlock:
     def test_gdn_gpu_forward(self):
         """Test GPU forward pass with GDN, attention, and Mamba layers."""
         layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
-        layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = TransformerConfig(
             hidden_size=256,
-            num_layers=len(layer_type_list),
+            num_layers=len(layer_pattern),
             num_attention_heads=4,
             use_cpu_initialization=True,
             activation_func=torch.nn.functional.silu,
         )
+        layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
         modules = hybrid_stack_spec.submodules
         block = HybridStack(
             transformer_config,
             modules,
-            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
         )
