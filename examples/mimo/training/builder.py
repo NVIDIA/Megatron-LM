@@ -24,7 +24,6 @@ from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
-# Match the standalone language-model RNG; only encoders need role offsets.
 _LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
 _ENCODER_SEED_OFFSET = 10_000

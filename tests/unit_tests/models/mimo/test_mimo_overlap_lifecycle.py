@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import MimoOptimizer, _optimizer_config_for_module
 from megatron.core.optimizer.optimizer import MixedPrecisionOptimizer
@@ -123,6 +125,11 @@ def test_encoder_optimizer_uses_nonoverlapped_mxfp8_param_copy():
     assert MixedPrecisionOptimizer.step_with_ready_grads(optimizer)
     optimizer._copy_main_params_to_model_params.assert_not_called()
     optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
+
+
+def test_optimizer_config_rejects_module_without_ddp_config():
+    with pytest.raises(ValueError, match="must be DDP-wrapped"):
+        _optimizer_config_for_module(OptimizerConfig(), SimpleNamespace())
 
 
 def test_mimo_optimizer_stages_each_active_optimizer_before_param_sync():
