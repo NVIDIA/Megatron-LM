@@ -14,11 +14,14 @@ assertions, so they hold at any size.
 """
 
 import os
+import pickle
 
+import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor, exchange_utils
 from megatron.core.dist_checkpointing.exchange_utils import (
+    _load_pg_dist_cache,
     _pg_dist_cache_file_path,
     determine_main_replica_uniform_distribution,
 )
@@ -32,6 +35,14 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+class _UnsafeCachePayload:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return os.system, (f"touch {self.marker}",)
 
 
 def _state_dict():
@@ -96,6 +107,16 @@ class TestPgDistributionCache:
             # The deterministic distribution decisions round-trip exactly.
             assert read.main_rank_for_shard == created.main_rank_for_shard
             assert read.all_ranks_for_shard == created.all_ranks_for_shard
+
+    def test_read_rejects_disallowed_globals_without_executing_them(self, tmp_path):
+        marker = tmp_path / "pickle_executed"
+        cache_file = tmp_path / "pg_dist_0.pkl"
+        with open(cache_file, "wb") as f:
+            pickle.dump(_UnsafeCachePayload(marker), f)
+
+        with pytest.raises(pickle.UnpicklingError, match="Refusing to unpickle"):
+            _load_pg_dist_cache(str(cache_file))
+        assert not marker.exists()
 
     def test_read_path_skips_the_gather_collective(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 1)

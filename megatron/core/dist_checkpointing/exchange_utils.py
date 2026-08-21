@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
+from megatron.core.safe_globals import SafeUnpickler
 
 from .core import CheckpointingException
 from .dict_utils import nested_values
@@ -178,6 +179,48 @@ def distribute_shards_to_ranks(
 # PG-collective caching feature (see `determine_main_replica_uniform_distribution`).
 PG_DIST_CACHE_FILE_PREFIX = "pg_dist"
 
+# The cache contains only ShardDistribution, data-less ShardedTensor metadata,
+# and primitive containers. Extend the project's restricted unpickler with
+# exactly those globals instead of trusting the cache path with pickle.load.
+_PG_DIST_CACHE_SAFE_CLASSES = frozenset(
+    {
+        ("builtins", "slice"),
+        ("megatron.core.dist_checkpointing.exchange_utils", "ShardDistribution"),
+        ("megatron.core.dist_checkpointing.mapping", "ShardedTensor"),
+        ("torch", "bfloat16"),
+        ("torch", "bool"),
+        ("torch", "complex128"),
+        ("torch", "complex64"),
+        ("torch", "float16"),
+        ("torch", "float32"),
+        ("torch", "float64"),
+        ("torch", "float8_e8m0fnu"),
+        ("torch", "float8_e4m3fn"),
+        ("torch", "float8_e4m3fnuz"),
+        ("torch", "float8_e5m2"),
+        ("torch", "float8_e5m2fnuz"),
+        ("torch", "int16"),
+        ("torch", "int32"),
+        ("torch", "int64"),
+        ("torch", "int8"),
+        ("torch", "uint8"),
+        ("torch", "uint16"),
+        ("torch", "uint32"),
+        ("torch", "uint64"),
+    }
+)
+
+
+class _PgDistCacheUnpickler(SafeUnpickler):
+    """Restricted unpickler for PG distribution cache metadata."""
+
+    _SAFE_CLASSES = frozenset(
+        item
+        for item in _PG_DIST_CACHE_SAFE_CLASSES
+        if item[0] != "torch" or hasattr(torch, item[1])
+    )
+
+
 # Process-global in-memory cache of the per-group distributions, keyed by the
 # resolved cache file path (which uniquely identifies a (cache dir, group) pair).
 # Each entry holds the full {ignore_groups: ShardDistribution} map, so a single
@@ -340,7 +383,7 @@ def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
         Dict[bool, ShardDistribution]: the {ignore_groups: distribution} map.
     """
     with open(cache_file, "rb") as f:
-        return pickle.load(f)
+        return _PgDistCacheUnpickler(f).load()
 
 
 def _create_pg_dist_cache(
