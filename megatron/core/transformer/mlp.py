@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -262,7 +263,12 @@ class MLP(MegatronModule):
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if self.activation_func is situlu:
+                intermediate_parallel = situlu(
+                    intermediate_parallel, self.config.situ_glu_beta1, self.config.situ_glu_beta2
+                )
+            else:
+                intermediate_parallel = self.activation_func(intermediate_parallel)
             if per_token_scale is not None:
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
@@ -317,6 +323,8 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit:
 
                 def glu(x):
+                    if self.config.activation_func is situlu:
+                        return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
                     x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
