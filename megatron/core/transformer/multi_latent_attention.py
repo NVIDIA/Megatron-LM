@@ -165,6 +165,10 @@ class MultiLatentAttention(Attention):
         self.config: MLATransformerConfig
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
+        if self.config.gated_attention_proj_granularity == 'elementwise':
+            self.gate_projection_size = self.query_projection_size
+        else:
+            self.gate_projection_size = self.config.num_attention_heads
 
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
 
@@ -233,7 +237,7 @@ class MultiLatentAttention(Attention):
             self.linear_gate = build_module(
                 submodules.linear_gate,
                 self.config.hidden_size,
-                self.config.num_attention_heads,
+                self.gate_projection_size,
                 config=self.config,
                 init_method=self.config.init_method,
                 gather_output=False,
@@ -529,10 +533,50 @@ class MultiLatentAttention(Attention):
         gate, _ = apply_module(self.linear_gate)(gate_input)
         return self._apply_mla_output_gate(core_attn_out, gate)
 
+    def _apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply an MLA output gate with the configured projection granularity."""
+        if core_attn_out.shape[:-1] != gate.shape[:-1]:
+            raise ValueError(
+                "MLA output gate and core attention output must have matching token/batch "
+                f"dimensions, got {tuple(gate.shape)} and {tuple(core_attn_out.shape)}."
+            )
+
+        if self.config.gated_attention_proj_granularity == 'elementwise':
+            if core_attn_out.shape != gate.shape:
+                raise ValueError(
+                    "Elementwise MLA output gating requires the gate and core attention output "
+                    f"to have the same shape, got {tuple(gate.shape)} and "
+                    f"{tuple(core_attn_out.shape)}."
+                )
+            return self._apply_mla_elementwise_output_gate(core_attn_out, gate)
+
+        if core_attn_out.size(-1) % gate.size(-1) != 0:
+            raise ValueError(
+                "Headwise MLA output gating requires the core attention output dimension "
+                f"({core_attn_out.size(-1)}) to be divisible by the number of local gates "
+                f"({gate.size(-1)})."
+            )
+        return self._apply_mla_headwise_output_gate(core_attn_out, gate)
+
+    @staticmethod
+    def _apply_mla_elementwise_output_gate(
+        core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply one gate per local MLA output element in the activation dtype."""
+        # Keep the FP32 sigmoid followed by native-dtype multiplication used by the
+        # released model. Do not jit-fuse this helper: nvFuser can move the cast
+        # across the elementwise multiply and silently change the rounding/VJP.
+        gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
+        return core_attn_out * gate
+
     @staticmethod
     @jit_fuser
-    def _apply_mla_output_gate(core_attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Apply an FP32 sigmoid gate per local MLA attention head."""
+    def _apply_mla_headwise_output_gate(
+        core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply one gate per local MLA attention head in the activation dtype."""
         output_shape = core_attn_out.shape
         core_attn_out = core_attn_out.view(*output_shape[:2], gate.size(-1), -1)
         # Compute the sigmoid in FP32 for a stable gate VJP, then cast back to the

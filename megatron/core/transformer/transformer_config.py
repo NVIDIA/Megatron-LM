@@ -265,9 +265,16 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gating to attention layers.
 
-    For MLA, this uses one sigmoid gate per attention head. For standard attention,
-    this retains the full head-dimension output gate behavior. It is mutually exclusive
-    with ``head_wise_attn_gate``.
+    The gate projection granularity is controlled by
+    ``gated_attention_proj_granularity``. It is mutually exclusive with
+    ``head_wise_attn_gate``.
+    """
+
+    gated_attention_proj_granularity: Literal['elementwise', 'headwise'] = "elementwise"
+    """Projection granularity for ``attention_output_gate``.
+
+    ``elementwise`` projects one gate per attention output element. ``headwise`` projects one
+    scalar gate per attention head and is currently supported only by Multi-Latent Attention.
     """
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
@@ -1519,6 +1526,17 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
+
+        if self.gated_attention_proj_granularity not in ('elementwise', 'headwise'):
+            raise ValueError(
+                "gated_attention_proj_granularity must be either 'elementwise' or 'headwise', "
+                f"got {self.gated_attention_proj_granularity!r}."
+            )
+        if self.gated_attention_proj_granularity == 'headwise' and not self.multi_latent_attention:
+            raise ValueError(
+                "Regular attention does not support headwise "
+                "gated_attention_proj_granularity; use 'elementwise'."
+            )
 
         if (
             self.num_query_groups % self.tensor_model_parallel_size != 0

@@ -101,6 +101,7 @@ def test_ling_v3_tiny_reduced_hybrid_model_forward_backward(tp_size):
             rotary_percent=0.5,
             qk_layernorm=True,
             attention_output_gate=True,
+            gated_attention_proj_granularity="headwise",
             linear_conv_kernel_dim=4,
             linear_key_head_dim=32,
             linear_value_head_dim=32,
