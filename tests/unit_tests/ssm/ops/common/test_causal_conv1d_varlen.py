@@ -220,8 +220,8 @@ class TestCausalConv1dVarlenCarryStates:
     def test_long_slice_ignores_previous_state(self):
         """A slice of at least d_conv tokens fully determines the new state.
 
-        This is the case the non-carrying `causal_conv1d_varlen_states` also gets
-        right, so it pins the equivalence: nothing of the old state leaks through.
+        Pins the equivalence with deriving the state from the slice alone:
+        nothing of the incoming state may leak through.
         """
         torch.manual_seed(1)
         cu_seqlens = torch.tensor([0, 7], dtype=torch.int32, device="cuda")
