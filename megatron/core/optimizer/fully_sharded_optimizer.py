@@ -2,7 +2,7 @@
 
 """MCore optimizer wrapper for experimental Megatron-FSDP v2."""
 
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, override
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -51,6 +51,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
+    @override
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -107,6 +108,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 "MFSDP v2 does not currently support layer-wise distributed optimizer."
             )
 
+    @override
     def state_dict(self):
         """Return optimizer state.
 
@@ -116,10 +118,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
+    @override
     def load_state_dict(self, state_dict):
         """Load optimizer state."""
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
+    @override
     def sharded_state_dict(
         self,
         model_sharded_state_dict: ShardedStateDict,
@@ -129,6 +133,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Build a sharded optimizer state dict."""
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
+    @override
     def get_grad_norm(self):
         """Compute the global gradient L2 norm from each gradient's own DTensor layout.
 
@@ -175,6 +180,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         )
         return total_norm_squared.sqrt()
 
+    @override
     def get_grads_for_grad_norm(self, grad_norm_group: Optional[str] = None):
         """Return local gradient shards for the shared grad-norm helpers.
 
@@ -188,6 +194,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             to_local_if_dtensor(grad) for grad in super().get_grads_for_grad_norm(grad_norm_group)
         ]
 
+    @override
     def count_zeros(self) -> float:
         """Count zero gradient entries from each gradient's own DTensor layout.
 
@@ -215,6 +222,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         )
         return total_zeros.item()
 
+    @override
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear optimizer-visible sharded grads and any grads filtered from local groups."""
         if not self.is_stub_optimizer:
@@ -244,6 +252,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             parameter.grad = original_grad.to(dtype=parameter.data.dtype)
             self._casted_grads.append((parameter, original_grad))
 
+    @override
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer and restore MFSDP gradient dtypes."""
