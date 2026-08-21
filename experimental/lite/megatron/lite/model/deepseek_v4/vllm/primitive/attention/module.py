@@ -168,6 +168,61 @@ class VLLMAttention(CompressedSparseAttention):
                 output.record_stream(current_stream)
         return default_output, aux_outputs
 
+    def _project_boundary_k(
+        self,
+        boundary_hidden: torch.Tensor,
+        kv_visible: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        *,
+        global_start: int,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        if boundary_hidden.shape[0] == 0:
+            return kv_visible[:0]
+
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            cp_utils,
+        )
+        from megatron.lite.model.deepseek_v4.vllm.primitive.attention.cp import (
+            official_local_qk_visible,
+        )
+
+        rows = boundary_hidden.shape[0]
+        boundary_qr_kv = fused_block_fp8_linear(
+            self.fused_linear,
+            boundary_hidden,
+            self.wq_a.weight,
+            self.wkv.weight,
+        )
+        boundary_qr, boundary_kv = boundary_qr_kv.split(
+            [self.config.q_lora_rank, self.config.head_dim], dim=-1
+        )
+        _, boundary_kv = fused_qkv_rms_norm(
+            fused_q_kv_rmsnorm,
+            boundary_qr,
+            boundary_kv,
+            self.q_norm.weight,
+            self.kv_norm.weight,
+            self.config.rms_norm_eps,
+        )
+        positions = cp_utils._thd_cp_position_ids(
+            cu_seqlens, global_start - rows, rows
+        ).to(torch.int64)
+        dummy_q = boundary_kv.new_zeros(
+            (rows, self.config.num_attention_heads, self.config.head_dim)
+        )
+        _, boundary_k = official_local_qk_visible(
+            dummy_q,
+            boundary_kv,
+            positions,
+            cos_sin_cache,
+            insert_qkv,
+            eps=self.config.rms_norm_eps,
+            rope_dim=self.config.qk_rope_head_dim,
+            padded_heads=self.config.num_attention_heads,
+        )
+        return boundary_k
+
     def _forward_training_attention(
         self,
         hidden_states: torch.Tensor,
@@ -243,42 +298,12 @@ class VLLMAttention(CompressedSparseAttention):
             else hidden_states[:0]
         )
         d_window = boundary_hidden.shape[0]
-        boundary_qr_kv = fused_block_fp8_linear(
-            self.fused_linear,
+        boundary_k_visible = self._project_boundary_k(
             boundary_hidden,
-            self.wq_a.weight,
-            self.wkv.weight,
-        )
-        boundary_qr, boundary_kv = boundary_qr_kv.split(
-            [self.config.q_lora_rank, self.config.head_dim], dim=-1
-        )
-        _, boundary_kv = fused_qkv_rms_norm(
-            fused_q_kv_rmsnorm,
-            boundary_qr,
-            boundary_kv,
-            self.q_norm.weight,
-            self.kv_norm.weight,
-            self.config.rms_norm_eps,
-        )
-        boundary_positions = cp_utils._thd_cp_position_ids(
-            cu_seqlens, global_start - d_window, d_window
-        ).to(torch.int64)
-        boundary_dummy_q = boundary_kv.new_zeros(
-            (
-                d_window,
-                self.config.num_attention_heads,
-                self.config.head_dim,
-            )
-        )
-        _, boundary_k_visible = official_local_qk_visible(
-            boundary_dummy_q,
-            boundary_kv,
-            boundary_positions,
-            metadata.cos_sin_cache,
-            insert_qkv,
-            eps=self.config.rms_norm_eps,
-            rope_dim=self.config.qk_rope_head_dim,
-            padded_heads=self.config.num_attention_heads,
+            kv_visible,
+            cu_seqlens,
+            global_start=global_start,
+            cos_sin_cache=metadata.cos_sin_cache,
         )
 
         compressed_rank_major = hidden_states.new_empty((0, self.config.head_dim))

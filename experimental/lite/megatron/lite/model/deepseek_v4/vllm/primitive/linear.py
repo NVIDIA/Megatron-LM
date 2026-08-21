@@ -35,7 +35,13 @@ class _VisibleLinear(torch.autograd.Function):
         )
 
 
+def _empty_output(value: torch.Tensor, weights: tuple[torch.Tensor, ...]):
+    return value.new_empty((*value.shape[:-1], sum(weight.shape[0] for weight in weights)))
+
+
 def visible_linear(visible_op, value, master_weight):
+    if value.numel() == 0:
+        visible_op = lambda _value, _weight: _empty_output(_value, (_weight,))
     if not torch.is_grad_enabled():
         output = visible_op(value, master_weight)
         return output[0] if isinstance(output, (tuple, list)) else output
@@ -46,6 +52,8 @@ block_fp8_linear = visible_linear
 
 
 def fused_block_fp8_linear(visible_op, value, *master_weights):
+    if value.numel() == 0:
+        visible_op = lambda _value, *_weights: _empty_output(_value, _weights)
     if not torch.is_grad_enabled():
         output = visible_op(value, *master_weights)
         return output[0] if isinstance(output, (tuple, list)) else output

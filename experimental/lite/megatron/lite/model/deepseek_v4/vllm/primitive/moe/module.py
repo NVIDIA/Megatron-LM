@@ -17,7 +17,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.router import fixed_route_vj
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (
     VLLMGroupedMoEWithBF16Backward,
 )
-from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
+from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
@@ -37,6 +37,14 @@ def _learned_route(logits, bias, scale):
 def _batch_invariant_gate_logits(
     hidden_states: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
+    if hidden_states.shape[0] <= 16:
+        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+            is_available,
+            ll_bf16_gemm,
+        )
+
+        if is_available():
+            return ll_bf16_gemm(hidden_states, weight)
     return torch.mm(hidden_states, weight.T, out_dtype=torch.float32)
 
 
@@ -140,9 +148,10 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
             hidden_states,
             self.shared_experts.gate_up.weight,
         )
+        gate, up = gate_up.chunk(2, dim=-1)
         return block_fp8_linear(
             self.shared_down_fp8,
-            swiglu_with_probs(gate_up, None, self.config.swiglu_limit),
+            F.silu(gate) * up,
             self.shared_experts.down.weight,
         )
 

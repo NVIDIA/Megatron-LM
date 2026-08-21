@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import math
 
 import pytest
@@ -13,15 +12,8 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
 
 
 @pytest.mark.gpus(1)
-@pytest.mark.optional
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or importlib.util.find_spec("flash_mla") is None
-    or importlib.util.find_spec("cudnn") is None,
-    reason="requires CUDA, FlashMLA, and cuDNN DSA",
-)
 def test_real_flashmla_sparse_backward_matches_reference_direction() -> None:
-    from flash_mla import flash_mla_sparse_fwd
+    from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
     torch.manual_seed(37)
     # Validate the production DS4 training contract.  The earlier five-row

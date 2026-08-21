@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
@@ -55,6 +57,48 @@ def _deployment_weight_cache_enabled(impl_cfg: ImplConfig) -> bool:
     if impl_cfg.cache_deployment_weights is not None:
         return impl_cfg.cache_deployment_weights
     return _optimizer_backend_name(impl_cfg.optimizer) == "dist_opt"
+
+
+def _local_num_tokens(batch: Any) -> int:
+    total_tokens = getattr(batch, "total_tokens", None)
+    if total_tokens is not None:
+        value = int(total_tokens)
+    else:
+        input_ids = getattr(batch, "input_ids", None)
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError("DeepSeek V4 vLLM batches require tensor input_ids")
+        value = int(input_ids.numel())
+    if value <= 0:
+        raise ValueError("DeepSeek V4 vLLM batches must contain at least one token")
+    return value
+
+
+@contextmanager
+def _vllm_forward_context(batch: Any, parallel_state, vllm_config) -> Iterator[None]:
+    from vllm.forward_context import (
+        DPMetadata,
+        create_forward_context,
+        override_forward_context,
+    )
+
+    input_ids = getattr(batch, "input_ids", None)
+    if not isinstance(input_ids, torch.Tensor):
+        raise TypeError("DeepSeek V4 vLLM batches require tensor input_ids")
+    if parallel_state.ep_group is None:
+        raise RuntimeError("DeepSeek V4 vLLM requires an initialized EP group")
+    local_tokens = torch.tensor(
+        [_local_num_tokens(batch)], dtype=torch.int32, device=input_ids.device
+    )
+    gathered_tokens = [
+        torch.empty_like(local_tokens) for _ in range(parallel_state.ep_size)
+    ]
+    dist.all_gather(gathered_tokens, local_tokens, group=parallel_state.ep_group)
+    dp_metadata = DPMetadata(torch.cat(gathered_tokens).cpu())
+    forward_context = create_forward_context(
+        None, vllm_config, dp_metadata=dp_metadata
+    )
+    with override_forward_context(forward_context):
+        yield
 
 
 def _post_optimizer_step(model: nn.Module) -> None:
@@ -211,6 +255,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             init_workspace_manager(next(model.parameters()).device, num_ubatches=1)
     selected_layers = tuple(model.layer_indices)
     attention_builders = None
+    from vllm.config import VllmConfig
+
+    vllm_config = VllmConfig()
 
     def ensure_runtime_assets():
         nonlocal attention_builders
@@ -234,12 +281,13 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             )
             for layer_idx in selected_layers
         }
-        return _forward_step(
-            model,
-            batch,
-            attention_metadata=attention_metadata,
-            forward_inputs=forward_inputs,
-        )
+        with _vllm_forward_context(batch, parallel_state, vllm_config):
+            return _forward_step(
+                model,
+                batch,
+                attention_metadata=attention_metadata,
+                forward_inputs=forward_inputs,
+            )
 
     # ``build_training_backend`` replaces this list in-place with Megatron DDP
     # wrappers for dist-opt (Lite follows the same ownership contract).  Keep

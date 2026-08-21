@@ -33,6 +33,13 @@ def test_shared_experts_block_fp8_bridges_cover_bf16_master_gradients() -> None:
     grad_output = torch.randn_like(hidden)
 
     output = moe._shared_expert_forward(hidden)
+    gate_up_visible = F.linear(hidden, moe.shared_experts.gate_up.weight)
+    gate_visible, up_visible = gate_up_visible.chunk(2, dim=-1)
+    expected_visible = F.linear(
+        F.silu(gate_visible) * up_visible,
+        moe.shared_experts.down.weight,
+    )
+    torch.testing.assert_close(output, expected_visible, rtol=0, atol=0)
     output.backward(grad_output)
     actual_grads = (
         hidden.grad,

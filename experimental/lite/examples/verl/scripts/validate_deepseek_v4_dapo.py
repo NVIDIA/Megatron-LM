@@ -86,6 +86,12 @@ def validate_environment() -> None:
         raise SystemExit(
             "nvidia-cudnn-frontend lacks q_causal_offsets required by fused DSA CP"
         )
+    sparse_backward = getattr(DSA, "sparse_attention_backward_wrapper", None)
+    if not callable(sparse_backward):
+        raise SystemExit(
+            "nvidia-cudnn-frontend lacks sparse_attention_backward_wrapper "
+            "required by DS4 actor backward"
+        )
 
     print(
         "DS4_DEPENDENCY_CONTRACT_PASSED "

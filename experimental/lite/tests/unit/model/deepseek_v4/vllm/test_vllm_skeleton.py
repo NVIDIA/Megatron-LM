@@ -63,7 +63,19 @@ def test_gate_logits_use_one_batch_invariant_gemm(tokens: int) -> None:
     hidden = torch.randn(tokens, 8, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(4, 8, dtype=torch.bfloat16, device="cuda")
     actual = _batch_invariant_gate_logits(hidden, weight)
-    expected = torch.mm(hidden, weight.T, out_dtype=torch.float32)
+    if tokens <= 16:
+        from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
+            is_available,
+            ll_bf16_gemm,
+        )
+
+        expected = (
+            ll_bf16_gemm(hidden, weight)
+            if is_available()
+            else torch.mm(hidden, weight.T, out_dtype=torch.float32)
+        )
+    else:
+        expected = torch.mm(hidden, weight.T, out_dtype=torch.float32)
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -82,6 +94,51 @@ def test_deployment_weight_cache_policy_tracks_optimizer() -> None:
             optimizer="dist_opt", cache_deployment_weights=False
         )
     ) is False
+
+
+def test_forward_context_carries_dynamic_ep_token_counts(monkeypatch) -> None:
+    import contextlib
+    import vllm.forward_context as forward_context
+
+    observed = {}
+
+    class FakeDPMetadata:
+        def __init__(self, counts):
+            self.num_tokens_across_dp_cpu = counts
+
+    def fake_all_gather(outputs, local, *, group):
+        assert group == "ep"
+        outputs[0].copy_(local)
+        outputs[1].fill_(7)
+
+    def fake_create_forward_context(_attn_metadata, config, *, dp_metadata):
+        observed["config"] = config
+        observed["counts"] = dp_metadata.num_tokens_across_dp_cpu.clone()
+        return "dynamic-context"
+
+    @contextlib.contextmanager
+    def fake_override(value):
+        observed["context"] = value
+        yield
+
+    monkeypatch.setattr(protocol.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(forward_context, "DPMetadata", FakeDPMetadata)
+    monkeypatch.setattr(
+        forward_context, "create_forward_context", fake_create_forward_context
+    )
+    monkeypatch.setattr(forward_context, "override_forward_context", fake_override)
+    batch = SimpleNamespace(
+        input_ids=torch.arange(5, device="cuda"),
+        total_tokens=5,
+    )
+    parallel = SimpleNamespace(ep_group="ep", ep_size=2)
+    config = object()
+
+    with protocol._vllm_forward_context(batch, parallel, config):
+        assert observed["context"] == "dynamic-context"
+
+    assert observed["config"] is config
+    assert torch.equal(observed["counts"], torch.tensor([5, 7], dtype=torch.int32))
 
 
 def test_r3_uses_contiguous_cp_layout_and_live_actor_weights() -> None:
@@ -169,6 +226,8 @@ def test_cp1_forward_inputs_use_shared_packing_and_roll_targets() -> None:
 
 
 def test_forward_builds_model_owned_training_metadata(monkeypatch) -> None:
+    import contextlib
+
     captured = {}
     built = {}
 
@@ -180,6 +239,11 @@ def test_forward_builds_model_owned_training_metadata(monkeypatch) -> None:
 
     monkeypatch.setattr(protocol, "init_batch_invariance", lambda: None)
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
+    monkeypatch.setattr(
+        protocol,
+        "_vllm_forward_context",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
+    )
     monkeypatch.setattr(
         protocol,
         "build_attention_metadata_builders",

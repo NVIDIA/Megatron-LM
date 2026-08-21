@@ -1,9 +1,4 @@
-"""Deterministic Triton kernels for DS4 vLLM route permutation gradients.
-
-These kernels only replace launch-heavy tensor indexing with equivalent
-pointwise copies or one-program-per-token ordered reductions.  They do not use
-atomics, and every visible output element has exactly one writer.
-"""
+"""Deterministic DS4 route permutation kernels."""
 
 from __future__ import annotations
 
@@ -75,9 +70,6 @@ def _scatter_routes_backward_kernel(
                 mask=hidden_mask & valid,
                 other=0.0,
             ).to(tl.float32)
-            # The reference performs one BF16 in-place add per top-k slot.
-            # Keep that observable rounding boundary instead of accumulating
-            # all slots in FP32 and casting only once.
             accumulator = (accumulator + route_grad).to(tl.bfloat16).to(tl.float32)
         tl.store(
             grad_input + token * hidden_size + hidden_offsets,
@@ -148,34 +140,11 @@ def _compact_route_positions_kernel(
     )
 
 
-def _validate_common(
-    value: torch.Tensor,
-    output_index: torch.Tensor,
-) -> None:
-    if not value.is_cuda or not output_index.is_cuda:
-        raise RuntimeError("deterministic route kernels require CUDA tensors")
-    if value.ndim != 2 or value.dtype != torch.bfloat16:
-        raise TypeError(
-            "deterministic route kernels require BF16 [rows, hidden], got " f"{value.dtype} {tuple(value.shape)}"
-        )
-    if output_index.ndim != 2 or output_index.dtype not in (torch.int32, torch.int64):
-        raise TypeError(
-            "deterministic route kernels require an integer [tokens, topk] mapping, got "
-            f"{output_index.dtype} {tuple(output_index.shape)}"
-        )
-    if not value.is_contiguous() or not output_index.is_contiguous():
-        raise RuntimeError("deterministic route kernel inputs must be contiguous")
-
-
 def scatter_routes_forward(
     hidden_states: torch.Tensor,
     output_index: torch.Tensor,
     output: torch.Tensor,
 ) -> None:
-    """Copy token rows into their unique expert-major route rows."""
-    _validate_common(hidden_states, output_index)
-    if output.ndim != 2 or output.dtype != hidden_states.dtype or not output.is_contiguous():
-        raise TypeError("deterministic route-scatter output must be contiguous BF16 [rows, hidden]")
     hidden_size = hidden_states.shape[1]
     block_d = 1024 if hidden_size >= 1024 else triton.next_power_of_2(hidden_size)
     num_slot_programs = min(output_index.numel(), 8192)
@@ -197,14 +166,6 @@ def scatter_routes_backward(
     output_index: torch.Tensor,
     grad_input: torch.Tensor,
 ) -> None:
-    """Sum route gradients in fixed top-k order into token rows."""
-    _validate_common(grad_output, output_index)
-    if (
-        grad_input.shape != (output_index.shape[0], grad_output.shape[1])
-        or grad_input.dtype != grad_output.dtype
-        or not grad_input.is_contiguous()
-    ):
-        raise TypeError("deterministic route-scatter input gradient has an invalid layout")
     hidden_size = grad_output.shape[1]
     block_d = 1024 if hidden_size >= 1024 else triton.next_power_of_2(hidden_size)
     num_token_programs = min(output_index.shape[0], 2048)
@@ -228,20 +189,6 @@ def ordered_route_grad(
     output_index: torch.Tensor,
     grad_routes: torch.Tensor,
 ) -> None:
-    """Write each token/slot gradient to its unique route row."""
-    _validate_common(grad_output, output_index)
-    if topk_weights.shape != output_index.shape or topk_weights.dtype != torch.float32:
-        raise TypeError("ordered route gradients require FP32 [tokens, topk] weights")
-    if not topk_weights.is_cuda or not topk_weights.is_contiguous():
-        raise RuntimeError("ordered route-gradient weights must be contiguous CUDA tensors")
-    if (
-        grad_routes.ndim != 2
-        or grad_routes.shape[1] != grad_output.shape[1]
-        or grad_routes.dtype != grad_output.dtype
-        or not grad_routes.is_cuda
-        or not grad_routes.is_contiguous()
-    ):
-        raise TypeError("ordered route-gradient output has an invalid layout")
     hidden_size = grad_output.shape[1]
     block_d = 1024 if hidden_size >= 1024 else triton.next_power_of_2(hidden_size)
     num_slot_programs = min(output_index.numel(), 8192)
@@ -263,12 +210,6 @@ def compact_route_positions(
     valid: torch.Tensor,
     num_routes: int,
 ) -> torch.Tensor:
-    """Compact a row-major fixed-top-k validity mask without a host sync."""
-    if valid.ndim != 2 or valid.dtype != torch.bool or not valid.is_cuda:
-        raise ValueError("route-position compaction requires a CUDA bool [tokens, topk] mask")
-    if num_routes < 0 or num_routes > valid.numel():
-        raise ValueError(f"invalid compact route count {num_routes} for {valid.numel()} slots")
-
     flat_valid = valid.reshape(-1).contiguous()
     prefix = torch.cumsum(flat_valid, dim=0, dtype=torch.int32)
     positions = torch.empty(

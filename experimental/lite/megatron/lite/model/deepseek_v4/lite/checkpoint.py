@@ -38,13 +38,11 @@ from megatron.lite.model.deepseek_v4.quantization import (
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.weights import ResyncFormat
-from megatron.lite.model.deepseek_v4.checkpoint_block_fp8 import (
-    BLOCK_SHAPE,
-    BlockFP8CheckpointDequantAdapter,
-)
 from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
+    BLOCK_SHAPE,
     requantize_block_fp8_weight,
 )
+from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
@@ -346,7 +344,6 @@ class DeepseekV4WeightSpec:
                 raise ValueError(
                     f"{native_name} requires weight/scale pairs for {len(names)} weights"
                 )
-            dequant = BlockFP8CheckpointDequantAdapter()
             masters: list[torch.Tensor] = []
             scales: list[torch.Tensor] = []
             for name, weight, scale in zip(
@@ -354,7 +351,9 @@ class DeepseekV4WeightSpec:
             ):
                 if weight.dtype == torch.float8_e4m3fn:
                     fp32_scale = _scale_to_float32(scale)
-                    master = dequant(weight, scale)
+                    master = dequantize_block_fp8(
+                        weight, fp32_scale, BLOCK_SHAPE
+                    ).to(torch.bfloat16)
                     restored = requantize_block_fp8_weight(master, fp32_scale)
                     if not torch.equal(restored.qweight, weight):
                         changed = int((restored.qweight != weight).sum().item())

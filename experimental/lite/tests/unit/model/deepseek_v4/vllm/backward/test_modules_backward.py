@@ -64,6 +64,30 @@ def test_visible_linear_value_and_master_vjp(fused: bool) -> None:
         torch.testing.assert_close(actual.grad.float(), reference.grad, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("fused", [False, True])
+def test_visible_linear_empty_rows_do_not_call_deployment_kernel(fused: bool) -> None:
+    value = torch.empty(0, 4, requires_grad=True)
+    weights = tuple(
+        torch.randn(rows, 4, requires_grad=True)
+        for rows in ((2, 3) if fused else (5,))
+    )
+
+    def unsupported_empty_m(*_args):
+        raise AssertionError("deployment kernel must not receive M=0")
+
+    output = (
+        fused_block_fp8_linear(unsupported_empty_m, value, *weights)
+        if fused
+        else block_fp8_linear(unsupported_empty_m, value, weights[0])
+    )
+    assert output.shape == (0, 5)
+    output.sum().backward()
+    assert value.grad is not None and value.grad.numel() == 0
+    for weight in weights:
+        assert weight.grad is not None
+        assert torch.count_nonzero(weight.grad) == 0
+
+
 def test_forward_only_uses_visible_path_without_autograd_owner() -> None:
     x = torch.randn(3, 4, requires_grad=True)
     weight = torch.randn(5, 4, requires_grad=True)

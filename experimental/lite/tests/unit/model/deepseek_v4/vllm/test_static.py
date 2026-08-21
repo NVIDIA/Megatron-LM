@@ -15,6 +15,9 @@ from megatron.lite.model.deepseek_v4.vllm.model import (
     DeepseekV4Layer,
     DeepseekV4Model,
 )
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
+    VLLMAttention,
+)
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe import DeepseekV4MoE
 
 
@@ -43,6 +46,21 @@ def test_vllm_path_reuses_lite_model_containers() -> None:
     assert issubclass(DeepseekV4Model, LiteDeepseekV4Model)
     assert issubclass(DeepseekV4Layer, LiteDeepseekV4Layer)
     assert issubclass(DeepseekV4MoE, LiteDeepseekV4MoE)
+
+
+def test_cp1_has_no_boundary_projection() -> None:
+    attention = VLLMAttention.__new__(VLLMAttention)
+    local_k = torch.randn(7, 1, 8)
+    result = attention._project_boundary_k(
+        torch.empty(0, 16),
+        local_k,
+        torch.tensor([0, 7], dtype=torch.int32),
+        global_start=0,
+        cos_sin_cache=torch.empty(0),
+    )
+
+    assert result.shape == (0, 1, 8)
+    assert result.untyped_storage().data_ptr() == local_k.untyped_storage().data_ptr()
 
 
 @pytest.mark.gpus(1)

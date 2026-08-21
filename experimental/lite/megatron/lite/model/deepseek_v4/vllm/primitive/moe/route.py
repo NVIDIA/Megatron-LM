@@ -18,6 +18,7 @@ def _ordered_route_backward(
     grad_output: torch.Tensor,
     grad_routes: torch.Tensor | None,
     grad_weights: torch.Tensor | None,
+    static_mapping_valid: bool,
 ) -> None:
     """Differentiate rollout's ordered fixed-top-k gather."""
     aliases_values = (
@@ -30,6 +31,54 @@ def _ordered_route_backward(
     flat_output_index = output_index.reshape(-1)
     flat_weights = topk_weights.reshape(-1)
     flat_grad_weights = grad_weights.reshape(-1) if grad_weights is not None else None
+
+    if not static_mapping_valid:
+        valid_positions = torch.nonzero(output_index >= 0, as_tuple=False)
+        if aliases_values and grad_weights is not None:
+            for start in range(0, valid_positions.shape[0], _BACKWARD_CHUNK_ROWS):
+                positions = valid_positions[start : start + _BACKWARD_CHUNK_ROWS]
+                token_rows, columns = positions[:, 0], positions[:, 1]
+                route_rows = output_index[token_rows, columns].long()
+                token_grads = grad_output.index_select(0, token_rows)
+                selected = route_values.index_select(0, route_rows)
+                grad_weights[token_rows, columns] = (
+                    token_grads.float() * selected.float()
+                ).sum(dim=-1)
+        if grad_routes is not None and aliases_values:
+            grad_routes.zero_()
+        fused_route_grad = False
+        if grad_routes is not None and grad_output.is_cuda:
+            from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route_kernels import (
+                ordered_route_grad,
+            )
+
+            ordered_route_grad(
+                grad_output.contiguous(),
+                topk_weights.contiguous(),
+                output_index.contiguous(),
+                grad_routes,
+            )
+            fused_route_grad = True
+        for start in range(0, valid_positions.shape[0], _BACKWARD_CHUNK_ROWS):
+            positions = valid_positions[start : start + _BACKWARD_CHUNK_ROWS]
+            token_rows, columns = positions[:, 0], positions[:, 1]
+            route_rows = output_index[token_rows, columns].long()
+            token_grads = grad_output.index_select(0, token_rows)
+            if grad_routes is not None and not fused_route_grad:
+                weights = topk_weights[token_rows, columns]
+                grad_routes.index_copy_(
+                    0,
+                    route_rows,
+                    (token_grads.float() * weights.float().unsqueeze(1)).to(
+                        grad_routes.dtype
+                    ),
+                )
+            if grad_weights is not None and not aliases_values:
+                selected = route_values.index_select(0, route_rows)
+                grad_weights[token_rows, columns] = (
+                    token_grads.float() * selected.float()
+                ).sum(dim=-1)
+        return
 
     def positions(start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
         flat = torch.arange(start, end, device=output_index.device, dtype=torch.long)
@@ -314,6 +363,7 @@ class _VLLMEPGatherWithBF16Backward(torch.autograd.Function):
         topk_weights: torch.Tensor,
         output_index: torch.Tensor,
         reuse_input_for_grad: bool,
+        static_mapping_valid: bool,
     ) -> torch.Tensor:
         if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
             raise TypeError(
@@ -344,6 +394,7 @@ class _VLLMEPGatherWithBF16Backward(torch.autograd.Function):
             output,
         )
         ctx.reuse_input_for_grad = bool(reuse_input_for_grad)
+        ctx.static_mapping_valid = bool(static_mapping_valid)
         ctx.save_for_backward(hidden_states, topk_weights, output_index)
         return output
 
@@ -368,16 +419,17 @@ class _VLLMEPGatherWithBF16Backward(torch.autograd.Function):
             grad_output=grad_output,
             grad_routes=grad_hidden,
             grad_weights=grad_weights,
+            static_mapping_valid=ctx.static_mapping_valid,
         )
 
-        return grad_hidden, None, grad_weights, None, None
+        return grad_hidden, None, grad_weights, None, None, None
 
 
 def _compact_route_preserving_metadata_inputs(
     hidden_states: torch.Tensor,
     topk_indices: torch.Tensor,
     topk_weights: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     """Expand fixed top-k routes into Slime's metadata-only dispatch."""
     if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
         raise TypeError("Route metadata requires BF16 [tokens, hidden]")
@@ -422,6 +474,7 @@ def _compact_route_preserving_metadata_inputs(
         compact_weights.reshape(-1, 1).contiguous(),
         fingerprints,
         output_index,
+        valid_positions.numel() == flat_indices.numel(),
     )
 
 

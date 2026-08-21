@@ -140,6 +140,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             self._source_weights,
             self._source_output_index,
             True,
+            self._source_all_routes_valid,
         )
         for name in (
             "_metadata_route_rows",
@@ -147,6 +148,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             "_source_indices",
             "_source_weights",
             "_source_output_index",
+            "_source_all_routes_valid",
         ):
             delattr(self, name)
         self._local_tpe_list = None
@@ -171,6 +173,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             route_weights,
             route_fingerprints,
             source_output_index,
+            source_all_routes_valid,
         ) = _compact_route_preserving_metadata_inputs(
             hidden_states,
             topk_indices,
@@ -255,5 +258,6 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         self._source_indices = topk_indices
         self._source_weights = topk_scores
         self._source_output_index = source_output_index
+        self._source_all_routes_valid = source_all_routes_valid
         self._local_tpe_list = received_per_expert.tolist()
         return expert_hidden, received_per_expert, expert_probs
