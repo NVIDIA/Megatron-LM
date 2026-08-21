@@ -4,6 +4,7 @@
 
 import importlib.util
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -13,7 +14,7 @@ from megatron.core.resharding.copy_services.base import RecvOp, SendOp
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     NCCLM2NCopyService,
     _operation_layout,
-    _ordered_ops_by_peer,
+    _ops_by_peer,
     _validate_nccl_version,
     _validate_pair_layouts,
     _validate_role_roster,
@@ -53,24 +54,22 @@ def test_validate_role_roster_rejects_unsupported_topologies(roles, message):
         _validate_role_roster(roles)
 
 
-def test_ordered_ops_group_by_peer_and_keep_duplicate_task_order():
+def test_ops_by_peer_preserves_submission_order():
     first_duplicate = SendOp(task_id=4, tensor=torch.tensor([1]), dest_rank=3)
     second_duplicate = SendOp(task_id=4, tensor=torch.tensor([2]), dest_rank=3)
     lower_id = SendOp(task_id=1, tensor=torch.tensor([3]), dest_rank=3)
     other_peer = SendOp(task_id=0, tensor=torch.tensor([4]), dest_rank=2)
 
-    grouped = _ordered_ops_by_peer(
-        [first_duplicate, other_peer, second_duplicate, lower_id], is_send=True
-    )
+    grouped = _ops_by_peer([first_duplicate, other_peer, second_duplicate, lower_id], is_send=True)
 
     assert grouped[2] == [other_peer]
-    assert grouped[3] == [lower_id, first_duplicate, second_duplicate]
+    assert grouped[3] == [first_duplicate, second_duplicate, lower_id]
 
 
-def test_ordered_ops_requires_task_ids():
+def test_operation_layout_requires_task_ids():
     op = RecvOp(task_id=None, tensor=torch.zeros(1), src_rank=0)
     with pytest.raises(RuntimeError, match="requires a task_id"):
-        _ordered_ops_by_peer([op], is_send=False)
+        _operation_layout([op])
 
 
 def test_operation_layout_detects_ordered_tensor_disagreement():
@@ -159,14 +158,16 @@ def test_pair_layout_is_reused_until_plan_changes(monkeypatch):
     service._active_transform = None
     service._slot_bytes = None
     topology = _validate_role_roster([(True, False), (False, True)])
-    calls = 0
+    exchanges = 0
 
     def fake_exchange(_topology, _sends, _recvs):
-        nonlocal calls
-        calls += 1
-        return calls * 8
+        nonlocal exchanges
+        exchanges += 1
+        return exchanges * 8
 
+    validate_peers = Mock()
     monkeypatch.setattr(service, "_exchange_pair_layouts", fake_exchange)
+    monkeypatch.setattr(service, "_validate_peers", validate_peers)
 
     first_plan = object()
     service.set_plan(first_plan)
@@ -179,7 +180,7 @@ def test_pair_layout_is_reused_until_plan_changes(monkeypatch):
     assert service._get_slot_bytes(topology, {}, {}) == 16
     service.set_plan(second_plan, transform=object())
     assert service._get_slot_bytes(topology, {}, {}) == 24
-    assert calls == 3
+    assert exchanges == validate_peers.call_count == 3
 
 
 def test_unbound_pair_layout_is_collected_every_run(monkeypatch):
@@ -188,18 +189,20 @@ def test_unbound_pair_layout_is_collected_every_run(monkeypatch):
     service._active_transform = None
     service._slot_bytes = None
     topology = _validate_role_roster([(True, False), (False, True)])
-    calls = 0
+    exchanges = 0
 
     def fake_exchange(_topology, _sends, _recvs):
-        nonlocal calls
-        calls += 1
+        nonlocal exchanges
+        exchanges += 1
         return 8
 
+    validate_peers = Mock()
     monkeypatch.setattr(service, "_exchange_pair_layouts", fake_exchange)
+    monkeypatch.setattr(service, "_validate_peers", validate_peers)
 
     assert service._get_slot_bytes(topology, {}, {}) == 8
     assert service._get_slot_bytes(topology, {}, {}) == 8
-    assert calls == 2
+    assert exchanges == validate_peers.call_count == 2
 
 
 def test_pack_leaves_padding_untouched():

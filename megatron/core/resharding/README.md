@@ -113,9 +113,11 @@ The backend preserves the existing ReFIT planner and packs its operations into
 one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
 0, destination ranks shard dimension 1, and one cross-dimension
 `nccl.m2n.reshard` call moves the entire batch through M2N's managed
-copy/staging transport. Before each call, ranks exchange byte counts, tensor
-counts, and an ordered layout digest for every source/destination pair; any
-sender/receiver disagreement fails before weight data moves.
+copy/staging transport. Before a plan's first call, ranks exchange byte counts,
+tensor counts, and an ordered layout digest for every source/destination pair;
+any sender/receiver disagreement fails before weight data moves. The result is
+cached with the immutable plan, so subsequent refits do not run that collective
+or repeat the peer/layout validation.
 
 This backend supports only non-collocated multi-rank layouts. The communication
 group must contain a contiguous source interval starting at group rank 0,
