@@ -11,13 +11,12 @@ from megatron.core.fusions import fused_mtp_tv as fused_tv_module
 from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import multi_token_prediction as mtp_module
-from megatron.core.transformer.multi_token_prediction import (
+from megatron.core.transformer.mtp_sequence_roll import (
     ContiguousPackedCPRollContext,
-    MTPLossAutoScaler,
     ZigzagPackedCPRollContext,
     prepare_mtp_sequence_roll_context,
-    process_mtp_loss,
 )
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -848,7 +847,7 @@ def test_aligned_rows_per_token_normalization_matches_roll(loss_type, derived_la
     source = input_ids if derived_labels else labels
     bare_context = prepare_mtp_sequence_roll_context(source, None, None)
     assert bare_context is not None
-    original_prepare = mtp_module._prepare_mtp_sequence_roll_fields
+    original_prepare = mtp_module.prepare_mtp_sequence_roll_fields
     original_roll = mtp_module.roll_tensor
     original_tv = mtp_module.vocab_parallel_tv_distance
     prepared_groups = 0
@@ -873,7 +872,7 @@ def test_aligned_rows_per_token_normalization_matches_roll(loss_type, derived_la
 
     with (
         mock.patch.object(
-            mtp_module, "_prepare_mtp_sequence_roll_fields", side_effect=record_prepare
+            mtp_module, "prepare_mtp_sequence_roll_fields", side_effect=record_prepare
         ),
         mock.patch.object(mtp_module, "roll_tensor", side_effect=record_roll),
         mock.patch.object(mtp_module, "vocab_parallel_tv_distance", side_effect=record_tv),

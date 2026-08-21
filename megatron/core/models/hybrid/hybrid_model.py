@@ -24,11 +24,13 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
-from megatron.core.transformer.multi_token_prediction import (
+from megatron.core.transformer.mtp_sequence_roll import (
     MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
+from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
-    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module

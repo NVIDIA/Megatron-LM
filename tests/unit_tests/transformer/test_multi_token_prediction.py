@@ -26,18 +26,20 @@ from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.multi_token_prediction import (
+from megatron.core.transformer.mtp_sequence_roll import (
     ContiguousPackedCPRollContext,
     ContiguousPackedCPRollHalos,
     ContiguousPackedSeqRollPlan,
     LocalRollContext,
-    MTPLossLoggingHelper,
     MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+    roll_tensor,
+)
+from megatron.core.transformer.multi_token_prediction import (
+    MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     _mtp_logits_are_vocab_sharded,
-    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
-    roll_tensor,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
