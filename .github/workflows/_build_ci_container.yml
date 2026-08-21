@@ -206,16 +206,23 @@ jobs:
         shell: bash
         env:
           BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
+          EVENT_NAME: ${{ github.event_name }}
           LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
           RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
         run: |
-          DONOR_CACHE="$RUN_CACHE"
-          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
-            DONOR_CACHE="$BASELINE_CACHE"
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            CANDIDATES=("$BASELINE_CACHE" "$RUN_CACHE" "$LEGACY_CACHE")
+          else
+            CANDIDATES=("$RUN_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
           fi
-          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
-            DONOR_CACHE="$LEGACY_CACHE"
-          fi
+
+          DONOR_CACHE="$LEGACY_CACHE"
+          for candidate in "${CANDIDATES[@]}"; do
+            if docker buildx imagetools inspect "$candidate" >/dev/null 2>&1; then
+              DONOR_CACHE="$candidate"
+              break
+            fi
+          done
           echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Build and push
