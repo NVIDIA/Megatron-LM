@@ -30,6 +30,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -49,7 +50,6 @@ try:
         MixedPrecisionPolicy,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-        Flat,
         Placements,
         fully_shard,
         fully_shard_context,
@@ -560,7 +560,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
         placements = Placements(
-            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
         )
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant

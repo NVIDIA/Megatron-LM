@@ -37,7 +37,8 @@ class Placements:
     """Per-data-parallel-axis placements for MFSDP buffers.
 
     ``dp_axes`` identifies the parent-mesh axes that form MFSDP's data-parallel
-    mesh. Placement sequences are ordered to match those axes.
+    mesh. Placement sequences are ordered to match those axes. Use Torch's
+    ``Shard(0)`` for public parameter, gradient, and optimizer sharding.
     """
 
     dp_axes: Sequence[MeshAxis]
@@ -198,7 +199,7 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
     """Mark an FSDP microbatch as the last accumulation microbatch.
 
     At present, this is only needed for HSDP/HFSDP gradient accumulation, so
-    FSDP finalizes gradients only on the last backward. Plain all-Flat data
+    FSDP finalizes gradients only on the last backward. Plain all-``Shard(0)`` data
     parallelism finalizes gradients on every backward and does not need it.
 
     Args:
