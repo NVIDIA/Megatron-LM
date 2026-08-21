@@ -14,7 +14,6 @@ from megatron.core import mpu
 from megatron.core.dist_checkpointing.serialization import load, load_common_state_dict, save
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.safe_globals import safe_load_from_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -166,13 +165,7 @@ def restore_sharded_modelopt_state(
         return
 
     # Loading the common modelopt_state (replicated on all ranks).
-    # Detect format: legacy checkpoints store common state in a standalone common.pt file;
-    # newer sharded checkpoints store it as a ShardedObject inside the torch_dist checkpoint.
-    legacy_common_path = os.path.join(modelopt_checkpoint_name, "common.py")
-    if os.path.exists(legacy_common_path):
-        common_modelopt_state = safe_load_from_bytes(legacy_common_path)
-    else:
-        common_modelopt_state = load_common_state_dict(modelopt_checkpoint_name)
+    common_modelopt_state = load_common_state_dict(modelopt_checkpoint_name)
 
     modelopt_load_version = common_modelopt_state["modelopt_version"]
 
