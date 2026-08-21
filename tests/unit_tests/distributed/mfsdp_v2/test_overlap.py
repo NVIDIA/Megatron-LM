@@ -7,13 +7,12 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import Partial, Replicate
 from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
-    Partial,
     Placements,
-    Replicate,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -48,10 +47,7 @@ def _flat_placements() -> Placements:
 
 def _zero1_placements() -> Placements:
     return Placements(
-        dp_axes=[0],
-        parameter=[Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG)],
-        optimizer=[Flat()],
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Flat()]
     )
 
 
