@@ -17,12 +17,14 @@ from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.multi_token_prediction import (
+from megatron.core.transformer.mtp_sequence_roll import (
     MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
+from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     _scatter_mtp_padding_mask,
     get_mtp_layer_offset,
-    prepare_mtp_sequence_roll_context,
 )
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,

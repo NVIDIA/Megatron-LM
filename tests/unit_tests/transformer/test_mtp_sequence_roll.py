@@ -7,24 +7,44 @@ import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
 from megatron.core.parallel_state import get_context_parallel_group
-from megatron.core.transformer import multi_token_prediction as mtp
-from megatron.core.transformer.multi_token_prediction import (
+from megatron.core.transformer import mtp_sequence_roll
+from megatron.core.transformer import multi_token_prediction as multi_token_prediction_module
+from megatron.core.transformer.mtp_sequence_roll import (
     ContiguousPackedCPRollContext,
     ContiguousPackedCPRollHalos,
     ContiguousPackedSeqRollPlan,
     LocalRollContext,
     MTPSequenceRollField,
-    MultiTokenPredictionBlock,
     ZigzagPackedCPRollContext,
-    _prepare_mtp_sequence_roll_fields,
     prepare_mtp_sequence_roll_context,
-    process_mtp_loss,
+    prepare_mtp_sequence_roll_fields,
     roll_tensor,
+)
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    process_mtp_loss,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.launch_on_gb200
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "MTPSequenceRollHalos",
+        "ContiguousPackedCPRollHalos",
+        "MTPSequenceRollContext",
+        "ContiguousPackedSeqRollPlan",
+        "ContiguousPackedCPRollContext",
+        "prepare_mtp_sequence_roll_context",
+        "roll_tensor",
+    ],
+)
+def test_sequence_roll_legacy_exports(name):
+    """Moving the implementation must preserve the established import path."""
+    assert getattr(multi_token_prediction_module, name) is getattr(mtp_sequence_roll, name)
 
 
 def _packed_params(cu_seqlens, *, partition_mode="contiguous"):
@@ -346,7 +366,7 @@ def test_late_bound_siblings_reuse_local_and_contiguous_geometry(monkeypatch):
     local_indices = local._roll_row_indices
     local_valid = local._roll_valid_rows
     monkeypatch.setattr(
-        mtp,
+        mtp_sequence_roll,
         "_build_local_roll_geometry",
         lambda **_: pytest.fail("Local late binding should reuse row geometry."),
     )
@@ -373,7 +393,7 @@ def test_late_bound_siblings_reuse_local_and_contiguous_geometry(monkeypatch):
     contiguous_indices = contiguous._roll_row_indices
     contiguous_valid = contiguous._roll_valid_rows
     monkeypatch.setattr(
-        mtp,
+        mtp_sequence_roll,
         "_build_contiguous_packed_cp_roll_geometry",
         lambda *_, **__: pytest.fail("Contiguous late binding should reuse row geometry."),
     )
@@ -398,7 +418,7 @@ def test_source_identity_guard_reprepares_stale_fields_atomically():
     assert not context.is_prepared_for_fields(
         [MTPSequenceRollField("input_ids", current, -1, 0, 0)]
     )
-    rebound = _prepare_mtp_sequence_roll_fields(
+    rebound = prepare_mtp_sequence_roll_fields(
         context, [MTPSequenceRollField("input_ids", current, -1, 0, 0)], max_offset=2
     )
     assert rebound is not None
@@ -422,7 +442,7 @@ def test_source_identity_guard_safely_falls_back_for_inference_tensors():
         # version counter with which to prove that a later reuse is fresh.
         assert torch.equal(context.materialize("input_ids", 1), torch.tensor([[2, 3, 4, 0]]))
         assert not context.is_prepared_for_fields([field])
-        assert _prepare_mtp_sequence_roll_fields(context, [field], max_offset=2) is None
+        assert prepare_mtp_sequence_roll_fields(context, [field], max_offset=2) is None
 
 
 def _packed_global_aligned_rows(source, cu_seqlens, offset, fill_value):
@@ -608,7 +628,7 @@ def test_certified_zigzag_multi_hop_fallback_is_atomic(monkeypatch):
 
     fields = (MTPSequenceRollField("tokens", source, -1, 0, 0),)
     assert bare.prepare_fields(fields, max_offset=3) is bare
-    assert _prepare_mtp_sequence_roll_fields(bare, fields, max_offset=3) is None
+    assert prepare_mtp_sequence_roll_fields(bare, fields, max_offset=3) is None
     assert bare.keys == ()
     assert bare.max_offset == 0
 
@@ -683,7 +703,7 @@ def test_certified_zigzag_routes_and_late_binding_reuse_geometry(monkeypatch):
     # A late-bound TV/mask sibling with a smaller requested depth must reuse the
     # already-built row map and route metadata rather than reconstruct either.
     monkeypatch.setattr(
-        mtp,
+        mtp_sequence_roll,
         "_build_zigzag_packed_cp_roll_geometry",
         lambda **_: pytest.fail("Late binding should reuse certified zigzag geometry."),
     )
