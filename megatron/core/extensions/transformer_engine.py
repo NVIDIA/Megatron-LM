@@ -2707,8 +2707,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         # These fields are MCore-only and should not be forwarded to TE attention.
         # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
-        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
-        # are MCore CP metadata.
+        # MoE sequence-level aux loss reshaping; the remaining fields are MCore CP metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
@@ -2718,6 +2717,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("cp_singleton_group")
         # Runtime groups belong to MCore layout conversion and CP binding, not TE's forward API.
         self.kept_packed_seq_params.difference_update({"cp_group", "local_cp_size", "tp_cp_group"})
+        self.kept_packed_seq_params.discard("zigzag_cp_min_chunk_size")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
