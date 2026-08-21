@@ -141,6 +141,36 @@ class MimoModel(MegatronModule):
                 )
         return sharded_sd
 
+    @staticmethod
+    def _validate_precomputed_token_indices(
+        modality_embeddings: Dict[str, torch.Tensor],
+        modality_token_indices: Dict[str, torch.Tensor],
+        num_positions: int,
+    ) -> None:
+        """Validate the metadata-only contract for precomputed token positions."""
+        if modality_token_indices.keys() != modality_embeddings.keys():
+            raise ValueError(
+                "Precomputed token indices must have the same modalities as the embeddings"
+            )
+
+        total_indices = 0
+        for name, embeddings in modality_embeddings.items():
+            indices = modality_token_indices[name]
+            if indices.ndim != 1:
+                raise ValueError(f"{name} token indices must be one-dimensional")
+            if indices.numel() != embeddings.size(0):
+                raise ValueError(
+                    f"Number of {name} token indices ({indices.numel()}) does not match "
+                    f"number of embeddings ({embeddings.size(0)})"
+                )
+            total_indices += indices.numel()
+
+        if total_indices != num_positions:
+            raise ValueError(
+                f"Precomputed token indices must cover {num_positions} positions, "
+                f"got {total_indices}"
+            )
+
     def align_embeddings_by_token_positions(
         self,
         modality_embeddings: Dict[str, torch.Tensor],  # [num_embeddings, hidden_dim]
@@ -196,60 +226,18 @@ class MimoModel(MegatronModule):
         )
         flat_combined_embeddings = combined_embeddings.view(-1, hidden_dim)
 
-        precomputed_indices = modality_token_indices
-        if precomputed_indices is not None:
-            expected_modalities = set(modality_embeddings)
-            supplied_modalities = set(precomputed_indices)
-            if supplied_modalities != expected_modalities:
-                missing = sorted(expected_modalities - supplied_modalities)
-                unexpected = sorted(supplied_modalities - expected_modalities)
-                raise ValueError(
-                    "Precomputed modality token indices must be provided for every modality "
-                    f"(missing={missing}, unexpected={unexpected})"
-                )
-
-            total_indices = 0
+        if modality_token_indices is not None:
+            self._validate_precomputed_token_indices(
+                modality_embeddings, modality_token_indices, batch_size * seq_length
+            )
             for modality_name, modality_emb in modality_embeddings.items():
-                if modality_name != "text" and modality_name not in special_token_ids:
-                    raise ValueError(f"No special token ID defined for modality {modality_name}")
-
-                token_indices = precomputed_indices[modality_name]
-                if token_indices.ndim != 1:
-                    raise ValueError(
-                        f"{modality_name} token indices must be a flat one-dimensional tensor, "
-                        f"got shape {tuple(token_indices.shape)}"
-                    )
-                if token_indices.dtype != torch.long:
-                    raise ValueError(
-                        f"{modality_name} token indices must have dtype torch.long, "
-                        f"got {token_indices.dtype}"
-                    )
-                if token_indices.device != device:
-                    raise ValueError(
-                        f"{modality_name} token indices must be on device {device}, "
-                        f"got {token_indices.device}"
-                    )
-                if token_indices.numel() != modality_emb.size(0):
-                    raise ValueError(
-                        f"Number of {modality_name} token indices ({token_indices.numel()}) "
-                        f"does not match number of embeddings ({modality_emb.size(0)})"
-                    )
-                total_indices += token_indices.numel()
-
-            num_positions = batch_size * seq_length
-            if total_indices != num_positions:
-                raise ValueError(
-                    "Precomputed modality token indices must cover the complete flattened "
-                    f"[B, S] grid ({num_positions} positions), got {total_indices} indices"
+                flat_combined_embeddings.index_copy_(
+                    0, modality_token_indices[modality_name], modality_emb
                 )
+            return combined_embeddings.transpose(0, 1).contiguous()
 
         # Process each modality in modality_embeddings
         for modality_name, modality_emb in modality_embeddings.items():
-            if precomputed_indices is not None:
-                token_indices = precomputed_indices[modality_name]
-                flat_combined_embeddings.index_copy_(0, token_indices, modality_emb)
-                continue
-
             if modality_name == "text":
                 mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
                 for token_id in special_token_ids.values():
@@ -438,15 +426,6 @@ class MimoModel(MegatronModule):
         else:
             if text_token_indices.ndim != 1:
                 raise ValueError("Text token indices must be a flat one-dimensional tensor")
-            if text_token_indices.dtype != torch.long:
-                raise ValueError(
-                    f"Text token indices must have dtype torch.long, got {text_token_indices.dtype}"
-                )
-            if text_token_indices.device != input_ids.device:
-                raise ValueError(
-                    f"Text token indices must be on device {input_ids.device}, "
-                    f"got {text_token_indices.device}"
-                )
 
         input_ids_text = input_ids.reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
 

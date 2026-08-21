@@ -499,7 +499,7 @@ class TestEmbeddingAlignment:
                 },
             )
 
-        with pytest.raises(ValueError, match="flat one-dimensional tensor"):
+        with pytest.raises(ValueError, match="must be one-dimensional"):
             self.model.align_embeddings_by_token_positions(
                 modality_embeddings=indexed_modality_embeddings,
                 input_ids=input_ids,
@@ -510,23 +510,12 @@ class TestEmbeddingAlignment:
                 },
             )
 
-        with pytest.raises(ValueError, match="must be provided for every modality"):
+        with pytest.raises(ValueError, match="same modalities as the embeddings"):
             self.model.align_embeddings_by_token_positions(
                 modality_embeddings=indexed_modality_embeddings,
                 input_ids=input_ids,
                 special_token_ids=special_token_ids,
                 modality_token_indices={"text": valid_text_indices},
-            )
-
-        with pytest.raises(ValueError, match="must have dtype torch.long"):
-            self.model.align_embeddings_by_token_positions(
-                modality_embeddings=indexed_modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=special_token_ids,
-                modality_token_indices={
-                    "text": valid_text_indices,
-                    "vision": valid_vision_indices.to(dtype=torch.int32),
-                },
             )
 
         incomplete_text_indices = valid_text_indices[:-1]
@@ -536,7 +525,7 @@ class TestEmbeddingAlignment:
                 (incomplete_text_indices.numel(), hidden_dim), 0.01, device=self.device
             ),
         }
-        with pytest.raises(ValueError, match="must cover the complete flattened"):
+        with pytest.raises(ValueError, match="must cover .* positions"):
             self.model.align_embeddings_by_token_positions(
                 modality_embeddings=incomplete_modality_embeddings,
                 input_ids=input_ids,
