@@ -78,18 +78,9 @@ export VALIDATE_DS4_ENVIRONMENT="${VALIDATE_DS4_ENVIRONMENT:-1}"
 # the worker environment.
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 
-# Keep this release gate free of tensor dumps, forced synchronization, and
-# validation probes so its timings remain representative.
-unset MLITE_CUDA_SYNC_BOUNDARIES MLITE_CUDA_SYNC_BOUNDARY_STAGES
-unset CUDA_LAUNCH_BLOCKING VERL_TRAIN_INFER_RAW_DUMP
-export MLITE_VALIDATE_FINITE=0
-export MLITE_VALIDATE_INDICES=0
-export MLITE_WEIGHT_SYNC_FINGERPRINT=0
-export MLITE_WEIGHT_SYNC_PROBE=0
 export VERL_TRAIN_INFER_DIFF_MODE=compact
 export VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT="${VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT:-8}"
 
-layers='[0,1,2,3]'
 set +e
 bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "data.seed=${SEED:-42}" \
@@ -104,8 +95,6 @@ bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "++actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=False" \
   "++actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=False" \
   "++actor_rollout_ref.actor.engine.impl_cfg.qat=null" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.selector.global_layer_ids=${layers}" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.selector.module_names=[mhc,linear,kv_flashmla,o_proj,router_moe,deepep]" \
   "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096" \
   "actor_rollout_ref.rollout.full_determinism=True" \
   "actor_rollout_ref.rollout.seed=${SEED:-42}" \
