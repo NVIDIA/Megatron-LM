@@ -5,7 +5,7 @@ from copy import copy
 
 import torch
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention import _rope_and_qnorm
+from megatron.lite.model.deepseek_v4.vllm.attention import _rope_and_qnorm
 
 
 def _packed_cache(rows: int, device: torch.device, block_size: int = 64) -> torch.Tensor:

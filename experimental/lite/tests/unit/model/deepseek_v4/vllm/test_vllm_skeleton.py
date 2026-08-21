@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -121,7 +120,7 @@ def test_r3_uses_contiguous_cp_layout_and_live_actor_weights() -> None:
 def test_parallel_contract_rejects_unsupported_dimensions(parallel: ParallelConfig) -> None:
     with pytest.raises(NotImplementedError):
         protocol._validate_contract(
-            _tiny_config(), protocol.ImplConfig(parallel=parallel, use_deepep=True)
+            _tiny_config(), protocol.ImplConfig(parallel=parallel)
         )
 
 
@@ -130,7 +129,6 @@ def test_parallel_contract_accepts_pp2_cp2_ep4() -> None:
         _tiny_config(),
         protocol.ImplConfig(
             parallel=ParallelConfig(pp=2, cp=2, ep=4),
-            use_deepep=True,
             recompute=("full",),
         ),
     )
@@ -172,15 +170,13 @@ def test_cp1_forward_inputs_use_shared_packing_and_roll_targets() -> None:
 
 def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
     captured = {}
-    monkeypatch.setattr(protocol, "initialize_ds4_vllm_batch_invariance", lambda: None)
+    monkeypatch.setattr(protocol, "init_batch_invariance", lambda **_kwargs: None)
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
     monkeypatch.setattr(
-        protocol.DS4SparseIndexerCompressorMetadataAdapter,
-        "from_hf",
+        protocol,
+        "build_prefill_metadata_builders",
         lambda *_args, **_kwargs: pytest.fail("rebuilt caller-owned metadata"),
     )
-    monkeypatch.setattr(protocol, "ds4_vllm_forward_context", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setitem(sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object()))
     monkeypatch.setitem(
         sys.modules,
         "vllm.v1.worker.workspace",
@@ -198,7 +194,7 @@ def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
     bundle = protocol.build_model(
         _tiny_config(layers=1),
         impl_cfg=protocol.ImplConfig(
-            parallel=ParallelConfig(ep=1), use_deepep=True, hf_path="/unused"
+            parallel=ParallelConfig(ep=1), hf_path="/unused"
         ),
     )
     attention_metadata = {0: object()}
@@ -226,7 +222,7 @@ def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
         captured["wrapped"] = chunks[0]
         return None, None, None, "dist_opt"
 
-    monkeypatch.setattr(protocol, "initialize_ds4_vllm_batch_invariance", lambda: None)
+    monkeypatch.setattr(protocol, "init_batch_invariance", lambda **_kwargs: None)
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
     monkeypatch.setattr(protocol, "build_training_backend", fake_build_training_backend)
     monkeypatch.setitem(sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object()))
@@ -243,7 +239,7 @@ def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
     bundle = protocol.build_model(
         _tiny_config(layers=1),
         impl_cfg=protocol.ImplConfig(
-            parallel=ParallelConfig(ep=1), use_deepep=True, hf_path="/unused"
+            parallel=ParallelConfig(ep=1), hf_path="/unused"
         ),
     )
 

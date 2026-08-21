@@ -17,17 +17,12 @@ export PYTHONNOUSERSITE=1
 : "${MODEL_PATH:?set MODEL_PATH to the four-layer DeepSeek-V4 checkpoint}"
 : "${TRAIN_FILES:?set TRAIN_FILES to DAPO-format training parquet}"
 : "${VAL_FILES:?set VAL_FILES to DAPO-format validation parquet}"
-export VLLM_BATCH_INVARIANT_KERNEL_LIB="${VLLM_BATCH_INVARIANT_KERNEL_LIB:-/opt/batch-invariant-kernel/_vllm_batch_invariant_C.so}"
 test -s "${MODEL_PATH}/config.json"
-if [[ ! -s "${VLLM_BATCH_INVARIANT_KERNEL_LIB}" ]]; then
-  echo "required batch-invariant kernel is missing: ${VLLM_BATCH_INVARIANT_KERNEL_LIB}" >&2
-  exit 2
-fi
 
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/ds4_4layer_alignment}"
 export RUN_NAME="${RUN_NAME:-ds4_4layer_ep4_alignment}"
 export LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
-export VERL_TRAIN_INFER_DIFF_DUMP="${VERL_TRAIN_INFER_DIFF_DUMP:-${OUTPUT_ROOT}/train_infer_tokens.jsonl}"
+export JSONL_FILE="${JSONL_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 
 export NNODES=1
 export NGPUS_PER_NODE=4
@@ -57,14 +52,9 @@ export ROLLOUT_WEIGHT_BITS=8
 export ROLLOUT_MOE_BACKEND=deep_gemm
 
 export VLLM_BATCH_INVARIANT=1
-export VERL_ACTOR_BATCH_INVARIANT=1
-export VERL_ROLLOUT_BATCH_INVARIANT=1
 export VLLM_DS4_DECODE_KERNEL=sparse
 export VERL_FULL_DETERMINISM=1
-export VERL_DETERMINISM_SEED="${SEED:-42}"
 export PYTHONHASHSEED="${SEED:-42}"
-export VERL_LOCAL_TASK_RUNNER=1
-export VERL_ENGINE_LAZY_IMPORTS=1
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
 # Dockerfile.1 provides the validated torch-2.12/dev631 runtime. Keep the
@@ -78,9 +68,6 @@ export VALIDATE_DS4_ENVIRONMENT="${VALIDATE_DS4_ENVIRONMENT:-1}"
 # the worker environment.
 unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES
 
-export VERL_TRAIN_INFER_DIFF_MODE=compact
-export VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT="${VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT:-8}"
-
 set +e
 bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "data.seed=${SEED:-42}" \
@@ -89,11 +76,6 @@ bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "+actor_rollout_ref.actor.engine.full_determinism=True" \
   "actor_rollout_ref.actor.engine.attention_backend_override=null" \
   "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=True" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.use_thd=False" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.use_deepep=True" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=False" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=False" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.qat=null" \
   "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096" \
   "actor_rollout_ref.rollout.full_determinism=True" \
   "actor_rollout_ref.rollout.seed=${SEED:-42}" \
@@ -119,25 +101,32 @@ if [[ "${DRY_RUN:-0}" == "1" || "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-# Gate on VERL's production train/infer metrics rather than a separate
-# comparator. Every completed old-log-prob stage must be byte-exact and have
-# zero K3 KL; absence of the metric is also a failure.
-python3 - "${LOG_FILE}" <<'PY'
-import re
+# Gate directly on VERL's file logger; no diagnostic dump or custom stage
+# print is involved.
+python3 - "${JSONL_FILE}" "${TOTAL_TRAINING_STEPS}" <<'PY'
+import json
 import sys
 from pathlib import Path
 
-log_path = Path(sys.argv[1])
-pattern = re.compile(
-    r"RL_STAGE old_log_prob_done .*?bitwise_fraction=([^\s\x1b]+) "
-    r"k3_kl=([^\s\x1b]+)"
-)
-metrics = [(float(a), float(b)) for a, b in pattern.findall(log_path.read_text())]
-if not metrics:
-    raise SystemExit(f"no VERL train/infer alignment metric found in {log_path}")
-bad = [(index + 1, bitwise, k3) for index, (bitwise, k3) in enumerate(metrics)
-       if bitwise != 1.0 or k3 != 0.0]
+path = Path(sys.argv[1])
+expected = int(sys.argv[2])
+steps = {}
+for line in path.read_text().splitlines():
+    record = json.loads(line)
+    data = record.get("data", {})
+    if "training/rollout_logprob_bitwise_equal_fraction" in data:
+        steps[int(record["step"])] = data
+if len(steps) != expected:
+    raise SystemExit(f"expected {expected} alignment steps, found {sorted(steps)} in {path}")
+bad = [
+    (step, data["training/rollout_logprob_bitwise_equal_fraction"],
+     data["training/rollout_logprob_abs_diff_max"], data["rollout_corr/k3_kl"])
+    for step, data in sorted(steps.items())
+    if data["training/rollout_logprob_bitwise_equal_fraction"] != 1.0
+    or data["training/rollout_logprob_abs_diff_max"] > 1e-6
+    or data["rollout_corr/k3_kl"] != 0.0
+]
 if bad:
     raise SystemExit(f"DS4 train/infer alignment gate failed: {bad}")
-print(f"DS4_4L_ALIGNMENT_EXACT steps={len(metrics)} bitwise_fraction=1.0 k3_kl=0.0")
+print(f"DS4_4L_ALIGNMENT_EXACT steps={len(steps)} bitwise_fraction=1.0 k3_kl=0.0")
 PY

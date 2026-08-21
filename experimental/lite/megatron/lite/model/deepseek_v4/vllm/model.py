@@ -7,39 +7,48 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+from vllm.models.common.ops import fused_q_kv_rmsnorm
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.model import (
-    DeepseekV4CSAAttention as LiteDeepseekV4CSAAttention,
     DeepseekV4Layer as LiteDeepseekV4Layer,
     DeepseekV4Model as LiteDeepseekV4Model,
 )
 from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
-from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import AttentionKernelMetadata
-from megatron.lite.model.deepseek_v4.vllm.primitive import (
+from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
+    AttentionKernelMetadata,
+    CPAttentionKernelMetadata,
+    compressor_operation,
+    indexer_operation,
+)
+from megatron.lite.model.deepseek_v4.vllm.attention import (
     attention_core,
     attach_indexer_aux_loss,
+    visible_sparse_attention,
+)
+from megatron.lite.model.deepseek_v4.vllm.linear import (
     block_fp8_linear,
     fused_block_fp8_linear,
-    fused_qkv_rms_norm,
+    visible_linear,
+)
+from megatron.lite.model.deepseek_v4.vllm.mhc import (
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,
-    o_projection,
-    rms_norm,
-    visible_linear,
-    visible_sparse_attention,
 )
+from megatron.lite.model.deepseek_v4.vllm.norm import (
+    fused_qkv_rms_norm,
+    rms_norm,
+)
+from megatron.lite.model.deepseek_v4.vllm.o_proj import o_projection
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
 from megatron.lite.model.deepseek_v4.vllm.kernels import (
-    DS4KVInsertAdapter,
-    FlashMLAAdapter,
-    FusedQKVRMSNormAdapter,
-    KVCacheLayout,
-    MHCKernel,
-    MHCTileLangAdapter,
-    OProjectionAdapter,
+    insert_qkv,
+    mhc_kernel,
+    o_projection_visible,
+    sparse_attention,
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.parallel.mhc import (
@@ -50,6 +59,12 @@ from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
 )
+
+
+def _fp32_linear(value: torch.Tensor, *weights: torch.Tensor) -> torch.Tensor:
+    return torch.mm(
+        value.contiguous(), torch.cat(weights, dim=0).T, out_dtype=torch.float32
+    )
 
 
 def _rollout_selected_log_probs(
@@ -164,27 +179,6 @@ def _aligned_selected_log_probs(
     return selected, entropy
 
 
-def _default_attention_ops(*, cache_weight: bool) -> SimpleNamespace:
-    return SimpleNamespace(
-        fused_linear=DeploymentFusedBlockFP8Adapter(cache_weight=cache_weight),
-        q_linear=DeploymentBlockFP8Adapter(cache_weight=cache_weight),
-        indexer_q_linear=DeploymentBlockFP8Adapter(cache_weight=cache_weight),
-        bf16_linear=lambda value, weight: __import__(
-            "vllm.model_executor.layers.batch_invariant",
-            fromlist=["linear_batch_invariant"],
-        ).linear_batch_invariant(value, weight),
-        fp32_linear=lambda value, *weights: torch.mm(
-            value.contiguous(),
-            torch.cat(weights, dim=0).T,
-            out_dtype=torch.float32,
-        ),
-        norm=FusedQKVRMSNormAdapter(),
-        kv_insert=DS4KVInsertAdapter(KVCacheLayout.FP8_DS_MLA),
-        flash=FlashMLAAdapter(),
-        o_project=OProjectionAdapter(),
-    )
-
-
 class _AttentionState(CompressedSparseAttention):
     def __init__(
         self,
@@ -205,16 +199,22 @@ class _AttentionState(CompressedSparseAttention):
         )
         self.compress_ratio = max(1, configured_ratio)
         self.indexer_loss_coeff = indexer_loss_coeff
-        self.adapters = _default_attention_ops(
+        self.fused_linear = DeploymentFusedBlockFP8Adapter(
+            cache_weight=cache_deployment_weights
+        )
+        self.q_linear = DeploymentBlockFP8Adapter(
+            cache_weight=cache_deployment_weights
+        )
+        self.indexer_q_linear = DeploymentBlockFP8Adapter(
             cache_weight=cache_deployment_weights
         )
         self._projection_streams: list[torch.cuda.Stream] | None = None
         self._projection_events: list[torch.cuda.Event] | None = None
 
     def clear_deployment_weight_cache(self) -> None:
-        self.adapters.fused_linear.clear_cache()
-        self.adapters.q_linear.clear_cache()
-        self.adapters.indexer_q_linear.clear_cache()
+        self.fused_linear.clear_cache()
+        self.q_linear.clear_cache()
+        self.indexer_q_linear.clear_cache()
 
     def _output_projection(
         self,
@@ -225,7 +225,7 @@ class _AttentionState(CompressedSparseAttention):
         heads_per_group = self.config.num_attention_heads // self.config.o_groups
         nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
         return o_projection(
-            lambda value, wa, wb: self.adapters.o_project(
+            lambda value, wa, wb: o_projection_visible(
                 value,
                 positions,
                 cos_sin_cache,
@@ -252,7 +252,7 @@ class _AttentionState(CompressedSparseAttention):
     def _input_projections(self, hidden_states: torch.Tensor):
         def fused_projection():
             return fused_block_fp8_linear(
-                self.adapters.fused_linear,
+                self.fused_linear,
                 hidden_states,
                 self.wq_a.weight,
                 self.wkv.weight,
@@ -261,19 +261,19 @@ class _AttentionState(CompressedSparseAttention):
         aux_fns: list[Callable[[], torch.Tensor] | None] = [None, None, None]
         if self.compressor is not None:
             aux_fns[0] = lambda: fused_block_fp8_linear(
-                self.adapters.fp32_linear,
+                _fp32_linear,
                 hidden_states,
                 self.compressor.wkv.weight,
                 self.compressor.wgate.weight,
             )
         if self.indexer is not None:
             aux_fns[1] = lambda: visible_linear(
-                self.adapters.bf16_linear,
+                linear_batch_invariant,
                 hidden_states,
                 self.indexer.weights_proj.weight,
             )
             aux_fns[2] = lambda: fused_block_fp8_linear(
-                self.adapters.fp32_linear,
+                _fp32_linear,
                 hidden_states,
                 self.indexer.compressor.wkv.weight,
                 self.indexer.compressor.wgate.weight,
@@ -309,16 +309,15 @@ class _AttentionState(CompressedSparseAttention):
     def _forward_cp(
         self,
         hidden_states: torch.Tensor,
-        metadata: AttentionKernelMetadata,
+        metadata: CPAttentionKernelMetadata,
         q: torch.Tensor,
-        qr: torch.Tensor,
         kv: torch.Tensor,
-        projection_outputs,
+        index_q: torch.Tensor | None,
+        indexer_weights: torch.Tensor | None,
+        indexer_kv_score: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.ps is None or self.ps.cp_size <= 1 or self.ps.cp_group is None:
             raise RuntimeError("DS4 CP requires a model-owned CP group")
-        if metadata.cp_packed_seq_params is None or metadata.cp_positions is None:
-            raise RuntimeError("DS4 CP requires packed sequence geometry")
         if self.indexer_loss_coeff:
             raise NotImplementedError(
                 "DS4 CP indexer auxiliary loss is not implemented"
@@ -335,15 +334,15 @@ class _AttentionState(CompressedSparseAttention):
             official_local_qk_visible,
             quantized_main_k_visible,
         )
-        from megatron.lite.model.deepseek_v4.vllm.primitive.attention import (
+        from megatron.lite.model.deepseek_v4.vllm.attention import (
             compressed_compact_graph,
         )
-        from megatron.lite.primitive.modules.attention.cp_geometry import (
+        from megatron.lite.model.deepseek_v4.cp import (
             gather_cp_compressed_rows,
             prepare_cp_compression_geometry,
         )
 
-        psp = metadata.cp_packed_seq_params
+        psp = metadata.packed_seq_params
         cu_seqlens = (
             psp.cu_seqlens_q_padded
             if psp.cu_seqlens_q_padded is not None
@@ -353,16 +352,15 @@ class _AttentionState(CompressedSparseAttention):
             raise RuntimeError("DS4 CP requires cu_seqlens_q")
         l_local = hidden_states.shape[0]
         global_start = self.ps.cp_rank * l_local
-        positions = metadata.cp_positions.reshape(-1).to(torch.int64)
+        positions = metadata.positions.reshape(-1).to(torch.int64)
         if positions.numel() != l_local:
             raise RuntimeError("DS4 CP position rows do not match local tokens")
-        compressor_kv_score, indexer_weights, indexer_kv_score = projection_outputs
         q_visible, kv_visible = official_local_qk_visible(
             q,
             kv,
             positions,
             metadata.cos_sin_cache,
-            self.adapters.kv_insert,
+            insert_qkv,
             eps=self.config.rms_norm_eps,
             rope_dim=self.config.qk_rope_head_dim,
             padded_heads=self.config.num_attention_heads,
@@ -376,7 +374,7 @@ class _AttentionState(CompressedSparseAttention):
         )
         d_window = boundary_hidden.shape[0]
         boundary_qr_kv = fused_block_fp8_linear(
-            self.adapters.fused_linear,
+            self.fused_linear,
             boundary_hidden,
             self.wq_a.weight,
             self.wkv.weight,
@@ -385,7 +383,7 @@ class _AttentionState(CompressedSparseAttention):
             [self.config.q_lora_rank, self.config.head_dim], dim=-1
         )
         _, boundary_kv = fused_qkv_rms_norm(
-            self.adapters.norm,
+            fused_q_kv_rmsnorm,
             boundary_qr,
             boundary_kv,
             self.q_norm.weight,
@@ -407,7 +405,7 @@ class _AttentionState(CompressedSparseAttention):
             boundary_kv,
             boundary_positions,
             metadata.cos_sin_cache,
-            self.adapters.kv_insert,
+            insert_qkv,
             eps=self.config.rms_norm_eps,
             rope_dim=self.config.qk_rope_head_dim,
             padded_heads=self.config.num_attention_heads,
@@ -432,7 +430,7 @@ class _AttentionState(CompressedSparseAttention):
             group_ids = compression_geometry.compressed_group_ids
             seq_to_rank_row = compression_geometry.seq_to_rank_row
             compact_score = fused_block_fp8_linear(
-                self.adapters.fp32_linear,
+                _fp32_linear,
                 hidden_compact,
                 self.compressor.wkv.weight,
                 self.compressor.wgate.weight,
@@ -453,10 +451,7 @@ class _AttentionState(CompressedSparseAttention):
                     official_compact_compressed_visible,
                 )
 
-                if (
-                    metadata.cp_compressor_operation is None
-                    or metadata.cp_compressor_metadata is None
-                ):
+                if metadata.compressor_metadata is None:
                     raise RuntimeError(
                         "C4/C128 CP requires caller-owned official compressor metadata"
                     )
@@ -467,8 +462,8 @@ class _AttentionState(CompressedSparseAttention):
                     self.compressor.norm.weight,
                     group_ids,
                     metadata.cos_sin_cache,
-                    operation=metadata.cp_compressor_operation,
-                    runtime_metadata=metadata.cp_compressor_metadata,
+                    operation=compressor_operation,
+                    runtime_metadata=metadata.compressor_metadata,
                     ratio=ratio,
                     head_dim=self.config.head_dim,
                 )
@@ -487,13 +482,9 @@ class _AttentionState(CompressedSparseAttention):
             if self.indexer is not None:
                 if indexer_kv_score is None or indexer_weights is None:
                     raise RuntimeError("C4 CP requires indexer projections")
-                index_q = block_fp8_linear(
-                    self.adapters.indexer_q_linear,
-                    qr,
-                    self.indexer.wq_b.weight,
-                ).view(-1, self.config.index_n_heads, self.config.index_head_dim)
+                assert index_q is not None
                 compact_index_score = fused_block_fp8_linear(
-                    self.adapters.fp32_linear,
+                    _fp32_linear,
                     hidden_compact.detach(),
                     self.indexer.compressor.wkv.weight,
                     self.indexer.compressor.wgate.weight,
@@ -588,7 +579,7 @@ class _AttentionState(CompressedSparseAttention):
         output_buffer = torch.empty_like(q_visible)
 
         def visible_attention(q_value, kv_value):
-            return self.adapters.flash.sparse(
+            return sparse_attention(
                 q_value,
                 kv_value,
                 indices,
@@ -618,7 +609,7 @@ class _AttentionState(CompressedSparseAttention):
         self,
         hidden_states: torch.Tensor,
         *,
-        metadata: AttentionKernelMetadata | None,
+        metadata: AttentionKernelMetadata | CPAttentionKernelMetadata | None,
     ) -> torch.Tensor:
         if hidden_states.ndim != 2:
             raise ValueError("layer-0 attention requires flat [tokens, hidden]")
@@ -634,7 +625,7 @@ class _AttentionState(CompressedSparseAttention):
         compressor_kv_score, indexer_weights, indexer_kv_score = projection_outputs
         qr, kv = qr_kv.split([self.config.q_lora_rank, self.config.head_dim], dim=-1)
         qr, kv = fused_qkv_rms_norm(
-            self.adapters.norm,
+            fused_q_kv_rmsnorm,
             qr,
             kv,
             self.q_norm.weight,
@@ -642,21 +633,11 @@ class _AttentionState(CompressedSparseAttention):
             self.config.rms_norm_eps,
         )
         q = block_fp8_linear(
-            self.adapters.q_linear, qr, self.wq_b.weight
+            self.q_linear, qr, self.wq_b.weight
         ).view(-1, self.config.num_attention_heads, self.config.head_dim)
-        if self.ps is not None and self.ps.cp_size > 1:
-            return self._forward_cp(
-                hidden_states,
-                metadata,
-                q.contiguous(),
-                qr,
-                kv,
-                projection_outputs,
-            )
-        q = q.clone(memory_format=torch.contiguous_format)
         index_q = (
             block_fp8_linear(
-                self.adapters.indexer_q_linear,
+                self.indexer_q_linear,
                 qr,
                 self.indexer.wq_b.weight,
             )
@@ -665,14 +646,25 @@ class _AttentionState(CompressedSparseAttention):
             if self.indexer is not None
             else None
         )
+        if self.ps is not None and self.ps.cp_size > 1:
+            if not isinstance(metadata, CPAttentionKernelMetadata):
+                raise TypeError("CP requires CPAttentionKernelMetadata")
+            return self._forward_cp(
+                hidden_states,
+                metadata,
+                q.contiguous(),
+                kv,
+                index_q,
+                indexer_weights,
+                indexer_kv_score,
+            )
+        q = q.clone(memory_format=torch.contiguous_format)
         indexer_topk = None
         if self.compressor is not None:
-            if metadata.compressor_operation is None:
-                raise NotImplementedError(
-                    f"layer {self.layer_idx} compressor requires explicit runtime metadata"
-                )
+            if metadata.compressor_metadata is None:
+                raise RuntimeError("compressor metadata is required")
             assert compressor_kv_score is not None
-            metadata.compressor_operation(
+            compressor_operation(
                 kv_score=compressor_kv_score.detach(),
                 positions=metadata.positions,
                 ape=self.compressor.ape.detach().float().contiguous(),
@@ -682,12 +674,10 @@ class _AttentionState(CompressedSparseAttention):
                 metadata=metadata.compressor_metadata,
             )
         if self.indexer is not None:
-            if metadata.indexer_operation is None:
-                raise NotImplementedError(
-                    f"layer {self.layer_idx} indexer requires explicit runtime metadata"
-                )
+            if metadata.indexer_metadata is None:
+                raise RuntimeError("indexer metadata is required")
             assert indexer_kv_score is not None and indexer_weights is not None
-            metadata.compressor_operation(
+            compressor_operation(
                 kv_score=indexer_kv_score.detach(),
                 positions=metadata.positions,
                 ape=self.indexer.compressor.ape.detach().float().contiguous(),
@@ -697,7 +687,7 @@ class _AttentionState(CompressedSparseAttention):
                 metadata=metadata.indexer_metadata,
             )
             assert index_q is not None
-            index_result = metadata.indexer_operation(
+            index_result = indexer_operation(
                 qr=qr.detach(),
                 index_q=index_q.detach(),
                 index_weights=indexer_weights.detach(),
@@ -718,7 +708,7 @@ class _AttentionState(CompressedSparseAttention):
             raise NotImplementedError("FlashMLA prefill requires kv_workspace")
 
         def visible_attention(q_pre, kv_pre):
-            q_visible = self.adapters.kv_insert(
+            q_visible = insert_qkv(
                 q_pre,
                 kv_pre,
                 insert_cache,
@@ -731,7 +721,7 @@ class _AttentionState(CompressedSparseAttention):
             ).contiguous()
             if metadata.prepare_flash is not None:
                 metadata.prepare_flash()
-            flash_result = self.adapters.flash.sparse(
+            flash_result = sparse_attention(
                 q_visible,
                 metadata.kv_workspace,
                 indices=metadata.indices,
@@ -811,40 +801,6 @@ class _AttentionState(CompressedSparseAttention):
         )
 
 
-class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
-    def __init__(
-        self,
-        config: DeepseekV4Config,
-        *,
-        ps: ParallelState,
-        layer_idx: int,
-        indexer_loss_coeff: float,
-        cache_deployment_weights: bool,
-    ):
-        self._indexer_loss_coeff = indexer_loss_coeff
-        self._cache_deployment_weights = cache_deployment_weights
-        super().__init__(config, layer_idx=layer_idx, ps=ps)
-
-    def _build_attention(
-        self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState
-    ) -> nn.Module:
-        return _AttentionState(
-            config,
-            ps=ps,
-            layer_idx=layer_idx,
-            indexer_loss_coeff=self._indexer_loss_coeff,
-            cache_deployment_weights=self._cache_deployment_weights,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        metadata: AttentionKernelMetadata | dict[int, AttentionKernelMetadata] | None,
-    ) -> torch.Tensor:
-        return self.self_attn(hidden_states, metadata=metadata)
-
-
 class DeepseekV4Layer(LiteDeepseekV4Layer):
     def __init__(
         self,
@@ -868,7 +824,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
     def _build_attention(
         self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState
     ) -> nn.Module:
-        return _VLLMCSAAttention(
+        return _AttentionState(
             config,
             ps=ps,
             layer_idx=layer_idx,
@@ -902,9 +858,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         scale = hc.scale.float().contiguous()
         base = hc.base.float().contiguous()
         broadcast = hidden_states.ndim == 2
-        adapter = MHCTileLangAdapter(
-            MHCKernel.PRE_BROADCAST if broadcast else MHCKernel.PRE
-        )
+        kernel = "pre_broadcast" if broadcast else "pre"
 
         def visible_pre(hidden, fn_, scale_, base_, norm_weight_):
             common = (
@@ -928,8 +882,8 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
                     .sum(dim=1)
                     .contiguous()
                 )
-                return adapter(*common, **kwargs)
-            return (hidden, *adapter(*common, **kwargs))
+                return mhc_kernel(kernel, *common, **kwargs)
+            return (hidden, *mhc_kernel(kernel, *common, **kwargs))
 
         return mhc_pre_broadcast(
             visible_pre,
@@ -951,9 +905,8 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         post_mix: torch.Tensor,
         res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        adapter = MHCTileLangAdapter(MHCKernel.POST)
         return mhc_post(
-            lambda *args: adapter(*args),
+            lambda *args: mhc_kernel("post", *args),
             hidden_states,
             residual,
             post_mix,
@@ -966,7 +919,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         *,
         position_ids: torch.Tensor,
         packed_seq_params: Any,
-        metadata: AttentionKernelMetadata | None = None,
+        metadata: AttentionKernelMetadata | CPAttentionKernelMetadata | None = None,
     ) -> torch.Tensor:
         del position_ids, packed_seq_params
         residual, post_mix, res_mix, hidden_states = self._mhc_pre(
@@ -1059,7 +1012,9 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         input_ids: torch.Tensor | None = None,
         hidden_states: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        attention_metadata: AttentionKernelMetadata | None = None,
+        attention_metadata: dict[
+            int, AttentionKernelMetadata | CPAttentionKernelMetadata
+        ] | None = None,
         labels: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor = 1.0,
@@ -1086,15 +1041,11 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         if self._shared_projection_streams is None:
             self._shared_projection_streams = [torch.cuda.Stream() for _ in range(3)]
         for layer in self.layers.values():
-            layer.self_attn.self_attn._projection_streams = (
-                self._shared_projection_streams
-            )
+            layer.self_attn._projection_streams = self._shared_projection_streams
         for local_idx, layer_idx in enumerate(self.layer_indices):
             layer = self.layers[str(local_idx)]
             layer_attention_metadata = (
-                attention_metadata.get(layer_idx)
-                if isinstance(attention_metadata, dict)
-                else attention_metadata
+                None if attention_metadata is None else attention_metadata[layer_idx]
             )
             hidden_states = layer(
                 hidden_states,
@@ -1111,9 +1062,9 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             }
         if self.norm is None or self.hc_head is None or self.lm_head is None:
             raise RuntimeError("final pipeline stage is missing the output head")
-        head_adapter = MHCTileLangAdapter(MHCKernel.HEAD)
         hidden_states = mhc_head(
-            lambda *args: head_adapter(
+            lambda *args: mhc_kernel(
+                "head",
                 *args, self.config.rms_norm_eps, self.config.hc_eps
             ),
             hidden_states,

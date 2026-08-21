@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
@@ -15,7 +16,6 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights as save_hf_weights,
 )
 from megatron.lite.model.deepseek_v4.lite.protocol import (
-    ImplConfig as LiteImplConfig,
     MODULE_MAP,
     _optimizer_backend_name,
     build_model_config as build_model_config,
@@ -27,25 +27,25 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
     unpack_forward_output as unpack_forward_output,
 )
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
-    DS4SparseIndexerCompressorMetadataAdapter,
-    ds4_vllm_forward_context,
-    initialize_ds4_vllm_batch_invariance,
+    build_prefill_metadata_builders,
 )
-from megatron.lite.model.protocol_utils import (
-    add_loss_context_kwargs,
-    router_replay_roots as router_replay_roots,
-)
+from megatron.lite.model.protocol_utils import add_loss_context_kwargs
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
 
 @dataclass(frozen=True)
-class ImplConfig(LiteImplConfig):
+class ImplConfig:
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
     optimizer: str | None = None
-    mtp_enable: bool = False
+    optimizer_config: OptimizerConfig | None = None
+    hf_path: str = ""
+    recompute: list[str] = field(default_factory=list)
+    deterministic: bool = True
     dsa_indexer_loss_coeff: float = 0.0
     logprob_chunk_size: int = 8192
     cache_deployment_weights: bool | None = None
@@ -94,26 +94,6 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
     if parallel.ep <= 0 or model_cfg.n_routed_experts % parallel.ep:
         raise ValueError(
             f"EP={parallel.ep} must divide {model_cfg.n_routed_experts} routed experts."
-        )
-    if impl_cfg.mtp_enable:
-        raise NotImplementedError("DeepSeek V4 vLLM skeleton does not support MTP yet.")
-    enabled = [
-        name
-        for name, value in (
-            ("offload", impl_cfg.offload),
-            ("use_thd", impl_cfg.use_thd),
-            (
-                "attention_backend_override",
-                impl_cfg.attention_backend_override not in (None, "flash"),
-            ),
-            ("qat", impl_cfg.qat),
-        )
-        if value
-    ]
-    if enabled:
-        raise NotImplementedError(
-            "DeepSeek V4 vLLM skeleton does not install training/runtime features: "
-            + ", ".join(enabled)
         )
     if len(model_cfg.compress_ratios) < model_cfg.num_hidden_layers:
         raise ValueError(
@@ -196,7 +176,7 @@ def _prepare_cp_forward_inputs(
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     _validate_contract(model_cfg, impl_cfg)
-    initialize_ds4_vllm_batch_invariance()
+    init_batch_invariance(force=True)
     from megatron.lite.model.deepseek_v4.vllm.model import (
         DeepseekV4Layer,
         DeepseekV4Model,
@@ -241,19 +221,10 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         if attention_builders is not None:
             return attention_builders
         device = next(model.parameters()).device
-        attention_builders = {
-            layer_idx: DS4SparseIndexerCompressorMetadataAdapter.from_hf(
-                impl_cfg.hf_path,
-                model_cfg,
-                layer_idx=layer_idx,
-                device=device,
-            )
-            for layer_idx in selected_layers
-        }
+        attention_builders = build_prefill_metadata_builders(
+            impl_cfg.hf_path, model_cfg, selected_layers, device
+        )
         return attention_builders
-    from vllm.config import VllmConfig
-
-    vllm_config = VllmConfig()
 
     def forward_step(model: nn.Module, batch) -> dict[str, torch.Tensor]:
         attention_metadata = getattr(batch, "attention_metadata", None)
@@ -295,31 +266,12 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                     ].build_prefill_batch(token_counts)
                     for layer_idx in selected_layers
                 }
-        if parallel_state.cp_size > 1:
-            if cp_packed_seq_params is None:
-                raise RuntimeError("DeepSeek V4 vLLM CP requires packed sequence metadata")
-            local_positions = forward_inputs.get("position_ids")
-            if local_positions is None:
-                raise RuntimeError("DeepSeek V4 vLLM CP requires local position ids")
-            values = (
-                attention_metadata.values()
-                if isinstance(attention_metadata, dict)
-                else (attention_metadata,)
-            )
-            for layer_metadata in values:
-                layer_metadata.cp_packed_seq_params = cp_packed_seq_params
-                layer_metadata.cp_positions = local_positions
-        with ds4_vllm_forward_context(
+        return _forward_step(
+            model,
             batch,
-            parallel_state,
-            vllm_config=vllm_config,
-        ):
-            return _forward_step(
-                model,
-                batch,
-                attention_metadata=attention_metadata,
-                forward_inputs=forward_inputs,
-            )
+            attention_metadata=attention_metadata,
+            forward_inputs=forward_inputs,
+        )
 
     # ``build_training_backend`` replaces this list in-place with Megatron DDP
     # wrappers for dist-opt (Lite follows the same ownership contract).  Keep

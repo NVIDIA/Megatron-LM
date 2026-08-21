@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm import kernels as vllm_ds4
-from megatron.lite.model.deepseek_v4.vllm.kernels import OProjectionAdapter
+from megatron.lite.model.deepseek_v4.vllm.kernels import o_projection_visible
 from megatron.lite.primitive.quantization import deployment_block_fp8
 
 
@@ -25,15 +25,10 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
 
     def post_process(**kwargs):
         calls.append("post")
-        # The real vLLM helper requantizes qweight in place.  qweight is an
-        # inference tensor produced by the deployment packer, so this is legal
-        # only while the adapter's packing phase remains in inference mode.
         kwargs["wq"].copy_(kwargs["wq"])
         return kwargs["wq"], kwargs["ws"].to(torch.int32)
 
     def official(*args, **kwargs):
-        # The visible result must not inherit inference-tensor ownership: the
-        # functional VJP bridge needs to save it during checkpoint recompute.
         assert not torch.is_inference_mode_enabled()
         return torch.ones(2, 128, dtype=torch.bfloat16)
 
@@ -61,13 +56,20 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
             "compute_fp8_einsum_recipe",
         ): lambda: ((1, 128, 128), False),
     }
-    monkeypatch.setattr(vllm_ds4, "_symbol", lambda module, name: entries[(module, name)])
+    monkeypatch.setattr(vllm_ds4, "deepgemm_post_process_fp8_weight_block", post_process)
+    monkeypatch.setattr(vllm_ds4, "per_token_group_quant_fp8", entries[(
+        "vllm.model_executor.layers.quantization.utils.fp8_utils",
+        "per_token_group_quant_fp8",
+    )])
+    monkeypatch.setattr(vllm_ds4, "deep_gemm_fp8_o_proj", official_mock)
+    monkeypatch.setattr(vllm_ds4, "compute_fp8_einsum_recipe", lambda: ((1, 128, 128), False))
+    monkeypatch.setattr(vllm_ds4.envs, "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", False)
     monkeypatch.setattr(
         deployment_block_fp8,
         "_entry",
         lambda module, name: entries[(module, name)],
     )
-    result = OProjectionAdapter()(
+    result = o_projection_visible(
         torch.zeros(2, 2, 128, dtype=torch.bfloat16),
         torch.arange(2, dtype=torch.int64),
         torch.ones(8, 64, dtype=torch.float32),
@@ -163,7 +165,7 @@ def test_official_vllm_o_projection_is_bitwise_through_candidate_callable() -> N
 
     reference = deep_gemm_fp8_o_proj(o, positions, cos, wo_a, wo_b, **kwargs)
 
-    candidate_value = OProjectionAdapter()(
+    candidate_value = o_projection_visible(
         o,
         positions,
         cos,

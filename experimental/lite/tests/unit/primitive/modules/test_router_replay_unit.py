@@ -208,7 +208,7 @@ def test_replay_roots_exclude_mtp_layers():
     "protocol_name",
     ["qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"],
 )
-def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
+def test_supported_moe_protocols_do_not_reexport_shared_replay_roots(protocol_name):
     from pathlib import Path
 
     protocol_path = (
@@ -221,7 +221,7 @@ def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
         / "protocol.py"
     )
     source = protocol_path.read_text()
-    assert "router_replay_roots" in source
+    assert "router_replay_roots" not in source
     if protocol_name in {"deepseek_v4", "glm5"}:
         assert "def pack_r3_replay_mask" in source
 

@@ -6,31 +6,32 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention import (
+import megatron.lite.model.deepseek_v4.vllm.attention as attention_module
+from megatron.lite.model.deepseek_v4.vllm.attention import (
     _rope_and_qnorm,
     attention_core,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.linear import (
+from megatron.lite.model.deepseek_v4.vllm.linear import (
     block_fp8_linear,
     fused_block_fp8_linear,
     gate_linear,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.mhc import (
+from megatron.lite.model.deepseek_v4.vllm.mhc import (
     _pre_graph,
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,
 )
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
-from megatron.lite.model.deepseek_v4.vllm.primitive.norm import (
+from megatron.lite.model.deepseek_v4.vllm.norm import (
     fused_qkv_rms_norm,
     rms_norm,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.o_proj import (
+from megatron.lite.model.deepseek_v4.vllm.o_proj import (
     _inverse_rope,
     o_projection,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.router import fixed_route_vjp
+from megatron.lite.model.deepseek_v4.vllm.router import fixed_route_vjp
 from megatron.lite.primitive.recompute import wrap_checkpoint
 
 
@@ -46,8 +47,13 @@ def _post_graph(x, residual, post, comb):
 def test_visible_linear_value_and_master_vjp(fused: bool) -> None:
     torch.manual_seed(1)
     x = torch.randn(3, 4, requires_grad=True)
-    weights = tuple(torch.randn(rows, 4, requires_grad=True) for rows in ((2, 3) if fused else (5,)))
-    visible = lambda value, *ws: F.linear(value, torch.cat(ws)) + 0.25
+    weights = tuple(
+        torch.randn(rows, 4, requires_grad=True)
+        for rows in ((2, 3) if fused else (5,))
+    )
+
+    def visible(value, *ws):
+        return F.linear(value, torch.cat(ws)) + 0.25
     output = (
         fused_block_fp8_linear(visible, x, *weights)
         if fused
@@ -64,7 +70,8 @@ def test_visible_linear_value_and_master_vjp(fused: bool) -> None:
 def test_forward_only_uses_visible_path_without_autograd_owner() -> None:
     x = torch.randn(3, 4, requires_grad=True)
     weight = torch.randn(5, 4, requires_grad=True)
-    visible = lambda value, master: F.linear(value, master) + 0.25
+    def visible(value, master):
+        return F.linear(value, master) + 0.25
 
     with torch.inference_mode():
         output = block_fp8_linear(visible, x, weight)
@@ -136,14 +143,17 @@ def test_rms_norm_vjp_matches_pytorch(fused: bool) -> None:
     eps = 1e-6
     x = torch.randn(3, 8, requires_grad=True)
     weight = torch.randn(8, requires_grad=True)
-    visible = lambda value, w, epsilon: F.rms_norm(value, (8,), w, epsilon)
+    def visible(value, w, epsilon):
+        return F.rms_norm(value, (8,), w, epsilon)
+
     if fused:
         y = torch.randn(3, 6, requires_grad=True)
         wy = torch.randn(6, requires_grad=True)
-        pair = lambda a, b, wa, wb, epsilon: (
-            F.rms_norm(a, (8,), wa, epsilon),
-            F.rms_norm(b, (6,), wb, epsilon),
-        )
+        def pair(a, b, wa, wb, epsilon):
+            return (
+                F.rms_norm(a, (8,), wa, epsilon),
+                F.rms_norm(b, (6,), wb, epsilon),
+            )
         outputs = fused_qkv_rms_norm(pair, x, y, weight, wy, eps)
         grads = tuple(_grad_like(value) for value in outputs)
         torch.autograd.backward(outputs, grads)
@@ -266,7 +276,7 @@ def test_router_backward_keeps_ids_snapshot_when_consumer_mutates_output() -> No
     torch.testing.assert_close(logits.grad, reference.grad)
 
 
-def test_attention_core_replays_visible_rope_and_workspace_vjp() -> None:
+def test_attention_core_replays_visible_rope_and_workspace_vjp(monkeypatch) -> None:
     torch.manual_seed(5)
     tokens, heads, dim, rope_dim = 3, 2, 6, 4
     q = torch.randn(tokens, heads, dim, requires_grad=True)
@@ -282,6 +292,7 @@ def test_attention_core_replays_visible_rope_and_workspace_vjp() -> None:
     visible_output = q_visible + 0.25
     dq = torch.randn_like(q_visible)
     dworkspace = torch.randn_like(workspace)
+    monkeypatch.setattr(attention_module, "_default_sparse_backward", lambda *_: (dq, dworkspace))
     output = attention_core(
         lambda *_args: (
             visible_output,
@@ -293,7 +304,6 @@ def test_attention_core_replays_visible_rope_and_workspace_vjp() -> None:
         ),
         q, kv, workspace, indices, lengths, sink, slots, positions, cache,
         softmax_scale=0.5, eps=1e-6, rope_dim=rope_dim,
-        backward_op=lambda *_args: (dq, dworkspace),
     )
     output.backward(torch.ones_like(output))
     assert q.grad is not None and kv.grad is not None

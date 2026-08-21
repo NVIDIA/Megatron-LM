@@ -178,7 +178,6 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             expected_route_count=expected_route_count,
         )
         self._metadata_route_rows = _validate_and_order_route_preserving_outputs(
-            expert_hidden,
             received_hidden,
             sanitized_indices,
             received_weights,
@@ -186,9 +185,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             received_fingerprints,
             received_route_indices.reshape(-1),
             received_route_weights.reshape(-1),
-            order_outputs=False,
             route_positions=positions,
-            return_route_rows=True,
         )
         self._route_handle = route_handle
         self._source_indices = topk_indices

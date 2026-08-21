@@ -85,13 +85,22 @@ class DeepseekV4MoE(nn.Module):
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return (weights * self.route_scale).to(dtype=x.dtype), indices
 
+    def _route(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.is_hash_layer and input_ids is not None:
+            return self._hash_route(x, input_ids)
+        return self.gate(x)
+
+    def _shared_expert_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.shared_experts(x)
+
     def forward(self, x: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.shape
         x_flat = x.reshape(-1, self.hidden_size)
-        if self.is_hash_layer and input_ids is not None:
-            weights, indices = self._hash_route(x_flat, input_ids)
-        else:
-            weights, indices = self.gate(x_flat)
+        weights, indices = self._route(x_flat, input_ids)
         dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_flat, weights, indices)
         del weights, indices
         self.dispatcher.wait_dispatch_event()
@@ -103,5 +112,5 @@ class DeepseekV4MoE(nn.Module):
         )
         out = self.dispatcher.combine(out)
         if self.shared_experts is not None:
-            out = out + self.shared_experts(x_flat)
+            out = out + self._shared_expert_forward(x_flat)
         return out.view(shape)

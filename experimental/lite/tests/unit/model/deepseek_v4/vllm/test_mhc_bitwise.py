@@ -10,7 +10,7 @@ from torch import nn
 from megatron.lite.model.deepseek_v4.vllm import model as model_module
 from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Layer
 from megatron.lite.model.deepseek_v4.vllm import kernels as vllm_ds4
-from megatron.lite.model.deepseek_v4.vllm.kernels import MHCKernel, MHCTileLangAdapter
+from megatron.lite.model.deepseek_v4.vllm.kernels import mhc_kernel
 
 
 def _post_inputs(device: str = "cpu") -> tuple[torch.Tensor, ...]:
@@ -22,22 +22,16 @@ def _post_inputs(device: str = "cpu") -> tuple[torch.Tensor, ...]:
     )
 
 
-@pytest.mark.parametrize("kernel,entry", list(vllm_ds4._MHC_ENTRIES.items()))
-def test_each_mhc_adapter_calls_the_official_entry(
-    monkeypatch: pytest.MonkeyPatch, kernel: MHCKernel, entry: str
+@pytest.mark.parametrize("kernel", list(vllm_ds4._MHC_ENTRIES))
+def test_each_mhc_call_uses_the_official_entry(
+    monkeypatch: pytest.MonkeyPatch, kernel: str
 ) -> None:
     result = torch.tensor([7])
     official = Mock(return_value=result)
-    monkeypatch.setattr(
-        vllm_ds4,
-        "_symbol",
-        lambda module, name: official
-        if (module, name) == ("vllm.model_executor.kernels.mhc.tilelang", entry)
-        else pytest.fail((module, name)),
-    )
-    if kernel is MHCKernel.POST:
+    monkeypatch.setitem(vllm_ds4._MHC_ENTRIES, kernel, official)
+    if kernel == "post":
         args = _post_inputs()
-    elif kernel is MHCKernel.HEAD:
+    elif kernel == "head":
         args = (
             torch.zeros(2, 4, 128, dtype=torch.bfloat16),
             torch.zeros(4, 512),
@@ -48,7 +42,7 @@ def test_each_mhc_adapter_calls_the_official_entry(
         )
     else:
         residual = torch.zeros(2, 128, dtype=torch.bfloat16)
-        if kernel is not MHCKernel.PRE_BROADCAST:
+        if kernel != "pre_broadcast":
             residual = torch.zeros(2, 4, 128, dtype=torch.bfloat16)
         pre = (
             residual,
@@ -61,8 +55,8 @@ def test_each_mhc_adapter_calls_the_official_entry(
             2.0,
             2,
         )
-        args = _post_inputs() + pre[1:] if kernel is MHCKernel.POST_PRE else pre
-    assert MHCTileLangAdapter(kernel)(*args) is result
+        args = _post_inputs() + pre[1:] if kernel == "post_pre" else pre
+    assert mhc_kernel(kernel, *args) is result
     official.assert_called_once_with(*args)
 
 
@@ -104,30 +98,26 @@ def test_layer_matches_lite_unfused_pre_block_post_sequence(monkeypatch) -> None
             return value
 
     class MLP(nn.Module):
-        def forward(self, value, *, input_ids, metadata):
+        def forward(self, value, *, input_ids):
             return value
 
     layer.self_attn = Attention()
     layer.mlp = MLP()
     calls = []
 
-    class FakeAdapter:
-        def __init__(self, kernel):
-            calls.append(kernel)
+    def fake_kernel(kernel, *args, **kwargs):
+        del kwargs
+        calls.append(kernel)
+        if kernel == "pre":
+            streams = args[0]
+            post = torch.zeros(tokens, hc_mult, 1)
+            comb = torch.zeros(tokens, hc_mult, hc_mult)
+            return post, comb, streams[:, 0] + 1
+        if kernel == "post":
+            return args[1]
+        raise AssertionError(kernel)
 
-        def __call__(self, *args, **kwargs):
-            del kwargs
-            kernel = calls[-1]
-            if kernel is MHCKernel.PRE:
-                streams = args[0]
-                post = torch.zeros(tokens, hc_mult, 1)
-                comb = torch.zeros(tokens, hc_mult, hc_mult)
-                return post, comb, streams[:, 0] + 1
-            if kernel is MHCKernel.POST:
-                return args[1]
-            raise AssertionError(kernel)
-
-    monkeypatch.setattr(model_module, "MHCTileLangAdapter", FakeAdapter)
+    monkeypatch.setattr(model_module, "mhc_kernel", fake_kernel)
     streams = torch.zeros(tokens, hc_mult, hidden_size, dtype=torch.bfloat16)
 
     layer(
@@ -137,10 +127,10 @@ def test_layer_matches_lite_unfused_pre_block_post_sequence(monkeypatch) -> None
     )
 
     assert calls == [
-        MHCKernel.PRE,
-        MHCKernel.POST,
-        MHCKernel.PRE,
-        MHCKernel.POST,
+        "pre",
+        "post",
+        "pre",
+        "post",
     ]
     torch.testing.assert_close(attention_inputs[0], streams[:, 0] + 1)
 
@@ -151,12 +141,12 @@ def test_layer_matches_lite_unfused_pre_block_post_sequence(monkeypatch) -> None
     importlib.util.find_spec("vllm") is None,
     reason="requires the official vLLM package and compiled TileLang kernels",
 )
-def test_mhc_post_official_kernel_is_bitwise_through_adapter() -> None:
+def test_mhc_post_official_kernel_is_bitwise() -> None:
     from vllm.model_executor.kernels.mhc.tilelang import mhc_post_tilelang
 
     args = _post_inputs("cuda")
     reference = mhc_post_tilelang(*(value.clone() for value in args))
-    candidate = MHCTileLangAdapter("post")(*(value.clone() for value in args))
+    candidate = mhc_kernel("post", *(value.clone() for value in args))
     torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
 
 
@@ -166,19 +156,19 @@ def test_mhc_post_official_kernel_is_bitwise_through_adapter() -> None:
     importlib.util.find_spec("vllm") is None,
     reason="requires the official vLLM package and compiled TileLang kernels",
 )
-@pytest.mark.parametrize("kernel", [MHCKernel.PRE_BROADCAST, MHCKernel.PRE])
-def test_mhc_pre_is_bitwise_invariant_to_batch_composition(kernel: MHCKernel) -> None:
+@pytest.mark.parametrize("kernel", ["pre_broadcast", "pre"])
+def test_mhc_pre_is_bitwise_invariant_to_batch_composition(kernel: str) -> None:
     torch.manual_seed(42)
     mult, hidden, mixed_tokens, target_index = 4, 128, 17, 7
     width = mult * hidden
     mixes = (2 + mult) * mult
     target = torch.randn(
         1,
-        hidden if kernel is MHCKernel.PRE_BROADCAST else mult,
+        hidden if kernel == "pre_broadcast" else mult,
         dtype=torch.bfloat16,
         device="cuda",
     )
-    if kernel is MHCKernel.PRE:
+    if kernel == "pre":
         target = torch.randn(1, mult, hidden, dtype=torch.bfloat16, device="cuda")
         mixed = torch.randn(
             mixed_tokens, mult, hidden, dtype=torch.bfloat16, device="cuda"
@@ -194,14 +184,14 @@ def test_mhc_pre_is_bitwise_invariant_to_batch_composition(kernel: MHCKernel) ->
     norm_weight = torch.randn(hidden, dtype=torch.bfloat16, device="cuda")
     common = (fn, scale, base, 1e-6, 1e-6, 1e-6, 2.0, 2)
     kwargs = {"norm_weight": norm_weight, "norm_eps": 1e-6}
-    if kernel is MHCKernel.PRE_BROADCAST:
+    if kernel == "pre_broadcast":
         kwargs["fn_broadcast"] = (
             fn.view(-1, mult, hidden).sum(dim=1).contiguous()
         )
 
-    target_outputs = MHCTileLangAdapter(kernel)(target, *common, **kwargs)
-    mixed_outputs = MHCTileLangAdapter(kernel)(mixed, *common, **kwargs)
-    if kernel is MHCKernel.PRE_BROADCAST:
+    target_outputs = mhc_kernel(kernel, target, *common, **kwargs)
+    mixed_outputs = mhc_kernel(kernel, mixed, *common, **kwargs)
+    if kernel == "pre_broadcast":
         # PRE_BROADCAST additionally materializes the residual streams.
         target_outputs = target_outputs[1:]
         mixed_outputs = mixed_outputs[1:]
@@ -231,6 +221,6 @@ def test_mhc_post_is_bitwise_invariant_to_batch_composition() -> None:
     mixed = values(mixed_tokens)
     for target_value, mixed_value in zip(target, mixed):
         mixed_value[target_index].copy_(target_value[0])
-    target_output = MHCTileLangAdapter(MHCKernel.POST)(*target)
-    mixed_output = MHCTileLangAdapter(MHCKernel.POST)(*mixed)
+    target_output = mhc_kernel("post", *target)
+    mixed_output = mhc_kernel("post", *mixed)
     assert torch.equal(target_output[0], mixed_output[target_index])

@@ -20,7 +20,6 @@ from megatron.lite.model.protocol_utils import (
     nested_from_packed,
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
-    router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel

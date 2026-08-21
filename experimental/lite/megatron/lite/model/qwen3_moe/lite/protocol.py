@@ -33,7 +33,6 @@ from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     pack_magi_forward_kwargs,
     pack_thd_forward_kwargs,
-    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_magi_forward_output,
     unpack_thd_forward_output,

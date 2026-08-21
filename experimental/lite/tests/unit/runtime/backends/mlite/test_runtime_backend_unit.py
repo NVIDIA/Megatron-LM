@@ -132,14 +132,13 @@ def test_mlite_config_impl_cfg_optimizer_and_load_gate():
     hook = lambda cfg: cfg  # noqa: E731
     cfg = MegatronLiteConfig(
         model_name="qwen3_moe",
-        impl_cfg={"recompute": "full", "use_deepep": True},
+        impl_cfg={"recompute": "full"},
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.1, adam_beta1=0.9),
         load_hf_weights=False,
         model_config_hook=hook,
     )
 
     assert cfg.impl_cfg["recompute"] == "full"
-    assert cfg.impl_cfg["use_deepep"] is True
     assert cfg.optimizer.lr == 1e-4
     assert cfg.optimizer.adam_beta1 == 0.9
     assert cfg.load_hf_weights is False

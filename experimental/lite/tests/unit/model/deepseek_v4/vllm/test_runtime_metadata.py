@@ -24,68 +24,6 @@ def _config(**overrides) -> DeepseekV4Config:
     return DeepseekV4Config(**values)
 
 
-def test_batch_invariance_initialization_is_mandatory(monkeypatch) -> None:
-    init = Mock()
-
-    monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: init)
-    runtime.initialize_ds4_vllm_batch_invariance()
-
-    init.assert_called_once_with(force=True)
-
-
-def test_vllm_forward_context_gathers_tokens_on_ep_group(monkeypatch) -> None:
-    captured = {}
-    ep_group = object()
-
-    def all_gather(outputs, local, *, group):
-        assert group is ep_group
-        assert local.tolist() == [5]
-        outputs[0].copy_(local)
-        outputs[1].fill_(7)
-
-    class Override:
-        def __init__(self, context):
-            self.context = context
-
-        def __enter__(self):
-            captured["active"] = self.context
-
-        def __exit__(self, *_args):
-            captured["active"] = None
-
-    def symbol(_module, name):
-        if name == "DPMetadata":
-            return lambda counts: SimpleNamespace(
-                num_tokens_across_dp_cpu=counts
-            )
-        if name == "create_forward_context":
-            return lambda _attn, config, **kwargs: SimpleNamespace(
-                config=config, **kwargs
-            )
-        if name == "override_forward_context":
-            return Override
-        raise AssertionError(name)
-
-    monkeypatch.setattr(runtime.dist, "all_gather", all_gather)
-    monkeypatch.setattr(runtime, "_symbol", symbol)
-    batch = SimpleNamespace(
-        input_ids=torch.arange(3),
-        total_tokens=5,
-    )
-    parallel_state = SimpleNamespace(ep_group=ep_group, ep_size=2)
-    config = object()
-
-    with runtime.ds4_vllm_forward_context(
-        batch,
-        parallel_state,
-        vllm_config=config,
-    ):
-        context = captured["active"]
-        assert context.config is config
-        assert context.dp_metadata.num_tokens_across_dp_cpu.tolist() == [5, 7]
-    assert captured["active"] is None
-
-
 def test_layer0_rope_uses_official_vllm_config_loader(monkeypatch) -> None:
     hf_config = SimpleNamespace()
     cos = torch.arange(32 * 64, dtype=torch.bfloat16).reshape(32, 64)
@@ -93,15 +31,11 @@ def test_layer0_rope_uses_official_vllm_config_loader(monkeypatch) -> None:
     get_config = Mock(return_value=hf_config)
     build = Mock(return_value=rotary)
 
-    def symbol(module, name):
-        assert (module, name) == ("vllm.transformers_utils.config", "get_config")
-        return get_config
-
-    monkeypatch.setattr(runtime, "_symbol", symbol)
+    monkeypatch.setattr(runtime, "get_config", get_config)
     monkeypatch.setattr(runtime, "_build_rope", build)
-    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter.from_hf(
-        "/model", _config(), device="cpu"
-    )
+    metadata = runtime.build_prefill_metadata_builders(
+        "/model", _config(), (0,), torch.device("cpu")
+    )[0]
 
     get_config.assert_called_once_with("/model", trust_remote_code=True)
     build.assert_called_once()
@@ -120,16 +54,17 @@ def test_rope_custom_op_is_built_in_scoped_vllm_config(monkeypatch) -> None:
         def __exit__(self, *_args):
             events.append("exit")
 
-    def symbol(_module, name):
-        if name == "VllmConfig":
-            return lambda: "config"
-        if name == "set_current_vllm_config":
-            return lambda value: Context() if value == "config" else None
-        if name == "build_deepseek_v4_rope":
-            return lambda *_args, **_kwargs: events.append("build") or rotary
-        raise AssertionError(name)
-
-    monkeypatch.setattr(runtime, "_symbol", symbol)
+    monkeypatch.setattr(runtime, "VllmConfig", lambda: "config")
+    monkeypatch.setattr(
+        runtime,
+        "set_current_vllm_config",
+        lambda value: Context() if value == "config" else None,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "build_deepseek_v4_rope",
+        lambda *_args, **_kwargs: events.append("build") or rotary,
+    )
     actual = runtime._build_rope(
         SimpleNamespace(), _config(), compress_ratio=1, device="cpu"
     )
@@ -151,10 +86,10 @@ def test_native_cp_compressor_reuses_single_request_batch_metadata() -> None:
         packed_seq_params=packed,
     )
 
-    compressor = metadata.cp_compressor_metadata
+    compressor = metadata.compressor_metadata
     assert compressor is not None
-    assert metadata.cp_packed_seq_params is packed
-    assert metadata.cp_positions is positions
+    assert metadata.packed_seq_params is packed
+    assert metadata.positions is positions
     assert compressor.state_block_table.shape[0] == 1
     assert compressor.token_to_req_indices.shape == (64,)
     assert compressor.token_to_req_indices.count_nonzero().item() == 0
@@ -162,9 +97,9 @@ def test_native_cp_compressor_reuses_single_request_batch_metadata() -> None:
 
 def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
     gather = Mock()
-    monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: gather)
+    monkeypatch.setattr(runtime, "dequantize_and_gather_k_cache", gather)
     cos = torch.empty(256, 128, dtype=torch.float32)
-    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+    metadata = runtime.DS4PrefillMetadataBuilder(
         _config(), device="cpu", cos_sin_cache=cos
     ).build_prefill_batch([130])
 
@@ -181,7 +116,7 @@ def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
     assert metadata.indices[129, 0, -1].item() == 129
     assert metadata.kv_workspace.shape == (130, 1, 512)
     assert metadata.output.shape == (130, 64, 512)
-    assert metadata.runtime_layout.block_table.tolist() == [[0]]
+    assert metadata.swa_block_table.tolist() == [[0]]
 
     metadata.prepare_flash()
     gather.assert_called_once()
@@ -196,8 +131,8 @@ def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
 
 def test_layer0_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
     gather = Mock()
-    monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: gather)
-    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+    monkeypatch.setattr(runtime, "dequantize_and_gather_k_cache", gather)
+    metadata = runtime.DS4PrefillMetadataBuilder(
         _config(),
         device="cpu",
         cos_sin_cache=torch.empty(256, 128, dtype=torch.float32),
@@ -205,9 +140,9 @@ def test_layer0_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
 
     assert metadata.positions.tolist() == [0, 1, 2, 0, 1]
     assert metadata.slot_mapping.tolist() == [0, 1, 2, 256, 257]
-    assert metadata.runtime_layout.block_table.tolist() == [[0], [1]]
-    assert metadata.runtime_layout.seq_lens.tolist() == [3, 2]
-    assert metadata.runtime_layout.query_start_loc.tolist() == [0, 3, 5]
+    assert metadata.swa_block_table.tolist() == [[0], [1]]
+    assert metadata.swa_seq_lens.tolist() == [3, 2]
+    assert metadata.query_start_loc.tolist() == [0, 3, 5]
     assert metadata.indices[:3, 0, 0].tolist() == [0, 0, 0]
     assert metadata.indices[3:, 0, 0].tolist() == [3, 3]
     assert metadata.topk_length.tolist() == [1, 2, 3, 1, 2]
@@ -221,7 +156,7 @@ def test_layer0_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
 
 
 def test_unified_builder_uses_selected_layer_ratio() -> None:
-    builder = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+    builder = runtime.DS4PrefillMetadataBuilder(
         _config(num_hidden_layers=2, compress_ratios=[0, 4]),
         layer_idx=1,
         device="cpu",
@@ -230,17 +165,16 @@ def test_unified_builder_uses_selected_layer_ratio() -> None:
     assert builder.compress_ratio == 4
 
 
-def test_layer1_extended_builder_reuses_swa_only_contract(monkeypatch) -> None:
-    monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: Mock())
-    builder = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+def test_layer1_extended_builder_reuses_swa_only_contract() -> None:
+    builder = runtime.DS4PrefillMetadataBuilder(
         _config(),
         layer_idx=1,
         device="cpu",
         cos_sin_cache=torch.empty(256, 128),
     )
     metadata = builder.build_prefill_batch([5])
-    assert metadata.compressor_operation is None
-    assert metadata.indexer_operation is None
+    assert metadata.compressor_metadata is None
+    assert metadata.indexer_metadata is None
     assert metadata.indices.shape == (5, 1, 128)
 
 
@@ -254,7 +188,7 @@ def test_extended_builder_covers_every_full_model_layer() -> None:
     cos_sin_cache = torch.empty(512, 128, dtype=torch.float32)
 
     builders = [
-        runtime.DS4SparseIndexerCompressorMetadataAdapter(
+        runtime.DS4PrefillMetadataBuilder(
             config,
             layer_idx=layer_idx,
             device="cpu",
@@ -273,7 +207,7 @@ def test_extended_builder_covers_every_full_model_layer() -> None:
 def test_unified_builder_rejects_layers_outside_model(layer_idx) -> None:
     ratios = [0, 0] + [4, 128] * 20 + [4, 0]
     with pytest.raises(ValueError, match="outside the model"):
-        runtime.DS4SparseIndexerCompressorMetadataAdapter(
+        runtime.DS4PrefillMetadataBuilder(
             _config(num_hidden_layers=len(ratios), compress_ratios=ratios),
             layer_idx=layer_idx,
             device="cpu",
@@ -282,17 +216,16 @@ def test_unified_builder_rejects_layers_outside_model(layer_idx) -> None:
 
 
 def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
-    def symbol(_module, name):
-        if name == "DeepseekV32IndexerMetadata":
-            return lambda **kwargs: SimpleNamespace(**kwargs)
-        if name == "DeepseekV32IndexerPrefillMetadata":
-            return lambda chunks: SimpleNamespace(chunks=chunks)
-        if name == "build_prefill_chunk_metadata":
-            return lambda *_args: None
-        raise AssertionError(name)
-
-    monkeypatch.setattr(runtime, "_symbol", symbol)
-    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+    monkeypatch.setattr(
+        runtime, "DeepseekV32IndexerMetadata", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(
+        runtime,
+        "DeepseekV32IndexerPrefillMetadata",
+        lambda chunks: SimpleNamespace(chunks=chunks),
+    )
+    monkeypatch.setattr(runtime, "build_prefill_chunk_metadata", lambda *_args: None)
+    metadata = runtime.DS4PrefillMetadataBuilder(
         _config(),
         layer_idx=2,
         device="cpu",
@@ -329,21 +262,18 @@ def test_prepare_flash_rebuilds_derived_layout_for_activation_recompute(
         lengths.fill_(topk.shape[-1])
         return indices, lengths
 
-    def symbol(_module, name):
-        if name == "DeepseekV32IndexerMetadata":
-            return lambda **kwargs: SimpleNamespace(**kwargs)
-        if name == "DeepseekV32IndexerPrefillMetadata":
-            return lambda chunks: SimpleNamespace(chunks=chunks)
-        if name == "build_prefill_chunk_metadata":
-            return lambda *_args: None
-        if name == "dequantize_and_gather_k_cache":
-            return gather
-        if name == "combine_topk_swa_indices":
-            return combine
-        raise AssertionError(name)
-
-    monkeypatch.setattr(runtime, "_symbol", symbol)
-    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+    monkeypatch.setattr(
+        runtime, "DeepseekV32IndexerMetadata", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(
+        runtime,
+        "DeepseekV32IndexerPrefillMetadata",
+        lambda chunks: SimpleNamespace(chunks=chunks),
+    )
+    monkeypatch.setattr(runtime, "build_prefill_chunk_metadata", lambda *_args: None)
+    monkeypatch.setattr(runtime, "dequantize_and_gather_k_cache", gather)
+    monkeypatch.setattr(runtime, "combine_topk_swa_indices", combine)
+    metadata = runtime.DS4PrefillMetadataBuilder(
         _config(),
         layer_idx=2,
         device="cpu",
@@ -368,7 +298,7 @@ def test_prepare_flash_rebuilds_derived_layout_for_activation_recompute(
 
 @pytest.mark.gpus(1)
 def test_layer3_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
-    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+    metadata = runtime.DS4PrefillMetadataBuilder(
         _config(max_position_embeddings=512),
         layer_idx=3,
         device="cuda",
@@ -408,19 +338,17 @@ def _compressor_metadata(device: str = "cpu", tokens: int = 2):
 def test_extended_compressor_cpu_contract_calls_official_operations(
     monkeypatch,
 ) -> None:
+    from vllm.models.deepseek_v4.common.ops import fused_compress_quant_cache
+
     save = Mock()
     compress = Mock()
-
-    def lookup(module, name):
-        return {
-            "save_partial_states": save,
-            "compress_norm_rope_store_triton": compress,
-        }[name]
-
-    monkeypatch.setattr(runtime, "_symbol", lookup)
+    monkeypatch.setattr(runtime, "save_partial_states", save)
+    monkeypatch.setattr(
+        fused_compress_quant_cache, "compress_norm_rope_store_triton", compress
+    )
     metadata = _compressor_metadata()
     kv_score = torch.zeros(2, 512, dtype=torch.float32)
-    runtime.DS4SparseIndexerCompressorMetadataAdapter.compressor_operation(
+    runtime.DS4PrefillMetadataBuilder.compressor_operation(
         kv_score=kv_score,
         positions=torch.tensor([0, 1], dtype=torch.int64),
         ape=torch.zeros(4, 256, dtype=torch.float32),
@@ -448,7 +376,7 @@ def test_extended_indexer_cpu_contract_calls_official_short_metadata_kernel(
         def __getitem__(self, _grid):
             return launch
 
-    monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: Kernel())
+    monkeypatch.setattr(runtime, "_fill_short_context_topk_indices", Kernel())
     compressor = _compressor_metadata()
     topk = torch.full((2, 4), -1, dtype=torch.int32)
     metadata = runtime.DS4IndexerRuntimeMetadata(
@@ -459,7 +387,7 @@ def test_extended_indexer_cpu_contract_calls_official_short_metadata_kernel(
         max_model_len=64,
         max_total_seq_len=2,
     )
-    result = runtime.DS4SparseIndexerCompressorMetadataAdapter.indexer_operation(
+    result = runtime.DS4PrefillMetadataBuilder.indexer_operation(
         qr=torch.zeros(2, 8, dtype=torch.bfloat16),
         index_q=torch.zeros(2, 2, 128, dtype=torch.bfloat16),
         index_weights=torch.zeros(2, 2, dtype=torch.bfloat16),
@@ -494,7 +422,7 @@ def test_prefill_indices_are_bitwise_official_vllm() -> None:
 
     num_tokens = 193
     config = _config(max_position_embeddings=512)
-    builder = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+    builder = runtime.DS4PrefillMetadataBuilder(
         config,
         device="cuda",
         cos_sin_cache=torch.empty(512, 128, dtype=torch.float32, device="cuda"),
@@ -547,7 +475,7 @@ def test_extended_short_indexer_is_bitwise_official_vllm() -> None:
         max_model_len=64,
         max_total_seq_len=2,
     )
-    result = runtime.DS4SparseIndexerCompressorMetadataAdapter.indexer_operation(
+    result = runtime.DS4PrefillMetadataBuilder.indexer_operation(
         qr=torch.zeros(8, 8, dtype=torch.bfloat16, device="cuda"),
         index_q=torch.zeros(8, 2, 128, dtype=torch.bfloat16, device="cuda"),
         index_weights=torch.zeros(8, 2, dtype=torch.bfloat16, device="cuda"),
@@ -622,7 +550,7 @@ def test_extended_compressor_is_bitwise_official_vllm() -> None:
         token_stride=128,
         scale_dim=4,
     )
-    runtime.DS4SparseIndexerCompressorMetadataAdapter.compressor_operation(
+    runtime.DS4PrefillMetadataBuilder.compressor_operation(
         kv_score=kv_score,
         positions=positions,
         ape=ape,

@@ -22,16 +22,6 @@ def _rope_and_qnorm(value, positions, cache, rope_dim, eps, *, normalize):
 def _default_sparse_backward(q, kv, out, grad_out, lse, sink, indices, scale, length):
     from megatron.lite.primitive.kernels import dsa_kernels
 
-    # The pinned DSA SM90 overlay still uses the pre-4.6 type annotation
-    # ``cute.core.ThrMma``.  CUTLASS 4.6 keeps the same class at
-    # ``cute.ThrMma`` but removed only that compatibility re-export.  Restore
-    # the alias locally before the overlay lazily imports its kernel modules;
-    # no runtime object or kernel behavior is changed.
-    import cutlass.cute as cute
-    import cutlass.cute.core as cute_core
-
-    if not hasattr(cute_core, "ThrMma"):
-        cute_core.ThrMma = cute.ThrMma
     dsa_kernels._ensure_dsa_namespace()
     # vLLM keeps the prefill workspace request-major even for batch=1
     # ([S_kv, 1, D]), while the cuDNN DSA backward API consumes the flattened
@@ -299,7 +289,6 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
     def forward(
         ctx: Any,
         visible_op,
-        backward_op,
         scale,
         eps,
         rope_dim,
@@ -346,7 +335,6 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
             compressor_workspace_slots,
             query_start_loc,
         )
-        ctx.backward_op = backward_op or _default_sparse_backward
         ctx.scale, ctx.eps, ctx.rope_dim = scale, eps, rope_dim
         ctx.compressor_ratio = compressor_ratio
         return out
@@ -372,7 +360,7 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
             compressor_workspace_slots,
             query_start_loc,
         ) = ctx.saved_tensors
-        dq_visible, dworkspace = ctx.backward_op(
+        dq_visible, dworkspace = _default_sparse_backward(
             q_visible,
             workspace,
             out,
@@ -450,7 +438,7 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
                     ),
                 )
         return (
-            (None,) * 5
+            (None,) * 4
             + (dq, dkv)
             + (None,) * 7
             + (dcompressor, dape, dcompressor_norm, None, None, None)
@@ -472,7 +460,6 @@ def attention_core(
     softmax_scale: float,
     eps: float,
     rope_dim: int,
-    backward_op=None,
     compressor_kv_score=None,
     compressor_ape=None,
     compressor_norm=None,
@@ -509,7 +496,6 @@ def attention_core(
         )
     return _VLLMAttentionCoreFunction.apply(
         visible_op,
-        backward_op,
         softmax_scale,
         eps,
         rope_dim,

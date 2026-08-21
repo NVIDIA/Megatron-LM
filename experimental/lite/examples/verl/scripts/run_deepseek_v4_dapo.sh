@@ -95,8 +95,6 @@ add_pythonpath "${VERL_ROOT:-}"
 add_pythonpath "${MEGATRON_ROOT:-}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export VLLM_USE_V1=1
-export VERL_VLLM_FP8_QUANT_ENABLED=1
 
 case "${ROLLOUT_WEIGHT_BITS}" in
   4)

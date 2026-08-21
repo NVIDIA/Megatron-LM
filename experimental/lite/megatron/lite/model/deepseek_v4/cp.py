@@ -1,4 +1,4 @@
-"""Shared DS4 context-parallel compression geometry.
+"""Shared DeepSeek-V4 context-parallel compression geometry.
 
 The Lite and vLLM implementations intentionally differ at their numerical
 kernel boundaries, but must not independently implement token ownership,

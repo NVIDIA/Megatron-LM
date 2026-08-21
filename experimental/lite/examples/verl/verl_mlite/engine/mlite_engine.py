@@ -8,7 +8,6 @@ import os
 import weakref
 from contextlib import nullcontext
 from enum import Enum
-from types import SimpleNamespace
 from typing import Any
 
 import torch

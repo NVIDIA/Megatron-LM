@@ -1,27 +1,39 @@
 from __future__ import annotations
 
-import importlib
 import math
-from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 import torch
-import torch.distributed as dist
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.forward_context import (
+    ForwardContext,
+    override_forward_context,
+)
+from vllm.model_executor.layers.sparse_attn_indexer import sparse_attn_indexer
+from vllm.models.deepseek_v4.attention import _fill_short_context_topk_indices
+from vllm.models.deepseek_v4.common.ops import (
+    combine_topk_swa_indices,
+    dequantize_and_gather_k_cache,
+    fused_indexer_q_rope_quant,
+    save_partial_states,
+)
+from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
+from vllm.models.deepseek_v4.sparse_mla import build_c128a_topk_metadata
+from vllm.transformers_utils.config import get_config
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerPrefillMetadata,
+    build_prefill_chunk_metadata,
+)
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.primitive.parallel import ParallelState
 
 
 DS4_SWA_BLOCK_SIZE = 256
 DS4_FP8_MLA_TOKEN_BYTES = 584
 DS4_FLASHMLA_INDEX_ALIGNMENT = 128
-
-
-def _symbol(module: str, name: str) -> Any:
-    return getattr(importlib.import_module(module), name)
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -77,75 +89,6 @@ def _packed_blocks(
     return _PackedBlocks(table, torch.cat(slots).contiguous(), offsets[-1])
 
 
-def _local_num_tokens(batch: Any) -> int:
-    total_tokens = getattr(batch, "total_tokens", None)
-    if total_tokens is not None:
-        value = int(total_tokens)
-    else:
-        input_ids = getattr(batch, "input_ids", None)
-        if not isinstance(input_ids, torch.Tensor):
-            raise TypeError("DeepSeek V4 vLLM batches require tensor input_ids")
-        value = int(input_ids.numel())
-    if value <= 0:
-        raise ValueError("DeepSeek V4 vLLM batches must contain at least one token")
-    return value
-
-
-def initialize_ds4_vllm_batch_invariance() -> None:
-    _symbol(
-        "vllm.model_executor.layers.batch_invariant",
-        "init_batch_invariance",
-    )(force=True)
-
-
-@contextmanager
-def ds4_vllm_forward_context(
-    batch: Any,
-    parallel_state: ParallelState,
-    *,
-    vllm_config: Any,
-) -> Iterator[None]:
-
-    input_ids = getattr(batch, "input_ids", None)
-    if not isinstance(input_ids, torch.Tensor):
-        raise TypeError("DeepSeek V4 vLLM batches require tensor input_ids")
-    if parallel_state.ep_group is None:
-        raise RuntimeError("DeepSeek V4 vLLM requires an initialized EP group")
-
-    local_tokens = torch.tensor(
-        [_local_num_tokens(batch)],
-        dtype=torch.int32,
-        device=input_ids.device,
-    )
-    gathered_tokens = [
-        torch.empty_like(local_tokens) for _ in range(parallel_state.ep_size)
-    ]
-    dist.all_gather(
-        gathered_tokens,
-        local_tokens,
-        group=parallel_state.ep_group,
-    )
-
-    dp_metadata = _symbol("vllm.forward_context", "DPMetadata")(
-        torch.cat(gathered_tokens).cpu()
-    )
-    if not torch.equal(
-        dp_metadata.num_tokens_across_dp_cpu,
-        torch.cat(gathered_tokens).cpu(),
-    ):
-        raise RuntimeError("DPMetadata token counts do not match the runtime batch")
-    forward_context = _symbol("vllm.forward_context", "create_forward_context")(
-        None,
-        vllm_config,
-        dp_metadata=dp_metadata,
-    )
-    override_forward_context = _symbol(
-        "vllm.forward_context", "override_forward_context"
-    )
-    with override_forward_context(forward_context):
-        yield
-
-
 def _build_rope(
     hf_config: Any,
     config: DeepseekV4Config,
@@ -153,14 +96,9 @@ def _build_rope(
     compress_ratio: int,
     device: torch.device | str,
 ) -> Any:
-    build_rope = _symbol(
-        "vllm.models.deepseek_v4.common.rope", "build_deepseek_v4_rope"
-    )
-    vllm_config_type = _symbol("vllm.config", "VllmConfig")
-    set_current_vllm_config = _symbol("vllm.config", "set_current_vllm_config")
     target_device = torch.device(device)
-    with set_current_vllm_config(vllm_config_type()), torch.device(target_device):
-        rotary = build_rope(
+    with set_current_vllm_config(VllmConfig()), torch.device(target_device):
+        rotary = build_deepseek_v4_rope(
             hf_config,
             head_dim=config.head_dim,
             rope_head_dim=config.qk_rope_head_dim,
@@ -168,28 +106,6 @@ def _build_rope(
             compress_ratio=compress_ratio,
         )
     return rotary.to(device=target_device)
-
-
-def _cos_sin_from_hf(
-    model_path: str | Path,
-    config: DeepseekV4Config,
-    *,
-    compress_ratio: int,
-    device: torch.device | str,
-) -> torch.Tensor:
-    hf_config = _symbol("vllm.transformers_utils.config", "get_config")(
-        str(model_path), trust_remote_code=True
-    )
-    return _build_rope(
-        hf_config, config, compress_ratio=compress_ratio, device=device
-    ).cos_sin_cache.to(device=device, dtype=torch.float32)
-
-
-@dataclass(frozen=True)
-class DS4RuntimeLayout:
-    block_table: torch.Tensor
-    seq_lens: torch.Tensor
-    query_start_loc: torch.Tensor
 
 
 @dataclass
@@ -230,16 +146,19 @@ class AttentionKernelMetadata:
     kv_workspace_slot_mapping: torch.Tensor | None = None
     compressor_workspace_slot_mapping: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
+    swa_block_table: torch.Tensor | None = None
+    swa_seq_lens: torch.Tensor | None = None
     prepare_flash: Any | None = None
-    runtime_layout: Any | None = None
-    compressor_operation: Any | None = None
     compressor_metadata: Any | None = None
-    indexer_operation: Any | None = None
     indexer_metadata: Any | None = None
-    cp_packed_seq_params: Any | None = None
-    cp_positions: torch.Tensor | None = None
-    cp_compressor_operation: Any | None = None
-    cp_compressor_metadata: Any | None = None
+
+
+@dataclass
+class CPAttentionKernelMetadata:
+    positions: torch.Tensor
+    cos_sin_cache: torch.Tensor
+    packed_seq_params: Any
+    compressor_metadata: DS4CompressorRuntimeMetadata | None
 
 
 def build_native_cp_attention_metadata(
@@ -251,12 +170,7 @@ def build_native_cp_attention_metadata(
     packed_seq_params: Any,
 ):
     device = local_positions.device
-    empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-    empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
-    empty_u8 = torch.empty(0, dtype=torch.uint8, device=device)
-    empty_bf16 = torch.empty(0, dtype=torch.bfloat16, device=device)
     ratio = max(1, config.compress_ratios[layer_idx])
-    cp_compressor_operation = None
     cp_compressor_metadata = None
     if ratio in (4, 128):
         local_rows = local_positions.numel()
@@ -272,35 +186,26 @@ def build_native_cp_attention_metadata(
             dtype=cos_sin_cache.dtype,
             device=device,
         )
-        adapter = DS4SparseIndexerCompressorMetadataAdapter(
+        builder = DS4PrefillMetadataBuilder(
             config,
             layer_idx=layer_idx,
             device=device,
             cos_sin_cache=synthetic_cos,
         )
-        cp_compressor_operation = adapter.compressor_operation
-        cp_compressor_metadata, _ = adapter._compressor_metadata_batch(
+        cp_compressor_metadata, _ = builder._compressor_metadata_batch(
             [synthetic_tokens],
             head_dim=config.head_dim,
-            token_bytes=adapter._MAIN_TOKEN_BYTES,
+            token_bytes=builder._MAIN_TOKEN_BYTES,
         )
-    return AttentionKernelMetadata(
+    return CPAttentionKernelMetadata(
         positions=local_positions,
-        slot_mapping=empty_i64,
         cos_sin_cache=cos_sin_cache,
-        swa_cache=empty_u8,
-        block_size=DS4_SWA_BLOCK_SIZE,
-        indices=empty_i32,
-        topk_length=empty_i32,
-        output=empty_bf16,
-        cp_packed_seq_params=packed_seq_params,
-        cp_positions=local_positions,
-        cp_compressor_operation=cp_compressor_operation,
-        cp_compressor_metadata=cp_compressor_metadata,
+        packed_seq_params=packed_seq_params,
+        compressor_metadata=cp_compressor_metadata,
     )
 
 
-class DS4PrefillMetadataBuilder:
+class _SWAOnlyMetadataBuilder:
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -338,28 +243,6 @@ class DS4PrefillMetadataBuilder:
             raise ValueError(
                 "cos_sin_cache must be a 2D float32 tensor on the runtime device"
             )
-
-    @classmethod
-    def from_hf(
-        cls,
-        model_path: str | Path,
-        config: DeepseekV4Config,
-        *,
-        layer_idx: int = 0,
-        device: torch.device | str,
-    ) -> "DS4PrefillMetadataBuilder":
-
-        return cls(
-            config,
-            layer_idx=layer_idx,
-            device=device,
-            cos_sin_cache=_cos_sin_from_hf(
-                model_path,
-                config,
-                compress_ratio=max(1, config.compress_ratios[layer_idx]),
-                device=device,
-            ),
-        )
 
     def _prefill_indices(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
         width = _round_up(self.config.sliding_window, DS4_FLASHMLA_INDEX_ALIGNMENT)
@@ -410,14 +293,9 @@ class DS4PrefillMetadataBuilder:
             topk_lengths.append(sequence_lengths)
             query_start.append(query_start[-1] + count)
 
-        layout = DS4RuntimeLayout(
-            block_table=blocks.block_table,
-            seq_lens=torch.tensor(
-                token_counts, dtype=torch.int32, device=self.device
-            ),
-            query_start_loc=torch.tensor(
-                query_start, dtype=torch.int32, device=self.device
-            ),
+        seq_lens = torch.tensor(token_counts, dtype=torch.int32, device=self.device)
+        query_start_loc = torch.tensor(
+            query_start, dtype=torch.int32, device=self.device
         )
         workspace_3d = torch.empty(
             (len(token_counts), max_tokens, self.config.head_dim),
@@ -435,16 +313,12 @@ class DS4PrefillMetadataBuilder:
         )
 
         def prepare_flash() -> None:
-            gather = _symbol(
-                "vllm.models.deepseek_v4.common.ops",
-                "dequantize_and_gather_k_cache",
-            )
-            gather(
+            dequantize_and_gather_k_cache(
                 workspace_3d,
                 cache,
-                seq_lens=layout.seq_lens,
-                gather_lens=layout.seq_lens,
-                block_table=layout.block_table,
+                seq_lens=seq_lens,
+                gather_lens=seq_lens,
+                block_table=blocks.block_table,
                 block_size=DS4_SWA_BLOCK_SIZE,
                 offset=0,
             )
@@ -466,19 +340,14 @@ class DS4PrefillMetadataBuilder:
                     for batch_index, count in enumerate(token_counts)
                 ]
             ).contiguous(),
-            query_start_loc=layout.query_start_loc,
+            query_start_loc=query_start_loc,
+            swa_block_table=blocks.block_table,
+            swa_seq_lens=seq_lens,
             prepare_flash=prepare_flash,
         )
-        metadata.runtime_layout = layout
         return metadata
 
-class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
-    """Runtime metadata for any non-zero DS4 decoder layer.
-
-    Parameters remain owned by the mLite model.  This adapter owns only
-    ephemeral cache/state tensors and calls vLLM's operation-level compressor,
-    indexer, gather, and metadata helpers.
-    """
+class DS4PrefillMetadataBuilder(_SWAOnlyMetadataBuilder):
 
     _MAIN_TOKEN_BYTES = 584
     _INDEXER_TOKEN_BYTES = 132
@@ -561,11 +430,7 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         coff = 2 if compress_ratio == 4 else 1
         width = coff * head_dim
         kv, score = kv_score.split([width, width], dim=-1)
-        save = _symbol(
-            "vllm.models.deepseek_v4.common.ops.save_partial_states",
-            "save_partial_states",
-        )
-        save(
+        save_partial_states(
             kv=kv,
             score=score,
             ape=ape,
@@ -578,19 +443,14 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             pdl_kwargs={"launch_pdl": False},
         )
         use_cutedsl = head_dim == 512 and kv_score.device.type == "cuda"
-        compress = _symbol(
-            (
-                "vllm.models.deepseek_v4.nvidia.ops."
-                "sparse_attn_compress_cutedsl"
-                if use_cutedsl
-                else "vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache"
-            ),
-            (
-                "compress_norm_rope_store_cutedsl"
-                if use_cutedsl
-                else "compress_norm_rope_store_triton"
-            ),
-        )
+        if use_cutedsl:
+            from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
+                compress_norm_rope_store_cutedsl as compress,
+            )
+        else:
+            from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
+                compress_norm_rope_store_triton as compress,
+            )
         quant_block = 64 if head_dim == 512 else 128
         token_stride = (
             head_dim - metadata.rope_head_dim + 2 * metadata.rope_head_dim
@@ -637,10 +497,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> Any:
-        module = "vllm.v1.attention.backends.mla.indexer"
-        metadata_cls = _symbol(module, "DeepseekV32IndexerMetadata")
-        prefill_cls = _symbol(module, "DeepseekV32IndexerPrefillMetadata")
-        build_chunk = _symbol(module, "build_prefill_chunk_metadata")
         query_start = torch.tensor(
             [0, *torch.tensor(token_counts).cumsum(0).tolist()],
             dtype=torch.int32,
@@ -648,7 +504,7 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         )
         seq_lens = torch.tensor(token_counts, dtype=torch.int32, device=self.device)
         compressed = seq_lens // self.compress_ratio
-        chunk = build_chunk(
+        chunk = build_prefill_chunk_metadata(
             0,
             len(token_counts),
             query_start,
@@ -659,7 +515,7 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             block_table,
             self.compress_ratio,
         )
-        return metadata_cls(
+        return DeepseekV32IndexerMetadata(
             seq_lens=seq_lens,
             max_seq_len=max(token_counts),
             slot_mapping=slot_mapping,
@@ -667,7 +523,7 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             num_decode_tokens=0,
             num_prefills=len(token_counts),
             num_prefill_tokens=sum(token_counts),
-            prefill=prefill_cls([] if chunk is None else [chunk]),
+            prefill=DeepseekV32IndexerPrefillMetadata([] if chunk is None else [chunk]),
             decode=None,
         )
 
@@ -684,12 +540,8 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
     ) -> torch.Tensor:
 
         if metadata.attention_metadata.max_seq_len // compress_ratio <= topk:
-            fill = _symbol(
-                "vllm.models.deepseek_v4.attention",
-                "_fill_short_context_topk_indices",
-            )
             padded_topk = 1 << (topk - 1).bit_length()
-            fill[(positions.numel(),)](
+            _fill_short_context_topk_indices[(positions.numel(),)](
                 metadata.topk_indices,
                 positions,
                 TOP_K=topk,
@@ -699,11 +551,7 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             )
             return metadata.topk_indices
 
-        quantize = _symbol(
-            "vllm.models.deepseek_v4.common.ops.fused_indexer_q",
-            "fused_indexer_q_rope_quant",
-        )
-        q_quant, weights = quantize(
+        q_quant, weights = fused_indexer_q_rope_quant(
             positions,
             index_q,
             metadata.compressor.cos_sin_cache,
@@ -712,18 +560,13 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             index_q.shape[1] ** -0.5,
             use_fp4=False,
         )
-        sparse = _symbol(
-            "vllm.model_executor.layers.sparse_attn_indexer",
-            "sparse_attn_indexer",
-        )
-        forward_module = importlib.import_module("vllm.forward_context")
-        context = forward_module.ForwardContext(
+        context = ForwardContext(
             no_compile_layers={},
             attn_metadata={metadata.k_cache_prefix: metadata.attention_metadata},
             slot_mapping={},
         )
-        with forward_module.override_forward_context(context):
-            return sparse(
+        with override_forward_context(context):
+            return sparse_attn_indexer(
                 qr,
                 metadata.k_cache_prefix,
                 metadata.compressor.k_cache,
@@ -746,16 +589,13 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
 
     def _c128_prefill_indices(self, num_tokens: int) -> torch.Tensor:
         width = max(128, _round_up(max(num_tokens // 128, 1), 128))
-        build = _symbol(
-            "vllm.models.deepseek_v4.sparse_mla", "build_c128a_topk_metadata"
-        )
         positions = torch.arange(num_tokens, dtype=torch.int64, device=self.device)
         global_buffer = torch.empty((1, width), dtype=torch.int32, device=self.device)
         decode_lens = torch.empty(1, dtype=torch.int32, device=self.device)
         prefill_buffer = torch.empty(
             (num_tokens, width), dtype=torch.int32, device=self.device
         )
-        return build(
+        return build_c128a_topk_metadata(
             positions,
             128,
             0,
@@ -881,21 +721,15 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
                     for batch_index, count in enumerate(token_counts)
                 ]
             ).contiguous(),
-            query_start_loc=base.runtime_layout.query_start_loc,
-            compressor_operation=self.compressor_operation,
+            query_start_loc=base.query_start_loc,
+            swa_block_table=base.swa_block_table,
+            swa_seq_lens=base.swa_seq_lens,
             compressor_metadata=main,
-            indexer_operation=(
-                self.indexer_operation if indexer_runtime is not None else None
-            ),
             indexer_metadata=indexer_runtime,
         )
         def prepare_flash() -> None:
-            gather = _symbol(
-                "vllm.models.deepseek_v4.common.ops",
-                "dequantize_and_gather_k_cache",
-            )
             if max_compressed:
-                gather(
+                dequantize_and_gather_k_cache(
                     workspace,
                     main.k_cache,
                     seq_lens=torch.tensor(
@@ -906,29 +740,25 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
                     block_size=self._MLA_BLOCK_SIZE // self.compress_ratio,
                     offset=0,
                 )
-            gather(
+            dequantize_and_gather_k_cache(
                 workspace,
                 base.swa_cache,
-                seq_lens=base.runtime_layout.seq_lens,
+                seq_lens=base.swa_seq_lens,
                 gather_lens=torch.tensor(
                     gathered_lens, dtype=torch.int32, device=self.device
                 ),
-                block_table=base.runtime_layout.block_table,
+                block_table=base.swa_block_table,
                 block_size=self._SWA_BLOCK_SIZE,
                 offset=max_compressed,
             )
-            combine = _symbol(
-                "vllm.models.deepseek_v4.common.ops",
-                "combine_topk_swa_indices",
-            )
-            indices, lengths = combine(
+            indices, lengths = combine_topk_swa_indices(
                 # ``topk`` is the per-forward source layout.  ``metadata.indices``
                 # is the derived FlashMLA layout and is overwritten below; using
                 # it as input on activation recompute would combine twice.  The
                 # indexer updates ``topk`` in place for C4 layers.
                 topk,
-                base.runtime_layout.query_start_loc,
-                base.runtime_layout.seq_lens,
+                base.query_start_loc,
+                base.swa_seq_lens,
                 torch.tensor(gathered_lens, dtype=torch.int32, device=self.device),
                 self.config.sliding_window,
                 self.compress_ratio,
@@ -941,11 +771,28 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             metadata.topk_length = lengths
 
         metadata.prepare_flash = prepare_flash
-        metadata.runtime_layout = SimpleNamespace(
-            swa=base.runtime_layout,
-            compressor=main,
-            compressor_block_table=main_block_table,
-            indexer=indexer_runtime,
-            indexer_block_table=indexer_block_table,
-        )
         return metadata
+
+
+compressor_operation = DS4PrefillMetadataBuilder.compressor_operation
+indexer_operation = DS4PrefillMetadataBuilder.indexer_operation
+
+
+def build_prefill_metadata_builders(
+    model_path: str,
+    config: DeepseekV4Config,
+    layer_indices: tuple[int, ...],
+    device: torch.device,
+) -> dict[int, DS4PrefillMetadataBuilder]:
+    hf_config = get_config(model_path, trust_remote_code=True)
+    caches = {}
+    for ratio in {max(1, config.compress_ratios[i]) for i in layer_indices}:
+        caches[ratio] = _build_rope(
+            hf_config, config, compress_ratio=ratio, device=device
+        ).cos_sin_cache.to(device=device, dtype=torch.float32)
+    return {
+        i: DS4PrefillMetadataBuilder(
+            config, layer_idx=i, device=device, cos_sin_cache=caches[max(1, config.compress_ratios[i])]
+        )
+        for i in layer_indices
+    }

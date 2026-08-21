@@ -1,11 +1,38 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
 
-from ._contract import check_parameter_versions, parameter_versions
+def parameter_versions(parameters: Iterable[torch.Tensor]) -> tuple[int, ...]:
+    return tuple(parameter._version for parameter in parameters)
+
+
+def check_parameter_versions(
+    parameters: Iterable[torch.Tensor], expected: tuple[int, ...]
+) -> None:
+    actual = parameter_versions(parameters)
+    if actual != expected:
+        raise RuntimeError(
+            "DS4 vLLM master parameter changed between forward and backward; "
+            f"versions={expected}->{actual}"
+        )
+
+
+def fp32_linear_vjp(
+    grad_output: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x2d = value.reshape(-1, value.shape[-1]).float()
+    dy2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
+    if grad_output.shape[:-1] != value.shape[:-1]:
+        raise RuntimeError("linear bridge received incompatible grad_output shape")
+    return (
+        torch.mm(dy2d, weight.float()).to(value.dtype).reshape(value.shape),
+        torch.mm(dy2d.T, x2d).to(weight.dtype),
+    )
 
 
 def _own(value):

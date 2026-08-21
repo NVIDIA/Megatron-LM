@@ -9,15 +9,15 @@ from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepse
 from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive import (
+from megatron.lite.model.deepseek_v4.vllm.linear import (
     block_fp8_linear,
-    fixed_route_vjp,
     gate_linear,
 )
+from megatron.lite.model.deepseek_v4.vllm.router import fixed_route_vjp
 from megatron.lite.model.deepseek_v4.vllm.grouped_moe import (
     VLLMGroupedMoEWithBF16Backward,
 )
-from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
@@ -103,18 +103,14 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         cache_deployment_weights: bool = False,
     ):
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-            is_batch_invariant_quant_kernel_enabled,
+            require_batch_invariant_quant_kernel,
         )
 
         # ``deepseek_v4.vllm`` is an alignment implementation, not a generic
         # MoE backend.  Validate its required numerical kernel while building
         # the model so a missing or incompatible library can never turn into a
         # later, layout-dependent fallback.
-        if not is_batch_invariant_quant_kernel_enabled():
-            raise RuntimeError(
-                "DeepSeek V4 vLLM requires "
-                "VLLM_BATCH_INVARIANT_KERNEL_LIB; refusing a non-BI MoE fallback"
-            )
+        require_batch_invariant_quant_kernel()
         ps = ps or ParallelState()
         super().__init__(
             config,
@@ -138,16 +134,15 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
     def _build_experts(self, config: DeepseekV4Config, ps: ParallelState) -> nn.Module:
         return _VLLMVisibleExperts(config, ps)
 
-    def _visible_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _shared_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = block_fp8_linear(
             self.shared_gate_up_fp8,
             hidden_states,
             self.shared_experts.gate_up.weight,
         )
-        gate, up = gate_up.chunk(2, dim=-1)
         return block_fp8_linear(
             self.shared_down_fp8,
-            F.silu(gate) * up,
+            swiglu_with_probs(gate_up, None, self.config.swiglu_limit),
             self.shared_experts.down.weight,
         )
 
@@ -170,14 +165,11 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         weights = weights * self.config.routed_scaling_factor
         return weights.to(dtype=logits.dtype), selected
 
-    def forward(
+    def _route(
         self,
         hidden_states: torch.Tensor,
-        *,
-        input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if hidden_states.ndim != 2:
-            raise ValueError("MoE requires flat [tokens, hidden]")
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.is_hash_layer and input_ids is None:
             raise NotImplementedError("hash MoE requires explicit input_ids")
         logits = gate_linear(
@@ -190,6 +182,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         if self.is_hash_layer:
             token_ids = input_ids.reshape(-1).to(dtype=torch.int32)
             tid2eid = self.gate.tid2eid.to(dtype=torch.int32).contiguous()
+
             def hash_route(value):
                 weights, ids = _hash_route(
                     value,
@@ -201,7 +194,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
                 )
                 return self._replay_route(value, weights, ids)
 
-            topk_weights, topk_ids = fixed_route_vjp(
+            weights, ids = fixed_route_vjp(
                 hash_route,
                 logits,
                 renormalize=self.config.norm_topk_prob,
@@ -216,26 +209,10 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
                 )
                 return self._replay_route(value, weights, ids)
 
-            topk_weights, topk_ids = fixed_route_vjp(
+            weights, ids = fixed_route_vjp(
                 learned_route,
                 logits,
                 renormalize=True,
                 route_scale=self.config.routed_scaling_factor,
             )
-
-        dispatched, tokens_per_expert, permuted_probs = self.dispatcher.dispatch(
-            hidden_states,
-            _kernel_topk_weights(topk_weights),
-            topk_ids.to(dtype=torch.int64),
-        )
-        self.dispatcher.wait_dispatch_event()
-        output = self.experts(
-            dispatched,
-            tokens_per_expert,
-            permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
-        )
-        output = self.dispatcher.combine(output)
-        if self.shared_experts is not None:
-            output = output + self._visible_shared_experts(hidden_states)
-        return output
+        return _kernel_topk_weights(weights), ids.to(dtype=torch.int64)

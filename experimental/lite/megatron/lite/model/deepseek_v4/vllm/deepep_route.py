@@ -447,7 +447,6 @@ def _deepep_route_handle_received_rows(handle: tuple) -> int:
 
 
 def _validate_and_order_route_preserving_outputs(
-    expert_outputs: torch.Tensor,
     received_tokens: torch.Tensor,
     received_topk_indices: torch.Tensor,
     received_topk_weights: torch.Tensor,
@@ -456,17 +455,15 @@ def _validate_and_order_route_preserving_outputs(
     route_indices: torch.Tensor,
     route_weights: torch.Tensor,
     *,
-    order_outputs: bool = True,
     route_positions: torch.Tensor | None = None,
-    return_route_rows: bool = False,
 ) -> torch.Tensor:
-    """Return expert outputs in the route handle's receive order.
+    """Return primary expert rows in the route handle's receive order.
 
     DeepEP currently preserves source-token/slot order between the primary
     rank-deduplicated dispatch and the route-level metadata dispatch.  Match
     Slime by validating that invariant before consuming the route handle.
     """
-    if expert_outputs.ndim != 2 or received_tokens.ndim != 2:
+    if received_tokens.ndim != 2:
         raise ValueError("Route-preserving DeepEP expects 2D hidden tensors")
     if received_topk_indices.shape != received_topk_weights.shape:
         raise ValueError("Received DeepEP IDs and weights do not align")
@@ -506,9 +503,4 @@ def _validate_and_order_route_preserving_outputs(
         torch.all(expected_fingerprints == route_fingerprints),
         "Route-preserving DeepEP metadata changed source-token order",
     )
-    route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
-    if return_route_rows:
-        return route_rows
-    if not order_outputs:
-        return expert_outputs
-    return expert_outputs.index_select(0, route_rows)
+    return output_index[token_rows, topk_slots].to(dtype=torch.long)

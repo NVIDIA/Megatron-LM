@@ -864,25 +864,6 @@ def set_expert_idx(name: str, idx: int) -> str:
     return re.sub(r"weight\d+$", f"weight{idx}", name)
 
 
-def _export_expert_local_idx(name: str, spec: HFWeights) -> int:
-    """Return the stage-local expert suffix used by an export source tensor.
-
-    Most Lite models use ``weight<N>`` names, but model implementations are
-    allowed to use a different native naming scheme.  In particular DS4-vLLM
-    stores experts as ``...experts.w13.<N>`` / ``...w2.<N>``.  Falling back to
-    the legacy parser keeps existing specs unchanged while letting such models
-    define the export boundary explicitly.
-    """
-    resolver = getattr(spec, "export_expert_local_id", None)
-    return int(resolver(name)) if callable(resolver) else parse_expert_idx(name)
-
-
-def _export_expert_name(name: str, idx: int, spec: HFWeights) -> str:
-    """Rewrite an export source tensor name with ``idx`` as its expert ID."""
-    resolver = getattr(spec, "export_expert_name", None)
-    return resolver(name, idx) if callable(resolver) else set_expert_idx(name, idx)
-
-
 def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
     if not layer_map:
         return name
@@ -1519,7 +1500,7 @@ def export_hf_weights(
             expert_bucket_bytes = 0
             experts_per_rank = spec.num_experts // ps.ep_size
             for native_name, _, shards in gathered_bucket:
-                local_idx = _export_expert_local_idx(native_name, spec)
+                local_idx = parse_expert_idx(native_name)
                 packed_group_name = getattr(spec, "packed_expert_group_name", None)
                 packed_name = (
                     packed_group_name(native_name)
@@ -1528,7 +1509,7 @@ def export_hf_weights(
                 )
                 for ep_rank, shard in enumerate(shards):
                     global_idx = ep_rank * experts_per_rank + local_idx
-                    global_name = _export_expert_name(native_name, global_idx, spec)
+                    global_name = set_expert_idx(native_name, global_idx)
                     export_shard = _maybe_cpu(shard, cpu=cpu)
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
@@ -1735,16 +1716,14 @@ def _gather_expert(
     tensor = _gather_expert_etp(name, tensor, spec, ps)
 
     # EP gather: global_id = ep_rank * n_local + local_id.
-    local_idx = _export_expert_local_idx(name, spec)
+    local_idx = parse_expert_idx(name)
     if ps.ep_size > 1 and ps.ep_group is not None:
         n_local = spec.num_experts // ps.ep_size
         ep_gathered = [torch.empty_like(tensor) for _ in range(ps.ep_size)]
         _ep_all_gather(ep_gathered, tensor.contiguous(), ps.ep_group)
         for ep_rank, ep_tensor in enumerate(ep_gathered):
             global_idx = ep_rank * n_local + local_idx
-            out[_export_expert_name(name, global_idx, spec)] = _maybe_cpu(
-                ep_tensor, cpu=cpu
-            )
+            out[set_expert_idx(name, global_idx)] = _maybe_cpu(ep_tensor, cpu=cpu)
     else:
         out[name] = _maybe_cpu(tensor, cpu=cpu)
 
