@@ -377,7 +377,9 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
         moe_shortcut_post_norm=True,
         is_hybrid_model=True,
         use_fused_weighted_squared_relu=True,
-        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm"],
+        wide_residual=object(),
+        residual_stream_recompute_num_layers=4,
+        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm", "residual_stream"],
         offload_modules=["core_attn", "shortcut_post_norm"],
     )
 
@@ -400,6 +402,8 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
     assert config.moe_shortcut_post_norm is False
     assert config.is_hybrid_model is False
     assert config.use_fused_weighted_squared_relu is False
+    assert config.wide_residual is None
+    assert config.residual_stream_recompute_num_layers is None
     assert config.recompute_modules == ["moe_act"]
     assert config.offload_modules == ["core_attn"]
 

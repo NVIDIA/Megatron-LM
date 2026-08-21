@@ -43,7 +43,7 @@ from megatron.core.transformer.residual_recompute import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
 from megatron.core.typed_torch import apply_module
 from tests.unit_tests.test_utilities import Utils
@@ -167,6 +167,12 @@ class _MambaMixer(_TransformerBranch):
 
 
 class _RecordingTransformerLayer(WideResidualTransformerLayer):
+    def forward(self, *args, **kwargs):
+        self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
+        return super().forward(*args, **kwargs)
+
+
+class _RecordingOrdinaryTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
         return super().forward(*args, **kwargs)
@@ -301,6 +307,12 @@ def _offloaded_qkv_layer_spec() -> ModuleSpec:
 def _recording_layer_spec() -> ModuleSpec:
     spec = _layer_spec()
     spec.module = _RecordingTransformerLayer
+    return spec
+
+
+def _ordinary_recording_layer_spec() -> ModuleSpec:
+    spec = _layer_spec()
+    spec.module = _RecordingOrdinaryTransformerLayer
     return spec
 
 
@@ -920,3 +932,30 @@ class TestResidualStreamRecomputeIntegration:
         assert len(replay_inputs) == 1
         assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
         assert output.shape == hidden_states.shape
+
+    def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):
+        config = _wide_recompute_config(num_layers=1)
+        stack = HybridStack(
+            config,
+            HybridStackSubmodules(attention_layer=_ordinary_recording_layer_spec()),
+            layer_type_list=[Symbols.ATTENTION],
+            post_layer_norm=False,
+            is_mtp_layer=True,
+            pg_collection=_process_groups(),
+        ).cuda()
+        hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
+
+        output = stack(hidden_states=hidden_states, attention_mask=None)
+        output.square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        assert not stack.uses_wide_residual_stream
+        assert stack.residual_stream_readout is None
+        layer = stack.layers[0]
+        assert type(layer) is _RecordingOrdinaryTransformerLayer
+        assert layer.is_mtp_layer
+        assert not layer.supports_wide_residual_connections
+        assert layer._get_self_attention_residual_connection() is None
+        assert layer._get_mlp_residual_connection() is None
+        assert not layer.received_residual_recompute_kwarg
+        assert hidden_states.grad is not None
