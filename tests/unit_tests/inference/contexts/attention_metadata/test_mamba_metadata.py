@@ -40,6 +40,50 @@ class TestMambaMetadata:
 
         assert metadata._batch_indices_decode_buffer.dtype == dtype
 
+    def test_free_unbound_live_slot(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+
+        slot = int(metadata.allocate_slot())
+        assert metadata.mamba_state_free_slot_count == 1
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 2
+        assert int(metadata.allocate_slot()) == slot
+
+    def test_allocated_slots_do_not_alias_free_slot_stack(self):
+        metadata = MambaMetadata(max_requests=3, max_tokens=4, max_intermediate_count=1)
+
+        slot_to_release = metadata.allocate_slot()
+        allocated_slot = metadata.allocate_slot()
+        metadata.free_slot(slot_to_release)
+
+        assert isinstance(allocated_slot, int)
+        assert allocated_slot == 1
+
+        metadata.reset()
+        slot_to_release = metadata.allocate_slot()
+        allocated_slots = metadata.batch_allocate_slots(2)
+        metadata.free_slot(slot_to_release)
+
+        assert torch.equal(allocated_slots, torch.tensor([0, 1], dtype=torch.int32))
+
+    def test_detached_live_slot_survives_request_cleanup(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        slot = int(metadata.allocate_slot())
+        metadata.request_to_mamba_state_idx[0] = slot
+
+        assert metadata.detach_state_slot(0) == slot
+        metadata.free_slots(torch.tensor([0], dtype=torch.int64))
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) != slot
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == slot
+
     def _run_update_test(
         self,
         metadata: MambaMetadata,

@@ -505,6 +505,28 @@ class TestGroupedRollouts:
             assert trajectories[: len(expected_trajectories)] == expected_trajectories
 
     @pytest.mark.asyncio
+    async def test_batch_order_starts_at_initial_batch_id(self):
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        pipeline = RolloutPipeline(
+            MockGenerator(), request, parallel_generation_tasks=1, initial_batch_id=10
+        )
+
+        async with aclosing(pipeline.run()) as groups:
+            first_two_batches = [
+                await asyncio.wait_for(anext(groups), timeout=10) for _ in range(4)
+            ]
+
+        assert [group.batch_id for group in first_two_batches] == [10, 10, 11, 11]
+        assert [group.index_in_batch for group in first_two_batches] == [0, 1, 0, 1]
+
+    @pytest.mark.asyncio
     async def test_rollout_submission_granularity_limits_inference_concurrency(self):
         # parallel_generation_tasks is a depth in batches; the R gate admits at
         # most depth x (num_groups x rollouts_per_group) rollouts at once.

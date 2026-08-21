@@ -1,12 +1,22 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
+import ipaddress
 import json
 import logging
+import socket
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import warnings
+
+_IMAGE_FETCH_TIMEOUT_S = 5.0
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
+_IMAGE_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
@@ -232,6 +242,123 @@ def _coerce_arguments_mapping(arguments):
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects so a 3xx to a private address can't bypass the
+    pre-fetch allowlist check."""
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        """Turn a 3xx redirect into an HTTPError so the fetch fails closed."""
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirects disabled for image_url fetches", headers, fp
+        )
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _extract_image_url_bytes(url: str) -> bytes:
+    """Extract raw bytes from an OpenAI-style image_url value.
+
+    Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
+    plain ``http(s)://`` URLs.
+    """
+    if url.startswith("data:"):
+        _, b64_data = url.split(",", 1)
+        return base64.b64decode(b64_data)
+    if url.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.hostname:
+            raise ValueError(f"Invalid image_url: {url[:40]!r}")
+        try:
+            ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
+        except (socket.gaierror, ValueError) as exc:
+            raise ValueError(f"Cannot resolve image_url host: {parsed.hostname}") from exc
+        # Refuse SSRF-prone destinations (loopback, RFC1918, link-local,
+        # multicast, reserved, unspecified). Public addresses only.
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"Refusing to fetch image from non-public address: {parsed.hostname}")
+        req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_FETCH_USER_AGENT})
+        with _no_redirect_opener.open(req, timeout=_IMAGE_FETCH_TIMEOUT_S) as response:
+            data = response.read(_MAX_IMAGE_BYTES + 1)
+        if len(data) > _MAX_IMAGE_BYTES:
+            raise ValueError(f"Image at {parsed.hostname} exceeds {_MAX_IMAGE_BYTES} byte limit")
+        return data
+    raise ValueError(f"Unsupported image_url scheme: {url[:40]!r}")
+
+
+def _extract_images_from_messages(messages):
+    """Pull image_url blocks out of OpenAI-style multimodal messages.
+
+    Walks the message list, extracting bytes from each ``image_url`` block,
+    replacing it with an inline ``<image>`` text marker, and returning both
+    the rewritten messages and the ordered list of image bytes. Messages
+    with plain string ``content`` are passed through unchanged.
+
+    Fetching a remote ``image_url`` blocks, so call this off the event loop.
+
+    Returns:
+        (messages_with_markers, image_bytes_list)
+
+    Raises:
+        ValueError: an ``image_url`` could not be loaded.
+    """
+    if not isinstance(messages, list):
+        return messages, []
+
+    rewritten = []
+    image_bytes_list: list[bytes] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            rewritten.append(message)
+            continue
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+
+        new_chunks = []
+        found_image = False
+        for chunk in content:
+            if isinstance(chunk, dict) and chunk.get("type") == "image_url":
+                url = chunk.get("image_url", {}).get("url", "")
+                if not url:
+                    continue
+                try:
+                    image_bytes_list.append(_extract_image_url_bytes(url))
+                except Exception as e:
+                    # Dropping the image would answer the request as if it were
+                    # text-only, handing the client a confident answer about an
+                    # image the model never saw. Surface it as a 400 instead.
+                    raise ValueError(f"Failed to load image_url: {e}") from e
+                new_chunks.append({"type": "text", "text": "<image>"})
+                found_image = True
+            else:
+                new_chunks.append(chunk)
+
+        if found_image:
+            msg_copy = dict(message)
+            msg_copy["content"] = new_chunks
+            rewritten.append(msg_copy)
+        else:
+            rewritten.append(message)
+
+    return rewritten, image_bytes_list
 
 
 def _sanitize_messages_for_template(messages):
@@ -468,16 +595,41 @@ try:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
+        # Extract any image_url blocks before template sanitization, which would
+        # otherwise drop them. Replaces each image block with an inline <image>
+        # text marker that the chat template can substitute. Runs in a worker
+        # thread because a remote image_url fetch blocks, which would otherwise
+        # stall every other in-flight generation on this rank.
+        try:
+            messages, image_bytes_list = await asyncio.to_thread(
+                _extract_images_from_messages, messages
+            )
+        except ValueError as e:
+            return Response(str(e), status=400)
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 
+        # Inject a server-configured chat template (e.g. pretraining.jinja for
+        # VLM checkpoints) unless the caller supplies its own. Loaded once at
+        # server startup from --chat-template into app.config.
+        server_chat_template = current_app.config.get('chat_template', None)
+        if server_chat_template and 'chat_template' not in chat_template_kwargs:
+            chat_template_kwargs['chat_template'] = server_chat_template
+
+        # Prefer the underlying HF tokenizer for chat-template application when
+        # reachable. The vision tokenizer's apply_chat_template is a stub, and
+        # the text wrapper just forwards anyway; reaching the HF tokenizer lets
+        # us pass tokenize/add_generation_prompt/chat_template directly.
+        hf_tok = getattr(getattr(tokenizer, '_tokenizer', None), 'tokenizer', None)
+        chat_tok = hf_tok if hf_tok is not None else tokenizer
+
         try:
-            if (
-                hasattr(tokenizer, 'apply_chat_template')
-                and getattr(tokenizer, "chat_template", None) is not None
+            if hasattr(chat_tok, 'apply_chat_template') and (
+                getattr(chat_tok, "chat_template", None) is not None
+                or chat_template_kwargs.get('chat_template') is not None
             ):
                 prompt_tokens = _coerce_to_token_id_list(
-                    tokenizer.apply_chat_template(
+                    chat_tok.apply_chat_template(
                         template_messages,
                         tokenize=True,
                         add_generation_prompt=True,
@@ -525,7 +677,7 @@ try:
 
                         # Get the templated tokenization of just the previous generation
                         retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                            tokenizer.apply_chat_template(
+                            chat_tok.apply_chat_template(
                                 messages_to_last_assistant_message,
                                 tokenize=True,
                                 add_generation_prompt=False,
@@ -611,6 +763,11 @@ try:
             return_raw_text = req.get("return_raw_text", False)
             return_prompt_tokens = return_tokenized_data or return_raw_text
 
+            # OpenAI-style "stop" may be a string or list of strings; normalize.
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -618,6 +775,7 @@ try:
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
+                stop_words=stop,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
@@ -628,6 +786,15 @@ try:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
+        # TODO(perf): with n > 1, the same ``image_bytes_list`` is forwarded n
+        # times, and every admission independently re-preprocesses the bytes
+        # and runs the vision encoder. The engine has an
+        # ``ImageProcessingConfig`` that could preprocess once here if it were
+        # plumbed to the HTTP layer; embedding-level reuse across the n
+        # requests would need a wider change (compute embeddings once, ship
+        # them as a serialized tensor dict on the wire, skip the encoder for
+        # admissions 2..n). Kept as a known limitation for a follow-up so this
+        # PR stays scoped.
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -640,7 +807,12 @@ try:
                 return Response(str(error), status=400)
 
             streams = [
-                client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
+                client.add_request_streaming(
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=({"image": image_bytes_list} if image_bytes_list else None),
+                )
+                for _ in range(n)
             ]
             chat_parsers = None
             if parsers:
@@ -692,7 +864,14 @@ try:
             response.timeout = None
             return response
 
-        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        tasks = [
+            client.add_request(
+                prompt_tokens,
+                sampling_params,
+                multi_modal_data=({"image": image_bytes_list} if image_bytes_list else None),
+            )
+            for _ in range(n)
+        ]
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()

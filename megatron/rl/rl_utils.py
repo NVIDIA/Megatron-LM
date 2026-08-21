@@ -83,7 +83,6 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.rl.agent.api import (
-    KNOWN_ROLLOUT_STATUSES,
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutRequest,
@@ -116,6 +115,7 @@ from megatron.rl.sequence_packing_utils import (
     update_microbatch_calculator,
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
+from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
 from megatron.training.global_vars import (
     get_args,
     get_tensorboard_writer,
@@ -366,6 +366,10 @@ class RLRuntimeState:
         self.request_ledger = {}
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Durable rollout-bank state (rank 0 only). Recovered groups live on the
+        # rollout agent, which treats them as per-environment producers.
+        self.rollout_bank = None
+        self.bank_restored = False
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
         # Per-GPU variants are available via methods that divide by world_size.
         self.world_size = None
@@ -663,6 +667,47 @@ def get_inference_interface(args, loop, model):
 
 _ROLLOUT_GENERATOR = None
 _ROLLOUT_PIPELINE = None
+_ROLLOUT_AGENT = None
+_ROLLOUT_BANK = None
+
+
+def maybe_get_rollout_bank(args):
+    """Return the durable rollout bank singleton, creating it on first use."""
+    global _ROLLOUT_BANK
+    if not getattr(args, "rl_durable_rollout_bank", False):
+        logger.debug("Durable rollout bank is disabled; proceeding without it.")
+        return None
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        logger.debug("Durable rollout bank runs on rank 0 only; skipping on this rank.")
+        return None
+    if _ROLLOUT_BANK is None:
+        from megatron.rl.rollout_bank import RolloutBank
+
+        bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
+        get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
+        log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
+    return _ROLLOUT_BANK
+
+
+def get_rollout_bank():
+    """Return the rollout bank singleton, or None if disabled or not yet created."""
+    return _ROLLOUT_BANK
+
+
+def maybe_compact_rollout_bank(iteration):
+    """Compact the bank at a durable-checkpoint boundary."""
+    bank = get_rollout_bank()
+    if bank is not None:
+        bank.checkpoint(iteration)
+
+
+def _get_or_create_rollout_agent(env_config_path):
+    """Return the cached rollout agent used by the persistent pipeline."""
+    global _ROLLOUT_AGENT
+    if _ROLLOUT_AGENT is None:
+        _ROLLOUT_AGENT = get_agent(env_config_path)
+    return _ROLLOUT_AGENT
 
 
 def get_rollout_generator(
@@ -676,6 +721,7 @@ def get_rollout_generator(
     consumption_granularity: ConsumptionGranularity,
     generation_lag: int,
     env_config_path: str,
+    current_iteration: int,
 ) -> AsyncIterator[RolloutGroup]:
     """Return the rollout group iterator for this step.
 
@@ -695,9 +741,11 @@ def get_rollout_generator(
         )
         # Keep the pipeline handle so logging can read its queues, gate state, and per-env counters.
         _ROLLOUT_PIPELINE = RolloutPipeline(
-            agent=get_agent(env_config_path),
+            agent=_get_or_create_rollout_agent(env_config_path),
             request=request,
             parallel_generation_tasks=generation_lag + 1,
+            bank=get_rollout_bank(),
+            initial_batch_id=current_iteration,
         )
         log_single_rank(
             logger,
@@ -770,6 +818,23 @@ def get_environment_rollouts(
             training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
+            runtime_state = get_rl_runtime_state()
+            bank = maybe_get_rollout_bank(args)
+            if bank is not None:
+                agent = _get_or_create_rollout_agent(args.langrl_env_config)
+                if not runtime_state.bank_restored:
+                    restored_groups: GroupedRollouts = bank.recover(args.iteration)
+                    total_restored_groups = agent.set_restored_groups(restored_groups)
+                    runtime_state.bank_restored = True
+                    if total_restored_groups:
+                        log_single_rank(
+                            logger,
+                            logging.INFO,
+                            f"RolloutBank restored {total_restored_groups} completed groups from "
+                            f"disk at resume iteration {args.iteration}",
+                        )
+                bank.set_collection(args.curr_iteration)
+
             with nvtx_range("rl/inference-setup", time=True):
                 # Asyncronously run inference and rollout collection
                 rollout_generator = get_rollout_generator(
@@ -787,6 +852,7 @@ def get_environment_rollouts(
                     consumption_granularity=args.rl_consumption_granularity,
                     generation_lag=args.rl_generation_lag,
                     env_config_path=args.langrl_env_config,
+                    current_iteration=args.curr_iteration,
                 )
 
             # NOTE(jbarker): we need to double check this when using PP>1
@@ -807,6 +873,13 @@ def get_environment_rollouts(
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
                         _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
+                    # Record consumption for every group handed to the trainer. On a
+                    # rollback (restart before this update) the marker > T rule restores
+                    # these; once a checkpoint includes the update they are pruned.
+                    if bank is not None:
+                        bank.mark_consumed_many(
+                            (group.uid for group in rollouts), args.curr_iteration + 1
+                        )
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
@@ -1765,6 +1838,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.inferred_count = 0
     pipeline.assembled_count = 0
     pipeline.filtered_count = 0
+    pipeline.restored_count = 0
     pipeline.yielded_count = 0
     num_envs = len(pipeline.gran_policy.num_groups_per_env)
     pipeline.prepared_groups_per_env = [0] * num_envs

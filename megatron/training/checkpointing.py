@@ -30,6 +30,7 @@ except ImportError:
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
@@ -42,13 +43,12 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
-from megatron.core.msc_utils import maybe_msc, MultiStorageClientFeature 
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
@@ -67,8 +67,11 @@ try:
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
+        handle_mla_down_proj_in_state_dict,
+        handle_mtp_in_state_dict,
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
+        validate_fsdp_dtensor_model_load,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -95,6 +98,22 @@ _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
+
+
+def _maybe_compact_rollout_bank(iteration):
+    """Compact the rollout bank without making checkpointing depend eagerly on RL."""
+    from megatron.rl.rl_utils import maybe_compact_rollout_bank
+
+    maybe_compact_rollout_bank(iteration)
+
+
+def _register_rollout_bank_compaction(async_save_request, iteration):
+    """Compact the rollout bank after an asynchronous checkpoint becomes durable."""
+
+    def rollout_bank_finalize_fn(iteration=iteration):
+        _maybe_compact_rollout_bank(iteration)
+
+    async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
 
 
 def finalize_deletion_processes(blocking=False):
@@ -1209,6 +1228,14 @@ def save_checkpoint(
                 finalize_fns=logits_finalize_fns,
             )
 
+        if (
+            getattr(args, "rl_durable_rollout_bank", False)
+            and async_save_request is not None
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+        ):
+            # Compact the bank once this async checkpoint becomes durable, so the
+            # bank's compacted-through T tracks the model checkpoint. Rank-0 only.
+            _register_rollout_bank_compaction(async_save_request, iteration)
         if async_save_request is not None:
             schedule_async_save(async_save_request)
         if logits_saver is not None:
@@ -1226,6 +1253,13 @@ def save_checkpoint(
         # before returning from this function.
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+        # Durable rollout bank: compact at the checkpoint boundary so the bank's
+        # compacted-through T tracks this (now durable) checkpoint. Only on sync
+        # saves; async saves compact in their durability finalize callback above.
+        # Rank-0 no-op otherwise.
+        if getattr(args, "rl_durable_rollout_bank", False):
+            _maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
@@ -1697,18 +1731,26 @@ def _localize_redundant_extra_states(state_dict):
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
-    if args.swiglu:
+
+    def apply(handler):
+        """Run a state dict handler over the model and, when present, the optimizer state."""
+        model_state_dict, optimizer_state_dict = handler(
+            model, state_dict['model'], state_dict.get('optimizer')
+        )
+        state_dict['model'] = model_state_dict
         if 'optimizer' in state_dict:
-            model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
-                model, state_dict['model'], state_dict['optimizer']
-            )
-            state_dict['model'] = model_state_dict
             state_dict['optimizer'] = optimizer_state_dict
-        else:
-            model_state_dict, _ = handle_swiglu_in_state_dict(model, state_dict['model'], None)
-            state_dict['model'] = model_state_dict
+
+    if args.swiglu:
+        apply(handle_swiglu_in_state_dict)
+    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
+    # layout used on disk. No-op for unfused models.
+    apply(handle_mla_down_proj_in_state_dict)
     if args.num_experts:
         state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
+    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
+    # above resolve keys against live module paths, which still use the new name.
+    apply(handle_mtp_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -2128,6 +2170,16 @@ def _load_base_checkpoint(
 
             _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
             print_diff_in_state_dicts(state_dict_metadata, state_dict)
+            # A partial load silently skips model weights the checkpoint does not have,
+            # leaving them at their initialized values. Report that, unless this is a
+            # fine-tune where loading only part of the model is the intent.
+            if not getattr(args, 'finetune', False):
+                validate_fsdp_dtensor_model_load(
+                    state_dict_metadata,
+                    state_dict,
+                    checkpoint_name,
+                    strict=args.dist_ckpt_strictness,
+                )
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         torch.distributed.checkpoint.load_state_dict(
@@ -2330,9 +2382,13 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
         # ``module`` but are intentionally not handled by the regular
-        # ``unwrap_model`` helper.
+        # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
+        # the language model under ``language_model`` instead.
         while module is not None:
             if isinstance(module, HybridModel):
+                return True
+            inner = getattr(module, 'language_model', None)
+            if inner is not None and isinstance(inner, HybridModel):
                 return True
             module = getattr(module, 'module', None)
         return False
