@@ -14,11 +14,13 @@ from megatron.core.datasets.data_schedule import (
     DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
     _get_scheduler_max_real_num_seqs,
+    _refresh_zigzag_cp_certificate,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    build_packed_microbatches,
     create_data_iterator,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
@@ -55,6 +57,67 @@ def test_scheduler_max_real_num_seqs_rejects_dummy_without_capacity():
 
     with pytest.raises(ValueError, match="includes that dummy sequence"):
         _get_scheduler_max_real_num_seqs(config)
+
+
+@pytest.mark.parametrize("dynamic_cp", [False, True])
+@pytest.mark.parametrize(("padded_lengths", "expected_min_chunk"), [((8, 12), 2), ((8, 10), 0)])
+def test_build_packed_microbatches_certifies_zigzag_chunk_size(
+    dynamic_cp, padded_lengths, expected_min_chunk
+):
+    """The host schedule emits one conservative certificate for each packed batch."""
+    samples = {
+        sample_id: {
+            "original_seq_len": torch.tensor([padded_length - 1], dtype=torch.int32),
+            "padded_seq_len": torch.tensor([padded_length], dtype=torch.int32),
+        }
+        for sample_id, padded_length in enumerate(padded_lengths)
+    }
+    sample_id_groups = [[[0, 1], [0, 1]]]
+
+    packed = build_packed_microbatches(
+        samples,
+        sample_id_groups,
+        dcp_rank=0,
+        dev=torch.device("cpu"),
+        is_dynamic_cp=dynamic_cp,
+        global_id_seqlens=list(enumerate(padded_lengths)),
+    )
+
+    assert len(packed) == 1
+    assert packed[0]["zigzag_cp_min_chunk_size"].item() == expected_min_chunk
+    if dynamic_cp:
+        assert packed[0]["local_cp_size"].item() == 2
+    else:
+        assert "local_cp_size" not in packed[0]
+
+
+@pytest.mark.parametrize(
+    ("certificate", "cu_seqlens_padded", "expected"),
+    [
+        # A dummy tail sequence of 4 rows (CP2 half-chunk 1) caps a positive certificate.
+        (3, [0, 12, 24, 28], 1),
+        # Extending the final sequence keeps every half-chunk at least as large.
+        (2, [0, 8, 24], 2),
+        # Zero-length fixed-capacity slots do not reduce the certificate.
+        (2, [0, 8, 16, 16, 16], 2),
+        # Padding can repair a non-certifiable layout, so zero becomes unknown.
+        (0, [0, 8, 16], -1),
+        # Unknown stays unknown.
+        (-1, [0, 8, 16], -1),
+        # A non-divisible non-empty sequence cannot carry a positive certificate.
+        (2, [0, 8, 14], 0),
+    ],
+)
+def test_pre_slice_padding_refreshes_zigzag_certificate(certificate, cu_seqlens_padded, expected):
+    """Pre-CP-slice padding never leaves a certificate that overstates the layout."""
+    refreshed = _refresh_zigzag_cp_certificate(
+        torch.tensor(certificate, dtype=torch.int32),
+        torch.tensor(cu_seqlens_padded, dtype=torch.int32),
+        cp_size=2,
+    )
+
+    assert refreshed.dtype == torch.int32
+    assert refreshed.item() == expected
 
 
 def test_scheduler_thd_padding_mask_from_cu_seqlens():
