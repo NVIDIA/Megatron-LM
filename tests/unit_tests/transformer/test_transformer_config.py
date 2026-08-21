@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
+import torch
+from torch.nn import functional as F
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -57,6 +59,33 @@ def test_gdp_num_householder_accepts_positive_values():
     )
 
     assert config.gdp_num_householder == 5
+
+
+def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="replica_hybridep",
+        moe_expert_rank_capacity_factor=1.0,
+        moe_grouped_gemm=True,
+        moe_single_grouped_weight=True,
+        moe_router_dtype="fp32",
+        use_transformer_engine_op_fuser=True,
+        gradient_accumulation_fusion=True,
+        add_bias_linear=False,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        cuda_graph_impl="local",
+        cuda_graph_modules=["moe"],
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert config.moe_flex_dispatcher_backend == "replica_hybridep"
 
 
 @pytest.mark.parametrize("num_householder", [0, -1])

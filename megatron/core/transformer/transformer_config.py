@@ -2921,7 +2921,7 @@ class TransformerConfig(ModelParallelConfig):
                     if (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
-                    ):
+                    ) and self.moe_flex_dispatcher_backend != "replica_hybridep":
                         assert (
                             CudaGraphModule.moe not in self.cuda_graph_modules
                         ), 'moe cuda graph is only supported with drop-padding MoE.'
