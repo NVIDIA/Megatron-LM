@@ -14,10 +14,9 @@
 
 """DBuffer placement definitions.
 
-These placement concepts are borrowed from PyTorch DTensor placements:
-``Replicate`` and ``Partial`` mirror DTensor's placements. ``Flat`` is the
-only sharded DBuffer placement implemented so far; it stores dim-0 shards in a
-flattened local buffer.
+DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
+types directly. ``Flat`` is the only DBuffer-specific placement: a dim-0
+``Shard`` whose local storage is part of one flattened buffer.
 
 =============  =============  ====================
 Source         Destination    DBuffer operation
@@ -32,31 +31,19 @@ sharded        ``Replicate``  ``allgather()``
 import dataclasses
 from collections.abc import Iterable, Sequence
 
-import torch.distributed as dist
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor.placement_types import Placement
 
-
-class Placement:
-    """Base class for DBuffer placements."""
-
+__all__ = ["Flat", "Placements", "changed_mesh_axis"]
 
 MeshAxis = int | str
 
 
-@dataclasses.dataclass(frozen=True)
-class Replicate(Placement):
-    """Replicated local buffer placement."""
+class Flat(Shard):
+    """DBuffer-specific flattened dim-0 shard placement."""
 
-
-@dataclasses.dataclass(frozen=True)
-class Partial(Placement):
-    """Unreduced replicated local buffer placement."""
-
-    reduce_op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM
-
-
-@dataclasses.dataclass(frozen=True)
-class Flat(Placement):
-    """Flat dim-0 sharded local buffer placement."""
+    def __init__(self) -> None:
+        super().__init__(0)
 
 
 def changed_mesh_axis(

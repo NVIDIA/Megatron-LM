@@ -258,13 +258,24 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
-    def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
-        """All-gather grad along GTP_remat/EGTP_remat dim 0, orthogonalize, then slice back.
+    @staticmethod
+    def _all_gather_tensor(t, group, dim):
+        """All-gather equal-size shards of ``t`` over ``group`` and concat along ``dim``."""
+        shards = [torch.empty_like(t) for _ in range(get_pg_size(group))]
+        torch.distributed.all_gather(shards, t.contiguous(), group)
+        return torch.cat(shards, dim=dim)
 
-        GTP_remat shards weights along dim 0 independently of TP's partition_dim. Newton-Schulz
-        needs the full weight matrix, so we reconstruct the GTP_remat dimension before running
-        the TP-aware orthogonalization, then extract the local GTP_remat shard from the result.
-        When GTP_remat is inactive this is a plain passthrough to scaled_orthogonalize_fn.
+    def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
+        """Orthogonalize a (possibly GTP-sharded) momentum, then reshard.
+
+        When GTP is inactive this is a plain passthrough to ``scaled_orthogonalize_fn``.
+        Otherwise, ``self.tp_mode`` controls how GTP sharding is handled:
+
+        - **blockwise**: orthogonalize the local GTP shard independently, no collective.
+        - **duplicated**: all-gather over GTP, run whole-matrix NS (TP-aware), reshard.
+        - **distributed**: distribute NS over GTP via small-Gram all-reduce. When both
+          GTP and TP are active, NS is distributed over the larger group to minimize
+          redundant compute; the smaller group is all-gathered beforehand.
         """
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
@@ -284,21 +295,61 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
 
         gtp_remat_size = get_pg_size(gtp_remat_group)
-        gtp_rank = get_pg_rank(gtp_remat_group)
-        shards = [torch.empty_like(grad) for _ in range(gtp_remat_size)]
-        torch.distributed.all_gather(shards, grad, gtp_remat_group)
-        gathered_grad = torch.cat(shards, dim=0)
 
-        gathered_grad = self.scaled_orthogonalize_fn(gathered_grad, tp_group, partition_dim)
+        if self.tp_mode == "blockwise":
+            # Local block NS on this rank's GTP row-shard (shape [M/gtp_remat_size, K]):
+            # partition_dim=None makes scaled_orthogonalize_fn run a plain Newton-Schulz on
+            # the shard with no GTP/TP collective.
+            return self.scaled_orthogonalize_fn(grad, tp_group, None)
 
-        shard_size = gathered_grad.shape[0] // gtp_remat_size
-        return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
+        if self.tp_mode == "duplicated":
+            # All-gather the full matrix over GTP (dim 0), orthogonalize the whole tensor
+            # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
+            gathered_grad = self._all_gather_tensor(grad, gtp_remat_group, 0)
+            gathered_grad = self.scaled_orthogonalize_fn(gathered_grad, tp_group, partition_dim)
+            shard_size = gathered_grad.size(0) // gtp_remat_size
+            gtp_rank = get_pg_rank(gtp_remat_group)
+            return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
+
+        # distributed: NS via the small-Gram all-reduce (no redundant full-matrix NS).
+        # A momentum with both TP and GTP as sharding axes takes two communication steps: an
+        # all-gather that eliminates one axis, then the Gram all-reduce that distributes NS over
+        # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
+        # communication needed. partition_dim is what says whether TP is a sharding axis here,
+        # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
+        needs_two_step_communication = (
+            partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
+        )
+
+        if not needs_two_step_communication:
+            # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
+            return self.scaled_orthogonalize_fn(grad, gtp_remat_group, partition_dim=0)
+
+        # GTP + TP: distributed NS can only operate over one (group, dim) at a
+        # time. Distribute over the larger group so that the NS GEMMs are sharded
+        # across more ranks (less redundant compute), and all-gather the smaller
+        # group to eliminate its sharding beforehand.
+        tp_size = get_pg_size(tp_group)
+        if gtp_remat_size >= tp_size:
+            smaller_group, smaller_dim = tp_group, partition_dim
+            larger_group, larger_dim = gtp_remat_group, 0
+        else:
+            smaller_group, smaller_dim = gtp_remat_group, 0
+            larger_group, larger_dim = tp_group, partition_dim
+
+        gathered_grad = self._all_gather_tensor(grad, smaller_group, smaller_dim)
+        orthogonalized_grad = self.scaled_orthogonalize_fn(gathered_grad, larger_group, larger_dim)
+        shard_size = orthogonalized_grad.size(smaller_dim) // get_pg_size(smaller_group)
+        reshard_rank = get_pg_rank(smaller_group)
+        return orthogonalized_grad.narrow(
+            smaller_dim, reshard_rank * shard_size, shard_size
+        ).contiguous()
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
         Args:
-            p: The parameter tensor. i is necessary to pass param tensor in addition to
+            p: The parameter tensor. It is necessary to pass param tensor in addition to
                 momentum because a lot of information is only available in the param tensor,
                 attributes for example.
             grad: The momentum tensor.

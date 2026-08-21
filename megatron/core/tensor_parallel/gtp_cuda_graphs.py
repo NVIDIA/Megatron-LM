@@ -36,13 +36,15 @@ class GraphWgradRingSlot:
 
 @dataclass
 class GTPCaptureCommState:
-    """Asynchronous GTP work issued while capturing one CUDA graph."""
+    """GTP work and parameter-readiness dependencies issued while capturing one CUDA graph."""
 
     params: list = field(default_factory=list)
+    params_to_ensure_ready: list = field(default_factory=list)
     ag_streams: list = field(default_factory=list)
     rs_streams: list = field(default_factory=list)
     wgrad_ring_slots: list = field(default_factory=list)
     _param_ids: set = field(default_factory=set)
+    _param_ids_to_ensure_ready: set = field(default_factory=set)
     _ag_stream_ids: set = field(default_factory=set)
     _rs_stream_ids: set = field(default_factory=set)
     _wgrad_ring_slot_params: dict = field(default_factory=dict)
@@ -60,6 +62,14 @@ class GTPCaptureCommState:
         if stream_id not in stream_ids:
             stream_ids.add(stream_id)
             streams.append(stream)
+
+    def register_params_to_ensure_ready(self, params: Iterable) -> None:
+        """Record parameters that must be published before this graph replays."""
+        for param in params:
+            param_id = id(param)
+            if param_id not in self._param_ids_to_ensure_ready:
+                self._param_ids_to_ensure_ready.add(param_id)
+                self.params_to_ensure_ready.append(param)
 
     def register_wgrad_ring_slot(self, slot: GraphWgradRingSlot, param) -> None:
         """Track slots used by this graph and reject unsafe intra-graph aliasing."""
@@ -83,6 +93,12 @@ def register_capture_comm(param, stream: torch.cuda.Stream, *, reduce_scatter: b
     """Register communication with the active capture, if one exists."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
         _ACTIVE_CAPTURE_COMM_STATE.register_comm(param, stream, reduce_scatter=reduce_scatter)
+
+
+def register_capture_params_to_ensure_ready(params: Iterable) -> None:
+    """Record GTP parameter reads that need publication before graph replay."""
+    if _ACTIVE_CAPTURE_COMM_STATE is not None:
+        _ACTIVE_CAPTURE_COMM_STATE.register_params_to_ensure_ready(params)
 
 
 def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:

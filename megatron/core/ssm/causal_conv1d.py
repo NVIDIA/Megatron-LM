@@ -1,15 +1,63 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Causal convolution over contiguous context-parallel sequence shards."""
+"""Causal convolution over contiguous context-parallel sequence shards, and the determinism
+guard the SSM mixers apply to the causal_conv1d backward."""
+
+import os
 
 import torch
 
 from megatron.core.tensor_parallel.mappings import all_to_all
+from megatron.core.utils import is_causal_conv1d_min_version
 
 try:
     from causal_conv1d import causal_conv1d_fn
 except ImportError:
     causal_conv1d_fn = None
+
+
+def _use_causal_conv1d_deterministic_mode():
+    """Whether causal_conv1d's backward will take its deterministic reduction.
+
+    Mirrors the kernel's own ``use_deterministic_mode()`` (``csrc/causal_conv1d.cpp``): only a
+    leading ``'1'`` or ``'0'`` decides, anything else falls through to torch.
+    """
+    env = os.environ.get('CAUSAL_CONV1D_DETERMINISTIC')
+    if env:
+        if env[0] == '1':
+            return True
+        if env[0] == '0':
+            return False
+    return torch.are_deterministic_algorithms_enabled()
+
+
+def assert_causal_conv1d_deterministic(deterministic_mode):
+    """Refuse a deterministic run whose convolution cannot be bit-reproducible.
+
+    The conv backward combines each weight-gradient element's per-block partials with
+    ``atomicAdd``, which fixes no order; 1.6.0+ uses a per-block workspace and an ordered
+    reduce instead. Worst on the channel-last layout GDP and Mamba's fused path both feed the
+    conv, where an element takes ``batch * ceil(seqlen / 128)`` contributions rather than the
+    channels-first ``batch``.
+
+    Call once at construction. Keyed on ``deterministic_mode``, not torch's global flag, which
+    unrelated tests set and never restore.
+    """
+    if not deterministic_mode or causal_conv1d_fn is None:
+        return
+
+    assert _use_causal_conv1d_deterministic_mode(), (
+        "deterministic_mode requires a deterministic causal_conv1d backward. Enable it with "
+        "torch.use_deterministic_algorithms(True) (which --deterministic-mode does) or "
+        "CAUSAL_CONV1D_DETERMINISTIC=1."
+    )
+    # https://github.com/Dao-AILab/causal-conv1d/pull/88 added the deterministic reduction.
+    conv1d_min = "1.6.0"
+    assert is_causal_conv1d_min_version(conv1d_min), (
+        f"causal_conv1d >= {conv1d_min} is required for deterministic_mode: older builds "
+        "reduce the conv weight and bias gradients with atomicAdd, which is not "
+        "bit-reproducible, and ignore CAUSAL_CONV1D_DETERMINISTIC."
+    )
 
 
 def _exchange_initial_states(

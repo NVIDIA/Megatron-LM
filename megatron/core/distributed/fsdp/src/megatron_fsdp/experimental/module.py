@@ -246,6 +246,7 @@ class FsdpModule:
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
+        module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.
         module.register_forward_pre_hook(
@@ -284,6 +285,26 @@ class FsdpModule:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
                 fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+
+    @staticmethod
+    def _pre_load_state_dict(
+        _module: nn.Module,
+        _state_dict: dict[str, object],
+        _prefix: str,
+        local_metadata: dict[str, object],
+        _strict: bool,
+        _missing_keys: list[str],
+        _unexpected_keys: list[str],
+        _error_msgs: list[str],
+    ) -> None:
+        """Reject state-dict loads that replace parameters managed by FSDP."""
+        # PyTorch propagates load_state_dict(assign=True) to pre-hooks through
+        # this internal metadata key before replacing parameters and buffers.
+        if local_metadata.get("assign_to_params_buffers", False):
+            raise RuntimeError(
+                "load_state_dict(assign=True) is not supported after fully_shard(). "
+                "Load before fully_shard() or use an in-place load path with assign=False."
+            )
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
