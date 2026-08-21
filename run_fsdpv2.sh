@@ -11,10 +11,20 @@ export  NVTE_NORM_BWD_USE_CUDNN=1
 export  NVTE_FWD_LAYERNORM_SM_MARGIN=16
 export  NVTE_BWD_LAYERNORM_SM_MARGIN=16
 
+# Required by GroupedMLP._is_fused_impl_supported() whenever the TE op fuser is
+# combined with a GLU activation; without it the fused path is rejected.
+export  NVTE_CUTEDSL_FUSED_GROUPED_MLP=1
+
 export  PYTHONWARNINGS=ignore
 export  NCCL_DEBUG=VERSION
 export  NCCL_GRAPH_REGISTER=0
 export  NCCL_ALGO=Ring
+
+#Torch Compile stuff
+# Dynamo reads TORCH_COMPILE_DISABLE at import time, so it also neutralizes the
+# @jit_fuser (torch.compile) decorators that are bound before arg parsing.
+export NO_TORCH_COMPILE=1
+export TORCH_COMPILE_DISABLE=1
 
 
 MEGATRON_LM_DIR="$LUSTRE_ROOT/Megatron-LM"
@@ -79,7 +89,7 @@ MODEL_ARGS=(
   
 
   # FSDP args
-  #--megatron-fsdp-version=2
+  --megatron-fsdp-version=2
   --use-megatron-fsdp 
   --data-parallel-sharding-strategy="optim_grads_params"
   --outer-dp-sharding-strategy="no_shard"
@@ -87,21 +97,23 @@ MODEL_ARGS=(
   --num-distributed-optimizer-instances=1
 
   # Precision
-  --fp8-format="hybrid"
-  --fp8-recipe="mxfp8"
+  #--fp8-format="hybrid"
+  #--fp8-recipe="mxfp8"
   #--fp8-param-gather
+  --bf16
+
+
   --megatron-fsdp-main-params-dtype=fp32
   --megatron-fsdp-main-grads-dtype=fp32
   --megatron-fsdp-grad-comm-dtype=fp32
 
   # Training args
-  --use-mcore-models
   --sequence-parallel
   --disable-bias-linear
   --no-gradient-accumulation-fusion
   --micro-batch-size=4
   --global-batch-size=32
-  --train-iters=50
+  --train-iters=10
   --exit-duration-in-mins=60
   --no-check-for-nan-in-loss-and-grad 
   --no-rope-fusion
@@ -110,11 +122,18 @@ MODEL_ARGS=(
   --manual-gc 
   --manual-gc-interval=100
   --deterministic-mode 
-  --seed=42 
+  --seed=1234
+
+  --disable-jit-fuser
 
 
   # Transformer Engine args
   --transformer-impl=transformer_engine
+  #--transformer-impl=local
+
+  # The local backend builds norms via WrappedTorchNorm, which rejects the Apex
+  # persistent fused LayerNorm kernel.
+  #--no-persist-layer-norm
 
   # Recompute args
   #--recompute-granularity=selective
@@ -122,7 +141,7 @@ MODEL_ARGS=(
 
   # CPU Offloading
   #--fine-grained-activation-offloading 
-  #--offload-modules core_attn attn_proj 
+  #--offload-modules core_attn attn_proj
 
 
   # Data args
@@ -183,8 +202,8 @@ MODEL_ARGS=(
   --moe-router-pre-softmax 
   
   # MoE Dispatcher
-  --moe-token-dispatcher-type=alltoall
-  #--moe-flex-dispatcher-backend=hybridep
+  --moe-token-dispatcher-type=flex
+  --moe-flex-dispatcher-backend=hybridep
   
   # MLA args (DeepSeek-style)
   --q-lora-rank=256
@@ -196,6 +215,24 @@ MODEL_ARGS=(
   --mscale=1.0
   --mscale-all-dim=1.0
   --attention-backend=unfused
+
+  # Cuda Graphs
+  --cuda-graph-impl=local
+  --cuda-graph-scope=full_iteration
+
+  #--megatron-fsdp-cuda-graph-mode 
+  #--overlap-dispatch-backward-with-experts-wgrad
+  #--moe-paged-stash
+
+  # Full-iteration capture includes the HybridEP token dispatch, so the dispatch has to be
+  # sync-free: the rank capacity factor gives it a static permuted-token budget, and the
+  # grouped-tensor expert path keeps the GEMMs off host-side token counts.
+  --moe-expert-rank-capacity-factor=1
+  --moe-use-grouped-tensor
+  --use-transformer-engine-op-fuser
+
+  --moe-router-force-load-balancing
+
 
 
   # Validation

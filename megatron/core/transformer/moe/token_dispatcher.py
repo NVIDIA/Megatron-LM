@@ -316,6 +316,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ].contiguous()
 
+        # #region agent log
+        # import json as _j, time as _t
+        # open('/home/gkollu/lustre/.cursor/debug-788eac.log', 'a').write(_j.dumps({"sessionId": "788eac", "runId": "pre-fix", "hypothesisId": "H2,H1,H5", "location": "token_dispatcher.py:319", "message": "AllGather dispatch_postprocess about to DtoH-copy tokens_per_expert", "data": {"dispatcher_cls": type(self).__name__, "cfg_dispatcher_type": str(self.config.moe_token_dispatcher_type), "cuda_graph_impl": str(getattr(self.config, 'cuda_graph_impl', None)), "cuda_graph_modules": [str(m) for m in (getattr(self.config, 'cuda_graph_modules', None) or [])], "capturing": torch.cuda.is_current_stream_capturing(), "pad_to_capacity": bool(getattr(self.config, 'moe_pad_expert_input_to_capacity', False)), "capacity_factor": getattr(self.config, 'moe_expert_capacity_factor', None), "tp_size": self.tp_size, "ep_size": self.ep_size}, "timestamp": int(_t.time() * 1000)}) + "\n")
+        # #endregion
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
         permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping, _, _ = (
@@ -469,6 +473,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cuda_dtoh_point = "before_ep_alltoall"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
+
+        # #region agent log
+        # import json as _j, time as _t
+        # open('/home/gkollu/lustre/.cursor/debug-788eac.log', 'a').write(_j.dumps({"sessionId": "788eac", "runId": "pre-fix", "hypothesisId": "H3,H1", "location": "token_dispatcher.py:471", "message": "AlltoAll dispatcher init: dtoh/sync config", "data": {"drop_and_pad": bool(self.drop_and_pad), "cuda_dtoh_point": self.cuda_dtoh_point, "cuda_graph_impl": str(getattr(config, 'cuda_graph_impl', None)), "cuda_graph_modules": [str(m) for m in (getattr(config, 'cuda_graph_modules', None) or [])], "capacity_factor": getattr(config, 'moe_expert_capacity_factor', None), "pad_to_capacity": bool(getattr(config, 'moe_pad_expert_input_to_capacity', False))}, "timestamp": int(_t.time() * 1000)}) + "\n")
+        # #endregion
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
@@ -923,6 +932,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
         """
+        # #region agent log
+        # import json as _j, time as _t
+        # open('/home/gkollu/lustre/.cursor/debug-788eac.log', 'a').write(_j.dumps({"sessionId": "788eac", "runId": "pre-fix", "hypothesisId": "H3", "location": "token_dispatcher.py:920", "message": "AlltoAll _maybe_dtoh_and_synchronize reached", "data": {"point": point, "drop_and_pad": bool(self.drop_and_pad), "cuda_dtoh_point": self.cuda_dtoh_point, "cuda_sync_point": self.cuda_sync_point, "will_dtoh": (not self.drop_and_pad) and point == self.cuda_dtoh_point, "capturing": torch.cuda.is_current_stream_capturing()}, "timestamp": int(_t.time() * 1000)}) + "\n")
+        # #endregion
         if not self.drop_and_pad:
             if point == self.cuda_dtoh_point:
                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
