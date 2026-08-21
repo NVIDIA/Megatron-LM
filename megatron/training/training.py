@@ -3800,7 +3800,18 @@ def save_checkpoint_and_time(
                     model_chunk.free_overlap_buffers()
 
         # timer.log() reports the min & max time. We do not need a barrier here.
-        timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+        # NOTE: when --async-save is enabled, save_checkpoint() below only *dispatches*
+        # the save (the actual write happens later, off the critical path, and is
+        # finalized in maybe_finalize_async_save()). Give the timer a name that makes
+        # that explicit, so the logged duration isn't mistaken for the full save time.
+        if non_persistent_ckpt:
+            timer_key = (
+                'save-checkpoint-non-persistent-async-request'
+                if args.async_save
+                else 'save-checkpoint-non-persistent'
+            )
+        else:
+            timer_key = 'save-checkpoint-async-request' if args.async_save else 'save-checkpoint'
         timers(timer_key, log_level=0).start(barrier=False)
 
         # Resolve checkpoint groups from this rank's module PGC; None for stock runs
@@ -3842,7 +3853,8 @@ def save_checkpoint_and_time(
                 rng_state_key_prefix=rng_state_key_prefix,
             )
 
-            # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
+            # Stop timer and compute time elapsed to save (or, for --async-save, to dispatch)
+            # the checkpoint. Stop timer before timers.log() call as it resets the timer.
             # Since timer.log() reports the min & max time, we do not need a barrier here.
             timers(timer_key).stop(barrier=False)
             save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
