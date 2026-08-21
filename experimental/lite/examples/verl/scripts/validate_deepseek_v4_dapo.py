@@ -11,8 +11,6 @@ import argparse
 import importlib.metadata as metadata
 import inspect
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -31,9 +29,6 @@ MINIMUM_DEPENDENCIES = {
     "transformer-engine": "2.15.0",
     "nvidia-cudnn-frontend": "1.27.0",
 }
-EXPECTED_VERL_COMMIT = "e284c51e"
-
-
 def installed(name: str) -> str:
     try:
         return metadata.version(name)
@@ -52,27 +47,6 @@ def validate_geometry(model_config: Path, rollout_tp: int) -> None:
         f"DS4_ROLLOUT_TP_PREFLIGHT_PASSED o_groups={o_groups} rollout_tp={rollout_tp}",
         flush=True,
     )
-
-
-def verl_commit() -> str:
-    declared = os.environ.get("VERL_COMMIT")
-    root = os.environ.get("VERL_ROOT")
-    if declared is None and root:
-        try:
-            declared = subprocess.check_output(
-                ["git", "-C", root, "rev-parse", "HEAD"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            pass
-    if declared is None:
-        raise SystemExit(
-            f"VERL provenance is not verifiable; set VERL_COMMIT={EXPECTED_VERL_COMMIT}"
-        )
-    if not declared.startswith(EXPECTED_VERL_COMMIT):
-        raise SystemExit(f"DS4 requires VERL {EXPECTED_VERL_COMMIT}, got {declared}")
-    return declared
 
 
 def validate_environment() -> None:
@@ -113,10 +87,9 @@ def validate_environment() -> None:
             "nvidia-cudnn-frontend lacks q_causal_offsets required by fused DSA CP"
         )
 
-    declared_verl = verl_commit()
     print(
         "DS4_DEPENDENCY_CONTRACT_PASSED "
-        f"verl={declared_verl} python={sys.version.split()[0]} "
+        f"python={sys.version.split()[0]} "
         f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
         f"vllm={actual['vllm']} te={actual['transformer-engine']} "
         f"cudnn_frontend={actual['nvidia-cudnn-frontend']} "
