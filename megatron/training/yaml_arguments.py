@@ -135,8 +135,8 @@ def validate_yaml(args, defaults={}):
 
     # num_layers_per_virtual_pipeline_stage is not insde model parallel for checkpointing
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        assert args.model_parallel.pipeline_model_parallel_size > 2, \
-            'pipeline-model-parallel size should be greater than 2 with ' \
+        assert args.model_parallel.pipeline_model_parallel_size > 1, \
+            'pipeline-model-parallel size should be greater than 1 with ' \
             'interleaved schedule'
         assert args.language_model.num_layers % args.model_parallel.transformer_pipeline_model_parallel_size == 0, \
             'number of layers should be divisible by the pipeline parallel size'
