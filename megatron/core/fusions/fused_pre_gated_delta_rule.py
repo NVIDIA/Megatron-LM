@@ -1918,7 +1918,7 @@ def _triton_pre_gated_delta_rule_forward(
         batch, seq_len, num_value_heads, value_head_dim, dtype=out_dtype, device=device
     )
     g = torch.empty(batch, seq_len, num_value_heads, dtype=torch.float32, device=device)
-    beta = torch.empty(batch, seq_len, num_value_heads, dtype=out_dtype, device=device)
+    beta = torch.empty(batch, seq_len, num_value_heads, dtype=torch.float32, device=device)
 
     # Conv weight is (conv_dim, 1, K_W); we treat it as (conv_dim, K_W).
     weight_2d = conv1d_weight.view(conv1d_weight.shape[0], k_w)
