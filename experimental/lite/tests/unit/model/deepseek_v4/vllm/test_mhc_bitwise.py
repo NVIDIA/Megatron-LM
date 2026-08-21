@@ -134,7 +134,6 @@ def test_layer_matches_lite_unfused_pre_block_post_sequence(monkeypatch) -> None
         streams,
         position_ids=torch.arange(tokens),
         attention_metadata=object(),
-        moe_metadata=object(),
     )
 
     assert calls == [

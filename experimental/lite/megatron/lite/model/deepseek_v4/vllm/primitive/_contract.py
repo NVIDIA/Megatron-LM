@@ -5,14 +5,6 @@ from collections.abc import Iterable
 import torch
 
 
-def own_visible_tensor(value: torch.Tensor) -> torch.Tensor:
-    if not isinstance(value, torch.Tensor):
-        raise TypeError("a vLLM training bridge must own a tensor output")
-    if value.is_inference():
-        raise RuntimeError("the vLLM training model cannot run under inference_mode")
-    return value
-
-
 def parameter_versions(parameters: Iterable[torch.Tensor]) -> tuple[int, ...]:
     return tuple(parameter._version for parameter in parameters)
 

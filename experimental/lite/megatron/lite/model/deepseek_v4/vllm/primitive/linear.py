@@ -7,7 +7,6 @@ import torch
 from ._contract import (
     check_parameter_versions,
     fp32_linear_vjp,
-    own_visible_tensor,
     parameter_versions,
 )
 
@@ -21,7 +20,7 @@ class _VisibleLinear(torch.autograd.Function):
         ctx.save_for_backward(value)
         ctx.weights = weights
         ctx.versions = parameter_versions(weights)
-        return own_visible_tensor(output)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):

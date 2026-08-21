@@ -9,26 +9,25 @@ import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.checkpoint import (
-    export_hf_weights,
+    export_hf_weights as export_hf_weights,
     invalidate_bound_source_scales,
-    load_hf_weights,
-    save_hf_weights,
+    load_hf_weights as load_hf_weights,
+    save_hf_weights as save_hf_weights,
 )
 from megatron.lite.model.deepseek_v4.lite.protocol import (
     ImplConfig as LiteImplConfig,
     MODULE_MAP,
     _optimizer_backend_name,
-    build_model_config,
+    build_model_config as build_model_config,
     build_training_backend,
-    is_expert_param,
+    is_expert_param as is_expert_param,
     pack_packed_batch,
-    pack_r3_replay_mask,
-    pack_routed_experts,
-    unpack_forward_output,
+    pack_r3_replay_mask as pack_r3_replay_mask,
+    pack_routed_experts as pack_routed_experts,
+    unpack_forward_output as unpack_forward_output,
 )
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
     DS4SparseIndexerCompressorMetadataAdapter,
-    build_moe_metadata,
     ds4_vllm_forward_context,
     initialize_ds4_vllm_batch_invariance,
 )
@@ -96,10 +95,6 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
         raise ValueError(
             f"EP={parallel.ep} must divide {model_cfg.n_routed_experts} routed experts."
         )
-    if not impl_cfg.use_deepep:
-        raise NotImplementedError(
-            "DeepSeek V4 vLLM requires normal DeepEP training transport."
-        )
     if impl_cfg.mtp_enable:
         raise NotImplementedError("DeepSeek V4 vLLM skeleton does not support MTP yet.")
     enabled = [
@@ -150,7 +145,6 @@ def _forward_step(
     batch,
     *,
     attention_metadata=None,
-    moe_metadata=None,
     forward_inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     kwargs = {
@@ -160,11 +154,6 @@ def _forward_step(
             getattr(batch, "attention_metadata", None)
             if attention_metadata is None
             else attention_metadata
-        ),
-        "moe_metadata": (
-            getattr(batch, "moe_metadata", None)
-            if moe_metadata is None
-            else moe_metadata
         ),
         "labels": getattr(batch, "labels", None),
         "loss_mask": getattr(batch, "loss_mask", None),
@@ -217,7 +206,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     model = DeepseekV4Model(
         model_cfg,
         ps=parallel_state,
-        use_deepep=impl_cfg.use_deepep,
         indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
         logprob_chunk_size=impl_cfg.logprob_chunk_size,
         cache_deployment_weights=_deployment_weight_cache_enabled(impl_cfg),
@@ -247,12 +235,11 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             init_workspace_manager(next(model.parameters()).device, num_ubatches=1)
     selected_layers = tuple(model.layer_indices)
     attention_builders = None
-    moe_metadata = None
 
     def ensure_runtime_assets():
-        nonlocal attention_builders, moe_metadata
-        if attention_builders is not None and moe_metadata is not None:
-            return attention_builders, moe_metadata
+        nonlocal attention_builders
+        if attention_builders is not None:
+            return attention_builders
         device = next(model.parameters()).device
         attention_builders = {
             layer_idx: DS4SparseIndexerCompressorMetadataAdapter.from_hf(
@@ -263,27 +250,16 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             )
             for layer_idx in selected_layers
         }
-        moe_metadata = {
-            layer_idx: build_moe_metadata(model_cfg, device)
-            for layer_idx in selected_layers
-        }
-        return attention_builders, moe_metadata
+        return attention_builders
     from vllm.config import VllmConfig
 
     vllm_config = VllmConfig()
 
     def forward_step(model: nn.Module, batch) -> dict[str, torch.Tensor]:
         attention_metadata = getattr(batch, "attention_metadata", None)
-        moe_metadata = getattr(batch, "moe_metadata", None)
-        if (attention_metadata is None) != (moe_metadata is None):
-            raise ValueError(
-                "caller-owned attention_metadata and moe_metadata must be "
-                "provided together"
-            )
         current_attention_builders = None
-        current_moe_metadata = None
-        if attention_metadata is None or moe_metadata is None:
-            current_attention_builders, current_moe_metadata = ensure_runtime_assets()
+        if attention_metadata is None:
+            current_attention_builders = ensure_runtime_assets()
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
             if parallel_state.cp_size > 1:
@@ -319,9 +295,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                     ].build_prefill_batch(token_counts)
                     for layer_idx in selected_layers
                 }
-        if moe_metadata is None:
-            assert current_moe_metadata is not None
-            moe_metadata = current_moe_metadata
         if parallel_state.cp_size > 1:
             if cp_packed_seq_params is None:
                 raise RuntimeError("DeepSeek V4 vLLM CP requires packed sequence metadata")
@@ -345,7 +318,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 model,
                 batch,
                 attention_metadata=attention_metadata,
-                moe_metadata=moe_metadata,
                 forward_inputs=forward_inputs,
             )
 
@@ -370,10 +342,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         "model_cfg": model_cfg,
         "optimizer_backend": optimizer_backend,
     }
-    if torch.cuda.is_available():
-        from vllm.v1.worker.workspace import reset_workspace_manager
-
-        extras["close_hook"] = reset_workspace_manager
     extras["post_optimizer_step_hook"] = lambda: _post_optimizer_step(model)
     if post_model_load_hook is not None:
         extras["post_model_load_hook"] = post_model_load_hook

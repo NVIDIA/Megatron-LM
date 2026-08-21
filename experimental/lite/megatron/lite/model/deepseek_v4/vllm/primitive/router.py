@@ -5,9 +5,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from ._contract import own_visible_tensor
-
-
 class _VLLMFixedRouteFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, logits, visible_op, renormalize, route_scale):
@@ -19,7 +16,7 @@ class _VLLMFixedRouteFunction(torch.autograd.Function):
         ctx.renormalize = renormalize
         ctx.route_scale = route_scale
         ctx.mark_non_differentiable(ids)
-        return own_visible_tensor(weights), ids
+        return weights, ids
 
     @staticmethod
     def backward(ctx: Any, grad_weights, _grad_ids):

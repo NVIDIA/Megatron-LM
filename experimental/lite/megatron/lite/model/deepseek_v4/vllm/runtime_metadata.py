@@ -10,7 +10,6 @@ from typing import Any, Iterator
 
 import torch
 import torch.distributed as dist
-from torch import nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.primitive.parallel import ParallelState
@@ -147,28 +146,6 @@ def ds4_vllm_forward_context(
         yield
 
 
-class _RuntimeGateLinear(nn.Module):
-    def __init__(self, input_size: int, output_size: int, *, device: torch.device) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(output_size, input_size, dtype=torch.bfloat16, device=device)
-        )
-
-    def forward(self, hidden_states: torch.Tensor):
-        if hidden_states.shape[0] <= 16:
-            is_available = _symbol(
-                "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16",
-                "is_available",
-            )
-            if is_available():
-                kernel = _symbol(
-                    "vllm.model_executor.kernels.linear.cute_dsl.ll_bf16",
-                    "ll_bf16_gemm",
-                )
-                return kernel(hidden_states, self.weight), None
-        return torch.mm(hidden_states, self.weight.T, out_dtype=torch.float32), None
-
-
 def _build_rope(
     hf_config: Any,
     config: DeepseekV4Config,
@@ -263,11 +240,6 @@ class AttentionKernelMetadata:
     cp_positions: torch.Tensor | None = None
     cp_compressor_operation: Any | None = None
     cp_compressor_metadata: Any | None = None
-
-
-@dataclass
-class MoEKernelMetadata:
-    gate_linear: Any | None
 
 
 def build_native_cp_attention_metadata(
@@ -977,12 +949,3 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
             indexer_block_table=indexer_block_table,
         )
         return metadata
-
-
-def build_moe_metadata(config: DeepseekV4Config, device: torch.device | str):
-    gate = _RuntimeGateLinear(
-        config.hidden_size,
-        config.n_routed_experts,
-        device=torch.device(device),
-    )
-    return MoEKernelMetadata(gate_linear=gate)

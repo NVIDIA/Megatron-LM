@@ -105,6 +105,16 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             raise ValueError("top-k IDs and scores must have identical shapes")
         topk_indices = topk_indices.long().contiguous()
         topk_scores = topk_scores.float().contiguous()
+        (
+            route_indices,
+            route_weights,
+            route_fingerprints,
+            source_output_index,
+        ) = _compact_route_preserving_metadata_inputs(
+            hidden_states,
+            topk_indices,
+            topk_scores,
+        )
 
         if self.ep_size > 1:
             (
@@ -121,16 +131,6 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
                 self.num_experts,
                 False,
                 False,
-            )
-            (
-                route_indices,
-                route_weights,
-                route_fingerprints,
-                source_output_index,
-            ) = _compact_route_preserving_metadata_inputs(
-                hidden_states,
-                topk_indices,
-                topk_scores,
             )
             (
                 received_fingerprints,
@@ -150,18 +150,10 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             received_hidden = hidden_states
             received_indices = topk_indices
             received_weights = topk_scores
-            positions = torch.nonzero(topk_indices >= 0, as_tuple=False)
-            token_rows = positions[:, 0]
-            topk_slots = positions[:, 1]
-            received_fingerprints = (
-                hidden_states.detach().narrow(1, 0, 16).index_select(0, token_rows)
-            )
-            received_route_indices = topk_indices[token_rows, topk_slots]
-            received_route_weights = topk_scores[token_rows, topk_slots]
+            received_fingerprints = route_fingerprints
+            received_route_indices = route_indices
+            received_route_weights = route_weights
             route_handle = None
-            source_output_index = torch.arange(
-                topk_indices.numel(), device=topk_indices.device, dtype=torch.long
-            ).reshape_as(topk_indices)
             received_per_expert = torch.bincount(
                 received_route_indices.reshape(-1).long(),
                 minlength=self.num_local_experts,

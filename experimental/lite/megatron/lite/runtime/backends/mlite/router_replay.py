@@ -171,7 +171,6 @@ class RouterReplayDriver:
             print(
                 f"R3_REPLAY_EVIDENCE calls={stats['calls']} rows={stats['rows']} "
                 f"changed={stats['changed']} changed_frac={frac:.6f} "
-                f"sets_changed={stats['sets_changed']} "
                 f"routers={self._num_routers}",
                 flush=True,
             )

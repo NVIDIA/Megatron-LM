@@ -393,26 +393,33 @@ def _compact_route_preserving_metadata_inputs(
         raise TypeError("Route weights must be FP32")
 
     flat_indices = topk_indices.reshape(-1)
-    torch._assert_async(
-        torch.all(flat_indices >= 0),
-        "Route-preserving DeepEP requires a valid fixed top-k",
+    valid_positions = torch.nonzero(flat_indices >= 0, as_tuple=False).reshape(-1)
+    if valid_positions.numel() == 0:
+        raise RuntimeError("Route-preserving DeepEP received no valid expert routes")
+    compact_indices = flat_indices.index_select(0, valid_positions)
+    compact_weights = topk_weights.detach().reshape(-1).index_select(
+        0, valid_positions
+    )
+    token_rows = torch.div(
+        valid_positions, topk_indices.shape[1], rounding_mode="floor"
     )
     fingerprints = (
         hidden_states.detach()
         .narrow(1, 0, 16)
-        .unsqueeze(1)
-        .expand(-1, topk_indices.shape[1], -1)
-        .reshape(-1, 16)
+        .index_select(0, token_rows)
         .contiguous()
     )
-    output_index = torch.arange(
-        flat_indices.numel(),
-        device=flat_indices.device,
-        dtype=torch.long,
-    ).reshape_as(topk_indices)
+    output_index = torch.full_like(topk_indices, -1, dtype=torch.long)
+    output_index.reshape(-1).index_copy_(
+        0,
+        valid_positions,
+        torch.arange(
+            valid_positions.numel(), device=valid_positions.device, dtype=torch.long
+        ),
+    )
     return (
-        flat_indices.reshape(-1, 1).contiguous(),
-        topk_weights.detach().reshape(-1, 1).contiguous(),
+        compact_indices.reshape(-1, 1).contiguous(),
+        compact_weights.reshape(-1, 1).contiguous(),
         fingerprints,
         output_index,
     )
@@ -455,12 +462,9 @@ def _validate_and_order_route_preserving_outputs(
 ) -> torch.Tensor:
     """Return expert outputs in the route handle's receive order.
 
-    Normal DeepEP's primary dispatch is rank-deduplicated: its received route
-    probabilities are not a reliable per-(token, slot) identity when one token
-    reaches multiple experts on the same rank.  Pair the primary hidden rows
-    with the route-preserving metadata by expert ID and a sixteen-BF16 source
-    fingerprint.  The metadata dispatch and the caller-owned source weights
-    remain authoritative for exact route probabilities.
+    DeepEP currently preserves source-token/slot order between the primary
+    rank-deduplicated dispatch and the route-level metadata dispatch.  Match
+    Slime by validating that invariant before consuming the route handle.
     """
     if expert_outputs.ndim != 2 or received_tokens.ndim != 2:
         raise ValueError("Route-preserving DeepEP expects 2D hidden tensors")
@@ -482,6 +486,7 @@ def _validate_and_order_route_preserving_outputs(
     token_rows = positions[:, 0]
     topk_slots = positions[:, 1]
     expected_indices = received_topk_indices[token_rows, topk_slots].reshape(-1)
+    expected_weights = received_topk_weights[token_rows, topk_slots].reshape(-1)
     expected_fingerprints = received_tokens.narrow(1, 0, 16).index_select(0, token_rows)
     if route_fingerprints.shape != expected_fingerprints.shape:
         raise RuntimeError(
@@ -489,65 +494,19 @@ def _validate_and_order_route_preserving_outputs(
             f"{tuple(route_fingerprints.shape)} != {tuple(expected_fingerprints.shape)}"
         )
 
-    def stable_key_order(
-        fingerprints: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Lexicographically order exact route identity without hashing."""
-        order = torch.arange(indices.numel(), device=indices.device, dtype=torch.long)
-        fingerprint_bits = fingerprints.contiguous().view(torch.int16)
-        columns = [
-            *(
-                fingerprint_bits[:, column]
-                for column in range(fingerprint_bits.shape[1])
-            ),
-            indices.to(dtype=torch.long),
-        ]
-        # Stable least-significant-to-most-significant sorts implement a
-        # deterministic lexicographic order and retain duplicate multiplicity.
-        for column in reversed(columns):
-            permutation = torch.argsort(column.index_select(0, order), stable=True)
-            order = order.index_select(0, permutation)
-        return order
-
-    primary_order = stable_key_order(expected_fingerprints, expected_indices)
-    metadata_order = stable_key_order(
-        route_fingerprints,
-        route_indices.to(dtype=expected_indices.dtype),
+    torch._assert_async(
+        torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
+        "Route-preserving DeepEP metadata changed local expert order",
     )
     torch._assert_async(
-        torch.all(
-            expected_indices.index_select(0, primary_order)
-            == route_indices.to(dtype=expected_indices.dtype).index_select(
-                0, metadata_order
-            )
-        ),
-        "Route-preserving DeepEP metadata changed expert identities",
+        torch.all(expected_weights == route_weights.to(dtype=expected_weights.dtype)),
+        "Route-preserving DeepEP metadata changed route probability order",
     )
     torch._assert_async(
-        torch.all(torch.isfinite(route_weights)),
-        "Route-preserving DeepEP metadata contains nonfinite route probabilities",
+        torch.all(expected_fingerprints == route_fingerprints),
+        "Route-preserving DeepEP metadata changed source-token order",
     )
-    torch._assert_async(
-        torch.all(
-            expected_fingerprints.contiguous()
-            .view(torch.int16)
-            .index_select(0, primary_order)
-            == route_fingerprints.contiguous()
-            .view(torch.int16)
-            .index_select(0, metadata_order)
-        ),
-        "Route-preserving DeepEP metadata changed source fingerprints",
-    )
-
-    # metadata_to_primary[m] is the corresponding route occurrence in the
-    # primary hidden dispatch.  Stable ordering gives duplicate identities a
-    # deterministic one-to-one pairing; identical duplicates are semantically
-    # interchangeable.
-    metadata_to_primary = torch.empty_like(metadata_order)
-    metadata_to_primary.scatter_(0, metadata_order, primary_order)
-    primary_route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
-    route_rows = primary_route_rows.index_select(0, metadata_to_primary)
+    route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
     if return_route_rows:
         return route_rows
     if not order_outputs:

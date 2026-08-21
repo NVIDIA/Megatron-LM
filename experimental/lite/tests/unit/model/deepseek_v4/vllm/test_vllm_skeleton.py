@@ -15,7 +15,10 @@ from megatron.lite.model.deepseek_v4.vllm import protocol
 from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
-from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
+from megatron.lite.model.deepseek_v4.vllm.moe import (
+    DeepseekV4MoE,
+    _batch_invariant_gate_logits,
+)
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 from megatron.lite.primitive.parallel import ParallelState
@@ -52,6 +55,16 @@ def test_registry_exposes_vllm_training_runtime() -> None:
 def test_vllm_owns_alignment_without_changing_lite_dispatcher() -> None:
     assert LiteDeepseekV4MoE.dispatcher_cls is TokenDispatcher
     assert DeepseekV4MoE.dispatcher_cls is VLLMAlignedNormalDeepEPDispatcher
+
+
+@pytest.mark.parametrize("tokens", [1, 17])
+def test_gate_logits_use_one_batch_invariant_gemm(tokens: int) -> None:
+    hidden = torch.randn(tokens, 8, dtype=torch.bfloat16)
+    weight = torch.randn(4, 8, dtype=torch.bfloat16)
+    actual = _batch_invariant_gate_logits(hidden, weight)
+    expected = torch.mm(hidden, weight.T, out_dtype=torch.float32)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_deployment_weight_cache_policy_tracks_optimizer() -> None:
@@ -189,15 +202,12 @@ def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
         ),
     )
     attention_metadata = {0: object()}
-    moe_metadata = {0: object()}
     batch = SimpleNamespace(
         input_ids=torch.tensor([1, 2, 3]),
         attention_metadata=attention_metadata,
-        moe_metadata=moe_metadata,
     )
     bundle.forward_step(bundle.chunks[0], batch)
     assert captured["attention_metadata"] is attention_metadata
-    assert captured["moe_metadata"] is moe_metadata
 
 
 def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:

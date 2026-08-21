@@ -6,14 +6,13 @@ import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
-from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import MoEKernelMetadata
 from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive import (
     block_fp8_linear,
     fixed_route_vjp,
-    gate_linear as training_gate_linear,
+    gate_linear,
 )
 from megatron.lite.model.deepseek_v4.vllm.grouped_moe import (
     VLLMGroupedMoEWithBF16Backward,
@@ -35,9 +34,10 @@ def _learned_route(logits, bias, scale):
     return dsv4_topk(logits, bias, torch.int64, scale)
 
 
-def _gate_output(gate, hidden_states):
-    result = gate(hidden_states)
-    return result[0] if isinstance(result, tuple) else result
+def _batch_invariant_gate_logits(
+    hidden_states: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return torch.mm(hidden_states, weight.T, out_dtype=torch.float32)
 
 
 def _hash_route(logits, token_ids, tid2eid, *, topk, renormalize, scale):
@@ -100,7 +100,6 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         ps=None,
         *,
         layer_idx: int,
-        use_deepep: bool = False,
         cache_deployment_weights: bool = False,
     ):
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -121,11 +120,10 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
             config,
             ps,
             layer_idx=layer_idx,
-            use_deepep=use_deepep,
+            use_deepep=True,
         )
         self.config = config
         self.ps = ps
-        self.use_deepep = use_deepep
         self.shared_gate_up_fp8 = DeploymentBlockFP8Adapter(
             cache_weight=cache_deployment_weights
         )
@@ -177,21 +175,15 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         hidden_states: torch.Tensor,
         *,
         input_ids: torch.Tensor | None = None,
-        metadata: MoEKernelMetadata | None = None,
     ) -> torch.Tensor:
         if hidden_states.ndim != 2:
             raise ValueError("MoE requires flat [tokens, hidden]")
         if self.is_hash_layer and input_ids is None:
             raise NotImplementedError("hash MoE requires explicit input_ids")
-        if metadata is None or metadata.gate_linear is None:
-            raise NotImplementedError("MoE requires an explicit vLLM GateLinear")
-        gate_linear = metadata.gate_linear
-        if isinstance(gate_linear, nn.Module) and hasattr(gate_linear, "weight"):
-            # Bind the caller-constructed vLLM GateLinear to this model's BF16
-            # master rather than retaining a second persistent parameter.
-            gate_linear._parameters["weight"] = self.gate.gate.weight
-        logits = training_gate_linear(
-            lambda value: _gate_output(gate_linear, value),
+        logits = gate_linear(
+            lambda value: _batch_invariant_gate_logits(
+                value, self.gate.gate.weight
+            ),
             hidden_states,
             self.gate.gate.weight,
         ).float().contiguous()
@@ -231,10 +223,6 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
                 route_scale=self.config.routed_scaling_factor,
             )
 
-        if not self.use_deepep:
-            raise NotImplementedError(
-                "MoE requires normal DeepEP transport aligned to rollout route semantics"
-            )
         dispatched, tokens_per_expert, permuted_probs = self.dispatcher.dispatch(
             hidden_states,
             _kernel_topk_weights(topk_weights),

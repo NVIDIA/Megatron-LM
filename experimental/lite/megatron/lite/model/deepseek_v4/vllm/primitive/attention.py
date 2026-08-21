@@ -4,9 +4,6 @@ from typing import Any
 
 import torch
 
-from ._contract import own_visible_tensor
-
-
 def _rope_and_qnorm(value, positions, cache, rope_dim, eps, *, normalize):
     x = value.float()
     if normalize:
@@ -352,7 +349,7 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
         ctx.backward_op = backward_op or _default_sparse_backward
         ctx.scale, ctx.eps, ctx.rope_dim = scale, eps, rope_dim
         ctx.compressor_ratio = compressor_ratio
-        return own_visible_tensor(out)
+        return out
 
     @staticmethod
     def backward(ctx: Any, grad_out):
@@ -553,7 +550,7 @@ class _VisibleSparseAttentionFunction(torch.autograd.Function):
         ctx.save_for_backward(q.detach(), kv.detach(), out, lse, indices, length, sink)
         ctx.backward_op = backward_op or _default_sparse_backward
         ctx.scale = scale
-        return own_visible_tensor(out)
+        return out
 
     @staticmethod
     def backward(ctx, grad_out):

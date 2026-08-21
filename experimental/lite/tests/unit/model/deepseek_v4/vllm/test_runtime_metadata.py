@@ -230,15 +230,6 @@ def test_unified_builder_uses_selected_layer_ratio() -> None:
     assert builder.compress_ratio == 4
 
 
-def test_moe_metadata_builder_uses_tp_independent_runtime_gate() -> None:
-    metadata = runtime.build_moe_metadata(
-        _config(num_hidden_layers=4, num_hash_layers=3), "cpu"
-    )
-    assert isinstance(metadata.gate_linear, runtime._RuntimeGateLinear)
-    assert metadata.gate_linear.weight.shape == (256, 4096)
-    assert not hasattr(metadata, "build_grouped_moe")
-
-
 def test_layer1_extended_builder_reuses_swa_only_contract(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: Mock())
     builder = runtime.DS4SparseIndexerCompressorMetadataAdapter(

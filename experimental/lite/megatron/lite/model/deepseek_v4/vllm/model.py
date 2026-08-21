@@ -14,7 +14,7 @@ from megatron.lite.model.deepseek_v4.lite.model import (
     DeepseekV4Layer as LiteDeepseekV4Layer,
     DeepseekV4Model as LiteDeepseekV4Model,
 )
-from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE, MoEKernelMetadata
+from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import AttentionKernelMetadata
 from megatron.lite.model.deepseek_v4.vllm.primitive import (
     attention_core,
@@ -216,6 +216,39 @@ class _AttentionState(CompressedSparseAttention):
         self.adapters.q_linear.clear_cache()
         self.adapters.indexer_q_linear.clear_cache()
 
+    def _output_projection(
+        self,
+        result: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        heads_per_group = self.config.num_attention_heads // self.config.o_groups
+        nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
+        return o_projection(
+            lambda value, wa, wb: self.adapters.o_project(
+                value,
+                positions,
+                cos_sin_cache,
+                wa,
+                wb,
+                n_groups=self.config.o_groups,
+                heads_per_group=heads_per_group,
+                nope_dim=nope_dim,
+                rope_dim=self.config.qk_rope_head_dim,
+                o_lora_rank=self.config.o_lora_rank,
+            ),
+            result,
+            self.wo_a.weight,
+            self.wo_b.weight,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            n_groups=self.config.o_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=self.config.qk_rope_head_dim,
+            o_lora_rank=self.config.o_lora_rank,
+        )
+
     def _input_projections(self, hidden_states: torch.Tensor):
         def fused_projection():
             return fused_block_fp8_linear(
@@ -273,16 +306,22 @@ class _AttentionState(CompressedSparseAttention):
                 output.record_stream(current_stream)
         return default_output, aux_outputs
 
-    def _forward_native_cp(
-        self, hidden_states: torch.Tensor, metadata: AttentionKernelMetadata
+    def _forward_cp(
+        self,
+        hidden_states: torch.Tensor,
+        metadata: AttentionKernelMetadata,
+        q: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        projection_outputs,
     ) -> torch.Tensor:
         if self.ps is None or self.ps.cp_size <= 1 or self.ps.cp_group is None:
-            raise RuntimeError("native DS4 CP requires a model-owned CP group")
+            raise RuntimeError("DS4 CP requires a model-owned CP group")
         if metadata.cp_packed_seq_params is None or metadata.cp_positions is None:
-            raise RuntimeError("native DS4 CP requires packed sequence geometry")
+            raise RuntimeError("DS4 CP requires packed sequence geometry")
         if self.indexer_loss_coeff:
             raise NotImplementedError(
-                "native DS4 CP indexer auxiliary loss is not implemented"
+                "DS4 CP indexer auxiliary loss is not implemented"
             )
 
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
@@ -311,29 +350,13 @@ class _AttentionState(CompressedSparseAttention):
             else psp.cu_seqlens_q
         )
         if cu_seqlens is None:
-            raise RuntimeError("native DS4 CP requires cu_seqlens_q")
+            raise RuntimeError("DS4 CP requires cu_seqlens_q")
         l_local = hidden_states.shape[0]
         global_start = self.ps.cp_rank * l_local
         positions = metadata.cp_positions.reshape(-1).to(torch.int64)
         if positions.numel() != l_local:
-            raise RuntimeError("native DS4 CP position rows do not match local tokens")
-        if metadata.cos_sin_cache.dtype != torch.float32:
-            metadata.cos_sin_cache = metadata.cos_sin_cache.float()
-
-        qr_kv, projection_outputs = self._input_projections(hidden_states)
+            raise RuntimeError("DS4 CP position rows do not match local tokens")
         compressor_kv_score, indexer_weights, indexer_kv_score = projection_outputs
-        qr, kv = qr_kv.split([self.config.q_lora_rank, self.config.head_dim], dim=-1)
-        qr, kv = fused_qkv_rms_norm(
-            self.adapters.norm,
-            qr,
-            kv,
-            self.q_norm.weight,
-            self.kv_norm.weight,
-            self.config.rms_norm_eps,
-        )
-        q = block_fp8_linear(self.adapters.q_linear, qr, self.wq_b.weight).view(
-            -1, self.config.num_attention_heads, self.config.head_dim
-        ).contiguous()
         q_visible, kv_visible = official_local_qk_visible(
             q,
             kv,
@@ -435,7 +458,7 @@ class _AttentionState(CompressedSparseAttention):
                     or metadata.cp_compressor_metadata is None
                 ):
                     raise RuntimeError(
-                        "C4/C128 native CP requires caller-owned official compressor metadata"
+                        "C4/C128 CP requires caller-owned official compressor metadata"
                     )
                 compressed_graph = official_compact_compressed_visible(
                     compressed_graph,
@@ -463,7 +486,7 @@ class _AttentionState(CompressedSparseAttention):
             )
             if self.indexer is not None:
                 if indexer_kv_score is None or indexer_weights is None:
-                    raise RuntimeError("C4 native CP requires indexer projections")
+                    raise RuntimeError("C4 CP requires indexer projections")
                 index_q = block_fp8_linear(
                     self.adapters.indexer_q_linear,
                     qr,
@@ -533,7 +556,7 @@ class _AttentionState(CompressedSparseAttention):
             for_indexer_loss=False,
         )
         if topk_length is None:
-            raise RuntimeError("native DS4 CP index lowering must return lengths")
+            raise RuntimeError("DS4 CP index lowering must return lengths")
         if compressed_topk is not None:
             # MCore's normal selected layout is compact [window | compressed].
             # vLLM FlashMLA consumes compact [compressed | window], so rotate
@@ -585,31 +608,10 @@ class _AttentionState(CompressedSparseAttention):
             softmax_scale=scale,
         )
         result = result[:, : self.config.num_attention_heads, :]
-        heads_per_group = self.config.num_attention_heads // self.config.o_groups
-        nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
-        return o_projection(
-            lambda o, wa, wb: self.adapters.o_project(
-                o,
-                positions,
-                metadata.cos_sin_cache,
-                wa,
-                wb,
-                n_groups=self.config.o_groups,
-                heads_per_group=heads_per_group,
-                nope_dim=nope_dim,
-                rope_dim=self.config.qk_rope_head_dim,
-                o_lora_rank=self.config.o_lora_rank,
-            ),
+        return self._output_projection(
             result,
-            self.wo_a.weight,
-            self.wo_b.weight,
-            positions=positions,
-            cos_sin_cache=metadata.cos_sin_cache,
-            n_groups=self.config.o_groups,
-            heads_per_group=heads_per_group,
-            nope_dim=nope_dim,
-            rope_dim=self.config.qk_rope_head_dim,
-            o_lora_rank=self.config.o_lora_rank,
+            positions,
+            metadata.cos_sin_cache,
         )
 
     def forward(
@@ -622,8 +624,6 @@ class _AttentionState(CompressedSparseAttention):
             raise ValueError("layer-0 attention requires flat [tokens, hidden]")
         if metadata is None:
             raise NotImplementedError("layer-0 attention requires explicit metadata")
-        if self.ps is not None and self.ps.cp_size > 1:
-            return self._forward_native_cp(hidden_states, metadata)
         # FSDP2 mixed precision recursively casts floating forward inputs,
         # including tensors nested in this metadata dataclass. FlashMLA's RoPE
         # kernels require the cache to remain FP32, so restore that boundary
@@ -641,11 +641,19 @@ class _AttentionState(CompressedSparseAttention):
             self.kv_norm.weight,
             self.config.rms_norm_eps,
         )
-        q = (
-            block_fp8_linear(self.adapters.q_linear, qr, self.wq_b.weight)
-            .view(-1, self.config.num_attention_heads, self.config.head_dim)
-            .clone(memory_format=torch.contiguous_format)
-        )
+        q = block_fp8_linear(
+            self.adapters.q_linear, qr, self.wq_b.weight
+        ).view(-1, self.config.num_attention_heads, self.config.head_dim)
+        if self.ps is not None and self.ps.cp_size > 1:
+            return self._forward_cp(
+                hidden_states,
+                metadata,
+                q.contiguous(),
+                qr,
+                kv,
+                projection_outputs,
+            )
+        q = q.clone(memory_format=torch.contiguous_format)
         index_q = (
             block_fp8_linear(
                 self.adapters.indexer_q_linear,
@@ -796,33 +804,11 @@ class _AttentionState(CompressedSparseAttention):
         result = result.reshape(hidden_states.shape[0], -1, self.config.head_dim)
         result = result[:, : self.config.num_attention_heads, :]
 
-        heads_per_group = self.config.num_attention_heads // self.config.o_groups
-        nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
-        output = o_projection(
-            lambda o, wa, wb: self.adapters.o_project(
-                o,
-                metadata.positions,
-                metadata.cos_sin_cache,
-                wa,
-                wb,
-                n_groups=self.config.o_groups,
-                heads_per_group=heads_per_group,
-                nope_dim=nope_dim,
-                rope_dim=self.config.qk_rope_head_dim,
-                o_lora_rank=self.config.o_lora_rank,
-            ),
+        return self._output_projection(
             result,
-            self.wo_a.weight,
-            self.wo_b.weight,
-            positions=metadata.positions,
-            cos_sin_cache=metadata.cos_sin_cache,
-            n_groups=self.config.o_groups,
-            heads_per_group=heads_per_group,
-            nope_dim=nope_dim,
-            rope_dim=self.config.qk_rope_head_dim,
-            o_lora_rank=self.config.o_lora_rank,
+            metadata.positions,
+            metadata.cos_sin_cache,
         )
-        return output
 
 
 class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
@@ -866,7 +852,6 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         ps=None,
         layer_idx: int = 0,
         *,
-        use_deepep: bool = False,
         indexer_loss_coeff: float = 0.0,
         cache_deployment_weights: bool = False,
     ):
@@ -877,7 +862,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
             config,
             ps or ParallelState(),
             layer_idx,
-            use_deepep=use_deepep,
+            use_deepep=True,
         )
 
     def _build_attention(
@@ -899,11 +884,11 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         layer_idx: int,
         use_deepep: bool,
     ) -> nn.Module:
+        del use_deepep
         return DeepseekV4MoE(
             config,
             ps,
             layer_idx=layer_idx,
-            use_deepep=use_deepep,
             cache_deployment_weights=self._cache_deployment_weights,
         )
 
@@ -995,14 +980,11 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         x: torch.Tensor,
         *,
         input_ids: torch.Tensor | None,
-        metadata: MoEKernelMetadata | None = None,
     ) -> torch.Tensor:
         residual, post_mix, res_mix, hidden_states = self._mhc_pre(
             x, self.ffn_hc, self.post_attention_layernorm.weight
         )
-        hidden_states = self.mlp(
-            hidden_states, input_ids=input_ids, metadata=metadata
-        )
+        hidden_states = self.mlp(hidden_states, input_ids=input_ids)
         return self._mhc_post(hidden_states, residual, post_mix, res_mix)
 
 
@@ -1013,7 +995,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         train_config=None,
         ps=None,
         *,
-        use_deepep: bool = False,
         indexer_loss_coeff: float = 0.0,
         logprob_chunk_size: int = 8192,
         cache_deployment_weights: bool = False,
@@ -1030,7 +1011,7 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             train_config,
             ps,
             mtp_enable=False,
-            use_deepep=use_deepep,
+            use_deepep=True,
         )
         # The release keeps deployment GEMM masters in BF16 while the mHC
         # coefficients, sparse-attention sinks/APE, and router correction bias
@@ -1064,11 +1045,11 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         *,
         use_deepep: bool,
     ) -> nn.Module:
+        del use_deepep
         return DeepseekV4Layer(
             config,
             ps,
             layer_idx=layer_idx,
-            use_deepep=use_deepep,
             indexer_loss_coeff=self._vllm_indexer_loss_coeff,
             cache_deployment_weights=self._cache_deployment_weights,
         )
@@ -1079,14 +1060,11 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         hidden_states: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_metadata: AttentionKernelMetadata | None = None,
-        moe_metadata: MoEKernelMetadata | None = None,
         labels: torch.Tensor | None = None,
         loss_mask: torch.Tensor | None = None,
         temperature: float | torch.Tensor = 1.0,
         calculate_entropy: bool = False,
-        **unused,
     ) -> dict[str, torch.Tensor]:
-        del unused
         pipeline_streams = False
         if hidden_states is None:
             if not self.pre_process:
@@ -1118,16 +1096,10 @@ class DeepseekV4Model(LiteDeepseekV4Model):
                 if isinstance(attention_metadata, dict)
                 else attention_metadata
             )
-            layer_moe_metadata = (
-                moe_metadata.get(layer_idx)
-                if isinstance(moe_metadata, dict)
-                else moe_metadata
-            )
             hidden_states = layer(
                 hidden_states,
                 position_ids=position_ids,
                 attention_metadata=layer_attention_metadata,
-                moe_metadata=layer_moe_metadata,
                 input_ids=input_ids,
             )
         if not self.post_process:

@@ -5,12 +5,12 @@ from typing import Any
 
 import torch
 
-from ._contract import check_parameter_versions, own_visible_tensor, parameter_versions
+from ._contract import check_parameter_versions, parameter_versions
 
 
 def _own(value):
     if isinstance(value, torch.Tensor):
-        return own_visible_tensor(value)
+        return value
     if isinstance(value, tuple):
         return tuple(_own(item) for item in value)
     if isinstance(value, list):

@@ -60,7 +60,6 @@ class ImplConfig:
     use_thd: bool = False
     use_deepep: bool = False
     attention_backend_override: str | None = None
-    apply_dsa_kernel_fusion: bool = True
     deterministic: bool = True
     mtp_enable: bool = True
     mtp_enable_train: bool = False
@@ -347,21 +346,6 @@ def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None
                 module.attention_backend = backend_name
 
 
-def _configure_dsa_kernel_fusion(chunks: list[nn.Module], *, enabled: bool) -> None:
-    """Select CSA's documented fused production path or reference fallback.
-
-    The pinned report-23 runtime carries cudnn-frontend 1.25, whose DSA
-    indexer cannot represent the per-sequence causal offsets required by
-    native CP.  MCore's CSA module already owns a complete non-fused fallback
-    for this case; expose that existing implementation choice through the
-    runtime config instead of silently dropping offsets or replacing wheels.
-    """
-    for chunk in chunks:
-        for module in chunk.modules():
-            if hasattr(module, "apply_dsa_kernel_fusion"):
-                module.apply_dsa_kernel_fusion = bool(enabled)
-
-
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
     # Native DS4 chunks are DeepseekV4Model instances themselves. Keep support
     # for wrapper-style chunks, but do not require a `.model` indirection or
@@ -502,7 +486,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
-    _configure_dsa_kernel_fusion(chunks, enabled=impl_cfg.apply_dsa_kernel_fusion)
 
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:

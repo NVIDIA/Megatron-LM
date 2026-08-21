@@ -214,9 +214,7 @@ class DeepseekV4Layer(nn.Module):
         x: torch.Tensor,
         *,
         input_ids: torch.Tensor | None,
-        metadata: Any = None,
     ) -> torch.Tensor:
-        del metadata
         residual = x
         ffn_in, post, comb = self.ffn_hc(x)
         mlp_input_ids = (
@@ -235,7 +233,6 @@ class DeepseekV4Layer(nn.Module):
         input_ids: torch.Tensor | None = None,
         packed_seq_params: Any = None,
         attention_metadata: Any = None,
-        moe_metadata: Any = None,
     ) -> torch.Tensor:
         # x is SBHD mHC [S, B, hc_mult, H].  HyperConnection collapses the
         # streams to a 3-D [S, B, H] pre-mix, the sub-block runs SBHD, and
@@ -246,7 +243,7 @@ class DeepseekV4Layer(nn.Module):
             packed_seq_params=packed_seq_params,
             metadata=attention_metadata,
         )
-        return self._mlp_block(x, input_ids=input_ids, metadata=moe_metadata)
+        return self._mlp_block(x, input_ids=input_ids)
 
 
 class DeepseekV4MTPLayer(DeepseekV4Layer):
