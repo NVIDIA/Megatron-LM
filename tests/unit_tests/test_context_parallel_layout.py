@@ -11,6 +11,7 @@ from megatron.core.context_parallel_layout import (
     CpPartitionModeConverter,
     ThdCpRoute,
     convert_module_input_tensors_cp_partition_mode,
+    finalize_packed_seq_params,
     prebuild_thd_cp_partition_routes,
 )
 from megatron.core.context_parallel_layout.routes import (
@@ -401,6 +402,46 @@ def test_prebuild_thd_cp_partition_routes_populates_direct_fields():
     assert same_route is route
     assert reverse_route is route
     assert packed_seq_params.cp_partition_route is route
+
+
+def test_finalize_packed_seq_params_uses_caller_group_with_dynamic_override(monkeypatch):
+    static_cp_group = _FakeGroup(size=4, rank=0)
+    dynamic_cp_group = _FakeGroup(size=2, rank=0)
+    calls = []
+
+    def fake_prebuild(packed_seq_params, cp_group):
+        calls.append((packed_seq_params, cp_group))
+
+    monkeypatch.setattr(
+        "megatron.core.context_parallel_layout.routes.prebuild_thd_cp_partition_routes",
+        fake_prebuild,
+    )
+
+    static_packed_seq_params = SimpleNamespace(cp_group=None)
+    dynamic_packed_seq_params = SimpleNamespace(cp_group=dynamic_cp_group)
+    no_group_packed_seq_params = SimpleNamespace(cp_group=None)
+
+    assert (
+        finalize_packed_seq_params(
+            packed_seq_params=static_packed_seq_params, cp_group=static_cp_group
+        )
+        is static_packed_seq_params
+    )
+    assert (
+        finalize_packed_seq_params(
+            packed_seq_params=dynamic_packed_seq_params, cp_group=static_cp_group
+        )
+        is dynamic_packed_seq_params
+    )
+    assert (
+        finalize_packed_seq_params(packed_seq_params=no_group_packed_seq_params)
+        is no_group_packed_seq_params
+    )
+    assert calls == [
+        (static_packed_seq_params, static_cp_group),
+        (dynamic_packed_seq_params, dynamic_cp_group),
+        (no_group_packed_seq_params, None),
+    ]
 
 
 def test_prebuild_thd_cp_partition_routes_raises_route_errors():

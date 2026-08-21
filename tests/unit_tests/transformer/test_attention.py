@@ -719,19 +719,30 @@ def _test_parallel_attention_correctness(
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "cp_partition_mode"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 4),  # CP
-        (2, False, 2),  # CP + TP w/o SP
-        (2, True, 2),  # CP + TP w/ SP
+        (4, False, 1, "zigzag"),  # TP w/o SP
+        (4, True, 1, "zigzag"),  # TP w/ SP
+        (1, False, 4, "zigzag"),  # CP
+        (1, False, 4, "contiguous"),  # CP
+        (2, False, 2, "zigzag"),  # CP + TP w/o SP
+        (2, False, 2, "contiguous"),  # CP + TP w/o SP
+        (2, True, 2, "zigzag"),  # CP + TP w/ SP
+        (2, True, 2, "contiguous"),  # CP + TP w/ SP
     ],
 )
 @pytest.mark.parametrize("qk_layernorm", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt, sequence_packing, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
+    tmp_path_dist_ckpt,
+    sequence_packing,
+    apply_rope_fusion,
+    tp,
+    sp,
+    cp,
+    cp_partition_mode,
+    qk_layernorm,
+    output_gate,
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
@@ -750,9 +761,9 @@ def test_parallel_attention_correctness(
     atol, rtol = 1e-2, 1e-2
 
     _test_parallel_attention_correctness(
-        transformer_config,
-        transformer_layer_spec,
-        tmp_path_dist_ckpt,
+        transformer_config=transformer_config,
+        transformer_layer_spec=transformer_layer_spec,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
         atol=atol,
         rtol=rtol,
         tp=tp,
@@ -761,6 +772,8 @@ def test_parallel_attention_correctness(
         seed=123,
         sequence_length=256,
         sequence_packing=sequence_packing,
+        cp_partition_mode=cp_partition_mode,
+        compare_param_grads=(tp == 1 and cp > 1),
     )
 
 
