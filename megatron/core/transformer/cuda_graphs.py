@@ -1807,7 +1807,7 @@ class TECudaGraphHelper:
         # TE graph capture happens after the configured eager warmup iterations. Route
         # those iterations through the same parent transport as capture, otherwise the
         # logical CP communicators are initialized before they can be avoided.
-        self._reuse_parent_cp_transport = self._should_share_dynamic_cp_pool()
+        self._reuse_parent_cp_transport = self._should_reuse_dynamic_cp_p2p_transport()
         self._dynamic_cp_transport_contexts = ()
         if self._reuse_parent_cp_transport:
             try:
@@ -2345,6 +2345,12 @@ class TECudaGraphHelper:
             and not self.config.overlap_moe_expert_parallel_comm
             and not self.config.delay_wgrad_compute
         )
+
+    def _should_reuse_dynamic_cp_p2p_transport(self) -> bool:
+        """Whether captured attention needs one parent P2P communicator."""
+        graph_modules = getattr(self.config, 'cuda_graph_modules', ())
+        captures_attention = not graph_modules or CudaGraphModule.attn in graph_modules
+        return self._should_share_dynamic_cp_pool() and captures_attention
 
     def _publish_dynamic_cp_graph_microbatch_limit(self) -> None:
         """Publish the logical PP range proved safe for the physical graph-slot ring."""
@@ -3468,7 +3474,7 @@ class TECudaGraphHelper:
         reuse_parent_cp_transport = self._reuse_parent_cp_transport
         try:
             capture_contexts = self._get_dynamic_cp_capture_contexts()
-            if self._should_share_dynamic_cp_pool():
+            if self._should_reuse_dynamic_cp_p2p_transport():
                 if reuse_parent_cp_transport:
                     self._set_dynamic_cp_p2p_transport(capture_contexts, self.dp_cp_group)
                 self._warmup_dynamic_cp_communicators(

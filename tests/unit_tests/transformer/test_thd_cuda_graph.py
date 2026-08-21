@@ -1094,6 +1094,23 @@ class TestDynamicMicrobatchSlots:
         ]
 
     @pytest.mark.internal
+    def test_parent_cp_transport_is_limited_to_captured_attention(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+        from megatron.core.transformer.enums import CudaGraphModule
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper._should_share_dynamic_cp_pool = lambda: True
+
+        helper.config = SimpleNamespace(cuda_graph_modules=[CudaGraphModule.attn])
+        assert helper._should_reuse_dynamic_cp_p2p_transport()
+
+        helper.config = SimpleNamespace(cuda_graph_modules=[])
+        assert helper._should_reuse_dynamic_cp_p2p_transport()
+
+        helper.config = SimpleNamespace(cuda_graph_modules=[CudaGraphModule.moe_router])
+        assert not helper._should_reuse_dynamic_cp_p2p_transport()
+
+    @pytest.mark.internal
     def test_dynamic_cp_graph_bank_and_capture_contexts(self, monkeypatch):
         from megatron.core import parallel_state
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper

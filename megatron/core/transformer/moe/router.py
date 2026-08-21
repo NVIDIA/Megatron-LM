@@ -10,6 +10,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import reduce_from_dynamic_cp_subgroup
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -514,10 +515,16 @@ class TopKRouter(Router):
             and packed_seq_params.local_cp_size is not None
             and packed_seq_params.cp_group is not None
         ):
+            graph_modules = getattr(self.config, 'cuda_graph_modules', ())
+            captures_router = not graph_modules or any(
+                module in graph_modules
+                for module in (CudaGraphModule.moe, CudaGraphModule.moe_router)
+            )
             use_parent_group = (
                 getattr(self.config, 'dynamic_context_parallel', False)
                 and getattr(self.config, 'cuda_graph_impl', 'none') == 'transformer_engine'
                 and getattr(self.config, 'cuda_graph_dynamic_microbatches', False)
+                and captures_router
             )
             dynamic_cp_parent_group = self.dp_cp_group if use_parent_group else None
             if use_parent_group and dynamic_cp_parent_group is None:
