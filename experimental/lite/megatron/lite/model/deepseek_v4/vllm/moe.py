@@ -75,10 +75,6 @@ class _VLLMVisibleExperts(Experts):
                 device=tokens_per_expert.device,
                 dtype=tokens_per_expert.dtype,
             )
-        if permuted_probs is None:
-            permuted_probs = hidden_states.new_zeros(
-                hidden_states.shape[0], dtype=torch.float32
-            )
         w13 = tuple(
             getattr(self.fc1, f"weight{i}") for i in range(self.num_local_experts)
         )
@@ -88,7 +84,6 @@ class _VLLMVisibleExperts(Experts):
         return VLLMGroupedMoEWithBF16Backward.apply(
             hidden_states,
             tokens_per_expert,
-            permuted_probs,
             0.0,
             *w13,
             *w2,

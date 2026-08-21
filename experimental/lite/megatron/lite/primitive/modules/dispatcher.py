@@ -21,48 +21,16 @@ except ImportError:
     EventOverlap = None  # type: ignore
 
 
-_deepep_buffer = None
-def _configure_deepep_deterministic_allocator() -> None:
-    """Avoid DeepEP's known deterministic ``torch.empty`` stream race.
-
-    Legacy normal DeepEP waits its communication stream before allocating
-    output tensors.  PyTorch's deterministic debug fill is consequently
-    enqueued after that wait on the compute stream and can race DeepEP's
-    communication-stream writers.  ``fill_uninitialized_memory`` is only an
-    uninitialized-memory debugging aid; disabling it does not relax PyTorch's
-    deterministic algorithm selection.
-
-    See https://github.com/deepseek-ai/DeepEP/issues/589.
-    """
-
-    if (
-        torch.are_deterministic_algorithms_enabled()
-        and torch.utils.deterministic.fill_uninitialized_memory
-    ):
-        torch.utils.deterministic.fill_uninitialized_memory = False
-
-
 def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
 
-def _get_deepep_buffer(group: dist.ProcessGroup, hidden_bytes: int):
-    """Return MCore's process-wide normal-DeepEP communication buffer.
-
-    This deliberately mirrors ``megatron.core.transformer.moe.fused_a2a``:
-    dispatch and combine look the buffer up from their process group and the
-    payload width on every forward/backward entry.  In particular, the tiny
-    route-fingerprint dispatch reuses the full-width primary buffer instead of
-    creating a second per-layer DeepEP runtime.
-    """
-
+def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
     if deep_ep is None:
         raise RuntimeError("DeepEP buffer requested but deep_ep is not installed.")
 
-    _configure_deepep_deterministic_allocator()
-
-    global _deepep_buffer
     group_size = dist.get_world_size(group=group)
+    hidden_bytes = _hidden_bytes(hidden_size)
     num_nvl_bytes = 0
     num_rdma_bytes = 0
 
@@ -73,34 +41,11 @@ def _get_deepep_buffer(group: dist.ProcessGroup, hidden_bytes: int):
         num_nvl_bytes = max(
             config.get_nvl_buffer_size_hint(hidden_bytes, group_size), num_nvl_bytes
         )
-        # Match MCore: a node-local EP group neither needs an RDMA heap nor can
-        # assume that a DeepEP build exposes internode size hints.
-        if group_size > torch.cuda.device_count():
-            num_rdma_bytes = max(
-                config.get_rdma_buffer_size_hint(hidden_bytes, group_size),
-                num_rdma_bytes,
-            )
-
-    if (
-        _deepep_buffer is None
-        or getattr(_deepep_buffer, "runtime", None) is None
-        or _deepep_buffer.group != group
-        or _deepep_buffer.num_nvl_bytes < num_nvl_bytes
-        or _deepep_buffer.num_rdma_bytes < num_rdma_bytes
-    ):
-        _deepep_buffer = deep_ep.Buffer(
-            group=group,
-            num_nvl_bytes=num_nvl_bytes,
-            num_rdma_bytes=num_rdma_bytes,
-            explicitly_destroy=True,
+        num_rdma_bytes = max(
+            config.get_rdma_buffer_size_hint(hidden_bytes, group_size), num_rdma_bytes
         )
-    return _deepep_buffer
 
-
-def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
-    """Compatibility wrapper for callers that specify a BF16 hidden width."""
-
-    return _get_deepep_buffer(group, _hidden_bytes(hidden_size))
+    return deep_ep.Buffer(group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes)
 
 
 def _use_moe_permute_fusion() -> bool:
@@ -111,61 +56,11 @@ def _tensor_hidden_bytes(x: torch.Tensor) -> int:
     return x.size(1) * max(x.element_size(), 2)
 
 
-def _dispatch_deepep_raw(
-    group,
-    hidden_states: torch.Tensor,
-    topk_indices: torch.Tensor,
-    topk_scores: torch.Tensor,
-    num_experts: int,
-    *,
-    async_finish: bool,
-    allocate_on_comm_stream: bool,
-):
-    """Run the shared normal-DeepEP dispatch without owning autograd state."""
-    buffer = _get_deepep_buffer(group, _tensor_hidden_bytes(hidden_states))
-    hidden_states = hidden_states.contiguous()
-    topk_indices = topk_indices.contiguous()
-    topk_scores = topk_scores.float().contiguous()
-    previous_event = (
-        EventOverlap(EventHandle())
-        if async_finish and EventHandle is not None and EventOverlap is not None
-        else None
-    )
-    (
-        num_tokens_per_rank,
-        num_tokens_per_rdma_rank,
-        num_tokens_per_expert,
-        is_token_in_rank,
-        event,
-    ) = buffer.get_dispatch_layout(
-        topk_indices,
-        num_experts=num_experts,
-        previous_event=previous_event,
-        async_finish=async_finish,
-        allocate_on_comm_stream=allocate_on_comm_stream,
-    )
-    result = buffer.dispatch(
-        hidden_states,
-        topk_idx=topk_indices,
-        topk_weights=topk_scores,
-        num_tokens_per_rank=num_tokens_per_rank,
-        num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-        is_token_in_rank=is_token_in_rank,
-        num_tokens_per_expert=num_tokens_per_expert,
-        previous_event=event,
-        async_finish=async_finish,
-        allocate_on_comm_stream=allocate_on_comm_stream,
-    )
-    if async_finish:
-        result[-1].current_stream_wait()
-    return result
-
-
 class _DeepEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        group,
+        buffer,
         hidden_states: torch.Tensor,
         topk_indices: torch.Tensor,
         topk_scores: torch.Tensor,
@@ -173,34 +68,48 @@ class _DeepEPDispatch(torch.autograd.Function):
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ):
+        previous_event = (
+            EventOverlap(EventHandle())
+            if async_finish and EventHandle is not None and EventOverlap is not None
+            else None
+        )
         (
-            recv_hidden,
-            recv_indices,
-            recv_probs,
-            recv_per_expert,
-            handle,
-            _,
-        ) = _dispatch_deepep_raw(
-            group,
-            hidden_states,
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            event,
+        ) = buffer.get_dispatch_layout(
             topk_indices,
-            topk_scores,
-            num_experts,
+            num_experts=num_experts,
+            previous_event=previous_event,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        (recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, after_event) = (
+            buffer.dispatch(
+                hidden_states.contiguous(),
+                topk_idx=topk_indices,
+                topk_weights=topk_scores.float(),
+                num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                is_token_in_rank=is_token_in_rank,
+                num_tokens_per_expert=num_tokens_per_expert,
+                previous_event=event,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        )
+        if async_finish:
+            after_event.current_stream_wait()
 
-        ctx.group = group
+        ctx.buffer = buffer
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        # Match MCore/Slime's normal-DeepEP contract: the public API returns
-        # receive counts as a Python list and the dispatcher materializes that
-        # metadata on CPU.  Do not enqueue an unrelated CUDA allocation while
-        # DeepEP's communication result is becoming visible.  The aligned
-        # scatter consumes CPU counts directly and derives its CUDA counts from
-        # the received route metadata when needed.
-        recv_per_expert_tensor = torch.tensor(recv_per_expert, dtype=torch.int64)
+        recv_per_expert_tensor = torch.tensor(
+            recv_per_expert, dtype=torch.int64, device=recv_hidden.device
+        )
         return recv_hidden, recv_indices, recv_probs, recv_per_expert_tensor, handle
 
     @staticmethod
@@ -213,9 +122,8 @@ class _DeepEPDispatch(torch.autograd.Function):
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
-        buffer = _get_deepep_buffer(ctx.group, _tensor_hidden_bytes(grad_recv_hidden))
         grad_scores = None if grad_recv_probs is None else grad_recv_probs.float()
-        grad_hidden, grad_topk_scores, after_event = buffer.combine(
+        grad_hidden, grad_topk_scores, after_event = ctx.buffer.combine(
             grad_recv_hidden.contiguous(),
             ctx.handle,
             topk_weights=grad_scores,
@@ -232,13 +140,12 @@ class _DeepEPCombine(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        group,
+        buffer,
         rank_grouped: torch.Tensor,
         handle,
         async_finish: bool,
         allocate_on_comm_stream: bool,
     ):
-        buffer = _get_deepep_buffer(group, _tensor_hidden_bytes(rank_grouped))
         previous_event = (
             EventOverlap(EventHandle())
             if async_finish and EventHandle is not None and EventOverlap is not None
@@ -253,7 +160,7 @@ class _DeepEPCombine(torch.autograd.Function):
         )
         if async_finish:
             after_event.current_stream_wait()
-        ctx.group = group
+        ctx.buffer = buffer
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
@@ -266,8 +173,7 @@ class _DeepEPCombine(torch.autograd.Function):
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
-        buffer = _get_deepep_buffer(ctx.group, _tensor_hidden_bytes(grad_output))
-        grad_rank_grouped, _, _, _, _, after_event = buffer.dispatch(
+        grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
             grad_output.contiguous(),
             handle=ctx.handle,
             previous_event=previous_event,
@@ -301,19 +207,7 @@ class TokenDispatcher:
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
         if self.use_deepep:
             assert ps.tp_ep_group is not None
-            self._deepep_group = ps.tp_ep_group
-            # Match MCore's _DeepepManager initialization exactly.  DeepEP's
-            # SM allocation is process-global; leaving it at the package
-            # default makes this shared dispatcher differ from both mLite.lite
-            # through MCore and Slime, and can starve later collectives while
-            # grouped expert kernels are active.
-            deep_ep.Buffer.set_num_sms(20)
-            # Match MCore/Slime: get_buffer() is entered by the first dispatch,
-            # after a colocated trainer has woken and restored its CUDA state.
-            # Eager construction here makes the DeepEP runtime span VERL's
-            # initial model offload/empty-cache boundary, a lifecycle that the
-            # mature fused_a2a manager deliberately avoids.
-            self.buffer = None
+            self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
@@ -321,6 +215,7 @@ class TokenDispatcher:
         self._output_splits: list[int] | None = None
         self._handle = None
         self._deepep_event = None
+
         if self.ep_size > 1 and self.num_local_experts > 1:
             chunk_idxs = torch.arange(self.ep_size * self.num_local_experts, device="cpu")
             self._sort_by_experts = (
@@ -330,21 +225,8 @@ class TokenDispatcher:
                 chunk_idxs.reshape(self.num_local_experts, self.ep_size).T.ravel().tolist()
             )
 
-    def _ensure_deepep_buffer(self, hidden_states: torch.Tensor):
-        """Lazily enter MCore/Slime's process-wide normal DeepEP runtime."""
-
-        if not self.use_deepep:
-            raise RuntimeError("DeepEP buffer requested while DeepEP is disabled")
-        self.buffer = _get_deepep_buffer(
-            self._deepep_group, _tensor_hidden_bytes(hidden_states)
-        )
-        return self.buffer
-
     def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_scores: torch.Tensor,
-        topk_indices: torch.Tensor,
+        self, hidden_states: torch.Tensor, topk_scores: torch.Tensor, topk_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.ep_size <= 1:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
@@ -378,10 +260,7 @@ class TokenDispatcher:
             if EventHandle is not None and EventOverlap is not None
             else None
         )
-        buffer = _get_deepep_buffer(
-            self._deepep_group, _tensor_hidden_bytes(rank_grouped)
-        )
-        combined = buffer.combine(
+        combined = self.buffer.combine(
             rank_grouped,
             self._handle,
             previous_event=previous_event,
@@ -543,22 +422,18 @@ class TokenDispatcher:
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
-        hidden_states = hidden_states.contiguous()
-        topk_indices = topk_indices.contiguous()
-        topk_scores = topk_scores.float().contiguous()
         previous_event = (
             EventOverlap(EventHandle())
             if EventHandle is not None and EventOverlap is not None
             else None
         )
-        buffer = self._ensure_deepep_buffer(hidden_states)
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
             num_tokens_per_expert,
             is_token_in_rank,
             event,
-        ) = buffer.get_dispatch_layout(
+        ) = self.buffer.get_dispatch_layout(
             topk_indices,
             num_experts=self.num_experts,
             previous_event=previous_event,
@@ -566,8 +441,9 @@ class TokenDispatcher:
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
 
+        topk_scores = topk_scores.float()
         recv_hidden, recv_indices, recv_probs, recv_per_expert, handle, event = (
-            buffer.dispatch(
+            self.buffer.dispatch(
                 hidden_states,
                 topk_idx=topk_indices,
                 topk_weights=topk_scores,
@@ -611,6 +487,10 @@ class TokenDispatcher:
     ):
         if isinstance(recv_per_expert, torch.Tensor):
             recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
+        local_tpe = torch.tensor(
+            recv_per_expert[: self.num_local_experts], dtype=torch.int64, device=recv_hidden.device
+        )
+        self._local_tpe_list = [int(x) for x in recv_per_expert[: self.num_local_experts]]
         rows = recv_hidden.size(0)
         recv_indices = recv_indices.to(torch.long)
         routing_map = torch.zeros(
@@ -624,20 +504,8 @@ class TokenDispatcher:
         row_ids = row_ids.expand_as(recv_indices)[valid]
         expert_ids = recv_indices[valid]
         routing_map[row_ids, expert_ids] = True
-        # DS4 hash routing can map multiple top-k slots of one token to the
-        # same expert. The boolean routing map intentionally deduplicates those
-        # routes, so their weights must be accumulated and expert counts must
-        # be derived from that same deduplicated map. Using DeepEP's raw slot
-        # counts here over-allocates permute rows and feeds uninitialized
-        # expert outputs into combine.
-        probs_2d.index_put_(
-            (row_ids, expert_ids),
-            recv_probs[valid],
-            accumulate=True,
-        )
-        local_tpe = routing_map.sum(dim=0).to(torch.int64)
-        self._local_tpe_list = [int(x) for x in local_tpe.detach().cpu().tolist()]
-        num_out = int(local_tpe.sum().item())
+        probs_2d.index_put_((row_ids, expert_ids), recv_probs[valid], accumulate=True)
+        num_out = sum(int(x) for x in recv_per_expert)
         dispatched, permuted_probs, sorted_indices = permute(
             recv_hidden,
             routing_map,
@@ -647,7 +515,22 @@ class TokenDispatcher:
         )[:3]
         self._row_id_map = sorted_indices
         self._restore_shape = recv_hidden.shape
-        if int(local_tpe.sum().item()) != int(dispatched.shape[0]):
+        if os.environ.get("MEGATRON_LITE_DEEPEP_DEBUG_METADATA") == "1":
+            ep_rank = dist.get_rank(group=self.ps.ep_group)
+            print(
+                "[DEEPEP_METADATA] "
+                f"ep_rank={ep_rank} recv_rows={int(recv_hidden.shape[0])} "
+                f"expert_rows={int(dispatched.shape[0])} "
+                f"recv_indices_shape={tuple(recv_indices.shape)} "
+                f"recv_per_expert_len={len(recv_per_expert)} "
+                f"recv_per_expert_sum={sum(int(x) for x in recv_per_expert)} "
+                f"recv_per_expert_head={recv_per_expert[: self.num_local_experts]} "
+                f"local_tpe_sum={int(local_tpe.sum().item())}",
+                flush=True,
+            )
+        if os.environ.get("MEGATRON_LITE_DEEPEP_SKIP_DISPATCH_METADATA_CHECK") != "1" and int(
+            local_tpe.sum().item()
+        ) != int(dispatched.shape[0]):
             ep_rank = dist.get_rank(group=self.ps.ep_group)
             raise RuntimeError(
                 "DeepEP dispatch metadata mismatch: "
@@ -657,10 +540,9 @@ class TokenDispatcher:
         return dispatched, local_tpe, permuted_probs
 
     def _dispatch_deepep(self, hidden_states, topk_scores, topk_indices):
-        self._ensure_deepep_buffer(hidden_states)
         if torch.is_grad_enabled():
             recv_hidden, recv_indices, recv_probs, recv_per_expert, handle = _DeepEPDispatch.apply(
-                self._deepep_group,
+                self.buffer,
                 hidden_states,
                 topk_indices,
                 topk_scores.float(),
@@ -691,14 +573,9 @@ class TokenDispatcher:
             fused=self.moe_permute_fusion,
         )
         if torch.is_grad_enabled():
-            combined = _DeepEPCombine.apply(
-                self._deepep_group, rank_grouped, self._handle, False, False
-            )
+            combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)
         else:
-            buffer = _get_deepep_buffer(
-                self._deepep_group, _tensor_hidden_bytes(rank_grouped)
-            )
-            combined = buffer.combine(rank_grouped, self._handle)
+            combined = self.buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):
             combined = combined[0]
         self._row_id_map = None

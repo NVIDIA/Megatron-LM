@@ -199,7 +199,6 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
         ctx,
         hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
-        permuted_probs: torch.Tensor,
         swiglu_limit: float,
         *weights: torch.Tensor,
     ) -> torch.Tensor:
@@ -224,8 +223,8 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
         w13 = weights[:num_experts]
         w2 = weights[num_experts:]
         grad_hidden = torch.empty_like(hidden_states) if ctx.needs_input_grad[0] else None
-        grad_w13 = [torch.zeros_like(weight) if ctx.needs_input_grad[4 + i] else None for i, weight in enumerate(w13)]
-        grad_w2 = [torch.zeros_like(weight) if ctx.needs_input_grad[4 + num_experts + i] else None for i, weight in enumerate(w2)]
+        grad_w13 = [torch.zeros_like(weight) if ctx.needs_input_grad[3 + i] else None for i, weight in enumerate(w13)]
+        grad_w2 = [torch.zeros_like(weight) if ctx.needs_input_grad[3 + num_experts + i] else None for i, weight in enumerate(w2)]
         offset = 0
         for expert, count in enumerate(ctx.counts):
             for start in range(0, count, _BACKWARD_CHUNK_ROWS):
@@ -250,4 +249,4 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
                 if grad_w2[expert] is not None:
                     grad_w2[expert].add_(grad_fc2)
             offset += count
-        return grad_hidden, None, None, None, *grad_w13, *grad_w2
+        return grad_hidden, None, None, *grad_w13, *grad_w2

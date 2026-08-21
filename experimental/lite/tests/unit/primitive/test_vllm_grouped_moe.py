@@ -66,13 +66,10 @@ def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     w13 = tuple((torch.randn(6, 4) * 3).requires_grad_(True) for _ in counts)
     w2 = tuple(torch.randn(4, 3).requires_grad_(True) for _ in counts)
     tokens_per_expert = torch.tensor(counts, dtype=torch.int32)
-    probabilities = torch.ones(sum(counts), 1)
-
     monkeypatch.setattr(vllm_grouped_moe, "_vllm_grouped_forward", _reference)
     output = vllm_grouped_moe.VLLMGroupedMoEWithBF16Backward.apply(
         hidden,
         tokens_per_expert,
-        probabilities,
         limit,
         *w13,
         *w2,
@@ -125,11 +122,9 @@ def test_real_grouped_deepgemm_forward_has_bf16_master_vjp() -> None:
         for _ in counts
     )
     tokens_per_expert = torch.tensor(counts, device="cuda", dtype=torch.int32)
-    probabilities = torch.ones(sum(counts), 1, device="cuda", dtype=torch.float32)
     output = vllm_grouped_moe.VLLMGroupedMoEWithBF16Backward.apply(
         hidden,
         tokens_per_expert,
-        probabilities,
         limit,
         *w13,
         *w2,

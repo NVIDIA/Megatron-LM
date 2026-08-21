@@ -15,8 +15,34 @@ from megatron.lite.primitive.modules.dispatcher import (
     TokenDispatcher,
     _DeepEPCombine,
     _DeepEPDispatch,
-    _dispatch_deepep_raw,
 )
+
+
+def _dispatch_route_metadata(
+    buffer,
+    fingerprints: torch.Tensor,
+    route_indices: torch.Tensor,
+    route_weights: torch.Tensor,
+    num_experts: int,
+):
+    layout = buffer.get_dispatch_layout(
+        route_indices,
+        num_experts=num_experts,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    )
+    return buffer.dispatch(
+        fingerprints.contiguous(),
+        topk_idx=route_indices.contiguous(),
+        topk_weights=route_weights.float().contiguous(),
+        num_tokens_per_rank=layout[0],
+        num_tokens_per_rdma_rank=layout[1],
+        num_tokens_per_expert=layout[2],
+        is_token_in_rank=layout[3],
+        previous_event=layout[4],
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    )
 
 
 class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
@@ -39,7 +65,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         route_outputs = expert_output.index_select(0, self._metadata_route_rows)
         if self.ep_size > 1:
             source_routes = _DeepEPCombine.apply(
-                self._deepep_group,
+                self.buffer,
                 route_outputs,
                 self._route_handle,
                 True,
@@ -71,8 +97,6 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         topk_scores: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.use_deepep:
-            self._ensure_deepep_buffer(hidden_states)
         if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
             raise TypeError("aligned DeepEP requires BF16 [tokens, hidden]")
         if hidden_states.shape[1] < 16:
@@ -90,7 +114,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
                 received_per_expert,
                 _,
             ) = _DeepEPDispatch.apply(
-                self._deepep_group,
+                self.buffer,
                 hidden_states,
                 topk_indices,
                 topk_scores,
@@ -115,14 +139,12 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
                 _,
                 route_handle,
                 _,
-            ) = _dispatch_deepep_raw(
-                self._deepep_group,
+            ) = _dispatch_route_metadata(
+                self.buffer,
                 route_fingerprints,
                 route_indices,
                 route_weights,
                 self.num_experts,
-                async_finish=False,
-                allocate_on_comm_stream=False,
             )
         else:
             received_hidden = hidden_states

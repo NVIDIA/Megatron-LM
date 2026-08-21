@@ -58,7 +58,7 @@ def _run_microbatch(
         [0.25, 0.75], device="cuda", dtype=torch.float32
     ).expand(tokens, -1).contiguous()
 
-    expert_input, actual_counts, route_weights = dispatcher.dispatch(
+    expert_input, actual_counts, _route_weights = dispatcher.dispatch(
         hidden, topk_weights, topk_ids
     )
     assert actual_counts.numel() == 2
@@ -67,7 +67,6 @@ def _run_microbatch(
     expert_output = VLLMGroupedMoEWithBF16Backward.apply(
         expert_input,
         actual_counts,
-        route_weights,
         0.0,
         *weights,
     )
@@ -145,11 +144,5 @@ def test_normal_deepep_contiguous_moe_is_shape_invariant_across_microbatches() -
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         dist.barrier(group=group)
     finally:
-        import megatron.lite.primitive.modules.dispatcher as dispatcher_module
-
-        buffer = dispatcher_module._deepep_buffer
-        if buffer is not None:
-            buffer.destroy()
-            dispatcher_module._deepep_buffer = None
         if created_group:
             dist.destroy_process_group()
