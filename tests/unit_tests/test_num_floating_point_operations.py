@@ -20,8 +20,10 @@ import torch
 import megatron.training.training as training_module
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
+    consume_vision_model_flops_stats,
     num_floating_point_operations,
     update_seqlen_stats_from_cu_seqlens,
+    update_vision_model_flops_stats,
 )
 
 
@@ -29,6 +31,12 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+
+
+def _reset_vision_flops_accumulator():
+    """Tear down the per-iteration vision FLOPs accumulator between tests."""
+    training_module._vision_flops_stats_in_iteration = None
+    training_module._vision_flops_stats_active = False
 
 
 def _make_gpt_args(
@@ -99,6 +107,50 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     return args
 
 
+def _enable_qwen35_vision_flops(args):
+    """Attach a small Qwen3.5-VL vision configuration to decoder args."""
+    args.count_vision_model_flops = True
+    args.vision_flops_variant = "qwen35_vl_v2"
+    args.vision_num_layers = 2
+    args.vision_hidden_size = 8
+    args.vision_ffn_hidden_size = 16
+    args.vision_num_attention_heads = 2
+    args.vision_kv_channels = 4
+    args.vision_in_channels = 3
+    args.vision_patch_size = 2
+    args.vision_temporal_patch_size = 2
+    args.vision_spatial_merge_size = 2
+    args.vision_out_hidden_size = 12
+    args.image_size = 8
+    return args
+
+
+def _qwen35_vision_golden_flops(*, total_patches, attention_sum_sq, merged_tokens):
+    """Independent matrix-shape calculation for the tiny vision config above."""
+    training_matmul_factor = 3 * 2
+    hidden_size = 8
+    ffn_hidden_size = 16
+    projection_size = 2 * 4
+    patch_dim = 3 * 2 * 2 * 2
+    merge_dim = hidden_size * 2**2
+
+    patch_embed = training_matmul_factor * total_patches * patch_dim * hidden_size
+    per_layer_projections = (
+        training_matmul_factor
+        * total_patches
+        * (
+            hidden_size * (3 * projection_size)
+            + projection_size * hidden_size
+            + hidden_size * ffn_hidden_size
+            + ffn_hidden_size * hidden_size
+        )
+    )
+    per_layer_attention = 3 * 4 * attention_sum_sq * projection_size
+    transformer = 2 * (per_layer_projections + per_layer_attention)
+    merger = training_matmul_factor * merged_tokens * (merge_dim * merge_dim + merge_dim * 12)
+    return patch_embed + transformer + merger
+
+
 class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
 
@@ -148,6 +200,87 @@ class TestBSHDBackwardCompat:
         )
 
         assert default_flops == explicit_flops
+
+
+class TestQwen35VisionFlops:
+    """Qwen3.5-VL vision work is additive to either decoder FLOPs path."""
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            pytest.param(_make_gpt_args(), id="standard-decoder"),
+            pytest.param(_make_hybrid_args(), id="hybrid-decoder"),
+        ],
+    )
+    def test_runtime_grid_stats_add_exact_vision_flops(self, args):
+        batch_size = 2
+        decoder_flops = num_floating_point_operations(args, batch_size)
+        _enable_qwen35_vision_flops(args)
+
+        # Equivalent to grids [[2, 4, 4], [1, 2, 4]]:
+        # patches = 2*16 + 1*8 = 40
+        # attention sumsq = 2*16^2 + 1*8^2 = 576
+        # merged tokens = 2*(2*2) + 1*(1*2) = 10
+        vision_stats = {
+            "vision_total_tokens_in_batch": 40,
+            "vision_seqlen_squared_sum_in_batch": 576,
+            "vision_merged_tokens_in_batch": 10,
+        }
+        multimodal_flops = num_floating_point_operations(args, batch_size, **vision_stats)
+
+        assert multimodal_flops - decoder_flops == _qwen35_vision_golden_flops(
+            total_patches=40, attention_sum_sq=576, merged_tokens=10
+        )
+
+    def test_nominal_image_size_fallback_matches_explicit_stats(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        batch_size = 3
+
+        # image_size=8, patch=2 -> 4x4 grid; nominal T=2, merge=2.
+        nominal_flops = num_floating_point_operations(args, batch_size)
+        explicit_flops = num_floating_point_operations(
+            args,
+            batch_size,
+            vision_total_tokens_in_batch=batch_size * 2 * 16,
+            vision_seqlen_squared_sum_in_batch=batch_size * 2 * 16**2,
+            vision_merged_tokens_in_batch=batch_size * 2 * 2 * 2,
+        )
+        assert nominal_flops == explicit_flops
+
+    def test_partial_runtime_stats_fail_loudly(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        with pytest.raises(ValueError, match="must be provided together"):
+            num_floating_point_operations(args, batch_size=2, vision_total_tokens_in_batch=40)
+
+    def test_invalid_vision_metadata_fails_loudly(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        args.vision_spatial_merge_size = 0
+        with pytest.raises(ValueError, match="metadata must be positive"):
+            num_floating_point_operations(args, batch_size=2)
+
+    def test_negative_runtime_stats_fail_loudly(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        with pytest.raises(ValueError, match="must be non-negative"):
+            num_floating_point_operations(
+                args,
+                batch_size=2,
+                vision_total_tokens_in_batch=-1,
+                vision_seqlen_squared_sum_in_batch=0,
+                vision_merged_tokens_in_batch=0,
+            )
+
+    def test_enabled_unknown_variant_fails_loudly(self):
+        args = _enable_qwen35_vision_flops(_make_gpt_args())
+        args.vision_flops_variant = "unknown"
+        with pytest.raises(ValueError, match="Unsupported vision FLOPs variant"):
+            num_floating_point_operations(args, batch_size=2)
+
+    def test_disabled_vision_preserves_decoder_only_result(self):
+        args = _make_gpt_args()
+        decoder_flops = num_floating_point_operations(args, batch_size=2)
+        args.count_vision_model_flops = False
+        args.vision_flops_variant = "unknown"
+        assert num_floating_point_operations(args, batch_size=2) == decoder_flops
 
 
 class TestTHDScaling:
@@ -595,6 +728,58 @@ class TestAccumulator:
         assert training_module._seqlen_stats_active is False
         assert training_module._seqlen_stats_in_iteration is not None
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
+
+
+class TestVisionFlopsAccumulator:
+    """Actual per-microbatch vision grids feed the global FLOPs estimate."""
+
+    def setup_method(self):
+        _reset_vision_flops_accumulator()
+
+    def teardown_method(self):
+        _reset_vision_flops_accumulator()
+
+    def test_variable_grids_accumulate_exact_stats(self):
+        update_vision_model_flops_stats(
+            torch.tensor([[2, 4, 4], [1, 2, 4]], dtype=torch.int64), spatial_merge_size=2
+        )
+        update_vision_model_flops_stats(
+            torch.tensor([[1, 6, 2]], dtype=torch.int64), spatial_merge_size=2
+        )
+
+        total_patches, attention_sum_sq, merged_tokens = consume_vision_model_flops_stats()
+        assert total_patches == 40 + 12
+        assert attention_sum_sq == 576 + 12**2
+        assert merged_tokens == 10 + 3
+
+    def test_no_vision_inputs_returns_none(self):
+        assert consume_vision_model_flops_stats() == (None, None, None)
+        assert training_module._vision_flops_stats_in_iteration is None
+        assert training_module._vision_flops_stats_active is False
+
+    def test_explicit_text_only_microbatch_returns_zeros(self):
+        update_vision_model_flops_stats(None, spatial_merge_size=2)
+        assert consume_vision_model_flops_stats() == (0.0, 0.0, 0.0)
+
+    def test_consume_resets_accumulator(self):
+        update_vision_model_flops_stats(
+            torch.tensor([[1, 4, 4]], dtype=torch.int64), spatial_merge_size=2
+        )
+        consume_vision_model_flops_stats()
+        assert consume_vision_model_flops_stats() == (None, None, None)
+
+    @pytest.mark.parametrize(
+        "grid,merge,error",
+        [
+            (torch.tensor([1, 4, 4]), 2, "shape"),
+            (torch.tensor([[1, 3, 4]]), 2, "divisible"),
+            (torch.tensor([[0, 4, 4]]), 2, "positive"),
+            (torch.tensor([[1, 4, 4]]), 0, "positive"),
+        ],
+    )
+    def test_invalid_grid_metadata_fails_loudly(self, grid, merge, error):
+        with pytest.raises(ValueError, match=error):
+            update_vision_model_flops_stats(grid, spatial_merge_size=merge)
 
 
 class TestAccumulatorDistributed:

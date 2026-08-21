@@ -18,6 +18,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_src_rank,
 )
 from megatron.training import get_args
+from megatron.training.training import update_vision_model_flops_stats
 
 # -------------------------------------------------------------------
 # dtype <-> int mapping for cross-rank broadcast
@@ -400,6 +401,13 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
+    args = get_args()
+    image_grid_thw = batch.get("image_grid_thw", None)
+    if getattr(model, "training", True) and getattr(args, "count_vision_model_flops", False):
+        update_vision_model_flops_stats(
+            image_grid_thw, spatial_merge_size=args.vision_spatial_merge_size
+        )
+
     pixel_values = batch.get("pixel_values", None)
     if (
         pixel_values is not None
@@ -417,7 +425,7 @@ def forward_step(data_iterator, model):
         loss_mask=batch.get("loss_mask", None),
         padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
-        image_grid_thw=batch.get("image_grid_thw", None),
+        image_grid_thw=image_grid_thw,
         packed_seq_params=batch.get("packed_seq_params", None),
     )
 
