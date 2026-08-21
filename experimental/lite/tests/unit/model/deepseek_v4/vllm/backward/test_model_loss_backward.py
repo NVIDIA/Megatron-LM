@@ -10,6 +10,7 @@ from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm import model as model_module
 from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Model
+from megatron.lite.model.deepseek_v4.vllm.primitive import logprob as logprob_module
 
 pytestmark = pytest.mark.gpus(1)
 
@@ -23,9 +24,7 @@ class _Layer(nn.Module):
     def __init__(self, hidden: int, mult: int):
         super().__init__()
         self.projection = nn.Linear(hidden, hidden, bias=False)
-        self.self_attn = SimpleNamespace(
-            self_attn=SimpleNamespace(_projection_streams=None)
-        )
+        self.self_attn = SimpleNamespace(_projection_streams=None)
         self.mult = mult
 
     def forward(self, hidden_states, **_kwargs):
@@ -123,7 +122,7 @@ def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) 
 
     rollout_value = -labels.float()
     monkeypatch.setattr(
-        model_module,
+        logprob_module,
         "_rollout_selected_log_probs",
         lambda _logits, chunk_labels, _temperature: -chunk_labels.float(),
     )
@@ -160,8 +159,8 @@ def test_aligned_chunked_logprob_uses_rollout_value_and_same_head_vjp(
         assert chunk_temperature == temperature
         return 1000.0 + chunk_labels.float()
 
-    monkeypatch.setattr(model_module, "_rollout_selected_log_probs", rollout_value)
-    actual, entropy = model_module._aligned_selected_log_probs(
+    monkeypatch.setattr(logprob_module, "_rollout_selected_log_probs", rollout_value)
+    actual, entropy = logprob_module.aligned_selected_log_probs(
         value,
         head,
         labels,
@@ -196,7 +195,7 @@ def test_aligned_chunked_logprob_uses_rollout_value_and_same_head_vjp(
 
     calls.clear()
     with torch.no_grad():
-        forward_only, _ = model_module._aligned_selected_log_probs(
+        forward_only, _ = logprob_module.aligned_selected_log_probs(
             value,
             head,
             labels,
@@ -219,7 +218,7 @@ def test_supported_local_head_chunk_matches_unchunked_vllm_logprob() -> None:
     head = nn.Linear(hidden, vocab, bias=False, device=device, dtype=torch.bfloat16)
 
     with torch.no_grad():
-        chunked, _ = model_module._aligned_selected_log_probs(
+        chunked, _ = logprob_module.aligned_selected_log_probs(
             value,
             head,
             labels,
@@ -227,7 +226,7 @@ def test_supported_local_head_chunk_matches_unchunked_vllm_logprob() -> None:
             8192,
             calculate_entropy=False,
         )
-        unchunked, _ = model_module._aligned_selected_log_probs(
+        unchunked, _ = logprob_module.aligned_selected_log_probs(
             value,
             head,
             labels,

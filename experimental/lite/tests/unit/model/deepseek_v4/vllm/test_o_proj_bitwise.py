@@ -7,8 +7,8 @@ import pytest
 import torch
 from torch import nn
 
-from megatron.lite.model.deepseek_v4.vllm import kernels as vllm_ds4
-from megatron.lite.model.deepseek_v4.vllm.kernels import o_projection_visible
+from megatron.lite.model.deepseek_v4.vllm.primitive import kernels as vllm_ds4
+from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import o_projection_visible
 from megatron.lite.model.deepseek_v4 import deployment_block_fp8
 
 

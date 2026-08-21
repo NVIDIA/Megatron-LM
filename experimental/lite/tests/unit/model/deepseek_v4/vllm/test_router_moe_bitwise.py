@@ -14,7 +14,7 @@ def test_r3_official_route_is_exact_mlite_native_noop() -> None:
     import torch.nn as nn
 
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4Router
     from megatron.lite.primitive.modules.router_replay import (
         RouterReplay,
         RouterReplayAction,
@@ -22,7 +22,7 @@ def test_r3_official_route_is_exact_mlite_native_noop() -> None:
     from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
 
     config = DeepseekV4Config(hidden_size=256)
-    router = SigmoidTopKRouter(
+    router = DeepseekV4Router(
         config, Mock(tp_size=1, tp_group=None), compute_aux_loss=False
     ).cuda()
     router.gate = nn.Identity()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from megatron.lite.model.deepseek_v4.vllm.deepep_route import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route import (
     _validate_and_order_route_preserving_outputs,
 )
 

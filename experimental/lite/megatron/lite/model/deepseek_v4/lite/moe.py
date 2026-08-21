@@ -9,6 +9,43 @@ from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.mlp import SwiGLUMLP
 from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.primitive.utils.moe import topk_routing_with_score_function
+
+
+class DeepseekV4Router(SigmoidTopKRouter):
+    """DS4 router whose observable slot order matches rollout's dsv4_topk."""
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = self.gate(x).view(-1, self.num_experts)
+        routing_kwargs = {}
+        if self.num_groups is not None and self.group_topk is not None:
+            routing_kwargs = {
+                "num_groups": self.num_groups,
+                "group_topk": self.group_topk,
+            }
+        topk_scores, topk_indices = topk_routing_with_score_function(
+            logits,
+            self.topk,
+            use_pre_softmax=self.use_pre_softmax,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias.to(logits.dtype),
+            scaling_factor=(self.scaling_factor or None),
+            fused=False,
+            dense_output=True,
+            **routing_kwargs,
+        )
+        if self.router_replay is not None:
+            selected = self.router_replay.select_indices(topk_indices)
+            if selected is not topk_indices:
+                scores = torch.sqrt(F.softplus(logits.float()))
+                topk_scores = scores.gather(-1, selected.long())
+                if self.topk > 1:
+                    topk_scores = topk_scores / topk_scores.sum(
+                        dim=-1, keepdim=True
+                    ).clamp_min(1e-20)
+                topk_scores = topk_scores * self.scaling_factor
+                topk_indices = selected
+        return topk_scores.to(logits.dtype), topk_indices
 
 
 class DeepseekV4MoE(nn.Module):
@@ -32,7 +69,7 @@ class DeepseekV4MoE(nn.Module):
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
         self.is_hash_layer = layer_idx < config.num_hash_layers
-        self.gate = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
+        self.gate = DeepseekV4Router(config, ps, compute_aux_loss=False)
         if self.is_hash_layer:
             self.gate.register_buffer(
                 "tid2eid",

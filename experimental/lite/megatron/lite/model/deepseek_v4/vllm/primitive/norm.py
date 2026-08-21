@@ -5,7 +5,7 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
-from ._recompute import visible_functional_vjp
+from .recompute import visible_functional_vjp
 
 
 def _norm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

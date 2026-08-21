@@ -7,10 +7,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
-from megatron.lite.model.deepseek_v4.vllm.grouped_moe import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (
     VLLMGroupedMoEWithBF16Backward,
 )
 from megatron.lite.primitive.parallel import ParallelState

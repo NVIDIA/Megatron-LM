@@ -6,15 +6,15 @@ import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
-from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
-from megatron.lite.model.deepseek_v4.vllm.linear import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.linear import (
     block_fp8_linear,
     gate_linear,
 )
-from megatron.lite.model.deepseek_v4.vllm.router import fixed_route_vjp
-from megatron.lite.model.deepseek_v4.vllm.grouped_moe import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.router import fixed_route_vjp
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (
     VLLMGroupedMoEWithBF16Backward,
 )
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs

@@ -26,8 +26,8 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
     pack_routed_experts as pack_routed_experts,
     unpack_forward_output as unpack_forward_output,
 )
-from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
-    build_prefill_metadata_builders,
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.metadata import (
+    build_attention_metadata_builders,
 )
 from megatron.lite.model.protocol_utils import add_loss_context_kwargs
 from megatron.lite.primitive.bundle import ModelBundle
@@ -147,7 +147,7 @@ def _forward_step(
 
 def _prepare_cp_forward_inputs(
     model: nn.Module, batch
-) -> tuple[dict[str, Any], list[int], Any | None]:
+) -> tuple[dict[str, Any], Any]:
 
     ps = parallel_state_from_model(model)
     packed = pack_packed_batch(model, batch, batch.seq_lens)
@@ -167,11 +167,7 @@ def _prepare_cp_forward_inputs(
         "labels": local(packed.labels),
         "loss_mask": local(packed.loss_mask),
     }
-    return (
-        inputs,
-        [int(value) for value in packed.padded_lengths.detach().cpu().tolist()],
-        packed.packed_seq_params,
-    )
+    return inputs, packed.packed_seq_params
 
 
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -221,51 +217,23 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         if attention_builders is not None:
             return attention_builders
         device = next(model.parameters()).device
-        attention_builders = build_prefill_metadata_builders(
+        attention_builders = build_attention_metadata_builders(
             impl_cfg.hf_path, model_cfg, selected_layers, device
         )
         return attention_builders
 
     def forward_step(model: nn.Module, batch) -> dict[str, torch.Tensor]:
-        attention_metadata = getattr(batch, "attention_metadata", None)
-        current_attention_builders = None
-        if attention_metadata is None:
-            current_attention_builders = ensure_runtime_assets()
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
-            if parallel_state.cp_size > 1:
-                raise ValueError("DeepSeek V4 vLLM CP requires batch.seq_lens")
-            forward_inputs = {}
-            token_counts = [int(batch.input_ids.numel())]
-            cp_packed_seq_params = None
-        else:
-            forward_inputs, token_counts, cp_packed_seq_params = _prepare_cp_forward_inputs(
-                model, batch
+            raise ValueError("DeepSeek V4 vLLM requires packed batch.seq_lens")
+        forward_inputs, packed_seq_params = _prepare_cp_forward_inputs(model, batch)
+        current_attention_builders = ensure_runtime_assets()
+        attention_metadata = {
+            layer_idx: current_attention_builders[layer_idx].build(
+                forward_inputs["position_ids"], packed_seq_params
             )
-        if attention_metadata is None:
-            assert current_attention_builders is not None
-            if parallel_state.cp_size > 1:
-                from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
-                    build_native_cp_attention_metadata,
-                )
-
-                attention_metadata = {
-                    layer_idx: build_native_cp_attention_metadata(
-                        model_cfg,
-                        layer_idx=layer_idx,
-                        cos_sin_cache=current_attention_builders[layer_idx].cos_sin_cache,
-                        local_positions=forward_inputs["position_ids"],
-                        packed_seq_params=cp_packed_seq_params,
-                    )
-                    for layer_idx in selected_layers
-                }
-            else:
-                attention_metadata = {
-                    layer_idx: current_attention_builders[
-                        layer_idx
-                    ].build_prefill_batch(token_counts)
-                    for layer_idx in selected_layers
-                }
+            for layer_idx in selected_layers
+        }
         return _forward_step(
             model,
             batch,

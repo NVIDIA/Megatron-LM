@@ -358,16 +358,14 @@ def log_rank0(msg: str) -> None:
         print(f"[megatron.lite] {msg}", flush=True)
 
 
-def parse_recompute_spec(
-    recompute: str | list[str] | tuple[str, ...] | None,
-) -> list[str]:
+def parse_recompute_spec(recompute: str | list[str] | None) -> list[str]:
     """Parse a recompute spec into a list of module names."""
     if recompute is None or recompute == "none":
         return []
     if recompute == "full":
         return ["full"]
-    if isinstance(recompute, (list, tuple)):
-        return list(recompute)
+    if isinstance(recompute, list):
+        return recompute
     return recompute.split(",")
 
 

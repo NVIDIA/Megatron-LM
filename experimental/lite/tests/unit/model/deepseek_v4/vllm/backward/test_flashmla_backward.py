@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.lite.model.deepseek_v4.vllm.attention import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
     _default_sparse_backward,
 )
 

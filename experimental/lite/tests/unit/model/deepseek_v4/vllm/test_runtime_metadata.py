@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,7 +7,7 @@ import pytest
 import torch
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.deepseek_v4.vllm import runtime_metadata as runtime
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention import metadata as runtime
 
 
 def _config(**overrides) -> DeepseekV4Config:
@@ -17,327 +16,109 @@ def _config(**overrides) -> DeepseekV4Config:
         qk_rope_head_dim=64,
         num_attention_heads=64,
         sliding_window=128,
-        compress_ratios=[0, 0, 4, 128],
-        max_position_embeddings=256,
+        compress_ratios=[1, 1, 4, 128],
+        num_hidden_layers=4,
+        max_position_embeddings=512,
     )
     values.update(overrides)
     return DeepseekV4Config(**values)
 
 
-def test_layer0_rope_uses_official_vllm_config_loader(monkeypatch) -> None:
-    hf_config = SimpleNamespace()
-    cos = torch.arange(32 * 64, dtype=torch.bfloat16).reshape(32, 64)
-    rotary = SimpleNamespace(cos_sin_cache=cos)
-    get_config = Mock(return_value=hf_config)
-    build = Mock(return_value=rotary)
-
-    monkeypatch.setattr(runtime, "get_config", get_config)
-    monkeypatch.setattr(runtime, "_build_rope", build)
-    metadata = runtime.build_prefill_metadata_builders(
-        "/model", _config(), (0,), torch.device("cpu")
-    )[0]
-
-    get_config.assert_called_once_with("/model", trust_remote_code=True)
-    build.assert_called_once()
-    assert metadata.cos_sin_cache.dtype == torch.float32
-    torch.testing.assert_close(metadata.cos_sin_cache, cos.float(), rtol=0, atol=0)
+def test_packed_blocks_keep_requests_isolated() -> None:
+    blocks = runtime._packed_blocks([5, 9], 4, device=torch.device("cpu"))
+    assert blocks.block_table.tolist() == [[0, 1, -1], [2, 3, 4]]
+    assert blocks.slot_mapping.tolist() == list(range(5)) + list(range(8, 17))
 
 
-def test_rope_custom_op_is_built_in_scoped_vllm_config(monkeypatch) -> None:
-    events = []
-    rotary = SimpleNamespace(to=lambda **_kwargs: rotary)
-
-    class Context:
-        def __enter__(self):
-            events.append("enter")
-
-        def __exit__(self, *_args):
-            events.append("exit")
-
-    monkeypatch.setattr(runtime, "VllmConfig", lambda: "config")
-    monkeypatch.setattr(
-        runtime,
-        "set_current_vllm_config",
-        lambda value: Context() if value == "config" else None,
+def test_packed_blocks_write_only_complete_compressor_groups() -> None:
+    blocks = runtime._packed_blocks(
+        [5, 9], 64, device=torch.device("cpu"), write_every=4
     )
-    monkeypatch.setattr(
-        runtime,
-        "build_deepseek_v4_rope",
-        lambda *_args, **_kwargs: events.append("build") or rotary,
-    )
-    actual = runtime._build_rope(
-        SimpleNamespace(), _config(), compress_ratio=1, device="cpu"
-    )
-
-    assert actual is rotary
-    assert events == ["enter", "build", "exit"]
-
-
-def test_native_cp_compressor_reuses_single_request_batch_metadata() -> None:
-    config = _config(num_hidden_layers=4)
-    positions = torch.arange(37, dtype=torch.int64)
-    packed = object()
-
-    metadata = runtime.build_native_cp_attention_metadata(
-        config,
-        layer_idx=2,
-        cos_sin_cache=torch.zeros(256, 64, dtype=torch.float32),
-        local_positions=positions,
-        packed_seq_params=packed,
-    )
-
-    compressor = metadata.compressor_metadata
-    assert compressor is not None
-    assert metadata.packed_seq_params is packed
-    assert metadata.positions is positions
-    assert compressor.state_block_table.shape[0] == 1
-    assert compressor.token_to_req_indices.shape == (64,)
-    assert compressor.token_to_req_indices.count_nonzero().item() == 0
-
-
-def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
-    gather = Mock()
-    monkeypatch.setattr(runtime, "dequantize_and_gather_k_cache", gather)
-    cos = torch.empty(256, 128, dtype=torch.float32)
-    metadata = runtime.DS4PrefillMetadataBuilder(
-        _config(), device="cpu", cos_sin_cache=cos
-    ).build_prefill_batch([130])
-
-    assert torch.equal(metadata.positions, torch.arange(130, dtype=torch.int64))
-    assert torch.equal(metadata.slot_mapping, metadata.positions)
-    assert metadata.swa_cache.shape == (1, 256, 584)
-    assert metadata.swa_cache.dtype == torch.uint8
-    assert metadata.indices.shape == (130, 1, 128)
-    assert metadata.indices.dtype == torch.int32
-    assert metadata.topk_length.dtype == torch.int32
-    assert metadata.topk_length.tolist() == list(range(1, 129)) + [128, 128]
-    assert metadata.indices[0, 0, 0].item() == 0
-    assert metadata.indices[128, 0, 0].item() == 1
-    assert metadata.indices[129, 0, -1].item() == 129
-    assert metadata.kv_workspace.shape == (130, 1, 512)
-    assert metadata.output.shape == (130, 64, 512)
-    assert metadata.swa_block_table.tolist() == [[0]]
-
-    metadata.prepare_flash()
-    gather.assert_called_once()
-    args = gather.call_args
-    assert args.args[0].shape == (1, 130, 512)
-    assert args.args[1].shape == (1, 256, 584)
-    assert args.kwargs["block_size"] == 256
-    assert args.kwargs["offset"] == 0
-    assert torch.equal(args.kwargs["seq_lens"], torch.tensor([130], dtype=torch.int32))
-    assert torch.equal(args.kwargs["gather_lens"], args.kwargs["seq_lens"])
-
-
-def test_layer0_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
-    gather = Mock()
-    monkeypatch.setattr(runtime, "dequantize_and_gather_k_cache", gather)
-    metadata = runtime.DS4PrefillMetadataBuilder(
-        _config(),
-        device="cpu",
-        cos_sin_cache=torch.empty(256, 128, dtype=torch.float32),
-    ).build_prefill_batch([3, 2])
-
-    assert metadata.positions.tolist() == [0, 1, 2, 0, 1]
-    assert metadata.slot_mapping.tolist() == [0, 1, 2, 256, 257]
-    assert metadata.swa_block_table.tolist() == [[0], [1]]
-    assert metadata.swa_seq_lens.tolist() == [3, 2]
-    assert metadata.query_start_loc.tolist() == [0, 3, 5]
-    assert metadata.indices[:3, 0, 0].tolist() == [0, 0, 0]
-    assert metadata.indices[3:, 0, 0].tolist() == [3, 3]
-    assert metadata.topk_length.tolist() == [1, 2, 3, 1, 2]
-    assert metadata.kv_workspace.shape == (6, 1, 512)
-    assert metadata.output.shape == (5, 64, 512)
-
-    metadata.prepare_flash()
-    args = gather.call_args
-    assert args.args[0].shape == (2, 3, 512)
-    assert args.args[1].shape == (2, 256, 584)
-
-
-def test_unified_builder_uses_selected_layer_ratio() -> None:
-    builder = runtime.DS4PrefillMetadataBuilder(
-        _config(num_hidden_layers=2, compress_ratios=[0, 4]),
-        layer_idx=1,
-        device="cpu",
-        cos_sin_cache=torch.empty(16, 128),
-    )
-    assert builder.compress_ratio == 4
-
-
-def test_layer1_extended_builder_reuses_swa_only_contract() -> None:
-    builder = runtime.DS4PrefillMetadataBuilder(
-        _config(),
-        layer_idx=1,
-        device="cpu",
-        cos_sin_cache=torch.empty(256, 128),
-    )
-    metadata = builder.build_prefill_batch([5])
-    assert metadata.compressor_metadata is None
-    assert metadata.indexer_metadata is None
-    assert metadata.indices.shape == (5, 1, 128)
-
-
-def test_extended_builder_covers_every_full_model_layer() -> None:
-    ratios = [0, 0] + [4, 128] * 20 + [4, 0]
-    config = _config(
-        num_hidden_layers=len(ratios),
-        compress_ratios=ratios,
-        max_position_embeddings=512,
-    )
-    cos_sin_cache = torch.empty(512, 128, dtype=torch.float32)
-
-    builders = [
-        runtime.DS4PrefillMetadataBuilder(
-            config,
-            layer_idx=layer_idx,
-            device="cpu",
-            cos_sin_cache=cos_sin_cache,
-        )
-        for layer_idx in range(config.num_hidden_layers)
+    assert blocks.block_table.tolist() == [[0], [1]]
+    assert blocks.slot_mapping.tolist() == [
+        -1,
+        -1,
+        -1,
+        0,
+        -1,
+        -1,
+        -1,
+        -1,
+        64,
+        -1,
+        -1,
+        -1,
+        65,
+        -1,
     ]
 
-    assert [builder.layer_idx for builder in builders] == list(
-        range(config.num_hidden_layers)
-    )
-    assert {builder.compress_ratio for builder in builders} == {1, 4, 128}
 
-
-@pytest.mark.parametrize("layer_idx", [-1, 44])
-def test_unified_builder_rejects_layers_outside_model(layer_idx) -> None:
-    ratios = [0, 0] + [4, 128] * 20 + [4, 0]
-    with pytest.raises(ValueError, match="outside the model"):
-        runtime.DS4PrefillMetadataBuilder(
-            _config(num_hidden_layers=len(ratios), compress_ratios=ratios),
-            layer_idx=layer_idx,
-            device="cpu",
-            cos_sin_cache=torch.empty(256, 128, dtype=torch.float32),
+def test_builders_share_rope_by_ratio(monkeypatch) -> None:
+    get_config = Mock(return_value=SimpleNamespace())
+    build_rope = Mock(
+        side_effect=lambda *_args, compress_ratio, **_kwargs: torch.full(
+            (512, 128), compress_ratio, dtype=torch.float32
         )
-
-
-def test_layer2_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
-    monkeypatch.setattr(
-        runtime, "DeepseekV32IndexerMetadata", lambda **kwargs: SimpleNamespace(**kwargs)
     )
-    monkeypatch.setattr(
-        runtime,
-        "DeepseekV32IndexerPrefillMetadata",
-        lambda chunks: SimpleNamespace(chunks=chunks),
+    monkeypatch.setattr(runtime, "get_config", get_config)
+    monkeypatch.setattr(runtime, "_build_rope", build_rope)
+
+    builders = runtime.build_attention_metadata_builders(
+        "/model", _config(), (0, 1, 2, 3), torch.device("cpu")
     )
-    monkeypatch.setattr(runtime, "build_prefill_chunk_metadata", lambda *_args: None)
-    metadata = runtime.DS4PrefillMetadataBuilder(
-        _config(),
-        layer_idx=2,
-        device="cpu",
-        cos_sin_cache=torch.empty(256, 128),
-    ).build_prefill_batch([5, 9])
 
-    main = metadata.compressor_metadata
-    indexer = metadata.indexer_metadata.compressor
-    assert metadata.positions.tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6, 7, 8]
-    assert metadata.slot_mapping.tolist() == [0, 1, 2, 3, 4, 256, 257, 258, 259, 260, 261, 262, 263, 264]
-    assert main.token_to_req_indices.tolist() == [0] * 5 + [1] * 9
-    assert main.state_block_table.tolist() == [[0, 1, -1], [2, 3, 4]]
-    assert main.state_slot_mapping.tolist() == list(range(5)) + list(range(8, 17))
-    assert main.k_slot_mapping.tolist() == [-1, -1, -1, 0, -1] + [-1, -1, -1, 64, -1, -1, -1, 65, -1]
-    assert indexer.k_slot_mapping.tolist() == main.k_slot_mapping.tolist()
-    assert metadata.indexer_metadata.attention_metadata.seq_lens.tolist() == [5, 9]
-    assert metadata.indexer_metadata.attention_metadata.max_seq_len == 9
-    # The official SparseAttnIndexer workspace covers every compressed K row
-    # in the packed chunk: floor(5 / 4) + floor(9 / 4), not max(1, 2).
-    assert metadata.indexer_metadata.max_total_seq_len == 3
-    assert metadata.kv_workspace.shape == (22, 1, 512)
+    get_config.assert_called_once_with("/model", trust_remote_code=True)
+    assert build_rope.call_count == 3
+    assert builders[0].cos_sin_cache is builders[1].cos_sin_cache
+    assert builders[2].ratio == 4
+    assert builders[3].ratio == 128
 
 
-def test_prepare_flash_rebuilds_derived_layout_for_activation_recompute(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("layer_idx", "rows", "expected_tokens"),
+    [(0, 37, 0), (2, 37, 64), (3, 5000, 5120)],
+)
+def test_training_metadata_has_only_local_packed_state(
+    layer_idx: int, rows: int, expected_tokens: int
 ) -> None:
-    combine_inputs = []
-    gather = Mock()
-
-    def combine(topk, *_args, out):
-        combine_inputs.append(topk)
-        indices, lengths = out
-        indices.fill_(len(combine_inputs))
-        lengths.fill_(topk.shape[-1])
-        return indices, lengths
-
-    monkeypatch.setattr(
-        runtime, "DeepseekV32IndexerMetadata", lambda **kwargs: SimpleNamespace(**kwargs)
-    )
-    monkeypatch.setattr(
-        runtime,
-        "DeepseekV32IndexerPrefillMetadata",
-        lambda chunks: SimpleNamespace(chunks=chunks),
-    )
-    monkeypatch.setattr(runtime, "build_prefill_chunk_metadata", lambda *_args: None)
-    monkeypatch.setattr(runtime, "dequantize_and_gather_k_cache", gather)
-    monkeypatch.setattr(runtime, "combine_topk_swa_indices", combine)
-    metadata = runtime.DS4PrefillMetadataBuilder(
+    packed = object()
+    positions = torch.arange(rows, dtype=torch.int64)
+    builder = runtime.AttentionMetadataBuilder(
         _config(),
-        layer_idx=2,
-        device="cpu",
-        cos_sin_cache=torch.empty(256, 128),
-    ).build_prefill_batch([5, 9])
-    source_topk = metadata.indices[:, 0]
+        layer_idx=layer_idx,
+        cos_sin_cache=torch.zeros(8192, 128, dtype=torch.float32),
+    )
+    metadata = builder.build(positions, packed)
 
-    metadata.prepare_flash()
-    assert metadata.indices.ndim == 3
-    assert metadata.indices[0, 0, 0].item() == 1
-    metadata.prepare_flash()
-    assert metadata.indices.ndim == 3
-    assert metadata.indices[0, 0, 0].item() == 2
-
-    assert gather.call_count == 4
-    assert len(combine_inputs) == 2
-    assert combine_inputs[0] is combine_inputs[1]
-    assert combine_inputs[0].untyped_storage().data_ptr() == source_topk.untyped_storage().data_ptr()
-    assert combine_inputs[0].shape == source_topk.shape
-    assert combine_inputs[0].ndim == 2
+    assert metadata.positions is positions
+    assert metadata.packed_seq_params is packed
+    assert not hasattr(metadata, "swa_cache")
+    assert not hasattr(metadata, "kv_workspace")
+    if expected_tokens == 0:
+        assert metadata.compressor_metadata is None
+    else:
+        compressor = metadata.compressor_metadata
+        assert compressor is not None
+        assert compressor.token_to_req_indices.shape == (expected_tokens,)
+        assert compressor.token_to_req_indices.count_nonzero().item() == 0
 
 
-@pytest.mark.gpus(1)
-def test_layer3_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
-    metadata = runtime.DS4PrefillMetadataBuilder(
-        _config(max_position_embeddings=512),
-        layer_idx=3,
-        device="cuda",
-        cos_sin_cache=torch.empty(512, 128, device="cuda"),
-    ).build_prefill_batch([129, 257])
-
-    main = metadata.compressor_metadata
-    assert main.token_to_req_indices.tolist() == [0] * 129 + [1] * 257
-    assert main.state_block_table.shape == (2, 33)
-    assert main.state_block_table[0, -1].item() == -1
-    assert main.state_block_table[1, 0].item() == 17
-    assert main.k_slot_mapping[127].item() == 0
-    assert main.k_slot_mapping[128].item() == -1
-    assert main.k_slot_mapping[129 + 127].item() == 2
-    assert main.k_slot_mapping[129 + 255].item() == 3
-    # Two request-major rows, each padded to max(compressed)=2 plus the full
-    # max prefill source=257.  Keeping only a 128-token tail makes early SWA
-    # indices negative in combine_topk_swa_indices.
-    assert metadata.kv_workspace.shape == (518, 1, 512)
-
-
-def _compressor_metadata(device: str = "cpu", tokens: int = 2):
-    return runtime.DS4CompressorRuntimeMetadata(
-        state_cache=torch.zeros(1, 4, 512, dtype=torch.float32, device=device),
-        state_slot_mapping=torch.arange(tokens, dtype=torch.int64, device=device),
-        state_block_table=torch.tensor([[0]], dtype=torch.int32, device=device),
+def _compressor_metadata(tokens: int = 4):
+    return runtime.DS4CompressorMetadata(
+        state_cache=torch.zeros(1, 4, 512, dtype=torch.float32),
+        state_slot_mapping=torch.arange(tokens, dtype=torch.int64),
+        state_block_table=torch.tensor([[0]], dtype=torch.int32),
         state_block_size=4,
-        token_to_req_indices=torch.zeros(tokens, dtype=torch.int32, device=device),
-        k_cache=torch.zeros(1, 64, 132, dtype=torch.uint8, device=device),
-        k_slot_mapping=torch.full((tokens,), -1, dtype=torch.int64, device=device),
-        cos_sin_cache=torch.zeros(16, 128, dtype=torch.float32, device=device),
+        token_to_req_indices=torch.zeros(tokens, dtype=torch.int32),
+        k_cache=torch.zeros(1, 64, 132, dtype=torch.uint8),
+        k_slot_mapping=torch.full((tokens,), -1, dtype=torch.int64),
+        cos_sin_cache=torch.zeros(16, 128, dtype=torch.float32),
         rms_norm_eps=1e-6,
         rope_head_dim=64,
     )
 
 
-def test_extended_compressor_cpu_contract_calls_official_operations(
-    monkeypatch,
-) -> None:
+def test_compressor_calls_official_operations(monkeypatch) -> None:
     from vllm.models.deepseek_v4.common.ops import fused_compress_quant_cache
 
     save = Mock()
@@ -347,10 +128,9 @@ def test_extended_compressor_cpu_contract_calls_official_operations(
         fused_compress_quant_cache, "compress_norm_rope_store_triton", compress
     )
     metadata = _compressor_metadata()
-    kv_score = torch.zeros(2, 512, dtype=torch.float32)
-    runtime.DS4PrefillMetadataBuilder.compressor_operation(
-        kv_score=kv_score,
-        positions=torch.tensor([0, 1], dtype=torch.int64),
+    runtime.compressor_operation(
+        kv_score=torch.zeros(4, 512, dtype=torch.float32),
+        positions=torch.arange(4, dtype=torch.int64),
         ape=torch.zeros(4, 256, dtype=torch.float32),
         norm_weight=torch.ones(128, dtype=torch.bfloat16),
         compress_ratio=4,
@@ -363,201 +143,4 @@ def test_extended_compressor_cpu_contract_calls_official_operations(
     assert save.call_args.kwargs["state_width"] == 256
     compress.assert_called_once()
     assert compress.call_args.kwargs["kv_cache"] is metadata.k_cache
-    assert compress.call_args.kwargs["head_dim"] == 128
     assert compress.call_args.kwargs["token_stride"] == 128
-
-
-def test_extended_indexer_cpu_contract_calls_official_short_metadata_kernel(
-    monkeypatch,
-) -> None:
-    launch = Mock()
-
-    class Kernel:
-        def __getitem__(self, _grid):
-            return launch
-
-    monkeypatch.setattr(runtime, "_fill_short_context_topk_indices", Kernel())
-    compressor = _compressor_metadata()
-    topk = torch.full((2, 4), -1, dtype=torch.int32)
-    metadata = runtime.DS4IndexerRuntimeMetadata(
-        compressor=compressor,
-        attention_metadata=SimpleNamespace(max_seq_len=8),
-        k_cache_prefix="indexer.k_cache",
-        topk_indices=topk,
-        max_model_len=64,
-        max_total_seq_len=2,
-    )
-    result = runtime.DS4PrefillMetadataBuilder.indexer_operation(
-        qr=torch.zeros(2, 8, dtype=torch.bfloat16),
-        index_q=torch.zeros(2, 2, 128, dtype=torch.bfloat16),
-        index_weights=torch.zeros(2, 2, dtype=torch.bfloat16),
-        positions=torch.tensor([0, 1], dtype=torch.int64),
-        compress_ratio=4,
-        topk=4,
-        metadata=metadata,
-    )
-
-    assert result is topk
-    launch.assert_called_once()
-    assert launch.call_args.args[0] is topk
-    assert torch.equal(launch.call_args.args[1], metadata.compressor.state_slot_mapping)
-    assert launch.call_args.kwargs["COMPRESS_RATIO"] == 4
-
-
-def _production_ready() -> bool:
-    return (
-        torch.cuda.is_available()
-        and importlib.util.find_spec("vllm") is not None
-        and importlib.util.find_spec("triton") is not None
-    )
-
-
-@pytest.mark.gpus(1)
-@pytest.mark.skipif(
-    not _production_ready(),
-    reason="requires CUDA and the matching vLLM DS4 Triton primitives",
-)
-def test_prefill_indices_are_bitwise_official_vllm() -> None:
-    from vllm.models.deepseek_v4.common.ops import combine_topk_swa_indices
-
-    num_tokens = 193
-    config = _config(max_position_embeddings=512)
-    builder = runtime.DS4PrefillMetadataBuilder(
-        config,
-        device="cuda",
-        cos_sin_cache=torch.empty(512, 128, dtype=torch.float32, device="cuda"),
-    )
-    candidate = builder.build_prefill_batch([num_tokens])
-    reference_indices, reference_lens = combine_topk_swa_indices(
-        torch.empty(num_tokens, config.index_topk, dtype=torch.int32, device="cuda"),
-        torch.tensor([0, num_tokens], dtype=torch.int32, device="cuda"),
-        torch.tensor([num_tokens], dtype=torch.int32, device="cuda"),
-        torch.tensor([num_tokens], dtype=torch.int32, device="cuda"),
-        config.sliding_window,
-        1,
-        0,
-        num_tokens,
-        0,
-    )
-    torch.testing.assert_close(
-        candidate.indices.squeeze(1), reference_indices, rtol=0, atol=0
-    )
-    torch.testing.assert_close(candidate.topk_length, reference_lens, rtol=0, atol=0)
-
-
-@pytest.mark.gpus(1)
-@pytest.mark.skipif(
-    not _production_ready(),
-    reason="requires CUDA and the matching vLLM DS4 Triton primitives",
-)
-def test_extended_short_indexer_is_bitwise_official_vllm() -> None:
-    from vllm.models.deepseek_v4.attention import (
-        _fill_short_context_topk_indices,
-    )
-
-    positions = torch.arange(8, dtype=torch.int64, device="cuda")
-    expected = torch.full((8, 8), -1, dtype=torch.int32, device="cuda")
-    actual = expected.clone()
-    _fill_short_context_topk_indices[(8,)](
-        expected,
-        positions,
-        TOP_K=8,
-        COMPRESS_RATIO=4,
-        PADDED_TOP_K=8,
-        num_warps=8,
-    )
-    compressor = _compressor_metadata("cuda")
-    metadata = runtime.DS4IndexerRuntimeMetadata(
-        compressor=compressor,
-        attention_metadata=SimpleNamespace(max_seq_len=8),
-        k_cache_prefix="indexer.k_cache",
-        topk_indices=actual,
-        max_model_len=64,
-        max_total_seq_len=2,
-    )
-    result = runtime.DS4PrefillMetadataBuilder.indexer_operation(
-        qr=torch.zeros(8, 8, dtype=torch.bfloat16, device="cuda"),
-        index_q=torch.zeros(8, 2, 128, dtype=torch.bfloat16, device="cuda"),
-        index_weights=torch.zeros(8, 2, dtype=torch.bfloat16, device="cuda"),
-        positions=positions,
-        compress_ratio=4,
-        topk=8,
-        metadata=metadata,
-    )
-    torch.testing.assert_close(result, expected, rtol=0, atol=0)
-
-
-@pytest.mark.gpus(1)
-@pytest.mark.skipif(
-    not _production_ready(),
-    reason="requires CUDA and the matching vLLM DS4 Triton primitives",
-)
-def test_extended_compressor_is_bitwise_official_vllm() -> None:
-    from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
-        compress_norm_rope_store_triton,
-    )
-    from vllm.models.deepseek_v4.common.ops.save_partial_states import (
-        save_partial_states,
-    )
-
-    torch.manual_seed(31)
-    tokens = 4
-    positions = torch.arange(tokens, dtype=torch.int64, device="cuda")
-    kv_score = torch.randn(tokens, 512, dtype=torch.float32, device="cuda")
-    ape = torch.randn(4, 256, dtype=torch.float32, device="cuda")
-    norm = torch.randn(128, dtype=torch.bfloat16, device="cuda")
-    expected = _compressor_metadata("cuda", tokens)
-    actual = _compressor_metadata("cuda", tokens)
-    expected.k_slot_mapping.copy_(
-        torch.tensor([-1, -1, -1, 0], dtype=torch.int64, device="cuda")
-    )
-    actual.k_slot_mapping.copy_(expected.k_slot_mapping)
-
-    kv, score = kv_score.split([256, 256], dim=-1)
-    save_partial_states(
-        kv=kv,
-        score=score,
-        ape=ape,
-        positions=positions,
-        state_cache=expected.state_cache,
-        slot_mapping=expected.state_slot_mapping,
-        block_size=4,
-        state_width=256,
-        compress_ratio=4,
-        pdl_kwargs={"launch_pdl": False},
-    )
-    compress_norm_rope_store_triton(
-        state_cache=expected.state_cache,
-        num_actual=tokens,
-        token_to_req_indices=expected.token_to_req_indices,
-        positions=positions,
-        slot_mapping=expected.state_slot_mapping,
-        block_table=expected.state_block_table,
-        block_size=4,
-        state_width=256,
-        cos_sin_cache=expected.cos_sin_cache,
-        kv_cache=expected.k_cache,
-        k_cache_metadata=SimpleNamespace(slot_mapping=expected.k_slot_mapping),
-        pdl_kwargs={"launch_pdl": False},
-        head_dim=128,
-        rope_head_dim=64,
-        compress_ratio=4,
-        overlap=True,
-        use_fp4_cache=False,
-        rms_norm_weight=norm,
-        rms_norm_eps=1e-6,
-        quant_block=128,
-        token_stride=128,
-        scale_dim=4,
-    )
-    runtime.DS4PrefillMetadataBuilder.compressor_operation(
-        kv_score=kv_score,
-        positions=positions,
-        ape=ape,
-        norm_weight=norm,
-        compress_ratio=4,
-        head_dim=128,
-        metadata=actual,
-    )
-    torch.testing.assert_close(actual.state_cache, expected.state_cache, rtol=0, atol=0)
-    assert torch.equal(actual.k_cache, expected.k_cache)

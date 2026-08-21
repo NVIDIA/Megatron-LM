@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 import torch
 
-from ._recompute import (
+from .recompute import (
     check_parameter_versions,
     fp32_linear_vjp,
     parameter_versions,

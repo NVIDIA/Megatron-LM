@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe import DeepseekV4MoE
 from megatron.lite.primitive.modules.mlp import SwiGLUMLP
 
 

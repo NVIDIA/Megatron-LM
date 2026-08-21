@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
@@ -14,7 +15,7 @@ from megatron.lite.model.deepseek_v4.vllm.model import (
     DeepseekV4Layer,
     DeepseekV4Model,
 )
-from megatron.lite.model.deepseek_v4.vllm.moe import DeepseekV4MoE
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe import DeepseekV4MoE
 
 
 def _tiny_config() -> DeepseekV4Config:
@@ -44,6 +45,7 @@ def test_vllm_path_reuses_lite_model_containers() -> None:
     assert issubclass(DeepseekV4MoE, LiteDeepseekV4MoE)
 
 
+@pytest.mark.gpus(1)
 def test_small_model_state_dict_preserves_release_master_dtypes() -> None:
     model = DeepseekV4Model(_tiny_config())
     floating = {
@@ -70,16 +72,17 @@ def test_small_model_state_dict_preserves_release_master_dtypes() -> None:
     assert sum(value.numel() for value in model.state_dict().values()) < 100_000
 
 
+@pytest.mark.gpus(1)
 def test_deployment_weight_cache_policy_reaches_attention_and_moe() -> None:
     for enabled in (False, True):
         model = DeepseekV4Model(
             _tiny_config(), cache_deployment_weights=enabled
         )
         layer = model.layers["0"]
-        attention = layer.self_attn.self_attn
-        assert attention.adapters.fused_linear.cache_weight is enabled
-        assert attention.adapters.q_linear.cache_weight is enabled
-        assert attention.adapters.indexer_q_linear.cache_weight is enabled
+        attention = layer.self_attn
+        assert attention.fused_linear.cache_weight is enabled
+        assert attention.q_linear.cache_weight is enabled
+        assert attention.indexer_q_linear.cache_weight is enabled
         assert layer.mlp.shared_gate_up_fp8.cache_weight is enabled
         assert layer.mlp.shared_down_fp8.cache_weight is enabled
 

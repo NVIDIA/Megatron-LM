@@ -6,32 +6,27 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import megatron.lite.model.deepseek_v4.vllm.attention as attention_module
-from megatron.lite.model.deepseek_v4.vllm.attention import (
-    _rope_and_qnorm,
-    attention_core,
-)
-from megatron.lite.model.deepseek_v4.vllm.linear import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.linear import (
     block_fp8_linear,
     fused_block_fp8_linear,
     gate_linear,
 )
-from megatron.lite.model.deepseek_v4.vllm.mhc import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.mhc import (
     _pre_graph,
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,
 )
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
-from megatron.lite.model.deepseek_v4.vllm.norm import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.norm import (
     fused_qkv_rms_norm,
     rms_norm,
 )
-from megatron.lite.model.deepseek_v4.vllm.o_proj import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.o_proj import (
     _inverse_rope,
     o_projection,
 )
-from megatron.lite.model.deepseek_v4.vllm.router import fixed_route_vjp
+from megatron.lite.model.deepseek_v4.vllm.primitive.router import fixed_route_vjp
 from megatron.lite.primitive.recompute import wrap_checkpoint
 
 pytestmark = pytest.mark.gpus(1)
@@ -276,36 +271,3 @@ def test_router_backward_keeps_ids_snapshot_when_consumer_mutates_output() -> No
     reference = logits.detach().requires_grad_(True)
     visible(reference)[0].backward(grad)
     torch.testing.assert_close(logits.grad, reference.grad)
-
-
-def test_attention_core_replays_visible_rope_and_workspace_vjp(monkeypatch) -> None:
-    torch.manual_seed(5)
-    tokens, heads, dim, rope_dim = 3, 2, 6, 4
-    q = torch.randn(tokens, heads, dim, requires_grad=True)
-    kv = torch.randn(tokens, dim, requires_grad=True)
-    workspace = torch.randn(5, 1, dim)
-    indices = torch.zeros(tokens, 1, 2, dtype=torch.int32)
-    lengths = torch.full((tokens,), 2, dtype=torch.int32)
-    sink = torch.zeros(heads)
-    slots = torch.tensor([4, 1, 3])
-    positions = torch.tensor([2, 0, 1])
-    cache = torch.randn(4, rope_dim)
-    q_visible = _rope_and_qnorm(q.detach(), positions, cache, rope_dim, 1e-6, normalize=True)
-    visible_output = q_visible + 0.25
-    dq = torch.randn_like(q_visible)
-    dworkspace = torch.randn_like(workspace)
-    monkeypatch.setattr(attention_module, "_default_sparse_backward", lambda *_: (dq, dworkspace))
-    output = attention_core(
-        lambda *_args: (
-            visible_output,
-            torch.randn(tokens, heads),
-            q_visible,
-            workspace,
-            indices,
-            lengths,
-        ),
-        q, kv, workspace, indices, lengths, sink, slots, positions, cache,
-        softmax_scale=0.5, eps=1e-6, rope_dim=rope_dim,
-    )
-    output.backward(torch.ones_like(output))
-    assert q.grad is not None and kv.grad is not None

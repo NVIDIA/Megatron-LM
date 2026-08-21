@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from megatron.lite.primitive.modules.attention.hca import HyperConnection, split_sinkhorn
 
-from ._recompute import visible_functional_vjp
+from .recompute import visible_functional_vjp
 
 
 def _pre_graph(x, fn, scale, base, *, mult, iters, eps):

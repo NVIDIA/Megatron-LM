@@ -50,7 +50,7 @@ def _ordered_route_backward(
 
     fused_route_grad = False
     if grad_routes is not None and grad_output.is_cuda:
-        from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import (
+        from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route_kernels import (
             ordered_route_grad,
         )
 
@@ -97,7 +97,7 @@ class _DeepEPScatterWithDeterministicBackward(torch.autograd.Function):
     ) -> torch.Tensor:
         output = hidden_states.new_zeros((int(total_rows), hidden_states.shape[1]))
         if hidden_states.is_cuda:
-            from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import (
+            from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route_kernels import (
                 scatter_routes_forward,
             )
 
@@ -139,7 +139,7 @@ class _DeepEPScatterWithDeterministicBackward(torch.autograd.Function):
             device=ctx.input_device,
         )
         if grad_output.is_cuda:
-            from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import (
+            from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route_kernels import (
                 scatter_routes_backward,
             )
 
@@ -253,7 +253,7 @@ def _scatter_deepep_routes_with_padding(
     expert_offsets = torch.cumsum(counts, dim=0) - counts
 
     if expected_route_count is not None and valid.is_cuda:
-        from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import (
+        from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route_kernels import (
             compact_route_positions,
         )
 
@@ -447,6 +447,7 @@ def _deepep_route_handle_received_rows(handle: tuple) -> int:
 
 
 def _validate_and_order_route_preserving_outputs(
+    expert_outputs: torch.Tensor,
     received_tokens: torch.Tensor,
     received_topk_indices: torch.Tensor,
     received_topk_weights: torch.Tensor,
@@ -455,15 +456,19 @@ def _validate_and_order_route_preserving_outputs(
     route_indices: torch.Tensor,
     route_weights: torch.Tensor,
     *,
+    order_outputs: bool = True,
     route_positions: torch.Tensor | None = None,
+    return_route_rows: bool = False,
 ) -> torch.Tensor:
-    """Return primary expert rows in the route handle's receive order.
+    """Return expert outputs in the route handle's receive order.
 
-    DeepEP currently preserves source-token/slot order between the primary
-    rank-deduplicated dispatch and the route-level metadata dispatch.  Match
-    Slime by validating that invariant before consuming the route handle.
+    Normal DeepEP's primary dispatch is rank-deduplicated: its received route
+    probabilities are not a reliable per-(token, slot) identity when one token
+    reaches multiple experts on the same rank. Pair the primary hidden rows
+    with Slime's route-preserving metadata by expert ID and a sixteen-BF16
+    source fingerprint.
     """
-    if received_tokens.ndim != 2:
+    if expert_outputs.ndim != 2 or received_tokens.ndim != 2:
         raise ValueError("Route-preserving DeepEP expects 2D hidden tensors")
     if received_topk_indices.shape != received_topk_weights.shape:
         raise ValueError("Received DeepEP IDs and weights do not align")
@@ -483,7 +488,6 @@ def _validate_and_order_route_preserving_outputs(
     token_rows = positions[:, 0]
     topk_slots = positions[:, 1]
     expected_indices = received_topk_indices[token_rows, topk_slots].reshape(-1)
-    expected_weights = received_topk_weights[token_rows, topk_slots].reshape(-1)
     expected_fingerprints = received_tokens.narrow(1, 0, 16).index_select(0, token_rows)
     if route_fingerprints.shape != expected_fingerprints.shape:
         raise RuntimeError(
@@ -491,16 +495,61 @@ def _validate_and_order_route_preserving_outputs(
             f"{tuple(route_fingerprints.shape)} != {tuple(expected_fingerprints.shape)}"
         )
 
-    torch._assert_async(
-        torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
-        "Route-preserving DeepEP metadata changed local expert order",
+    def stable_key_order(
+        fingerprints: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        order = torch.arange(
+            indices.numel(), device=indices.device, dtype=torch.long
+        )
+        fingerprint_bits = fingerprints.contiguous().view(torch.int16)
+        columns = [
+            *(fingerprint_bits[:, column] for column in range(fingerprint_bits.shape[1])),
+            indices.to(dtype=torch.long),
+        ]
+        for column in reversed(columns):
+            permutation = torch.argsort(
+                column.index_select(0, order), stable=True
+            )
+            order = order.index_select(0, permutation)
+        return order
+
+    primary_order = stable_key_order(expected_fingerprints, expected_indices)
+    metadata_order = stable_key_order(
+        route_fingerprints,
+        route_indices.to(dtype=expected_indices.dtype),
     )
     torch._assert_async(
-        torch.all(expected_weights == route_weights.to(dtype=expected_weights.dtype)),
-        "Route-preserving DeepEP metadata changed route probability order",
+        torch.all(
+            expected_indices.index_select(0, primary_order)
+            == route_indices.to(dtype=expected_indices.dtype).index_select(
+                0, metadata_order
+            )
+        ),
+        "Route-preserving DeepEP metadata changed expert identities",
     )
     torch._assert_async(
-        torch.all(expected_fingerprints == route_fingerprints),
-        "Route-preserving DeepEP metadata changed source-token order",
+        torch.all(torch.isfinite(route_weights)),
+        "Route-preserving DeepEP metadata contains nonfinite route probabilities",
     )
-    return output_index[token_rows, topk_slots].to(dtype=torch.long)
+    torch._assert_async(
+        torch.all(
+            expected_fingerprints.contiguous()
+            .view(torch.int16)
+            .index_select(0, primary_order)
+            == route_fingerprints.contiguous()
+            .view(torch.int16)
+            .index_select(0, metadata_order)
+        ),
+        "Route-preserving DeepEP metadata changed source fingerprints",
+    )
+
+    metadata_to_primary = torch.empty_like(metadata_order)
+    metadata_to_primary.scatter_(0, metadata_order, primary_order)
+    primary_route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
+    route_rows = primary_route_rows.index_select(0, metadata_to_primary)
+    if return_route_rows:
+        return route_rows
+    if not order_outputs:
+        return expert_outputs
+    return expert_outputs.index_select(0, route_rows)

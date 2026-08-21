@@ -11,10 +11,10 @@ from megatron.lite.model import registry
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm import protocol
-from megatron.lite.model.deepseek_v4.vllm.dispatcher import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
-from megatron.lite.model.deepseek_v4.vllm.moe import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import (
     DeepseekV4MoE,
     _batch_invariant_gate_logits,
 )
@@ -145,8 +145,7 @@ def test_cp_forward_inputs_reuse_lite_contiguous_layout() -> None:
         loss_mask=torch.ones(7),
         seq_lens=torch.tensor([3, 4]),
     )
-    inputs, padded_lengths, packed = protocol._prepare_cp_forward_inputs(model, batch)
-    assert padded_lengths == [4, 4]
+    inputs, packed = protocol._prepare_cp_forward_inputs(model, batch)
     assert {name: value.shape for name, value in inputs.items()} == {
         "input_ids": (4,),
         "position_ids": (4,),
@@ -165,19 +164,26 @@ def test_cp1_forward_inputs_use_shared_packing_and_roll_targets() -> None:
         loss_mask=torch.ones(5),
         seq_lens=torch.tensor([2, 3]),
     )
-    inputs, lengths, _ = protocol._prepare_cp_forward_inputs(model, batch)
-    assert lengths == [2, 3]
+    inputs, _ = protocol._prepare_cp_forward_inputs(model, batch)
     assert torch.equal(inputs["labels"], torch.tensor([12, 0, 22, 23, 0]))
 
 
-def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
+def test_forward_builds_model_owned_training_metadata(monkeypatch) -> None:
     captured = {}
+    built = {}
+
+    class Builder:
+        def build(self, positions, packed_seq_params):
+            built["positions"] = positions
+            built["packed"] = packed_seq_params
+            return "metadata"
+
     monkeypatch.setattr(protocol, "init_batch_invariance", lambda: None)
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
     monkeypatch.setattr(
         protocol,
-        "build_prefill_metadata_builders",
-        lambda *_args, **_kwargs: pytest.fail("rebuilt caller-owned metadata"),
+        "build_attention_metadata_builders",
+        lambda *_args, **_kwargs: {0: Builder()},
     )
     monkeypatch.setitem(
         sys.modules,
@@ -199,13 +205,18 @@ def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
             parallel=ParallelConfig(ep=1), hf_path="/unused"
         ),
     )
-    attention_metadata = {0: object()}
-    batch = SimpleNamespace(
+    batch = PackedBatch(
         input_ids=torch.tensor([1, 2, 3]),
-        attention_metadata=attention_metadata,
+        labels=torch.tensor([4, 5, 6]),
+        loss_mask=torch.ones(3),
+        seq_lens=torch.tensor([3]),
     )
     bundle.forward_step(bundle.chunks[0], batch)
-    assert captured["attention_metadata"] is attention_metadata
+    assert captured["attention_metadata"] == {0: "metadata"}
+    assert torch.equal(
+        built["positions"], torch.arange(built["positions"].numel())
+    )
+    assert built["packed"] is not None
 
 
 def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:

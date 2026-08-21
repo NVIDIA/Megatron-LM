@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 
-from megatron.lite.model.deepseek_v4.vllm.deepep_route import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.route import (
     _VLLMEPGatherWithBF16Backward,
     _compact_route_preserving_metadata_inputs,
     _deepep_route_handle_received_rows,
@@ -15,7 +16,50 @@ from megatron.lite.primitive.modules.dispatcher import (
     TokenDispatcher,
     _DeepEPCombine,
     _DeepEPDispatch,
+    deep_ep,
 )
+
+
+_deepep_buffer = None
+
+
+def _get_deepep_buffer(group: dist.ProcessGroup, hidden_bytes: int):
+    """Reuse the process-wide normal-DeepEP buffer used by MCore and Slime."""
+
+    if deep_ep is None:
+        raise RuntimeError("DeepEP is required for vLLM-aligned EP>1")
+    global _deepep_buffer
+    group_size = dist.get_world_size(group=group)
+    num_nvl_bytes = 0
+    num_rdma_bytes = 0
+    for config in (
+        deep_ep.Buffer.get_dispatch_config(group_size),
+        deep_ep.Buffer.get_combine_config(group_size),
+    ):
+        num_nvl_bytes = max(
+            num_nvl_bytes,
+            config.get_nvl_buffer_size_hint(hidden_bytes, group_size),
+        )
+        if group_size > torch.cuda.device_count():
+            num_rdma_bytes = max(
+                num_rdma_bytes,
+                config.get_rdma_buffer_size_hint(hidden_bytes, group_size),
+            )
+
+    if (
+        _deepep_buffer is None
+        or getattr(_deepep_buffer, "runtime", None) is None
+        or _deepep_buffer.group != group
+        or _deepep_buffer.num_nvl_bytes < num_nvl_bytes
+        or _deepep_buffer.num_rdma_bytes < num_rdma_bytes
+    ):
+        _deepep_buffer = deep_ep.Buffer(
+            group=group,
+            num_nvl_bytes=num_nvl_bytes,
+            num_rdma_bytes=num_rdma_bytes,
+            explicitly_destroy=True,
+        )
+    return _deepep_buffer
 
 
 def _dispatch_route_metadata(
@@ -49,9 +93,26 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
     """Match vLLM route identity while using only normal DeepEP transport."""
 
     def __init__(self, *args, **kwargs):
+        kwargs["use_deepep"] = False
         super().__init__(*args, **kwargs)
-        if self.ep_size > 1 and not self.use_deepep:
-            raise RuntimeError("vLLM alignment at EP>1 requires normal DeepEP")
+        self.use_deepep = self.ep_size > 1
+        self.buffer = None
+        if self.use_deepep:
+            if deep_ep is None:
+                raise RuntimeError("DeepEP is required for vLLM-aligned EP>1")
+            if self.ps.tp_ep_group is None:
+                raise RuntimeError("vLLM alignment at EP>1 requires an EP group")
+            self._deepep_group = self.ps.tp_ep_group
+            deep_ep.Buffer.set_num_sms(20)
+
+    def _ensure_deepep_buffer(self, hidden_states: torch.Tensor):
+        if not self.use_deepep:
+            raise RuntimeError("DeepEP buffer requested at EP=1")
+        self.buffer = _get_deepep_buffer(
+            self._deepep_group,
+            hidden_states.shape[1] * max(hidden_states.element_size(), 2),
+        )
+        return self.buffer
 
     def dispatch(
         self,
@@ -117,6 +178,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         )
 
         if self.ep_size > 1:
+            buffer = self._ensure_deepep_buffer(hidden_states)
             (
                 received_hidden,
                 received_indices,
@@ -124,7 +186,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
                 received_per_expert,
                 _,
             ) = _DeepEPDispatch.apply(
-                self.buffer,
+                buffer,
                 hidden_states,
                 topk_indices,
                 topk_scores,
@@ -140,7 +202,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
                 route_handle,
                 _,
             ) = _dispatch_route_metadata(
-                self.buffer,
+                buffer,
                 route_fingerprints,
                 route_indices,
                 route_weights,
@@ -178,6 +240,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             expected_route_count=expected_route_count,
         )
         self._metadata_route_rows = _validate_and_order_route_preserving_outputs(
+            expert_hidden,
             received_hidden,
             sanitized_indices,
             received_weights,
@@ -186,6 +249,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             received_route_indices.reshape(-1),
             received_route_weights.reshape(-1),
             route_positions=positions,
+            return_route_rows=True,
         )
         self._route_handle = route_handle
         self._source_indices = topk_indices

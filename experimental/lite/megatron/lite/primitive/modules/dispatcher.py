@@ -12,6 +12,7 @@ from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.moe import permute, unpermute
+
 try:
     import deep_ep  # pyright: ignore[reportMissingImports]
     from deep_ep.utils import EventHandle, EventOverlap  # pyright: ignore[reportMissingImports]
