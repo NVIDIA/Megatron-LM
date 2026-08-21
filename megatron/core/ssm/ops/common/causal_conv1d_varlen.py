@@ -278,6 +278,20 @@ def _causal_conv1d_varlen_simple(
             out[start + t] = result.to(out.dtype)
 
 
+# Tiny and launch-bound: one program per (request, channel block), each writing
+# d_conv columns. The useful axis is how much of conv_dim a program covers --
+# wide blocks cut the program count, narrow ones keep more SMs busy when the
+# padded request count is small.
+@triton.autotune(
+    configs=autotune_configs(
+        [
+            triton.Config({"BLOCK_C": 64}, num_warps=2),
+            triton.Config({"BLOCK_C": 128}, num_warps=4),
+            triton.Config({"BLOCK_C": 256}, num_warps=4),
+        ]
+    ),
+    key=["conv_dim"],
+)
 @triton.jit
 def _causal_conv1d_carry_states_kernel(
     x_ptr,
@@ -404,8 +418,7 @@ def causal_conv1d_varlen_carry_states(
     if num_requests == 0:
         return out
 
-    block_c = min(triton.next_power_of_2(conv_dim), 256)
-    grid = (num_requests, triton.cdiv(conv_dim, block_c))
+    grid = lambda meta: (num_requests, triton.cdiv(conv_dim, meta["BLOCK_C"]))
     _causal_conv1d_carry_states_kernel[grid](
         x,
         cu_seqlens,
@@ -420,7 +433,5 @@ def causal_conv1d_varlen_carry_states(
         out.stride(0),
         out.stride(1),
         D_CONV=d_conv,
-        BLOCK_C=block_c,
-        num_warps=4,
     )
     return out
