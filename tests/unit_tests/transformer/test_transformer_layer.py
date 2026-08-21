@@ -912,7 +912,7 @@ class TestMHCWithCudaGraph:
 
     def test_te_graph_static_hidden_input_tracks_runtime_microbatch_slot(self):
         """Static-input handles use the same modulo slot selection as TE graphs."""
-        layer, _ = self._create_mhc_layer()
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.cuda_graphs = [object(), object()]
         slot_inputs = (
             torch.empty((4, 1, 64), device="cuda"),
@@ -928,7 +928,7 @@ class TestMHCWithCudaGraph:
 
     def test_te_graph_static_hidden_input_rejects_address_drift(self):
         """A retained static-input handle whose storage moved must refuse to serve."""
-        layer, _ = self._create_mhc_layer()
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.cuda_graphs = [object()]
         slot = torch.empty((4, 1, 64), device="cuda")
         layer.set_te_cuda_graph_static_hidden_inputs((slot,))
@@ -937,7 +937,7 @@ class TestMHCWithCudaGraph:
             layer.get_te_cuda_graph_static_hidden_input()
 
     def test_set_te_cuda_graph_static_hidden_inputs_validates_inputs(self):
-        layer, _ = self._create_mhc_layer()
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.cuda_graphs = [object(), object()]
         with pytest.raises(ValueError, match="match graph count"):
             layer.set_te_cuda_graph_static_hidden_inputs((torch.empty(2, device="cuda"),))
@@ -950,7 +950,7 @@ class TestMHCWithCudaGraph:
 
     def test_te_graph_static_hidden_inputs_follow_dynamic_cp_graph_bank(self, monkeypatch):
         """DCP replay must switch the graph and mHC direct-write input as one bank."""
-        layer, _ = self._create_mhc_layer()
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         graph_banks = {1: [object(), object()], 2: [object(), object()]}
         input_banks = {
             1: (
