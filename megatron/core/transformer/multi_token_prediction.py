@@ -619,6 +619,7 @@ def mtp_on_this_rank(
     mtp_num_layers: Optional[int] = None,
     ignore_virtual: Optional[bool] = True,
     vp_stage: Optional[int] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> bool:
     """
     Check if there is MTP on the current rank.
@@ -631,15 +632,27 @@ def mtp_on_this_rank(
               True if any virtual sub-rank includes at least one MTP layer.
         - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
           pipeline stage. The function returns True only on the last pipeline stage.
+        - If ``pp_group`` is provided, all pipeline coordinates are derived from it instead of
+          the global ``parallel_state``, so frameworks that build models with explicit process
+          groups (without initializing the global mpu) can use MTP. When both ``pp_group`` and a
+          custom layout are given, virtual pipelining is inferred from the layout of this rank.
+          Without ``pp_group`` the behavior is unchanged.
     """
     mtp_on_this_rank = False
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_rank = (
+        torch.distributed.get_rank(group=pp_group)
+        if pp_group is not None
+        else parallel_state.get_pipeline_model_parallel_rank()
+    )
     if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
-        if (
-            not ignore_virtual
-            and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
-        ):
+        if pp_group is not None:
+            vpp_enabled = len(layout.layout[pp_rank]) > 1
+        else:
+            vpp_enabled = (
+                parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+            )
+        if not ignore_virtual and vpp_enabled:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
             num_layers_to_build = layout.layout[pp_rank][vp_stage].count(LayerType.mtp)
             mtp_on_this_rank = num_layers_to_build > 0
@@ -652,9 +665,12 @@ def mtp_on_this_rank(
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
-            mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
-                ignore_virtual=ignore_virtual, vp_stage=vp_stage
-            )
+            if pp_group is not None:
+                mtp_on_this_rank = pp_rank == torch.distributed.get_world_size(group=pp_group) - 1
+            else:
+                mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
+                    ignore_virtual=ignore_virtual, vp_stage=vp_stage
+                )
         else:
             mtp_on_this_rank = False
     return mtp_on_this_rank
@@ -770,6 +786,7 @@ def process_mtp_loss(
     config: TransformerConfig,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
@@ -791,6 +808,9 @@ def process_mtp_loss(
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
         tp_group (Optional[ProcessGroup]): Tensor parallelism process group.
+        dp_cp_group (Optional[ProcessGroup]): Data-parallel group with context parallelism,
+            used to average the logged MTP metrics. Falls back to the global
+            ``parallel_state`` group when not provided.
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
         scale_logits_fn (Optional[Callable[[Tensor], Tensor]]): Optional function to
             scale logits before loss computation (e.g., MuP output scaling).
@@ -871,7 +891,11 @@ def process_mtp_loss(
                 total,
                 mtp_layer_number,
                 config.mtp_num_layers,
-                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                avg_group=(
+                    dp_cp_group
+                    if dp_cp_group is not None
+                    else parallel_state.get_data_parallel_group(with_context_parallel=True)
+                ),
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
@@ -1412,7 +1436,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                     custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    (
+                        self.tp_group
+                        if self.tp_group is not None
+                        else parallel_state.get_tensor_model_parallel_group()
+                    ),
                     hidden_states,
                     decoder_input,
                     attention_mask,

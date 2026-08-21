@@ -27,6 +27,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     _mtp_logits_are_vocab_sharded,
+    mtp_on_this_rank,
     process_mtp_loss,
     roll_tensor,
 )
@@ -1780,3 +1781,75 @@ class TestMultiTokenPredictionHybrid:
                 pytest.fail(f"Attention mask validation failed for Mamba hybrid model: {e}")
             else:
                 raise
+
+
+class TestMTPExplicitProcessGroups:
+    """Explicit process groups must reproduce the ``parallel_state`` defaults exactly,
+    and providing them must bypass the global-state reads so frameworks that do not
+    initialize the global mpu can run MTP."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_mtp_on_this_rank_explicit_pp_group_matches_default(self):
+        from megatron.core import parallel_state
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
+        )
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        for mtp_num_layers in (None, 2):
+            assert mtp_on_this_rank(
+                mtp_num_layers=mtp_num_layers, pp_group=pp_group
+            ) == mtp_on_this_rank(mtp_num_layers=mtp_num_layers)
+
+    def test_process_mtp_loss_explicit_dp_cp_group_bypasses_parallel_state(self, monkeypatch):
+        from megatron.core import parallel_state
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        vocab_size = 16
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len, 1, config.hidden_size, requires_grad=True
+        )
+        labels = torch.randint(0, vocab_size, (1, seq_len))
+        loss_mask = torch.ones(1, seq_len)
+        output_weight = torch.nn.Parameter(torch.randn(vocab_size, config.hidden_size))
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return torch.matmul(hidden, weight.t()), None
+
+        def compute_language_model_loss(labels, logits):
+            return logits.sum(dim=-1).transpose(0, 1)
+
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+        def _forbid_global_read(*args, **kwargs):
+            raise AssertionError(
+                "process_mtp_loss read parallel_state despite an explicit dp_cp_group"
+            )
+
+        monkeypatch.setattr(parallel_state, "get_data_parallel_group", _forbid_global_read)
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=None,
+            is_training=True,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            dp_cp_group=dp_cp_group,
+        )
+        assert torch.isfinite(result.sum())
+        MTPLossLoggingHelper.clean_metrics_in_tracker()

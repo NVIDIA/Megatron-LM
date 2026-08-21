@@ -168,6 +168,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             mtp_num_layers=self.config.mtp_num_layers,
             ignore_virtual=False,
             vp_stage=vp_stage,
+            pp_group=getattr(self.pg_collection, 'pp', None),
         )
 
         if self.pre_process or self.mtp_process:
@@ -755,6 +756,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     tp_group=self.tp_group,
+                    dp_cp_group=getattr(self.pg_collection, 'dp_cp', None),
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
