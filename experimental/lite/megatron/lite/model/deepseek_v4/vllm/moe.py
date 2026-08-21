@@ -106,6 +106,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         *,
         layer_idx: int,
         use_deepep: bool = False,
+        cache_deployment_weights: bool = False,
     ):
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             is_batch_invariant_quant_kernel_enabled,
@@ -130,8 +131,12 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         self.config = config
         self.ps = ps
         self.use_deepep = use_deepep
-        self.shared_gate_up_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
-        self.shared_down_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
+        self.shared_gate_up_fp8 = DeploymentBlockFP8Adapter(
+            cache_weight=cache_deployment_weights
+        )
+        self.shared_down_fp8 = DeploymentBlockFP8Adapter(
+            cache_weight=cache_deployment_weights
+        )
 
     def clear_deployment_weight_cache(self) -> None:
         self.shared_gate_up_fp8.clear_cache()

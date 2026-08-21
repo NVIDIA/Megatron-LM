@@ -54,6 +54,22 @@ def test_vllm_owns_alignment_without_changing_lite_dispatcher() -> None:
     assert DeepseekV4MoE.dispatcher_cls is VLLMAlignedNormalDeepEPDispatcher
 
 
+def test_deployment_weight_cache_policy_tracks_optimizer() -> None:
+    policy = protocol._deployment_weight_cache_enabled
+    assert policy(protocol.ImplConfig(optimizer="dist_opt")) is True
+    assert policy(protocol.ImplConfig(optimizer="fsdp2")) is False
+    assert policy(
+        protocol.ImplConfig(
+            optimizer="fsdp2", cache_deployment_weights=True
+        )
+    ) is True
+    assert policy(
+        protocol.ImplConfig(
+            optimizer="dist_opt", cache_deployment_weights=False
+        )
+    ) is False
+
+
 def test_r3_uses_contiguous_cp_layout_and_live_actor_weights() -> None:
     model = nn.Module()
     model.ps = SimpleNamespace(tp_size=1, tp_rank=0, cp_size=2, cp_rank=1, cp_group=None)

@@ -164,11 +164,11 @@ def _aligned_selected_log_probs(
     return selected, entropy
 
 
-def _default_attention_ops() -> SimpleNamespace:
+def _default_attention_ops(*, cache_weight: bool) -> SimpleNamespace:
     return SimpleNamespace(
-        fused_linear=DeploymentFusedBlockFP8Adapter(cache_weight=True),
-        q_linear=DeploymentBlockFP8Adapter(cache_weight=True),
-        indexer_q_linear=DeploymentBlockFP8Adapter(cache_weight=True),
+        fused_linear=DeploymentFusedBlockFP8Adapter(cache_weight=cache_weight),
+        q_linear=DeploymentBlockFP8Adapter(cache_weight=cache_weight),
+        indexer_q_linear=DeploymentBlockFP8Adapter(cache_weight=cache_weight),
         bf16_linear=lambda value, weight: __import__(
             "vllm.model_executor.layers.batch_invariant",
             fromlist=["linear_batch_invariant"],
@@ -193,6 +193,7 @@ class _AttentionState(CompressedSparseAttention):
         ps=None,
         layer_idx: int,
         indexer_loss_coeff: float = 0.0,
+        cache_deployment_weights: bool = False,
     ):
         ps = ps or ParallelState()
         super().__init__(config, layer_idx=layer_idx, ps=ps)
@@ -204,7 +205,9 @@ class _AttentionState(CompressedSparseAttention):
         )
         self.compress_ratio = max(1, configured_ratio)
         self.indexer_loss_coeff = indexer_loss_coeff
-        self.adapters = _default_attention_ops()
+        self.adapters = _default_attention_ops(
+            cache_weight=cache_deployment_weights
+        )
         self._projection_streams: list[torch.cuda.Stream] | None = None
         self._projection_events: list[torch.cuda.Event] | None = None
 
@@ -830,8 +833,10 @@ class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
         ps: ParallelState,
         layer_idx: int,
         indexer_loss_coeff: float,
+        cache_deployment_weights: bool,
     ):
         self._indexer_loss_coeff = indexer_loss_coeff
+        self._cache_deployment_weights = cache_deployment_weights
         super().__init__(config, layer_idx=layer_idx, ps=ps)
 
     def _build_attention(
@@ -842,6 +847,7 @@ class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
             ps=ps,
             layer_idx=layer_idx,
             indexer_loss_coeff=self._indexer_loss_coeff,
+            cache_deployment_weights=self._cache_deployment_weights,
         )
 
     def forward(
@@ -862,9 +868,11 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         *,
         use_deepep: bool = False,
         indexer_loss_coeff: float = 0.0,
+        cache_deployment_weights: bool = False,
     ):
         self.config = config
         self._vllm_indexer_loss_coeff = indexer_loss_coeff
+        self._cache_deployment_weights = cache_deployment_weights
         super().__init__(
             config,
             ps or ParallelState(),
@@ -880,6 +888,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
             ps=ps,
             layer_idx=layer_idx,
             indexer_loss_coeff=self._vllm_indexer_loss_coeff,
+            cache_deployment_weights=self._cache_deployment_weights,
         )
 
     def _build_moe(
@@ -895,6 +904,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
             ps,
             layer_idx=layer_idx,
             use_deepep=use_deepep,
+            cache_deployment_weights=self._cache_deployment_weights,
         )
 
     def _mhc_pre(
@@ -1006,9 +1016,11 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         use_deepep: bool = False,
         indexer_loss_coeff: float = 0.0,
         logprob_chunk_size: int = 8192,
+        cache_deployment_weights: bool = False,
     ):
         ps = ps or ParallelState()
         self._vllm_indexer_loss_coeff = indexer_loss_coeff
+        self._cache_deployment_weights = cache_deployment_weights
         if logprob_chunk_size <= 0:
             raise ValueError("logprob_chunk_size must be positive")
         self._logprob_chunk_size = int(logprob_chunk_size)
@@ -1058,6 +1070,7 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             layer_idx=layer_idx,
             use_deepep=use_deepep,
             indexer_loss_coeff=self._vllm_indexer_loss_coeff,
+            cache_deployment_weights=self._cache_deployment_weights,
         )
 
     def forward(

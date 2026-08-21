@@ -17,6 +17,7 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
 from megatron.lite.model.deepseek_v4.lite.protocol import (
     ImplConfig as LiteImplConfig,
     MODULE_MAP,
+    _optimizer_backend_name,
     build_model_config,
     build_training_backend,
     is_expert_param,
@@ -48,6 +49,13 @@ class ImplConfig(LiteImplConfig):
     mtp_enable: bool = False
     dsa_indexer_loss_coeff: float = 0.0
     logprob_chunk_size: int = 8192
+    cache_deployment_weights: bool | None = None
+
+
+def _deployment_weight_cache_enabled(impl_cfg: ImplConfig) -> bool:
+    if impl_cfg.cache_deployment_weights is not None:
+        return impl_cfg.cache_deployment_weights
+    return _optimizer_backend_name(impl_cfg.optimizer) == "dist_opt"
 
 
 def _post_optimizer_step(model: nn.Module) -> None:
@@ -212,6 +220,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         use_deepep=impl_cfg.use_deepep,
         indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
         logprob_chunk_size=impl_cfg.logprob_chunk_size,
+        cache_deployment_weights=_deployment_weight_cache_enabled(impl_cfg),
     )
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:

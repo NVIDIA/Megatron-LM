@@ -70,6 +70,20 @@ def test_small_model_state_dict_preserves_release_master_dtypes() -> None:
     assert sum(value.numel() for value in model.state_dict().values()) < 100_000
 
 
+def test_deployment_weight_cache_policy_reaches_attention_and_moe() -> None:
+    for enabled in (False, True):
+        model = DeepseekV4Model(
+            _tiny_config(), cache_deployment_weights=enabled
+        )
+        layer = model.layers["0"]
+        attention = layer.self_attn.self_attn
+        assert attention.adapters.fused_linear.cache_weight is enabled
+        assert attention.adapters.q_linear.cache_weight is enabled
+        assert attention.adapters.indexer_q_linear.cache_weight is enabled
+        assert layer.mlp.shared_gate_up_fp8.cache_weight is enabled
+        assert layer.mlp.shared_down_fp8.cache_weight is enabled
+
+
 def test_static_suite_never_constructs_release_dimensions() -> None:
     config = _tiny_config()
     assert config.vocab_size <= 32
