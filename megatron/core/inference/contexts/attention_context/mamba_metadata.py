@@ -393,7 +393,6 @@ class MambaMetadata:
             self.conv_seq_idx = self._conv_seq_idx_buffer[:padded_token_count]
             self.conv_seq_start = self._conv_seq_start_buffer[:padded_token_count]
 
-
             # --- Precompute intermediate state extraction metadata ---
             # This converts per-request token offsets to chunk indices and
             # absolute positions, padded to fixed size for CUDA graph compat.
@@ -831,10 +830,6 @@ class MambaMetadata:
             self.seq_idx_for_varlen = v.mamba_seq_idx_for_varlen[:padded_max_chunks]
             self.conv_seq_idx = v.mamba_conv_seq_idx[:padded_token_count]
             self.conv_seq_start = v.mamba_conv_seq_start[:padded_token_count]
-
-            # Built here, from the just-transferred cu_seqlens, for the same
-            # reason as the intermediate metadata below: it is the first point at
-            # which this step's slice boundaries are valid on the device.
 
             if self.gdp_num_householder > 0:
                 self.gdp_chunk_indices = v.gdp_chunk_indices[: d["gdp_num_chunks"]]
