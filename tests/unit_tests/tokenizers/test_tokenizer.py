@@ -341,8 +341,10 @@ def test_bytelevel_tokenizer():
     assert tokenizer.detokenize([72, 101, 108, 108, 111]) == "Hello"
 
 
-def test_write_metadata_hf():
-    tokenizer_path = "/opt/data/tokenizers/huggingface"
+def test_write_metadata_hf(tmp_path):
+    tokenizer_dir = tmp_path / "huggingface"
+    tokenizer_dir.mkdir()
+    tokenizer_path = str(tokenizer_dir)
     metadata_path = f"{tokenizer_path}/tokenizer_metadata.json"
     chat_template = "test chat template"
     tokenizer_library = "huggingface"
@@ -376,7 +378,7 @@ def test_write_metadata_hf():
     assert metadata['class_name'] == "CustomTokenizerClass"
 
     # Save metadata to specific path
-    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
@@ -389,10 +391,10 @@ def test_write_metadata_hf():
     assert metadata['class_name'] == "MegatronTokenizerText"
 
 
-def test_write_metadata_sp():
+def test_write_metadata_sp(tmp_path):
     path = "/opt/data/tokenizers/sentencepiece"
     tokenizer_path = f"{path}/tokenizer.model"
-    metadata_path = f"{path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     tokenizer_library = "sentencepiece"
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
@@ -407,9 +409,9 @@ def test_write_metadata_sp():
     assert metadata['class_name'] == "MegatronTokenizerText"
 
 
-def test_write_metadata_vision():
+def test_write_metadata_vision(tmp_path):
     tokenizer_path = "/opt/data/tokenizers/multimodal"
-    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
@@ -420,12 +422,12 @@ def test_write_metadata_vision():
         assert json.load(f)["class_name"] == "MegatronTokenizerVision"
 
 
-def test_own_metadata_class():
+def test_own_metadata_class(tmp_path):
     tokenizer_path = "/opt/data/tokenizers/huggingface"
     chat_template = "test chat template"
     tokenizer_library = "huggingface"
 
-    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
