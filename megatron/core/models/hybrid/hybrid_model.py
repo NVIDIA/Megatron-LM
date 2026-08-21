@@ -25,6 +25,7 @@ from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
+    MTPSequenceRollField,
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
     prepare_mtp_sequence_roll_context,
@@ -565,9 +566,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and not (in_inference_mode or is_spec_decode)
         ):
             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
-            # Build layout-specific metadata once, then fetch every locally owned
-            # MTP field's compact successor rows in one grouped operation. The extra
-            # row covers RL's initial label derivation before the per-layer rolls.
+            # Build layout-specific metadata once, then prepare every locally owned
+            # MTP field for absolute sequence-roll access in one grouped operation.
             sequence_roll_context = prepare_mtp_sequence_roll_context(
                 tensor=input_ids if input_ids is not None else labels,
                 cp_group=mtp_cp_group,
@@ -575,13 +575,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             if sequence_roll_context is not None:
                 roll_position_ids = getattr(self.embedding, "add_position_embedding", True)
-                sequence_roll_context = sequence_roll_context.prefetch_halos(
-                    width=self.config.mtp_num_layers + 1,
-                    input_ids=input_ids,
-                    position_ids=position_ids if roll_position_ids else None,
-                    labels=labels if self.post_process else None,
-                    loss_mask=loss_mask if self.post_process else None,
-                    padding_mask=padding_mask,
+                fields = []
+                if input_ids is not None:
+                    fields.append(MTPSequenceRollField("input_ids", input_ids, -1, 0, 0))
+                if roll_position_ids and position_ids is not None:
+                    fields.append(MTPSequenceRollField("position_ids", position_ids, -1, 0, 0))
+                if self.post_process and labels is not None:
+                    fields.append(MTPSequenceRollField("labels", labels, -1, 0, 0))
+                if self.post_process and loss_mask is not None:
+                    fields.append(MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0))
+                if padding_mask is not None:
+                    fields.append(MTPSequenceRollField("padding_mask", padding_mask, -1, 0, True))
+                max_offset = self.config.mtp_num_layers + int(self.post_process and labels is None)
+                sequence_roll_context = sequence_roll_context.prepare_fields(
+                    fields, max_offset=max_offset
                 )
 
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
@@ -598,6 +605,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 sequence_roll_context=sequence_roll_context,
                 embedding=self.embedding,
                 padding_mask=padding_mask,
+                sequence_roll_padding_mask=padding_mask,
             )
 
         if not self.post_process:

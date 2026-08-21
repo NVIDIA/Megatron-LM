@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
 
 import torch
@@ -37,6 +37,14 @@ class PackedSeqParams:
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    # Host-side certificate produced by the packing scheduler. None leaves
+    # zigzag packed-CP MTP on its established roll path. Zero records that the
+    # scheduler inspected the layout but could not certify one-hop addressing;
+    # a positive value proves the minimum non-empty half-chunk size. The
+    # certificate is runtime transport metadata, not part of a graph signature.
+    zigzag_cp_min_chunk_size: Optional[int] = field(
+        default=None, compare=False, metadata={"cuda_graph_ignore": True}
+    )
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -51,6 +59,12 @@ class PackedSeqParams:
         cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
         included.
         """
+        if self.zigzag_cp_min_chunk_size is not None and (
+            isinstance(self.zigzag_cp_min_chunk_size, bool)
+            or not isinstance(self.zigzag_cp_min_chunk_size, int)
+        ):
+            raise TypeError("zigzag_cp_min_chunk_size must be a host int or None.")
+
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
@@ -650,6 +664,19 @@ def pad_sequence_for_thd(
         cu_seqlens_kv_padded = _pad_cu_seqlens(cu_seqlens_kv_padded, target_cu_entries)
 
     # Rebuild PackedSeqParams with the padded tensor and metadata shapes.
+    zigzag_cp_min_chunk_size = packed_seq_params.zigzag_cp_min_chunk_size
+    if (
+        zigzag_cp_min_chunk_size is not None
+        and has_dummy_padding_seq
+        and packed_seq_params.cp_partition_mode == "zigzag"
+    ):
+        # The divisibility assertion above makes this an exact physical
+        # half-chunk length. Empty fixed-capacity cu_seqlens slots do not reduce
+        # the scheduler certificate.
+        dummy_chunk_size = dummy_seq_len // (2 * cp_size)
+        if dummy_chunk_size > 0:
+            zigzag_cp_min_chunk_size = min(zigzag_cp_min_chunk_size, dummy_chunk_size)
+
     padded_params = PackedSeqParams(
         qkv_format=packed_seq_params.qkv_format,
         cu_seqlens_q=cu_seqlens_q,
@@ -690,6 +717,7 @@ def pad_sequence_for_thd(
                 else (True if has_non_dummy_padding_tail else packed_seq_params.pad_between_seqs)
             )
         ),
+        zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
     )
 
     # True marks padded local token slots for routing/loss paths.
