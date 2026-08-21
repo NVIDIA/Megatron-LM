@@ -166,7 +166,13 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             )
         mimo_model = model_list[0]
 
-        wrap_active_modules_with_ddp(args, mimo_model, topology, data_parallel_random_init)
+        wrap_active_modules_with_ddp(
+            args,
+            mimo_model,
+            topology,
+            ddp_config=ddp_config,
+            data_parallel_random_init=data_parallel_random_init,
+        )
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg
         mimo_model.rng_state_key_prefix = rng_state_key_prefix

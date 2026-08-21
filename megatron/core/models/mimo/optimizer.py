@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from copy import copy, deepcopy
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -351,17 +351,18 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
 def _optimizer_config_for_module(
     config: OptimizerConfig, module: torch.nn.Module
 ) -> OptimizerConfig:
-    """Match optimizer overlap behavior to the module's DDP lifecycle."""
+    """Derive an optimizer config whose param-gather overlap matches the module's DDP config."""
     ddp_config = getattr(module, 'ddp_config', None)
     if ddp_config is None:
         raise ValueError("Active MIMO modules must be DDP-wrapped before optimizer construction.")
     overlap_param_gather = ddp_config.overlap_param_gather
-    module_config = copy(config)
-    module_config.overlap_param_gather = overlap_param_gather
-    module_config.overlap_param_gather_with_optimizer_step = (
-        config.overlap_param_gather_with_optimizer_step and overlap_param_gather
+    return replace(
+        config,
+        overlap_param_gather=overlap_param_gather,
+        overlap_param_gather_with_optimizer_step=(
+            config.overlap_param_gather_with_optimizer_step and overlap_param_gather
+        ),
     )
-    return module_config
 
 
 def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
