@@ -64,7 +64,7 @@ def _ordered_route_backward(
 
         fused_route_grad = False
         if grad_routes is not None and grad_output.is_cuda:
-            from megatron.lite.primitive.alignment.deterministic_route_kernels import ordered_route_grad
+            from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import ordered_route_grad
 
             ordered_route_grad(
                 grad_output.contiguous(),
@@ -230,7 +230,7 @@ class _DeepEPScatterWithDeterministicBackward(torch.autograd.Function):
     ) -> torch.Tensor:
         output = hidden_states.new_zeros((int(total_rows), hidden_states.shape[1]))
         if hidden_states.is_cuda:
-            from megatron.lite.primitive.alignment.deterministic_route_kernels import scatter_routes_forward
+            from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import scatter_routes_forward
 
             scatter_routes_forward(
                 hidden_states.contiguous(),
@@ -268,7 +268,7 @@ class _DeepEPScatterWithDeterministicBackward(torch.autograd.Function):
             device=ctx.input_device,
         )
         if grad_output.is_cuda:
-            from megatron.lite.primitive.alignment.deterministic_route_kernels import scatter_routes_backward
+            from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import scatter_routes_backward
 
             scatter_routes_backward(
                 grad_output.contiguous(),
@@ -380,7 +380,7 @@ def _scatter_deepep_routes_with_padding(
     expert_offsets = torch.cumsum(counts, dim=0) - counts
 
     if expected_route_count is not None and valid.is_cuda:
-        from megatron.lite.primitive.alignment.deterministic_route_kernels import compact_route_positions
+        from megatron.lite.model.deepseek_v4.vllm.deterministic_route_kernels import compact_route_positions
 
         occurrences = compact_route_positions(valid.contiguous(), expected_route_count)
     else:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from megatron.lite.primitive.alignment.deepep_route import (
+from megatron.lite.model.deepseek_v4.vllm.deepep_route import (
     _VLLMEPGatherWithBF16Backward,
     _compact_route_preserving_metadata_inputs,
     _deepep_route_handle_received_rows,

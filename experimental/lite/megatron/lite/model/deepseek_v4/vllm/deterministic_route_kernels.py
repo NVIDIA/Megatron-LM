@@ -1,4 +1,4 @@
-"""Deterministic Triton kernels for route permutation gradients.
+"""Deterministic Triton kernels for DS4 vLLM route permutation gradients.
 
 These kernels only replace launch-heavy tensor indexing with equivalent
 pointwise copies or one-program-per-token ordered reductions.  They do not use
@@ -293,4 +293,3 @@ def compact_route_positions(
             BLOCK_SIZE=block_size,
         )
     return positions
-
