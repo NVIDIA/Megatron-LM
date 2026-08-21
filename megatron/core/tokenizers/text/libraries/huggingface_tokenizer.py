@@ -315,7 +315,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         """Encodes whole jsonl file."""
         if self.use_gigatoken:
             return self.tokenizer.tokenizer.encode_files(
-                gt.JsonlFileSource(paths, field="text"), parallel=True
+                gt.JsonlFileSource(paths, field=field), parallel=True
             )
         else:
             raise NotImplementedError(
