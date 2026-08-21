@@ -21,11 +21,11 @@ from weakref import ref
 import torch
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import Placements
 
 
 def _is_in_backward() -> bool:
@@ -170,7 +170,9 @@ class FsdpModule:
         self,
         context: FsdpContext,
         mesh: DeviceMesh,
-        placements: Placements,
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
@@ -182,9 +184,6 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         owned_parameters = _collect_owned_parameters(self)
-        assert tuple(placements.dp_axes) == tuple(
-            range(mesh.ndim)
-        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = [
@@ -192,7 +191,9 @@ class FsdpModule:
                 owning_module=self,
                 parameters=group_parameters,
                 mesh=mesh,
-                placements=placements,
+                model_weight_placements=model_weight_placements,
+                main_grad_placements=main_grad_placements,
+                main_weight_placements=main_weight_placements,
                 mixed_precision_policy=mixed_precision_policy,
                 allgather_stream=context.allgather_stream,
                 reduce_scatter_stream=context.reduce_scatter_stream,

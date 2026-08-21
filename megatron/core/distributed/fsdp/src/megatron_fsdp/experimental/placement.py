@@ -28,15 +28,12 @@ sharded        ``Replicate``  ``allgather()``
 =============  =============  ====================
 """
 
-import dataclasses
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["Flat", "Placements", "changed_mesh_axis"]
-
-MeshAxis = int | str
+__all__ = ["Flat", "changed_mesh_axis"]
 
 
 class Flat(Shard):
@@ -63,24 +60,3 @@ def changed_mesh_axis(
             )
         changed_axis = axis
     return changed_axis
-
-
-@dataclasses.dataclass(frozen=True)
-class Placements:
-    """Per-mesh-axis placements for parameter, gradient, and optimizer buffers."""
-
-    dp_axes: Sequence[MeshAxis]
-    parameter: list[Placement]
-    gradient: list[Placement]
-    optimizer: list[Placement]
-
-    def __post_init__(self) -> None:
-        """Validate placement list lengths."""
-        axis_count = len(self.dp_axes)
-        for name, placements in (
-            ("parameter", self.parameter),
-            ("gradient", self.gradient),
-            ("optimizer", self.optimizer),
-        ):
-            if len(placements) != axis_count:
-                raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
