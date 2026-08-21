@@ -517,29 +517,20 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         gtp_remat_group = self._get_gtp_remat_group(p)
         expected_size = getattr(p, 'gtp_remat_size', 1)
-        if gtp_remat_group is None:
-            if expected_size > 1:
-                raise RuntimeError(
-                    "Muon GLU split requires the GTP-remat process group to reconstruct "
-                    f"a {expected_size}-way weight shard"
-                )
-            gtp_remat_size = 1
-            gtp_rank = 0
-            gathered_grad = grad
+        gtp_remat_size = get_pg_size(gtp_remat_group) if gtp_remat_group is not None else 1
+        gtp_rank = get_pg_rank(gtp_remat_group) if gtp_remat_group is not None else 0
+        if gtp_remat_size != expected_size:
+            raise RuntimeError(
+                "Muon GLU split GTP size mismatch: "
+                f"parameter metadata={expected_size}, process group={gtp_remat_size}"
+            )
+
+        if gtp_remat_size > 1:
+            shards = [torch.empty_like(grad) for _ in range(gtp_remat_size)]
+            torch.distributed.all_gather(shards, grad, gtp_remat_group)
+            gathered_grad = torch.cat(shards, dim=0)
         else:
-            gtp_remat_size = get_pg_size(gtp_remat_group)
-            gtp_rank = get_pg_rank(gtp_remat_group)
-            if gtp_remat_size != expected_size:
-                raise RuntimeError(
-                    "Muon GLU split GTP size mismatch: "
-                    f"parameter metadata={expected_size}, process group={gtp_remat_size}"
-                )
-            if gtp_remat_size > 1:
-                shards = [torch.empty_like(grad) for _ in range(gtp_remat_size)]
-                torch.distributed.all_gather(shards, grad, gtp_remat_group)
-                gathered_grad = torch.cat(shards, dim=0)
-            else:
-                gathered_grad = grad
+            gathered_grad = grad
 
         pad_length = getattr(p, 'pad_length', 0)
         if pad_length < 0 or pad_length >= gathered_grad.shape[0]:
