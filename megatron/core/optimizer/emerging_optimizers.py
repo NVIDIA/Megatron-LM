@@ -303,7 +303,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return grad, None
 
         gtp_remat_group = self._get_gtp_remat_group(p)
-        expected_size = getattr(p, 'glu_gtp_remat_size', 1)
+        expected_size = getattr(p, 'gtp_remat_size', 1)
         if gtp_remat_group is None:
             if expected_size > 1:
                 raise RuntimeError(
@@ -328,7 +328,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             else:
                 gathered_grad = grad
 
-        pad_length = getattr(p, 'glu_gtp_pad_length', 0)
+        pad_length = getattr(p, 'pad_length', 0)
         if pad_length < 0 or pad_length >= gathered_grad.shape[0]:
             raise RuntimeError(
                 f"Muon GLU split has invalid GTP padding: grad_shape={tuple(gathered_grad.shape)}, "
