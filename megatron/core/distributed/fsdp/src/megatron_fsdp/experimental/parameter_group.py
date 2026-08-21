@@ -20,14 +20,14 @@ from dataclasses import dataclass
 from weakref import ReferenceType, ref
 
 import torch
-import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Partial, Replicate
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .placement import Placements, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -335,7 +335,7 @@ class FsdpParameterGroup:
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
+                placements=[Partial("avg")] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,

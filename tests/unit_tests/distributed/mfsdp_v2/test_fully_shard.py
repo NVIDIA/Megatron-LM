@@ -9,15 +9,13 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Partial, Replicate
 from torch.profiler import ProfilerActivity, profile
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
-    Partial,
     Placements,
-    Replicate,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -137,19 +135,13 @@ def _flat_placements() -> Placements:
 
 def _no_shard_placements() -> Placements:
     return Placements(
-        dp_axes=[0],
-        parameter=[Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG)],
-        optimizer=[Replicate()],
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
     )
 
 
 def _zero1_placements() -> Placements:
     return Placements(
-        dp_axes=[0],
-        parameter=[Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG)],
-        optimizer=[Flat()],
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Flat()]
     )
 
 
@@ -164,7 +156,7 @@ def _hsdp_placements() -> Placements:
     return Placements(
         dp_axes=[0, 1],
         parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
+        gradient=[Partial("avg"), Flat()],
         optimizer=[Replicate(), Flat()],
     )
 
@@ -177,7 +169,7 @@ def _hfsdp_placements() -> Placements:
     return Placements(
         dp_axes=[0, 1],
         parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
+        gradient=[Partial("avg"), Flat()],
         optimizer=[Flat(), Flat()],
     )
 

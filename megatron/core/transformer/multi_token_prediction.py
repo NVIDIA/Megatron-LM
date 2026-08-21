@@ -875,6 +875,8 @@ def process_mtp_loss(
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
+            # This uses local counts; exact parity for packed or uneven valid-token
+            # distributions across DP/CP ranks would require all-reduced counts.
             # When calculate_per_token_loss is enabled, finalize_model_grads will
             # divide all gradients by total_num_tokens (from main loss).
             # However, MTP has fewer valid tokens due to rolling. To ensure correct
