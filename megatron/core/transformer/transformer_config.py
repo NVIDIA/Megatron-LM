@@ -1044,6 +1044,9 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    gpt_postprocess_graph: bool = False
+    """Capture the GPT output/loss postprocess in a separate local CUDA graph."""
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).

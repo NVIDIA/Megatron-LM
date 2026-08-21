@@ -38,6 +38,7 @@ from megatron.core.transformer.transformer_layer import (
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
+    MoETransformerLayer,
     get_transformer_layer_offset,
 )
 from megatron.core.typed_torch import copy_signature, not_none
@@ -640,6 +641,10 @@ def get_gpt_decoder_layer_specs(
             kitchen_attention_backend=config.kitchen_attention_backend,
         )
 
+    # MoE layers need the specialized transformer wrapper so local partial
+    # CUDA Graphs can split router/postprocess from eager dispatch.
+    moe_layer_spec.module = MoETransformerLayer
+
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
     # For integer N: Creates a pattern with one expert layer every N layers.
@@ -767,7 +772,7 @@ def get_gpt_mtp_block_spec_for_backend(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
-    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+    elif isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerLayer):
         transformer_layer_spec = spec
     else:
         raise ValueError(f"Invalid spec: {spec}")
