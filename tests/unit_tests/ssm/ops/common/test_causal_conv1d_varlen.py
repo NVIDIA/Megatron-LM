@@ -226,7 +226,9 @@ class TestCausalConv1dVarlenCarryStates:
         torch.manual_seed(1)
         cu_seqlens = torch.tensor([0, 7], dtype=torch.int32, device="cuda")
         x = torch.randn(7, 3, device="cuda")
-        first = causal_conv1d_varlen_carry_states(x, cu_seqlens, torch.randn(1, 3, 4, device="cuda"))
+        first = causal_conv1d_varlen_carry_states(
+            x, cu_seqlens, torch.randn(1, 3, 4, device="cuda")
+        )
         second = causal_conv1d_varlen_carry_states(
             x, cu_seqlens, torch.randn(1, 3, 4, device="cuda")
         )

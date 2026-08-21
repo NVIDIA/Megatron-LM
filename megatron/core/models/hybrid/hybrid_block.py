@@ -314,9 +314,7 @@ class HybridStack(MegatronModule):
                 # is not always `chunk_size`: the forked Gated Delta Product
                 # prefill kernels chunk at a fixed 64. Falls back to chunk_size
                 # for any mixer predating the property.
-                inference_chunk_size=getattr(
-                    mixer, 'ssm_inference_chunk_size', mixer.chunk_size
-                ),
+                inference_chunk_size=getattr(mixer, 'ssm_inference_chunk_size', mixer.chunk_size),
                 # Gated Delta Product layers register as Mamba layers but carry
                 # a Householder count, which sizes their (separate) chunk
                 # descriptors.

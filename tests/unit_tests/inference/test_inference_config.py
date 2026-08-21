@@ -161,9 +161,8 @@ class TestInferenceConfig:
 
 def _ssm_model(mixers):
     """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
-    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-
     from megatron.core.models.hybrid.hybrid_block import HybridStack
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
     decoder = SimpleNamespace(
         layer_type_list=[Symbols.MAMBA] * len(mixers),
