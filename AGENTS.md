@@ -30,6 +30,11 @@ test` can verify the pushed commit without manually specifying the SHA.
 Megatron Core engineers at NVIDIA should sign using their NVIDIA emails so they
 are automatically added to the right user groups on the internal Slack
 workspace.
+- For stacked PRs, use `pull-request/<base PR number>` as a dependent PR's
+  GitHub base/diffbase while the stack is under review. Before merging any base
+  PR, retarget every dependent PR to `main` and refresh its branch against
+  `origin/main`; otherwise GitHub may close dependents and discard their review
+  discussion or approvals.
 - Read @docs/developer/contribute.md for the full contribution policy, including code style, commit message conventions, and issue guidelines.
 
 ### Code Quality
