@@ -504,7 +504,7 @@ class TestMultiTokenPredictionLayer:
         def fake_embedding(input_ids, position_ids):
             return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
 
-        rolled_input_ids, rolled_position_ids, rolled_padding_mask, _, _ = (
+        rolled_input_ids, rolled_position_ids, rolled_padding_mask, _, _, _ = (
             mtp_layer._get_embeddings(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -567,7 +567,7 @@ class TestMultiTokenPredictionLayer:
             types.MethodType(fake_proj_and_transformer_layer, mtp_layer),
         )
 
-        _, _, _, returned_padding_mask = mtp_layer.forward(
+        _, _, _, returned_padding_mask, _ = mtp_layer.forward(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -601,7 +601,7 @@ class TestMultiTokenPredictionLayer:
         def fake_embedding(input_ids, position_ids):
             return emb_weight.clone()
 
-        _, _, _, decoder_input, returned_hidden_states = mtp_layer._get_embeddings(
+        _, _, _, _, decoder_input, returned_hidden_states = mtp_layer._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=fake_embedding,
@@ -741,6 +741,68 @@ class TestMultiTokenPredictionLayer:
             assert hidden_states.grad is not None
             assert emb_weight.grad is not None
 
+    def test_invalid_conditioning_embedding_has_no_input_gradient(self):
+        """A later causal loss must not update an invalid tied embedding row.
+
+        The selected output position can attend to the earlier invalid MTP input.
+        Its embedding value remains available in the forward pass, but its row in
+        the shared embedding table must be detached from the input-side gradient.
+        """
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        layer_spec = get_gpt_layer_local_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=layer_spec, use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+
+        vocab_size = 16
+        invalid_token_id = 9
+
+        class SharedEmbedding(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.randn(vocab_size, config.hidden_size, device="cuda")
+                )
+
+            def forward(self, input_ids, position_ids):
+                return torch.nn.functional.embedding(input_ids, self.weight).transpose(0, 1)
+
+        embedding = SharedEmbedding()
+        input_ids = torch.tensor([[4, invalid_token_id, 5, 6]], device="cuda")
+        position_ids = torch.arange(input_ids.size(1), device="cuda").unsqueeze(0)
+        mtp_input_mask = input_ids != invalid_token_id
+        hidden_states = torch.randn(
+            input_ids.size(1), 1, config.hidden_size, device="cuda", requires_grad=True
+        )
+
+        output = mtp(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            embedding=embedding,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        # After the MTP shift, the invalid token is at position 0. A loss on
+        # position 2 can attend to it through causal self-attention.
+        output[input_ids.size(1) + 2].square().sum().backward()
+
+        assert torch.count_nonzero(embedding.weight.grad[invalid_token_id]) == 0
+        assert torch.count_nonzero(embedding.weight.grad[6]) > 0
+
     @pytest.mark.parametrize("detach_heads", [False, True])
     def test_process_mtp_loss_detaches_output_weight(self, detach_heads):
         """process_mtp_loss must detach the output-head weight when mtp_detach_heads=True
@@ -835,6 +897,50 @@ class TestMultiTokenPredictionLayer:
         assert torch.count_nonzero(hidden_states.grad[seq_len:]) == 0
         assert output_weight.grad is not None
         assert torch.count_nonzero(output_weight.grad) == 0
+
+    def test_process_mtp_loss_masks_later_steps_after_invalid_input(self):
+        """Mask an MTP prediction after its conditioning path reaches an invalid token."""
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 5
+        hidden_states = torch.ones(
+            (1 + config.mtp_num_layers) * seq_len, 1, config.hidden_size, requires_grad=True
+        )
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return hidden, None
+
+        def compute_language_model_loss(labels, logits):
+            return logits.squeeze(-1).transpose(0, 1)
+
+        # Input validity: [text, modality, text, text, padding]. The first-step path
+        # starting at position 1 consumes only valid text at position 2. The second-step
+        # path starting at position 0 crosses the modality token at position 1.
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.tensor([[10, 13, 100, 101, 0]]),
+            loss_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0, 0.0]]),
+            mtp_input_mask=torch.tensor([[True, False, True, True, True]]),
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+        ).sum().backward()
+
+        first_step_grad = hidden_states.grad[seq_len : 2 * seq_len, 0, 0]
+        second_step_grad = hidden_states.grad[2 * seq_len :, 0, 0]
+
+        assert first_step_grad[1] != 0  # The one-step text-only path remains supervised.
+        assert second_step_grad[0] == 0  # The path that crossed the modality is masked.
+        assert second_step_grad[1] != 0  # Its neighboring text-only path remains supervised.
 
 
 class TestMTPHiddenStateRollUnderParallelism:
@@ -2771,7 +2877,7 @@ class TestMultiTokenPredictionHybrid:
     @staticmethod
     def _make_forward_stub():
         hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
-        call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
+        call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0, "mtp_input_mask": None}
 
         def decoder(**kwargs):
             decoder_hidden_states = kwargs["hidden_states"]
@@ -2783,6 +2889,7 @@ class TestMultiTokenPredictionHybrid:
 
         def mtp(**kwargs):
             call_counts["mtp"] += 1
+            call_counts["mtp_input_mask"] = kwargs.get("mtp_input_mask")
             decoder_hidden_states = kwargs["hidden_states"]
             return torch.cat((decoder_hidden_states, decoder_hidden_states + 100.0), dim=0)
 
@@ -2848,12 +2955,14 @@ class TestMultiTokenPredictionHybrid:
         labels = torch.tensor([[3, 4]]) if provide_labels else None
         input_ids = torch.zeros(1, 2, dtype=torch.long)
         loss_mask = torch.ones(1, 2)
+        mtp_input_mask = torch.ones(1, 2, dtype=torch.bool)
 
         def process_mtp_loss_spy(**kwargs):
             call_counts["mtp_loss"] += 1
             assert kwargs["labels"] is labels
             assert kwargs["input_ids"] is input_ids
             assert kwargs["loss_mask"] is loss_mask
+            assert kwargs["mtp_input_mask"] is mtp_input_mask
             return torch.chunk(kwargs["hidden_states"], 1 + kwargs["config"].mtp_num_layers, dim=0)[
                 0
             ]
@@ -2870,9 +2979,12 @@ class TestMultiTokenPredictionHybrid:
             decoder_input=hidden_states,
             labels=labels,
             loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             compute_mtp_loss=compute_mtp_loss,
         )
 
+        expected_block_mask = mtp_input_mask if expected_mtp_calls else None
+        assert call_counts.pop("mtp_input_mask") is expected_block_mask
         assert call_counts == {
             "mtp": expected_mtp_calls,
             "mtp_loss": expected_mtp_loss_calls,
@@ -2918,6 +3030,7 @@ class TestMultiTokenPredictionHybrid:
 
         torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
         torch.testing.assert_close(inference_context.mtp_decoder_hidden_states, hidden_states)
+        assert call_counts.pop("mtp_input_mask") is None
         assert call_counts == {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")

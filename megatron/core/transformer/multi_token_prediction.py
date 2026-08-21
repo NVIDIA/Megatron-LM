@@ -944,6 +944,7 @@ def process_mtp_loss(
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
+    mtp_input_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -969,6 +970,9 @@ def process_mtp_loss(
             ``labels`` is None (e.g. RL training), by rolling left to match the SFT
             label convention (``label[i] = input_id[i + 1]``). Ignored when ``labels``
             is provided.
+        mtp_input_mask (Optional[Tensor]): Boolean mask over tokens that are valid as
+            additional MTP conditioning inputs. The mask accumulates across prediction
+            steps so a path stays masked after it reaches an invalid token.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -1009,6 +1013,15 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+    cumulative_mtp_input_mask = None
+    rolled_num_tokens = original_num_tokens
+    if mtp_input_mask is not None:
+        assert mtp_input_mask.shape == loss_mask.shape, (
+            f"mtp_input_mask shape {mtp_input_mask.shape} must match "
+            f"loss_mask shape {loss_mask.shape}"
+        )
+        mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
             hidden_states_list[mtp_layer_number + 1],
@@ -1020,20 +1033,47 @@ def process_mtp_loss(
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        loss_mask, num_tokens = roll_tensor(
+        loss_mask, rolled_num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
+        layer_loss_mask = loss_mask
+        if mtp_input_mask is not None:
+            # Each MTP step consumes one additional token. Accumulate validity so
+            # one invalid conditioning token also masks every later step on that path.
+            mtp_input_mask, _ = roll_tensor(
+                mtp_input_mask,
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            if cumulative_mtp_input_mask is None:
+                cumulative_mtp_input_mask = mtp_input_mask
+            else:
+                cumulative_mtp_input_mask = cumulative_mtp_input_mask & mtp_input_mask
+            layer_loss_mask = loss_mask * cumulative_mtp_input_mask
+            num_tokens = layer_loss_mask.sum()
+        else:
+            # roll_tensor already computed this reduction. Preserve the legacy
+            # no-mask fast path for all non-multimodal MTP callers.
+            num_tokens = rolled_num_tokens
+
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
 
-        mtp_loss = loss_mask * mtp_loss
+        mtp_loss = layer_loss_mask * mtp_loss
 
         if is_training:
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
             correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, mtp_labels, loss_mask, output_layer, runtime_gather_output, tp_group
+                mtp_logits,
+                mtp_labels,
+                layer_loss_mask,
+                output_layer,
+                runtime_gather_output,
+                tp_group,
             )
 
             MTPLossLoggingHelper.save_metrics_to_tracker(
@@ -1259,6 +1299,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        mtp_input_mask: Optional[torch.Tensor] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -1274,15 +1315,34 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
+                regular token embeddings. Shape: [b, s].
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
+        if mtp_input_mask is None:
+            input_ids, _ = roll_tensor(
+                input_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            assert mtp_input_mask.shape == input_ids.shape, (
+                f"mtp_input_mask shape {mtp_input_mask.shape} must match "
+                f"input_ids shape {input_ids.shape}"
+            )
+            # Roll IDs and validity together so CP performs one boundary exchange.
+            token_metadata = torch.cat((input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0)
+            token_metadata, _ = roll_tensor(
+                token_metadata,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
+            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
         position_ids, _ = roll_tensor(
             position_ids,
             shifts=-1,
@@ -1300,6 +1360,12 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+
+        if mtp_input_mask is not None:
+            # Keep invalid placeholder values in the forward pass, but prevent
+            # later causal positions from updating their shared embedding rows.
+            valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
+            decoder_input = torch.where(valid_decoder_input, decoder_input, decoder_input.detach())
 
         # Mirror the scatter in the model's own forward (see hybrid_model.py:
         # "the embedding skips SP scatter for models whose outer wrapper
@@ -1326,7 +1392,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         if not hidden_states.requires_grad:
             hidden_states.requires_grad_(True)
 
-        return input_ids, position_ids, padding_mask, decoder_input, hidden_states
+        return (input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states)
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """
@@ -1669,6 +1735,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        mtp_input_mask: Optional[Tensor] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -1687,19 +1754,23 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
+            mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
-        input_ids, position_ids, padding_mask, decoder_input, hidden_states = self._get_embeddings(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            padding_mask=padding_mask,
-            embedding=embedding,
-            hidden_states=hidden_states,
-            packed_seq_params=packed_seq_params,
+        input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
+            self._get_embeddings(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+                embedding=embedding,
+                hidden_states=hidden_states,
+                packed_seq_params=packed_seq_params,
+                mtp_input_mask=mtp_input_mask,
+            )
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -1735,7 +1806,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
             )
 
-        return hidden_states, input_ids, position_ids, padding_mask
+        return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -2020,6 +2091,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
+        mtp_input_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -2029,6 +2101,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 where s is the sequence length, b is the batch size, and h is the hidden size.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
+            mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
@@ -2112,7 +2185,9 @@ class MultiTokenPredictionBlock(MegatronModule):
             else:
                 hidden_states_input = hidden_states
 
-            hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
+            hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask = self.layers[
+                layer_idx
+            ](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states_input,
@@ -2125,6 +2200,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                mtp_input_mask=mtp_input_mask,
                 **(extra_block_kwargs or {}),
             )
 
