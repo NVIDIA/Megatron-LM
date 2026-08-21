@@ -12,7 +12,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
     fixed_route_vjp,
     gate_linear as training_gate_linear,
 )
-from megatron.lite.primitive.alignment.vllm_grouped_moe import (
+from megatron.lite.model.deepseek_v4.vllm.grouped_moe import (
     VLLMGroupedMoEWithBF16Backward,
 )
 from megatron.lite.primitive.modules.experts import Experts

@@ -32,7 +32,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
 )
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
-from megatron.lite.primitive.kernels.vllm_ds4 import (
+from megatron.lite.model.deepseek_v4.vllm.kernels import (
     DS4KVInsertAdapter,
     FlashMLAAdapter,
     FusedQKVRMSNormAdapter,

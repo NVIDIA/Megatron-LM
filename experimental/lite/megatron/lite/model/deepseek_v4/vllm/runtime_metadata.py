@@ -128,7 +128,6 @@ def initialize_ds4_vllm_batch_invariance() -> None:
             "vLLM BatchedDeepGemmExperts does not expose native "
             "batch-invariant capability"
         )
-    os.environ["DS4_BATCH_INVARIANT_CAPABILITY_MODE"] = "native"
 
 
 @contextmanager
@@ -167,7 +166,6 @@ def ds4_vllm_forward_context(
         torch.cat(gathered_tokens).cpu(),
     ):
         raise RuntimeError("DPMetadata token counts do not match the runtime batch")
-    os.environ["DS4_DP_METADATA_MODE"] = "dynamic"
     forward_context = _symbol("vllm.forward_context", "create_forward_context")(
         None,
         vllm_config,

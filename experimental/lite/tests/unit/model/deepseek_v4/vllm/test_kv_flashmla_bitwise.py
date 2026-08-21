@@ -6,8 +6,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from megatron.lite.primitive.kernels import vllm_ds4
-from megatron.lite.primitive.kernels.vllm_ds4 import (
+from megatron.lite.model.deepseek_v4.vllm import kernels as vllm_ds4
+from megatron.lite.model.deepseek_v4.vllm.kernels import (
     DS4KVInsertAdapter,
     FlashMLAAdapter,
     FusedQKVRMSNormAdapter,
