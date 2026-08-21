@@ -85,6 +85,25 @@ def test_malformed_client_handoff_does_not_allocate_request_state(fields):
     assert coordinator.next_request_id == 0
 
 
+def test_native_disaggregation_rejects_multimodal_requests():
+    coordinator = unittest.mock.MagicMock(
+        known_clients={b"client"},
+        next_request_id=0,
+        request_id_to_client_id={},
+        request_id_to_client_request_id={},
+        client_request_to_request_id={},
+    )
+
+    HANDLERS[Headers.SUBMIT_REQUEST](
+        coordinator, b"client", [Headers.SUBMIT_REQUEST.value, 7, [1], {}, {"image": [b"image"]}]
+    )
+
+    coordinator.disagg.route_submit.assert_not_called()
+    coordinator.disagg.drop_request.assert_called_once_with(
+        0, "multimodal requests are not supported by native disaggregation", source_safe=True
+    )
+
+
 class DummyTokenizer:
     """Dummy tokenizer."""
 

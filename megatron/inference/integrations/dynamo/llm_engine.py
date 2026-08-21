@@ -28,8 +28,8 @@ from dynamo.common.backend.worker import WorkerConfig
 from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import KvEventPublisher, ModelInput
 
-from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver

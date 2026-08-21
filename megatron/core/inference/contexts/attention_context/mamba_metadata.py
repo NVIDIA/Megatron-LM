@@ -935,8 +935,10 @@ class MambaMetadata:
         # Get the Mamba state indices for finished requests
         mamba_indices_to_free = self.request_to_mamba_state_idx[request_indices]
 
-        # Filter out any invalid indices (e.g., -1)
-        mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
+        # The optional EP dummy slot is outside the request-owned pool.
+        mamba_indices_to_free = mamba_indices_to_free[
+            (mamba_indices_to_free >= 0) & (mamba_indices_to_free < self.max_requests)
+        ]
         self._return_slots(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests

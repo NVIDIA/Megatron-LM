@@ -14,6 +14,7 @@ MODEL_ARGS:
   --inference-dynamic-batching-prefix-caching: true
   --refit-method: gloo
   --inference-dynamic-batching-num-cuda-graphs: 1
+  --inference-cuda-graph-all-prefills: true
   --inference-dynamic-batching-unified-memory-level: 1
   --inference-dynamic-batching-buffer-size-gb: 20
   --ckpt-format: torch_dist

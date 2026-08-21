@@ -257,6 +257,7 @@ class DisaggCoordinatorRuntime:
             if request is None:
                 return
             state = self.requests[request.request_id]
+            assert state.prompt is not None, "completed request remained in the prefill queue"
             self._submit_prefill(
                 prefill_id, request.request_id, state.prompt, state.sampling_params
             )

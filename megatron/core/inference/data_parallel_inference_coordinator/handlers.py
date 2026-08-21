@@ -136,7 +136,14 @@ def handle_submit_request(coordinator, sender_identity, payload):
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
     if coordinator.disagg is not None:
-        coordinator.disagg.route_submit(request_id, prompt, sampling_params)
+        if multi_modal_data:
+            coordinator.disagg.drop_request(
+                request_id,
+                "multimodal requests are not supported by native disaggregation",
+                source_safe=True,
+            )
+        else:
+            coordinator.disagg.route_submit(request_id, prompt, sampling_params)
         return
 
     engine_payload = msgpack.packb(

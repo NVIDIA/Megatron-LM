@@ -1,9 +1,8 @@
 # Megatron Dynamo integration
 
-Megatron-LM owns its Dynamo backend adapter, engine protocol, tests, examples,
-deployment manifests, and runtime image. Dynamo remains an external dependency
-that supplies the common backend API, distributed runtime, frontend, and KV
-router.
+Megatron-LM owns its Dynamo backend adapter, engine protocol, and tests. Dynamo
+remains an external dependency that supplies the common backend API,
+distributed runtime, frontend, and KV router.
 
 Each registered worker owns one complete Megatron model replica. The lightweight
 Dynamo parent launches a private TP/PP/EP rank group and Megatron coordinator,
@@ -14,54 +13,12 @@ are not registered as Dynamo workers.
 
 ```text
 megatron/inference/integrations/dynamo/             adapter and engine protocol
-megatron/inference/integrations/dynamo/container/   runtime image
-megatron/inference/integrations/dynamo/deploy/      deployment manifests
-megatron/inference/integrations/dynamo/nano-v3-test/ Slurm test
-megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/ multi-node KV routing tests
 megatron/core/inference/disaggregation/            reusable KV/state handoff
 tests/unit_tests/inference/dynamo/                  adapter unit tests
 ```
 
 Logic reusable by other inference engines belongs in Dynamo's
 `dynamo.common.backend`; Megatron-specific behavior belongs here.
-
-## Build the image
-
-Build from the Megatron-LM repository root. The default Dynamo ref is recorded
-in `megatron/inference/integrations/dynamo/dynamo-ref.txt`; use a release, branch, tag, or commit to
-keep the adapter and common backend API compatible.
-
-```bash
-export IMAGE=megatron-dynamo:dev
-export DYNAMO_REF="$(cat megatron/inference/integrations/dynamo/dynamo-ref.txt)"
-
-docker build \
-  -f megatron/inference/integrations/dynamo/container/Dockerfile \
-  --build-arg DYNAMO_REF="$DYNAMO_REF" \
-  -t "$IMAGE" \
-  .
-```
-
-For a Dynamo fork, also pass `--build-arg DYNAMO_REPO=<git-url>`. Numeric refs
-install the matching PyPI release; other non-empty refs install Dynamo and its
-native runtime from git.
-
-The image contains Megatron-LM, the adapter, `ai-dynamo`,
-`ai-dynamo-runtime`, NIXL, and the dependencies needed by the inference path.
-It also includes NATS and etcd binaries for the single-container examples;
-production deployments normally run those as separate services.
-
-Validate the ownership boundary:
-
-```bash
-docker run --rm "$IMAGE" python -c '
-from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine
-from megatron.inference.integrations.dynamo.engine_service import main
-from dynamo.common.backend import LLMEngine
-assert issubclass(MegatronLLMEngine, LLMEngine)
-print("Megatron adapter and Dynamo runtime are present")
-'
-```
 
 ## Launch
 
@@ -142,29 +99,6 @@ python -m megatron.inference.integrations.dynamo \
 This starts one `torch.distributed.run` agent per node, with `SLURM_NODEID` as
 the node rank. Reserve the selected nodes exclusively for this Dynamo worker;
 individual Megatron ranks are not separate Dynamo workers.
-
-The Nano v3 Slurm test starts etcd, NATS, the frontend, and matched TP=1/PP=1
-prefill and decode workers:
-
-```bash
-bash megatron/inference/integrations/dynamo/nano-v3-test/launch.sh
-```
-
-The eight-GPU Nano v3 test scales that topology to two EP=2 prefill and two
-EP=2 decode workers across two four-GPU nodes:
-
-```bash
-bash megatron/inference/integrations/dynamo/nano-v3-2p2d-test/launch.sh
-```
-
-The multi-node Nano v3 harness validates aggregated KV events, event-driven
-routing, and an otherwise identical round-robin baseline in separate runs:
-
-```bash
-bash megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/launch-events.sh
-bash megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/launch-routing.sh
-bash megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/launch-baseline.sh
-```
 
 ## Tests
 

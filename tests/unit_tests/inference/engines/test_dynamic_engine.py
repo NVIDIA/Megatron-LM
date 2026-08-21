@@ -721,6 +721,55 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
 
 
+def test_post_process_zero_token_handoff_keeps_resume_log_prob():
+    request = DynamicInferenceRequest(
+        request_id=17,
+        prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=0,
+            termination_id=-1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            do_kv_handoff=True,
+        ),
+    )
+    entry = types.SimpleNamespace(
+        record=DynamicInferenceRequestRecord.from_request(request), future=mock.Mock()
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        kv_block_allocator=types.SimpleNamespace(), remove_vlm_request_data=mock.Mock()
+    )
+    engine.requests = {request.request_id: entry}
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine._prepare_handoff_metadata_batch = mock.Mock(return_value={request.request_id: "meta"})
+    engine._capture_handoff_meta = mock.Mock()
+
+    active_request_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        finished_request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        evict_request_ids=torch.empty(0, dtype=torch.int64),
+        step_time=0.0,
+        sample=torch.tensor([99], dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[[-0.25]],
+        consumed_chunked_prefill_request_id=-1,
+        finished_handoff_block_ids={request.request_id: [10]},
+        finished_handoff_decode_tokens={request.request_id: [99]},
+    )
+
+    assert active_request_ids == []
+    assert finished_records == [entry.record]
+    assert request.generated_tokens == []
+    assert not request.generated_log_probs
+    assert engine._prepare_handoff_metadata_batch.call_args.args[2] == {request.request_id: [-0.25]}
+    engine._capture_handoff_meta.assert_called_once_with(request, "meta")
+
+
 def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
     """RECOMPUTE suspend/resume must re-add the prefix-enabled checkpoint tail."""
     request = _make_prefix_cached_request_for_checkpoint(request_id=23)

@@ -155,7 +155,7 @@ def inference_model_alloc_context(args):
 
 
 def refit_inference_model(model, inference_model, args) -> int:
-    """Copy training weights into this rank's inference shard."""
+    """Copy training weights and return the number of destination pools."""
 
     num_dst_pools, dst_pool_index = disagg_refit_pools(
         args.inference_shards, args.world_size

@@ -31,8 +31,8 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
-from .disagg import configure_disagg_engine, is_disagg_rollout
 from ..server.api import InferenceServer
+from .disagg import configure_disagg_engine, is_disagg_rollout
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -156,7 +156,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                start_text_gen_server,
+            )
 
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
@@ -218,7 +220,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.stop()
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                stop_text_gen_server,
+            )
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):

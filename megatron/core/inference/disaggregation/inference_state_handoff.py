@@ -1128,9 +1128,8 @@ class InferenceStateHandoffMixin:
                 "Decode-only handoff is missing its sampled token or MTP proposals: "
                 f"expected {expected_tokens}, got {len(pending.resume_tokens)}"
             )
-        if self.context.is_hybrid_model:
-            if pending.ssm is None:
-                raise RuntimeError("Hybrid decode-only handoff is missing transferred SSM state")
+        if self.context.is_hybrid_model and pending.ssm is None:
+            raise RuntimeError("Hybrid decode-only handoff is missing transferred SSM state")
         expected_log_probs = 1 if pending.sampling_params.return_log_probs else 0
         if len(pending.resume_log_probs) != expected_log_probs:
             raise RuntimeError(

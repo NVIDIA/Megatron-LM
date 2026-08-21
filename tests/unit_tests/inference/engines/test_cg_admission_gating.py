@@ -12,7 +12,13 @@ from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngin
 
 
 def _create_engine(
-    cg_list, active_tok=0, num_prefill=0, num_decode=0, is_hybrid=False, warn_after=100
+    cg_list,
+    active_tok=0,
+    num_prefill=0,
+    num_decode=0,
+    is_hybrid=False,
+    warn_after=100,
+    chunked_prefill_request_id=-1,
 ):
     """Mock engine instance."""
     engine = types.SimpleNamespace()
@@ -23,6 +29,7 @@ def _create_engine(
         num_decode_requests=num_decode,
         is_hybrid_model=is_hybrid,
         use_cuda_graphs_for_non_decode_steps=True,
+        chunked_prefill_request_id=chunked_prefill_request_id,
     )
     engine.cuda_graph_all_prefills = True
     engine._cg_admission_warn_after = warn_after
@@ -454,6 +461,13 @@ class TestChunkedPrefillCgGating:
 
         with pytest.raises(RuntimeError, match="No captured CUDA graph"):
             engine._select_cg_chunk_size(req, max_chunk_tokens=7)
+
+    def test_lone_continuation_uses_captured_graph(self):
+        engine = _create_engine(
+            [_get_cudagraph(8, 1, 0)], chunked_prefill_request_id=1, is_hybrid=True
+        )
+
+        assert engine._select_cg_chunk_size(_make_request(), max_chunk_tokens=7) == 7
 
     def test_hybrid_continuation_retries_after_batch_shape_changes(self):
         # At full request occupancy, the next geometric P bucket (4P + 28D)

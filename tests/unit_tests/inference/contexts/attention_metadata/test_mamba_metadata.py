@@ -98,6 +98,16 @@ class TestMambaMetadata:
         assert metadata.mamba_state_free_slot_count == 1
         assert int(metadata.allocate_slot()) == detached_slot
 
+    def test_free_slots_ignores_reserved_dummy_slot(self):
+        metadata = MambaMetadata(
+            max_requests=2, max_tokens=4, max_intermediate_count=1, reserve_dummy_state_slot=True
+        )
+        metadata.request_to_mamba_state_idx[0] = metadata.dummy_state_idx
+
+        metadata.free_slots(torch.tensor([0], dtype=torch.int64))
+
+        assert metadata.mamba_state_free_slot_count == metadata.max_requests
+
     def _run_update_test(
         self,
         metadata: MambaMetadata,

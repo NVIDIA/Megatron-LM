@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+
 def engine_metadata(engine, role: str) -> dict:
     """Return the capabilities Dynamo needs to configure this engine."""
 

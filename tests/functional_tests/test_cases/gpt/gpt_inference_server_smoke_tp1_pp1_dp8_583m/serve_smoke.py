@@ -60,6 +60,7 @@ def build_server_cmd(
             "block",
             "--inference-dynamic-batching-num-cuda-graphs",
             "1",
+            "--inference-cuda-graph-all-prefills",
         ]
     return [
         sys.executable,

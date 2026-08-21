@@ -1952,10 +1952,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Skip for requests being finished due to stop words — tokens are not
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
-            if (
-                request_log_probs is not None
-                and request_id not in self.stop_word_being_finished_ids
-            ):
+            if request_log_probs and request_id not in self.stop_word_being_finished_ids:
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
@@ -3528,7 +3525,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         + len(self.waiting_request_ids)
                         + int(self.has_admittable_kv_import)
                     )
-                    local_pending_imports = self.pending_kv_import_count
+                    local_pending_transfers = (
+                        self.pending_kv_import_count + self.pending_kv_push_count
+                    )
                     if self.disable_ep_consensus:
                         # Skip the EP consensus all-reduce; act on local state only.
                         # NOTE: even with no consensus we must still participate in EP
@@ -3542,7 +3541,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self._state_events[EngineState.PAUSED].set()
                         elif local_schedulable > 0:
                             await self.async_step()
-                        elif self.ep_world_size == 1 and local_pending_imports > 0:
+                        elif self.ep_world_size == 1 and local_pending_transfers > 0:
                             # No model work is ready; poll the network transfer without
                             # spending a dummy forward while waiting for decode admission.
                             await asyncio.sleep(0.001)
@@ -3599,7 +3598,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.context.prefix_cache_lru_clock += 1
                     else:
                         # No work, but not all pausing: idle.
-                        await asyncio.sleep(0.001 if local_pending_imports > 0 else 0.02)
+                        await asyncio.sleep(0.001 if local_pending_transfers > 0 else 0.02)
 
                 elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)

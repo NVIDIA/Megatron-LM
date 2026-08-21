@@ -260,7 +260,7 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def _new_abort_future(self, request_id: int) -> asyncio.Future:
-        """Create a safety acknowledgement that removes itself on completion."""
+        """Create a future for the request's source-safety acknowledgement."""
 
         future = asyncio.get_running_loop().create_future()
         self.abort_futures[request_id] = future
@@ -403,8 +403,6 @@ class InferenceClient:
                     if source_safe:
                         if abort_future is not None and not abort_future.done():
                             abort_future.set_result(True)
-                    elif abort_future is None:
-                        self._new_abort_future(request_id)
                     stream = self.streams.pop(request_id, None)
                     if stream is not None:
                         stream.finish(exception=error)

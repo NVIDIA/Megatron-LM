@@ -219,10 +219,9 @@ def test_decode_ssm_capacity_is_released_on_generation_completion():
         runtime.route_submit(request_id, [request_id], {})
     sent.clear()
     handoff = {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]}
-    for request_id in (5, 6):
-        runtime.handle_prefill_done(
-            request_id, {"request_id": request_id, "disaggregated_params": handoff}
-        )
+    runtime.handle_prefill_done(5, {"request_id": 5, "disaggregated_params": handoff})
+    runtime.handle_kv_read_done(b"decode", 5)
+    runtime.handle_prefill_done(6, {"request_id": 6, "disaggregated_params": handoff})
 
     decode_submits = [
         message[1]
