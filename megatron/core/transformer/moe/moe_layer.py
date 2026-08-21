@@ -352,6 +352,27 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        # Experimental E2E path: MOK keeps the original routed Parameters as the
+        # authoritative optimizer/DDP owners. Single-grouped weights are used
+        # directly; non-single weights are re-registered as per-expert aliases and
+        # addressed through MOK descriptor tables. The source expert module can
+        # therefore be unregistered without copying any routed-weight payload.
+        self.mok_experts = None
+        if self.config.use_mok_megakernel:
+            from megatron.core.transformer.moe.mok_megakernel import MoKMegakernel
+
+            self.mok_experts = MoKMegakernel(
+                config=self.config,
+                ep_group=self.ep_group,
+                routed_experts=self.experts,
+                shared_experts=self.shared_experts,
+                num_local_experts=self.num_local_experts,
+            )
+            if not self.config.moe_single_grouped_weight:
+                self.experts = None
+            self.shared_experts = None
+            self.token_dispatcher = None
+
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
             if config.inference_grouped_gemm_backend == 'auto':
@@ -734,6 +755,18 @@ class MoELayer(BaseMoELayer):
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
+
+        if self.config.use_mok_megakernel:
+            if intermediate_tensors is not None:
+                raise RuntimeError(
+                    "MoK E2E integration does not support partial MoE CUDA-graph capture; "
+                    "remove moe_router/moe_preprocess from cuda_graph_modules"
+                )
+            probs, routing_map = self.route(
+                hidden_states, padding_mask, input_ids, packed_seq_params
+            )
+            output = apply_module(self.mok_experts)(hidden_states, probs, routing_map)
+            return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
