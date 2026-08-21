@@ -174,6 +174,8 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        fine_grained: bool = False,
+        skip_backward_callback: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -206,7 +208,9 @@ class FsdpModule:
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
-        self._register_hooks()
+        self._register_hooks(
+            fine_grained=fine_grained, skip_backward_callback=skip_backward_callback
+        )
         context.register_module(self)
 
     @property
@@ -244,25 +248,34 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self._is_root
 
-    def _register_hooks(self) -> None:
+    def _register_hooks(
+        self, fine_grained: bool = False, skip_backward_callback: bool = False
+    ) -> None:
         module = cast(nn.Module, self)
-        # Use PyTorch's callback module argument instead of capturing self so
-        # these hooks do not retain a deleted FSDP module.
-        module.register_forward_pre_hook(
-            lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
-        )
-        module.register_forward_hook(
-            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
-        )
-        module.register_full_backward_pre_hook(
-            lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
-        )
+        if fine_grained:
+            _register_fine_grained_forward_hooks(self)
+            _register_fine_grained_backward_hooks(self)
+        else:
+            # Use PyTorch's callback module argument instead of capturing self so
+            # these hooks do not retain a deleted FSDP module.
+            module.register_forward_pre_hook(
+                lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
+            )
+            module.register_forward_hook(
+                lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+            )
+            module.register_full_backward_pre_hook(
+                lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
+            )
         if self._num_trainable_parameters == 0:
             module.register_full_backward_hook(
                 lambda hooked_module, _grad_input, _grad_output: cast(
                     FsdpModule, hooked_module
                 ).post_backward()
             )
+            return
+
+        if skip_backward_callback:
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
@@ -369,14 +382,22 @@ class FsdpModule:
                 group.release_unsharded_storage()
             self._unshard_event = None
 
-    def pre_backward(self) -> None:
-        """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+    def pre_backward(self, register_final_callback: bool = True) -> None:
+        """Prepare full parameters and prefetch the next FsdpModule in backward order.
+
+        Args:
+            register_final_callback: Whether to finalize through the autograd engine.
+                Manual backward schedules (the 1F1B EP overlap schedule) finalize
+                explicitly in ``post_backward()``, so they pass False to avoid
+                installing an autograd callback outside the backward pass.
+        """
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            context.register_post_backward_final_callback()
+            if register_final_callback:
+                context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
             # part of any active CUDA-graph capture. A stream only joins the
@@ -395,10 +416,27 @@ class FsdpModule:
             next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
-        """Reduce gradients and return parameters to their sharded resting state."""
+        """Reduce gradients and return parameters to their sharded resting state.
+
+        No-op unless this module is in the BACKWARD phase (idempotent). Any
+        submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B schedule
+        skipped its per-module release) is finalized first.
+        """
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            return
+        # The 1F1B schedule may skip a per-module release; finalize any submodule
+        # still in the BACKWARD phase (excluding this module itself).
+        for module in reversed(list(cast(nn.Module, self).modules())):
+            if module is self:
+                continue
+            if isinstance(module, FsdpModule) and module.phase is FsdpModule.Phase.BACKWARD:
+                module.post_backward()
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
+        # 1F1B cooldown can run consecutive backward passes without an intervening
+        # pre_forward(), so reset the hook counter as soon as this pass is finalized.
+        self._num_ready_grad_parameters = 0
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
@@ -481,3 +519,87 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         key = (parameter.dtype, parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
+
+
+# ---------------------------------------------------------------------------
+# Fine-grained hook registration for 1F1B EP overlap support
+# ---------------------------------------------------------------------------
+
+_FSDP_PARENT_MODULE_REF_ATTR = "_fsdp_parent_module_ref"
+
+
+def _find_fsdp_target(submodule: nn.Module) -> FsdpModule | None:
+    """Return the nearest parent FsdpModule for *submodule*, if any."""
+    if isinstance(submodule, FsdpModule):
+        return submodule
+    parent_ref = getattr(submodule, _FSDP_PARENT_MODULE_REF_ATTR, None)
+    return parent_ref() if parent_ref is not None else None
+
+
+def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
+    """Register pre-forward hooks on every sub-module of *fsdp_module*.
+
+    When the 1F1B EP overlap schedule calls individual sub-modules directly
+    (e.g., ``layer.attn.forward()``), the hook resolves the parent FsdpModule
+    and unshards its parameters.
+    """
+    for submodule in fsdp_module.modules():
+        if submodule is fsdp_module:
+            continue
+        target = _find_fsdp_target(submodule)
+        if target is not None and target is not fsdp_module:
+            continue
+        object.__setattr__(submodule, _FSDP_PARENT_MODULE_REF_ATTR, ref(fsdp_module))
+        submodule.register_forward_pre_hook(
+            _fine_grained_pre_forward_hook, prepend=True, with_kwargs=True
+        )
+
+
+def _fine_grained_pre_forward_hook(submodule: nn.Module, _args, _kwargs) -> None:
+    """Pre-forward hook for fine-grained sub-modules."""
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    target._unshard_parameter_groups()
+    if target._unshard_event is not None:
+        target.context.current_stream().wait_event(target._unshard_event)
+
+    # Fine-grained schedules bypass FsdpModule.pre_forward(), so issue the same
+    # one-module lookahead here. This queues the next all-gather before the current
+    # module's post-forward storage-release barrier reaches the all-gather stream.
+    is_recomputing = target.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+    if not is_recomputing:
+        next_module = target.context.forward_order.next_item(target)
+        if next_module is not None:
+            next_module._unshard_parameter_groups()
+
+
+def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
+    """Register pre-backward hooks on every sub-module of *fsdp_module*.
+
+    Uses ``register_full_backward_pre_hook`` on each sub-module.  When
+    autograd reaches a sub-module during backward, the hook unshards the
+    parent FsdpModule's parameters before that sub-module's own backward
+    computes its gradients.
+    """
+    for submodule in fsdp_module.modules():
+        if submodule is fsdp_module:
+            continue
+        target = _find_fsdp_target(submodule)
+        if target is not None and target is not fsdp_module:
+            continue
+        submodule.register_full_backward_pre_hook(_fine_grained_pre_backward_hook)
+
+
+def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
+    """Pre-backward hook for fine-grained sub-modules.
+
+    Enters the parent ``FsdpModule`` backward lifecycle before the sub-module's
+    backward runs, so its weight-gradient computation sees full parameters and
+    its later ``post_backward()`` has a matching lifecycle/NVTX entry.
+    """
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    if target.phase is FsdpModule.Phase.RESTING:
+        target.pre_backward(register_final_callback=False)

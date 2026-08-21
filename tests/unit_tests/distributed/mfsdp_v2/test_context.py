@@ -137,6 +137,74 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
+def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
+    """Fine-grained parent references must not become registered child modules."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+    module_names = tuple(name for name, _ in model.named_modules())
+    layer_keys = tuple(model.layers._modules)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    assert tuple(name for name, _ in model.named_modules()) == module_names
+    assert tuple(model.layers._modules) == layer_keys
+
+
+def test_fine_grained_hooks_run_for_direct_child_forward_and_backward(
+    distributed_setup, monkeypatch
+):
+    """Direct child execution should enter the owning FSDP lifecycle."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
+    with torch.no_grad():
+        model[0].weight.copy_(torch.eye(4, device=device))
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    events = []
+    original_unshard = model._unshard_parameter_groups
+    original_pre_backward = model.pre_backward
+    original_post_backward = model.post_backward
+
+    def tracked_unshard():
+        events.append("unshard")
+        return original_unshard()
+
+    def tracked_pre_backward(register_final_callback=True):
+        events.append(("pre_backward", register_final_callback))
+        return original_pre_backward(register_final_callback=register_final_callback)
+
+    def tracked_post_backward():
+        events.append("post_backward")
+        return original_post_backward()
+
+    monkeypatch.setattr(model, "_unshard_parameter_groups", tracked_unshard)
+    monkeypatch.setattr(model, "pre_backward", tracked_pre_backward)
+    monkeypatch.setattr(model, "post_backward", tracked_post_backward)
+
+    inputs = torch.arange(8, device=device, dtype=torch.float32).reshape(2, 4)
+    inputs.requires_grad_()
+
+    # Call the child directly, bypassing the owning FsdpModule's forward hooks.
+    output = model[0](inputs)
+    torch.testing.assert_close(output, inputs)
+    assert events == ["unshard"]
+
+    # Match the schedule's post-forward release before autograd reaches the child.
+    model._reshard_parameter_groups()
+    output.sum().backward()
+
+    assert events == ["unshard", ("pre_backward", False), "unshard", "post_backward"]
+    assert inputs.grad is not None
+    assert model.phase is model.Phase.RESTING
+
+
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
@@ -234,3 +302,41 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.inner.context is first_context
+
+
+def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_setup, monkeypatch):
+    """Manual 1F1B release should include nested units still in the backward phase."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model.inner, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True
+        )
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
+
+    calls = []
+    for name, module in (("root", model), ("inner", model.inner)):
+        monkeypatch.setattr(
+            module, "_reshard_parameter_groups", lambda name=name: calls.append((name, "reshard"))
+        )
+        monkeypatch.setattr(
+            module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
+        )
+
+    # The schedule skipped the inner unit's per-module release; its post_backward
+    # should still finalize it because it remains in the BACKWARD phase.
+    model.pre_backward(register_final_callback=False)
+    model.inner.pre_backward(register_final_callback=False)
+    model.post_backward()
+
+    # The root post_backward finalizes itself and any nested unit still in the
+    # BACKWARD phase; the relative order of the two operations is not a contract.
+    assert sorted(calls) == [
+        ("inner", "reduce"),
+        ("inner", "reshard"),
+        ("root", "reduce"),
+        ("root", "reshard"),
+    ]
