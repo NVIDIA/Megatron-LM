@@ -80,6 +80,9 @@ class WeightedMultiTask(
             self._rollout_env_ids.append(env_id)
             self._rollout_weights.append(config.weight / total_weight)
             self._rollout_config_indices.append(idx)
+            # Curriculum-cursor agents scale restart seeds by their roster share
+            # (see responses_env_agent.next_curriculum_index).
+            object.__setattr__(agent, '_prompt_share', config.weight / total_weight)
         duplicates = {
             env_id for env_id in self._rollout_env_ids if self._rollout_env_ids.count(env_id) > 1
         }
