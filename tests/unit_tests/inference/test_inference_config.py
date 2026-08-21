@@ -161,7 +161,6 @@ class TestInferenceConfig:
 
 def _ssm_model(mixers):
     """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
-    from megatron.core.models.hybrid.hybrid_block import HybridStack
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
     decoder = SimpleNamespace(
@@ -169,10 +168,6 @@ def _ssm_model(mixers):
         layers=[SimpleNamespace(mixer=mixer) for mixer in mixers],
         mamba_state_shapes_per_request=lambda: ((16, 4), (2, 8, 16)),
     )
-    # The real scan, called unbound: it reads only `layer_type_list` and
-    # `layers`, so the stand-in satisfies it and the tests stay on the
-    # implementation rather than a copy of it.
-    decoder.ssm_chunking = lambda: HybridStack.ssm_chunking(decoder)
     return SimpleNamespace(
         decoder=decoder,
         config=SimpleNamespace(params_dtype=torch.bfloat16, batch_invariant_mode=False),
@@ -230,14 +225,11 @@ class TestSSMChunkAlignment:
     @pytest.mark.internal
     def test_stack_without_a_recurrent_layer_reports_no_chunking(self):
         """A pipeline stage of pure attention/MLP layers has nothing to report."""
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.ssm.ssm_inference import ssm_chunking
 
-        decoder = SimpleNamespace(
-            layer_type_list=[Symbols.ATTENTION, Symbols.MLP],
-            layers=[SimpleNamespace(), SimpleNamespace()],
-        )
-        assert HybridStack.ssm_chunking(decoder) is None
+        layer_types = [Symbols.ATTENTION, Symbols.MLP]
+        assert ssm_chunking(layer_types, [SimpleNamespace(), SimpleNamespace()]) is None
 
     @pytest.mark.internal
     @pytest.mark.parametrize(

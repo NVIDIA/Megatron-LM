@@ -76,6 +76,7 @@ class MambaInferenceStateConfig:
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.ssm.ssm_inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -120,7 +121,7 @@ class MambaInferenceStateConfig:
             # gated off for GDP (batch-invariant chunk lengths, prefix-cache
             # extraction offsets). A future cross-rank consumer must reconcile
             # these across the PP group.
-            chunking = decoder.ssm_chunking()
+            chunking = ssm_chunking(decoder.layer_type_list, decoder.layers)
             if chunking is None:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size
