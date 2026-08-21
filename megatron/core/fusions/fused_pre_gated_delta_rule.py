@@ -1862,6 +1862,7 @@ def _triton_pre_gated_delta_rule_forward(
     device = qkvzba.device
 
     # Output buffers: contiguous (b, s, h, d) for q/k/v and (b, s, h) for g/beta.
+    # g and beta stay fp32 to match the unfused pre-GDR contract.
     # Q and K share one allocation so the fused-streamed QK kernel can select
     # the logical group by pointer stride instead of branching between two
     # unrelated base pointers inside Triton.
@@ -1874,7 +1875,7 @@ def _triton_pre_gated_delta_rule_forward(
         batch, seq_len, num_value_heads, value_head_dim, dtype=out_dtype, device=device
     )
     g = torch.empty(batch, seq_len, num_value_heads, dtype=torch.float32, device=device)
-    beta = torch.empty(batch, seq_len, num_value_heads, dtype=out_dtype, device=device)
+    beta = torch.empty(batch, seq_len, num_value_heads, dtype=torch.float32, device=device)
 
     # Conv weight is (conv_dim, 1, K_W); we treat it as (conv_dim, K_W).
     weight_2d = conv1d_weight.view(conv1d_weight.shape[0], k_w)
