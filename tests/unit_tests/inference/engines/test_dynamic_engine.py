@@ -6361,10 +6361,10 @@ class TestChunkedPrefillCudaGraphs:
         `causal_conv1d_varlen_carry_states` the saved state loses its leading
         columns here and the generated tokens diverge from the unchunked run.
 
-        Run under capture as well as eagerly: the carry op's shape-dependent
-        branches (the `total_tokens == 0` early return, the out-of-range column
-        rewrite) and its precomputed-plan path are exactly what a replayed graph
-        stresses.
+        Run under capture as well as eagerly. The kernel reads each slice length
+        from `cu_seqlens` on the device, so a single captured graph serves both a
+        full-length chunk and the short final one: the per-column choice has to
+        come out right on replay, from lengths the capture never saw.
         """
         skip_if_mamba_sequence_packing_not_available("hybrid", ssm_mixer)
 
