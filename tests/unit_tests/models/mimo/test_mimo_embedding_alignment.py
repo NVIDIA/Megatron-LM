@@ -237,6 +237,66 @@ class TestEmbeddingAlignment:
         assert torch.all(combined[5, 1, :1] == 0.0), "Non-zero values found before marker"
         assert torch.all(combined[5, 1, 2:] == 0.0), "Non-zero values found after marker"
 
+    def test_precomputed_indices_match_mask_path_outputs_and_gradients(self):
+        """Precomputed positions must be equivalent to the topology-independent mask path."""
+        input_ids = torch.tensor(
+            [
+                [1, 50, 50, 2, 51, 3, 4, 5],
+                [50, 6, 7, 51, 51, 8, 9, 10],
+                [11, 12, 51, 13, 14, 15, 16, 17],
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+        special_token_ids = {"vision": 50, "audio": 51}
+        flat_input_ids = input_ids.reshape(-1)
+        text_mask = torch.ones_like(flat_input_ids, dtype=torch.bool)
+        modality_token_indices = {}
+        for modality_name, token_id in special_token_ids.items():
+            modality_mask = flat_input_ids == token_id
+            modality_token_indices[modality_name] = modality_mask.nonzero(as_tuple=False).flatten()
+            text_mask &= ~modality_mask
+        modality_token_indices["text"] = text_mask.nonzero(as_tuple=False).flatten()
+
+        torch.manual_seed(1234)
+        source_embeddings = {
+            modality_name: torch.randn(token_indices.numel(), self.hidden_dim, device=self.device)
+            for modality_name, token_indices in modality_token_indices.items()
+        }
+        mask_embeddings = {
+            name: embeddings.detach().clone().requires_grad_()
+            for name, embeddings in source_embeddings.items()
+        }
+        indexed_embeddings = {
+            name: embeddings.detach().clone().requires_grad_()
+            for name, embeddings in source_embeddings.items()
+        }
+
+        mask_output = self.model.align_embeddings_by_token_positions(
+            modality_embeddings=mask_embeddings,
+            input_ids=input_ids,
+            special_token_ids=special_token_ids,
+        )
+        indexed_output = self.model.align_embeddings_by_token_positions(
+            modality_embeddings=indexed_embeddings,
+            input_ids=input_ids,
+            special_token_ids=special_token_ids,
+            modality_token_indices=modality_token_indices,
+        )
+
+        torch.testing.assert_close(indexed_output, mask_output, rtol=0, atol=0)
+
+        output_gradient = torch.randn_like(mask_output)
+        mask_output.backward(output_gradient)
+        indexed_output.backward(output_gradient)
+        for modality_name in source_embeddings:
+            torch.testing.assert_close(
+                indexed_embeddings[modality_name].grad,
+                mask_embeddings[modality_name].grad,
+                rtol=0,
+                atol=0,
+            )
+
     def test_multiple_images_with_variable_length(self):
         """Test handling multiple images per sample with variable sequence lengths.
 
@@ -418,6 +478,73 @@ class TestEmbeddingAlignment:
                 modality_embeddings=modality_embeddings,
                 input_ids=input_ids,
                 special_token_ids=special_token_ids,
+            )
+
+        # The precomputed path validates its complete-map contract using tensor
+        # metadata only; none of these checks synchronize with the device.
+        valid_text_indices = (input_ids.reshape(-1) != vision_token_id).nonzero().flatten()
+        valid_vision_indices = (input_ids.reshape(-1) == vision_token_id).nonzero().flatten()
+        indexed_modality_embeddings = {
+            "vision": vision_embeddings,
+            "text": torch.full((valid_text_indices.numel(), hidden_dim), 0.01, device=self.device),
+        }
+        with pytest.raises(ValueError, match="Number of vision token indices.*does not match"):
+            self.model.align_embeddings_by_token_positions(
+                modality_embeddings=indexed_modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=special_token_ids,
+                modality_token_indices={
+                    "text": valid_text_indices,
+                    "vision": torch.tensor([1], dtype=torch.long, device=self.device),
+                },
+            )
+
+        with pytest.raises(ValueError, match="flat one-dimensional tensor"):
+            self.model.align_embeddings_by_token_positions(
+                modality_embeddings=indexed_modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=special_token_ids,
+                modality_token_indices={
+                    "text": valid_text_indices,
+                    "vision": torch.tensor([[1, 7]], dtype=torch.long, device=self.device),
+                },
+            )
+
+        with pytest.raises(ValueError, match="must be provided for every modality"):
+            self.model.align_embeddings_by_token_positions(
+                modality_embeddings=indexed_modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=special_token_ids,
+                modality_token_indices={"text": valid_text_indices},
+            )
+
+        with pytest.raises(ValueError, match="must have dtype torch.long"):
+            self.model.align_embeddings_by_token_positions(
+                modality_embeddings=indexed_modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=special_token_ids,
+                modality_token_indices={
+                    "text": valid_text_indices,
+                    "vision": valid_vision_indices.to(dtype=torch.int32),
+                },
+            )
+
+        incomplete_text_indices = valid_text_indices[:-1]
+        incomplete_modality_embeddings = {
+            "vision": vision_embeddings,
+            "text": torch.full(
+                (incomplete_text_indices.numel(), hidden_dim), 0.01, device=self.device
+            ),
+        }
+        with pytest.raises(ValueError, match="must cover the complete flattened"):
+            self.model.align_embeddings_by_token_positions(
+                modality_embeddings=incomplete_modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=special_token_ids,
+                modality_token_indices={
+                    "text": incomplete_text_indices,
+                    "vision": valid_vision_indices,
+                },
             )
 
     def test_missing_special_token_id(self):

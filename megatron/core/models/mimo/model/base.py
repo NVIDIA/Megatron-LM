@@ -159,7 +159,15 @@ class MimoModel(MegatronModule):
                 The number of special tokens for each modality should exactly match the number
                 of embeddings for that modality.
             special_token_ids: Dictionary mapping modality names to their special token IDs
-            modality_token_indices: Optional mapping from modality names to flat token indices.
+            modality_token_indices: Optional complete mapping from modality names to flat,
+                batch-major ``torch.long`` token indices on the embedding device. Each tensor must
+                contain the same positions, in the same order, that the corresponding
+                ``special_token_ids`` mask would select; ``text`` contains the complement of all
+                special-token positions. When provided, the keys must exactly match
+                ``modality_embeddings`` and their lengths must sum to ``B * S``. Index values are a
+                trusted producer contract and are not revalidated because doing so would add device
+                reductions and host synchronization to the forward hot path. Pass ``None`` to use
+                the mask-based path for every modality.
 
         Returns:
             Combined embeddings tensor. Shape: (S, B, H)
@@ -188,15 +196,57 @@ class MimoModel(MegatronModule):
         )
         flat_combined_embeddings = combined_embeddings.view(-1, hidden_dim)
 
-        # Process each modality in modality_embeddings
-        for modality_name, modality_emb in modality_embeddings.items():
-            token_indices = (modality_token_indices or {}).get(modality_name)
-            if token_indices is not None:
-                if token_indices.ndim != 1 or token_indices.numel() != modality_emb.size(0):
+        precomputed_indices = modality_token_indices
+        if precomputed_indices is not None:
+            expected_modalities = set(modality_embeddings)
+            supplied_modalities = set(precomputed_indices)
+            if supplied_modalities != expected_modalities:
+                missing = sorted(expected_modalities - supplied_modalities)
+                unexpected = sorted(supplied_modalities - expected_modalities)
+                raise ValueError(
+                    "Precomputed modality token indices must be provided for every modality "
+                    f"(missing={missing}, unexpected={unexpected})"
+                )
+
+            total_indices = 0
+            for modality_name, modality_emb in modality_embeddings.items():
+                if modality_name != "text" and modality_name not in special_token_ids:
+                    raise ValueError(f"No special token ID defined for modality {modality_name}")
+
+                token_indices = precomputed_indices[modality_name]
+                if token_indices.ndim != 1:
+                    raise ValueError(
+                        f"{modality_name} token indices must be a flat one-dimensional tensor, "
+                        f"got shape {tuple(token_indices.shape)}"
+                    )
+                if token_indices.dtype != torch.long:
+                    raise ValueError(
+                        f"{modality_name} token indices must have dtype torch.long, "
+                        f"got {token_indices.dtype}"
+                    )
+                if token_indices.device != device:
+                    raise ValueError(
+                        f"{modality_name} token indices must be on device {device}, "
+                        f"got {token_indices.device}"
+                    )
+                if token_indices.numel() != modality_emb.size(0):
                     raise ValueError(
                         f"Number of {modality_name} token indices ({token_indices.numel()}) "
                         f"does not match number of embeddings ({modality_emb.size(0)})"
                     )
+                total_indices += token_indices.numel()
+
+            num_positions = batch_size * seq_length
+            if total_indices != num_positions:
+                raise ValueError(
+                    "Precomputed modality token indices must cover the complete flattened "
+                    f"[B, S] grid ({num_positions} positions), got {total_indices} indices"
+                )
+
+        # Process each modality in modality_embeddings
+        for modality_name, modality_emb in modality_embeddings.items():
+            if precomputed_indices is not None:
+                token_indices = precomputed_indices[modality_name]
                 flat_combined_embeddings.index_copy_(0, token_indices, modality_emb)
                 continue
 
@@ -371,7 +421,8 @@ class MimoModel(MegatronModule):
                 Shape: (B, S)
             special_token_ids: Dictionary mapping modality names to their special token IDs.
                 Used to identify non-text tokens in the input_ids.
-            text_token_indices: Optional flat indices of text tokens in ``input_ids``.
+            text_token_indices: Optional flat, logical row-major ``torch.long`` indices of text
+                tokens in the ``[B, S]`` input grid.
 
         Returns:
             torch.Tensor: Embeddings for text tokens.
@@ -384,8 +435,18 @@ class MimoModel(MegatronModule):
 
             batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
             text_token_indices = batch_idx * input_ids.size(1) + seq_idx
-        elif text_token_indices.ndim != 1:
-            raise ValueError("Text token indices must be a flat one-dimensional tensor")
+        else:
+            if text_token_indices.ndim != 1:
+                raise ValueError("Text token indices must be a flat one-dimensional tensor")
+            if text_token_indices.dtype != torch.long:
+                raise ValueError(
+                    f"Text token indices must have dtype torch.long, got {text_token_indices.dtype}"
+                )
+            if text_token_indices.device != input_ids.device:
+                raise ValueError(
+                    f"Text token indices must be on device {input_ids.device}, "
+                    f"got {text_token_indices.device}"
+                )
 
         input_ids_text = input_ids.reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
 
@@ -466,7 +527,11 @@ class MimoModel(MegatronModule):
                                         max(seqlens_padded), dtype=torch.int32
                                     ),
                                 }
-            modality_token_indices: Optional mapping from modality names to flat token indices.
+            modality_token_indices: Optional complete mapping from every active modality name,
+                including ``text``, to flat logical row-major ``torch.long`` indices in the
+                ``[B, S]`` input grid. Encoder-only ranks ignore this argument. Pass ``None`` to
+                derive every position from ``input_ids``. See
+                ``align_embeddings_by_token_positions`` for the trusted-producer contract.
 
         Returns:
             tuple: (output, loss_mask) where output semantics depend on role:
@@ -485,12 +550,13 @@ class MimoModel(MegatronModule):
                 loss_mask,
                 labels,
                 modality_inputs,
-                packing_kwargs,
-                modality_token_indices,
+                packing_kwargs=packing_kwargs,
+                modality_token_indices=modality_token_indices,
             )
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
+                # Token indices are consumed only when language embeddings are assembled.
                 return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
             if self.role.has_language_module:
@@ -501,8 +567,8 @@ class MimoModel(MegatronModule):
                     loss_mask,
                     labels,
                     input_tensors,
-                    packing_kwargs,
-                    modality_token_indices,
+                    packing_kwargs=packing_kwargs,
+                    modality_token_indices=modality_token_indices,
                 )
 
             raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
@@ -676,7 +742,8 @@ class MimoModel(MegatronModule):
             labels: Labels for loss computation
             input_tensors: Hidden states or embeddings from previous stage
             packing_kwargs: Optional kwargs to construct packed (THD) sequence params.
-            modality_token_indices: Optional mapping from modality names to flat token indices.
+            modality_token_indices: Optional complete mapping of trusted flat logical row-major
+                token indices. See ``align_embeddings_by_token_positions``.
 
         Returns:
             Tuple of (language model output, possibly CP-sharded loss mask). The
