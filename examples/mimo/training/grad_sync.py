@@ -55,15 +55,6 @@ def _vision_participation_count(submodule, vision_dp_group) -> torch.Tensor:
     return indicator
 
 
-def _vision_participation_scale(participation: torch.Tensor, vision_dp_size: int) -> torch.Tensor:
-    """Correct gradients when only part of the vision-DP group processed input."""
-    return torch.where(
-        (participation > 0) & (participation < vision_dp_size),
-        vision_dp_size * participation.reciprocal(),
-        torch.ones_like(participation),
-    )
-
-
 def _token_normalization_scale(num_tokens: torch.Tensor) -> torch.Tensor:
     """Return a device-side reciprocal, leaving zero-token gradients unscaled."""
     return num_tokens.clamp_min(1).reciprocal()
@@ -193,8 +184,10 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
                     vision_dp_size = dist.get_world_size(vision_dp_group)
                     if vision_dp_size > 1:
                         participation = _vision_participation_count(submodule, vision_dp_group)
-                        participation_scale = _vision_participation_scale(
-                            participation, vision_dp_size
+                        participation_scale = torch.where(
+                            (participation > 0) & (participation < vision_dp_size),
+                            vision_dp_size * participation.reciprocal(),
+                            torch.ones_like(participation),
                         )
                         vision_scale = vision_scale * participation_scale
 

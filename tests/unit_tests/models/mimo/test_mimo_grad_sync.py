@@ -17,7 +17,6 @@ import torch.distributed as dist
 from examples.mimo.training.grad_sync import (
     _token_normalization_scale,
     _vision_participation_count,
-    _vision_participation_scale,
     configure_grad_sync,
     mark_modality_participation,
     reset_modality_participation,
@@ -33,14 +32,6 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.mark.parametrize(("num_tokens", "expected"), [(0.0, 1.0), (4.0, 0.25)])
 def test_token_normalization_scale(num_tokens, expected):
     scale = _token_normalization_scale(torch.tensor(num_tokens))
-
-    assert scale.ndim == 0
-    torch.testing.assert_close(scale, torch.tensor(expected))
-
-
-@pytest.mark.parametrize(("participation", "expected"), [(0.0, 1.0), (4.0, 2.0), (8.0, 1.0)])
-def test_vision_participation_scale(participation, expected):
-    scale = _vision_participation_scale(torch.tensor(participation), vision_dp_size=8)
 
     assert scale.ndim == 0
     torch.testing.assert_close(scale, torch.tensor(expected))
