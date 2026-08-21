@@ -621,9 +621,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         gate_grad = self.scaled_orthogonalize_fn(gate_grad, tp_group, partition_dim)
         up_grad = self.scaled_orthogonalize_fn(up_grad, tp_group, partition_dim)
         orthogonalized_grad = torch.cat((gate_grad, up_grad), dim=0)
-        orthogonalized_grad = self._interleave_glu_grad(
-            orthogonalized_grad, interleave_size
-        )
+        orthogonalized_grad = self._interleave_glu_grad(orthogonalized_grad, interleave_size)
         return self._restore_local_glu_grad(orthogonalized_grad, restore_info)
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
