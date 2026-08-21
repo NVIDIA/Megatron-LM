@@ -88,6 +88,65 @@ def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
     assert config.moe_single_grouped_weight is False
 
 
+def test_replica_hybridep_allows_native_mxfp8_and_router_padding():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="replica_hybridep",
+        moe_grouped_gemm=True,
+        moe_router_dtype="fp32",
+        moe_router_padding_for_quantization=True,
+        use_transformer_engine_op_fuser=True,
+        gradient_accumulation_fusion=True,
+        add_bias_linear=False,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+    )
+
+    assert config.fp8 == "e4m3"
+    assert config.fp8_recipe == "mxfp8"
+    assert config.fp8_param
+    assert config.moe_router_padding_for_quantization
+
+
+@pytest.mark.parametrize(
+    ("fp8", "fp8_recipe", "fp8_param"),
+    [("e4m3", "mxfp8", False), ("e4m3", "tensorwise", True), ("hybrid", "mxfp8", True)],
+)
+def test_replica_hybridep_rejects_unsupported_fp8_parameter_storage(fp8, fp8_recipe, fp8_param):
+    with pytest.raises(ValueError, match="MXFP8 E4M3 with native FP8 parameters"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            expert_model_parallel_size=2,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="replica_hybridep",
+            moe_grouped_gemm=True,
+            moe_router_dtype="fp32",
+            use_transformer_engine_op_fuser=True,
+            gradient_accumulation_fusion=True,
+            add_bias_linear=False,
+            activation_func=F.silu,
+            gated_linear_unit=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8=fp8,
+            fp8_recipe=fp8_recipe,
+            fp8_param=fp8_param,
+        )
+
+
 @pytest.mark.parametrize("num_householder", [0, -1])
 def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
     with pytest.raises(ValueError, match="gdp_num_householder must be positive"):
