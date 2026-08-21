@@ -32,6 +32,7 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
+    ensure_params_ready,
     get_attr_wrapped_model,
     get_torch_version,
     is_te_min_version,
@@ -97,7 +98,57 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_CUDA_GRAPH_STREAM_POOL_SIZE = 3
+_CUDA_GRAPH_STREAM_POOLS = None
+_CUDA_GRAPH_STREAM_NEXT_SLOT = 0
 logger = logging.getLogger(__name__)
+
+
+def _get_cuda_graph_stream() -> torch.cuda.Stream:
+    """Assign local CUDA-graph runners across a bounded set of distinct streams.
+
+    PyTorch obtains streams from a bounded pool, so repeatedly constructing
+    ``torch.cuda.Stream`` objects can eventually return the same underlying CUDA stream.
+    Assigning capture and replay streams explicitly makes that sharing intentional.
+
+    ``CUDA_DEVICE_MAX_CONNECTIONS`` controls how CUDA maps logical streams to hardware work
+    queues. It does not make PyTorch stream handles unique and cannot prevent stream aliasing.
+    """
+    global _CUDA_GRAPH_STREAM_POOLS, _CUDA_GRAPH_STREAM_NEXT_SLOT
+
+    pool = _CUDA_GRAPH_STREAM_POOLS
+    if pool is None:
+        # CUDA recommends at least as many connections as independently active streams. GTP can
+        # concurrently use graph, GTP/EGTP AG and RS, EP, DDP, and activation-offload streams, so
+        # CUDA's default of eight connections can introduce false dependencies between them.
+        max_connections = os.getenv("CUDA_DEVICE_MAX_CONNECTIONS")
+        warning_reason = None
+        if max_connections is None:
+            warning_reason = "is unset (CUDA defaults to 8)"
+        else:
+            try:
+                max_connections_value = int(max_connections)
+            except ValueError:
+                warning_reason = f"must be an integer from 1 to 32, but is {max_connections!r}"
+            else:
+                if max_connections_value < 16:
+                    warning_reason = f"is {max_connections_value}"
+
+        if warning_reason is not None and GTP_CONFIG.is_active():
+            logger.warning(
+                "CUDA_DEVICE_MAX_CONNECTIONS %s. For GTP workloads, consider setting it to "
+                "16 or 32 before process startup to avoid implicit stream aliasing.",
+                warning_reason,
+            )
+
+        pool = tuple(torch.cuda.Stream() for _ in range(_CUDA_GRAPH_STREAM_POOL_SIZE))
+        if len({stream.cuda_stream for stream in pool}) != len(pool):
+            raise RuntimeError("CUDA graph stream pool contains aliased streams")
+        _CUDA_GRAPH_STREAM_POOLS = pool
+
+    slot = _CUDA_GRAPH_STREAM_NEXT_SLOT
+    _CUDA_GRAPH_STREAM_NEXT_SLOT = (slot + 1) % len(pool)
+    return pool[slot]
 
 
 def _get_tensor_alias_chain(tensor):
@@ -338,6 +389,7 @@ def _check_supported_type(meta):
 
     _SUPPORTED_TYPES = {
         torch.Tensor,
+        torch.distributed.ProcessGroup,
         type(None),
         bool,
         int,
@@ -709,6 +761,7 @@ def delete_cuda_graphs():
         runner.fwd_graph = None
         runner.bwd_graph = None
         runner.mempool = None
+        runner._gtp_fwd_params_to_ensure_ready = ()
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -947,6 +1000,8 @@ class _CudaGraphRunner(torch.nn.Module):
         # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
         # reader before launching the graph.
         self._gtp_wgrad_ring_slots = []
+        # GTP weights read by this forward graph before their owning module pre-hooks execute.
+        self._gtp_fwd_params_to_ensure_ready = ()
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -980,7 +1035,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.num_warmup_steps = max(self.num_warmup_steps, 2)
 
                 self.use_stream = True
-                self.stream = torch.cuda.Stream()
+                self.stream = _get_cuda_graph_stream()
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 # Register (chain, group) side streams before the first forward.
@@ -1334,8 +1389,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
-                with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                capture_comm_context = (
+                    track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+                )
+                with (
+                    capture_comm_context as capture_comms,
+                    torch.cuda.graph(
+                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    ),
                 ):
 
                     self._sync_against_side_streams(self.fwd_side_streams)
@@ -1353,6 +1414,11 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.use_stream:
                         self.fwd_completion_event.record()
+
+                if self.gtp_remat:
+                    self._gtp_fwd_params_to_ensure_ready = tuple(
+                        capture_comms.params_to_ensure_ready
+                    )
 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -1663,6 +1729,9 @@ class _CudaGraphRunner(torch.nn.Module):
         if mismatch_errors:
             error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
             raise AssertionError(error_msg)
+
+        if self._gtp_fwd_params_to_ensure_ready:
+            ensure_params_ready(self._gtp_fwd_params_to_ensure_ready)
 
         inp_tensors = self.get_tensors(args, kwargs, check_types=False)
         if self.grad_enabled:

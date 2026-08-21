@@ -15,7 +15,6 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
-from collections.abc import Callable
 from typing import Literal, cast
 from weakref import ref
 
@@ -44,30 +43,43 @@ class FsdpContext:
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
     use_symmetric_memory: bool
+    unify_communication_stream: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
 
-    def __init__(self, device: torch.device, use_symmetric_memory: bool = False) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        use_symmetric_memory: bool = False,
+        unify_communication_stream: bool = False,
+    ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: Device on which this context schedules communication.
             use_symmetric_memory: Whether modules constructed in this context allocate
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
+            unify_communication_stream: Whether all-gathers and reduce-scatters share one
+                communication stream to reduce peak transient memory.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
+        self.unify_communication_stream = unify_communication_stream
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
-        with torch.cuda.device(device):
-            self.allgather_stream = torch.cuda.Stream()
-            self.reduce_scatter_stream = torch.cuda.Stream()
+        self.allgather_stream = torch.cuda.Stream(device)
+        if unify_communication_stream:
+            # A unified stream lets an all-gather reuse the storage released by a
+            # preceding reduce-scatter.
+            self.reduce_scatter_stream = self.allgather_stream
+        else:
+            self.reduce_scatter_stream = torch.cuda.Stream(device)
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
@@ -182,6 +194,7 @@ class FsdpModule:
                 mesh=mesh,
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
+                allgather_stream=context.allgather_stream,
                 reduce_scatter_stream=context.reduce_scatter_stream,
                 grad_divisor=grad_divisor,
                 use_symmetric_memory=use_symmetric_memory,
@@ -233,6 +246,7 @@ class FsdpModule:
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
+        module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.
         module.register_forward_pre_hook(
@@ -256,16 +270,9 @@ class FsdpModule:
         # based: once every owned Parameter has accumulated its grad, this
         # FsdpModule can reduce and reshard. Module full-backward hooks can fire
         # before that when module inputs do not require grad.
-        for group in self._parameter_groups:
-            if not group.requires_grad:
-                continue
-            for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
-
-    def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         module_ref = ref(self)
 
-        def grad_hook(_parameter: nn.Parameter) -> None:
+        def grad_hook(_: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
                 return
@@ -273,7 +280,31 @@ class FsdpModule:
             if module._num_ready_grad_parameters == module._num_trainable_parameters:
                 module.post_backward()
 
-        return grad_hook
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            for fsdp_parameter in group.fsdp_parameters:
+                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+
+    @staticmethod
+    def _pre_load_state_dict(
+        _module: nn.Module,
+        _state_dict: dict[str, object],
+        _prefix: str,
+        local_metadata: dict[str, object],
+        _strict: bool,
+        _missing_keys: list[str],
+        _unexpected_keys: list[str],
+        _error_msgs: list[str],
+    ) -> None:
+        """Reject state-dict loads that replace parameters managed by FSDP."""
+        # PyTorch propagates load_state_dict(assign=True) to pre-hooks through
+        # this internal metadata key before replacing parameters and buffers.
+        if local_metadata.get("assign_to_params_buffers", False):
+            raise RuntimeError(
+                "load_state_dict(assign=True) is not supported after fully_shard(). "
+                "Load before fully_shard() or use an in-place load path with assign=False."
+            )
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
@@ -386,8 +417,8 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        self._reduce_gradient_groups()
         self._reshard_parameter_groups()
+        self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 

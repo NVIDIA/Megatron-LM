@@ -13,6 +13,7 @@ from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
@@ -96,6 +97,7 @@ class MimoModel(MegatronModule):
         # Initialize modality submodules from specifications
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
+        self._finish_init_quantization()
         self._initialize_language_model()
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
@@ -236,6 +238,13 @@ class MimoModel(MegatronModule):
             )
 
             self.modality_submodules[modality_name] = submodule
+
+    def _finish_init_quantization(self) -> None:
+        """Apply per-module quantization recipes to initialized modality submodules."""
+        for name, module in self.modality_submodules.named_modules(prefix="modality_submodules"):
+            if hasattr(module, 'finish_init'):
+                quant_config = get_quant_config_or_none(name, module.config.quant_recipe)
+                module.finish_init(quant_config)
 
     def _initialize_language_model(self) -> None:
         """Initialize the language model.
@@ -549,6 +558,8 @@ class MimoModel(MegatronModule):
             language_grid = grid_map[MIMO_LANGUAGE_MODULE_KEY]
             encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
             language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
+            if "gtp_remat" in language_grid.dim_names:
+                language_dp *= language_grid.shape[language_grid.dim_names.index("gtp_remat")]
             assert encoder_dp <= language_dp, (
                 f"Bridge fan-out split metadata with non-uniform per-sample sizes "
                 f"requires encoder DP <= LM DP (got encoder='{encoder_name}' "

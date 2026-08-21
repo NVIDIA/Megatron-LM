@@ -40,6 +40,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     allocate_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
+    register_capture_params_to_ensure_ready,
     register_capture_wgrad_ring_slot,
 )
 from megatron.core.utils import ensure_params_ready, log_single_rank
@@ -1297,6 +1298,7 @@ class GTPShardedParam(torch.nn.Parameter):
         #    Forward only: backward re-reads what forward published, and recompute runs inside
         #    backward where a dispatch could gather into the grad-aliased buffer.
         if fwd and not in_activation_recompute_phase():
+            register_capture_params_to_ensure_ready(weights)
             ensure_params_ready(weights)
 
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
@@ -1765,15 +1767,19 @@ class GTPShardedParam(torch.nn.Parameter):
     def _handle_megatron_grad_accum(param):
         """Handle megatron DDP and gradient-accumulation fusion.
 
-        Do NOT set param.grad before calling the hook — the hook checks param.grad and would
-        accumulate it into main_grad if zero_out_wgrad is True, corrupting it with a dummy.
-
         Returns a cached dummy wgrad; sync callers use it as the graph-safe grad, async drains
-        discard it.
+        discard it. It is zeroed when DDP will accumulate it — see below.
         """
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = True
-        dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
+        # This dummy becomes param.grad, and DDP accumulates it when zero_out_wgrad is set
+        # (DistributedDataParallel._make_backward_post_hook in distributed_data_parallel.py).
+        # get_dummy_wgrad returns a SHARED reused buffer, so it must be zeroed in that case
+        # or it injects whatever it last held into the gradient. Same pairing as layers.py.
+        if getattr(param, "zero_out_wgrad", False):
+            dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype, zero=True)
+        else:
+            dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
         if getattr(param, "_grad_accum_hook", None) is not None:
             param._grad_accum_hook()
 

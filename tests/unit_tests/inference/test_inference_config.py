@@ -5,14 +5,64 @@ from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    MambaInferenceStateConfig,
+)
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize(
+        ("grouped_gemm_backend", "expected_backend"),
+        [
+            ("torch", "triton"),
+            (InferenceGroupedGemmBackend.TORCH, "triton"),
+            ("flashinfer", "flashinfer"),
+            (InferenceGroupedGemmBackend.FLASHINFER, "flashinfer"),
+        ],
+    )
+    def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
+        assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
+
+    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+        with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
+            resolve_mxfp8_backend(grouped_gemm_backend)
+
+    @staticmethod
+    def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                params_dtype=torch.bfloat16,
+                batch_invariant_mode=False,
+                experimental_attention_variant=experimental_attention_variant,
+            ),
+            decoder=SimpleNamespace(layer_type_list=layer_type_list, layers=[]),
+        )
+
+    def test_mamba_inference_state_config_rejects_mixed_recurrent_layers(self):
+        """Mamba and GDN cannot share one state shape and prefill chunk size."""
+        model = self._hybrid_model([Symbols.MAMBA, Symbols.GDN])
+
+        with pytest.raises(ValueError, match="mixing Mamba and GDN"):
+            MambaInferenceStateConfig.from_model(model)
+
+    def test_mamba_inference_state_config_rejects_gdn2(self):
+        """GDN2 should fail explicitly instead of missing the GDN inference hooks."""
+        model = self._hybrid_model([Symbols.GDN], experimental_attention_variant="gdn2")
+
+        with pytest.raises(NotImplementedError, match="GDN2"):
+            MambaInferenceStateConfig.from_model(model)
+
     def test_mutual_exclusivity_with_transformer_config(self):
         """
         Ensure mutual exclusivity between fields in `InferenceConfig` and

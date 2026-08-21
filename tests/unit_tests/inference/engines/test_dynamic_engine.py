@@ -16,6 +16,7 @@ from unittest import mock
 import msgpack
 import pytest
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
@@ -58,6 +59,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -214,6 +216,7 @@ class DynamicInferenceEngineTestBase:
         assert env.engine.cuda_graph_impl == "full_iteration"
         assert env.engine.inference_cuda_graph_scope == InferenceCudaGraphScope.none
         assert env.engine.capture_stats is None
+        assert not hasattr(model, 'cudagraph_manager')
         assert not hasattr(model.decoder, 'cudagraph_manager')
         for layer in model.decoder.layers:
             assert not hasattr(layer, 'cudagraph_manager')
@@ -432,7 +435,8 @@ class DynamicInferenceEngineTestBase:
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=test_config.position_embedding_type,
             ).cuda()
-        elif test_config.model_provider == "hybrid":
+        elif test_config.model_provider in ("hybrid", "gdn"):
+            is_gdn = test_config.model_provider == "gdn"
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
@@ -444,6 +448,11 @@ class DynamicInferenceEngineTestBase:
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 mamba_num_heads=16,
                 num_attention_heads=16,
+                linear_conv_kernel_dim=4,
+                linear_key_head_dim=32,
+                linear_value_head_dim=64,
+                linear_num_key_heads=4,
+                linear_num_value_heads=8,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
@@ -475,9 +484,11 @@ class DynamicInferenceEngineTestBase:
                 ),
                 normalization=(
                     "RMSNorm"
-                    if test_config.transformer_impl == "inference_optimized"
+                    if is_gdn or test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
                 ),
+                layernorm_zero_centered_gamma=is_gdn,
+                activation_func=F.silu if is_gdn else F.gelu,
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
@@ -485,10 +496,11 @@ class DynamicInferenceEngineTestBase:
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = "/M" * test_config.num_speculative_tokens
+            recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
-                mamba_pattern = "M*-" + mtp_suffix
+                mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
             else:
-                mamba_pattern = "M*-|M*-" + mtp_suffix
+                mamba_pattern = recurrent_symbol + "*-|" + recurrent_symbol + "*-" + mtp_suffix
             model = HybridModel(
                 config=transformer_config,
                 hybrid_stack_spec=hybrid_stack_spec,
@@ -858,11 +870,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
             if inference_cuda_graph_scope == InferenceCudaGraphScope.block:
-                # hybrid models attach cudagraph_manager to the model; others attach to the decoder
-                if model_provider == "hybrid":
-                    assert model.cudagraph_manager.cudagraph_runners
-                else:
-                    assert model.decoder.cudagraph_manager.cudagraph_runners
+                # GPT and hybrid models both own the block-scope graph at model level;
+                # GPT removes the decoder's fallback manager at construction.
+                assert model.cudagraph_manager.cudagraph_runners
+                assert not hasattr(model.decoder, 'cudagraph_manager')
             else:
                 # check if cudagraph runners are created at the layer level
                 for layer in model.decoder.layers:
@@ -972,7 +983,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         model = env.engine.controller.inference_wrapped_model.model
         assert model.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         assert model.config.cuda_graph_modules == []
-        assert model.decoder.cudagraph_manager.cudagraph_runners
+        assert model.cudagraph_manager.cudagraph_runners
+        assert not hasattr(model.decoder, 'cudagraph_manager')
         for layer in model.decoder.layers:
             assert not hasattr(layer, 'cudagraph_manager')
 
@@ -5738,6 +5750,75 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert env.engine.context.total_request_count == 0
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
+    """Exercise GDN through the production scheduler and local CUDA graphs."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _generated_tokens(env):
+        return [list(request.generated_tokens) for request in env.requests]
+
+    def test_cuda_graph_parity(self):
+        common = dict(
+            model_provider="gdn",
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            top_k=1,
+            context_max_requests=32,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        eager = self._run_test(**common, num_cuda_graphs=None)
+        graphed = self._run_test(
+            **common,
+            num_cuda_graphs=3,
+            force_build_cuda_graphs=True,
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+        )
+
+        model = graphed.engine.controller.inference_wrapped_model.model
+        assert model.cudagraph_manager.cudagraph_runners
+        assert self._generated_tokens(graphed) == self._generated_tokens(eager)
+
+    def test_scheduling_invariance(self):
+        """Staggered admission must not change per-request greedy output."""
+        common = dict(
+            model_provider="gdn",
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=8,
+            top_k=1,
+            context_max_requests=32,
+            num_cuda_graphs=None,
+        )
+        dense = self._run_test(**common, num_gap_steps=0)
+        staggered = self._run_test(**common, num_gap_steps=3)
+
+        assert self._generated_tokens(staggered) == self._generated_tokens(dense)
+
+
 class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     """Tests that require non-default parallel configs (tp>1, pp>1, or ep>1).
 
@@ -5760,6 +5841,51 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             expert_tensor_parallel_size=1,
         )
         return super()._build_test_env(test_config)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_gdn_tensor_parallel(self):
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("GDN TP=2 inference requires at least two GPUs.")
+        env = self._run_test(
+            model_provider="gdn",
+            tensor_model_parallel_size=2,
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            top_k=1,
+            context_max_requests=16,
+        )
+        assert all(request.status == Status.COMPLETED for request in env.requests)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_gdn_pipeline_parallel(self):
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("GDN PP=2 inference requires at least two GPUs.")
+        env = self._run_test(
+            model_provider="gdn",
+            pipeline_model_parallel_size=2,
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            top_k=1,
+            context_max_requests=16,
+        )
+        assert all(request.status == Status.COMPLETED for request in env.requests)
+        assert all(len(request.generated_tokens) == 4 for request in env.requests)
 
     @pytest.mark.internal
     @pytest.mark.skipif(

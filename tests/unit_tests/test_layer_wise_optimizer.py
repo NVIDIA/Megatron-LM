@@ -59,6 +59,19 @@ class TinyModel(nn.Module):
         return self.fc1(x)
 
 
+class MuonExcludedMatrixModel(nn.Module):
+    """Model with a 2D matrix explicitly routed to the scalar optimizer."""
+
+    def __init__(self):
+        super().__init__()
+        self.scalar = nn.Linear(10, 8)
+        self.muon = nn.Linear(8, 5)
+        self.scalar.weight.use_muon = False
+
+    def forward(self, x):
+        return self.muon(F.relu(self.scalar(x)))
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
@@ -298,6 +311,27 @@ class TestLayerWiseOptimizer:
                         raise AssertionError(
                             f"Parameter {name} differs between rank 0 and rank {i}. {str(e)}"
                         ) from None
+
+    def test_explicit_muon_exclusion_updates_with_param_layout(self):
+        """An excluded 2D matrix is updated and synchronized by the scalar DistOpt."""
+        model, optimizer, pg_collection = self.create_model_and_optimizer(
+            model_class=MuonExcludedMatrixModel, use_param_layout=True
+        )
+        excluded_weight = model.module.scalar.weight
+        initial_weight = excluded_weight.detach().clone()
+
+        output = model(torch.randn(16, 10, dtype=torch.bfloat16, device='cuda'))
+        output.sum().backward()
+        update_successful, _, _ = optimizer.step()
+
+        assert update_successful
+        assert not torch.equal(excluded_weight, initial_weight)
+
+        dp_size = get_pg_size(pg_collection.dp_cp)
+        gathered = [torch.empty_like(excluded_weight) for _ in range(dp_size)]
+        torch.distributed.all_gather(gathered, excluded_weight, group=pg_collection.dp_cp)
+        for replica in gathered[1:]:
+            torch.testing.assert_close(gathered[0], replica, rtol=0, atol=0)
 
     def test_get_grad_norm(self):
         """Test LayerWiseDistributedOptimizer gradient norm computation."""

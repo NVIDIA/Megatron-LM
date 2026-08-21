@@ -10,6 +10,7 @@ import torch
 
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -2766,6 +2767,158 @@ class TestMultiTokenPredictionHybrid:
             'position_ids': position_ids,
         }
         return batch
+
+    @staticmethod
+    def _make_forward_stub():
+        hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
+        call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
+
+        def decoder(**kwargs):
+            decoder_hidden_states = kwargs["hidden_states"]
+            return (
+                decoder_hidden_states.unwrap()
+                if hasattr(decoder_hidden_states, "unwrap")
+                else decoder_hidden_states
+            )
+
+        def mtp(**kwargs):
+            call_counts["mtp"] += 1
+            decoder_hidden_states = kwargs["hidden_states"]
+            return torch.cat((decoder_hidden_states, decoder_hidden_states + 100.0), dim=0)
+
+        def output_layer(output, **kwargs):
+            return output, None
+
+        def compute_language_model_loss(labels, logits):
+            call_counts["main_loss"] += 1
+            return labels.to(dtype=logits.dtype) + 1000.0
+
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                fine_grained_activation_offloading=False,
+                moe_paged_stash=False,
+                multi_latent_attention=False,
+                mtp_num_layers=1,
+                use_mup=False,
+                inference_cuda_graph_scope=None,
+            ),
+            pre_process=False,
+            post_process=True,
+            position_embedding_type='none',
+            decoder=decoder,
+            share_embeddings_and_output_weights=False,
+            mtp_process=True,
+            embedding=None,
+            mtp=mtp,
+            output_layer=output_layer,
+            training=True,
+            compute_language_model_loss=compute_language_model_loss,
+            pg_collection=types.SimpleNamespace(cp=None),
+            tp_group=None,
+            _scale_logits=lambda logits: logits,
+        )
+        return model, hidden_states, call_counts
+
+    @pytest.mark.parametrize(
+        (
+            "compute_mtp_loss",
+            "provide_labels",
+            "expected_mtp_calls",
+            "expected_mtp_loss_calls",
+            "expected_main_loss_calls",
+        ),
+        [
+            pytest.param(True, True, 1, 1, 1, id="enabled-labels-return-loss"),
+            pytest.param(True, False, 1, 1, 0, id="enabled-rl-label-derivation"),
+            pytest.param(False, True, 0, 0, 1, id="skip-mtp-labels-return-loss"),
+            pytest.param(False, False, 0, 0, 0, id="skip-mtp-no-labels-return-logits"),
+        ],
+    )
+    def test_forward_compute_mtp_loss_contract(
+        self,
+        monkeypatch,
+        compute_mtp_loss,
+        provide_labels,
+        expected_mtp_calls,
+        expected_mtp_loss_calls,
+        expected_main_loss_calls,
+    ):
+        """Test that MTP execution and the main output contract are independent."""
+        model, hidden_states, call_counts = self._make_forward_stub()
+        labels = torch.tensor([[3, 4]]) if provide_labels else None
+        input_ids = torch.zeros(1, 2, dtype=torch.long)
+        loss_mask = torch.ones(1, 2)
+
+        def process_mtp_loss_spy(**kwargs):
+            call_counts["mtp_loss"] += 1
+            assert kwargs["labels"] is labels
+            assert kwargs["input_ids"] is input_ids
+            assert kwargs["loss_mask"] is loss_mask
+            return torch.chunk(kwargs["hidden_states"], 1 + kwargs["config"].mtp_num_layers, dim=0)[
+                0
+            ]
+
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_model.process_mtp_loss", process_mtp_loss_spy
+        )
+
+        output = HybridModel.forward(
+            model,
+            input_ids=input_ids,
+            position_ids=torch.arange(2).unsqueeze(0),
+            attention_mask=None,
+            decoder_input=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            compute_mtp_loss=compute_mtp_loss,
+        )
+
+        assert call_counts == {
+            "mtp": expected_mtp_calls,
+            "mtp_loss": expected_mtp_loss_calls,
+            "main_loss": expected_main_loss_calls,
+        }
+        if provide_labels:
+            torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)
+        else:
+            torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
+
+    @pytest.mark.parametrize("compute_mtp_loss", [True, False])
+    def test_compute_mtp_loss_does_not_control_speculative_decoding(
+        self, monkeypatch, compute_mtp_loss
+    ):
+        """Test the auxiliary MTP switch does not disable speculative-decoding state capture."""
+        model, hidden_states, call_counts = self._make_forward_stub()
+        inference_context = types.SimpleNamespace(
+            is_dynamic_batching=lambda: True,
+            num_speculative_tokens=1,
+            mtp_decoder_hidden_states=None,
+            config=types.SimpleNamespace(materialize_only_last_token_logits=False),
+        )
+
+        def unexpected_process_mtp_loss(**kwargs):
+            call_counts["mtp_loss"] += 1
+            raise AssertionError("MTP loss processing must not run during speculative decoding")
+
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_model.process_mtp_loss", unexpected_process_mtp_loss
+        )
+
+        with InferenceMode.active():
+            output = HybridModel.forward(
+                model,
+                input_ids=torch.zeros(1, 2, dtype=torch.long),
+                position_ids=torch.arange(2).unsqueeze(0),
+                attention_mask=None,
+                decoder_input=hidden_states,
+                inference_context=inference_context,
+                runtime_gather_output=True,
+                compute_mtp_loss=compute_mtp_loss,
+            )
+
+        torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
+        torch.testing.assert_close(inference_context.mtp_decoder_hidden_states, hidden_states)
+        assert call_counts == {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1)])
