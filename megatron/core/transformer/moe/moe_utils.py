@@ -1501,6 +1501,7 @@ def skip_routed_expert_padding(config: TransformerConfig) -> bool:
         return True
     if config.moe_token_dispatcher_type == "flex" and config.moe_flex_dispatcher_backend in (
         "hybridep",
+        "replica_hybridep",
         "ncclep",
     ):
         return True

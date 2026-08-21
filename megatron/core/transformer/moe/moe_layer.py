@@ -348,6 +348,7 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        self.token_dispatcher.set_experts(self.experts)
 
         # Initialize shared experts
         if self.use_shared_expert:

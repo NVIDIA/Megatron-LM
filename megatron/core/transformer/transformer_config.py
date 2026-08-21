@@ -9,6 +9,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -898,11 +899,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal[
+        'deepep', 'hybridep', 'replica_hybridep', 'ncclep'
+    ] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
-    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
-    transformer_engine.pytorch.ep API."""
+    Options are "deepep", "hybridep", "replica_hybridep", and "ncclep". The replica backend
+    uses deterministic route placement and asynchronous runtime weight replication on top of
+    HybridEP."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1010,6 +1013,9 @@ class TransformerConfig(ModelParallelConfig):
     expert-output gradient comes back as a per-expert MXFP8 GroupedTensor that the grouped
     GEMM backward consumes directly. Same requirements as moe_dispatch_fwd_dtype. Defaults to
     'bf16' (no quantization on the wire)."""
+
+    moe_ncclep_static_shape: bool = False
+    """Use fixed NCCL-EP dispatch and receive shapes. Retained for launcher compatibility."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -1763,10 +1769,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
 
-        if self.moe_flex_dispatcher_backend == "ncclep":
+        if self.moe_flex_dispatcher_backend in ("ncclep", "replica_hybridep"):
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError(
-                    "moe_flex_dispatcher_backend='ncclep' requires "
+                    f"moe_flex_dispatcher_backend='{self.moe_flex_dispatcher_backend}' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
             if self.moe_use_grouped_tensor and not self.use_transformer_engine_op_fuser:
@@ -1790,6 +1796,76 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
                     "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                )
+
+        if self.moe_flex_dispatcher_backend == "replica_hybridep":
+            replica_errors = []
+            if not self.bf16 or self.params_dtype != torch.bfloat16:
+                replica_errors.append("BF16 execution and BF16 parameters")
+            if self.fp8 or self.fp4:
+                replica_errors.append("FP8 and FP4 disabled")
+            if self.add_bias_linear:
+                replica_errors.append("add_bias_linear=False")
+            if not self.moe_grouped_gemm:
+                replica_errors.append("moe_grouped_gemm=True")
+            if not self.moe_single_grouped_weight:
+                replica_errors.append("moe_single_grouped_weight=True")
+            if self.moe_single_grouped_bias:
+                replica_errors.append("moe_single_grouped_bias=False")
+            if not self.use_transformer_engine_op_fuser:
+                replica_errors.append("use_transformer_engine_op_fuser=True")
+            if not self.gradient_accumulation_fusion:
+                replica_errors.append("gradient_accumulation_fusion=True")
+            if self.moe_router_dtype != "fp32":
+                replica_errors.append("moe_router_dtype='fp32'")
+            if self.expert_tensor_parallel_size != 1:
+                replica_errors.append("expert_tensor_parallel_size=1")
+            if self.moe_router_topk > 32:
+                replica_errors.append("moe_router_topk<=32")
+            supported_glu = self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu)
+            supported_squared_relu = (
+                not self.gated_linear_unit
+                and self.activation_func == squared_relu
+                and self.use_fused_weighted_squared_relu
+            )
+            if not (supported_glu or supported_squared_relu):
+                replica_errors.append(
+                    "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation"
+                )
+            if self.delay_wgrad_compute:
+                replica_errors.append("delay_wgrad_compute=False")
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                replica_errors.append("overlap_dispatch_backward_with_experts_wgrad=False")
+            if self.overlap_moe_expert_parallel_comm:
+                replica_errors.append("overlap_moe_expert_parallel_comm=False")
+            if self.moe_shared_expert_overlap:
+                replica_errors.append("moe_shared_expert_overlap=False")
+            expert_input_size = self.moe_latent_size or self.hidden_size
+            if expert_input_size % 128 != 0:
+                replica_errors.append("moe_latent_size (or hidden_size) divisible by 128")
+            if self.moe_ffn_hidden_size % 128 != 0:
+                replica_errors.append("moe_ffn_hidden_size divisible by 128")
+            if self.moe_expert_capacity_factor is not None:
+                replica_errors.append("moe_expert_capacity_factor=None")
+            if self.moe_expert_rank_capacity_factor is None:
+                replica_errors.append("moe_expert_rank_capacity_factor set")
+            elif self.moe_expert_rank_capacity_factor < 1.0:
+                replica_errors.append("moe_expert_rank_capacity_factor>=1.0")
+            if self.moe_hybridep_pad_uneven_dispatch_inputs:
+                replica_errors.append("moe_hybridep_pad_uneven_dispatch_inputs=False")
+            if self.moe_pad_expert_input_to_capacity:
+                replica_errors.append("moe_pad_expert_input_to_capacity=False")
+            if self.moe_router_padding_for_quantization:
+                replica_errors.append("moe_router_padding_for_quantization=False")
+            if self.moe_token_dropping:
+                replica_errors.append("moe_token_dropping=False")
+            if self.moe_apply_probs_on_input:
+                replica_errors.append("moe_apply_probs_on_input=False")
+            if replica_errors:
+                raise ValueError(
+                    "Replica-HybridEP flex dispatcher configuration is unsupported; require "
+                    + ", ".join(replica_errors)
+                    + "."
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
@@ -1869,13 +1945,17 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):
+            if self.moe_flex_dispatcher_backend not in (
+                "hybridep",
+                "replica_hybridep",
+                "ncclep",
+            ):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
                     "'hybridep' or 'ncclep'."
                 )
             if (
-                self.moe_flex_dispatcher_backend == "hybridep"
+                self.moe_flex_dispatcher_backend in ("hybridep", "replica_hybridep")
                 and not self.use_transformer_engine_op_fuser
                 and not self.moe_use_grouped_tensor
             ):
