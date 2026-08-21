@@ -49,6 +49,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "attention_softmax_in_fp32": False,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
+    "batch_invariant_backend": "te_native",
     "batch_invariant_mode": False,
     "batch_p2p_comm": True,
     "batch_p2p_sync": True,
