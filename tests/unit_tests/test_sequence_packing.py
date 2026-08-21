@@ -17,7 +17,10 @@ from megatron.core.datasets.data_schedule import (
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
-from megatron.core.datasets.data_schedule_utils import next_hdp_group_packing_aware
+from megatron.core.datasets.data_schedule_utils import (
+    next_hdp_group_packing_aware,
+    reroute_samples_to_dcp_ranks,
+)
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -77,6 +80,228 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
+    class _Group:
+        def __init__(self, size, rank):
+            self._size = size
+            self._rank = rank
+
+        def size(self):
+            return self._size
+
+        def rank(self):
+            return self._rank
+
+    dp_group = _Group(size=2, rank=0)
+    dp_cp_group = _Group(size=2, rank=0)
+    batch = [
+        {
+            'tokens': torch.tensor([10, 11]),
+            'labels': torch.tensor([110, 111]),
+            'loss_mask': torch.tensor([1.0, 0.0]),
+            'position_ids': torch.tensor([0, 1]),
+            'original_seq_len': torch.tensor([2], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([2], dtype=torch.int32),
+        },
+        {
+            'tokens': torch.tensor([20]),
+            'labels': torch.tensor([120]),
+            'loss_mask': torch.tensor([1.0]),
+            'position_ids': torch.tensor([0]),
+            'original_seq_len': torch.tensor([1], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([1], dtype=torch.int32),
+        },
+    ]
+    remote_inputs = iter(
+        [
+            torch.tensor([30, 31, 32, 33]),
+            torch.tensor([130, 131, 132, 133]),
+            torch.tensor([1.0, 1.0, 0.0, 0.0]),
+            torch.tensor([0, 1, 2, 3]),
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([4, 0], dtype=torch.int32),
+        ]
+    )
+    gather_groups = []
+
+    def _all_gather_into_tensor(output, input_, group):
+        gather_groups.append(group)
+        remote = next(remote_inputs)
+        assert input_.numel() == remote.numel(), (
+            f'gather input {input_.numel()} must be padded to the common rank width '
+            f'{remote.numel()}'
+        )
+        assert output.numel() == dp_group.size() * input_.numel()
+        output.copy_(torch.cat([input_, remote]))
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
+    monkeypatch.setattr(
+        torch.distributed,
+        'all_to_all_single',
+        lambda *args, **kwargs: pytest.fail('reroute must not use all_to_all_single'),
+    )
+
+    received = reroute_samples_to_dcp_ranks(
+        batch=batch,
+        global_ids_this_rank=torch.tensor([0, 1]),
+        global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+        sample_id_groups=[[[2], [0, 1]]],
+        offsets=torch.tensor([0, 2, 3]),
+        dp_group=dp_group,
+        dp_cp_group=dp_cp_group,
+    )
+
+    assert list(received) == [2]
+    assert torch.equal(received[2]['tokens'], torch.tensor([30, 31, 32, 33]))
+    assert torch.equal(received[2]['labels'], torch.tensor([130, 131, 132, 133]))
+    assert torch.equal(received[2]['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 0.0]))
+    assert torch.equal(received[2]['position_ids'], torch.tensor([0, 1, 2, 3]))
+    assert torch.equal(received[2]['original_seq_len'], torch.tensor([4], dtype=torch.int32))
+    assert torch.equal(received[2]['padded_seq_len'], torch.tensor([4], dtype=torch.int32))
+    assert gather_groups == [dp_group] * 6
+
+
+def test_scheduler_reroute_rejects_unsupported_sample_keys():
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    batch = [
+        {
+            'tokens': torch.tensor([10]),
+            'original_seq_len': torch.tensor([1], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([1], dtype=torch.int32),
+            'custom_weights': torch.tensor([1.0]),
+        }
+    ]
+
+    with pytest.raises(AssertionError, match=r"unsupported sample keys \['custom_weights'\]"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0]),
+            global_id_seqlens=[(0, 1)],
+            sample_id_groups=[[[0]]],
+            offsets=torch.tensor([0, 1]),
+            dp_group=group,
+            dp_cp_group=group,
+        )
+
+
+def test_scheduler_reroute_rejects_inconsistent_local_sample_keys():
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    batch = [
+        {
+            'tokens': torch.tensor([10]),
+            'original_seq_len': torch.tensor([1], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([1], dtype=torch.int32),
+        },
+        {'tokens': torch.tensor([20]), 'original_seq_len': torch.tensor([1], dtype=torch.int32)},
+    ]
+
+    with pytest.raises(AssertionError, match='Sample 1 keys'):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 1), (1, 1)],
+            sample_id_groups=[[[0, 1]]],
+            offsets=torch.tensor([0, 2]),
+            dp_group=group,
+            dp_cp_group=group,
+        )
+
+
+def test_scheduler_reroute_dp_all_gather_distributed():
+    Utils.initialize_distributed()
+    world_size = torch.distributed.get_world_size()
+    if world_size < 2:
+        pytest.skip('requires at least two distributed ranks')
+
+    rank = torch.distributed.get_rank()
+    device = torch.device('cuda', torch.cuda.current_device())
+    # WORLD for both groups is the degenerate CP=1 case. This test covers the real
+    # NCCL gather path; CP-lane selection is covered by the DP=2/CP=2 test below.
+    sample_len = rank + 1
+    batch = [
+        {
+            'tokens': torch.full((sample_len,), rank, dtype=torch.int64, device=device),
+            'original_seq_len': torch.tensor([sample_len], dtype=torch.int32, device=device),
+            'padded_seq_len': torch.tensor([sample_len], dtype=torch.int32, device=device),
+        }
+    ]
+    target_gid = (rank + 1) % world_size
+    sample_id_groups = [[[(dcp_rank + 1) % world_size] for dcp_rank in range(world_size)]]
+
+    received = reroute_samples_to_dcp_ranks(
+        batch=batch,
+        global_ids_this_rank=torch.tensor([rank], dtype=torch.int32, device=device),
+        global_id_seqlens=[(gid, gid + 1) for gid in range(world_size)],
+        sample_id_groups=sample_id_groups,
+        offsets=torch.arange(world_size + 1, dtype=torch.int32),
+        dp_group=torch.distributed.group.WORLD,
+        dp_cp_group=torch.distributed.group.WORLD,
+    )
+
+    assert list(received) == [target_gid]
+    assert torch.equal(
+        received[target_gid]['tokens'],
+        torch.full((target_gid + 1,), target_gid, dtype=torch.int64, device=device),
+    )
+    assert received[target_gid]['original_seq_len'].item() == target_gid + 1
+    assert received[target_gid]['padded_seq_len'].item() == target_gid + 1
+
+
+def test_scheduler_reroute_dp_all_gather_is_dcp_compatible():
+    if Utils.world_size < 4 or Utils.world_size % 2:
+        pytest.skip('requires an even distributed world size of at least four')
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        dynamic_context_parallel=True,
+        min_dynamic_context_parallel_size=1,
+    )
+    try:
+        dp_group = parallel_state.get_data_parallel_group()
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        dp_rank = dp_group.rank()
+        dcp_rank = dp_cp_group.rank()
+        total_dcp_gpus = dp_cp_group.size()
+        device = torch.device('cuda', torch.cuda.current_device())
+
+        # CP siblings intentionally construct the same two samples for their DP rank.
+        # A CP-lane DP all-gather makes every global sample visible, after which
+        # the DCP schedule assigns one distinct sample to each DPxCP rank.
+        local_gids = [2 * dp_rank, 2 * dp_rank + 1]
+        batch = [
+            {
+                'tokens': torch.full((gid + 1,), gid, dtype=torch.int64, device=device),
+                'original_seq_len': torch.tensor([gid + 1], dtype=torch.int32, device=device),
+                'padded_seq_len': torch.tensor([gid + 1], dtype=torch.int32, device=device),
+            }
+            for gid in local_gids
+        ]
+        sample_id_groups = [[[rank] for rank in range(total_dcp_gpus)]]
+
+        received = reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor(local_gids, dtype=torch.int32, device=device),
+            global_id_seqlens=[(gid, gid + 1) for gid in range(total_dcp_gpus)],
+            sample_id_groups=sample_id_groups,
+            offsets=torch.arange(0, total_dcp_gpus + 1, 2, dtype=torch.int32),
+            dp_group=dp_group,
+            dp_cp_group=dp_cp_group,
+        )
+
+        assert list(received) == [dcp_rank]
+        assert torch.equal(
+            received[dcp_rank]['tokens'],
+            torch.full((dcp_rank + 1,), dcp_rank, dtype=torch.int64, device=device),
+        )
+        assert received[dcp_rank]['original_seq_len'].item() == dcp_rank + 1
+        assert received[dcp_rank]['padded_seq_len'].item() == dcp_rank + 1
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class MockVariableLengthSequencePackingDataIterator:
