@@ -2,6 +2,7 @@
 
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -942,6 +943,49 @@ class TestMHCWithCudaGraph:
             layer.set_te_cuda_graph_static_hidden_inputs((torch.empty(2, device="cuda"),))
         with pytest.raises(TypeError, match="CUDA tensors"):
             layer.set_te_cuda_graph_static_hidden_inputs((torch.empty(2), torch.empty(2)))
+        with pytest.raises(ValueError, match="unknown dynamic CP size"):
+            layer.set_te_cuda_graph_static_hidden_inputs(
+                (torch.empty(2, device="cuda"),), dynamic_cp_size=2
+            )
+
+    def test_te_graph_static_hidden_inputs_follow_dynamic_cp_graph_bank(self, monkeypatch):
+        """DCP replay must switch the graph and mHC direct-write input as one bank."""
+        layer, _ = self._create_mhc_layer()
+        graph_banks = {1: [object(), object()], 2: [object(), object()]}
+        input_banks = {
+            1: (
+                torch.empty((8, 1, 64), device="cuda"),
+                torch.empty((8, 1, 64), device="cuda"),
+            ),
+            2: (
+                torch.empty((4, 1, 64), device="cuda"),
+                torch.empty((4, 1, 64), device="cuda"),
+            ),
+        }
+        cp_groups = {1: object(), 2: object()}
+        layer.cuda_graphs_by_dynamic_cp_size = graph_banks
+        for cp_size in (1, 2):
+            layer.cuda_graphs = graph_banks[cp_size]
+            layer.set_te_cuda_graph_static_hidden_inputs(
+                input_banks[cp_size], dynamic_cp_size=cp_size
+            )
+
+        monkeypatch.setattr(
+            parallel_state,
+            "get_dynamic_data_context_parallel_groups",
+            lambda group_size: cp_groups[group_size],
+        )
+        layer.current_microbatch = 1
+        for cp_size in (1, 2, 1):
+            layer._activate_dynamic_cp_cuda_graph(
+                SimpleNamespace(local_cp_size=cp_size, cp_group=cp_groups[cp_size])
+            )
+            assert layer.cuda_graphs is graph_banks[cp_size]
+            assert layer.get_te_cuda_graph_static_hidden_input() is input_banks[cp_size][1]
+
+        layer.clear_te_cuda_graph_static_hidden_inputs()
+        assert not layer._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size
+        assert not layer._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size
 
     def _create_split_layer(self):
         layer, config = self._create_mhc_layer(
