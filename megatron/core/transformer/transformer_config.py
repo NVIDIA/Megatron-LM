@@ -1147,6 +1147,12 @@ class TransformerConfig(ModelParallelConfig):
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
 
+    cuda_graph_granularity: Literal['layer', 'chunk'] = "layer"
+    """Controls training CUDA graph ownership for per-module CUDA graphs.
+    "layer": existing per-layer graph ownership.
+    "chunk": capture one graph per local TransformerBlock/model chunk and microbatch slot.
+    Chunk graphs require empty cuda_graph_modules and keep pipeline scheduling outside the graph."""
+
     create_attention_mask_in_dataloader: bool = True
     """Whether training data loaders create and pass an attention_mask tensor.
 
@@ -1202,9 +1208,12 @@ class TransformerConfig(ModelParallelConfig):
 
     cuda_graph_dynamic_microbatches: bool = False
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
-    This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
-    packing, capture uses a conservative upper bound on the packed microbatch count so graph
-    replay can cover iterations whose real packed microbatch count changes."""
+    This option is supported for cuda_graph_impl=transformer_engine and for cuda_graph_impl=local
+    with cuda_graph_granularity=chunk. For THD sequence packing, capture uses a conservative upper
+    bound or an in-flight chunk slot count so graph replay can cover iterations whose real packed
+    microbatch count changes. Local chunk graphs with paged stash use a physical-slot-owned
+    stash/reload schedule, so their graph identity does not depend on the absolute microbatch count
+    or warmup/steady/cooldown boundary."""
 
     ####################
     # Hyper-Connection Configuration
@@ -3196,6 +3205,56 @@ class TransformerConfig(ModelParallelConfig):
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
+            assert self.cuda_graph_granularity in (
+                "layer",
+                "chunk",
+            ), f"Invalid cuda_graph_granularity: {self.cuda_graph_granularity}"
+            if self.cuda_graph_granularity == "chunk":
+                assert (
+                    self.cuda_graph_impl == "local"
+                ), "chunk CUDA graph granularity is only supported with cuda_graph_impl='local'."
+                assert not self.cuda_graph_modules, (
+                    "chunk CUDA graph granularity captures the whole chunk and requires "
+                    "empty cuda_graph_modules."
+                )
+                assert not self.overlap_moe_expert_parallel_comm, (
+                    "chunk CUDA graph granularity does not support "
+                    "overlap_moe_expert_parallel_comm because that schedule executes "
+                    "individual layers instead of TransformerBlock.forward()."
+                )
+                assert not self.dynamic_context_parallel, (
+                    "chunk CUDA graph granularity does not support dynamic context parallel "
+                    "groups. Static context parallelism is supported."
+                )
+                if self.sequence_packing_scheduler is not None:
+                    assert self.cuda_graph_dynamic_microbatches, (
+                        "sequence-packed chunk CUDA graphs require "
+                        "cuda_graph_dynamic_microbatches because the packed microbatch count "
+                        "can change between iterations."
+                    )
+                if self.num_moe_experts is not None and self.num_moe_experts > 1:
+                    has_static_hybridep_rank_budget = (
+                        self.moe_expert_rank_capacity_factor is not None
+                        and self.moe_token_dispatcher_type == "flex"
+                        and self.moe_flex_dispatcher_backend == "hybridep"
+                    )
+                    has_graph_static_expert_shapes = has_static_hybridep_rank_budget or (
+                        self.moe_expert_capacity_factor is not None
+                        and self.moe_pad_expert_input_to_capacity
+                    )
+                    assert has_graph_static_expert_shapes, (
+                        "chunk CUDA graphs capture the complete MoE path and cannot capture "
+                        "native dropless dispatch with dynamic expert shapes. Set "
+                        "moe_expert_rank_capacity_factor with the flex HybridEP dispatcher "
+                        "(optionally with moe_paged_stash), or set moe_expert_capacity_factor "
+                        "together with "
+                        "moe_pad_expert_input_to_capacity."
+                    )
+                if self.moe_paged_stash:
+                    assert self.cuda_graph_dynamic_microbatches, (
+                        "paged-stash chunk CUDA graphs require "
+                        "cuda_graph_dynamic_microbatches for schedule-derived runtime slots."
+                    )
             # Check cuda graph scopes for per-layer implementations.
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 if self.cuda_graph_impl == "local":
@@ -3210,11 +3269,12 @@ class TransformerConfig(ModelParallelConfig):
                         if CudaGraphModule.moe_preprocess not in self.cuda_graph_modules:
                             self.cuda_graph_modules.append(CudaGraphModule.moe_preprocess)
 
-                if self.cuda_graph_impl != "transformer_engine":
-                    assert not self.cuda_graph_dynamic_microbatches, (
-                        "cuda_graph_dynamic_microbatches is only supported with "
-                        "cuda_graph_impl=transformer_engine."
-                    )
+                if self.cuda_graph_impl == "local":
+                    if self.cuda_graph_dynamic_microbatches:
+                        assert self.cuda_graph_granularity == "chunk", (
+                            "cuda_graph_dynamic_microbatches with cuda_graph_impl=local requires "
+                            "cuda_graph_granularity=chunk."
+                        )
 
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
@@ -3324,6 +3384,7 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 local_partial_moe_offload = (
                     self.cuda_graph_impl == "local"
+                    and self.cuda_graph_granularity == "layer"
                     and bool(offload_modules)
                     and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
                     and CudaGraphModule.moe not in self.cuda_graph_modules

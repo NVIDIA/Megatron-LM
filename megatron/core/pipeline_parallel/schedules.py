@@ -24,7 +24,12 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
+from megatron.core.transformer.cuda_graphs import (
+    create_cudagraphs,
+    reset_chunk_cuda_graph_runtime_slots,
+    set_current_cuda_graph_slot,
+    set_current_microbatch,
+)
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
@@ -726,6 +731,13 @@ def forward_backward_no_pipelining(
     ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
+    reset_chunk_cuda_graph_runtime_slots(
+        model,
+        num_microbatches=num_microbatches,
+        num_model_chunks=1,
+        num_warmup_microbatches=0,
+        forward_only=forward_only,
+    )
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
@@ -777,6 +789,7 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
+                    set_current_cuda_graph_slot(model, i, forward=False)
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
                     # Release the autograd graph head before the next forward_step.
                     # Without this, the previous microbatch's output_tensor stays
@@ -806,6 +819,7 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
+            set_current_cuda_graph_slot(model, num_microbatches - 1, forward=False)
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
             del output_tensor
 
@@ -1332,6 +1346,14 @@ def forward_backward_pipelining_with_interleaving(
     schedule_table = get_schedule_table(
         num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
     )
+    reset_chunk_cuda_graph_runtime_slots(
+        model,
+        num_microbatches=num_microbatches,
+        num_model_chunks=num_model_chunks,
+        num_warmup_microbatches=num_warmup_microbatches,
+        schedule_table=schedule_table,
+        forward_only=forward_only,
+    )
 
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
     # For example, the micro-batch table for PP2 N3M5 with VP2 is
@@ -1352,7 +1374,6 @@ def forward_backward_pipelining_with_interleaving(
 
     def get_microbatch_id_in_model_chunk(iteration_id, forward):
         """Helper method to get the microbatch_id within model chunk given the iteration number."""
-        assert forward
         microbatch_id_in_model_chunk = microbatch_id_table[iteration_id]
         return microbatch_id_in_model_chunk
 
@@ -1561,11 +1582,13 @@ def forward_backward_pipelining_with_interleaving(
         """Helper method to run backward step with model split into chunks"""
         nonlocal output_tensor_grads
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=False)
 
         input_tensor, output_tensor, output_tensor_grad = backward_step_helper_preprocess(
             virtual_microbatch_id, model_chunk_id
         )
 
+        set_current_cuda_graph_slot(model[model_chunk_id], microbatch_id, forward=False)
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
         backward_step_helper_postprocess(virtual_microbatch_id)
@@ -1613,7 +1636,6 @@ def forward_backward_pipelining_with_interleaving(
             backward_input_tensor_grad = None
             # forward pass
             if f_virtual_microbatch_id is not None:
-                forward_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
                 if pre_forward is not None:
                     pre_forward()
                 forward_output_tensor = forward_step_helper(
@@ -1624,7 +1646,6 @@ def forward_backward_pipelining_with_interleaving(
 
             # Backward pass.
             if b_virtual_microbatch_id is not None:
-                backward_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
                 if pre_backward is not None:
                     pre_backward()
                 backward_input_tensor_grad = backward_step_helper(b_virtual_microbatch_id)
@@ -2417,6 +2438,13 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+    reset_chunk_cuda_graph_runtime_slots(
+        model,
+        num_microbatches=num_microbatches,
+        num_model_chunks=1,
+        num_warmup_microbatches=num_warmup_microbatches,
+        forward_only=forward_only,
+    )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
@@ -2577,6 +2605,7 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
+            set_current_cuda_graph_slot(model, i, forward=False)
             input_tensor_grad = backward_func(
                 input_tensor, output_tensor, output_tensor_grad, config
             )
@@ -2611,6 +2640,8 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
+            backward_microbatch_id = num_microbatches_remaining + i
+            set_current_cuda_graph_slot(model, backward_microbatch_id, forward=False)
             input_tensor_grad = backward_func(
                 input_tensor, output_tensor, output_tensor_grad, config
             )

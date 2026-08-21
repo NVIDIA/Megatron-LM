@@ -117,6 +117,38 @@ def get_fused_mla_submodules():
     return submodules
 
 
+def test_mla_core_attention_preserves_native_unequal_head_dims():
+    attention = MultiLatentAttention.__new__(MultiLatentAttention)
+    torch.nn.Module.__init__(attention)
+    attention.attn_mask_type = AttnMaskType.causal
+    attention.config = mock.Mock(experimental_attention_variant=None)
+
+    expected_output = torch.empty(8, 4, 128)
+    core_attention = mock.Mock(return_value=expected_output)
+    core_attention.hidden_size_per_attention_head_v = 128
+    attention.core_attention = core_attention
+
+    query = torch.empty(8, 4, 192)
+    key = torch.empty(8, 4, 192)
+    value = torch.empty(8, 4, 128)
+    packed_seq_params = PackedSeqParams(qkv_format="thd")
+
+    output = attention._run_core_attention(
+        query,
+        key,
+        value,
+        attention_mask=None,
+        packed_seq_params=packed_seq_params,
+    )
+
+    call = core_attention.call_args
+    assert call.args[0] is query
+    assert call.args[1] is key
+    assert call.args[2] is value
+    assert call.kwargs["packed_seq_params"] is packed_seq_params
+    assert output is expected_output
+
+
 backend = TESpecProvider()
 linear_qkv_down_proj_options = [backend.linear(), backend.column_parallel_linear()]
 

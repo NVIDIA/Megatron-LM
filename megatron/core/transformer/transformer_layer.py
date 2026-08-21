@@ -552,6 +552,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """Register the transformer layer for cudagraphs."""
 
         assert self.config.cuda_graph_impl == "local"
+        if getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk":
+            return
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
@@ -2878,6 +2880,8 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         assert self.config.cuda_graph_impl == "local"
+        if getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk":
+            return
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 

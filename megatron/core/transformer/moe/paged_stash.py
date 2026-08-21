@@ -243,11 +243,15 @@ class PagedTensor:
         self._original_tensor = self._tensor
         self._tensor = None
 
-    def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
+    def reload_from_stash(
+        self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048, zero_padded_tokens=False
+    ):
         """Reload the paged tensor from paged stash buffer (CUDA or host from spilled_to_host).
 
         ``_tensor`` must already be allocated on the main (default) stream by the caller;
-        this method only enqueues unpack-stream kernels that fill it from the stash.
+        this method only enqueues unpack-stream kernels that fill it from the stash. When
+        ``zero_padded_tokens`` is set, the pop kernel also restores the zero-filled tail used by
+        the static-shape profiling path.
         """
         assert self._tensor is not None, "reload_from_stash expects _tensor pre-allocated on main"
         assert tuple(self._tensor.shape) == tuple(self.original_shape), (
@@ -288,6 +292,8 @@ class PagedTensor:
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
             BLOCK_SIZE=BLOCK_SIZE,
+            MAX_NUM_TOKENS=max_num_tokens,
+            ZERO_PADDED_TOKENS=zero_padded_tokens,
         )
 
         paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
@@ -312,6 +318,7 @@ class PipelinePreScheduleFunction(torch.autograd.Function):
         # Initiate reload for next layer
         if (
             ctx.stash_manager.status == 'captured'
+            and not getattr(ctx.stash_manager, 'chunk_graph_runtime_schedule', False)
             and ctx.stash_manager.current_schedule_index < len(ctx.stash_manager._pp_schedule)
         ):
             next_schedule_layer = ctx.stash_manager._pp_schedule[
@@ -342,17 +349,31 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
             current_schedule_layer = stash_manager.get_schedule_layer(
                 ctx.vp_stage + 1, ctx.layer_no, ctx.microbatch_no
             )
-            next_schedule_layer = ctx.stash_manager._pp_schedule[
-                ctx.stash_manager.current_schedule_index + 1
-            ]
-            if current_schedule_layer != -next_schedule_layer:
-                # Start stash for current layer
-                ctx.stash_manager.stash_paged_tensors(current_schedule_layer)
-                if next_schedule_layer < 0:
-                    # reload for next backward layer
-                    ctx.stash_manager.reload_paged_tensors(-next_schedule_layer, no_wait=True)
+            if getattr(stash_manager, 'chunk_graph_runtime_schedule', False):
+                if getattr(
+                    stash_manager, 'chunk_graph_runtime_stash_activations', True
+                ):
+                    # A physical chunk-graph slot owns this activation until its matching
+                    # backward. Always stashing here makes the graph pair independent of
+                    # neighboring pipeline operations and global-batch schedule boundaries.
+                    ctx.stash_manager.stash_paged_tensors(current_schedule_layer)
+                else:
+                    # PP=1 always runs a microbatch's backward immediately after its forward.
+                    # Keeping the original tensor is both cheaper and identical to the eager
+                    # Paged Stash schedule; no activation can remain in flight across pairs.
+                    ctx.stash_manager.remove_paged_tensor_from_stash()
             else:
-                ctx.stash_manager.remove_paged_tensor_from_stash()
+                next_schedule_layer = ctx.stash_manager._pp_schedule[
+                    ctx.stash_manager.current_schedule_index + 1
+                ]
+                if current_schedule_layer != -next_schedule_layer:
+                    # Start stash for current layer
+                    ctx.stash_manager.stash_paged_tensors(current_schedule_layer)
+                    if next_schedule_layer < 0:
+                        # reload for next backward layer
+                        ctx.stash_manager.reload_paged_tensors(-next_schedule_layer, no_wait=True)
+                else:
+                    ctx.stash_manager.remove_paged_tensor_from_stash()
 
         ctx.stash_manager.current_schedule_index += 1
         # return the identical tensor
@@ -362,6 +383,15 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
     def backward(ctx, *grad_output):  # before backward
         # pylint: disable=missing-function-docstring
         if ctx.vp_stage is not None:
+            if (
+                ctx.stash_manager.status == 'captured'
+                and getattr(ctx.stash_manager, 'chunk_graph_runtime_schedule', False)
+                and getattr(ctx.stash_manager, 'chunk_graph_runtime_stash_activations', True)
+            ):
+                current_schedule_layer = ctx.stash_manager.get_schedule_layer(
+                    ctx.vp_stage + 1, ctx.layer_no, ctx.microbatch_no
+                )
+                ctx.stash_manager.reload_paged_tensors(current_schedule_layer)
             ctx.stash_manager.update_pp_schedule(
                 -(ctx.vp_stage + 1), -ctx.layer_no, -ctx.microbatch_no
             )
@@ -417,6 +447,9 @@ class PagedStashManager:
         self.current_layer = None
         self.current_microbatch = None
         self.current_schedule_index = None
+        self.chunk_graph_runtime_schedule = False
+        self.chunk_graph_runtime_stash_activations = False
+        self.defer_chunk_graph_profile_completion = False
 
         # Track max tokens needed across all vp_stages grouped by dtype and hidden_size
         self.max_tokens_across_vp_stages = None
@@ -535,7 +568,12 @@ class PagedStashManager:
                 self._unpack_stream_status = 'reloading'
                 for paged_tensor in reload_batch:
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
-                    paged_tensor.reload_from_stash(stash_buffer)
+                    paged_tensor.reload_from_stash(
+                        stash_buffer,
+                        zero_padded_tokens=getattr(
+                            self, 'chunk_graph_runtime_schedule', False
+                        ),
+                    )
             else:
                 pass
             assert len(self.paged_tensors_to_reload[pp_schedule_layer]) == 0, (
@@ -662,8 +700,9 @@ class PagedStashManager:
             self._pp_schedule.append(self.get_schedule_layer(vp_stage, layer_no, microbatch_no))
 
         expected = self.get_schedule_layer(vp_stage, layer_no, microbatch_no)
-        actual = self._pp_schedule[self.current_schedule_index]
-        assert actual == expected, f"schedule {actual} != {expected}"
+        if not getattr(self, 'chunk_graph_runtime_schedule', False):
+            actual = self._pp_schedule[self.current_schedule_index]
+            assert actual == expected, f"schedule {actual} != {expected}"
 
         return layer_no, microbatch_no
 
@@ -750,18 +789,28 @@ class PagedStashManager:
             tensor = tensor_truncated
 
         tensor.grouped_tensor_scale_inv = columnwise_scale_inv
+        if getattr(self, 'chunk_graph_runtime_schedule', False):
+            vp_stage_index = self.current_vp_stage if self.current_vp_stage is not None else 0
+            schedule_layer_no = self.get_schedule_layer(
+                vp_stage_index + 1,
+                self.current_layer[vp_stage_index],
+                self.current_microbatch[vp_stage_index],
+            )
+        else:
+            schedule_layer_no = (
+                self._pp_schedule[self.current_schedule_index]
+                if self._pp_schedule is not None
+                and self.current_schedule_index < len(self._pp_schedule)
+                else None
+            )
+
         paged_tensor = PagedTensor(
             tensor,
             num_tokens_tensor=self.num_tokens_tensor,
             avg_num_tokens=avg_num_tokens,
             vp_stage=self.current_vp_stage,
             original_shape=original_shape,
-            schedule_layer_no=(
-                self._pp_schedule[self.current_schedule_index]
-                if self._pp_schedule is not None
-                and self.current_schedule_index < len(self._pp_schedule)
-                else None
-            ),
+            schedule_layer_no=schedule_layer_no,
             is_columnwise_scale_inv=columnwise_scale_inv,
             max_num_tokens=self.max_num_tokens,
             hidden_size=hidden_size,
@@ -814,9 +863,13 @@ class PagedStashManager:
                 pad = (0, npad)
                 saved_state._tensor = torch.nn.functional.pad(saved_state._tensor, pad).view(dtype)
 
-            assert (
-                saved_state._tensor is not None
-            ), f"saved_state._tensor is None {saved_state._tensor}"
+            assert saved_state._tensor is not None, (
+                f"saved_state._tensor is None; paged_tensor={id(saved_state)}, "
+                f"schedule_layer={saved_state.schedule_layer}, "
+                f"current_schedule_index={self.current_schedule_index}, "
+                f"reload_queue_sizes="
+                f"{ {key: len(value) for key, value in self.paged_tensors_to_reload.items()} }"
+            )
 
             return saved_state._tensor.view(saved_state.original_shape)
 
@@ -894,6 +947,18 @@ def paged_stash_reset(enabled=True, config=None):
     """
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
+    stash_manager.chunk_graph_runtime_schedule = bool(
+        enabled
+        and config is not None
+        and getattr(config, 'cuda_graph_impl', 'none') == 'local'
+        and getattr(config, 'cuda_graph_granularity', 'layer') == 'chunk'
+        and getattr(config, 'cuda_graph_dynamic_microbatches', False)
+        and getattr(config, 'moe_paged_stash', False)
+    )
+    stash_manager.chunk_graph_runtime_stash_activations = bool(
+        stash_manager.chunk_graph_runtime_schedule
+        and getattr(config, 'pipeline_model_parallel_size', 1) > 1
+    )
     stash_manager.iteration += 1
     if config is not None:
         stash_manager.page_size = config.moe_paged_stash_page_size
@@ -906,13 +971,28 @@ def paged_stash_reset(enabled=True, config=None):
     if stash_manager.status == 'begin':
         stash_manager.status = 'capture'
     elif stash_manager.status == 'capture':
-        stash_manager.status = 'captured'
-        cuda_factor = config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
-        cpu_factor = config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
-        stash_manager.allocate_stash_buffers(
-            moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
-            moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
-        )
+        if stash_manager.chunk_graph_runtime_schedule and getattr(
+            stash_manager, 'defer_chunk_graph_profile_completion', False
+        ):
+            # Start another independent profiling iteration. Capacity maxima intentionally
+            # accumulate, while per-iteration schedule coordinates restart from zero.
+            stash_manager.defer_chunk_graph_profile_completion = False
+            stash_manager._pp_schedule = []
+            if stash_manager.vp_size is not None:
+                stash_manager.current_layer = [1 for _ in range(stash_manager.vp_size)]
+                stash_manager.current_microbatch = [0 for _ in range(stash_manager.vp_size)]
+        else:
+            stash_manager.status = 'captured'
+            cuda_factor = (
+                config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
+            )
+            cpu_factor = (
+                config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
+            )
+            stash_manager.allocate_stash_buffers(
+                moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
+                moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
+            )
     elif stash_manager.status == 'captured':
         # Buffers may have been released after a PagedStashRunner fallback; reallocate using
         # the same capture-derived maxima and current config factors.
@@ -967,6 +1047,19 @@ def check_paged_stash_host_spill():
 
 class PagedStashRunner:
     """Runner for paged stash"""
+
+    @staticmethod
+    def _copy_batch_structure(value):
+        """Copy mutable batch containers while sharing tensor storage."""
+        if isinstance(value, dict):
+            return {
+                key: PagedStashRunner._copy_batch_structure(item) for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [PagedStashRunner._copy_batch_structure(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(PagedStashRunner._copy_batch_structure(item) for item in value)
+        return value
 
     def __init__(self, config, copy_main_params, model, optimizer, forward_backward_func):
         self.stash_manager = PagedStashManager.get_instance()
@@ -1033,6 +1126,24 @@ class PagedStashRunner:
         for c in self._configs_to_sync_moe_paged_stash:
             c.moe_paged_stash = value
 
+    def _uses_local_chunk_cuda_graph(self) -> bool:
+        """Return whether this runner owns a local full-chunk CUDA graph path."""
+        return any(
+            getattr(config, 'cuda_graph_impl', 'none') == 'local'
+            and getattr(config, 'cuda_graph_granularity', 'layer') == 'chunk'
+            for config in self._configs_to_sync_moe_paged_stash
+        )
+
+    def _has_created_local_chunk_cuda_graph(self) -> bool:
+        """Return whether local chunk graphs currently retain stash-buffer addresses."""
+        if not self._uses_local_chunk_cuda_graph():
+            return False
+
+        # Local import avoids paged_stash -> cuda_graphs -> paged_stash initialization cycles.
+        from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+
+        return _CudagraphGlobalRecord.cudagraph_created
+
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
         data_iterator_saved = []
@@ -1043,7 +1154,9 @@ class PagedStashRunner:
             if iterator0 is not None:
                 for b in range(num_microbatches):
                     data_list.append(next(iterator0))
-                data_iterator_saved.append(iter(data_list))
+                data_iterator_saved.append(
+                    iter([self._copy_batch_structure(batch) for batch in data_list])
+                )
                 data_list = [iter(data_list)]
             else:
                 data_iterator_saved.append(None)
@@ -1056,7 +1169,9 @@ class PagedStashRunner:
                     data_list_i = []
                     for b in range(num_microbatches):
                         data_list_i.append(next(data_iterator[i]))
-                    data_iterator_saved.append(iter(data_list_i))
+                    data_iterator_saved.append(
+                        iter([self._copy_batch_structure(batch) for batch in data_list_i])
+                    )
                     data_list.append(iter(data_list_i))
                 else:
                     data_iterator_saved.append(None)
@@ -1111,6 +1226,15 @@ class PagedStashRunner:
         if self.optimizer is not None:
             self.optimizer.zero_grad()
 
+        # Discard metrics recorded by the failed attempt before the eager retry.
+        from megatron.core.transformer.moe.moe_logging import (
+            get_moe_metrics_tracker,
+            get_moe_overload_factor_tracker,
+        )
+
+        get_moe_metrics_tracker().clear()
+        get_moe_overload_factor_tracker().clear()
+
         # _handle_mxfp8_param_buffer_copy
         if self.copy_main_params:
 
@@ -1143,7 +1267,7 @@ class PagedStashRunner:
         # FullCudaGraphWrapper could still replay a graph recorded against the old pointers.
         # Training fallback resets the training graph before this path, so release + realloc
         # remains consistent with capture.
-        if is_training:
+        if is_training and not self._has_created_local_chunk_cuda_graph():
             self.stash_manager.release_stash_buffers()
 
     def __call__(self, *args, **kwargs):
@@ -1159,7 +1283,7 @@ class PagedStashRunner:
         At most two attempts. Each attempt prefetches microbatches, runs the schedule,
         then all-reduces stash overflow, HybridEP over-budget, and host spill across ranks.
         On success, restore capacity factor and moe_paged_stash for the next step.
-        On overflow, prepare_for_rerun resets grads and the CUDA graph before retry.
+        On overflow, prepare_for_rerun resets grads and prepares the fallback retry.
         """
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
         assert all(
@@ -1180,6 +1304,11 @@ class PagedStashRunner:
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
         saved_moe_paged_stash = self.config.moe_paged_stash
+        saved_cuda_graph_impls = [
+            (config, getattr(config, 'cuda_graph_impl', 'none'))
+            for config in self._configs_to_sync_moe_paged_stash
+        ]
+        local_chunk_cuda_graph = self._uses_local_chunk_cuda_graph()
         num_tries = 0
         while True:
             assert (
@@ -1216,6 +1345,8 @@ class PagedStashRunner:
                             mlp.token_dispatcher.config.moe_expert_rank_capacity_factor
                         )
                 self._set_moe_paged_stash_all(saved_moe_paged_stash)
+                for config, cuda_graph_impl in saved_cuda_graph_impls:
+                    config.cuda_graph_impl = cuda_graph_impl
                 break
 
             # Overflow or over-budget: prepare_for_rerun clears capacity factor and paged stash.
@@ -1237,4 +1368,10 @@ class PagedStashRunner:
                     "moe_paged_stash_buffer_size_factor_cpu.",
                 )
             self.prepare_for_rerun(is_training=training)
+            if local_chunk_cuda_graph:
+                # The fallback has dynamic expert shapes and intentionally disables stash.
+                # Keep already-created local graphs intact for the next normal step, but run
+                # this retry eagerly so it cannot replay a static-shape graph.
+                for config, _ in saved_cuda_graph_impls:
+                    config.cuda_graph_impl = 'none'
         return result
