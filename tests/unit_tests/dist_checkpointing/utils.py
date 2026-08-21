@@ -190,6 +190,8 @@ def setup_model_and_optimizer(
     optimizer_state_offload_fraction=1.0,
     use_precision_aware_optimizer=False,
     initialize_optimizer_state=True,
+    ddp_num_buckets=None,
+    ddp_pad_buckets_for_high_nccl_busbw=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -210,6 +212,11 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        if ddp_num_buckets is not None:
+            # Bucket splitting also requires overlapping gradient reduction.
+            mock_args.ddp_num_buckets = ddp_num_buckets
+            mock_args.overlap_grad_reduce = True
+        mock_args.ddp_pad_buckets_for_high_nccl_busbw = ddp_pad_buckets_for_high_nccl_busbw
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
