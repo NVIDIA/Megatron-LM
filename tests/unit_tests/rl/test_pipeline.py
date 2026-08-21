@@ -2,6 +2,8 @@
 
 import asyncio
 import itertools
+import time
+from collections import Counter
 from contextlib import aclosing
 from unittest.mock import MagicMock
 
@@ -9,6 +11,7 @@ import numpy as np
 import pytest
 from pydantic import Field, ValidationError
 
+from megatron.rl.agent import rollout_pipeline as rollout_pipeline_module
 from megatron.rl.agent.api import (
     EpisodeResult,
     GroupedRolloutGenerator,
@@ -23,6 +26,8 @@ from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline, _SubmissionGate
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw, ReturnsTokens
+from megatron.rl.rollout_bank import RolloutBank
+from megatron.rl.types import RolloutGroup
 
 
 class MockInferenceInterface(ReturnsRaw):
@@ -68,8 +73,8 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         self.get_rollout_response_calls += 1
         return await request.inference_interface.agenerate(inference_request)
 
-    async def prepare_group_rollout(self, request):
-        idx = self._call_count
+    async def prepare_group_rollout(self, request, *, problem_state=None):
+        idx = problem_state["idx"] if problem_state else self._call_count
         self._call_count += 1
         self.prepare_group_rollout_calls += 1
 
@@ -100,8 +105,8 @@ class FilteringMockGenerator(MockGenerator):
         super().__init__(**kwargs)
         self.num_degenerate = num_degenerate
 
-    async def prepare_group_rollout(self, request):
-        idx = self._call_count
+    async def prepare_group_rollout(self, request, *, problem_state=None):
+        idx = problem_state["idx"] if problem_state else self._call_count
         params = await super().prepare_group_rollout(request)
         degenerate = idx < self.num_degenerate
         rollout_counter = itertools.count()
@@ -112,7 +117,11 @@ class FilteringMockGenerator(MockGenerator):
             rollout.reward = 0.0 if degenerate else float(next(rollout_counter))
             return rollout
 
-        return GroupRolloutParams(run_episode=params.run_episode, build_rollout=build_rollout)
+        return GroupRolloutParams(
+            run_episode=params.run_episode,
+            build_rollout=build_rollout,
+            problem_state=params.problem_state,
+        )
 
 
 class PlaceholderMockGenerator(MockGenerator):
@@ -139,9 +148,9 @@ class PlaceholderMockGenerator(MockGenerator):
         self.placeholder_status = placeholder_status
         self.placeholder_reason = placeholder_reason
 
-    async def prepare_group_rollout(self, request):
+    async def prepare_group_rollout(self, request, *, problem_state=None):
         idx = self._call_count
-        params = await super().prepare_group_rollout(request)
+        params = await super().prepare_group_rollout(request, problem_state=problem_state)
         make_placeholder = idx < self.num_placeholder
         member_counter = itertools.count()
         base_build = params.build_rollout
@@ -295,7 +304,7 @@ class TestStageFailurePropagation:
     @pytest.mark.asyncio
     async def test_prepare_failure_raises_out_of_run(self):
         class BrokenPrepareGenerator(MockGenerator):
-            async def prepare_group_rollout(self, request):
+            async def prepare_group_rollout(self, request, *, problem_state=None):
                 raise TypeError("agent/pipeline interface mismatch")
 
         request = GroupedRolloutRequest(
@@ -318,7 +327,7 @@ class TestStageFailurePropagation:
         class BrokenBuildGenerator(MockGenerator):
             """First group builds normally; every later group's build_rollout raises."""
 
-            async def prepare_group_rollout(self, request):
+            async def prepare_group_rollout(self, request, *, problem_state=None):
                 idx = self._call_count
                 params = await super().prepare_group_rollout(request)
                 if idx < 1:
@@ -672,9 +681,9 @@ class TestGroupedRollouts:
             """Group 0: member 0 fails, real members share one reward; later
             groups carry distinct member rewards."""
 
-            async def prepare_group_rollout(self, request):
+            async def prepare_group_rollout(self, request, *, problem_state=None):
                 idx = self._call_count
-                params = await super().prepare_group_rollout(request)
+                params = await super().prepare_group_rollout(request, problem_state=problem_state)
                 affected = idx < 1
                 member_counter = itertools.count()
                 base_build = params.build_rollout
@@ -1176,3 +1185,551 @@ class TestMultiTurnEpisode:
         assert agent.observation_turns == expected["observation_turns"]
         # get_trajectory_reward sees the full dialogue, ending on the final reply exactly once.
         assert [(m.role, m.content) for m in agent.reward_conversation] == expected["reward_conv"]
+
+
+class _RestoringGenerator(MockGenerator):
+    """MockGenerator that hands back preloaded groups before generating fresh ones."""
+
+    def __init__(self, restored=None, **kwargs):
+        super().__init__(**kwargs)
+        self._restored = list(restored or [])
+        self.resumed_states = []
+
+    def take_restored_group(self, env_id):
+        return self._restored.pop(0) if self._restored else None
+
+    async def prepare_group_rollout(self, request, *, problem_state=None):
+        if problem_state is not None:
+            self.resumed_states.append(problem_state)
+        params = await super().prepare_group_rollout(request, problem_state=problem_state)
+        # Incomplete groups are only banked for envs that can regenerate them.
+        return params._replace(problem_state=problem_state or {"idx": self._call_count})
+
+
+class _StallingGenerator(_RestoringGenerator):
+    """Generator whose episodes past `stall_after` never return, so a group never fills."""
+
+    def __init__(self, stall_after=1, **kwargs):
+        super().__init__(**kwargs)
+        self.stall_after = stall_after
+        self.started = 0
+        self._never = asyncio.Event()
+
+    async def prepare_group_rollout(self, request, *, problem_state=None):
+        params = await super().prepare_group_rollout(request, problem_state=problem_state)
+        base_run = params.run_episode
+
+        async def run_episode():
+            self.started += 1
+            if self.started > self.stall_after:
+                await self._never.wait()
+            return await base_run()
+
+        return params._replace(run_episode=run_episode)
+
+
+class TestProblemStateContract:
+    """problem_state is handed out so the bank can store it, and taken back to replay."""
+
+    @staticmethod
+    def _request():
+        return GroupedRolloutRequest(
+            num_groups=1,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            generation_args={},
+        )
+
+    def test_params_default_to_no_problem_state(self):
+        """Agents that opt out keep working; the field is optional."""
+        params = GroupRolloutParams(run_episode=lambda: None, build_rollout=lambda e: None)
+        assert params.problem_state is None
+
+    @pytest.mark.asyncio
+    async def test_agent_exposes_the_problem_it_drew(self):
+        agent = CountingRewardAgent()
+        params = await agent.prepare_group_rollout(self._request())
+        assert params.problem_state == {"prompt": "t0", "golden": {"idx": 0}}
+
+    @pytest.mark.asyncio
+    async def test_replaying_a_state_does_not_advance_the_dataset(self):
+        """Completing a restored group must reuse its prompt, not draw a new one."""
+        agent = CountingRewardAgent()
+        first = await agent.prepare_group_rollout(self._request())
+        await agent.prepare_group_rollout(self._request())  # dataset moves on
+
+        resumed = await agent.prepare_group_rollout(
+            self._request(), problem_state=first.problem_state
+        )
+        assert agent._prompt_count == 2, "no third draw"
+        assert resumed.problem_state == first.problem_state
+        episode = await resumed.run_episode()
+        assert episode.conversation[0].content == "t0"
+
+
+class TestDurableBank:
+    """The pipeline's half of incomplete-group durability."""
+
+    ROLLOUTS_PER_GROUP = 4
+
+    @classmethod
+    def _request(cls, **kwargs):
+        kwargs.setdefault("num_groups", 1)
+        kwargs.setdefault("rollouts_per_group", cls.ROLLOUTS_PER_GROUP)
+        kwargs.setdefault("inference_interface", MockInferenceInterface())
+        kwargs.setdefault("submission_granularity", "R")
+        kwargs.setdefault("consumption_granularity", "G")
+        return GroupedRolloutRequest(**kwargs)
+
+    @classmethod
+    def _bank(cls, tmp_path, **kwargs):
+        bank = RolloutBank(str(tmp_path), rollouts_per_group=cls.ROLLOUTS_PER_GROUP, **kwargs)
+        bank.set_collection(1)
+        return bank
+
+    @staticmethod
+    async def _take(pipeline, count):
+        async with aclosing(pipeline.run()) as stream:
+            return [await asyncio.wait_for(anext(stream), timeout=10) for _ in range(count)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stall, expected_members",
+        [
+            pytest.param(False, ROLLOUTS_PER_GROUP, id="complete-group-fully-persisted"),
+            pytest.param(True, ROLLOUTS_PER_GROUP - 1, id="stalled-group-persists-what-it-has"),
+        ],
+    )
+    async def test_members_persist_as_they_are_graded(self, tmp_path, stall, expected_members):
+        """Members are durable without waiting for the group.
+
+        Under append-at-assembly the stalled case would leave nothing on disk,
+        because that group is one member short forever.
+        """
+        bank = self._bank(tmp_path)
+        agent = (
+            _StallingGenerator(stall_after=self.ROLLOUTS_PER_GROUP - 1)
+            if stall
+            else _RestoringGenerator()
+        )
+        try:
+            pipeline = RolloutPipeline(
+                agent, self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            if stall:
+                async with aclosing(pipeline.run()) as stream:
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(anext(stream), timeout=1.0)
+            else:
+                await self._take(pipeline, 1)
+                pipeline.drain_bank()
+            restored = bank.restore(0)
+        finally:
+            bank.close()
+
+        assert len(restored) == 1
+        assert len(restored[0].rollouts) == expected_members
+
+    @pytest.mark.asyncio
+    async def test_restored_group_regenerates_only_its_missing_members(self, tmp_path):
+        """Persisted members are reused; only the gaps are generated, same prompt."""
+        incomplete = RolloutGroup(
+            rollouts=[
+                Rollout(trajectory=["kept-0"], reward=1.0, env_id="test"),
+                Rollout(trajectory=["kept-2"], reward=0.0, env_id="test"),
+            ],
+            uid="nonce/7",
+            member_indices=[0, 2],
+            problem_state={"idx": 0},
+        )
+        agent = _RestoringGenerator(restored=[incomplete])
+        bank = self._bank(tmp_path)
+        try:
+            pipeline = RolloutPipeline(
+                agent, self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            group = (await self._take(pipeline, 1))[0]
+        finally:
+            bank.close()
+
+        assert len(group.rollouts) == self.ROLLOUTS_PER_GROUP
+        assert group.uid == "nonce/7", "completion must not mint a new identity"
+        assert group.member_indices == [0, 1, 2, 3]
+        assert agent.resumed_states == [{"idx": 0}]
+        kept = [r.trajectory[0] for r in group.rollouts if r.trajectory[0].startswith("kept")]
+        assert sorted(kept) == ["kept-0", "kept-2"], "persisted members are not regenerated"
+
+    @pytest.mark.asyncio
+    async def test_writes_are_coalesced_and_run_off_the_event_loop(self, tmp_path):
+        """fsync is blocking, so it must batch and must not run on the loop thread."""
+        import threading
+
+        loop_thread = threading.get_ident()
+        writes, threads = [], set()
+
+        class RecordingBank(RolloutBank):
+            def write_records(self, pending):
+                writes.append(len(pending))
+                threads.add(threading.get_ident())
+                super().write_records(pending)
+
+        bank = RecordingBank(str(tmp_path), rollouts_per_group=self.ROLLOUTS_PER_GROUP)
+        bank.set_collection(1)
+        try:
+            pipeline = RolloutPipeline(
+                _RestoringGenerator(),
+                self._request(num_groups=2),
+                parallel_generation_tasks=2,
+                bank=bank,
+            )
+            await self._take(pipeline, 2)
+            pipeline.drain_bank()
+        finally:
+            bank.close()
+
+        assert threads and loop_thread not in threads, "a blocking fsync ran on the event loop"
+        assert len(writes) < sum(writes), "records must coalesce, not fsync one at a time"
+
+    @pytest.mark.asyncio
+    async def test_write_failure_surfaces_at_the_durability_barrier(self, tmp_path):
+        """Persistence is best-effort mid-stream, but a failure cannot be swallowed."""
+
+        class BrokenBank(RolloutBank):
+            def write_records(self, pending):
+                raise RuntimeError("disk exploded")
+
+        bank = BrokenBank(str(tmp_path), rollouts_per_group=self.ROLLOUTS_PER_GROUP)
+        bank.set_collection(1)
+        try:
+            pipeline = RolloutPipeline(
+                _RestoringGenerator(), self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            groups = await self._take(pipeline, 1)
+            assert len(groups) == 1, "a bank failure must not stop rollout generation"
+            with pytest.raises(RuntimeError, match="disk exploded"):
+                pipeline.drain_bank()
+            pipeline.drain_bank()  # latched errors report once, then clear
+        finally:
+            bank.close()
+
+    @pytest.mark.asyncio
+    async def test_placeholders_are_not_persisted(self, tmp_path):
+        """A failed episode has no decode work to save, and must not be restored.
+
+        main drops all-placeholder groups so they can be refilled. Persisting a
+        placeholder would let a restored group carry one past that policy; leaving
+        the slot empty means restore regenerates it, which is the same outcome.
+        """
+        # One member of the first group comes back empty; the rest are real.
+        agent = PlaceholderMockGenerator(num_placeholder=1, placeholder_members=1)
+        bank = self._bank(tmp_path)
+        try:
+            pipeline = RolloutPipeline(
+                agent, self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            await self._take(pipeline, 1)
+            pipeline.drain_bank()
+            restored = bank.restore(0)
+        finally:
+            bank.close()
+
+        for group in restored:
+            assert all(not r.is_placeholder for r in group.rollouts), "placeholder persisted"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_without_a_bank_is_unaffected(self, tmp_path):
+        """Persistence is opt-in."""
+        pipeline = RolloutPipeline(
+            _RestoringGenerator(), self._request(), parallel_generation_tasks=1
+        )
+        group = (await self._take(pipeline, 1))[0]
+        assert len(group.rollouts) == self.ROLLOUTS_PER_GROUP
+        assert group.uid is None
+
+
+class TestBackgroundBankWriter:
+    """Bank writes progress during training, without anyone pumping the event loop.
+
+    The trainer only runs the asyncio loop while collecting rollouts. If bank
+    writes could only progress on the loop, the whole backlog would have to be
+    fsynced inside the inference-to-training switch with the GPUs idle. These
+    tests pin the fix: a dedicated writer thread drains the queue on its own,
+    and consumption markers ride the same FIFO queue behind the records they
+    name instead of waiting for a drain.
+    """
+
+    ROLLOUTS_PER_GROUP = 4
+    # One problem record plus one record per member.
+    RECORDS_PER_GROUP = ROLLOUTS_PER_GROUP + 1
+
+    @classmethod
+    def _request(cls, **kwargs):
+        kwargs.setdefault("num_groups", 1)
+        kwargs.setdefault("rollouts_per_group", cls.ROLLOUTS_PER_GROUP)
+        kwargs.setdefault("inference_interface", MockInferenceInterface())
+        kwargs.setdefault("submission_granularity", "R")
+        kwargs.setdefault("consumption_granularity", "G")
+        return GroupedRolloutRequest(**kwargs)
+
+    @classmethod
+    def _recording_bank(cls, tmp_path, write_delay=0.0):
+        """A bank that logs ("w", n)/("m", n) ops, optionally slowing writes."""
+        ops = []
+
+        class RecordingBank(RolloutBank):
+            def write_records(self, pending):
+                if write_delay:
+                    time.sleep(write_delay)
+                super().write_records(pending)
+                ops.append(("w", len(pending)))
+
+            def mark_consumed_many(self, uids, iteration):
+                uids = [uid for uid in uids if uid]
+                super().mark_consumed_many(uids, iteration)
+                ops.append(("m", len(uids)))
+
+        bank = RecordingBank(str(tmp_path), rollouts_per_group=cls.ROLLOUTS_PER_GROUP)
+        bank.set_collection(1)
+        return bank, ops
+
+    @staticmethod
+    def _written(ops):
+        return sum(n for kind, n in ops if kind == "w")
+
+    @staticmethod
+    def _marked(ops):
+        return sum(n for kind, n in ops if kind == "m")
+
+    @staticmethod
+    def _poll_blocking(condition, timeout=10.0):
+        """Busy-wait on the loop thread, so nothing can pump the event loop."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not condition():
+            time.sleep(0.01)
+
+    @pytest.mark.asyncio
+    async def test_writes_progress_while_the_loop_is_blocked(self, tmp_path, monkeypatch):
+        """A training step blocks the loop thread; queued records must still land."""
+        monkeypatch.setattr(rollout_pipeline_module, "BANK_WRITE_MAX_RECORDS", 1)
+        bank, ops = self._recording_bank(tmp_path, write_delay=0.05)
+        try:
+            pipeline = RolloutPipeline(
+                _RestoringGenerator(), self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            async with aclosing(pipeline.run()) as stream:
+                await asyncio.wait_for(anext(stream), timeout=10)
+                # Run-ahead may bank records beyond the consumed group, so the
+                # bar is "at least the consumed group's records", not equality.
+                self._poll_blocking(lambda: self._written(ops) >= self.RECORDS_PER_GROUP)
+            assert (
+                self._written(ops) >= self.RECORDS_PER_GROUP
+            ), "bank writes stalled while the event loop was blocked (training)"
+        finally:
+            bank.close()
+
+    @pytest.mark.asyncio
+    async def test_consumed_markers_apply_without_a_drain(self, tmp_path):
+        """The switch enqueues markers and returns; no drain, no marker loss."""
+        bank, ops = self._recording_bank(tmp_path)
+        try:
+            pipeline = RolloutPipeline(
+                _RestoringGenerator(), self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            async with aclosing(pipeline.run()) as stream:
+                group = await asyncio.wait_for(anext(stream), timeout=10)
+                pipeline.enqueue_consumed_markers([group.uid], iteration=5)
+                self._poll_blocking(lambda: self._marked(ops) == 1)
+            pipeline.drain_bank()
+            assert self._marked(ops) == 1
+            marked_uids = {group.uid for group in bank.restore(trained_through=5)}
+            assert group.uid not in marked_uids, "marker was not applied"
+            unmarked_uids = {group.uid for group in bank.restore(trained_through=0)}
+            assert group.uid in unmarked_uids, "records were lost"
+        finally:
+            bank.close()
+
+    @pytest.mark.asyncio
+    async def test_markers_are_written_behind_every_queued_record(self, tmp_path, monkeypatch):
+        """FIFO ordering is the safety rule: records durable before their marker."""
+        monkeypatch.setattr(rollout_pipeline_module, "BANK_WRITE_MAX_RECORDS", 1)
+        bank, ops = self._recording_bank(tmp_path, write_delay=0.05)
+        try:
+            pipeline = RolloutPipeline(
+                _RestoringGenerator(), self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            async with aclosing(pipeline.run()) as stream:
+                group = await asyncio.wait_for(anext(stream), timeout=10)
+                pipeline.enqueue_consumed_markers([group.uid], iteration=5)
+                assert (
+                    self._marked(ops) == 0
+                ), "enqueue_consumed_markers blocked on the backlog instead of queueing"
+                pipeline.drain_bank()
+            kinds = [kind for kind, _ in ops]
+            assert kinds.count("m") == 1
+            # Every record queued before the marker (the consumed group's full
+            # set) must be on disk before the marker is; run-ahead records for
+            # the next batch may legitimately land after it.
+            marker_index = kinds.index("m")
+            written_before_marker = sum(n for kind, n in ops[:marker_index] if kind == "w")
+            assert (
+                written_before_marker >= self.RECORDS_PER_GROUP
+            ), f"marker overtook queued records, got {ops}"
+        finally:
+            bank.close()
+
+    @pytest.mark.asyncio
+    async def test_drain_is_synchronous_and_needs_no_loop(self, tmp_path):
+        """Compaction runs from sync checkpoint code; drain must not need the loop."""
+        bank, ops = self._recording_bank(tmp_path)
+        try:
+            pipeline = RolloutPipeline(
+                _RestoringGenerator(), self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            async with aclosing(pipeline.run()) as stream:
+                await asyncio.wait_for(anext(stream), timeout=10)
+            result = pipeline.drain_bank()
+            assert result is None, "drain_bank must be a plain synchronous barrier"
+            assert self._written(ops) >= self.RECORDS_PER_GROUP
+        finally:
+            bank.close()
+
+    @pytest.mark.asyncio
+    async def test_marker_enqueue_surfaces_a_latched_write_failure(self, tmp_path):
+        """A write failure from the previous backlog cannot be swallowed forever."""
+
+        class BrokenBank(RolloutBank):
+            def write_records(self, pending):
+                raise RuntimeError("disk exploded")
+
+        bank = BrokenBank(str(tmp_path), rollouts_per_group=self.ROLLOUTS_PER_GROUP)
+        bank.set_collection(1)
+        try:
+            pipeline = RolloutPipeline(
+                _RestoringGenerator(), self._request(), parallel_generation_tasks=1, bank=bank
+            )
+            async with aclosing(pipeline.run()) as stream:
+                group = await asyncio.wait_for(anext(stream), timeout=10)
+                self._poll_blocking(lambda: pipeline._bank_error is not None)
+                with pytest.raises(RuntimeError, match="disk exploded"):
+                    pipeline.enqueue_consumed_markers([group.uid], iteration=5)
+        finally:
+            bank.close()
+
+
+class TestRestoredGroupRouting:
+    """Recovered groups keep their per-env weighting and drain before fresh work."""
+
+    @staticmethod
+    def _env_group(env_id, problem_id):
+        return RolloutGroup(
+            rollouts=[
+                Rollout(trajectory=["cached"], reward=1.0, env_id=env_id, problem_id=problem_id)
+            ]
+        )
+
+    @staticmethod
+    def _weighted_agent(env_weights):
+        return WeightedMultiTask(
+            [
+                AgentConfig(agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight)
+                for env_id, weight in env_weights
+            ]
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "env_weights, restored_env, restored_count, request_groups, take_count, "
+        "expected_envs, expected_fresh_calls, write_through",
+        [
+            pytest.param(
+                [("a", 1.0), ("b", 1.0)],
+                "a",
+                2,
+                4,
+                4,
+                {"a": 2, "b": 2},
+                [0, 2],
+                False,
+                id="restored-groups-replace-fresh",
+            ),
+            pytest.param(
+                [("a", 1.0), ("b", 1.0)],
+                "a",
+                4,
+                4,
+                12,
+                {"a": 6, "b": 6},
+                [2, 6],
+                False,
+                id="streaming-backlog-drains-before-fresh",
+            ),
+            pytest.param(
+                [("", 1.0)], "", 1, 2, 2, {"": 2}, [1], False, id="single-env-without-env-id"
+            ),
+            pytest.param(
+                [("a", 1.0)], "a", 0, 4, 4, {"a": 4}, [4], True, id="fresh-groups-write-through"
+            ),
+        ],
+    )
+    async def test_restored_groups_are_consumed_before_fresh_generation(
+        self,
+        tmp_path,
+        env_weights,
+        restored_env,
+        restored_count,
+        request_groups,
+        take_count,
+        expected_envs,
+        expected_fresh_calls,
+        write_through,
+    ):
+        agent = self._weighted_agent(env_weights)
+        restored = [self._env_group(restored_env, f"cached-{i}") for i in range(restored_count)]
+        assert agent.set_restored_groups(restored) == restored_count
+
+        if len(env_weights) > 1:
+            with pytest.raises(ValueError, match="not in the current"):
+                agent.set_restored_groups([self._env_group("unknown", "drift")])
+            assert agent.set_restored_groups(restored) == restored_count
+
+        bank = RolloutBank(str(tmp_path), rollouts_per_group=1) if write_through else None
+        if bank is not None:
+            bank.set_collection(0)
+        request = GroupedRolloutRequest(
+            num_groups=request_groups,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+        )
+        pipeline = RolloutPipeline(
+            agent, request, parallel_generation_tasks=1, initial_batch_id=20, bank=bank
+        )
+
+        async with aclosing(pipeline.run()) as groups:
+            produced = [
+                await asyncio.wait_for(anext(groups), timeout=10) for _ in range(take_count)
+            ]
+            if bank is not None:
+                pipeline.drain_bank()
+
+        assert Counter(group[0].env_id for group in produced) == expected_envs
+        assert [g.prepare_group_rollout_calls for g in agent.agents] == expected_fresh_calls
+        assert {f"cached-{i}" for i in range(restored_count)} <= {
+            group[0].problem_id for group in produced
+        }
+        assert not agent._restored_groups.get(restored_env)
+        assert [group.batch_id for group in produced] == [
+            20 + i // request_groups for i in range(take_count)
+        ]
+        assert [group.index_in_batch for group in produced] == [
+            i % request_groups for i in range(take_count)
+        ]
+
+        if bank is not None:
+            bank.close()
+            persisted = RolloutBank(str(tmp_path), rollouts_per_group=1).restore(trained_through=0)
+            assert {group.uid for group in persisted} == {group.uid for group in produced}
+
+    def test_multiple_envs_require_env_ids_for_restore_routing(self):
+        agent = self._weighted_agent([("", 1.0), ("b", 1.0)])
+        with pytest.raises(ValueError, match="configuring multiple active agents"):
+            agent.set_restored_groups([])

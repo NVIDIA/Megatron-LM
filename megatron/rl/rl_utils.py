@@ -684,7 +684,12 @@ def maybe_get_rollout_bank(args):
         from megatron.rl.rollout_bank import RolloutBank
 
         bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
-        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
+        _ROLLOUT_BANK = RolloutBank(
+            bank_dir,
+            max_bytes=args.rl_rollout_bank_max_bytes,
+            rollouts_per_group=args.grpo_group_size,
+            drop_zero_variance=args.grpo_filter_groups_with_same_reward,
+        )
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
     return _ROLLOUT_BANK
@@ -696,10 +701,21 @@ def get_rollout_bank():
 
 
 def maybe_compact_rollout_bank(iteration):
-    """Compact the bank at a durable-checkpoint boundary."""
+    """Compact the bank at a durable-checkpoint boundary.
+
+    Compaction rewrites and reclaims segments, so queued records must reach disk
+    first or they would be written against a segment that no longer exists. The
+    drain is a plain thread-queue barrier — the bank writer runs on its own
+    thread, independent of the asyncio loop — and it also flushes any queued
+    consumption markers, so a checkpoint that includes a training update can
+    never land before that update's markers do.
+    """
     bank = get_rollout_bank()
-    if bank is not None:
-        bank.checkpoint(iteration)
+    if bank is None:
+        return
+    if _ROLLOUT_PIPELINE is not None:
+        _ROLLOUT_PIPELINE.drain_bank()
+    bank.checkpoint(iteration)
 
 
 def _get_or_create_rollout_agent(env_config_path):
@@ -833,6 +849,12 @@ def get_environment_rollouts(
                             f"RolloutBank restored {total_restored_groups} completed groups from "
                             f"disk at resume iteration {args.iteration}",
                         )
+                if _ROLLOUT_PIPELINE is not None:
+                    # Sidecar offsets are per-segment: queued records must land
+                    # in their own segment before appends move to the new one.
+                    # The writer thread has had the whole training step to work
+                    # through the backlog, so this barrier is normally instant.
+                    _ROLLOUT_PIPELINE.drain_bank()
                 bank.set_collection(args.curr_iteration)
 
             with nvtx_range("rl/inference-setup", time=True):
@@ -876,8 +898,12 @@ def get_environment_rollouts(
                     # Record consumption for every group handed to the trainer. On a
                     # rollback (restart before this update) the marker > T rule restores
                     # these; once a checkpoint includes the update they are pruned.
+                    # The markers ride the bank's FIFO queue behind the records they
+                    # name, so this returns immediately instead of idling the GPUs
+                    # on a full backlog drain; the writer thread keeps flushing
+                    # while the training step runs.
                     if bank is not None:
-                        bank.mark_consumed_many(
+                        _ROLLOUT_PIPELINE.enqueue_consumed_markers(
                             (group.uid for group in rollouts), args.curr_iteration + 1
                         )
                 else:
@@ -1456,7 +1482,7 @@ def _bounded_artifact_key(key, limit=100):
 
     keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
     a 7-char CRC suffix by wandb's sanitizer.
-    
+
     Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
     """
     if len(key) <= limit:
