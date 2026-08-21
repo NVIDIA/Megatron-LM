@@ -1804,20 +1804,26 @@ class TECudaGraphHelper:
         # mHC direct-write arena.
         self._mhc_sample_order_intervals = {}
 
-        # TE graph capture happens after the configured eager warmup iterations. Route
-        # those iterations through the same parent transport as capture, otherwise the
-        # logical CP communicators are initialized before they can be avoided.
+        # Initialize every parent communicator before graph capture. Captured attention also
+        # routes eager warmup iterations through that parent, otherwise the logical CP
+        # communicators are initialized before they can be avoided.
         self._reuse_parent_cp_transport = self._should_reuse_dynamic_cp_p2p_transport()
+        warmup_parent_router = self._should_use_dynamic_cp_parent_router_reduction()
         self._dynamic_cp_transport_contexts = ()
-        if self._reuse_parent_cp_transport:
+        if self._reuse_parent_cp_transport or warmup_parent_router:
             try:
-                self._dynamic_cp_transport_contexts = tuple(self._get_dynamic_cp_capture_contexts())
-                self._set_dynamic_cp_p2p_transport(
-                    self._dynamic_cp_transport_contexts, self.dp_cp_group
-                )
-                self._warmup_dynamic_cp_communicators(
-                    self._dynamic_cp_transport_contexts, self.dp_cp_group
-                )
+                if self._reuse_parent_cp_transport:
+                    self._dynamic_cp_transport_contexts = tuple(
+                        self._get_dynamic_cp_capture_contexts()
+                    )
+                    self._set_dynamic_cp_p2p_transport(
+                        self._dynamic_cp_transport_contexts, self.dp_cp_group
+                    )
+                    self._warmup_dynamic_cp_communicators(
+                        self._dynamic_cp_transport_contexts, self.dp_cp_group
+                    )
+                else:
+                    self._warmup_dynamic_cp_parent_collective(self.dp_cp_group)
             except BaseException:
                 self._set_dynamic_cp_p2p_transport(self._dynamic_cp_transport_contexts, None)
                 self._dynamic_cp_transport_contexts = ()
@@ -2351,6 +2357,15 @@ class TECudaGraphHelper:
         graph_modules = getattr(self.config, 'cuda_graph_modules', ())
         captures_attention = not graph_modules or CudaGraphModule.attn in graph_modules
         return self._should_share_dynamic_cp_pool() and captures_attention
+
+    def _should_use_dynamic_cp_parent_router_reduction(self) -> bool:
+        """Whether captured router collectives use the parent DPxCP group."""
+        graph_modules = getattr(self.config, 'cuda_graph_modules', ())
+        captures_router = not graph_modules or any(
+            module in graph_modules
+            for module in (CudaGraphModule.moe, CudaGraphModule.moe_router)
+        )
+        return self._should_share_dynamic_cp_pool() and captures_router
 
     def _publish_dynamic_cp_graph_microbatch_limit(self) -> None:
         """Publish the logical PP range proved safe for the physical graph-slot ring."""
@@ -2979,6 +2994,17 @@ class TECudaGraphHelper:
                 for request in requests:
                     request.wait()
 
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    @staticmethod
+    def _warmup_dynamic_cp_parent_collective(parent_group):
+        """Initialize a parent communicator used by captured router reductions."""
+        if not torch.distributed.is_initialized() or parent_group.size() <= 1:
+            return
+        torch.distributed.barrier(
+            group=parent_group, device_ids=[torch.cuda.current_device()]
+        )
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
