@@ -828,8 +828,6 @@ def _get_megatron_emerging_optimizer(
                 layout_multiple = 2 if interleave_size is None else 2 * interleave_size
                 if valid_interleave and logical_rows > 0 and logical_rows % layout_multiple == 0:
                     param.is_glu = True
-                    param.glu_gtp_remat_size = gtp_remat_size
-                    param.glu_gtp_pad_length = pad_length
                 else:
                     param.is_glu = False
                     log_single_rank(
