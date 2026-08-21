@@ -7,6 +7,7 @@ import sys
 
 import pytest
 import torch
+from packaging.version import Version
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -723,11 +724,23 @@ class TestFP8Param:
     # MXFP8Tensor is not supported yet"), so mxfp8 + --fp8-param-gather always runs with
     # reuse_grad_buf_for_mxfp8_param_ag. That covers the shared param/grad buffer branch of
     # the re-derivation; tensorwise and delayed cover the direct quantize_param_shard branch.
+    # LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one, so
+    # it re-derives through ChainedOptimizer._stage_model_params_from_main_params. Covered
+    # on mxfp8 only: tensorwise + muon does not round-trip on some ranks for a reason that
+    # predates this change -- the layer-wise path quantizes from the FP32 main param while
+    # DistributedOptimizer quantizes from bf16(main), so the two derive different tensorwise
+    # scales from a checkpoint that stores BF16.
     @pytest.mark.parametrize(
-        ("recipe", "reuse_grad_buf"), [("mxfp8", True), ("tensorwise", False), ("delayed", False)]
+        ("recipe", "reuse_grad_buf", "optimizer_name"),
+        [
+            ("mxfp8", True, "adam"),
+            ("tensorwise", False, "adam"),
+            ("delayed", False, "adam"),
+            ("mxfp8", True, "muon"),
+        ],
     )
     def test_fp8_param_checkpoint_resume_is_bitwise_exact(
-        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe, reuse_grad_buf
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe, reuse_grad_buf, optimizer_name
     ):
         """A resumed run must hold exactly the quantized weights the saving run held.
 
@@ -743,6 +756,10 @@ class TestFP8Param:
         """
         if recipe == "mxfp8" and get_device_arch_version() < 10:
             pytest.skip("MXFP8 is supported since Blackwell architecture")
+        if optimizer_name == "muon" and Version(
+            os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")
+        ) <= Version("25.05"):
+            pytest.skip("Layer-wise optimizer is not supported on LTS")
         # Delayed scaling stores its FP8 metadata as a pickled TE extra state, which TE
         # refuses to load by default. This checkpoint is created by the test and is
         # therefore trusted.
@@ -751,7 +768,12 @@ class TestFP8Param:
             "overlap_param_gather": True,
             "overlap_grad_reduce": True,
             "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf,
+            "optimizer": optimizer_name,
         }
+        if optimizer_name == "muon":
+            # validate_args turns --optimizer muon + --use-distributed-optimizer into the
+            # layer-wise optimizer.
+            kwargs["muon_tp_mode"] = "duplicated"
         # TempNamedDir(sync=True) barriers, so the process group has to exist first.
         Utils.initialize_distributed()
         with TempNamedDir(tmp_path_dist_ckpt / "test_fp8_ckpt_resume", sync=True) as ckpt_dir:
