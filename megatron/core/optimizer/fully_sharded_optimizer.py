@@ -5,6 +5,7 @@
 from typing import Callable, List, Optional
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -130,9 +131,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
         """
-        from torch.distributed.tensor import DTensor
-
-        total_sq = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
+        total_norm_squared = torch.zeros(
+            (), dtype=torch.float32, device=torch.cuda.current_device()
+        )
         for parameter in self.get_parameters():
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
@@ -149,18 +150,18 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                             "MFSDP v2 gradient is still Partial when the norm is taken; "
                             "the reduction must be finalized first."
                         )
-                local = grad.to_local()
+                local_grad = grad.to_local()
             else:
-                local = grad
-            if local.numel():
-                total_sq += local.float().pow(2).sum() / replication
+                local_grad = grad
+            if local_grad.numel():
+                total_norm_squared += local_grad.float().pow(2).sum() / replication
 
         torch.distributed.all_reduce(
-            total_sq,
+            total_norm_squared,
             op=torch.distributed.ReduceOp.SUM,
             group=self.get_grad_stats_parallel_group(),
         )
-        return total_sq.sqrt()
+        return total_norm_squared.sqrt()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear optimizer-visible sharded grads and any grads filtered from local groups."""
