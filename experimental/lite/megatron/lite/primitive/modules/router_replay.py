@@ -185,11 +185,11 @@ class RouterReplay:
                     f"router replay mask length does not match routing rows: mask={mask.size(0)} rows={target.size(0)}."
                 )
             selected = torch.where(mask, target, native_indices)
-        self._record_replay_stats(native_indices, selected)
-        return selected
+        changed = self._record_replay_stats(native_indices, selected)
+        return native_indices if changed == 0 else selected
 
     @staticmethod
-    def _record_replay_stats(native: torch.Tensor, selected: torch.Tensor) -> None:
+    def _record_replay_stats(native: torch.Tensor, selected: torch.Tensor) -> int:
         """Accumulate how many routing rows replay actually changed.
 
         Counted per (token, top-k slot) row so the number is comparable across
@@ -197,9 +197,11 @@ class RouterReplay:
         on an already-resident int tensor.
         """
         with torch.no_grad():
+            changed = int((selected != native).sum().item())
             RouterReplay.replay_calls += 1
             RouterReplay.replay_rows_total += int(native.numel())
-            RouterReplay.replay_rows_changed += int((selected != native).sum().item())
+            RouterReplay.replay_rows_changed += changed
+        return changed
 
 
 def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
