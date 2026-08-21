@@ -292,6 +292,23 @@ def test_dense_chunk_metadata_cache_reuses_offsets(monkeypatch):
     assert first.chunk_offsets.tolist() == [0, 2, 4]
 
 
+def test_dense_chunk_metadata_cache_evicts_least_recently_used(monkeypatch):
+    implementation = _implementation()
+
+    implementation._clear_dense_chunk_metadata_cache_for_test()
+    monkeypatch.setattr(implementation, "_DENSE_CHUNK_METADATA_CACHE_LIMIT", 2)
+
+    first = implementation._dense_chunk_metadata(1, 64, torch.device("cpu"))
+    second = implementation._dense_chunk_metadata(2, 64, torch.device("cpu"))
+    assert implementation._dense_chunk_metadata(1, 64, torch.device("cpu")) is first
+
+    third = implementation._dense_chunk_metadata(3, 64, torch.device("cpu"))
+
+    cached_ids = {id(metadata) for metadata in implementation._dense_chunk_metadata_cache.values()}
+    assert cached_ids == {id(first), id(third)}
+    assert id(second) not in cached_ids
+
+
 def test_cutedsl_forward_uses_cached_dense_chunk_offsets(monkeypatch):
     implementation = _implementation()
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
@@ -533,6 +550,23 @@ def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch):
     assert result is expected
     assert seen["q"] is q
     assert seen["dht"] is None
+
+
+def test_fused_backward_zero_dht_cache_is_stream_scoped(monkeypatch):
+    implementation = _implementation()
+
+    implementation._fused_bwd_zero_dht_cache.clear()
+    stream_keys = iter([(0, 1), (0, 2), (0, 1)])
+    monkeypatch.setattr(
+        implementation, "_current_stream_cache_key", lambda _device: next(stream_keys)
+    )
+
+    first = implementation._fused_bwd_zero_dht(torch.device("cpu"), 1)
+    second = implementation._fused_bwd_zero_dht(torch.device("cpu"), 1)
+    third = implementation._fused_bwd_zero_dht(torch.device("cpu"), 1)
+
+    assert second is not first
+    assert third is first
 
 
 @pytest.mark.parametrize("use_saved_h", [False, True])

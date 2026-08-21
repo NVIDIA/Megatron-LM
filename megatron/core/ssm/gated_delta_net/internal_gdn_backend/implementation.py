@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import os
 import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,7 +41,10 @@ _CHUNK_SIZE = 64
 _BACKEND_ENV = "MCORE_GDN_INTERNAL_BACKEND"
 _FUSED_BWD_HEADS = 64
 _FUSED_BWD_HEAD_DIM = 128
-_fused_bwd_zero_dht_cache: dict[tuple[str, int | None, int], torch.Tensor] = {}
+_fused_bwd_zero_dht_cache: dict[
+    tuple[str, int | None, int, tuple[int, int] | None], torch.Tensor
+] = {}
+_DENSE_CHUNK_METADATA_CACHE_LIMIT = 64
 
 
 @dataclass(frozen=True)
@@ -76,9 +80,9 @@ class _DenseChunkMetadata:
 _packed_chunk_metadata_cache: dict[
     tuple[int, tuple[int, int] | None], _PackedChunkMetadataEntry
 ] = {}
-_dense_chunk_metadata_cache: dict[
+_dense_chunk_metadata_cache: OrderedDict[
     tuple[str, int | None, int, int, int, tuple[int, int] | None], _DenseChunkMetadata
-] = {}
+] = OrderedDict()
 
 
 def _clear_packed_chunk_metadata_cache_for_test() -> None:
@@ -370,10 +374,9 @@ def _device_cache_key(device: torch.device) -> tuple[str, int | None]:
 
 def _fused_bwd_zero_dht(device: torch.device, num_sequences: int) -> torch.Tensor:
     device = torch.device(device)
-    device_index = device.index
-    if device.type == "cuda" and device_index is None:
-        device_index = torch.cuda.current_device()
-    key = (device.type, device_index, num_sequences)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (*_device_cache_key(device), num_sequences, _current_stream_cache_key(device))
     cached = _fused_bwd_zero_dht_cache.get(key)
     if cached is None or cached.device != device:
         cached = torch.zeros(
@@ -601,7 +604,10 @@ def _dense_chunk_metadata(
     )
     cached = _dense_chunk_metadata_cache.get(key)
     if cached is not None and cached.cu_seqlens.device == device:
+        _dense_chunk_metadata_cache.move_to_end(key)
         return cached
+    if cached is not None:
+        _dense_chunk_metadata_cache.pop(key, None)
     cu_seqlens = torch.arange(
         0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32
     )
@@ -615,6 +621,8 @@ def _dense_chunk_metadata(
     )
     metadata = _DenseChunkMetadata(cu_seqlens=cu_seqlens, chunk_offsets=chunk_offsets)
     _dense_chunk_metadata_cache[key] = metadata
+    if len(_dense_chunk_metadata_cache) > _DENSE_CHUNK_METADATA_CACHE_LIMIT:
+        _dense_chunk_metadata_cache.popitem(last=False)
     return metadata
 
 
