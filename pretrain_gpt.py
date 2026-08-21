@@ -348,7 +348,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             cp_group=hybrid_cp_group,
             tokens_per_sample=args.seq_length,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        finalize_packed_seq_params(
+            packed_seq_params=packed_seq_params, cp_group=get_context_parallel_group()
+        )
 
     timers('batch-generator').stop()
 

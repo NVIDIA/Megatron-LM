@@ -80,8 +80,9 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
-) -> dist.ProcessGroup:
+    static_cp_group: Optional[dist.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams] = None,
+) -> Optional[dist.ProcessGroup]:
     """Return the dynamic CP group from packed_seq_params when available, else the static one.
 
     Dynamic CP assigns a per-microbatch CP group that may differ from the
