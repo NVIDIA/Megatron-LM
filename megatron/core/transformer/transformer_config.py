@@ -1425,6 +1425,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
+        elif self.num_query_groups <= 0:
+            raise ValueError(f"num_query_groups ({self.num_query_groups}) must be positive.")
+
+        if self.num_query_groups > 0 and self.num_attention_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
+                f"num_query_groups ({self.num_query_groups})."
+            )
 
         if (
             self.num_query_groups % self.tensor_model_parallel_size != 0

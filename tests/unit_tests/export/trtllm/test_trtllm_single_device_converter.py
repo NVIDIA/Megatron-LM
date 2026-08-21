@@ -25,7 +25,7 @@ class TestTRTLLMSingleDeviceConverter:
         model_config = TransformerConfig(
             num_layers=num_layers,
             num_attention_heads=num_attn_heads,
-            num_query_groups=0,
+            num_query_groups=num_attn_heads,
             hidden_size=hidden_dim,
             ffn_hidden_size=hidden_dim * 4,
         )
