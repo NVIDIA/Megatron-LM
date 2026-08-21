@@ -156,11 +156,10 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
     )
 
 
-def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
+def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False, v_dim=128):
     assert fused_mla_rope_kv_split is not None
     num_heads = 32
     k_dim = 128
-    v_dim = 128
     emb_dim = 64
     dtype = torch.bfloat16
     transformer_config = TransformerConfig(
@@ -300,6 +299,11 @@ class TestFusedApplyMLARope:
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):
         _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
+
+    def test_kv_split_forward_backward_zero_v_dim(self, input_format):
+        # v_dim == 0 produces zero-element value tensors, so the wrapper's
+        # output/grad reshapes must not rely on view(-1) shape inference.
+        _test_fused_mla_rope_kv_split(input_format, v_dim=0)
 
 
 @pytest.mark.experimental
