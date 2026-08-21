@@ -363,6 +363,16 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
+    dsa_indexer_weights_proj_use_quantization: bool = True
+    """Whether the DSA indexer weights projection follows the enclosing FP8/FP4
+    quantization context. Disable this to keep the projection parameter outside FP8/FP4;
+    ``dsa_indexer_weights_proj_output_dtype`` then controls its BF16 or FP32 output contract."""
+
+    dsa_indexer_weights_proj_output_dtype: Literal["bf16", "fp32"] = "bf16"
+    """Output dtype of the DSA indexer weights projection. BF16 preserves the existing
+    path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
+    backend. The final index scores remain FP32 independently of this option."""
+
     ####################
     # DeepSeek-v4 hybrid attention
     ####################
@@ -1710,6 +1720,32 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
+            if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
+                raise ValueError(
+                    "dsa_indexer_weights_proj_output_dtype must be either 'bf16' or 'fp32', got "
+                    f"{self.dsa_indexer_weights_proj_output_dtype!r}."
+                )
+            quantization_configured = bool(self.fp8 or self.fp4 or self.fp8_param or self.fp4_param)
+            if (
+                self.dsa_indexer_weights_proj_use_quantization
+                and self.dsa_indexer_weights_proj_output_dtype == "fp32"
+                and quantization_configured
+            ):
+                raise ValueError(
+                    "dsa_indexer_weights_proj_output_dtype='fp32' requires "
+                    "dsa_indexer_weights_proj_use_quantization=False when FP8/FP4 "
+                    "quantization is configured. Quantized TELinear does not expose a "
+                    "guaranteed true-FP32 output contract for this projection."
+                )
+            if (
+                self.dsa_indexer_weights_proj_output_dtype == "fp32"
+                and self.dsa_kernel_backend == "cudnn"
+            ):
+                raise ValueError(
+                    "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
+                    "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
+                    "Use dsa_kernel_backend='tilelang' or 'none'."
+                )
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
             if self.add_bias_linear:
                 raise ValueError(
