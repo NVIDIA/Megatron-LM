@@ -1,5 +1,6 @@
 import types
 
+import pytest
 import torch
 
 import megatron.lite.primitive.modules.dispatcher as dispatcher_module
@@ -303,3 +304,28 @@ def test_normal_deepep_finish_deduplicates_hash_routes() -> None:
         rtol=0,
         atol=0,
     )
+
+
+def test_normal_deepep_finish_rejects_permute_count_mismatch(monkeypatch) -> None:
+    dispatcher = TokenDispatcher.__new__(TokenDispatcher)
+    dispatcher.num_local_experts = 2
+    dispatcher.moe_permute_fusion = False
+    dispatcher.ps = types.SimpleNamespace(ep_group=object())
+    monkeypatch.setattr(dispatcher_module.dist, "get_rank", lambda *, group: 0)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "permute",
+        lambda hidden, *_args, **_kwargs: (
+            hidden[:1],
+            torch.ones(1),
+            torch.zeros(1, dtype=torch.long),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="dispatch metadata mismatch"):
+        dispatcher._finish_deepep_dispatch(
+            torch.ones(2, 16, dtype=torch.bfloat16),
+            torch.tensor([[0], [1]], dtype=torch.int64),
+            torch.ones(2, 1, dtype=torch.float32),
+            [1, 1],
+        )
