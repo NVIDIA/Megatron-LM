@@ -1045,6 +1045,57 @@ class TestStaticInputs:
 class TestDynamicMicrobatchSlots:
 
     @pytest.mark.internal
+    def test_parent_cp_transport_is_initialized_by_helper_constructor(self, monkeypatch):
+        from megatron.core.pipeline_parallel import p2p_communication
+        from megatron.core.transformer import cuda_graphs
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        parent_group = object()
+        capture_contexts = ((8, object()), (4, object()))
+        calls = []
+        monkeypatch.setattr(cuda_graphs, 'HAVE_TE_GRAPHS', True)
+        monkeypatch.setattr(p2p_communication, 'P2PCommunicator', lambda **kwargs: object())
+        monkeypatch.setattr(TECudaGraphHelper, '_discover_layers', lambda self: None)
+        monkeypatch.setattr(
+            TECudaGraphHelper, '_publish_thd_rotary_seq_lens', lambda self, lengths: None
+        )
+        monkeypatch.setattr(TECudaGraphHelper, '_should_share_dynamic_cp_pool', lambda self: True)
+        monkeypatch.setattr(
+            TECudaGraphHelper,
+            '_get_dynamic_cp_capture_contexts',
+            lambda self: capture_contexts,
+        )
+        monkeypatch.setattr(
+            TECudaGraphHelper,
+            '_set_dynamic_cp_p2p_transport',
+            lambda self, contexts, group: calls.append(('set', contexts, group)),
+        )
+        monkeypatch.setattr(
+            TECudaGraphHelper,
+            '_warmup_dynamic_cp_communicators',
+            lambda self, contexts, group: calls.append(('warmup', contexts, group)),
+        )
+
+        helper = TECudaGraphHelper(
+            model=[],
+            config=SimpleNamespace(
+                cuda_graph_impl='transformer_engine', max_seqlen_per_dp_cp_rank=None
+            ),
+            seq_length=1,
+            micro_batch_size=1,
+            pg_collection=SimpleNamespace(
+                tp=object(), dp=object(), dp_cp=parent_group, pp=object()
+            ),
+        )
+
+        assert helper._reuse_parent_cp_transport is True
+        assert helper._dynamic_cp_transport_contexts == capture_contexts
+        assert calls == [
+            ('set', capture_contexts, parent_group),
+            ('warmup', capture_contexts, parent_group),
+        ]
+
+    @pytest.mark.internal
     def test_dynamic_cp_graph_bank_and_capture_contexts(self, monkeypatch):
         from megatron.core import parallel_state
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper

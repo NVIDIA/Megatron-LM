@@ -1804,6 +1804,27 @@ class TECudaGraphHelper:
         # mHC direct-write arena.
         self._mhc_sample_order_intervals = {}
 
+        # TE graph capture happens after the configured eager warmup iterations. Route
+        # those iterations through the same parent transport as capture, otherwise the
+        # logical CP communicators are initialized before they can be avoided.
+        self._reuse_parent_cp_transport = self._should_share_dynamic_cp_pool()
+        self._dynamic_cp_transport_contexts = ()
+        if self._reuse_parent_cp_transport:
+            try:
+                self._dynamic_cp_transport_contexts = tuple(self._get_dynamic_cp_capture_contexts())
+                self._set_dynamic_cp_p2p_transport(
+                    self._dynamic_cp_transport_contexts, self.dp_cp_group
+                )
+                self._warmup_dynamic_cp_communicators(
+                    self._dynamic_cp_transport_contexts, self.dp_cp_group
+                )
+            except BaseException:
+                self._set_dynamic_cp_p2p_transport(self._dynamic_cp_transport_contexts, None)
+                self._dynamic_cp_transport_contexts = ()
+                self._reuse_parent_cp_transport = False
+                self._clear_thd_rotary_seq_lens()
+                raise
+
     def _uses_mhc_direct_write_arena(self):
         """Whether attention-only graphs consume eager mHC recompute outputs."""
         from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
@@ -1854,27 +1875,6 @@ class TECudaGraphHelper:
                         "windows overlap in the capture order; aliasing them would "
                         "corrupt the recompute direct-write replay"
                     )
-
-        # TE graph capture happens after the configured eager warmup iterations. Route
-        # those iterations through the same parent transport as capture, otherwise the
-        # logical CP communicators are initialized before they can be avoided.
-        self._reuse_parent_cp_transport = self._should_share_dynamic_cp_pool()
-        self._dynamic_cp_transport_contexts = ()
-        if self._reuse_parent_cp_transport:
-            try:
-                self._dynamic_cp_transport_contexts = tuple(self._get_dynamic_cp_capture_contexts())
-                self._set_dynamic_cp_p2p_transport(
-                    self._dynamic_cp_transport_contexts, self.dp_cp_group
-                )
-                self._warmup_dynamic_cp_communicators(
-                    self._dynamic_cp_transport_contexts, self.dp_cp_group
-                )
-            except BaseException:
-                self._set_dynamic_cp_p2p_transport(self._dynamic_cp_transport_contexts, None)
-                self._dynamic_cp_transport_contexts = ()
-                self._reuse_parent_cp_transport = False
-                self._clear_thd_rotary_seq_lens()
-                raise
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
@@ -3251,7 +3251,9 @@ class TECudaGraphHelper:
         layer.cuda_graphs = []
         layer.cuda_graphs_by_dynamic_cp_size = {}
         layer.cuda_graph_manual_hooks = []
-        layer.clear_te_cuda_graph_static_hidden_inputs()
+        clear_static_inputs = getattr(layer, 'clear_te_cuda_graph_static_hidden_inputs', None)
+        if clear_static_inputs is not None:
+            clear_static_inputs()
         for module in layer.modules():
             vars(module).pop('_cuda_graph_static_tensor_refs', None)
 
