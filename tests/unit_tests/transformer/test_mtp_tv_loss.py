@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from unittest import mock
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,7 +12,9 @@ from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.multi_token_prediction import (
+    ContiguousPackedCPRollContext,
     MTPLossAutoScaler,
+    ZigzagPackedCPRollContext,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
@@ -252,10 +256,14 @@ def test_process_mtp_e2e_tv_uses_fused_tv_prefix_and_logs_each_depth(monkeypatch
 
     original_fused_tv = fused_tv_module._fused_vocab_parallel_tv_distance
 
-    def record_fused_tv(draft_logits, target_logits, tp_group, logits_are_vocab_sharded):
+    def record_fused_tv(
+        draft_logits, target_logits, tp_group, logits_are_vocab_sharded, **row_addressing
+    ):
         assert draft_logits.is_contiguous()
         assert target_logits.is_contiguous()
-        result = original_fused_tv(draft_logits, target_logits, tp_group, logits_are_vocab_sharded)
+        result = original_fused_tv(
+            draft_logits, target_logits, tp_group, logits_are_vocab_sharded, **row_addressing
+        )
         fused_tv_distances.append(result.detach().clone())
         return result
 
@@ -396,7 +404,27 @@ def test_process_mtp_e2e_tv_contiguous_packed_cp2_matches_global_reference(monke
         tv_distance = mtp_module.vocab_parallel_tv_distance
 
         def capture_target(draft_logits, target_logits, **kwargs):
-            captured_target_steps.append(target_logits.detach().clone())
+            target_row_indices = kwargs.get("target_row_indices")
+            if target_row_indices is None:
+                captured_target = target_logits.detach().clone()
+            else:
+                target_valid_rows = kwargs["target_valid_rows"]
+                target_halo_logits = kwargs.get("target_halo_logits")
+                vocab_size = target_logits.size(-1)
+                target_rows = target_logits.detach().reshape(-1, vocab_size)
+                if target_halo_logits is not None:
+                    target_rows = torch.cat(
+                        (target_rows, target_halo_logits.detach().reshape(-1, vocab_size)), dim=0
+                    )
+                flat_indices = target_row_indices.reshape(-1).long()
+                flat_valid = target_valid_rows.reshape(-1)
+                flat_valid = flat_valid & (flat_indices >= 0) & (flat_indices < target_rows.size(0))
+                safe_indices = torch.where(flat_valid, flat_indices, 0)
+                captured_target = target_rows.index_select(0, safe_indices).view_as(draft_logits)
+                captured_target.masked_fill_(
+                    ~flat_valid.view_as(target_valid_rows).unsqueeze(-1), 0
+                )
+            captured_target_steps.append(captured_target)
             return tv_distance(draft_logits, target_logits, **kwargs)
 
         monkeypatch.setattr(mtp_module, "vocab_parallel_tv_distance", capture_target)
@@ -506,3 +534,383 @@ def test_vocab_parallel_tv_tp2_matches_full_vocab_reference(logits_are_vocab_sha
         torch.testing.assert_close(local_draft.grad, expected_local_grad, rtol=1e-5, atol=1e-6)
     finally:
         Utils.destroy_model_parallel()
+
+
+def _zigzag_local_rows(global_tensor: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
+    """Shard a sequence-last tensor into MCore's front/mirrored-back zigzag layout."""
+    sequence_length = global_tensor.size(-1)
+    assert sequence_length % (2 * cp_size) == 0
+    chunk_length = sequence_length // (2 * cp_size)
+    chunks = global_tensor.split(chunk_length, dim=-1)
+    return torch.cat((chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]), dim=-1).contiguous()
+
+
+def _run_mtp_loss_and_grad(
+    *,
+    hidden_template: torch.Tensor,
+    labels: torch.Tensor | None,
+    loss_mask: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    output_layer,
+    output_weight: torch.Tensor | None,
+    config: TransformerConfig,
+    cp_group=None,
+    tp_group=None,
+    packed_seq_params: PackedSeqParams | None = None,
+    sequence_roll_context=None,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...], torch.Tensor | None]:
+    """Return visible output, hidden/weight gradients, and losses passed to autograd."""
+    hidden = hidden_template.detach().clone().requires_grad_(True)
+    layer_weight = getattr(output_layer, "weight", None)
+    if isinstance(layer_weight, torch.Tensor) and layer_weight.grad is not None:
+        layer_weight.grad = None
+
+    def language_model_loss(current_labels, logits):
+        vocab_size = logits.size(-1)
+        sequence_major_loss = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            current_labels.transpose(0, 1).reshape(-1),
+            reduction="none",
+        ).view(logits.shape[:-1])
+        return sequence_major_loss.transpose(0, 1).contiguous()
+
+    MTPLossAutoScaler.set_loss_scale(hidden.new_tensor(1.0))
+    normalized_losses = []
+    original_apply = MTPLossAutoScaler.apply
+
+    def record_loss(output, normalized_loss):
+        normalized_losses.append(normalized_loss.detach().clone())
+        return original_apply(output, normalized_loss)
+
+    with mock.patch.object(MTPLossAutoScaler, "apply", side_effect=record_loss):
+        output = process_mtp_loss(
+            hidden_states=hidden,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=False if tp_group is not None else True,
+            is_training=False,
+            compute_language_model_loss=language_model_loss,
+            config=config,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            packed_seq_params=packed_seq_params,
+            input_ids=input_ids,
+            sequence_roll_context=sequence_roll_context,
+        )
+    output.sum().backward()
+    assert hidden.grad is not None
+    layer_weight_grad = getattr(layer_weight, "grad", None)
+    return (
+        output.detach(),
+        hidden.grad.detach(),
+        tuple(normalized_losses),
+        None if layer_weight_grad is None else layer_weight_grad.detach().clone(),
+    )
+
+
+def test_e2e_tv_direct_rows_compose_tp2_with_contiguous_cp2(monkeypatch):
+    """TP-sharded TV and contiguous-CP row addressing compose in one consumer."""
+    if Utils.world_size < 4:
+        pytest.skip("TP2 x CP2 direct TV requires at least four distributed ranks")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        tp_rank = torch.distributed.get_rank(group=tp_group)
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        num_depths = 2
+        global_sequence_length = 8
+        local_sequence_length = global_sequence_length // 2
+        hidden_size = 4
+        global_vocab_size = 10
+
+        torch.manual_seed(101)
+        global_hidden = torch.randn(
+            (1 + num_depths) * global_sequence_length, 1, hidden_size, device="cuda"
+        )
+        local_chunks = [
+            chunk.narrow(0, cp_rank * local_sequence_length, local_sequence_length).contiguous()
+            for chunk in torch.chunk(global_hidden, 1 + num_depths, dim=0)
+        ]
+        local_hidden = torch.cat(local_chunks, dim=0)
+        full_weight = torch.randn(global_vocab_size, hidden_size, device="cuda")
+        local_weight = full_weight.chunk(2, dim=0)[tp_rank].contiguous()
+
+        class ShardedOutputLayer:
+            gather_output = False
+
+            def __call__(self, hidden, weight=None, runtime_gather_output=None):
+                assert runtime_gather_output is False
+                return torch.matmul(hidden, weight.t()), None
+
+        config = _make_tv_config(num_depths, hidden_size)
+        cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=6,
+            max_seqlen_kv=6,
+            qkv_format="thd",
+            cp_partition_mode="contiguous",
+        )
+        local_labels = torch.zeros(1, local_sequence_length, dtype=torch.long, device="cuda")
+        local_loss_mask = torch.ones_like(local_labels, dtype=torch.float32)
+        bare_context = prepare_mtp_sequence_roll_context(local_labels, cp_group, packed_seq_params)
+        assert isinstance(bare_context, ContiguousPackedCPRollContext)
+
+        original_tv = mtp_module.vocab_parallel_tv_distance
+        addressed_calls = 0
+
+        def record_addressing(*args, **kwargs):
+            nonlocal addressed_calls
+            addressed_calls += int(kwargs.get("target_row_indices") is not None)
+            return original_tv(*args, **kwargs)
+
+        monkeypatch.setattr(mtp_module, "vocab_parallel_tv_distance", record_addressing)
+        direct_output, direct_grad, direct_losses, _ = _run_mtp_loss_and_grad(
+            hidden_template=local_hidden,
+            labels=local_labels,
+            loss_mask=local_loss_mask,
+            input_ids=None,
+            output_layer=ShardedOutputLayer(),
+            output_weight=local_weight,
+            config=config,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            packed_seq_params=packed_seq_params,
+            sequence_roll_context=bare_context,
+        )
+
+        torch.distributed.barrier()
+        fallback_output, fallback_grad, fallback_losses, _ = _run_mtp_loss_and_grad(
+            hidden_template=local_hidden,
+            labels=local_labels,
+            loss_mask=local_loss_mask,
+            input_ids=None,
+            output_layer=ShardedOutputLayer(),
+            output_weight=local_weight,
+            config=config,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            packed_seq_params=packed_seq_params,
+            sequence_roll_context=None,
+        )
+        # Keep rank-local assertions after every TP/CP collective in both paths;
+        # otherwise one failing rank can enter teardown while peers run fallback.
+        torch.distributed.barrier()
+        assert addressed_calls == num_depths
+        torch.testing.assert_close(direct_output, fallback_output, rtol=0, atol=0)
+        torch.testing.assert_close(direct_grad, fallback_grad, rtol=1e-5, atol=1e-6)
+        assert len(direct_losses) == len(fallback_losses) == 1
+        torch.testing.assert_close(direct_losses[0], fallback_losses[0], rtol=1e-5, atol=1e-6)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("derived_labels", [False, True], ids=["sft", "rl"])
+def test_e2e_tv_certified_dynamic_zigzag_matches_roll_loss_and_gradient(
+    monkeypatch, derived_labels
+):
+    """Certified dynamic zigzag addressing preserves SFT/RL TV consumer semantics."""
+    if Utils.world_size < 2:
+        pytest.skip("Certified zigzag TV parity requires at least two distributed ranks")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+    try:
+        cp_group = parallel_state.get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        cp_size = torch.distributed.get_world_size(group=cp_group)
+        num_depths = 2
+        global_sequence_length = 12
+        hidden_size = 5
+
+        torch.manual_seed(211)
+        global_hidden_chunks = torch.chunk(
+            torch.randn((1 + num_depths) * global_sequence_length, 1, hidden_size, device="cuda"),
+            1 + num_depths,
+            dim=0,
+        )
+        local_hidden = torch.cat(
+            [
+                _zigzag_local_rows(chunk.permute(1, 2, 0), cp_rank, cp_size).permute(2, 0, 1)
+                for chunk in global_hidden_chunks
+            ],
+            dim=0,
+        )
+        global_input_ids = torch.arange(global_sequence_length, device="cuda").view(1, -1)
+        global_labels = (global_input_ids + 1).remainder(hidden_size)
+        global_loss_mask = torch.ones(1, global_sequence_length, device="cuda")
+        global_loss_mask[:, 4] = 0
+        global_loss_mask[:, -1] = 0
+        local_input_ids = _zigzag_local_rows(global_input_ids, cp_rank, cp_size)
+        local_labels = _zigzag_local_rows(global_labels, cp_rank, cp_size)
+        local_loss_mask = _zigzag_local_rows(global_loss_mask, cp_rank, cp_size)
+
+        cu_seqlens = torch.tensor([0, global_sequence_length], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=global_sequence_length,
+            max_seqlen_kv=global_sequence_length,
+            qkv_format="thd",
+            local_cp_size=cp_size,
+            cp_group=cp_group,
+            cp_partition_mode="zigzag",
+            zigzag_cp_min_chunk_size=global_sequence_length // (2 * cp_size),
+        )
+        source = local_input_ids if derived_labels else local_labels
+        bare_context = prepare_mtp_sequence_roll_context(source, None, packed_seq_params)
+        assert isinstance(bare_context, ZigzagPackedCPRollContext)
+        assert bare_context.cp_group is packed_seq_params.cp_group
+        config = _make_tv_config(num_depths, hidden_size)
+        output_layer = _OutputLayer(torch.eye(hidden_size, device="cuda"))
+        original_tv = mtp_module.vocab_parallel_tv_distance
+        addressed_calls = 0
+
+        def record_addressing(*args, **kwargs):
+            nonlocal addressed_calls
+            addressed_calls += int(kwargs.get("target_row_indices") is not None)
+            return original_tv(*args, **kwargs)
+
+        monkeypatch.setattr(mtp_module, "vocab_parallel_tv_distance", record_addressing)
+
+        direct_output, direct_grad, direct_losses, _ = _run_mtp_loss_and_grad(
+            hidden_template=local_hidden,
+            labels=None if derived_labels else local_labels,
+            loss_mask=local_loss_mask,
+            input_ids=local_input_ids if derived_labels else None,
+            output_layer=output_layer,
+            output_weight=None,
+            config=config,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            sequence_roll_context=bare_context,
+        )
+        torch.distributed.barrier()
+        fallback_output, fallback_grad, fallback_losses, _ = _run_mtp_loss_and_grad(
+            hidden_template=local_hidden,
+            labels=None if derived_labels else local_labels,
+            loss_mask=local_loss_mask,
+            input_ids=local_input_ids if derived_labels else None,
+            output_layer=output_layer,
+            output_weight=None,
+            config=config,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            sequence_roll_context=None,
+        )
+        torch.distributed.barrier()
+        assert addressed_calls == num_depths
+        torch.testing.assert_close(direct_output, fallback_output, rtol=0, atol=0)
+        torch.testing.assert_close(direct_grad, fallback_grad, rtol=1e-5, atol=1e-6)
+        assert len(direct_losses) == len(fallback_losses) == 1
+        torch.testing.assert_close(direct_losses[0], fallback_losses[0], rtol=1e-5, atol=1e-6)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("loss_type", ["cross_entropy", "e2e_tv"], ids=["ce", "tv"])
+@pytest.mark.parametrize("derived_labels", [False, True], ids=["sft", "rl"])
+def test_aligned_rows_per_token_normalization_matches_roll(loss_type, derived_labels):
+    """Absolute rows preserve SFT/RL per-token scaling for CE and TV consumers."""
+    torch.manual_seed(307)
+    num_depths = 2
+    sequence_length = 7
+    hidden_size = 5
+    hidden_template = torch.randn(
+        (1 + num_depths) * sequence_length, 1, hidden_size, dtype=torch.float32
+    )
+    input_ids = torch.tensor([[0, 1, 2, 3, 4, 0, 1]], dtype=torch.long)
+    labels = torch.tensor([[1, 2, 3, 4, 0, 1, 2]], dtype=torch.long)
+    loss_mask = torch.tensor([[1, 1, 0, 1, 1, 0, 1]], dtype=torch.float32)
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=hidden_size,
+        num_attention_heads=1,
+        mtp_num_layers=num_depths,
+        mtp_loss_type=loss_type,
+        mtp_detach_heads=loss_type == "e2e_tv",
+        mtp_loss_scaling_factor=0.75,
+        calculate_per_token_loss=True,
+        use_cpu_initialization=True,
+    )
+    output_weight = torch.eye(hidden_size)
+    direct_output_layer = _OutputLayer(output_weight.clone())
+    fallback_output_layer = _OutputLayer(output_weight.clone())
+    source = input_ids if derived_labels else labels
+    bare_context = prepare_mtp_sequence_roll_context(source, None, None)
+    assert bare_context is not None
+    original_prepare = mtp_module._prepare_mtp_sequence_roll_fields
+    original_roll = mtp_module.roll_tensor
+    original_tv = mtp_module.vocab_parallel_tv_distance
+    prepared_groups = 0
+    direct_roll_calls = 0
+    addressed_tv_calls = 0
+
+    def record_prepare(*args, **kwargs):
+        nonlocal prepared_groups
+        result = original_prepare(*args, **kwargs)
+        prepared_groups += int(result is not None)
+        return result
+
+    def record_roll(*args, **kwargs):
+        nonlocal direct_roll_calls
+        direct_roll_calls += 1
+        return original_roll(*args, **kwargs)
+
+    def record_tv(*args, **kwargs):
+        nonlocal addressed_tv_calls
+        addressed_tv_calls += int(kwargs.get("target_row_indices") is not None)
+        return original_tv(*args, **kwargs)
+
+    with (
+        mock.patch.object(
+            mtp_module, "_prepare_mtp_sequence_roll_fields", side_effect=record_prepare
+        ),
+        mock.patch.object(mtp_module, "roll_tensor", side_effect=record_roll),
+        mock.patch.object(mtp_module, "vocab_parallel_tv_distance", side_effect=record_tv),
+    ):
+        direct_output, direct_grad, direct_losses, direct_weight_grad = _run_mtp_loss_and_grad(
+            hidden_template=hidden_template,
+            labels=None if derived_labels else labels,
+            loss_mask=loss_mask,
+            input_ids=input_ids if derived_labels else None,
+            output_layer=direct_output_layer,
+            output_weight=None,
+            config=config,
+            sequence_roll_context=bare_context,
+        )
+
+    fallback_output, fallback_grad, fallback_losses, fallback_weight_grad = _run_mtp_loss_and_grad(
+        hidden_template=hidden_template,
+        labels=None if derived_labels else labels,
+        loss_mask=loss_mask,
+        input_ids=input_ids if derived_labels else None,
+        output_layer=fallback_output_layer,
+        output_weight=None,
+        config=config,
+        sequence_roll_context=None,
+    )
+    assert prepared_groups > 0
+    assert direct_roll_calls == 0
+    assert addressed_tv_calls == (num_depths if loss_type == "e2e_tv" else 0)
+    torch.testing.assert_close(direct_output, fallback_output, rtol=0, atol=0)
+    torch.testing.assert_close(direct_grad, fallback_grad, rtol=1e-6, atol=1e-6)
+    assert len(direct_losses) == len(fallback_losses)
+    for direct_loss, fallback_loss in zip(direct_losses, fallback_losses):
+        torch.testing.assert_close(direct_loss, fallback_loss, rtol=1e-6, atol=1e-6)
+    if loss_type == "cross_entropy":
+        assert direct_weight_grad is not None
+        assert fallback_weight_grad is not None
+        torch.testing.assert_close(direct_weight_grad, fallback_weight_grad, rtol=1e-6, atol=1e-6)
+    else:
+        assert direct_weight_grad is None
+        assert fallback_weight_grad is None

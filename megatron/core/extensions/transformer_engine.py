@@ -1753,11 +1753,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         # These fields are MCore-only and should not be forwarded to TE attention.
         # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
-        # MoE sequence-level aux loss reshaping; cp_partition_mode is MCore CP metadata.
+        # MoE sequence-level aux loss reshaping; the remaining fields are MCore CP metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
+        self.kept_packed_seq_params.discard("zigzag_cp_min_chunk_size")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
