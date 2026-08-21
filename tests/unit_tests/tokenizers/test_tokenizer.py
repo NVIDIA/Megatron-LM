@@ -632,7 +632,7 @@ class TestBuildTokenizer:
 
         tokenizer_default = build_tokenizer(config)
 
-        # Verify gigatoken matches with default implementation
+        # Verify gigatoken matches with default implemetation
         text = "Hi how are you? How was your day? :)"
         ids = [128000, 13347, 1268, 527, 499, 30, 2650, 574, 701, 1938, 30, 27046]
         assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
