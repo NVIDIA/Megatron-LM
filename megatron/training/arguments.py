@@ -4260,10 +4260,20 @@ def _add_distributed_args(parser):
     group.add_argument(
         '--fsdp-double-buffer',
         action='store_true',
-        help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
-        "Double-buffering the communication memory improves memory management efficiency by "
-        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
-        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+        help="Enable persistent buffer pools for temporary memory needed for Megatron FSDP "
+        "communications. The legacy option name does not fix the pool capacity at two; use "
+        "--fsdp-buffer-count to control it. Persistent communication memory improves memory "
+        "management efficiency by reusing previously allocated buffers. This is required for "
+        "user buffer registration and is enabled automatically when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers in each Megatron FSDP communication pool. "
+        "The default of two provides conventional double buffering; combined 1F1B "
+        "overlap with forward prefetch requires at least three. A non-default value requires "
+        "--fsdp-double-buffer, --nccl-ub, or --megatron-fsdp-max-pool-double-buffer.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',
