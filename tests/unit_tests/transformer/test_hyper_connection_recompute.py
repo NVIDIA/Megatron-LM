@@ -643,6 +643,30 @@ class TestTransformerConfigRecomputeMhc:
             )
         assert config.virtual_pipeline_model_parallel_size == 2
 
+    def test_config_rejects_te_whole_layer_capture_with_ep_overlap(self):
+        """Empty cuda_graph_modules means whole-layer TE capture, which covers
+        the MoE/MLP part; the generic overlap gate must reject it at config
+        time exactly like an explicit moe/mlp scope, mirroring the runtime
+        assert ("EP overlap must be disabled when CUDA graph captures the
+        whole MLP/MoE part"). This is a generic (non-mHC) gate; it lives here
+        with the rest of the overlap-config matrix."""
+        with pytest.raises(AssertionError, match="whole-layer"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    num_layers=4,
+                    cuda_graph_impl="transformer_engine",
+                    cuda_graph_modules=[],
+                    pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.bfloat16,
+                    overlap_moe_expert_parallel_comm=True,
+                    expert_model_parallel_size=2,
+                    num_moe_experts=4,
+                    moe_token_dispatcher_type="alltoall",
+                    bf16=True,
+                )
+            )
+
     def test_config_accepts_full_iteration_vpp_with_ep_overlap(self):
         """full_iteration + VPP + EP overlap is admitted (overlap is exercised
         here but no longer required): the divergence that used to gate this came

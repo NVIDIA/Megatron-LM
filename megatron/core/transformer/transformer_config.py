@@ -3241,6 +3241,15 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_attn_cuda_graph_split to capture the whole attention "
                     "range instead."
                 )
+            if self.sequence_packing_scheduler is not None:
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split does not support packed "
+                    "(THD) sequences: THD capture takes cu_seqlens_*/padding_mask "
+                    "as captured kwargs and the split's replay does not forward "
+                    "them, so the first replay fails at the Transformer Engine "
+                    "boundary. Keep the switch off on packed-sequence runs to "
+                    "capture the whole attention range instead."
+                )
             if self.fine_grained_activation_offloading:
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
                 # TransformerLayer's implementation for the split rather than extending
@@ -3590,13 +3599,19 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
+                    # Empty cuda_graph_modules means whole-layer capture, which
+                    # covers the MoE/MLP part just like an explicit moe/mlp
+                    # scope does, so it must be rejected here too — the replay
+                    # asserts the same condition at runtime.
                     assert (
-                        self.cuda_graph_impl == "transformer_engine"
+                        self.cuda_graph_modules
                         and CudaGraphModule.moe not in self.cuda_graph_modules
                         and CudaGraphModule.mlp not in self.cuda_graph_modules
                     ), (
-                        'CUDA graph scope on moe and mlp is not '
-                        'supported with overlap_moe_expert_parallel_comm'
+                        'CUDA graph capture covering the MoE/MLP part (scope moe '
+                        'or mlp, or empty cuda_graph_modules meaning whole-layer '
+                        'capture) is not supported with '
+                        'overlap_moe_expert_parallel_comm'
                     )
 
         # Check delay_wgrad_compute compatibility
