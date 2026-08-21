@@ -387,16 +387,6 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
-def _validate_rl_refit_method(args: argparse.Namespace) -> None:
-    """Reject ReFIT backends the built-in RL loop cannot drive."""
-    if args.refit_method == 'nccl_m2n':
-        raise ValueError(
-            "--refit-method nccl_m2n requires disjoint source and destination rank sets, "
-            "which the built-in RL loop never creates; use nccl/gloo/nvshmem here, or drive "
-            "NCCL M2N through swap_model_weights directly"
-        )
-
-
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -459,7 +449,7 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:
-        _validate_rl_refit_method(args)
+        assert args.refit_method != 'nccl_m2n', 'nccl_m2n is unsupported by the built-in RL loop'
 
         # ----------------------------------------------------------------
         # CUDA graphs
