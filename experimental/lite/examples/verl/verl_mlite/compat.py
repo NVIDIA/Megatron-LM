@@ -461,52 +461,6 @@ def _patch_transformers_apply_chat_template_return_dict() -> bool:
     return True
 
 
-def _trace_runtime_patch(stage: str, result: Any = None) -> None:
-    """Report patch ordering only for an explicitly traced startup."""
-    if os.environ.get("VERL_MLITE_RUNTIME_PATCH_TRACE") != "1":
-        return
-
-    import json
-
-    transformers = sys.modules.get("transformers")
-    module_vars = vars(transformers) if transformers is not None else {}
-    objects = module_vars.get("_objects")
-    missing = object()
-
-    def raw_binding(name: str) -> tuple[Any, str]:
-        if name in module_vars:
-            return module_vars[name], "namespace"
-        if isinstance(objects, dict) and name in objects:
-            return objects[name], "_objects"
-        return missing, "absent"
-
-    alias, alias_source = raw_binding("AutoModelForVision2Seq")
-    replacement, replacement_source = raw_binding(
-        "AutoModelForImageTextToText"
-    )
-    payload = {
-        "alias_is_replacement": (
-            alias is not missing
-            and replacement is not missing
-            and alias is replacement
-        ),
-        "alias_source": alias_source,
-        "changed": result,
-        "event": "runtime_patch",
-        "pid": os.getpid(),
-        "replacement_source": replacement_source,
-        "step": stage,
-        "transformers_file": module_vars.get("__file__"),
-        "transformers_id": id(transformers) if transformers is not None else None,
-        "transformers_loaded": transformers is not None,
-    }
-    sys.stderr.write(
-        "VERL_MLITE_RUNTIME_PATCH_TRACE "
-        f"{json.dumps(payload, sort_keys=True)}\n"
-    )
-    sys.stderr.flush()
-
-
 def _patch_verl_dsv4_mxfp4_check() -> bool:
     """Make verl's DeepSeek-V4 mxfp4 MoE check factory-aware for vLLM >= 0.24.
 
@@ -1290,35 +1244,19 @@ def _patch_bucketed_weight_sender() -> bool:
 
 
 def apply_runtime_patches() -> None:
-    _trace_runtime_patch("00.begin")
-    result = _patch_transformers_vision2seq_alias()
-    _trace_runtime_patch("01.transformers_alias", result)
-    result = _register_opaque_hf_config()
-    _trace_runtime_patch("02.opaque_hf_config", result)
-    result = _install_vllm_thin_finder()
-    _trace_runtime_patch("03.vllm_thin_finder", result)
-    result = _install_vllm_triton_kernels_alias()
-    _trace_runtime_patch("04.vllm_triton_kernels_alias", result)
-    result = _patch_verl_vllm_device_uuid()
-    _trace_runtime_patch("05.verl_vllm_device_uuid", result)
+    _patch_transformers_vision2seq_alias()
+    _register_opaque_hf_config()
+    _install_vllm_thin_finder()
+    _install_vllm_triton_kernels_alias()
+    _patch_verl_vllm_device_uuid()
     # Importing VERL's vLLM utilities can rebuild Transformers' lazy top-level
     # module, which drops compatibility attributes installed on the old module.
-    result = _patch_transformers_vision2seq_alias()
-    _trace_runtime_patch("06.transformers_alias_after_uuid", result)
-    result = _patch_transformers_rope_ignore_keys()
-    _trace_runtime_patch("07.transformers_rope_ignore_keys", result)
-    result = _patch_transformers_apply_chat_template_return_dict()
-    _trace_runtime_patch("07b.transformers_apply_chat_template_return_dict", result)
-    result = _patch_bucketed_weight_sender()
-    _trace_runtime_patch("08.bucketed_weight_sender", result)
-    result = _patch_verl_dsv4_mxfp4_check()
-    _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
-    # Current VERL owns the DS4 native layerwise reload lifecycle directly in
-    # vllm_quant_utils.  Do not patch the retired vllm_fp8_utils entry point.
-    _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", False)
-    result = _patch_vllm_server_profile()
-    _trace_runtime_patch("09.vllm_server_profile", result)
-    _trace_runtime_patch("10.end")
+    _patch_transformers_vision2seq_alias()
+    _patch_transformers_rope_ignore_keys()
+    _patch_transformers_apply_chat_template_return_dict()
+    _patch_bucketed_weight_sender()
+    _patch_verl_dsv4_mxfp4_check()
+    _patch_vllm_server_profile()
 
 
 def _load_verl_file(relative_path: str, module_name: str):

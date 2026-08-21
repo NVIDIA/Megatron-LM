@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,22 +166,6 @@ def test_mlite_config_preserves_protocol_owned_non_thd_layout() -> None:
     assert config.impl == "vllm"
     assert config.impl_cfg["use_thd"] is False
     assert config.impl_cfg["use_deepep"] is True
-
-
-def test_parameter_snapshot_records_step_change(monkeypatch, tmp_path) -> None:
-    from verl_mlite.engine.mlite_engine import _write_parameter_snapshot
-
-    module = torch.nn.Linear(2, 2, bias=False)
-    monkeypatch.setenv("VERL_MLITE_PARAM_SNAPSHOT_DIR", str(tmp_path))
-    _write_parameter_snapshot(module, phase="pre_step", rank=0)
-    with torch.no_grad():
-        module.weight.add_(1)
-    _write_parameter_snapshot(module, phase="post_step", rank=0)
-
-    before = json.loads((tmp_path / "rank00000.pre_step.json").read_text())
-    after = json.loads((tmp_path / "rank00000.post_step.json").read_text())
-    assert before["sampled_sha256"] != after["sampled_sha256"]
-    assert before["parameter_count"] == after["parameter_count"] == 4
 
 
 @pytest.mark.parametrize("zero_grad_on_exit, expected_calls", [(True, 1), (False, 0)])

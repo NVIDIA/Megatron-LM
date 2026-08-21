@@ -3,11 +3,8 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import os
-import time
 import weakref
 from contextlib import nullcontext
 from enum import Enum
@@ -84,44 +81,6 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
         or getattr(pad_mode, "value", None) == "no_padding"
         or str(pad_mode) in {"no_padding", "DatasetPadMode.NO_PADDING"}
     )
-
-
-def _write_parameter_snapshot(module: torch.nn.Module, *, phase: str, rank: int) -> None:
-    root = os.environ.get("VERL_MLITE_PARAM_SNAPSHOT_DIR")
-    if not root:
-        return
-    digest = hashlib.sha256()
-    tensor_count = 0
-    parameter_count = 0
-    for name, parameter in module.named_parameters():
-        value = parameter.detach()
-        if value.is_meta:
-            continue
-        flat = value.contiguous().view(torch.uint8).reshape(-1)
-        sample = (
-            flat
-            if flat.numel() <= 128
-            else torch.cat((flat[:64], flat[-64:]))
-        ).cpu()
-        digest.update(name.encode("utf-8"))
-        digest.update(str(value.dtype).encode("ascii"))
-        digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(sample.numpy().tobytes())
-        tensor_count += 1
-        parameter_count += value.numel()
-    output = {
-        "schema_version": 1,
-        "phase": phase,
-        "rank": rank,
-        "sampled_sha256": digest.hexdigest(),
-        "tensor_count": tensor_count,
-        "parameter_count": parameter_count,
-    }
-    os.makedirs(root, exist_ok=True)
-    path = os.path.join(root, f"rank{rank:05d}.{phase}.json")
-    with open(path, "w", encoding="utf-8") as stream:
-        json.dump(output, stream, indent=2, sort_keys=True)
-        stream.write("\n")
 
 
 class _MegatronLiteLRScheduler:
@@ -344,23 +303,12 @@ class MegatronLiteEngine(BaseEngine):
         return self.engine_config.optimizer_offload
 
     def initialize(self):
-        started_at = time.monotonic()
-
-        def log_stage(stage: str) -> None:
-            print(
-                f"MLITE_INIT_STAGE rank={self._rank} stage={stage} "
-                f"elapsed_s={time.monotonic() - started_at:.3f}",
-                flush=True,
-            )
-
-        log_stage("begin")
         if self.engine_config.full_determinism:
             from verl.workers.engine.utils import enable_full_determinism
 
             enable_full_determinism(seed=self.engine_config.seed)
 
         self._mlite_config = self._build_mlite_config()
-        log_stage("config_built")
         self.runtime = create_runtime(
             RuntimeConfig(
                 backend="mlite",
@@ -368,27 +316,19 @@ class MegatronLiteEngine(BaseEngine):
                 backend_cfg=self._mlite_config,
             )
         )
-        log_stage("runtime_created")
-        log_stage("build_model_begin")
         self.handle = self.runtime.build_model()
-        log_stage("build_model_done")
         self.module = self._extract_primary_module()
-        _write_parameter_snapshot(self.module, phase="pre_step", rank=self._rank)
-        log_stage("parameter_snapshot_done")
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(
                 self.handle._optimizer, self._mlite_config.optimizer
             )
-        log_stage("scheduler_ready")
-
         self.to(
             device="cpu",
             model=self.is_param_offload_enabled,
             optimizer=self.is_optimizer_offload_enabled,
             grad=self.is_param_offload_enabled,
         )
-        log_stage("offload_done")
 
     def train_mode(self, **kwargs):
         self._require_initialized()
@@ -405,17 +345,6 @@ class MegatronLiteEngine(BaseEngine):
     def optimizer_step(self):
         self._require_initialized()
         _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
-        _write_parameter_snapshot(self.module, phase="post_step", rank=self._rank)
-        grad_norm_value = (
-            float(grad_norm.detach().float().cpu())
-            if isinstance(grad_norm, torch.Tensor)
-            else float(grad_norm)
-        )
-        print(
-            f"MLITE_OPTIMIZER_STEP rank={self._rank} "
-            f"grad_norm={grad_norm_value:.9g}",
-            flush=True,
-        )
         return grad_norm
 
     def lr_scheduler_step(self):
