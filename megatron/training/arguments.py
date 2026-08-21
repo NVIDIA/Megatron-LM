@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -2273,6 +2273,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         _pat = args.hybrid_layer_pattern
+        _has_kda = Symbols.KDA in _pat
         _has_dsv4_csa = (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
         _has_dsa = Symbols.DS_ATTENTION in _pat
         if getattr(args, 'experimental_attention_variant', None) is None:
@@ -2285,6 +2286,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif _has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
         # Normalize compact and legacy-padded ratios through the shared migration helper.
         _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
 

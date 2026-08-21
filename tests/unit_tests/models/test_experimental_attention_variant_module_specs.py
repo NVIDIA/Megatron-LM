@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import MagicMock, patch
 
@@ -8,7 +8,10 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers: fake backend and config builders
@@ -82,6 +85,7 @@ def _make_config(**overrides):
         use_kitchen_attention=False,
         kitchen_attention_backend="sdpa",
         fallback_to_eager_attn=False,
+        enable_hyper_connections=False,
     )
     defaults.update(overrides)
     cfg = MagicMock()
@@ -108,9 +112,10 @@ class TestIsLinearAttentionVariant:
         "variant, expected",
         [
             ("gdn", True),
-            ("gdn2", True),
+            ("kda", True),
             ("gated_delta_net", True),
             ("dsa", False),
+            ("dsv4_hybrid", False),
             (None, False),
             ("some_unknown_variant", False),
         ],
@@ -118,6 +123,30 @@ class TestIsLinearAttentionVariant:
     def test_variants(self, variant, expected):
         """Validate linear-attention variant classification across supported and unsupported names."""
         assert self._fn(variant) is expected
+
+
+class TestNormalizeExperimentalAttentionVariant:
+    """Validate canonical variant names and deprecated aliases."""
+
+    @staticmethod
+    def _fn(variant):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            normalize_experimental_attention_variant,
+        )
+
+        return normalize_experimental_attention_variant(variant)
+
+    @pytest.mark.parametrize("variant", ["gdn", "kda", "dsa", "dsv4_hybrid", None])
+    def test_canonical_names_are_unchanged(self, variant):
+        """Canonical and unrelated variant names pass through unchanged."""
+        assert self._fn(variant) == variant
+
+    def test_legacy_gated_delta_net_alias_warns_and_normalizes(self):
+        """The legacy spelling warns and resolves to canonical GDN."""
+        with pytest.warns(DeprecationWarning, match="Use 'gdn' instead"):
+            normalized = self._fn("gated_delta_net")
+
+        assert normalized == "gdn"
 
 
 # ===================================================================
@@ -246,6 +275,26 @@ class TestGetGatedDeltaNetModuleSpec:
         assert isinstance(spec, ModuleSpec)
         assert spec.module is GatedDeltaNet
         assert spec.metainfo == {"fuse_input_layernorm": True}
+
+    def test_kda_uses_direct_projection_submodules(self):
+        """KDA uses separate input and beta projections without fused input norm."""
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_gated_delta_net_module_spec,
+        )
+        from megatron.core.ssm.gated_delta_net import (
+            KimiDeltaAttention,
+            KimiDeltaAttentionSubmodules,
+        )
+
+        backend = _make_backend()
+        cfg = _make_config(experimental_attention_variant="kda", normalization="RMSNorm")
+        spec = get_gated_delta_net_module_spec(cfg, backend=backend)
+
+        assert spec.module is KimiDeltaAttention
+        assert isinstance(spec.submodules, KimiDeltaAttentionSubmodules)
+        assert spec.submodules.in_proj == _FakeColumnParallelLinear
+        assert spec.submodules.beta_proj == _FakeColumnParallelLinear
+        assert spec.metainfo == {"fuse_input_layernorm": False}
 
     def test_submodules_use_backend_modules(self):
         """Verify backend-provided projection/norm modules are wired into submodules."""
@@ -420,9 +469,10 @@ class TestGetExperimentalAttentionVariantModuleSpec:
         "variant, target_fn",
         [
             ("gdn", "get_gated_delta_net_module_spec"),
-            ("gdn2", "get_gated_delta_net_module_spec"),
+            ("kda", "get_gated_delta_net_module_spec"),
             ("gated_delta_net", "get_gated_delta_net_module_spec"),
             ("dsa", "get_dsa_module_spec_for_backend"),
+            ("dsv4_hybrid", "get_dsv4_hybrid_module_spec_for_backend"),
         ],
     )
     def test_dispatches_to_variant_handler(self, variant, target_fn):
@@ -539,7 +589,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
         assert specs[2].submodules.self_attention is exp_attn_spec
         assert specs[3].submodules.self_attention is std_attn_spec
 
-    def test_hybrid_moe_pattern(self):
+    def test_hybrid_moe_pattern_with_mhc(self):
         """Verify MLP alternates between MoE and dense specs per moe_layer_freq pattern."""
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_transformer_layer_with_experimental_attention_variant_spec,
@@ -551,6 +601,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
             num_moe_experts=8,
             moe_layer_freq=2,
             normalization="RMSNorm",
+            enable_hyper_connections=True,
         )
         backend = _make_backend()
         attn_spec = self._make_attention_spec(fuse_input_layernorm=False)
@@ -574,6 +625,8 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
         assert specs[1].submodules.mlp is dense_spec
         assert specs[2].submodules.mlp is moe_spec
         assert specs[3].submodules.mlp is dense_spec
+        for s in specs:
+            assert s.module is HyperConnectionTransformerLayer
 
 
 # ===================================================================

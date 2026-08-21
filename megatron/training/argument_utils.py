@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
 import builtins
@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -38,9 +38,12 @@ from megatron.training.models import GPTModelConfig, HybridModelConfig
 
 # TODO: support arg renames
 
+
 class TypeInferenceError(Exception):
     """Custom exception type to be conditionally handled by ArgumentGroupFactory."""
+
     pass
+
 
 class ArgumentGroupFactory:
     """Utility that adds an argument group to an ArgumentParser based on the attributes of a dataclass.
@@ -48,7 +51,7 @@ class ArgumentGroupFactory:
     This utility uses dataclass metadata including type annotations and docstrings to automatically
         infer the type, default, and other argparse keyword arguments.
 
-    You can override or supplement the automatically inferred argparse kwargs for any 
+    You can override or supplement the automatically inferred argparse kwargs for any
         dataclass field by providing an "argparse_meta" key in the field's metadata dict.
         The value should be a dict of kwargs that will be passed to ArgumentParser.add_argument().
         These metadata kwargs take precedence over the automatically inferred values.
@@ -77,13 +80,13 @@ class ArgumentGroupFactory:
         that require some customized or additional handling.
 
     Args:
-        src_cfg_class: The source dataclass type (not instance) whose fields will be 
-            converted into command-line arguments. Each field's type annotation determines 
-            the argument type, default values become argument defaults, and field-level 
+        src_cfg_class: The source dataclass type (not instance) whose fields will be
+            converted into command-line arguments. Each field's type annotation determines
+            the argument type, default values become argument defaults, and field-level
             docstrings are extracted to populate argument help text.
-        exclude: Optional list of attribute names from `src_cfg_class` to exclude from 
+        exclude: Optional list of attribute names from `src_cfg_class` to exclude from
             argument generation. Useful for omitting internal fields, computed properties,
-            or attributes that should be configured through other means. If None, all 
+            or attributes that should be configured through other means. If None, all
             dataclass fields will be converted to command-line arguments. Default: None.
     """
 
@@ -97,7 +100,7 @@ class ArgumentGroupFactory:
 
         Args:
             config_attr_name: dataclass attribute name
-            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool 
+            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool
                 settings that are default True. A hyphen is added after the prefix. Default: None
         """
         arg_name = config_attr_name
@@ -112,6 +115,7 @@ class ArgumentGroupFactory:
         With these settings, the user must provide a valid enum value, e.g.
             'flash', for `AttnBackend.flash`.
         """
+
         def enum_type_handler(cli_arg):
             return config_type[cli_arg]
 
@@ -135,7 +139,9 @@ class ArgumentGroupFactory:
 
         if origin in [types.UnionType, typing.Union]:
             # Handle Optional and Union
-            if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
+            if type_tuple[1] == type(
+                None
+            ):  # Optional type. First element is value inside Optional[]
                 return self._extract_type(type_tuple[0])
             else:
                 raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
@@ -146,16 +152,19 @@ class ArgumentGroupFactory:
                 kwargs["nargs"] = "+"
                 return kwargs
             else:
-                raise TypeInferenceError(f"Multi-type lists not supported by argparse: {config_type}")
+                raise TypeInferenceError(
+                    f"Multi-type lists not supported by argparse: {config_type}"
+                )
 
         elif origin is typing.Literal:
             choices_types = [type(choice) for choice in type_tuple]
-            assert all([t == choices_types[0] for t in choices_types]), "Type of each choice in a Literal type should all be the same."
+            assert all(
+                [t == choices_types[0] for t in choices_types]
+            ), "Type of each choice in a Literal type should all be the same."
             kwargs = {"type": choices_types[0], "choices": type_tuple}
             return kwargs
         else:
             raise TypeInferenceError(f"Unsupported type: {config_type}")
-
 
     def _build_argparse_kwargs_from_field(self, attribute: Field) -> dict[str, Any]:
         """Assemble kwargs for add_argument().
@@ -166,7 +175,9 @@ class ArgumentGroupFactory:
         argparse_kwargs = {}
         argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
         argparse_kwargs["dest"] = attribute.name
-        argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
+        argparse_kwargs["help"] = (
+            self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
+        )
 
         # dataclasses specifies that both should not be set
         if isinstance(attribute.default, type(dataclasses.MISSING)):
@@ -180,7 +191,6 @@ class ArgumentGroupFactory:
             # save metadata here, but update at the end so the metadata has highest precedence
             attr_argparse_meta = attribute.metadata["argparse_meta"]
 
-
         # if we cannot infer the argparse type, all of this logic may fail. we try to defer
         # to the developer-specified metadata if present
         try:
@@ -188,12 +198,17 @@ class ArgumentGroupFactory:
 
             # use store_true or store_false action for enable/disable flags, which doesn't accept a 'type'
             if argparse_kwargs["type"] == bool:
-                argparse_kwargs["action"] = "store_true" if attribute.default == False else "store_false"
+                argparse_kwargs["action"] = (
+                    "store_true" if attribute.default == False else "store_false"
+                )
                 argparse_kwargs.pop("type")
 
                 # add '--no-*' and '--disable-*' prefix if this is a store_false argument
                 if argparse_kwargs["action"] == "store_false":
-                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+                    argparse_kwargs["arg_names"] = [
+                        self._format_arg_name(attribute.name, prefix="no"),
+                        self._format_arg_name(attribute.name, prefix="disable"),
+                    ]
         except TypeInferenceError as e:
             if attr_argparse_meta is not None:
                 print(
@@ -205,7 +220,7 @@ class ArgumentGroupFactory:
             else:
                 raise e
 
-        # metadata provided by field takes precedence 
+        # metadata provided by field takes precedence
         if attr_argparse_meta is not None:
             argparse_kwargs.update(attr_argparse_meta)
 
@@ -255,8 +270,12 @@ class ArgumentGroupFactory:
 
             if a_cond and b_cond:
                 # These should be guaranteed by typechecks above, but assert just in case
-                assert isinstance(a.target.id, str), "Dataclass attribute not in the expected format. Name is not a string."
-                assert isinstance(b.value.value, str), "Dataclass attribute docstring is not a string."
+                assert isinstance(
+                    a.target.id, str
+                ), "Dataclass attribute not in the expected format. Name is not a string."
+                assert isinstance(
+                    b.value.value, str
+                ), "Dataclass attribute docstring is not a string."
 
                 # Formatting
                 docstring = inspect.cleandoc(b.value.value)
@@ -272,6 +291,100 @@ class ArgumentGroupFactory:
                 field_docstrings.update(self._get_field_docstrings(base_classes[0]))
 
         return field_docstrings
+
+
+def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
+    """Normalize DSv4 hybrid compression ratios for args and TransformerConfig."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    variant = kw_args.get(
+        'experimental_attention_variant', getattr(args, 'experimental_attention_variant', None)
+    )
+    if variant != 'dsv4_hybrid':
+        return
+
+    fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
+    ratio_symbols = set(fixed_ratio_map)
+    sections = pattern.split(Symbols.MTP_SEPARATOR)
+    layers = ''.join(section.replace(Symbols.PIPE, '') for section in sections)
+    attn_symbols = [symbol for symbol in layers if symbol in ratio_symbols]
+    compact_len = len(attn_symbols)
+    full_len = len(layers)
+
+    def padded_to_compact_and_full(provided):
+        compact = []
+        full = []
+        compact_iter = iter(provided)
+        for symbol in layers:
+            if symbol in ratio_symbols:
+                ratio = next(compact_iter)
+                expected = fixed_ratio_map[symbol]
+                assert ratio == expected, (
+                    f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
+                    f"'{symbol}', expected {expected}."
+                )
+                compact.append(ratio)
+                full.append(ratio)
+            else:
+                full.append(0)
+        return compact, full
+
+    # args keeps the compact CLI form; TransformerConfig gets the full form for per-layer indexing.
+    if getattr(args, 'csa_compress_ratios', None) is None:
+        compact_ratios = [fixed_ratio_map[symbol] for symbol in attn_symbols]
+        args.csa_compress_ratios, kw_args['csa_compress_ratios'] = padded_to_compact_and_full(
+            compact_ratios
+        )
+    else:
+        provided = list(args.csa_compress_ratios)
+        if len(provided) == compact_len:
+            args.csa_compress_ratios, kw_args['csa_compress_ratios'] = padded_to_compact_and_full(
+                provided
+            )
+        elif len(provided) == full_len:
+            compact = []
+            for ratio, symbol in zip(provided, layers):
+                if symbol in ratio_symbols:
+                    expected = fixed_ratio_map[symbol]
+                    assert ratio == expected, (
+                        f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
+                        f"'{symbol}', expected {expected}."
+                    )
+                    compact.append(ratio)
+                else:
+                    assert ratio == 0, (
+                        f"csa_compress_ratios should not pad non-attention hybrid symbol "
+                        f"'{symbol}' with non-zero ratio {ratio}."
+                    )
+            args.csa_compress_ratios = compact
+            kw_args['csa_compress_ratios'] = provided
+        else:
+            raise AssertionError(
+                f"csa_compress_ratios length ({len(provided)}) must equal either the "
+                f"number of W/C/H attention symbols ({compact_len}) or the legacy "
+                f"number of all layers in the hybrid pattern ({full_len}) for pattern "
+                f"'{pattern}'."
+            )
+
+
+def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
+    """Resolve an omitted --dsa-kernel-backend flag to its effective backend.
+
+    The CLI flag carries no static default so an omitted flag is distinguishable
+    from an explicit "none". DSv4 hybrid launches historically ran fused kernels
+    by default (the deprecated --no-dsa-kernel-fusion flag defaulted to True), so
+    an omitted flag resolves to "cudnn" for that variant unless the deprecated
+    switch was passed; every other configuration resolves to "none". Runs before
+    TransformerConfig.__post_init__ folds the deprecated switch into
+    dsa_kernel_backend, so explicit legacy values still win.
+    """
+    if 'dsa_kernel_backend' not in kw_args or kw_args['dsa_kernel_backend'] is not None:
+        return
+    variant = kw_args.get('experimental_attention_variant') or kw_args.get('linear_attention_type')
+    if variant == 'dsv4_hybrid' and getattr(args, 'apply_dsa_kernel_fusion', None) is None:
+        kw_args['dsa_kernel_backend'] = 'cudnn'
+    else:
+        kw_args['dsa_kernel_backend'] = 'none'
 
 
 def core_transformer_config_from_args(args, config_class=None):
@@ -293,7 +406,9 @@ def core_transformer_config_from_args(args, config_class=None):
         config_class = MLATransformerConfig
 
     if args.heterogeneous_layers_config_path is not None:
-        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
+        assert (
+            not args.multi_latent_attention
+        ), "Multi latent attention with heterogeneous layers is not supported."
         config_class = HeterogeneousTransformerConfig
 
     # Translate args to core transformer configuration
@@ -306,9 +421,10 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['actual_vocab_size'] = args.padded_vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
-    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
     if args.swiglu:
@@ -336,17 +452,31 @@ def core_transformer_config_from_args(args, config_class=None):
         # Pop 'rope_type' to let the config class use the default value.
         kw_args.pop('rope_type', None)
     else:
-        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
-            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
-        )
+        assert (
+            args.multi_latent_attention or args.rope_type == 'rope'
+        ), f'Common attention only support rope_type="rope", but got {args.rope_type}.'
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+
+        pattern = args.hybrid_layer_pattern
+        has_kda = Symbols.KDA in pattern
+        has_dsv4_csa = any(s in pattern for s in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA))
+        has_dsa = Symbols.DS_ATTENTION in pattern
+        if getattr(args, 'experimental_attention_variant', None) is None:
+            if has_dsv4_csa:
+                kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+            elif has_dsa:
+                kw_args['experimental_attention_variant'] = 'dsa'
+            elif has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
+
+    _resolve_dsa_kernel_backend_cli_default(args, kw_args)
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -430,16 +560,8 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
-def gpt_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = GPTModelConfig
-) -> Any:
-    """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
-
-    `model_config_cls` lets callers reuse this same arg-derivation logic for
-    subclasses that only override metadata (e.g. `builder`) and add no new fields,
-    such as `ModelOptModelConfig`.
-    """
-    assert issubclass(model_config_cls, GPTModelConfig)
+def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
+    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
 
     kwargs = {}
     if config is None:
@@ -457,7 +579,6 @@ def gpt_config_from_args(
         kwargs["transformer_layer_spec"] = import_module(args.spec)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
-    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
@@ -475,23 +596,17 @@ def gpt_config_from_args(
         kwargs["vocab_size"] = args.padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        assert (
+            args.vocab_size is not None
+        ), "Either --padded-vocab-size or --vocab-size must be specified."
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return model_config_cls(**kwargs)
+    return GPTModelConfig(**kwargs)
 
 
-def hybrid_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = HybridModelConfig
-) -> Any:
-    """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
-
-    `model_config_cls` lets callers reuse this same arg-derivation logic for
-    subclasses that only override metadata (e.g. `builder`) and add no new fields,
-    such as `ModelOptHybridModelConfig`.
-    """
-    assert issubclass(model_config_cls, HybridModelConfig)
+def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
+    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
 
     kwargs = {}
     if config is None:
@@ -505,10 +620,15 @@ def hybrid_config_from_args(
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
-        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+        hybrid_stack_spec = import_module(args.spec)
+        # ModuleSpec implements __call__ to build the described module, so a
+        # generic callable check would instantiate static specs here before a
+        # ProcessGroupCollection exists. Only resolve callable spec factories.
+        if callable(hybrid_stack_spec) and not isinstance(hybrid_stack_spec, ModuleSpec):
+            hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
+        kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
-    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
@@ -526,11 +646,13 @@ def hybrid_config_from_args(
         kwargs["vocab_size"] = args.padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        assert (
+            args.vocab_size is not None
+        ), "Either --padded-vocab-size or --vocab-size must be specified."
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return model_config_cls(**kwargs)
+    return HybridModelConfig(**kwargs)
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
@@ -574,7 +696,6 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=ProfilingConfig(**prof_kwargs),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
-
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
     )
@@ -595,9 +716,7 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
     return _default_config_from_args(InferenceSetupConfig, args)
 
 
-def inference_cfg_container_from_args(
-    args: Namespace, model_cfg=None
-) -> InferenceConfigContainer:
+def inference_cfg_container_from_args(args: Namespace, model_cfg=None) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that

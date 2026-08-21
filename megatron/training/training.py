@@ -58,6 +58,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
@@ -1089,7 +1090,17 @@ def num_floating_point_operations(
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.experimental_attention_variant == "gated_delta_net":
+            if args.experimental_attention_variant == "kda":
+                linear_self_attn_term = forward_backward_expansion_factor * kda_layer_flops(
+                    total_tokens=1,
+                    hidden_size=args.hidden_size,
+                    qk_head_dim=args.linear_key_head_dim,
+                    v_head_dim=args.linear_value_head_dim,
+                    num_qk_heads=args.linear_num_key_heads,
+                    num_v_heads=args.linear_num_value_heads,
+                    conv_kernel_dim=args.linear_conv_kernel_dim,
+                )
+            elif is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim

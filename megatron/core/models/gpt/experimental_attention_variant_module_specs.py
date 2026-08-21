@@ -1,15 +1,32 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    GatedDeltaNetSubmodules,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
+    CompressedSparseAttentionSubmodules,
+    Compressor,
+    CompressorSubmodules,
+    CSAIndexer,
+    CSAIndexerSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -19,6 +36,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -27,6 +45,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
@@ -58,7 +77,7 @@ except ImportError:
 ##########
 
 # Canonical ``experimental_attention_variant`` names served by the gated delta net family.
-GDN_ATTENTION_VARIANTS = ("gdn", "gdn2")
+GDN_ATTENTION_VARIANTS = ("gdn", "kda")
 
 # Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
 _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
@@ -72,25 +91,33 @@ _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 def get_gated_delta_net_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
-    """Build module spec for GatedDeltaNet attention."""
+    """Build a module spec for a GDN-family attention variant."""
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
-    # gdn2 reuses the GDN submodules and spec structure with the GatedDeltaNet2 module.
-    gdn_module = (
-        GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
-    )
-    attention = ModuleSpec(
-        module=gdn_module,
-        submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
-            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
-            out_proj=backend.row_parallel_linear(),
-        ),
-        metainfo={"fuse_input_layernorm": True},
-    )
+    if config.experimental_attention_variant == "kda":
+        attention = ModuleSpec(
+            module=KimiDeltaAttention,
+            submodules=KimiDeltaAttentionSubmodules(
+                in_proj=backend.column_parallel_linear(),
+                beta_proj=backend.column_parallel_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
+    else:
+        attention = ModuleSpec(
+            module=GatedDeltaNet,
+            submodules=GatedDeltaNetSubmodules(
+                in_proj=backend.column_parallel_layer_norm_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": True},
+        )
     return attention
 
 
@@ -146,6 +173,63 @@ def get_dsa_module_spec_for_backend(
     return attention
 
 
+def get_dsv4_hybrid_module_spec_for_backend(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Helper function to get module spec for DSv4 Hybrid Sparse Attention."""
+    assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
+    assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+
+    # Adjust for RMS norm.
+    rms_norm = config.normalization == "RMSNorm"
+    # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
+    # with linear projection and have to use unfused qk layernorm.
+    qk_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+    )
+
+    compressor_spec = ModuleSpec(
+        module=Compressor,
+        submodules=CompressorSubmodules(
+            linear_wkv=backend.linear(),
+            linear_wgate=backend.linear(),
+            norm=backend.layer_norm(rms_norm=True, for_qk=False),
+        ),
+    )
+
+    indexer_spec = ModuleSpec(
+        module=CSAIndexer,
+        submodules=CSAIndexerSubmodules(
+            linear_wq_b=backend.linear(),
+            linear_weights_proj=backend.linear(),
+            compressor=compressor_spec,
+        ),
+    )
+
+    core_attention = ModuleSpec(
+        module=CompressedSparseAttention,
+        submodules=CompressedSparseAttentionSubmodules(
+            compressor=compressor_spec, indexer=indexer_spec
+        ),
+    )
+
+    attention = ModuleSpec(
+        module=DSv4HybridSelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=DSv4HybridSelfAttentionSubmodules(
+            linear_q_down_proj=backend.linear(),
+            linear_q_up_proj=backend.column_parallel_linear(),
+            linear_kv_proj=backend.column_parallel_linear(),
+            core_attention=core_attention,
+            linear_proj=backend.row_parallel_linear(),
+            q_layernorm=qk_norm,
+            kv_layernorm=qk_norm,
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+    return attention
+
+
 def get_experimental_attention_variant_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -158,6 +242,8 @@ def get_experimental_attention_variant_module_spec(
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsv4_hybrid":
+        return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -245,6 +331,10 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
+    enable_hc = config.enable_hyper_connections
+    hc_module = HyperConnectionModule if enable_hc else IdentityOp
+    layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
+
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -271,14 +361,16 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
         layer_specs.append(
             ModuleSpec(
-                module=TransformerLayer,
+                module=layer_module,
                 submodules=TransformerLayerSubmodules(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
+                    self_attention_hyper_connection=hc_module,
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=not_none(mlp),
                     mlp_bda=get_bias_dropout_add,
+                    mlp_hyper_connection=hc_module,
                 ),
             )
         )
@@ -349,19 +441,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 def normalize_experimental_attention_variant(
     experimental_attention_variant: Optional[str],
 ) -> Optional[str]:
-    """Resolve a deprecated ``experimental_attention_variant`` spelling to its canonical name.
-
-    ``gated_delta_net`` is the deprecated spelling of ``gdn``. Passing it emits a
-    ``DeprecationWarning`` and returns the canonical name so that every downstream
-    consumer only has to handle ``gdn``.
-
-    Args:
-        experimental_attention_variant: The configured variant name, possibly a
-            deprecated alias.
-
-    Returns:
-        The canonical variant name, or the argument unchanged when it is not an alias.
-    """
+    """Resolve a deprecated attention-variant spelling to its canonical name."""
     canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(experimental_attention_variant)
     if canonical is None:
         return experimental_attention_variant
@@ -376,11 +456,7 @@ def normalize_experimental_attention_variant(
 
 
 def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
-    """Check if the experimental attention variant is served by a gated delta net layer.
-
-    Accepts the deprecated ``gated_delta_net`` spelling without warning; use
-    :func:`normalize_experimental_attention_variant` to emit the deprecation notice.
-    """
+    """Return whether a name selects a GDN-family attention implementation."""
     canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(
         experimental_attention_variant, experimental_attention_variant
     )
@@ -501,7 +577,7 @@ def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider
     )
     backend: BackendSpecProvider = (
         KitchenSpecProvider(
-            fallback=TESpecProvider(),
+            fallback=TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn),
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
         )
@@ -537,6 +613,7 @@ def _get_self_attention_module_spec(
         qk_l2_norm=config.qk_l2_norm,
         use_kitchen=config.use_kitchen,
         use_te_activation_func=config.use_te_activation_func,
+        fallback_to_eager_attn=config.fallback_to_eager_attn,
         use_kitchen_attention=config.use_kitchen_attention,
         kitchen_attention_backend=config.kitchen_attention_backend,
         mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),

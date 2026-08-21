@@ -58,6 +58,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
   --pipeline-model-parallel-size 1 \
   --expert-model-parallel-size 8 \
   --context-parallel-size 2 \
+  --linear-cp-mode headwise \
   --cp-comm-type p2p \
   --num-experts 128 \
   --moe-ffn-hidden-size 512 \

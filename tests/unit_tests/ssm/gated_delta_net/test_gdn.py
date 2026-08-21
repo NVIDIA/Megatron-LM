@@ -58,7 +58,7 @@ def _make_gdn_config(**overrides):
         "num_attention_heads": 8,
         "activation_func": F.silu,
         "bf16": True,
-        "experimental_attention_variant": "gated_delta_net",
+        "experimental_attention_variant": "gdn",
         "linear_attention_freq": [1],
         "transformer_impl": "transformer_engine",
     }
@@ -89,7 +89,7 @@ def test_gdn_pre_gated_delta_rule_fusion_accepts_gdn_variant():
 
 
 def test_gdn_pre_gated_delta_rule_fusion_requires_gdn_variant():
-    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+    with pytest.raises(ValueError, match="experimental_attention_variant='gdn'"):
         _make_gdn_config(
             experimental_attention_variant=None,
             linear_attention_freq=None,
