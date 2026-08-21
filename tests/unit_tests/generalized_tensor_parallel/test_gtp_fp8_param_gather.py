@@ -9,6 +9,8 @@ under a non-``Test*`` alias so pytest doesn't re-collect it), flipping GTP on vi
 ``tensor_parallel_num_weight_shards`` (= tp x gtp_weight_remat_size).
 """
 
+import math
+
 import pytest
 import torch
 
@@ -17,6 +19,7 @@ from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
+from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.utils import is_te_min_version
 from megatron.training.utils import get_device_arch_version
 
@@ -24,6 +27,7 @@ from megatron.training.utils import get_device_arch_version
 # world/DP config + global-state pollution); reused by composition only.
 from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
 from tests.unit_tests.test_fp8_param import fp8_available, reason_for_no_fp8
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestGTPFp8ParamGather:
@@ -133,6 +137,89 @@ class TestGTPFp8ParamGather:
                 f"GTP+mxfp8 MoE fp8-param-gather loss diverges from pure-BF16 GTP baseline "
                 f"(max per-step |diff|={diff:.4f}; fp8: {loss_fp8[0]:.3f}->{loss_fp8[-1]:.3f}, "
                 f"bf16: {loss_bf16[0]:.3f}->{loss_bf16[-1]:.3f})."
+            )
+        finally:
+            harness.teardown_method(None)
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+                update_gtp_config,
+            )
+
+            update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS, reason="emerging-optimizers package is required"
+    )
+    @pytest.mark.parametrize("overlap", [False, True])
+    def test_muon_layout_and_mxfp8_param_gather_parity(self, overlap):
+        """Padded LayerWise MXFP8 sync must match the legacy LayerWise path.
+
+        Both runs are configured with Muon, GTP2 x DP2, MXFP8 primary weights,
+        FP8 parameter gather, and grad-buffer reuse. The legacy LayerWise gather
+        is the oracle; the padded-layout run exercises the reused DDP grad buffer
+        and is the regression target. Overlap selects synchronous step-time gather
+        or asynchronous dispatch from the next forward pre-hook.
+        """
+        if Utils.world_size != 4:
+            pytest.skip("Requires exactly 4 torchrun ranks for GTP2 x DP2")
+
+        harness = _FP8ParamHarness()
+        harness.setup_method(None)
+        harness.seq_length = 64
+        harness.micro_batch_size = 1
+        try:
+            common = dict(
+                num_steps=12,
+                num_layers=1,
+                padded_vocab_size=512,
+                ffn_hidden_size=256,
+                global_batch_size=4,
+                optimizer="muon",
+                muon_scalar_optimizer="adam",
+                muon_momentum=0.9,
+                muon_scale_mode="spectral",
+                muon_num_ns_steps=5,
+                muon_coefficient_type="quintic",
+                muon_tp_mode="duplicated",
+                lr=1e-3,
+                clip_grad=0.0,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                tensor_parallel_num_weight_shards=2,
+                untie_embeddings_and_output_weights=True,
+                overlap_param_gather=overlap,
+                overlap_grad_reduce=overlap,
+            )
+
+            loss_legacy = harness._run_test_helper(
+                tp_size=1,
+                recipe="mxfp8",
+                fp8_param_gather=True,
+                use_layer_wise_param_layout=False,
+                **common,
+            )
+            loss_padded = harness._run_test_helper(
+                tp_size=1,
+                recipe="mxfp8",
+                fp8_param_gather=True,
+                use_layer_wise_param_layout=True,
+                **common,
+            )
+
+            max_diff = torch.tensor(float((loss_legacy - loss_padded).abs().max()), device="cuda")
+            # Compare the worst local GTP/DP trajectory, rather than rank 0 alone.
+            # Map local non-finite values before MAX so NCCL cannot hide a NaN from one rank.
+            max_diff.nan_to_num_(nan=float('inf'), posinf=float('inf'), neginf=float('inf'))
+            torch.distributed.all_reduce(max_diff, op=torch.distributed.ReduceOp.MAX)
+            diff = max_diff.item()
+            tolerance = 2e-3
+            assert math.isfinite(diff) and diff < tolerance, (
+                f"Padded LayerWise MXFP8 loss diverges from the legacy path "
+                f"(overlap={overlap}, max per-step |diff|={diff:.6f}, tolerance={tolerance})."
             )
         finally:
             harness.teardown_method(None)
