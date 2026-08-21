@@ -4220,6 +4220,15 @@ def _add_distributed_args(parser):
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
     )
     group.add_argument(
+        '--fsdp-ubr-registration-scope',
+        type=str,
+        choices=['all', 'dense_inner'],
+        default='all',
+        help='Select FSDP communicators registered with the NCCL memory pool. '
+        '"all" preserves the default behavior; "dense_inner" registers only the '
+        'dense inner-FSDP parameter all-gather communicator.',
+    )
+    group.add_argument(
         '--fsdp-manual-registration',
         action='store_true',
         dest='fsdp_manual_registration',
@@ -4264,6 +4273,14 @@ def _add_distributed_args(parser):
         "Double-buffering the communication memory improves memory management efficiency by "
         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers in each Megatron FSDP communication pool. "
+        "The default of two provides conventional double buffering; combined 1F1B "
+        "overlap with forward prefetch requires at least three.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',

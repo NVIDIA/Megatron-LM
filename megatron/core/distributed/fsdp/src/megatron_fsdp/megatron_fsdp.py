@@ -158,11 +158,16 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_double_buffer (bool): Whether to use persistently allocated double buffers
             for the temporary memory needed in the FSDP communication. This flag is
             automatically set to True when nccl_ub is True.
+        fsdp_buffer_count (int): Number of persistent buffers allocated for each FSDP
+            communication pool. Defaults to two.
         fsdp_db_use_persist_buf_on_alloc_fail (bool): Whether to fall back to persistent buffer
             allocator when a bucket does not fit FSDP double buffer size.
         disable_symmetric_registration (bool): Whether to disable symmetric (window) registration
             for NCCL userbuffer registration. This option will force to use conventional (local)
             userbuffer registration when nccl_ub is set.
+        fsdp_ubr_registration_scope (str): FSDP communicator scope for NCCL user-buffer
+            registration. ``all`` preserves the default behavior; ``dense_inner`` registers
+            only dense inner-FSDP parameter all-gathers.
         enable_fine_grained_param_gather (bool): Whether to enable "fine-grained" param all-gather,
             which can improve performance when using MXFP8 parameters with activation recomputation.
         enable_fine_grained_param_gather_backward_hook (bool): Register pre-backward unshard hooks
@@ -207,8 +212,10 @@ class MegatronFSDP(torch.nn.Module):
         keep_fp8_transpose_cache: bool = False,
         nccl_ub: bool = False,
         fsdp_double_buffer: bool = False,
+        fsdp_buffer_count: int = 2,
         fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
         disable_symmetric_registration: bool = False,
+        fsdp_ubr_registration_scope: str = 'all',
         enable_fine_grained_param_gather_hook: bool = False,
         enable_fine_grained_param_gather_backward_hook: bool = False,
         fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
@@ -253,8 +260,10 @@ class MegatronFSDP(torch.nn.Module):
                 keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
                 nccl_ub=nccl_ub,
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+                fsdp_buffer_count=fsdp_buffer_count,
                 fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
                 disable_symmetric_registration=disable_symmetric_registration,
+                fsdp_ubr_registration_scope=fsdp_ubr_registration_scope,
                 check_for_nan_in_grad=False,
             )
         else:
