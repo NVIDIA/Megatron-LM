@@ -29,13 +29,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
-
-try:
-    from torch.distributed import DeviceMesh
-
-    HAVE_DTENSOR = True
-except ImportError:
-    HAVE_DTENSOR = False
+from torch.distributed import DeviceMesh
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -349,12 +343,6 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         """
         Initialize the distributed index for the module.
         """
-        if not HAVE_DTENSOR:
-            raise ImportError(
-                "This module requires PyTorch with DTensor support. "
-                "Please install a compatible version of PyTorch."
-            )
-
         enable_hsdp = self.ddp_config.num_distributed_optimizer_instances > 1
         if pg_collection is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
