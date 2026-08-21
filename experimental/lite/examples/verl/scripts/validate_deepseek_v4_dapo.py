@@ -23,6 +23,8 @@ EXACT_DEPENDENCIES = {
     "vllm": "0.26.1rc1.dev631+g5426311d9",
     "flashinfer-python": "0.6.16.post3",
     "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-nvshmem-cu13": "3.6.5",
+    "nvidia-resiliency-ext": "0.6.0",
     "tilelang": "0.1.12",
 }
 MINIMUM_DEPENDENCIES = {
@@ -119,7 +121,9 @@ def validate_environment() -> None:
         f"vllm={actual['vllm']} te={actual['transformer-engine']} "
         f"cudnn_frontend={actual['nvidia-cudnn-frontend']} "
         f"flashinfer={actual['flashinfer-python']} "
-        f"cutlass={actual['nvidia-cutlass-dsl']} tilelang={actual['tilelang']} "
+        f"cutlass={actual['nvidia-cutlass-dsl']} "
+        f"nvshmem={actual['nvidia-nvshmem-cu13']} "
+        f"nvrx={actual['nvidia-resiliency-ext']} tilelang={actual['tilelang']} "
         f"te_origin={te.__file__} cudnn_origin={cudnn.__file__}",
         flush=True,
     )
