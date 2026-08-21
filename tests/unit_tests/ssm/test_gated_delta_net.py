@@ -444,9 +444,12 @@ class TestGatedDeltaNet:
             # Per-head decay and write strength beta
             beta = kernel_inputs["beta"]
             assert g.shape == (batch, seq_len, num_v_heads_local)
+            assert g.dtype == torch.float32
             assert beta.shape == (batch, seq_len, num_v_heads_local)
+            assert beta.dtype == torch.float32
             assert (g <= 0).all()
             assert (beta >= 0).all() and (beta <= 1).all()
+            torch.testing.assert_close(beta, gate_feats[0].float().sigmoid())
 
             # The fused pre-GDR path exposes Z as a strided view into the combined
             # qkvzba projection. Verify gated norm consumes that view directly and
@@ -877,6 +880,73 @@ class TestFusedPreGatedDeltaRule:
             atol=1e-3,
             rtol=1e-3,
             output_tolerances={"g": (1e-3, 3e-3)},
+        )
+
+    def test_fused_and_unfused_beta_use_fp32_sigmoid(self):
+        reference_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 2
+        seq_len = 32
+        device = torch.cuda.current_device()
+        num_value_heads = reference_gdn.num_v_heads_local_tp
+        beta_channel_offset = 2 * reference_gdn.qk_dim_local_tp + 2 * reference_gdn.v_dim_local_tp
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim), device=device, dtype=torch.bfloat16
+        )
+        beta_raw = torch.linspace(
+            -6.0, 6.0, seq_len * batch * num_value_heads, device=device, dtype=torch.float32
+        ).reshape(seq_len, batch, num_value_heads)
+        qkvzba[:, :, beta_channel_offset : beta_channel_offset + num_value_heads] = beta_raw.to(
+            torch.bfloat16
+        )
+        expected_beta = (
+            qkvzba[:, :, beta_channel_offset : beta_channel_offset + num_value_heads]
+            .transpose(0, 1)
+            .float()
+            .sigmoid()
+        )
+
+        qkvzba_unfused = qkvzba.detach().clone().requires_grad_(True)
+        qkvzba_fused = qkvzba.detach().clone().requires_grad_(True)
+        reference_gdn.zero_grad(set_to_none=True)
+        fused_gdn.zero_grad(set_to_none=True)
+
+        unfused_outputs = reference_gdn.pre_gated_delta_rule(
+            qkvzba_unfused, batch, seq_len, reference_gdn.cp_size, reference_gdn.pg_collection.cp
+        )
+        fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba_fused)
+        unfused_beta = unfused_outputs[4]
+        fused_beta = fused_outputs[4]
+
+        assert unfused_beta.dtype == torch.float32
+        assert fused_beta.dtype == torch.float32
+        torch.testing.assert_close(unfused_beta, expected_beta, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(fused_beta, expected_beta, atol=1e-5, rtol=1e-5)
+
+        beta_grad = torch.linspace(
+            -0.25, 0.25, unfused_beta.numel(), device=device, dtype=torch.float32
+        ).reshape_as(unfused_beta)
+
+        def _beta_only_loss(outputs):
+            loss = outputs[4].float().mul(beta_grad).sum()
+            return loss + sum(
+                output.float().sum() * 0.0 for idx, output in enumerate(outputs) if idx != 4
+            )
+
+        _beta_only_loss(unfused_outputs).backward()
+        _beta_only_loss(fused_outputs).backward()
+        beta_slice = slice(beta_channel_offset, beta_channel_offset + num_value_heads)
+        torch.testing.assert_close(
+            qkvzba_fused.grad[:, :, beta_slice].float(),
+            qkvzba_unfused.grad[:, :, beta_slice].float(),
+            atol=2e-3,
+            rtol=2e-3,
         )
 
     def test_fused_and_unfused_pre_gated_delta_rule_backward_match(self):
