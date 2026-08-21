@@ -911,6 +911,86 @@ class TestParallelHybridBlockCudagraphs:
         )
 
 
+class TestHybridTECudaGraphDiscovery:
+    def test_hybrid_mtp_layers_are_flattened_and_adjacent_layers_are_grouped(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+
+        class FakeGraphLayer(torch.nn.Module):
+            def __init__(self, group_with_next=False, graphable=True):
+                super().__init__()
+                self.group_with_next = group_with_next
+                self.graphable = graphable
+                self.group_tail = None
+
+            def _can_group_te_cuda_graph_with(self, next_layer):
+                return self.group_with_next and next_layer.graphable
+
+            def _set_te_cuda_graph_group_tail(self, next_layer):
+                self.group_tail = next_layer
+
+        head = FakeGraphLayer(group_with_next=True)
+        tail = FakeGraphLayer()
+        eager = FakeGraphLayer(graphable=False)
+        mtp_stack = HybridStack.__new__(HybridStack)
+        torch.nn.Module.__init__(mtp_stack)
+        mtp_stack.layers = torch.nn.ModuleList([head, tail, eager])
+
+        monkeypatch.setattr(
+            cuda_graphs, '_layer_is_graphable', lambda layer, config: layer.graphable
+        )
+        callables = cuda_graphs._get_mtp_te_callables(mtp_stack, object())
+
+        assert callables == [head]
+        assert head.group_tail is tail
+
+        gpt_mtp_layer = FakeGraphLayer()
+        assert cuda_graphs._get_mtp_te_callables(gpt_mtp_layer, object()) == [gpt_mtp_layer]
+
+        class Holder:
+            pass
+
+        mtp_layer = Holder()
+        mtp_layer.mtp_model_layer = mtp_stack
+        chunk = Holder()
+        chunk.mtp = Holder()
+        chunk.mtp.layers = [mtp_layer]
+        assert cuda_graphs._is_mtp_te_callable(head, chunk)
+        assert cuda_graphs._is_mtp_te_callable(tail, chunk)
+        assert not cuda_graphs._is_mtp_te_callable(eager, Holder())
+
+    def test_capture_group_tail_does_not_change_module_registration(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        tail.capture_weight = torch.nn.Parameter(torch.ones(1))
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+        object.__setattr__(tail, '_get_submodules_under_cudagraphs', lambda: [tail])
+
+        state_dict_keys = tuple(head.state_dict())
+        head._set_te_cuda_graph_group_tail(tail)
+
+        assert head._get_te_cuda_graph_group_tail() is tail
+        assert '_te_cuda_graph_group_tail' not in head._modules
+        assert tuple(head.state_dict()) == state_dict_keys
+        assert any(param is tail.capture_weight for param in head.parameters())
+
+
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
 _unique_buffer_counts = {}

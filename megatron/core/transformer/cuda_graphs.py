@@ -1701,6 +1701,55 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _get_graphable_te_callables(layers, config):
+    """Return graphable layers, grouping a supported adjacent hybrid attention/MoE pair."""
+    graphable_layers = []
+    layer_number = 0
+    while layer_number < len(layers):
+        layer = layers[layer_number]
+        if not _layer_is_graphable(layer, config):
+            layer_number += 1
+            continue
+
+        if layer_number + 1 < len(layers):
+            next_layer = layers[layer_number + 1]
+            can_group = getattr(layer, '_can_group_te_cuda_graph_with', None)
+            if (
+                can_group is not None
+                and _layer_is_graphable(next_layer, config)
+                and can_group(next_layer)
+            ):
+                layer._set_te_cuda_graph_group_tail(next_layer)
+                graphable_layers.append(layer)
+                layer_number += 2
+                continue
+
+        graphable_layers.append(layer)
+        layer_number += 1
+    return graphable_layers
+
+
+def _get_mtp_te_callables(mtp_model_layer, config):
+    """Expose graphable layers inside a hybrid MTP stack; GPT MTP remains one callable."""
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+    layers = (
+        mtp_model_layer.layers if isinstance(mtp_model_layer, HybridStack) else [mtp_model_layer]
+    )
+    return _get_graphable_te_callables(layers, config)
+
+
+def _is_mtp_te_callable(layer, chunk_with_decoder):
+    """Whether a callable is an MTP wrapper or a layer nested in a hybrid MTP stack."""
+    for mtp_layer in getattr(getattr(chunk_with_decoder, 'mtp', None), 'layers', []):
+        mtp_model_layer = mtp_layer.mtp_model_layer
+        if layer is mtp_model_layer or any(
+            layer is inner_layer for inner_layer in getattr(mtp_model_layer, 'layers', [])
+        ):
+            return True
+    return False
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1846,20 +1895,16 @@ class TECudaGraphHelper:
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
-                num_graphable_layers = 0
-                callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
+                callables = _get_graphable_te_callables(
+                    chunk_with_decoder.decoder.layers, self.config
+                )
+                callables_is_mtp = [False] * len(callables)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    mtp_model_layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                    mtp_callables = _get_mtp_te_callables(mtp_model_layer, self.config)
+                    callables.extend(mtp_callables)
+                    callables_is_mtp.extend([True] * len(mtp_callables))
+                num_graphable_layers = len(callables)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -1980,8 +2025,8 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            assert layer in chunk_of_the_layer.decoder.layers or _is_mtp_te_callable(
+                layer, chunk_of_the_layer
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
@@ -2911,7 +2956,10 @@ def set_current_microbatch(model, microbatch_id):
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
+                mtp_model_layer = layer.mtp_model_layer
+                mtp_model_layer.current_microbatch = microbatch_id
+                for inner_layer in getattr(mtp_model_layer, 'layers', []):
+                    inner_layer.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,
