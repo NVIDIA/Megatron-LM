@@ -94,9 +94,7 @@ def save_sharded_modelopt_state(
 
 
 def _load_extra_state_from_sharded_checkpoint(
-    model: torch.nn.Module,
-    checkpoint_name: str | Path,
-    prefix: str,
+    model: torch.nn.Module, checkpoint_name: str | Path, prefix: str
 ) -> None:
     """Load extra state from sharded checkpoint.
 
@@ -125,9 +123,7 @@ def _load_extra_state_from_sharded_checkpoint(
 
 
 def restore_sharded_modelopt_state(
-    model: list[torch.nn.Module],
-    checkpoint_name: str | Path,
-    prefix: str = "",
+    model: list[torch.nn.Module], checkpoint_name: str | Path, prefix: str = ""
 ) -> None:
     """Restore modelopt_state from the sharded state_dict format.
 
