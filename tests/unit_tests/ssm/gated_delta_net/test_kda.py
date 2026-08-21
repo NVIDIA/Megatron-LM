@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import os
@@ -43,6 +43,7 @@ def _make_config(
     cp_size: int = 1,
     sequence_parallel: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
+    linear_cp_mode: str = "headwise",
 ) -> TransformerConfig:
     return TransformerConfig(
         hidden_size=128,
@@ -66,6 +67,9 @@ def _make_config(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
         sequence_parallel=sequence_parallel,
+        linear_cp_mode=linear_cp_mode,
+        experimental_attention_variant="kda",
+        is_hybrid_model=True,
         transformer_impl="transformer_engine",
     )
 
@@ -73,13 +77,23 @@ def _make_config(
 def test_kda_norm_out_recompute_config_accepts_hybrid_model():
     config = replace(
         _make_config(),
-        experimental_attention_variant=None,
         is_hybrid_model=True,
         recompute_granularity="selective",
         recompute_modules=["gdn_norm_out"],
     )
 
     assert config.recompute_modules == ["gdn_norm_out"]
+
+
+def test_kda_full_recompute_config_accepts_hybrid_model():
+    config = replace(
+        _make_config(),
+        is_hybrid_model=True,
+        recompute_granularity="selective",
+        recompute_modules=["gdn"],
+    )
+
+    assert config.recompute_modules == ["gdn"]
 
 
 def _build_kda(config: TransformerConfig) -> KimiDeltaAttention:
@@ -96,48 +110,40 @@ def _build_kda(config: TransformerConfig) -> KimiDeltaAttention:
     ).cuda()
 
 
-def test_kda_rejects_unsupported_head_layouts():
-    config = _make_config()
-    config.linear_num_value_heads = 8
+def test_kda_config_rejects_unsupported_head_layouts():
     with pytest.raises(ValueError, match="equal key and value head counts"):
-        KimiDeltaAttention._validate_config(config)
+        replace(_make_config(), linear_num_value_heads=8)
 
-    config = _make_config()
-    config.linear_value_head_dim = 64
     with pytest.raises(ValueError, match="equal key and value head dimensions"):
-        KimiDeltaAttention._validate_config(config)
+        replace(_make_config(), linear_value_head_dim=64)
 
-    config = _make_config()
-    config.context_parallel_size = 3
-    with pytest.raises(ValueError, match="tensor parallel size times context parallel size"):
-        KimiDeltaAttention._validate_config(config)
+    with pytest.raises(ValueError, match="must be either 'headwise' or 'chunkwise'"):
+        _make_config(linear_cp_mode="tokenwise")
+
+    with pytest.raises(AssertionError, match="linear_head_parallel_size"):
+        _make_config(cp_size=3, linear_cp_mode="headwise")
+
+    chunkwise_config = _make_config(cp_size=3, linear_cp_mode="chunkwise")
+    assert chunkwise_config.linear_cp_mode == "chunkwise"
 
 
 @pytest.mark.parametrize("lower_bound", [None, -5.1, 0.0, 1.0, float("nan")])
 def test_kda_rejects_invalid_safe_gate_lower_bound(lower_bound):
-    config = _make_config()
-    config.kda_safe_gate = True
-    config.kda_lower_bound = lower_bound
-
     with pytest.raises(ValueError, match="kda_lower_bound"):
-        KimiDeltaAttention._validate_config(config)
+        replace(_make_config(), kda_safe_gate=True, kda_lower_bound=lower_bound)
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, -1.0, -1e-6])
 def test_kda_accepts_valid_safe_gate_lower_bound(lower_bound):
-    config = _make_config()
-    config.kda_safe_gate = True
-    config.kda_lower_bound = lower_bound
+    config = replace(_make_config(), kda_safe_gate=True, kda_lower_bound=lower_bound)
 
-    KimiDeltaAttention._validate_config(config)
+    assert config.kda_lower_bound == lower_bound
 
 
 def test_kda_ignores_lower_bound_when_safe_gate_is_disabled():
-    config = _make_config()
-    config.kda_safe_gate = False
-    config.kda_lower_bound = None
+    config = replace(_make_config(), kda_safe_gate=False, kda_lower_bound=None)
 
-    KimiDeltaAttention._validate_config(config)
+    assert config.kda_lower_bound is None
 
 
 def test_kda_rejects_invalid_packed_boundaries():
@@ -237,7 +243,8 @@ def test_kda_packed_matches_unpacked_cp1():
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_kda_selective_recompute_norm_out():
+@pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
+def test_kda_selective_recompute(recompute_module):
     Utils.initialize_model_parallel(1, 1)
     try:
 
@@ -254,7 +261,7 @@ def test_kda_selective_recompute_norm_out():
         base_config = _make_config()
         recompute_config = copy.deepcopy(base_config)
         recompute_config.recompute_granularity = "selective"
-        recompute_config.recompute_modules = ["gdn_norm_out"]
+        recompute_config.recompute_modules = [recompute_module]
 
         model_parallel_cuda_manual_seed(42)
         base_kda = _build_kda(base_config)
@@ -277,16 +284,20 @@ def test_kda_selective_recompute_norm_out():
         )
 
         assert base_kda.recompute_norm_out is False
+        assert base_kda.recompute_gdn is False
         assert base_kda.norm_out_checkpoint is None
-        assert recompute_kda.recompute_norm_out is True
-        assert recompute_kda.norm_out_checkpoint is not None
+        assert recompute_kda.recompute_norm_out is (recompute_module == "gdn_norm_out")
+        assert recompute_kda.recompute_gdn is (recompute_module == "gdn")
+        assert (recompute_kda.norm_out_checkpoint is not None) is (
+            recompute_module == "gdn_norm_out"
+        )
         torch.testing.assert_close(recompute_output, base_output, atol=0, rtol=0)
         torch.testing.assert_close(recompute_input_grad, base_input_grad, atol=0, rtol=0)
         assert recompute_grads.keys() == base_grads.keys()
         for name in base_grads:
-            # The checkpointed gate/norm backward can choose a different BF16 reduction order.
-            # Keep output and input-gradient checks bitwise, while allowing only BF16-scale
-            # rounding in parameter gradients.
+            # Recomputed BF16 kernels can choose a different reduction order. Keep output and
+            # input-gradient checks bitwise while allowing only BF16-scale parameter-gradient
+            # rounding.
             torch.testing.assert_close(
                 recompute_grads[name],
                 base_grads[name],
@@ -388,12 +399,18 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1():
 
 
 @pytest.mark.parametrize(
-    ("sequence_packing", "tp", "sp", "cp"),
-    [(False, 2, True, 1), (True, 1, False, 2), (True, 2, True, 2)],
+    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
+    [
+        (False, 2, True, 1, "headwise"),
+        (True, 1, False, 2, "headwise"),
+        (True, 2, True, 2, "headwise"),
+        (True, 1, False, 2, "chunkwise"),
+        (True, 2, True, 2, "chunkwise"),
+    ],
 )
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
-    config = _make_config()
+def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode):
+    config = _make_config(linear_cp_mode=linear_cp_mode)
     _test_parallel_attention_correctness(
         transformer_config=config,
         transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
