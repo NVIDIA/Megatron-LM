@@ -231,17 +231,19 @@ class MoEModelTestContainer:
 
     @pytest.mark.internal
     def fused_moe_sequential_parity_test(self):
-        """Compare the full TE Sequential with Megatron's split NCCL-EP path."""
+        """Compare MXFP8 MegaMoE with Megatron's split BF16 NCCL-EP path."""
         from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
 
         torch.manual_seed(42)
         x = torch.randn((16, 4, self.config.hidden_size), dtype=self.test_dtype).cuda()
+        dy = (torch.randn_like(x, dtype=torch.float32) * 0.1).to(self.test_dtype)
 
         def run(layer):
             layer.zero_grad(set_to_none=True)
             inp = x.clone().detach().requires_grad_(True)
-            out, _ = layer(inp)
-            out.float().sum().backward()
+            with get_fp8_context(layer.config):
+                out, _ = layer(inp)
+            out.backward(dy)
             grads = {
                 name: param.grad.detach().clone()
                 for name, param in layer.named_parameters()
@@ -250,42 +252,52 @@ class MoEModelTestContainer:
             return out.detach(), inp.grad.detach(), grads
 
         reference = self.new_moe_layer(moe_use_transformer_engine_fused_moe=False)
-        out_ref, dgrad_ref, grads_ref = run(reference)
-        nccl_ep_finalize()
+        try:
+            out_ref, dgrad_ref, grads_ref = run(reference)
+        finally:
+            nccl_ep_finalize()
 
-        fused = self.new_moe_layer(moe_use_transformer_engine_fused_moe=True)
+        fused = self.new_moe_layer(
+            moe_use_transformer_engine_fused_moe=True,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+        )
         fused.load_state_dict(reference.state_dict())
-        out_fused, dgrad_fused, grads_fused = run(fused)
+        try:
+            out_fused, dgrad_fused, grads_fused = run(fused)
 
-        torch.testing.assert_close(out_fused, out_ref, rtol=1.6e-2, atol=1.6e-2)
-        torch.testing.assert_close(dgrad_fused, dgrad_ref, rtol=1.6e-2, atol=1.6e-2)
-        assert grads_fused.keys() == grads_ref.keys()
-        for name in grads_ref:
-            torch.testing.assert_close(
-                grads_fused[name], grads_ref[name], rtol=2e-2, atol=2e-2
+            # Match TE's MXFP8 MegaMoE-vs-reference numerical contract.
+            tolerances = {"rtol": 0.125, "atol": 0.25}
+            torch.testing.assert_close(out_fused, out_ref, **tolerances)
+            torch.testing.assert_close(dgrad_fused, dgrad_ref, **tolerances)
+            assert grads_fused.keys() == grads_ref.keys()
+            for name in grads_ref:
+                torch.testing.assert_close(grads_fused[name], grads_ref[name], **tolerances)
+
+            (sequence,) = fused.experts._last_fused_moe_ops
+            op_names = [type(op).__name__ for op in sequence]
+            assert op_names == [
+                "Dispatch",
+                "GroupedLinear",
+                "ScaledSwiGLU",
+                "GroupedLinear",
+                "Combine",
+            ]
+            forward_ops = sequence._module_groups[0]._forward_ops
+            is_megamoe = any(
+                type(op).__name__ == "FusedMoeEp" for group in forward_ops for op in group
             )
-
-        (sequence,) = fused.experts._last_fused_moe_ops
-        op_names = [type(op).__name__ for op in sequence]
-        assert op_names == [
-            "Dispatch",
-            "GroupedLinear",
-            "ScaledSwiGLU",
-            "GroupedLinear",
-            "Combine",
-        ]
-        forward_ops = sequence._module_groups[0]._forward_ops
-        is_megamoe = any(type(op).__name__ == "FusedMoeEp" for group in forward_ops for op in group)
-        if torch.cuda.get_device_capability() == (10, 7):
-            try:
-                from cudnn.moe_ep import MoeEp  # noqa: F401
-            except ImportError:
-                pass
+            if torch.cuda.get_device_capability() == (10, 7):
+                try:
+                    from cudnn.moe_ep import MoeEp  # noqa: F401
+                except ImportError:
+                    pass
+                else:
+                    assert is_megamoe
             else:
-                assert is_megamoe
-        else:
-            assert not is_megamoe
-        nccl_ep_finalize()
+                assert not is_megamoe
+        finally:
+            nccl_ep_finalize()
 
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
@@ -734,7 +746,7 @@ class TestFlexDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
-    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 4)])
     def test_fused_moe_sequential(self, tp_size, ep_size):
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -794,6 +806,7 @@ class TestFlexDispatcher:
             moe_pad_expert_input_to_capacity=False,
             moe_permute_fusion=permute_fusion,
             hidden_size=1024,
+            use_cpu_initialization=False,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
             test_dtype=torch.bfloat16,

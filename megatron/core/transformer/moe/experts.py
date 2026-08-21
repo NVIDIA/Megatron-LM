@@ -290,6 +290,7 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+        self._last_fused_moe_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -1159,12 +1160,26 @@ class TEGroupedMLP(MegatronModule):
         # wgrad pass through the fused children instead of falling through to no-op
         # backward_dw() on linear_fc{1,2} (whose forward never ran in the fused path).
         if self._with_fused_impl and self.linear_fc1.delay_wgrad_compute:
-            if self._fused_ops is not None:
-                (seq,) = self._fused_ops
+            ops = (
+                self._last_fused_moe_ops
+                if self.config.moe_use_transformer_engine_fused_moe
+                else self._fused_ops
+            )
+            if ops is not None:
+                (seq,) = ops
                 fused_children = list(seq.children())
-                assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
-                fused_children[2].backward_dw()
-                fused_children[0].backward_dw()
+                if self.config.moe_use_transformer_engine_fused_moe:
+                    assert len(fused_children) == 5, (
+                        "expected Dispatch, FC1, activation, FC2, Combine in fused TE ops"
+                    )
+                    fc1_idx, fc2_idx = 1, 3
+                else:
+                    assert len(fused_children) == 3, (
+                        "expected FC1, activation, FC2 in fused TE ops"
+                    )
+                    fc1_idx, fc2_idx = 0, 2
+                fused_children[fc2_idx].backward_dw()
+                fused_children[fc1_idx].backward_dw()
                 # DDP registers wgrad hooks on the original linear_fc1/fc2 module objects
                 # (those are in the nn.Module tree), but backward_dw() is called on the
                 # NEW GroupedLinear instances created by _make_fused_ops().  We must
