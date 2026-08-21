@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -22,6 +24,7 @@ def test_shared_experts_block_fp8_bridges_cover_bf16_master_gradients() -> None:
     moe.shared_experts = SwiGLUMLP(hidden_size, shared_intermediate).to(
         dtype=torch.bfloat16
     )
+    moe.config = SimpleNamespace(swiglu_limit=0.0)
     moe.shared_gate_up_fp8 = _VisibleLinear()
     moe.shared_down_fp8 = _VisibleLinear()
     hidden = (torch.randn(5, hidden_size, dtype=torch.bfloat16) * 8).requires_grad_(
@@ -29,7 +32,7 @@ def test_shared_experts_block_fp8_bridges_cover_bf16_master_gradients() -> None:
     )
     grad_output = torch.randn_like(hidden)
 
-    output = moe._visible_shared_experts(hidden)
+    output = moe._shared_expert_forward(hidden)
     output.backward(grad_output)
     actual_grads = (
         hidden.grad,

@@ -34,6 +34,8 @@ from megatron.lite.model.deepseek_v4.vllm.o_proj import (
 from megatron.lite.model.deepseek_v4.vllm.router import fixed_route_vjp
 from megatron.lite.primitive.recompute import wrap_checkpoint
 
+pytestmark = pytest.mark.gpus(1)
+
 
 def _grad_like(value: torch.Tensor) -> torch.Tensor:
     return torch.arange(1, value.numel() + 1, dtype=torch.float32).reshape_as(value).div(value.numel()).to(value)

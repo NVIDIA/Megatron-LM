@@ -13,6 +13,7 @@ from megatron.lite.model.deepseek_v4.vllm.attention import (
 
 
 @pytest.mark.gpus(1)
+@pytest.mark.optional
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or importlib.util.find_spec("flash_mla") is None

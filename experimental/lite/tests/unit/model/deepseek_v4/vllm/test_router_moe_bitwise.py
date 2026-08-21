@@ -3,6 +3,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+pytestmark = pytest.mark.gpus(1)
+
 
 def test_r3_official_route_is_exact_mlite_native_noop() -> None:
     """Preserve vLLM's token/layer/slot ordering through exact R3 replay."""

@@ -461,6 +461,7 @@ def test_suite_environment_sanitizes_then_applies_declared_variables(tmp_path):
         "RANK": "7",
         "WORLD_SIZE": "8",
         "MLITE_FORCE_TOPO": "1,1,1,1,1",
+        "MLITE_TEST_DEPENDENCY_PATHS": "/dependency/one:/dependency/two",
         "MLITE_TEST_ALLOW_SKIPS": "1",
         "NCCL_NVLS_ENABLE": "1",
         "QWEN35_HF_DIR": "/external/checkpoint",
@@ -483,8 +484,14 @@ def test_suite_environment_sanitizes_then_applies_declared_variables(tmp_path):
     assert "PYTEST_ADDOPTS" not in environment
     assert "PYTEST_PLUGINS" not in environment
     assert environment["PYTHONPATH"] == os.pathsep.join(
-        (str(TEST_ROOT.parent), str(REPO_ROOT))
+        (
+            "/dependency/one",
+            "/dependency/two",
+            str(REPO_ROOT),
+            str(TEST_ROOT.parent),
+        )
     )
+    assert "MLITE_TEST_DEPENDENCY_PATHS" not in environment
     assert environment["MLITE_TEST_HARNESS"] == "1"
     assert "MLITE_TEST_ALLOW_SKIPS" not in environment
     assert environment["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"

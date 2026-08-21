@@ -80,7 +80,7 @@ def requantize_block_fp8_weight(weight: torch.Tensor, scales: torch.Tensor):
         raise ValueError(f"fixed scales must be float32 {expected} on the weight device")
     if not bool(torch.all(torch.isfinite(scales) & (scales > 0))):
         raise ValueError("fixed scales must be finite and positive")
-    with torch.inference_mode():
+    with torch.no_grad():
         if weight.is_cuda and triton is not None:
             qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
             _requantize[(triton.cdiv(weight.numel(), 256),)](
@@ -97,7 +97,7 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
     scales = getattr(weight, "_fp8_source_scales", None)
     if scales is not None and getattr(weight, "_fp8_source_scale_version", None) == weight._version:
         return requantize_block_fp8_weight(weight, scales)
-    with torch.inference_mode():
+    with torch.no_grad():
         qweight, scales = _entry("vllm.utils.deep_gemm", "per_block_cast_to_fp8")(
             weight.detach(), block_size=list(BLOCK_SHAPE), use_ue8m0=False
         )
@@ -105,7 +105,7 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
 
 
 def _post_process(qweight, scales):
-    with torch.inference_mode():
+    with torch.no_grad():
         return _entry(
             "vllm.model_executor.layers.quantization.utils.fp8_utils",
             "deepgemm_post_process_fp8_weight_block",
@@ -139,7 +139,7 @@ def pack_block_fp8_activation(x: torch.Tensor):
         "vllm.model_executor.layers.quantization.utils.fp8_utils",
         "per_token_group_quant_fp8_packed_for_deepgemm" if packed else "per_token_group_quant_fp8",
     )
-    with torch.inference_mode():
+    with torch.no_grad():
         if packed:
             qactivation, scales = quantize(x, 128, use_ue8m0=True)
         else:
@@ -155,7 +155,7 @@ def fp8_gemm_nt(x: torch.Tensor, weight: PackedBlockFP8Weight):
         raise ValueError("activation K does not match packed weight K")
     activation = pack_block_fp8_activation(x)
     output = torch.empty((x.shape[0], weight.qweight.shape[-2]), dtype=torch.bfloat16, device=x.device)
-    with torch.inference_mode():
+    with torch.no_grad():
         _entry("vllm.utils.deep_gemm", "fp8_gemm_nt")(
             (activation.qactivation, activation.scales),
             (weight.qweight, weight.scales),

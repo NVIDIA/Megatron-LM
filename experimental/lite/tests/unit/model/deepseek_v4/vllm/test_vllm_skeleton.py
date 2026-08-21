@@ -23,6 +23,8 @@ from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterRe
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
+pytestmark = pytest.mark.gpus(1)
+
 
 def _tiny_config(*, layers: int = 2) -> DeepseekV4Config:
     return DeepseekV4Config(
@@ -58,8 +60,8 @@ def test_vllm_owns_alignment_without_changing_lite_dispatcher() -> None:
 
 @pytest.mark.parametrize("tokens", [1, 17])
 def test_gate_logits_use_one_batch_invariant_gemm(tokens: int) -> None:
-    hidden = torch.randn(tokens, 8, dtype=torch.bfloat16)
-    weight = torch.randn(4, 8, dtype=torch.bfloat16)
+    hidden = torch.randn(tokens, 8, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(4, 8, dtype=torch.bfloat16, device="cuda")
     actual = _batch_invariant_gate_logits(hidden, weight)
     expected = torch.mm(hidden, weight.T, out_dtype=torch.float32)
     assert actual.dtype == torch.float32

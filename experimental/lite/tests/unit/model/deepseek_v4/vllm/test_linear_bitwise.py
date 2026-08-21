@@ -51,7 +51,7 @@ def test_deployment_linear_calls_all_vllm_boundaries(monkeypatch) -> None:
             "per_token_group_quant_fp8_packed_for_deepgemm",
         ): activation_quant,
     }
-    monkeypatch.setattr(fp8, "_import_attr", lambda module, name: entries[(module, name)])
+    monkeypatch.setattr(fp8, "_entry", lambda module, name: entries[(module, name)])
 
     output = fp8.DeploymentBlockFP8Adapter()(
         torch.zeros(3, 128, dtype=torch.bfloat16), _weight()
@@ -62,7 +62,7 @@ def test_deployment_linear_calls_all_vllm_boundaries(monkeypatch) -> None:
 
 def test_linear_contract_fails_before_vllm_for_invalid_master(monkeypatch) -> None:
     lookup = Mock()
-    monkeypatch.setattr(fp8, "_import_attr", lookup)
+    monkeypatch.setattr(fp8, "_entry", lookup)
     with pytest.raises(TypeError, match="BF16"):
         fp8.DeploymentBlockFP8Adapter()(
             torch.zeros(2, 128, dtype=torch.bfloat16),

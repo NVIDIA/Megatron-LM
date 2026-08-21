@@ -3,12 +3,15 @@ from __future__ import annotations
 import inspect
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm import model as model_module
 from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Model
+
+pytestmark = pytest.mark.gpus(1)
 
 
 def test_model_constructor_owns_logprob_chunk_size() -> None:

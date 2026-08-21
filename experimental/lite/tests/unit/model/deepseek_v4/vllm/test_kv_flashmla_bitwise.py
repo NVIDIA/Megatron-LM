@@ -23,11 +23,7 @@ def test_sparse_flashmla_cpu_contract(monkeypatch) -> None:
 
 
 def _production_ready() -> bool:
-    return (
-        torch.cuda.is_available()
-        and importlib.util.find_spec("vllm") is not None
-        and importlib.util.find_spec("flash_mla") is not None
-    )
+    return torch.cuda.is_available() and importlib.util.find_spec("vllm") is not None
 
 
 @pytest.mark.gpus(1)

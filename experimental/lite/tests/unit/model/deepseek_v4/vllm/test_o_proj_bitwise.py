@@ -25,8 +25,7 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
 
     def post_process(**kwargs):
         calls.append("post")
-        kwargs["wq"].copy_(kwargs["wq"])
-        return kwargs["wq"], kwargs["ws"].to(torch.int32)
+        return kwargs["wq"].clone(), kwargs["ws"].to(torch.int32)
 
     def official(*args, **kwargs):
         assert not torch.is_inference_mode_enabled()
