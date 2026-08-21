@@ -1593,6 +1593,18 @@ class TestDynamicMicrobatchSlots:
             TECudaGraphHelper._build_saved_tensor_liveness_colors([1, 1, -1, -1], 1, [1])
 
     @pytest.mark.internal
+    def test_user_grad_colors_separate_adjacent_vpp_chunks(self):
+        """An overlapped PP send must survive the next chunk's backward graph."""
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        colors = TECudaGraphHelper._build_user_grad_liveness_colors(
+            [1, 2, -2, -1], num_slots=1, num_model_chunks=2
+        )
+
+        assert colors[(0, 0)] != colors[(1, 0)]
+        assert len(set(colors.values())) == 2
+
+    @pytest.mark.internal
     def test_dynamic_cp_variants_emit_one_compact_slot_plan(self):
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
@@ -1619,6 +1631,7 @@ class TestDynamicMicrobatchSlots:
         banks = [make_bank(2, 0), make_bank(1, 10)]
         callables, sample_args, kwargs = helper._get_dynamic_cp_variant_capture_data(banks)
         colors = TECudaGraphHelper._build_saved_tensor_liveness_colors(order, 2, [1])
+        grad_colors = TECudaGraphHelper._build_user_grad_liveness_colors(order, 2, 1)
         expected_slots = tuple(
             (
                 colors[(0, logical_slot % 2, 0)],
@@ -1627,6 +1640,7 @@ class TestDynamicMicrobatchSlots:
                 0,
                 0,
                 variant,
+                grad_colors[(0, logical_slot % 2)],
             )
             for variant in range(2)
             for logical_slot in range(2)

@@ -3127,6 +3127,70 @@ class TECudaGraphHelper:
             return colors, conflicts
         return colors
 
+    @staticmethod
+    def _build_user_grad_liveness_colors(orders, num_slots, num_model_chunks):
+        """Color graph-returned input gradients across overlapping PP sends.
+
+        With VPP P2P overlap, the input gradient produced by one backward event remains the
+        source of an asynchronous send until the following backward event completes.  Consecutive
+        backward events therefore need distinct storage even when different model chunks map to
+        the same physical graph slot.
+        """
+        if num_slots < 1:
+            raise ValueError("User-gradient liveness coloring requires at least one slot.")
+        if not orders:
+            raise ValueError("User-gradient liveness coloring requires at least one PP/VPP order.")
+        if isinstance(orders[0], (int, float)):
+            orders = (orders,)
+
+        frames = [
+            (model_chunk, slot)
+            for model_chunk in range(num_model_chunks)
+            for slot in range(num_slots)
+        ]
+        conflicts = {frame: set() for frame in frames}
+        for order in orders:
+            backward_idx = [0] * num_model_chunks
+            previous_frame = None
+            for c_id in order:
+                if ceil(c_id) != c_id or c_id > 0:
+                    continue
+                model_chunk = abs(int(c_id)) - 1
+                if model_chunk < 0 or model_chunk >= num_model_chunks:
+                    raise ValueError(
+                        f"Invalid model chunk {c_id} in CUDA graph user-gradient order."
+                    )
+                frame = (model_chunk, backward_idx[model_chunk] % num_slots)
+                backward_idx[model_chunk] += 1
+                if frame == previous_frame:
+                    raise RuntimeError(
+                        "CUDA graph slot period aliases consecutive backward user gradients for "
+                        f"frame {frame}."
+                    )
+                if previous_frame is not None:
+                    conflicts[frame].add(previous_frame)
+                    conflicts[previous_frame].add(frame)
+                previous_frame = frame
+
+        colors = {}
+        uncolored = set(frames)
+        while uncolored:
+            frame = max(
+                uncolored,
+                key=lambda candidate: (
+                    len({colors[n] for n in conflicts[candidate] if n in colors}),
+                    len(conflicts[candidate]),
+                    tuple(-value for value in candidate),
+                ),
+            )
+            unavailable = {colors[n] for n in conflicts[frame] if n in colors}
+            color = 0
+            while color in unavailable:
+                color += 1
+            colors[frame] = color
+            uncolored.remove(frame)
+        return colors
+
     def _get_dynamic_cp_variant_capture_data(self, capture_banks):
         """Combine CP alternatives into one slot-branched TE capture call and pool."""
         callables = []
@@ -3164,6 +3228,9 @@ class TECudaGraphHelper:
         saved_tensor_liveness_colors = self._build_saved_tensor_liveness_colors(
             liveness_orders, self.num_microbatches, self.num_layers_per_chunk
         )
+        user_grad_liveness_colors = self._build_user_grad_liveness_colors(
+            liveness_orders, self.num_microbatches, self.num_model_chunks
+        )
         for variant in range(len(capture_banks)):
             layer_offset = 0
             for model_chunk, num_layers in enumerate(self.num_layers_per_chunk):
@@ -3181,6 +3248,7 @@ class TECudaGraphHelper:
                                 model_chunk,
                                 layer,
                                 variant * len(self.flattened_callables) + layer_offset + layer,
+                                user_grad_liveness_colors[(model_chunk, physical_slot)],
                             )
                         )
                 layer_offset += num_layers
