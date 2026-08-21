@@ -1061,9 +1061,7 @@ class TestDynamicMicrobatchSlots:
         )
         monkeypatch.setattr(TECudaGraphHelper, '_should_share_dynamic_cp_pool', lambda self: True)
         monkeypatch.setattr(
-            TECudaGraphHelper,
-            '_get_dynamic_cp_capture_contexts',
-            lambda self: capture_contexts,
+            TECudaGraphHelper, '_get_dynamic_cp_capture_contexts', lambda self: capture_contexts
         )
         monkeypatch.setattr(
             TECudaGraphHelper,
