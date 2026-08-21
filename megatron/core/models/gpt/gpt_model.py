@@ -325,9 +325,7 @@ class GPTModel(LanguageModule):
         cp_size = packed_seq_params.local_cp_size
         if cp_size is None:
             cp_size = self.config.context_parallel_size
-        upper_bound = getattr(self.config, '_cuda_graph_thd_rotary_seq_lens', {}).get(
-            int(cp_size)
-        )
+        upper_bound = getattr(self.config, '_cuda_graph_thd_rotary_seq_lens', {}).get(int(cp_size))
         return rotary_seq_len if upper_bound is None else min(rotary_seq_len, upper_bound)
 
     def _preprocess(
@@ -423,9 +421,7 @@ class GPTModel(LanguageModule):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                rotary_seq_len = self._bound_thd_rotary_seq_len(
-                    rotary_seq_len, packed_seq_params
-                )
+                rotary_seq_len = self._bound_thd_rotary_seq_len(rotary_seq_len, packed_seq_params)
                 rotary_pos_emb = self.rotary_pos_emb(
                     rotary_seq_len,
                     packed_seq=packed_seq_params is not None
@@ -437,9 +433,7 @@ class GPTModel(LanguageModule):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                rotary_seq_len = self._bound_thd_rotary_seq_len(
-                    rotary_seq_len, packed_seq_params
-                )
+                rotary_seq_len = self._bound_thd_rotary_seq_len(rotary_seq_len, packed_seq_params)
                 rotary_pos_emb, _ = self.rotary_pos_emb(
                     rotary_seq_len,
                     packed_seq=packed_seq_params is not None

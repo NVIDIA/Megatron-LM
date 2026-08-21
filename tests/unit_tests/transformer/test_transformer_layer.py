@@ -953,14 +953,8 @@ class TestMHCWithCudaGraph:
         layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         graph_banks = {1: [object(), object()], 2: [object(), object()]}
         input_banks = {
-            1: (
-                torch.empty((8, 1, 64), device="cuda"),
-                torch.empty((8, 1, 64), device="cuda"),
-            ),
-            2: (
-                torch.empty((4, 1, 64), device="cuda"),
-                torch.empty((4, 1, 64), device="cuda"),
-            ),
+            1: (torch.empty((8, 1, 64), device="cuda"), torch.empty((8, 1, 64), device="cuda")),
+            2: (torch.empty((4, 1, 64), device="cuda"), torch.empty((4, 1, 64), device="cuda")),
         }
         cp_groups = {1: object(), 2: object()}
         layer.cuda_graphs_by_dynamic_cp_size = graph_banks

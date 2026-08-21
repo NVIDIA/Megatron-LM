@@ -238,9 +238,9 @@ class GraphableMegatronModule(MegatronModule):
         input_ptrs = tuple(tensor.data_ptr() for tensor in inputs)
         if dynamic_cp_size is not None:
             self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size[dynamic_cp_size] = inputs
-            self._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size[
-                dynamic_cp_size
-            ] = input_ptrs
+            self._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size[dynamic_cp_size] = (
+                input_ptrs
+            )
         self._te_cuda_graph_static_hidden_inputs = inputs
         self._te_cuda_graph_static_hidden_input_ptrs = input_ptrs
 

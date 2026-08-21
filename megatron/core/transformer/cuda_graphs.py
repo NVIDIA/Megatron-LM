@@ -2362,8 +2362,7 @@ class TECudaGraphHelper:
         """Whether captured router collectives use the parent DPxCP group."""
         graph_modules = getattr(self.config, 'cuda_graph_modules', ())
         captures_router = not graph_modules or any(
-            module in graph_modules
-            for module in (CudaGraphModule.moe, CudaGraphModule.moe_router)
+            module in graph_modules for module in (CudaGraphModule.moe, CudaGraphModule.moe_router)
         )
         return self._should_share_dynamic_cp_pool() and captures_router
 
@@ -3002,9 +3001,7 @@ class TECudaGraphHelper:
         """Initialize a parent communicator used by captured router reductions."""
         if not torch.distributed.is_initialized() or parent_group.size() <= 1:
             return
-        torch.distributed.barrier(
-            group=parent_group, device_ids=[torch.cuda.current_device()]
-        )
+        torch.distributed.barrier(group=parent_group, device_ids=[torch.cuda.current_device()])
         torch.cuda.synchronize()
         torch.distributed.barrier()
 

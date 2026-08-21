@@ -265,9 +265,9 @@ class DpBalancedScheduler(BasePackingScheduler):
         total_dcp_gpus = dp_cp_group.size()
         scheduler_dp_group = dp_group
         if dp_group.size() == total_dcp_gpus:
-            assert dp_group.rank() == dp_cp_group.rank(), (
-                "Equivalent DP and DPxCP groups must use the same rank order."
-            )
+            assert (
+                dp_group.rank() == dp_cp_group.rank()
+            ), "Equivalent DP and DPxCP groups must use the same rank order."
             scheduler_dp_group = dp_cp_group
         is_first_pp = pp_group.rank() == 0
         is_last_pp = pp_group.rank() == pp_group.size() - 1
