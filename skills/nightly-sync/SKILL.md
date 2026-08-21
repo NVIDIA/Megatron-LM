@@ -114,7 +114,7 @@ CODEOWNERS change after the PR lands is painful.
 
 **NEVER manually edit `uv.lock`.** It is a machine-generated lockfile. If
 it needs to change, it must be regenerated with `uv lock` inside a CUDA
-container (see `.claude/skills/build-and-test/SKILL.md`).
+container (see `skills/mcore-build-and-dependency/SKILL.md`).
 
 ### Git Source Reconciliation (pyproject.toml)
 
