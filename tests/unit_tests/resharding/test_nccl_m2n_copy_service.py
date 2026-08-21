@@ -148,6 +148,55 @@ def test_topology_is_collected_once(monkeypatch):
     assert calls == 1
 
 
+def test_pair_layout_is_reused_until_plan_changes(monkeypatch):
+    service = object.__new__(NCCLM2NCopyService)
+    service._active_plan = None
+    service._active_transform = None
+    service._slot_bytes = None
+    topology = _validate_role_roster([(True, False), (False, True)])
+    calls = 0
+
+    def fake_exchange(_topology, _sends, _recvs):
+        nonlocal calls
+        calls += 1
+        return calls * 8
+
+    monkeypatch.setattr(service, "_exchange_pair_layouts", fake_exchange)
+
+    first_plan = object()
+    service.set_plan(first_plan)
+    assert service._get_slot_bytes(topology, {}, {}) == 8
+    service.set_plan(first_plan)
+    assert service._get_slot_bytes(topology, {}, {}) == 8
+
+    second_plan = object()
+    service.set_plan(second_plan)
+    assert service._get_slot_bytes(topology, {}, {}) == 16
+    service.set_plan(second_plan, transform=object())
+    assert service._get_slot_bytes(topology, {}, {}) == 24
+    assert calls == 3
+
+
+def test_unbound_pair_layout_is_collected_every_run(monkeypatch):
+    service = object.__new__(NCCLM2NCopyService)
+    service._active_plan = None
+    service._active_transform = None
+    service._slot_bytes = None
+    topology = _validate_role_roster([(True, False), (False, True)])
+    calls = 0
+
+    def fake_exchange(_topology, _sends, _recvs):
+        nonlocal calls
+        calls += 1
+        return 8
+
+    monkeypatch.setattr(service, "_exchange_pair_layouts", fake_exchange)
+
+    assert service._get_slot_bytes(topology, {}, {}) == 8
+    assert service._get_slot_bytes(topology, {}, {}) == 8
+    assert calls == 2
+
+
 def test_pack_leaves_padding_untouched():
     service = object.__new__(NCCLM2NCopyService)
     buffer = torch.full((6,), 7, dtype=torch.uint8)
@@ -218,13 +267,23 @@ def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
 
     service = NCCLM2NCopyService()
     service.set_model_roles(is_source=is_source, is_destination=not is_source)
+    service.set_plan(object())
+    exchange_calls = 0
+    exchange_pair_layouts = service._exchange_pair_layouts
+
+    def counted_exchange_pair_layouts(topology, sends, recvs):
+        nonlocal exchange_calls
+        exchange_calls += 1
+        return exchange_pair_layouts(topology, sends, recvs)
+
+    service._exchange_pair_layouts = counted_exchange_pair_layouts
     local_ok = True
     for iteration in range(2):
         received: list[tuple[int, torch.Tensor, torch.Tensor, int]] = []
         if is_source:
             for dst_rank in dst_ranks:
                 task_id = rank * world_size + dst_rank
-                length = 13 + rank * 7 + (dst_rank - src_count) * 5 + iteration * 3
+                length = 13 + rank * 7 + (dst_rank - src_count) * 5
                 byte_value = (rank * 31 + dst_rank * 17 + iteration) % 251
                 service.submit_send(
                     torch.full((length,), byte_value, dtype=torch.uint8, device="cuda"),
@@ -243,7 +302,7 @@ def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
         else:
             for src_rank in src_ranks:
                 task_id = src_rank * world_size + rank
-                length = 13 + src_rank * 7 + (rank - src_count) * 5 + iteration * 3
+                length = 13 + src_rank * 7 + (rank - src_count) * 5
                 bytes_out = torch.empty(length, dtype=torch.uint8, device="cuda")
                 metadata_out = torch.empty(4, dtype=torch.int64, device="cuda")
                 service.submit_recv(bytes_out, src_rank, task_id=task_id)
@@ -262,6 +321,7 @@ def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
             local_ok &= torch.equal(bytes_out, expected_bytes)
             local_ok &= torch.equal(metadata_out, expected_metadata)
 
+    local_ok &= exchange_calls == 1
     service.close()
     status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")
     dist.all_reduce(status, op=dist.ReduceOp.MIN)

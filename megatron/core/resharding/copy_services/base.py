@@ -78,6 +78,14 @@ class CopyService(ABC):
         backends may override it to construct their source/destination meshes.
         """
 
+    def set_plan(self, plan: object, *, transform: object | None = None) -> None:
+        """Associate subsequent submissions with an immutable reshard plan.
+
+        Backends may use this identity to cache collective setup that is valid
+        for the lifetime of the plan and transform. Point-to-point backends do
+        not require per-plan setup and keep this default no-op.
+        """
+
 
 def match_local_ops_by_task_id(
     local_sends: list, local_recvs: list, backend_name: str, rank: int

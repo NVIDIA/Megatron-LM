@@ -207,6 +207,9 @@ class NCCLM2NCopyService(CopyService):
         self._is_destination: bool | None = None
         self._topology: _M2NTopology | None = None
         self._comm: Any | None = None
+        self._active_plan: object | None = None
+        self._active_transform: object | None = None
+        self._slot_bytes: int | None = None
         self._closed = False
         self._poisoned = False
         self.send_ops: list[SendOp] = []
@@ -224,6 +227,13 @@ class NCCLM2NCopyService(CopyService):
             )
         self._is_source = is_source
         self._is_destination = is_destination
+
+    def set_plan(self, plan: object, *, transform: object | None = None) -> None:
+        """Select the immutable plan whose M2N layout should be reused."""
+        if plan is not self._active_plan or transform is not self._active_transform:
+            self._active_plan = plan
+            self._active_transform = transform
+            self._slot_bytes = None
 
     def submit_send(
         self, src_tensor: torch.Tensor, dest_rank: int, task_id: int | None = None
@@ -294,7 +304,7 @@ class NCCLM2NCopyService(CopyService):
     def _exchange_pair_layouts(
         self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
     ) -> int:
-        """Agree on every pair's ordered byte layout before submitting M2N work."""
+        """Agree on every pair's ordered byte layout before a plan's first M2N run."""
         peer_count = max(len(topology.src_ranks), len(topology.dst_ranks))
         local_layouts = [[0, 0, 0] for _ in range(peer_count)]
         if self.rank in topology.src_ranks:
@@ -313,6 +323,19 @@ class NCCLM2NCopyService(CopyService):
         dist.all_gather_into_tensor(gathered, local_tensor, group=self.group)
         host_layouts = gathered.view(self.world_size, peer_count, 3).cpu().tolist()
         return _validate_pair_layouts(topology, host_layouts)
+
+    def _get_slot_bytes(
+        self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
+    ) -> int:
+        """Return a plan's agreed slot size, collecting it only on first use."""
+        if self._active_plan is None:
+            # Direct CopyService users have not promised an immutable plan, so
+            # retain the conservative per-run validation for that lower-level API.
+            return self._exchange_pair_layouts(topology, sends, recvs)
+
+        if self._slot_bytes is None:
+            self._slot_bytes = self._exchange_pair_layouts(topology, sends, recvs)
+        return self._slot_bytes
 
     def _get_comm(self) -> Any:
         if self._comm is not None:
@@ -404,7 +427,7 @@ class NCCLM2NCopyService(CopyService):
             sends, recvs = self._prepare_ops()
             topology = self._get_topology()
             self._validate_peers(topology, sends, recvs)
-            slot_bytes = self._exchange_pair_layouts(topology, sends, recvs)
+            slot_bytes = self._get_slot_bytes(topology, sends, recvs)
             if slot_bytes == 0:
                 return
 
@@ -457,6 +480,9 @@ class NCCLM2NCopyService(CopyService):
         if self._closed:
             return
         self._closed = True
+        self._active_plan = None
+        self._active_transform = None
+        self._slot_bytes = None
         handle, self._handle = self._handle, None
         comm, self._comm = self._comm, None
         try:

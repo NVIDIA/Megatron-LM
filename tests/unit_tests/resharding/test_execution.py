@@ -33,6 +33,12 @@ class MockCopyService(CopyService):
     def __init__(self):
         self.sends = []  # [(tensor, dest_rank, task_id)]
         self.recvs = []  # [(tensor, src_rank, task_id)]
+        self.plan = None
+        self.transform = None
+
+    def set_plan(self, plan, *, transform=None):
+        self.plan = plan
+        self.transform = transform
 
     def submit_send(self, src_tensor, dest_rank, task_id=None):
         self.sends.append((src_tensor.clone(), dest_rank, task_id))
@@ -124,6 +130,8 @@ class TestExecuteReshard:
         service = MockCopyService()
         _run(plan, src_module, dst_module, service)
 
+        assert service.plan is plan
+        assert service.transform is None
         assert torch.equal(
             dict(dst_module.named_parameters())["weight"].data,
             dict(src_module.named_parameters())["weight"].data,
