@@ -1802,10 +1802,15 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
             replica_errors = []
+            replica_mxfp8 = (
+                self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            )
             if not self.bf16 or self.params_dtype != torch.bfloat16:
                 replica_errors.append("BF16 execution and BF16 parameters")
-            if self.fp8 or self.fp4:
-                replica_errors.append("FP8 and FP4 disabled")
+            if (self.fp8 and not replica_mxfp8) or self.fp4:
+                replica_errors.append(
+                    "quantization disabled or MXFP8 E4M3 with native FP8 parameters"
+                )
             if self.add_bias_linear:
                 replica_errors.append("add_bias_linear=False")
             if not self.moe_grouped_gemm:
@@ -1853,7 +1858,7 @@ class TransformerConfig(ModelParallelConfig):
                 replica_errors.append("moe_hybridep_pad_uneven_dispatch_inputs=False")
             if self.moe_pad_expert_input_to_capacity:
                 replica_errors.append("moe_pad_expert_input_to_capacity=False")
-            if self.moe_router_padding_for_quantization:
+            if self.moe_router_padding_for_quantization and not replica_mxfp8:
                 replica_errors.append("moe_router_padding_for_quantization=False")
             if self.moe_token_dropping:
                 replica_errors.append("moe_token_dropping=False")
