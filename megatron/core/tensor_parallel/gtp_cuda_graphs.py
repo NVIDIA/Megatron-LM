@@ -25,31 +25,43 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def _preserve_gtp_forward_prefetch_state(params: Iterable):
-    """Preserve cross-graph forward-AG handoffs while a local graph warms up.
+def preserve_gtp_prefetch_state(params: Iterable[torch.nn.Parameter]):
+    """Preserve cross-graph AG handoffs while a local graph warms up.
 
-    A local graph's first GTP weight can be prefetched and drained by the preceding graph.
-    Runner-local warmup consumes that readiness without rerunning the producer, and can create
-    outgoing readiness of its own. Capture must therefore see the same ``_already_ag_drained``
-    state that existed before warmup. Completed Work handles are intentionally not restored; the
-    producer's external ``ag_event`` carries the device-side dependency into the consumer graph.
+    A local graph's first GTP weight can be prefetched and drained by the preceding forward or
+    backward graph. Runner-local warmup consumes that readiness without rerunning the producer,
+    and can create outgoing readiness of its own. Capture must therefore see the same forward and
+    recompute-forward handoff state that existed before each warmup pass. Completed Work handles
+    are intentionally not restored; the producer's external event carries the device dependency.
     """
     prefetch_state = tuple(
-        (param, getattr(param, "_already_ag_drained", False))
+        (
+            param,
+            getattr(param, "_already_ag_drained", False),
+            getattr(param, "_recompute_already_drained", False),
+        )
         for param in params
         if getattr(param, "is_gtp_weight_remat", False)
     )
+    completed = False
     try:
         yield
+        completed = True
     finally:
-        for param, already_drained in prefetch_state:
-            # Warmup must consume every forward AG it issues. Restoring a completed Work handle
-            # would be invalid; restore only the host flag describing the cross-graph handoff.
-            assert getattr(param, "_prefetch_handle", None) is None, (
-                "GTP warmup left an undrained forward AG for "
-                f"{getattr(param, '_debug_name', '') or id(param)}"
-            )
+        leaked_params = []
+        for param, already_drained, recompute_already_drained in prefetch_state:
+            if (
+                getattr(param, "_prefetch_handle", None) is not None
+                or getattr(param, "_recompute_prefetch_handle", None) is not None
+            ):
+                leaked_params.append(getattr(param, "_debug_name", "") or f"id={id(param):#x}")
             param._already_ag_drained = already_drained
+            param._recompute_already_drained = recompute_already_drained
+
+        # Do not replace an exception from the warmup body with a cleanup failure. On successful
+        # warmup, however, a live Work handle would make the restored host handoff state invalid.
+        if completed and leaked_params:
+            raise RuntimeError("GTP warmup left undrained AG work for: " + ", ".join(leaked_params))
 
 
 @dataclass
@@ -64,7 +76,7 @@ class GraphWgradRingSlot:
 
 @dataclass
 class GTPCaptureCommState:
-    """GTP work and parameter-readiness dependencies issued while capturing one CUDA graph."""
+    """GTP work and parameter-readiness dependencies owned by one capture or warmup pass."""
 
     params: list = field(default_factory=list)
     params_to_ensure_ready: list = field(default_factory=list)
@@ -76,9 +88,11 @@ class GTPCaptureCommState:
     _ag_stream_ids: set = field(default_factory=set)
     _rs_stream_ids: set = field(default_factory=set)
     _wgrad_ring_slot_params: dict = field(default_factory=dict)
+    _comm_records: list[tuple[object, torch.cuda.Stream, bool]] = field(default_factory=list)
 
     def register_comm(self, param, stream: torch.cuda.Stream, *, reduce_scatter: bool) -> None:
-        """Record a parameter and side stream owned by this graph capture."""
+        """Record a parameter and side stream owned by the active capture tracker."""
+        self._comm_records.append((param, stream, reduce_scatter))
         param_id = id(param)
         if param_id not in self._param_ids:
             self._param_ids.add(param_id)
@@ -98,6 +112,30 @@ class GTPCaptureCommState:
             if param_id not in self._param_ids_to_ensure_ready:
                 self._param_ids_to_ensure_ready.add(param_id)
                 self.params_to_ensure_ready.append(param)
+
+    def get_comms_for_chain(self, chain_id: str) -> tuple[list, list, list]:
+        """Return owned parameters, AG streams, and RS streams for one GTP chain."""
+        params = []
+        ag_streams = []
+        rs_streams = []
+        param_ids = set()
+        ag_stream_ids = set()
+        rs_stream_ids = set()
+
+        for param, stream, reduce_scatter in self._comm_records:
+            if getattr(param, "chain_id", None) != chain_id:
+                continue
+            if id(param) not in param_ids:
+                param_ids.add(id(param))
+                params.append(param)
+
+            streams = rs_streams if reduce_scatter else ag_streams
+            stream_ids = rs_stream_ids if reduce_scatter else ag_stream_ids
+            if id(stream) not in stream_ids:
+                stream_ids.add(id(stream))
+                streams.append(stream)
+
+        return params, ag_streams, rs_streams
 
     def register_wgrad_ring_slot(self, slot: GraphWgradRingSlot, param) -> None:
         """Track slots used by this graph and reject unsafe intra-graph aliasing."""
@@ -137,7 +175,12 @@ def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
 
 @contextmanager
 def track_gtp_capture_comms():
-    """Track asynchronous GTP work owned by one CUDA-graph capture."""
+    """Track asynchronous GTP work issued during one capture or warmup pass.
+
+    This context tracks ownership, not graph-chain membership. Nested modules can issue work for
+    ``UNGRAPHED`` parameters while the context is active, so callers implementing the cross-graph
+    handoff must explicitly select the ``GRAPHED`` parameters and their corresponding streams.
+    """
     global _ACTIVE_CAPTURE_COMM_STATE
 
     if _ACTIVE_CAPTURE_COMM_STATE is not None:

@@ -22,7 +22,6 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.gtp_cuda_graphs import _preserve_gtp_forward_prefetch_state
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     get_all_rng_states,
@@ -72,6 +71,7 @@ if HAVE_GTP:
         GTPChain,
         get_rs_stream,
         initialize_graph_wgrad_rings,
+        preserve_gtp_prefetch_state,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
         wait_async_comms,
@@ -84,6 +84,7 @@ else:
     GTP_CONFIG = None
     get_rs_stream = None
     initialize_graph_wgrad_rings = None
+    preserve_gtp_prefetch_state = None
     set_cuda_graph_mempool = None
     track_gtp_capture_comms = None
     wait_async_comms = None
@@ -1049,7 +1050,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 _set_skip_fp8_weight_update_tensor(False)
 
     def _wait_side_streams(self, side_streams):
-        """Make the current stream wait for all side streams discovered."""
+        """Wait for side streams that carried work owned by one capture tracker.
+
+        Joining only streams discovered by ``track_gtp_capture_comms`` avoids waiting on an empty
+        captured stream.
+        """
         for s in side_streams:
             torch.cuda.current_stream().wait_stream(s)
 
@@ -1300,13 +1305,8 @@ class _CudaGraphRunner(torch.nn.Module):
         )
 
         grad_context = torch.no_grad() if not self.grad_enabled else nullcontext()
-        preserve_prefetch_context = (
-            _preserve_gtp_forward_prefetch_state(self.base_module.parameters())
-            if self.gtp_remat
-            else nullcontext()
-        )
         warmup_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext()
-        with grad_context, preserve_prefetch_context, warmup_comm_context as warmup_comms:
+        with grad_context, warmup_comm_context as warmup_comms:
             # Warm up again because CUDA graph capture mode may execute a different codepath
             _set_warmup_start()
 
@@ -1315,36 +1315,45 @@ class _CudaGraphRunner(torch.nn.Module):
             # from that output's autograd graph. Force this pass even when configured warmup is 0.
             num_warmup_steps = max(self.num_warmup_steps, int(self.needs_recompute_param_discovery))
             for _ in range(num_warmup_steps):
-                with self.get_quantization_context():
+                preserve_prefetch_context = (
+                    preserve_gtp_prefetch_state(self.base_module.parameters())
+                    if self.gtp_remat
+                    else nullcontext()
+                )
+                with preserve_prefetch_context:
+                    with self.get_quantization_context():
 
-                    def clone_ten(ten):
-                        if not torch.is_tensor(ten):
-                            return ten
-                        return torch.clone(ten).detach().requires_grad_(ten.requires_grad)
+                        def clone_ten(ten):
+                            if not torch.is_tensor(ten):
+                                return ten
+                            return torch.clone(ten).detach().requires_grad_(ten.requires_grad)
 
-                    warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
-                    warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
-                    warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
+                        warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
+                        warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
+                        warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
 
-                if self.grad_enabled:
-                    warmup_outputs = self.get_tensors(warmup_outputs)
-                    warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
-                    input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
-                    torch.autograd.grad(
-                        outputs=warmup_outputs,
-                        inputs=tuple(i for i in input_tensors if i.requires_grad),
-                        grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
-                        only_inputs=True,
-                        allow_unused=True,
-                    )
+                    if self.grad_enabled:
+                        warmup_outputs = self.get_tensors(warmup_outputs)
+                        warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
+                        input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
+                        torch.autograd.grad(
+                            outputs=warmup_outputs,
+                            inputs=tuple(i for i in input_tensors if i.requires_grad),
+                            grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
+                            only_inputs=True,
+                            allow_unused=True,
+                        )
 
-                if self.gtp_remat:
-                    # Join only communication issued during this runner's warmup. The tracker
-                    # is discarded before capture, so warmup ownership cannot leak into the
-                    # captured graph's communication set.
-                    wait_async_comms(params=warmup_comms.params)
-                    self._wait_side_streams(warmup_comms.ag_streams)
-                    self._wait_side_streams(warmup_comms.rs_streams)
+                    if self.gtp_remat:
+                        # Join only GRAPHED-chain communication issued by this runner. Selecting
+                        # by both capture ownership and chain keeps UNGRAPHED work on its eager
+                        # lifecycle instead of turning it into a cross-graph handoff.
+                        warmup_params, warmup_ag_streams, warmup_rs_streams = (
+                            warmup_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                        )
+                        wait_async_comms(GTPChain.GRAPHED.value, params=warmup_params)
+                        self._wait_side_streams(warmup_ag_streams)
+                        self._wait_side_streams(warmup_rs_streams)
             _set_warmup_end()
 
         with grad_context:
@@ -1385,8 +1394,13 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.gtp_remat:
                         # Forward only issues AG prefetches. Drain the operations directly.
-                        wait_async_comms(skip_rs=True, params=capture_comms.params)
-                        self._wait_side_streams(capture_comms.ag_streams)
+                        captured_params, captured_ag_streams, _ = capture_comms.get_comms_for_chain(
+                            GTPChain.GRAPHED.value
+                        )
+                        wait_async_comms(
+                            GTPChain.GRAPHED.value, skip_rs=True, params=captured_params
+                        )
+                        self._wait_side_streams(captured_ag_streams)
 
                 if self.gtp_remat:
                     self._gtp_fwd_params_to_ensure_ready = tuple(
@@ -1536,18 +1550,21 @@ class _CudaGraphRunner(torch.nn.Module):
             #             consumer's cascade; for within-graph tails both
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
+                captured_params, captured_ag_streams, captured_rs_streams = (
+                    capture_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                )
                 # Phase 1: drain AG
-                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=capture_comms.params)
-                self._wait_side_streams(capture_comms.ag_streams)
+                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=captured_params)
+                self._wait_side_streams(captured_ag_streams)
 
                 # Release the next runner after AG drain but before RS drain.
                 self.bwd_completion_event.record()
 
                 # Phase 2: in-graph RS drain + finalize.
                 wait_async_comms(
-                    GTPChain.GRAPHED.value, finalize_after_drain=True, params=capture_comms.params
+                    GTPChain.GRAPHED.value, finalize_after_drain=True, params=captured_params
                 )
-                self._wait_side_streams(capture_comms.rs_streams)
+                self._wait_side_streams(captured_rs_streams)
 
             if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.
