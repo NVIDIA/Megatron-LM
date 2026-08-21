@@ -71,7 +71,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
     )
     enable_hybridep = (
         config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "hybridep"
+        and config.moe_flex_dispatcher_backend in ("hybridep", "replica_hybridep")
     )
     enable_ncclep = (
         config.moe_token_dispatcher_type == "flex"
