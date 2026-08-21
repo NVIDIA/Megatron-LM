@@ -256,7 +256,16 @@ class TestFP8Param:
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
-        model_parallel_cuda_manual_seed(_SEED)
+        # Mirror production RNG initialization. CUDA-graph validation enables the TE RNG
+        # tracker, whose graph-safe states must be torch.Generator objects rather than the
+        # Tensor states produced by the default MCore tracker. Each helper invocation may
+        # follow a test using a different tracker, so replace the process-global tracker.
+        model_parallel_cuda_manual_seed(
+            _SEED,
+            te_rng_tracker=args.te_rng_tracker,
+            use_cudagraphable_rng=args.cuda_graph_impl != "none",
+            force_reset_rng=True,
+        )
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:
