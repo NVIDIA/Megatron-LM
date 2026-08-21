@@ -13,6 +13,7 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
 from ..transformer.module import MegatronModule
+from ..utils import to_local_if_dtensor
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -106,6 +107,28 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Build a sharded optimizer state dict."""
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
+    @staticmethod
+    def count_replication(tensor: DTensor) -> int:
+        """Return how many ranks hold an identical copy of ``tensor``'s local shard.
+
+        A sharded mesh axis holds disjoint pieces that must all be counted; a replicated
+        axis holds identical copies that must be counted once, so a gradient statistic
+        summed over the grad-stats group has to divide by this.
+
+        MFSDP v2 gradients are always DTensors, so this takes one rather than accepting
+        a plain tensor and guessing a layout for it.
+        """
+        replication = 1
+        for axis, placement in enumerate(tensor.placements):
+            if placement.is_replicate():
+                replication *= tensor.device_mesh.size(axis)
+            elif placement.is_partial():
+                raise RuntimeError(
+                    "MFSDP v2 gradient is still Partial when gradient statistics are taken; "
+                    "the reduction must be finalized first."
+                )
+        return replication
+
     def get_grad_norm(self):
         """Compute the global gradient L2 norm from each gradient's own DTensor layout.
 
@@ -140,19 +163,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             grad = parameter.grad
             if grad is None:
                 continue
-            replication = 1
-            if isinstance(grad, DTensor):
-                for axis, placement in enumerate(grad.placements):
-                    if placement.is_replicate():
-                        replication *= grad.device_mesh.size(axis)
-                    elif placement.is_partial():
-                        raise RuntimeError(
-                            "MFSDP v2 gradient is still Partial when the norm is taken; "
-                            "the reduction must be finalized first."
-                        )
-                local_grad = grad.to_local()
-            else:
-                local_grad = grad
+            replication = self.count_replication(grad)
+            local_grad = grad.to_local()
             if local_grad.numel():
                 total_norm_squared += local_grad.float().pow(2).sum() / replication
 
@@ -162,6 +174,46 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             group=self.get_grad_stats_parallel_group(),
         )
         return total_norm_squared.sqrt()
+
+    def get_grads_for_grad_norm(self, grad_norm_group: Optional[str] = None):
+        """Return local gradient shards for the shared grad-norm helpers.
+
+        The base implementation only unwraps a DTensor gradient when the parameter
+        carries ``__fsdp_param__``; otherwise the DTensor reaches ``get_grad_norm_fp32``,
+        which feeds every gradient to ``get_data_parallel_group_if_dtensor`` and asserts
+        they all share one device mesh. MFSDP v2 breaks that assumption, so unwrap here
+        instead of marking the parameters.
+        """
+        return [
+            to_local_if_dtensor(grad) for grad in super().get_grads_for_grad_norm(grad_norm_group)
+        ]
+
+    def count_zeros(self) -> float:
+        """Count zero gradient entries from each gradient's own DTensor layout.
+
+        ``count_zeros_fp32`` has the same single-mesh assumption as the grad-norm path,
+        and additionally rejects the combination of a Megatron-FSDP parameter with a
+        DTensor-derived data-parallel group. Counting here keeps MFSDP v2 off that path,
+        and matches how ``get_grad_norm`` reduces: each rank contributes its own shard,
+        divided by the size of any replicated mesh axis, summed over the grad-stats group.
+        """
+        total_zeros = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
+        for parameter in self.get_parameters():
+            grad = parameter.grad
+            if grad is None:
+                continue
+            replication = self.count_replication(grad)
+            local_grad = grad.to_local()
+            if local_grad.numel():
+                zeros = local_grad.numel() - torch.count_nonzero(local_grad)
+                total_zeros += zeros.float() / replication
+
+        torch.distributed.all_reduce(
+            total_zeros,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.get_grad_stats_parallel_group(),
+        )
+        return total_zeros.item()
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear optimizer-visible sharded grads and any grads filtered from local groups."""
