@@ -3249,28 +3249,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     ) -> te.pytorch.NVFP4Quantizer:
                         """Construct NVFP4 quantizer with UE5M3 scales and no per-tensor
                         scale for activations."""
-
-                        from transformer_engine.pytorch.quantization import RecipeState
-
-                        # Parse tensor role
                         tensor_type = role.tensor_type if role is not None else None
-
-                        # Construct NVFP4 quantizer based on default NVFP4 recipe
-                        fp4_recipe = te.common.recipe.NVFP4BlockScaling(
-                            fp8_format=te.common.recipe.Format.UE5M3
+                        if not tensor_type:
+                            tensor_type = "input"
+                        with_rht = tensor_type in ("input", "grad_output")
+                        return te.pytorch.NVFP4Quantizer(
+                            scale_dtype=te.pytorch.DType.kFloat8UE5M3,
+                            with_rht=with_rht,
+                            with_post_rht_amax=with_rht,
+                            with_2d_quantization=tensor_type == "weight",
+                            stochastic_rounding=False,
+                            with_random_sign_mask=False,
+                            disable_second_level_scale=tensor_type == "input",
                         )
-                        (quantizer,) = RecipeState.create(
-                            fp4_recipe,
-                            mode="forward" if tensor_type != "grad_output" else "backward",
-                            num_quantizers=1,
-                            roles=[role],
-                        ).make_quantizers()
-
-                        # Disable per-tensor scale for activations
-                        if tensor_type == "input":
-                            quantizer.disable_second_level_scale = True
-
-                        return quantizer
 
                     # Construct custom recipe for NVFP4 with UE5M3 scales
                     self._recipe = te.common.recipe.CustomRecipe(
