@@ -48,11 +48,25 @@ def reset_modality_participation(mimo_model: MimoModel) -> None:
 
 
 def _vision_participation_count(submodule, vision_dp_group) -> torch.Tensor:
-    """Number of vision-DP ranks that processed image input this step."""
+    """Scalar count of vision-DP ranks that processed image input this step."""
     val = 1.0 if getattr(submodule, _PARTICIPATED_ATTR, False) else 0.0
-    indicator = torch.tensor([val], dtype=torch.float32, device="cuda")
+    indicator = torch.tensor(val, dtype=torch.float32, device="cuda")
     dist.all_reduce(indicator, op=dist.ReduceOp.SUM, group=vision_dp_group)
     return indicator
+
+
+def _vision_participation_scale(participation: torch.Tensor, vision_dp_size: int) -> torch.Tensor:
+    """Correct gradients when only part of the vision-DP group processed input."""
+    return torch.where(
+        (participation > 0) & (participation < vision_dp_size),
+        vision_dp_size * participation.reciprocal(),
+        torch.ones_like(participation),
+    )
+
+
+def _token_normalization_scale(num_tokens: torch.Tensor) -> torch.Tensor:
+    """Return a device-side reciprocal, leaving zero-token gradients unscaled."""
+    return num_tokens.clamp_min(1).reciprocal()
 
 
 def _is_pg_member(pg) -> bool:
@@ -106,10 +120,10 @@ def _global_token_count(num_tokens, language_pg, src_global_rank) -> torch.Tenso
     world (including the non-colocated encoder grid, where ``language_pg`` is None) so
     both modules divide by the same per-token mean.
     """
-    global_num_tokens = torch.zeros(1, dtype=torch.float32, device="cuda")
+    global_num_tokens = torch.zeros((), dtype=torch.float32, device="cuda")
     if _is_token_source_rank(language_pg):
         data_group = language_pg.dp_cp_gtp_remat or language_pg.dp_cp
-        token_count = num_tokens.to(dtype=torch.float32).sum().view(1)
+        token_count = num_tokens.to(dtype=torch.float32).sum()
         dist.all_reduce(token_count, group=data_group, op=dist.ReduceOp.SUM)
         if dist.get_rank(group=data_group) == 0:
             global_num_tokens.copy_(token_count)
@@ -150,7 +164,7 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
         # N_global is the global token count, published to every rank (including the
         # non-colocated encoder grid) so both modules divide by the same per-token mean.
         n_global = _global_token_count(num_tokens, language_pg, src_global_rank)
-        inv = torch.where(n_global > 0, n_global.reciprocal(), torch.zeros_like(n_global))
+        inv = _token_normalization_scale(n_global)
 
         if mimo_model.language_model is not None:
             finalize_model_grads(
@@ -179,10 +193,8 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
                     vision_dp_size = dist.get_world_size(vision_dp_group)
                     if vision_dp_size > 1:
                         participation = _vision_participation_count(submodule, vision_dp_group)
-                        participation_scale = torch.where(
-                            (participation > 0) & (participation < vision_dp_size),
-                            vision_dp_size * participation.reciprocal(),
-                            torch.ones_like(participation),
+                        participation_scale = _vision_participation_scale(
+                            participation, vision_dp_size
                         )
                         vision_scale = vision_scale * participation_scale
 
