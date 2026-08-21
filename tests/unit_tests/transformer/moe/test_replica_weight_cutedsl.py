@@ -28,8 +28,10 @@ from megatron.core.transformer.moe.replica_weight_cutedsl import (
     HAVE_CUTEDSL,
     MAX_REPLICA_WEIGHT_SMS,
     _validate_compile_shape,
+    compile_replica_mxfp8_weight_kernels,
     compile_replica_weight_kernels,
     launch_replica_grad_reduce,
+    launch_replica_mxfp8_weight_prefetch,
     launch_replica_weight_prefetch,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -84,9 +86,7 @@ def _allocate_symmetric(
 def _gather_samples(samples: list[float], group: dist.ProcessGroup) -> list[float]:
     """Gather fixed-size CUDA-event samples from every rank."""
     device_samples = torch.tensor(samples, dtype=torch.float64, device="cuda")
-    gathered = [
-        torch.empty_like(device_samples) for _ in range(dist.get_world_size(group))
-    ]
+    gathered = [torch.empty_like(device_samples) for _ in range(dist.get_world_size(group))]
     dist.all_gather(gathered, device_samples, group=group)
     return torch.cat(gathered).cpu().tolist()
 
@@ -103,8 +103,7 @@ def _summarize(samples: list[float]) -> dict[str, float]:
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
-    reason="CUDA and CuTeDSL are required",
+    not torch.cuda.is_available() or not HAVE_CUTEDSL, reason="CUDA and CuTeDSL are required"
 )
 def test_replica_weight_kernels_virtual_only_cases():
     """Cover owner-push, sparse clearing, zero work, and unequal FC shapes."""
@@ -117,11 +116,11 @@ def test_replica_weight_kernels_virtual_only_cases():
     world_size = dist.get_world_size(group)
     device = torch.device("cuda", torch.cuda.current_device())
     num_local_experts = 8
-    member_numels = (16384, 32768)
+    # Keep the test compact while using the same 8-KiB-aligned E8M0 scale
+    # transactions as the production 2048x640 expert projections.
+    member_numels = (262144, 524288)
     arena_numel = num_local_experts * sum(member_numels)
-    weight_storage, weight_handle = _allocate_symmetric(
-        arena_numel, torch.bfloat16, group
-    )
+    weight_storage, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
     grad_storage, grad_handle = _allocate_symmetric(arena_numel, torch.float32, group)
     weight_arena = weight_storage
     grad_arena = grad_storage
@@ -151,9 +150,7 @@ def test_replica_weight_kernels_virtual_only_cases():
     )
 
     def make_plan(placement: str, slots: tuple[int, ...]) -> torch.Tensor:
-        plan = torch.full(
-            (world_size, num_local_experts), -1, dtype=torch.int32, device=device
-        )
+        plan = torch.full((world_size, num_local_experts), -1, dtype=torch.int32, device=device)
         if placement == "asymmetric":
             plan[0, slots[0]] = num_local_experts
             plan[1, slots[0]] = 2 * num_local_experts
@@ -236,10 +233,7 @@ def test_replica_weight_kernels_virtual_only_cases():
             plan_rows = plan.tolist()
             for projection, member in enumerate(member_numels):
                 expected = torch.full(
-                    (num_local_experts,),
-                    projection + 5,
-                    dtype=torch.float32,
-                    device=device,
+                    (num_local_experts,), projection + 5, dtype=torch.float32, device=device
                 )
                 for local_expert in range(num_local_experts):
                     semantic_expert = rank * num_local_experts + local_expert
@@ -277,11 +271,7 @@ def test_replica_weight_kernels_virtual_only_cases():
                 )
                 for slot in range(num_local_experts):
                     semantic_expert = int(plan[rank, slot])
-                    expected = (
-                        -123
-                        if semantic_expert < 0
-                        else projection * 1000 + semantic_expert
-                    )
+                    expected = -123 if semantic_expert < 0 else projection * 1000 + semantic_expert
                     expected = torch.tensor(expected, dtype=torch.bfloat16).item()
                     if view[slot, 0].item() != expected:
                         errors.append(
@@ -307,12 +297,354 @@ def test_replica_weight_kernels_virtual_only_cases():
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
-    reason="CUDA and CuTeDSL are required",
+    not torch.cuda.is_available() or not HAVE_CUTEDSL, reason="CUDA and CuTeDSL are required"
 )
+def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
+    """Copy MXFP8 bytes/scales exactly without touching the other GEMM orientation."""
+    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
+        pytest.skip("Replica MXFP8 kernel coverage requires a 4-rank torchrun launch")
+
+    Utils.initialize_distributed()
+    group = dist.group.WORLD
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_local_experts = 4
+    member_numels = (16384, 32768)
+    rowwise_scale_numels = tuple(member // 32 for member in member_numels)
+    columnwise_scale_numels = rowwise_scale_numels
+
+    def allocate_orientation(scale_numels):
+        numel = num_local_experts * sum(
+            member + scale for member, scale in zip(member_numels, scale_numels)
+        )
+        return _allocate_symmetric(numel, torch.uint8, group)
+
+    rowwise_arena, rowwise_handle = allocate_orientation(rowwise_scale_numels)
+    columnwise_arena, columnwise_handle = allocate_orientation(columnwise_scale_numels)
+    rowwise_data = tuple(
+        torch.empty(num_local_experts, member, dtype=torch.uint8, device=device)
+        for member in member_numels
+    )
+    columnwise_data = tuple(torch.empty_like(source) for source in rowwise_data)
+    rowwise_scales = tuple(
+        torch.empty(num_local_experts, scale, dtype=torch.uint8, device=device)
+        for scale in rowwise_scale_numels
+    )
+    columnwise_scales = tuple(torch.empty_like(source) for source in rowwise_scales)
+    for projection in range(2):
+        for expert in range(num_local_experts):
+            semantic_expert = rank * num_local_experts + expert
+            rowwise_data[projection][expert].fill_(semantic_expert + 1 + 20 * projection)
+            rowwise_scales[projection][expert].fill_(semantic_expert + 65 + 20 * projection)
+            columnwise_data[projection][expert].fill_(semantic_expert + 129 + 20 * projection)
+            columnwise_scales[projection][expert].fill_(semantic_expert + 193 + 20 * projection)
+
+    experts_to_copy = torch.full(
+        (world_size, num_local_experts), -1, dtype=torch.int32, device=device
+    )
+    for destination in range(world_size):
+        owner = (destination + 1) % world_size
+        experts_to_copy[destination] = torch.arange(
+            owner * num_local_experts,
+            (owner + 1) * num_local_experts,
+            dtype=torch.int32,
+            device=device,
+        )
+    rowwise_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+    columnwise_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+    compile_replica_mxfp8_weight_kernels(
+        world_size=world_size,
+        num_local_experts=num_local_experts,
+        member_numels=member_numels,
+        rowwise_scale_numels=rowwise_scale_numels,
+        columnwise_scale_numels=columnwise_scale_numels,
+        num_sms=4,
+        device_index=device.index,
+    )
+
+    def launch(orientation):
+        dist.barrier(group=group, device_ids=[device.index])
+        rowwise = orientation == "rowwise"
+        arena = rowwise_arena if rowwise else columnwise_arena
+        handle = rowwise_handle if rowwise else columnwise_handle
+        launch_replica_mxfp8_weight_prefetch(
+            data_sources=rowwise_data if rowwise else columnwise_data,
+            scale_sources=rowwise_scales if rowwise else columnwise_scales,
+            arena=arena,
+            peer_bases=handle.buffer_ptrs_dev,
+            signal_bases=handle.signal_pad_ptrs_dev,
+            experts_to_copy=experts_to_copy,
+            grid_barrier=rowwise_barrier if rowwise else columnwise_barrier,
+            rank=rank,
+            world_size=world_size,
+            num_local_experts=num_local_experts,
+            member_numels=member_numels,
+            rowwise_scale_numels=rowwise_scale_numels,
+            columnwise_scale_numels=columnwise_scale_numels,
+            orientation=orientation,
+            num_sms=4,
+        )
+
+    def projection_views(arena, scale_numels, projection):
+        projection_offset = num_local_experts * sum(
+            member + scale
+            for member, scale in zip(member_numels[:projection], scale_numels[:projection])
+        )
+        data = arena.narrow(
+            0, projection_offset, num_local_experts * member_numels[projection]
+        ).view(num_local_experts, member_numels[projection])
+        scale = arena.narrow(
+            0,
+            projection_offset + num_local_experts * member_numels[projection],
+            num_local_experts * scale_numels[projection],
+        ).view(num_local_experts, scale_numels[projection])
+        return data, scale
+
+    try:
+        rowwise_arena.fill_(17)
+        columnwise_arena.fill_(23)
+        launch("rowwise")
+        torch.cuda.synchronize(device)
+        owner = (rank + 1) % world_size
+        for projection in range(2):
+            data, scale = projection_views(rowwise_arena, rowwise_scale_numels, projection)
+            expected_data = torch.arange(
+                owner * num_local_experts + 1 + 20 * projection,
+                (owner + 1) * num_local_experts + 1 + 20 * projection,
+                dtype=torch.uint8,
+                device=device,
+            )
+            expected_scale = expected_data + 64
+            torch.testing.assert_close(data[:, 0], expected_data, rtol=0, atol=0)
+            torch.testing.assert_close(data[:, -1], expected_data, rtol=0, atol=0)
+            torch.testing.assert_close(scale[:, 0], expected_scale, rtol=0, atol=0)
+            torch.testing.assert_close(scale[:, -1], expected_scale, rtol=0, atol=0)
+        torch.testing.assert_close(
+            columnwise_arena, torch.full_like(columnwise_arena, 23), rtol=0, atol=0
+        )
+
+        rowwise_snapshot = rowwise_arena.clone()
+        launch("columnwise")
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(rowwise_arena, rowwise_snapshot, rtol=0, atol=0)
+        for projection in range(2):
+            data, scale = projection_views(columnwise_arena, columnwise_scale_numels, projection)
+            expected_data = torch.arange(
+                owner * num_local_experts + 129 + 20 * projection,
+                (owner + 1) * num_local_experts + 129 + 20 * projection,
+                dtype=torch.uint8,
+                device=device,
+            )
+            expected_scale = expected_data + 64
+            torch.testing.assert_close(data[:, 0], expected_data, rtol=0, atol=0)
+            torch.testing.assert_close(data[:, -1], expected_data, rtol=0, atol=0)
+            torch.testing.assert_close(scale[:, 0], expected_scale, rtol=0, atol=0)
+            torch.testing.assert_close(scale[:, -1], expected_scale, rtol=0, atol=0)
+    finally:
+        dist.barrier(group=group, device_ids=[device.index])
+        del rowwise_handle, columnwise_handle, rowwise_arena, columnwise_arena
+        gc.collect()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
 @pytest.mark.skipif(
-    not _PROFILE_ENABLED, reason="set MCORE_RUN_REPLICA_WEIGHT_PROFILE=1"
+    not torch.cuda.is_available() or not HAVE_CUTEDSL, reason="CUDA and CuTeDSL are required"
 )
+@pytest.mark.skipif(not _PROFILE_ENABLED, reason="set MCORE_RUN_REPLICA_WEIGHT_PROFILE=1")
+def test_replica_mxfp8_weight_kernel_production_bandwidth():
+    """Require production-shape MXFP8 owner-push to approach NVLink bandwidth."""
+    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
+        pytest.skip("Replica MXFP8 profiling requires a 4-rank torchrun launch")
+
+    Utils.initialize_distributed()
+    group = dist.group.WORLD
+    rank = dist.get_rank(group)
+    world_size = dist.get_world_size(group)
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_local_experts = int(os.environ.get("MCORE_REPLICA_WEIGHT_LOCAL_EXPERTS", "32"))
+    member_numels = (
+        int(os.environ.get("MCORE_REPLICA_WEIGHT_FC1_NUMEL", str(2048 * 640))),
+        int(os.environ.get("MCORE_REPLICA_WEIGHT_FC2_NUMEL", str(2048 * 640))),
+    )
+    scale_numels = tuple(member // 32 for member in member_numels)
+    num_sms = int(os.environ.get("MCORE_REPLICA_WEIGHT_NUM_SMS", "32"))
+    active_slots = int(os.environ.get("MCORE_REPLICA_WEIGHT_ACTIVE_SLOTS", str(num_local_experts)))
+    warmups = int(os.environ.get("MCORE_REPLICA_WEIGHT_WARMUPS", "3"))
+    iterations = int(os.environ.get("MCORE_REPLICA_WEIGHT_ITERATIONS", "10"))
+    batches = int(os.environ.get("MCORE_REPLICA_WEIGHT_BATCHES", "5"))
+    minimum_gbps = float(os.environ.get("MCORE_REPLICA_WEIGHT_MIN_GBPS", "800"))
+
+    arena_numel = num_local_experts * sum(
+        member + scale for member, scale in zip(member_numels, scale_numels)
+    )
+    arena, handle = _allocate_symmetric(arena_numel, torch.uint8, group)
+    data_sources = tuple(
+        torch.empty(num_local_experts, member, dtype=torch.uint8, device=device)
+        for member in member_numels
+    )
+    scale_sources = tuple(
+        torch.empty(num_local_experts, scale, dtype=torch.uint8, device=device)
+        for scale in scale_numels
+    )
+    for projection in range(2):
+        for expert in range(num_local_experts):
+            value = rank * num_local_experts + expert + projection * 97
+            data_sources[projection][expert].fill_(value % 256)
+            scale_sources[projection][expert].fill_((value + 41) % 256)
+    # The production bridge binds these device tables once. Keep the benchmark
+    # on that steady-state path instead of timing four tiny host-to-device table
+    # constructions on every owner-push launch.
+    data_source_bases = tuple(
+        torch.tensor(
+            [source[expert].data_ptr() for expert in range(num_local_experts)],
+            dtype=torch.int64,
+            device=device,
+        )
+        for source in data_sources
+    )
+    scale_source_bases = tuple(
+        torch.tensor(
+            [source[expert].data_ptr() for expert in range(num_local_experts)],
+            dtype=torch.int64,
+            device=device,
+        )
+        for source in scale_sources
+    )
+
+    experts_to_copy = torch.full(
+        (world_size, num_local_experts), -1, dtype=torch.int32, device=device
+    )
+    for destination in range(world_size):
+        owner = (destination + 1) % world_size
+        experts_to_copy[destination, :active_slots] = torch.arange(
+            owner * num_local_experts,
+            owner * num_local_experts + active_slots,
+            dtype=torch.int32,
+            device=device,
+        )
+    grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
+    compile_replica_mxfp8_weight_kernels(
+        world_size=world_size,
+        num_local_experts=num_local_experts,
+        member_numels=member_numels,
+        rowwise_scale_numels=scale_numels,
+        columnwise_scale_numels=scale_numels,
+        num_sms=num_sms,
+        device_index=device.index,
+    )
+
+    def prefetch() -> None:
+        torch.cuda.nvtx.range_push("replica_mxfp8_weight_owner_push_profile")
+        launch_replica_mxfp8_weight_prefetch(
+            data_sources=data_source_bases,
+            scale_sources=scale_source_bases,
+            arena=arena,
+            peer_bases=handle.buffer_ptrs_dev,
+            signal_bases=handle.signal_pad_ptrs_dev,
+            experts_to_copy=experts_to_copy,
+            grid_barrier=grid_barrier,
+            rank=rank,
+            world_size=world_size,
+            num_local_experts=num_local_experts,
+            member_numels=member_numels,
+            rowwise_scale_numels=scale_numels,
+            columnwise_scale_numels=scale_numels,
+            orientation="rowwise",
+            num_sms=num_sms,
+        )
+        torch.cuda.nvtx.range_pop()
+
+    try:
+        for _ in range(warmups):
+            prefetch()
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group, device_ids=[device.index])
+        samples = []
+        for _ in range(batches):
+            # Enqueue a batch so rank-local Python launch skew is paid once,
+            # while every kernel's device-side completion barrier keeps the
+            # steady-state transport sequence aligned across ranks.
+            dist.barrier(group=group, device_ids=[device.index])
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iterations):
+                prefetch()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) / iterations)
+
+        owner = (rank + 1) % world_size
+        for projection, (member, scale) in enumerate(zip(member_numels, scale_numels)):
+            projection_offset = num_local_experts * sum(
+                data_bytes + scale_bytes
+                for data_bytes, scale_bytes in zip(
+                    member_numels[:projection], scale_numels[:projection]
+                )
+            )
+            data_view = arena.narrow(0, projection_offset, num_local_experts * member).view(
+                num_local_experts, member
+            )
+            scale_view = arena.narrow(
+                0, projection_offset + num_local_experts * member, num_local_experts * scale
+            ).view(num_local_experts, scale)
+            expected = torch.arange(
+                owner * num_local_experts + projection * 97,
+                (owner + 1) * num_local_experts + projection * 97,
+                dtype=torch.int64,
+                device=device,
+            ).to(torch.uint8)
+            if active_slots:
+                torch.testing.assert_close(
+                    data_view[:active_slots, -1], expected[:active_slots], rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    scale_view[:active_slots, -1], expected[:active_slots] + 41, rtol=0, atol=0
+                )
+
+        gathered_samples = _gather_samples(samples, group)
+        median_ms = statistics.median(gathered_samples)
+        payload_bytes = active_slots * sum(
+            member + scale for member, scale in zip(member_numels, scale_numels)
+        )
+        # Every payload byte is read from owner-local HBM and written across
+        # NVLink to the peer arena. Report the same aggregate wire traffic
+        # convention as the existing BF16 benchmark (read + remote write).
+        effective_gbps = 2 * payload_bytes / (median_ms * 1.0e6)
+        if rank == 0:
+            result = {
+                "shape": {
+                    "world_size": world_size,
+                    "num_local_experts": num_local_experts,
+                    "active_slots": active_slots,
+                    "member_numels": member_numels,
+                    "scale_numels": scale_numels,
+                    "num_sms": num_sms,
+                    "payload_bytes_per_rank": payload_bytes,
+                },
+                "prefetch_ms": _summarize(gathered_samples),
+                "effective_gbps": effective_gbps,
+                "minimum_gbps": minimum_gbps,
+            }
+            print("REPLICA_MXFP8_WEIGHT_PROFILE=" + json.dumps(result, sort_keys=True), flush=True)
+        assert effective_gbps >= minimum_gbps, (
+            f"MXFP8 replica prefetch achieved {effective_gbps:.1f} GB/s, "
+            f"below the {minimum_gbps:.1f} GB/s target"
+        )
+    finally:
+        dist.barrier(group=group, device_ids=[device.index])
+        del handle, arena
+        gc.collect()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_CUTEDSL, reason="CUDA and CuTeDSL are required"
+)
+@pytest.mark.skipif(not _PROFILE_ENABLED, reason="set MCORE_RUN_REPLICA_WEIGHT_PROFILE=1")
 def test_replica_weight_kernels_production_profile():
     """Profile correct prefetch and grad-reduce results at the production shape."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
@@ -329,20 +661,14 @@ def test_replica_weight_kernels_production_profile():
         int(os.environ.get("MCORE_REPLICA_WEIGHT_FC2_NUMEL", str(2048 * 640))),
     )
     num_sms = int(os.environ.get("MCORE_REPLICA_WEIGHT_NUM_SMS", "32"))
-    active_slots = int(
-        os.environ.get("MCORE_REPLICA_WEIGHT_ACTIVE_SLOTS", str(num_local_experts))
-    )
+    active_slots = int(os.environ.get("MCORE_REPLICA_WEIGHT_ACTIVE_SLOTS", str(num_local_experts)))
     warmups = int(os.environ.get("MCORE_REPLICA_WEIGHT_WARMUPS", "3"))
     iterations = int(os.environ.get("MCORE_REPLICA_WEIGHT_ITERATIONS", "10"))
     if not 0 <= active_slots <= num_local_experts:
-        raise ValueError(
-            f"active slots must be in [0, {num_local_experts}], got {active_slots}."
-        )
+        raise ValueError(f"active slots must be in [0, {num_local_experts}], got {active_slots}.")
 
     arena_numel = num_local_experts * sum(member_numels)
-    weight_arena, weight_handle = _allocate_symmetric(
-        arena_numel, torch.bfloat16, group
-    )
+    weight_arena, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
     grad_arena, grad_handle = _allocate_symmetric(arena_numel, torch.float32, group)
     weight_arena.fill_(-123)
     sources = tuple(
@@ -491,9 +817,7 @@ def test_replica_weight_kernels_production_profile():
             "prefetch_ms": _summarize(prefetch_samples),
             "grad_reduce_ms": _summarize(grad_samples),
         }
-        print(
-            "REPLICA_WEIGHT_PROFILE=" + json.dumps(result, sort_keys=True), flush=True
-        )
+        print("REPLICA_WEIGHT_PROFILE=" + json.dumps(result, sort_keys=True), flush=True)
 
     dist.barrier(group=group, device_ids=[device.index])
     del weight_handle, grad_handle, weight_arena, grad_arena
