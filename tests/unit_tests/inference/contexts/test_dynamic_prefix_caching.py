@@ -1442,6 +1442,9 @@ def _make_cpu_mamba_slot_allocator(
         # layers all chunk at 128 aligns at 128.
         mamba_chunk_size=128,
         ssm_chunk_alignment=128,
+        # Gated Delta Product prefix caching is unsupported; the allocator
+        # asserts this is 0 on construction (see MambaSlotAllocator.__init__).
+        gdp_num_householder=0,
     )
     return MambaSlotAllocator(
         context=context,
