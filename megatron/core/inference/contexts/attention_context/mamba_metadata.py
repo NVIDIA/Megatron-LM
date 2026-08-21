@@ -128,23 +128,6 @@ class MambaMetadata:
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
-        # Per-request gather plan for the carrying conv-state update. Each request
-        # contributes one row of `d_conv` state columns, and every column names
-        # either a token in this step's slice or a column of the request's
-        # incoming state. The plan depends only on `cu_seqlens` and `d_conv`, so
-        # it is built once per step here rather than once per SSM layer inside
-        # `causal_conv1d_varlen_carry_states`.
-        if d_conv > 0:
-            self._conv_carry_token_indices_buffer = torch.zeros(
-                (max_requests, d_conv), dtype=torch.int64, device=self.device
-            )
-            self._conv_carry_prev_columns_buffer = torch.zeros(
-                (max_requests, d_conv), dtype=torch.int64, device=self.device
-            )
-            self._conv_carry_from_slice_buffer = torch.zeros(
-                (max_requests, d_conv), dtype=torch.bool, device=self.device
-            )
-
         # Allocator for Mamba state slots (CPU for bookkeeping).
         self.mamba_state_free_slots = torch.arange(
             self.max_requests, dtype=torch.int32, device='cpu'
@@ -216,9 +199,6 @@ class MambaMetadata:
         self.seq_idx_for_varlen = None
         self.conv_seq_idx = None
         self.conv_seq_start = None
-        self.conv_carry_token_indices = None
-        self.conv_carry_prev_columns = None
-        self.conv_carry_from_slice = None
 
         # Gated Delta Product chunk descriptor views
         self.gdp_chunk_indices = None
@@ -413,7 +393,6 @@ class MambaMetadata:
             self.conv_seq_idx = self._conv_seq_idx_buffer[:padded_token_count]
             self.conv_seq_start = self._conv_seq_start_buffer[:padded_token_count]
 
-            self._update_conv_carry_plan(padded_prefill_count)
 
             # --- Precompute intermediate state extraction metadata ---
             # This converts per-request token offsets to chunk indices and
@@ -431,75 +410,6 @@ class MambaMetadata:
                 cu_seqlens[real_decode_count + real_prefill_count] - cu_seqlens[real_decode_count]
             )
             self.device_decode_prefill = self._device_decode_prefill_buffer
-
-    def _update_conv_carry_plan(
-        self, padded_prefill_count: int, cu_seqlens_gpu: Optional[torch.Tensor] = None
-    ) -> None:
-        """Build the per-request gather plan for this step's conv-state update.
-
-        A request's conv state is the last `d_conv` tokens it has seen, and it is
-        what the next step convolves against. When a prompt arrives one slice at a
-        time, the slice on its own does not always contain those `d_conv` tokens,
-        so the new state has to be assembled from the slice *and* the state the
-        request arrived with.
-
-        With `d_conv = 4`, a request whose previous state is `[a b c d]` and whose
-        slice this step is `[e f]`:
-
-            incoming state   a b c d
-            slice                    e f
-            new state            c d e f
-
-        Two columns come from the incoming state and two from the slice. Had the
-        slice been `[e f g h]` or longer, all four would come from the slice and
-        the incoming state would not be consulted at all.
-
-        This method records, for each request and each of the `d_conv` state
-        columns, which of the two sources to read and at what index:
-
-            from_slice     False False True True
-            token_indices    -     -     0    1     (offsets into the slice)
-            prev_columns     2     3     -    -     (columns of the old state)
-
-        The plan is a function of `cu_seqlens` and `d_conv` only -- not of the
-        hidden states -- so it is built once per step here and reused by every SSM
-        layer, which all share the same slice boundaries and conv width.
-
-        A zero-length (padding) request has every column resolve to the incoming
-        state, reproducing it unchanged.
-
-        Args:
-            padded_prefill_count: Number of prefill request rows to plan for,
-                including padding requests.
-            cu_seqlens_gpu: Device `cu_seqlens` to read from. `None` selects the
-                standalone `update()` buffer; the coalesced path passes the view
-                it just transferred into.
-        """
-        if self.d_conv <= 0:
-            return
-
-        source = self._cu_seqlens_buffer if cu_seqlens_gpu is None else cu_seqlens_gpu
-        cu_all = source[: padded_prefill_count + 1]
-        starts = cu_all[:padded_prefill_count].to(torch.int64)
-        lengths = cu_all[1:].to(torch.int64) - starts
-        columns = torch.arange(self.d_conv, dtype=torch.int64, device=self.device)
-
-        # Offset of each state column from the slice start. Negative means the
-        # token predates this slice and comes from the incoming state instead.
-        offsets = lengths[:, None] - self.d_conv + columns[None, :]
-        self._conv_carry_from_slice_buffer[:padded_prefill_count] = offsets >= 0
-        # offsets >= -d_conv always, so both clamps only guard entries that
-        # `from_slice` discards.
-        self._conv_carry_token_indices_buffer[:padded_prefill_count] = (
-            starts[:, None] + offsets
-        ).clamp_(min=0)
-        self._conv_carry_prev_columns_buffer[:padded_prefill_count] = (
-            offsets + self.d_conv
-        ).clamp_(0, self.d_conv - 1)
-
-        self.conv_carry_token_indices = self._conv_carry_token_indices_buffer[:padded_prefill_count]
-        self.conv_carry_prev_columns = self._conv_carry_prev_columns_buffer[:padded_prefill_count]
-        self.conv_carry_from_slice = self._conv_carry_from_slice_buffer[:padded_prefill_count]
 
     def _update_intermediate_metadata(
         self,
@@ -925,7 +835,6 @@ class MambaMetadata:
             # Built here, from the just-transferred cu_seqlens, for the same
             # reason as the intermediate metadata below: it is the first point at
             # which this step's slice boundaries are valid on the device.
-            self._update_conv_carry_plan(padded_prefill_count, cu_seqlens_gpu=v.mamba_cu_seqlens)
 
             if self.gdp_num_householder > 0:
                 self.gdp_chunk_indices = v.gdp_chunk_indices[: d["gdp_num_chunks"]]

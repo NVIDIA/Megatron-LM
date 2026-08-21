@@ -154,18 +154,6 @@ class TestMambaDynamicInference(unittest.TestCase):
             num_requests, self.nheads, self.headdim, self.d_state, device=self.device
         )
 
-        # Build the per-request conv-carry plan the way MambaMetadata does
-        # (see MambaMetadata._update_conv_carry_plan). ssm_prefill requires it to
-        # be precomputed and asserts it is non-None.
-        d_conv = self.d_conv
-        starts = cu_seqlens[:-1].to(torch.int64)
-        lengths = cu_seqlens[1:].to(torch.int64) - starts
-        columns = torch.arange(d_conv, dtype=torch.int64, device=self.device)
-        offsets = lengths[:, None] - d_conv + columns[None, :]
-        conv_carry_from_slice = offsets >= 0
-        conv_carry_token_indices = (starts[:, None] + offsets).clamp_(min=0)
-        conv_carry_prev_columns = (offsets + d_conv).clamp_(0, d_conv - 1)
-
         # Mock the dynamic inference context. Leaving the chunk metadata (and
         # extraction buffers) unset exercises the non-precomputed fallback path,
         # which rebuilds chunk boundaries from cu_seqlens; no slot allocator means
@@ -182,9 +170,6 @@ class TestMambaDynamicInference(unittest.TestCase):
             seq_idx_for_varlen=None,
             conv_seq_idx=None,
             conv_seq_start=None,
-            conv_carry_token_indices=conv_carry_token_indices,
-            conv_carry_prev_columns=conv_carry_prev_columns,
-            conv_carry_from_slice=conv_carry_from_slice,
         )
         context = SimpleNamespace(mamba_metadata=mamba_metadata, mamba_slot_allocator=None)
 

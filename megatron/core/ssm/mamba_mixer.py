@@ -827,19 +827,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         # describes only the slice scheduled this step, so a request whose slice
         # is shorter than d_conv keeps the columns it arrived with; see
         # `causal_conv1d_varlen_carry_states` for the column-by-column rule.
-        # The op can derive the plan itself, but doing so once per SSM layer is
-        # exactly the cost hoisting it into MambaMetadata removes. Fail loudly if
-        # a future change stops populating it rather than silently regressing.
-        assert (
-            metadata.conv_carry_token_indices is not None
-        ), "MambaMetadata did not build the conv-carry plan for this step"
         conv_varlen_states = causal_conv1d_varlen_carry_states(
-            xBC.squeeze(0),
-            cu_seqlens,
-            previous_conv_states,
-            token_indices=metadata.conv_carry_token_indices,
-            prev_columns=metadata.conv_carry_prev_columns,
-            from_slice=metadata.conv_carry_from_slice,
+            xBC.squeeze(0), cu_seqlens, previous_conv_states
         )
         tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
