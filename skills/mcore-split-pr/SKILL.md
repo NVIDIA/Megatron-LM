@@ -81,7 +81,7 @@ For each new PR:
 1. Create a new branch from the appropriate local base (`main`, or a dependency PR's branch).
 2. Extract the relevant changes: `git diff upstream/main..<source-branch> -- <file paths> | git apply`.
 3. Stage, commit with a clear message, and push to the user's fork.
-4. Create the PR as a **draft** (per repo contributing guidelines).
+4. Create the PR as a **draft** with base `main` (per repo contributing guidelines). Retarget dependent PRs to `pull-request/<base PR number>` only after a vetter's `/ok to test` has created that mirror ref.
 5. If the original PR needs to be narrowed in scope, confirm with the user before force-pushing.
 6. Report all PR URLs when done.
 
