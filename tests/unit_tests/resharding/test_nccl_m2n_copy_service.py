@@ -76,6 +76,10 @@ def test_ordered_ops_requires_task_ids():
 def test_operation_layout_detects_ordered_tensor_disagreement():
     first = SendOp(task_id=1, tensor=torch.zeros(1, dtype=torch.float32), dest_rank=2)
     second = SendOp(task_id=2, tensor=torch.zeros(4, dtype=torch.uint8), dest_rank=2)
+    matching_layout = [
+        RecvOp(task_id=1, tensor=torch.zeros(1, dtype=torch.float32), src_rank=0),
+        RecvOp(task_id=2, tensor=torch.zeros(4, dtype=torch.uint8), src_rank=0),
+    ]
     same_bytes_different_layout = [
         RecvOp(task_id=1, tensor=torch.zeros(4, dtype=torch.uint8), src_rank=0),
         RecvOp(task_id=2, tensor=torch.zeros(4, dtype=torch.uint8), src_rank=0),
@@ -84,6 +88,7 @@ def test_operation_layout_detects_ordered_tensor_disagreement():
     send_layout = _operation_layout([first, second])
     recv_layout = _operation_layout(same_bytes_different_layout)
 
+    assert send_layout == _operation_layout(matching_layout)
     assert send_layout[:2] == recv_layout[:2] == (8, 2)
     assert send_layout[2] != recv_layout[2]
 

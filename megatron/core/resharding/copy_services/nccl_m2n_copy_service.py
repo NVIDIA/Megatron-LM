@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -18,14 +19,6 @@ _TransferOpT = TypeVar("_TransferOpT", SendOp, RecvOp)
 # nccl-extensions' public M2N header requires NCCL 2.30.5 or newer.
 # _validate_nccl_version checks the loaded libnccl before M2N is initialized.
 _MINIMUM_NCCL_VERSION = (2, 30, 5)
-
-# _operation_layout uses these constants for a deterministic, FNV-inspired
-# fingerprint of each peer's ordered operations. The mask keeps the result in
-# the non-negative torch.int64 range used by _exchange_pair_layouts; the offset
-# is the initial seed, and the prime mixes each operation field and dtype byte.
-_DIGEST_MASK = (1 << 63) - 1
-_DIGEST_OFFSET = 1469598103934665603
-_DIGEST_PRIME = 1099511628211
 
 
 @dataclass(frozen=True)
@@ -107,19 +100,16 @@ def _operation_layout(ops: list[_TransferOpT]) -> tuple[int, int, int]:
         return 0, 0, 0
 
     total_bytes = 0
-    digest = _DIGEST_OFFSET
+    digest = hashlib.blake2b(digest_size=8)
     for op in ops:
         if op.task_id is None:
             raise RuntimeError("NCCL M2N refit requires a task_id for every transfer")
         size = _tensor_nbytes(op.tensor)
         total_bytes += size
-        fields = (op.task_id, size, op.tensor.element_size())
-        for value in fields:
-            digest = ((digest ^ (int(value) & _DIGEST_MASK)) * _DIGEST_PRIME) & _DIGEST_MASK
-        for value in str(op.tensor.dtype).encode("ascii"):
-            digest = ((digest ^ value) * _DIGEST_PRIME) & _DIGEST_MASK
-        digest = ((digest ^ 0xFF) * _DIGEST_PRIME) & _DIGEST_MASK
-    return total_bytes, len(ops), digest
+        digest.update(
+            f"{op.task_id}:{size}:{op.tensor.element_size()}:{op.tensor.dtype};".encode("ascii")
+        )
+    return total_bytes, len(ops), int.from_bytes(digest.digest(), "little", signed=True)
 
 
 def _validate_pair_layouts(topology: _M2NTopology, layouts: list[list[list[int]]]) -> int:
