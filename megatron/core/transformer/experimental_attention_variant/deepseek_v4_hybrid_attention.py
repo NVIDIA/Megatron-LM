@@ -1,12 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import warnings
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from functools import partial
+from typing import Callable, NoReturn, Optional, Union
 
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.dist_checkpointing.mapping import (
+    ReplicaId,
+    ShardedStateDict,
+    ShardedTensor,
+    ShardedTensorFactory,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_inplace,
@@ -42,6 +50,13 @@ def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
 
 
+def _initialize_grouped_output_projection(
+    weight: torch.Tensor, *, init_method: Callable[[torch.Tensor], None]
+) -> None:
+    """Initialize a grouped weight with the legacy 2D parameter layout."""
+    init_method(weight.view(-1, weight.size(-1)))
+
+
 @dataclass
 class DSv4HybridSelfAttentionSubmodules:
     """Submodules for the DSv4HybridAttention layer."""
@@ -53,6 +68,7 @@ class DSv4HybridSelfAttentionSubmodules:
     linear_q_up_proj: Union[ModuleSpec, type] = None
     linear_kv_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    linear_o_group_proj: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -174,16 +190,41 @@ class DSv4HybridAttention(Attention):
             self.query_projection_size % self.config.o_groups == 0
         ), "num_attention_heads * v_head_dim must be divisible by o_groups"
         group_proj_in_size = self.query_projection_size // self.config.o_groups
-        group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
-
-        _linear_o_group_proj = torch.empty(
-            group_proj_out_size,
-            group_proj_in_size,
-            device=torch.cuda.current_device(),
-            dtype=self.config.params_dtype,
-        )
-        self.config.init_method(_linear_o_group_proj)
-        self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
+        device = torch.device("cuda", torch.cuda.current_device())
+        self._uses_te_batched_linear = submodules.linear_o_group_proj is not None
+        if not self._uses_te_batched_linear:
+            warnings.warn(
+                "transformer_engine.pytorch.BatchedLinear is unavailable. Please upgrade "
+                "Transformer Engine to avoid a performance regression; "
+                "DSv4HybridAttention.linear_o_group_proj is falling back to torch.einsum.",
+                stacklevel=2,
+            )
+            group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
+            linear_o_group_proj = torch.empty(
+                group_proj_out_size,
+                group_proj_in_size,
+                device=device,
+                dtype=self.config.params_dtype,
+            )
+            self.config.init_method(linear_o_group_proj)
+            self.linear_o_group_proj = torch.nn.Parameter(linear_o_group_proj)
+        else:
+            self.linear_o_group_proj = build_module(
+                submodules.linear_o_group_proj,
+                self.o_local_groups,
+                group_proj_in_size,
+                self.config.o_lora_rank,
+                batch_dim=-2,
+                device=device,
+                params_dtype=self.config.params_dtype,
+                bias=False,
+                accumulate_into_main_grad=self.config.gradient_accumulation_fusion,
+                init_method=partial(
+                    _initialize_grouped_output_projection, init_method=self.config.init_method
+                ),
+                name=(name + ".linear_o_group_proj") if name is not None else None,
+            )
+            self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
 
@@ -218,6 +259,118 @@ class DSv4HybridAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    @property
+    def _linear_o_group_proj_weight(self) -> torch.nn.Parameter:
+        """Return the grouped output-projection weight from either implementation."""
+        if self._uses_te_batched_linear:
+            return self.linear_o_group_proj.weight
+        return self.linear_o_group_proj
+
+    @property
+    def _linear_o_group_proj_checkpoint_shape(self) -> tuple[int, int]:
+        """Legacy 2D checkpoint shape for the grouped output projection."""
+        return (
+            self.o_local_groups * self.config.o_lora_rank,
+            self._linear_o_group_proj_weight.size(-1),
+        )
+
+    def _linear_o_group_proj_state_dict_hook(
+        self, module, state_dict, prefix, local_metadata
+    ) -> None:
+        """Serialize the TE grouped output projection in its legacy 2D layout."""
+        assert module is self
+        checkpoint_key = f"{prefix}linear_o_group_proj"
+        runtime_key = f"{checkpoint_key}.weight"
+        state_dict[checkpoint_key] = state_dict.pop(runtime_key).reshape(
+            self._linear_o_group_proj_checkpoint_shape
+        )
+        state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Map legacy 2D grouped projection weights into TE's 3D layout."""
+        if self._uses_te_batched_linear:
+            checkpoint_key = f"{prefix}linear_o_group_proj"
+            runtime_key = f"{checkpoint_key}.weight"
+            if checkpoint_key in state_dict:
+                checkpoint_weight = state_dict.pop(checkpoint_key)
+                state_dict.setdefault(runtime_key, checkpoint_weight)
+            checkpoint_weight = state_dict.get(runtime_key)
+            if (
+                isinstance(checkpoint_weight, torch.Tensor)
+                and tuple(checkpoint_weight.shape) == self._linear_o_group_proj_checkpoint_shape
+            ):
+                state_dict[runtime_key] = checkpoint_weight.reshape(
+                    self._linear_o_group_proj_weight.shape
+                )
+            state_dict.setdefault(f"{prefix}linear_o_group_proj._extra_state", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Map TE's 3D grouped weight to the legacy 2D dist-checkpoint layout."""
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if not self._uses_te_batched_linear:
+            return sharded_state_dict
+
+        checkpoint_key = f"{prefix}linear_o_group_proj"
+        runtime_key = f"{checkpoint_key}.weight"
+        runtime_sharded_weight = sharded_state_dict.pop(runtime_key)
+        sharded_state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
+        assert isinstance(runtime_sharded_weight, ShardedTensor)
+        runtime_shape = runtime_sharded_weight.local_shape
+        assert len(runtime_shape) == 3, runtime_shape
+        local_groups, local_rank, local_in_features = runtime_shape
+        checkpoint_shape = (local_groups * local_rank, local_in_features)
+
+        # TP is fixed at one for DSv4. The only possible parameter sharding is
+        # FSDP along the group axis, which becomes axis 0 in the legacy layout.
+        group_axis = len(sharded_offsets)
+        assert runtime_sharded_weight.prepend_axis_num == group_axis
+        assert runtime_sharded_weight.axis_fragmentations is not None
+        group_fragmentation = runtime_sharded_weight.axis_fragmentations[group_axis]
+        group_offset = runtime_sharded_weight.global_offset[group_axis]
+        group_rank, remainder = divmod(group_offset, local_groups)
+        assert remainder == 0
+        checkpoint_group_offset = (group_axis, group_rank, group_fragmentation)
+
+        @torch.no_grad()
+        def build_fn(
+            key: str, tensor: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+        ) -> ShardedTensor:
+            if flattened_range is not None:
+                raise ValueError(
+                    "DSv4 grouped output projection does not support the deprecated "
+                    "fully_sharded_model_space optimizer checkpoint format"
+                )
+            return ShardedTensor.from_rank_offsets(
+                key,
+                tensor.reshape(checkpoint_shape),
+                *sharded_offsets,
+                checkpoint_group_offset,
+                replica_id=replica_id,
+                prepend_axis_num=len(sharded_offsets),
+            )
+
+        def merge_fn(checkpoint_tensor: torch.Tensor) -> torch.Tensor:
+            return checkpoint_tensor.reshape(runtime_shape)
+
+        runtime_weight = runtime_sharded_weight.data
+        assert runtime_weight is not None
+        sharded_state_dict[checkpoint_key] = ShardedTensorFactory(
+            checkpoint_key, runtime_weight, build_fn, merge_fn, runtime_sharded_weight.replica_id
+        )
+        return sharded_state_dict
+
+    def _apply_linear_o_group_proj(self, input_: torch.Tensor) -> torch.Tensor:
+        """Apply TE BatchedLinear when available, otherwise use the legacy einsum."""
+        if self._uses_te_batched_linear:
+            return self.linear_o_group_proj(input_)
+        weight = self._linear_o_group_proj_weight.reshape(
+            self.o_local_groups, self.config.o_lora_rank, -1
+        )
+        return torch.einsum("...gd,grd->...gr", input_, weight)
 
     def forward(
         self,
@@ -462,10 +615,7 @@ class DSv4HybridAttention(Attention):
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
         )
-        wo_a_weight = self.linear_o_group_proj.view(
-            self.o_local_groups, self.config.o_lora_rank, -1
-        )
-        core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
+        core_attn_out = self._apply_linear_o_group_proj(core_attn_out)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
