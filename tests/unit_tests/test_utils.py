@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import time
@@ -357,6 +357,33 @@ def test_param_norm_linear(use_distributed_optimizer: bool):
 
     # Teardown.
     _deinit_distributed()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dtensor_param_norm_uses_fp32_local_shards():
+    """The fused L2 norm should receive FP32 DTensor local shards."""
+    placement = mock.Mock()
+    placement.is_shard.return_value = False
+    placement.is_replicate.return_value = True
+    spec = mock.Mock()
+    spec.device_mesh.get_all_groups.return_value = [None]
+    spec.placements = (placement,)
+
+    local_tensor = torch.tensor([3.0, 4.0], dtype=torch.bfloat16, device="cuda")
+    param = SimpleNamespace(_local_tensor=local_tensor, _spec=spec)
+
+    def l2_norm_stub(_op, _overflow_buf, tensor_lists, _per_parameter):
+        norm_inputs = tensor_lists[0]
+        assert all(tensor.dtype == torch.float32 for tensor in norm_inputs)
+        return torch.linalg.vector_norm(torch.cat(norm_inputs)), None
+
+    with mock.patch(
+        "megatron.training.utils.common_utils.multi_tensor_applier", side_effect=l2_norm_stub
+    ):
+        norm = training_util.calc_dtensor_params_l2_norm([param])
+
+    assert norm == pytest.approx(5.0)
+    assert local_tensor.dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
