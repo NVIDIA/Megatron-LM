@@ -8,6 +8,8 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+import megatron.core.transformer.cuda_graphs as cuda_graphs_module
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -16,17 +18,19 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
+    CheckpointWithoutOutput,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -34,17 +38,25 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
-    _layer_is_graphable,
+    _CudagraphReplayNode,
+    _CudaGraphRunner,
+    create_cudagraphs,
+    delete_cuda_graphs,
 )
-from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
+from megatron.core.transformer.enums import (
+    AttnBackend,
+    CudaGraphModule,
+    CudaGraphScope,
+    InferenceCudaGraphScope,
+)
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import is_te_min_version
 from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -57,6 +69,27 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, _ = check_fp8_support()
+
+
+def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
+    created_streams = []
+
+    class FakeStream:
+        def __init__(self):
+            self.cuda_stream = len(created_streams) + 1
+            created_streams.append(self)
+
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32")
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOLS", None)
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_NEXT_SLOT", 0)
+
+    pool_size = cuda_graphs_module._CUDA_GRAPH_STREAM_POOL_SIZE
+    assigned = [cuda_graphs_module._get_cuda_graph_stream() for _ in range(2 * pool_size)]
+
+    assert len(created_streams) == pool_size
+    assert len({stream.cuda_stream for stream in created_streams}) == pool_size
+    assert assigned[:pool_size] == assigned[pool_size:]
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -382,6 +415,32 @@ class TestCudaGraphConfigAndArguments:
         assert cfg.cuda_graph_scope is None
 
 
+class TestCudaGraphReplay:
+    def test_gtp_forward_ensures_captured_params_ready_before_replay(self, monkeypatch):
+        calls = []
+        first = object()
+        second = object()
+        runner = object.__new__(_CudaGraphRunner)
+        runner._gtp_fwd_params_to_ensure_ready = (first, second)
+        runner.grad_enabled = False
+        runner.fwd_graph_outputs = (object(),)
+        runner.get_mismatch_errors = lambda args, kwargs: []
+        runner.get_tensors = lambda args, kwargs, check_types: []
+        runner.to_list = lambda value: list(value) if isinstance(value, tuple) else [value]
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "ensure_params_ready",
+            lambda params: calls.append(("ready", tuple(params))),
+        )
+        monkeypatch.setattr(
+            _CudagraphReplayNode, "apply", lambda *args: calls.append("replay") or (object(),)
+        )
+
+        runner.replay_graph_capture(False, (), {})
+
+        assert calls == [("ready", (first, second)), "replay"]
+
+
 class TestParallelTransformerBlockCudagraphs:
     def setup_method(self, method):
         # initialize parallel state
@@ -411,7 +470,6 @@ class TestParallelTransformerBlockCudagraphs:
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
-    @pytest.mark.flaky_in_dev  # Issue #5474
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
         reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
@@ -444,6 +502,191 @@ class TestParallelTransformerBlockCudagraphs:
                 .cudagraph_manager.cudagraph_runners[0]
                 .fwd_graph
             )
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+class TestPackedSeqCudagraphs:
+    """Training CUDA graphs over thd input with padding between sequences.
+
+    The padded cu_seqlens describe a slot layout that differs from the actual lengths,
+    and pad_between_seqs is set explicitly so TE does spend a GPU sync inferring it.
+    cp_size == 2 additionally captures TE's ring-P2P context-parallel attention inside the graphs.
+    """
+
+    SEQ_LENGTHS = [7, 5]
+    SLOT_STARTS = [0, 8, 16]  # slot layout aligned to 2 * cp_size for every cp_size tested
+    BIN_SIZE = 32
+    NVTE_ENV_VARS = (
+        "NVTE_FLASH_ATTN",
+        "NVTE_FUSED_ATTN",
+        "NVTE_UNFUSED_ATTN",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+    )
+
+    def setup_method(self, method):
+        self.original_nvte_env = {name: os.environ.get(name) for name in self.NVTE_ENV_VARS}
+        os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+
+    def teardown_method(self, method):
+        try:
+            Utils.destroy_model_parallel()
+            _CudagraphGlobalRecord.cudagraph_created = False
+            _CudagraphGlobalRecord.cudagraph_record = []
+            CudaGraphManager.global_mempool = None
+        finally:
+            for name, value in self.original_nvte_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def _build_packed_seq_params(self, device):
+        # Actual boundaries: each sequence's real tokens inside its slot; the trailing bin
+        # padding [SLOT_STARTS[-1], BIN_SIZE) forms a ghost slot of pad tokens.
+        boundaries = [0]
+        for length in self.SEQ_LENGTHS:
+            boundaries.append(boundaries[-1] + length)
+        boundaries.append(boundaries[-1] + self.BIN_SIZE - self.SLOT_STARTS[-1])
+        cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=device)
+        cu_seqlens_padded = torch.tensor(
+            self.SLOT_STARTS + [self.BIN_SIZE], dtype=torch.int32, device=device
+        )
+        return PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=self.BIN_SIZE,
+            max_seqlen_kv=self.BIN_SIZE,
+            pad_between_seqs=True,
+        )
+
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    def test_thd_capture_with_pad_between_seqs(self, cp_size):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(context_parallel_size=cp_size)
+        model_parallel_cuda_manual_seed(123)
+        os.environ["NVTE_FLASH_ATTN"] = "0"
+        os.environ["NVTE_FUSED_ATTN"] = "1"
+        os.environ["NVTE_UNFUSED_ATTN"] = "0"
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            context_parallel_size=cp_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            attention_backend=AttnBackend.fused,
+            deterministic_mode=True,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=1,
+            use_cpu_initialization=True,
+        )
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
+        block.train()
+        # CUDA-graphed backward assumes DDP-style grad accumulation buffers.
+        for param in block.parameters():
+            param.main_grad = torch.zeros_like(param)
+
+        packed_seq_params = self._build_packed_seq_params(torch.device('cuda'))
+        # Each CP rank holds its 1/cp_size share of the bin's tokens.
+        hidden_states = torch.randn(
+            (self.BIN_SIZE // cp_size, 1, config.hidden_size),
+            dtype=torch.bfloat16,
+            device='cuda',
+            requires_grad=True,
+        )
+
+        eager_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        hidden_states_metadata = hidden_states.cg_buffer_metadata
+        assert hidden_states_metadata.is_cudagraph_input
+        assert hidden_states_metadata.is_saved_for_backward
+
+        # The second layer's TE input layernorm saves the first layer's output for backward.
+        # This naturally exercises a CUDA graph output whose pool buffer must stay alive until
+        # backward capture.
+        first_runner = block.layers[0].cudagraph_manager.cudagraph_runners[0]
+        first_runner_record = next(
+            record
+            for record in _CudagraphGlobalRecord.cudagraph_record
+            if record[0] is first_runner and record[1] == "fwd"
+        )
+        recorded_outputs = first_runner_record[4]
+        output_metadata = first_runner.get_arg_metas(recorded_outputs)[0].cg_buffer_metadata
+        output_metadata_state = (
+            f"input={output_metadata.is_cudagraph_input}, "
+            f"output={output_metadata.is_cudagraph_output}, "
+            f"saved={output_metadata.is_saved_for_backward}"
+        )
+        assert output_metadata.is_cudagraph_input, output_metadata_state
+        assert output_metadata.is_cudagraph_output, output_metadata_state
+        assert output_metadata.is_saved_for_backward, output_metadata_state
+
+        # The q/kv aliases for each offsets tensor must share one metadata object while recording
+        # every graph-input use for replay-buffer sharing.
+        actual_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q.cg_buffer_metadata
+        padded_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q_padded.cg_buffer_metadata
+        assert packed_seq_params.cu_seqlens_kv.cg_buffer_metadata is actual_cu_seqlens_metadata
+        assert (
+            packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata is padded_cu_seqlens_metadata
+        )
+        assert actual_cu_seqlens_metadata.is_cudagraph_input
+        assert padded_cu_seqlens_metadata.is_cudagraph_input
+        eager_out.sum().backward()
+
+        # This is the primary function under test.
+        create_cudagraphs()
+
+        runners = []
+        for layer in block.layers:
+            layer_runners = layer.cudagraph_manager.cudagraph_runners
+            assert len(layer_runners) == 1
+            assert layer_runners[0].fwd_graph is not None
+            runners.extend(layer_runners)
+
+        # There are four cu_seqlens arguments per layer: q/kv pairs for the real and padded
+        # offsets. Each pair and every later layer should alias one of two shared buffers. Within
+        # each buffer group, only its first graph-input occurrence performs the replay copy.
+        cu_seqlens_buffers = [
+            tensor
+            for runner in runners
+            for tensor in runner.fwd_graph_input_surface[: runner.num_dgrads]
+            if tensor.dtype == torch.int32 and tensor.shape == packed_seq_params.cu_seqlens_q.shape
+        ]
+        assert len(cu_seqlens_buffers) == 4 * len(runners)
+        buffers_by_ptr = {}
+        for tensor in cu_seqlens_buffers:
+            buffers_by_ptr.setdefault(tensor.data_ptr(), []).append(tensor)
+        assert len(buffers_by_ptr) == 2
+        for shared_buffers in buffers_by_ptr.values():
+            assert sum(not tensor.can_skip_replay_copy for tensor in shared_buffers) == 1
+
+        graphed_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        assert torch.equal(graphed_out, eager_out), (
+            "CUDA graph replay output is not bitwise equal to eager output: "
+            f"max_abs_diff={(graphed_out.float() - eager_out.float()).abs().max().item()}"
+        )
+        graphed_out.sum().backward()
+
+        # Destroy captured graphs deterministically before parallel-state teardown.
+        for layer in block.layers:
+            for runner in layer.cudagraph_manager.cudagraph_runners:
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+        torch.cuda.synchronize()
 
 
 @pytest.mark.skipif(
@@ -866,50 +1109,6 @@ class TestParallelHybridBlockCudagraphs:
 
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
 
-    def test_mhc_hybrid_layers_are_te_cudagraph_capturable(self):
-        """Regression: a mHC-enabled HybridStack must expose graph-capturable layers.
-
-        When ``enable_hyper_connections=True``, ``HybridStack`` wraps every layer in
-        ``HyperConnectionHybridLayer``. That wrapper must subclass
-        ``GraphableMegatronModule`` and be recognized by ``_layer_is_graphable`` so TE
-        cuda-graph discovery finds the wrapped layers. Before the fix the wrapper
-        subclassed plain ``MegatronModule``, so discovery rejected every layer (0
-        graphable) and CUDA graph capture was silently skipped for the whole hybrid
-        model -- making the mHC hybrid run fully eager (several times slower than the
-        graphed GPT mHC path). This test fails on the pre-fix code via both assertions.
-        """
-        # The wrapper must be graph-capturable by construction.
-        assert issubclass(HyperConnectionHybridLayer, GraphableMegatronModule)
-
-        layer_type_list = validate_segment_layers("M-M*-")  # mamba / mlp / attention mix
-        config = TransformerConfig(
-            hidden_size=256,
-            num_layers=len(layer_type_list),
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            cuda_graph_impl="transformer_engine",
-            enable_hyper_connections=True,
-            num_residual_streams=4,
-            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mamba, CudaGraphModule.mlp],
-        )
-        block = HybridStack(
-            config,
-            hybrid_stack_spec.submodules,
-            layer_type_list=layer_type_list,
-            pp_layer_offset=0,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["tp", "pp", "cp"]
-            ),
-        )
-
-        # Every layer is wrapped, and the wrappers are discoverable as graphable.
-        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in block.layers)
-        graphable = [layer for layer in block.layers if _layer_is_graphable(layer, config)]
-        assert len(graphable) > 0, (
-            "mHC HybridStack produced 0 graphable layers -- TE cuda-graph capture would "
-            "be silently skipped for the entire model (the pre-fix bug)."
-        )
-
 
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
@@ -927,53 +1126,6 @@ class TestTECudaGraphHelper:
         destroy_num_microbatches_calculator()
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_mhc_static_input_aliasing_requires_disjoint_liveness_windows(self):
-        config = _base_cuda_graph_config(
-            enable_hyper_connections=True,
-            recompute_granularity="selective",
-            recompute_modules=["mhc"],
-            mhc_recompute_layer_num=2,
-            overlap_moe_expert_parallel_comm=True,
-            expert_model_parallel_size=2,
-            num_moe_experts=4,
-            moe_token_dispatcher_type="alltoall",
-            cuda_graph_impl="transformer_engine",
-            cuda_graph_modules=[CudaGraphModule.attn],
-            bf16=True,
-        )
-        helper = object.__new__(TECudaGraphHelper)
-        helper.config = config
-
-        shared = torch.randn(4, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        unique = torch.randn_like(shared)
-        # Samples 0 and 2 alias one static buffer (as MCore consumed-sample
-        # reuse and TE _reuse_graph_input_output_buffers legally do); sample 1
-        # owns its own bytes.
-        sample_args = [(shared,), (unique,), (shared.detach().requires_grad_(True),)]
-
-        # Disjoint windows: sample 0 fully retires before sample 2's forward.
-        helper._mhc_sample_order_intervals = {0: [0, 3], 1: [1, 4], 2: [5, 6]}
-        helper._validate_mhc_static_hidden_inputs(sample_args)
-
-        # Overlapping windows on a shared address must fail at capture time:
-        # sample 2's forward starts before sample 0's backward retired, which
-        # is exactly the aliasing that corrupts recompute direct-write replay.
-        helper._mhc_sample_order_intervals = {0: [0, 5], 1: [1, 4], 2: [3, 6]}
-        with pytest.raises(RuntimeError, match="windows overlap"):
-            helper._validate_mhc_static_hidden_inputs(sample_args)
-
-        # An entry whose backward never retires in the order is live forever,
-        # so any aliasing against it fails.
-        helper._mhc_sample_order_intervals = {0: [0, None], 1: [1, 4], 2: [3, 6]}
-        with pytest.raises(RuntimeError, match="windows overlap"):
-            helper._validate_mhc_static_hidden_inputs(sample_args)
-
-        # A sample with no recorded window at all is rejected outright.
-        helper._mhc_sample_order_intervals = {1: [1, 4]}
-        with pytest.raises(RuntimeError, match="no recorded"):
-            helper._validate_mhc_static_hidden_inputs(sample_args)
 
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
@@ -1217,62 +1369,6 @@ class TestTECudaGraphHelper:
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
 
 
-class TestRequiredNumMicrobatchSlots:
-    """Pure-Python tests for ``_get_required_num_microbatch_slots_from_order``.
-
-    The method derives the smallest cuda-graph slot count that guarantees no
-    in-flight microbatch's static buffer is reused before its backward
-    completes. ``order`` is a 1F1B / interleaved-1F1B schedule transcript
-    where ``+chunk_id`` denotes a forward and ``-chunk_id`` a backward.
-    Non-integer entries (e.g. ``0.5`` for wgrad sub-steps) are skipped.
-    """
-
-    @staticmethod
-    def _slots(order, num_chunks):
-        return TECudaGraphHelper._get_required_num_microbatch_slots_from_order(order, num_chunks)
-
-    def test_single_chunk_single_microbatch(self):
-        # F0 then B0: one slot is enough.
-        assert self._slots([1, -1], 1) == 1
-
-    def test_single_chunk_pp_pipeline_4_microbatches_pp2(self):
-        # PP=2 1F1B with 4 microbatches: warmup F-F, then F-B-F-B-..., then cooldown B-B.
-        # Max in-flight = 2.
-        order = [1, 1, -1, 1, -1, 1, -1, -1]
-        assert self._slots(order, 1) == 2
-
-    def test_two_chunks_independent(self):
-        # Two model chunks (VPP=2), each running a tiny PP=2-style 1F1B in turn.
-        # Per chunk max in-flight = 2 -> 2 slots.
-        order = [1, 1, -1, -1, 2, 2, -2, -2]
-        assert self._slots(order, 2) == 2
-
-    def test_two_chunks_interleaved(self):
-        # Worst case: forwards stack up across chunks before any backward.
-        # F0 F0 F1 F1 B1 B1 B0 B0 -> per-chunk max in-flight = 2.
-        order = [1, 1, 2, 2, -2, -2, -1, -1]
-        assert self._slots(order, 2) == 2
-
-    def test_skips_non_integer_entries(self):
-        # Float c_ids (e.g. 0.5 for wgrad sub-steps) must be ignored.
-        order = [1, 0.5, -0.5, -1]
-        assert self._slots(order, 1) == 1
-
-    def test_minimum_slot_is_one(self):
-        # Empty / no-op order still returns at least 1 (we always need a slot).
-        assert self._slots([], 1) == 1
-
-    def test_unbalanced_order_asserts(self):
-        # Forward without matching backward -> outstanding != 0 at end -> assert.
-        with pytest.raises(AssertionError):
-            self._slots([1], 1)
-
-    def test_negative_outstanding_asserts(self):
-        # Backward before any forward for a chunk -> outstanding goes negative.
-        with pytest.raises(AssertionError):
-            self._slots([-1], 1)
-
-
 def is_deep_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
 
@@ -1416,7 +1512,7 @@ class TestPartialCudaGraph:
             args.num_layers_at_end_in_bf16 = 1
 
         for key, value in kwargs.items():
-            assert hasattr(args, key) or hasattr(TransformerConfig, key), f"Unknown argument: {key}"
+            assert hasattr(args, key)
             setattr(args, key, value)
 
         validate_args(args)
@@ -1513,7 +1609,16 @@ class TestPartialCudaGraph:
     )
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep", "ncclep"])
+    @pytest.mark.parametrize(
+        "moe_dispatcher_type",
+        [
+            "alltoall",
+            "deepep",
+            "hybridep",
+            "ncclep",
+            pytest.param("ncclep_fp8", marks=pytest.mark.launch_on_gb200),
+        ],
+    )
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(
@@ -1542,12 +1647,30 @@ class TestPartialCudaGraph:
                 pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
-            # ncclep sizes a per-rank recv buffer from this and overflow hard-traps; size generously.
-            extra_kwargs["moe_expert_rank_capacity_factor"] = 8.0
+        elif moe_dispatcher_type == "ncclep_fp8":
+            from tests.unit_tests.transformer.moe.test_token_dispatcher import (
+                is_nccl_ep_fp8_dispatch_available,
+            )
+
+            if not is_nccl_ep_available():
+                pytest.skip("NCCL EP is not available")
+            if ep_size < 2:
+                pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
+            if not is_nccl_ep_fp8_dispatch_available():
+                pytest.skip(
+                    "NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware"
+                )
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
+            # MXFP8 wire dtypes require the op-fuser grouped GEMM (it consumes the carrier).
+            extra_kwargs["moe_grouped_gemm"] = True
+            extra_kwargs["use_transformer_engine_op_fuser"] = True
+            extra_kwargs["moe_dispatch_fwd_dtype"] = "mxfp8"
+            extra_kwargs["moe_combine_bwd_dtype"] = "mxfp8"
         else:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
         if not moe_dropless_dispatcher:
-            if moe_dispatcher_type in ("deepep", "ncclep"):
+            if moe_dispatcher_type in ("deepep", "ncclep", "ncclep_fp8"):
                 pytest.skip(f"{moe_dispatcher_type} doesn't support drop&pad MoE")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
@@ -1565,9 +1688,10 @@ class TestPartialCudaGraph:
                 CudaGraphModule.moe_preprocess,
             ],
         ]:
-            if (moe_dropless_dispatcher or moe_dispatcher_type in ("hybridep", "ncclep")) and (
-                cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules
-            ):
+            if (
+                moe_dropless_dispatcher
+                or moe_dispatcher_type in ("hybridep", "ncclep", "ncclep_fp8")
+            ) and (cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules):
                 # Dropless MoE or a dynamic-shape flex backend (Hybrid EP / NCCL EP) can't be
                 # captured at the "moe" scope (the dispatch does a device-to-host sync). Skip;
                 # the surrounding compute submodules are still graphed.
@@ -1584,67 +1708,10 @@ class TestPartialCudaGraph:
 
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
-        if moe_dispatcher_type == "ncclep":
+        if moe_dispatcher_type in ("ncclep", "ncclep_fp8"):
             from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
 
             nccl_ep_finalize()
-        Utils.destroy_model_parallel()
-
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
-    @pytest.mark.skipif(
-        not (HAVE_TE and is_te_min_version("2.10.0")),
-        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
-    )
-    @pytest.mark.parametrize("ep_size", [1, 4])
-    def test_mhc_moe_partial_cudagraph(self, ep_size):
-        """Test that mHC (Hyper Connection) layers produce identical loss curves
-        with and without TE partial CUDA graph capture.
-
-        This validates the fix where HyperConnectionTransformerLayer overrides
-        _te_cuda_graph_replay_impl (not _te_cuda_graph_replay) so that the parent's
-        delay_offload_until_cuda_graph lifecycle and overlap_moe_expert_parallel_comm
-        handling are preserved.
-        """
-        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size,
-            context_parallel_size=self.cp_size,
-            pipeline_model_parallel_size=1,
-            expert_tensor_parallel_size=1 if ep_size > 1 else self.tp_size,
-            expert_model_parallel_size=ep_size,
-        )
-
-        extra_kwargs = {
-            "enable_hyper_connections": True,
-            "num_residual_streams": 4,
-            "mtp_num_layers": None,  # mHC is incompatible with MTP
-        }
-
-        loss_list_ref = self._run_test_helper(ep_size, "none", None, 0, **extra_kwargs)
-        for cuda_graph_modules in [
-            [CudaGraphModule.attn],
-            [CudaGraphModule.mlp, CudaGraphModule.moe_router],
-            [
-                CudaGraphModule.attn,
-                CudaGraphModule.mlp,
-                CudaGraphModule.moe_router,
-                CudaGraphModule.moe_preprocess,
-            ],
-        ]:
-            cuda_graph_warmup_steps = 3
-            loss_list = self._run_test_helper(
-                ep_size,
-                "transformer_engine",
-                cuda_graph_modules,
-                cuda_graph_warmup_steps,
-                **extra_kwargs,
-            )
-            assert torch.equal(loss_list, loss_list_ref), (
-                f"mHC loss mismatch with cuda_graph_modules={cuda_graph_modules}, ep_size={ep_size}. "
-                f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
-            )
-
         Utils.destroy_model_parallel()
 
 
@@ -1657,6 +1724,25 @@ class _SimpleModule(MegatronModule):
 
     def my_op(self, x):
         return self.linear(x)
+
+
+class _CheckpointDependencyModule(MegatronModule):
+    """A visible projection consuming the output of a checkpointed child module."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.checkpointed = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.my_op(x)
+
+    def my_op(self, x):
+        checkpoint = CheckpointWithoutOutput()
+        hidden = checkpoint.checkpoint(self.checkpointed, x)
+        output = self.projection(hidden)
+        checkpoint.discard_output_and_register_recompute(output)
+        return output
 
 
 class _SimpleNonModule:
@@ -1675,6 +1761,94 @@ def _make_simple_module(config):
 
 def _make_simple_non_module(config):
     return _SimpleNonModule(config)
+
+
+class TestCheckpointParameterDiscovery:
+    """Local-CG discovery and DDP readiness for a checkpointed nested module."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        if _CudagraphGlobalRecord.cudagraph_created:
+            delete_cuda_graphs()
+        else:
+            _CudagraphGlobalRecord.cudagraph_record = []
+            _CudagraphGlobalRecord.cudagraph_inference_record = []
+            CudaGraphManager.global_mempool = None
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_nested_checkpoint_parameter_gradients_and_ddp_readiness(self):
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size() < 2:
+            pytest.skip("test requires at least two data-parallel ranks")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=0,
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
+        )
+        torch.manual_seed(123)
+        reference = _CheckpointDependencyModule(config).cuda()
+        module = _CheckpointDependencyModule(config).cuda()
+        module.load_state_dict(reference.state_dict())
+
+        manager = CudaGraphManager(
+            config, base_module=module, function_name="my_op", need_backward=True
+        )
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
+            module,
+        )
+
+        # Distinct inputs make the expected DDP result the average of different local gradients.
+        torch.manual_seed(1000 + ddp_model.dp_group.rank())
+        test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+        reference_output = reference.my_op(test_input.detach().clone().requires_grad_(True))
+        reference_output_value = reference_output.detach().clone()
+        reference_output.sum().backward()
+        reference_wgrads = {
+            name: param.grad.detach().clone() for name, param in reference.named_parameters()
+        }
+        for grad in reference_wgrads.values():
+            torch.distributed.all_reduce(grad, group=ddp_model.dp_group)
+            grad.div_(ddp_model.dp_group.size())
+        del reference_output
+
+        ddp_model.zero_grad_buffer()
+        record_input = test_input.detach().clone().requires_grad_(True)
+        ddp_model(record_input).sum().backward()
+        ddp_model.finish_grad_sync()
+        ddp_model.zero_grad_buffer()
+        create_cudagraphs()
+
+        runner = manager.cudagraph_runners[0]
+        assert any(param is module.checkpointed.weight for param in runner.params_to_backprop)
+
+        # The first replay uses DDP's recorded ready counts; the second verifies per-step reset.
+        for _ in range(2):
+            ddp_model.zero_grad_buffer()
+            replay_output = ddp_model(test_input.detach().clone().requires_grad_(True))
+            replay_output.sum().backward()
+            ddp_model.finish_grad_sync()
+            torch.cuda.synchronize()
+
+            torch.testing.assert_close(replay_output, reference_output_value)
+            for name, param in module.named_parameters():
+                assert param.grad is None
+                torch.testing.assert_close(param.main_grad, reference_wgrads[name])
 
 
 class TestInlineCaptureManager:
@@ -1871,9 +2045,4 @@ if __name__ == "__main__":
     test = TestPartialCudaGraph()
     test.setup_method(method=None)
     test.test_moe_partial_cudagraph(4, True, "alltoall")
-    test.teardown_method(method=None)
-
-    test = TestPartialCudaGraph()
-    test.setup_method(method=None)
-    test.test_mhc_moe_partial_cudagraph(4)
     test.teardown_method(method=None)

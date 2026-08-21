@@ -19,17 +19,17 @@ from megatron.core.dist_checkpointing.optimizer import (
 )
 from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding, extract_sharded_tensors
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, ChainedOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.utils import is_te_min_version, is_torch_min_version
+from megatron.core.utils import is_torch_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
@@ -79,17 +79,16 @@ class Model(torch.nn.Module):
         return sharded_state_dict
 
 
-class Fp32MarkedModel(torch.nn.Module):
-    """BF16 model with one parameter kept in FP32 (like the mHC / CSA params)."""
+class NativeFp32Model(torch.nn.Module):
+    """Parameters for an interleaved trainable/frozen BF16 and FP32 group."""
 
     def __init__(self):
         super().__init__()
-        from megatron.core.transformer.module import mark_keep_in_fp32
-
         self.pre = torch.nn.Linear(8, 8, bias=False)
-        self.gate = torch.nn.Parameter(torch.zeros(24))
+        self.frozen = torch.nn.Linear(8, 8, bias=False)
+        self.frozen.weight.requires_grad_(False)
+        self.gate = torch.nn.Parameter(torch.zeros(24, dtype=torch.float32))
         self.post = torch.nn.Linear(8, 8, bias=False)
-        mark_keep_in_fp32(self.gate)
         self.config = TransformerConfig(
             hidden_size=8, num_attention_heads=1, num_layers=1, bf16=True
         )
@@ -99,50 +98,6 @@ class Fp32MarkedModel(torch.nn.Module):
             key: ShardedTensor.from_rank_offsets(key, value)
             for key, value in self.state_dict(keep_vars=True).items()
         }
-
-
-class MixedDtypeNet(torch.nn.Module):
-    """Module whose single optimizer param group mixes bf16 and fp32 params.
-
-    Like ``Fp32MarkedModel`` above, mirrors hyper-connections under bf16
-    training (megatron/core/transformer/hyper_connection.py): most weights are
-    converted to bf16 while parameters marked with ``mark_keep_in_fp32`` stay
-    fp32, so the params of one optimizer group live in different-dtype grad
-    buffers. ``Fp32MarkedModel`` is sized for the non-distributed
-    ``Float16OptimizerWithFloat16Params`` pairing test; this model is sized
-    for ``DistributedOptimizer`` shard-map tests instead:
-
-    The fp32 param sits BETWEEN the two bf16 params in ``named_parameters()``
-    order, so no matter which direction DDP walks the params when grouping
-    them into per-dtype buffers (it walks in reverse), the gbuf-iteration
-    group order interleaves the dtypes — [bf16, fp32, bf16]-ish — while
-    ``_build_model_and_main_param_groups()`` installs the group as
-    [fp32 shard, bf16 main params...]. A trailing (or leading) fp32 param
-    can coincidentally match the installed order and mask the bug; the
-    middle position cannot.
-
-    Every parameter has a distinct numel, and each parameter's numel is a
-    multiple of lcm(dp, 128) for dp up to 8, so on every DP rank up to world
-    size 8 each rank owns a piece of every param and a lookup at the wrong
-    group order can never return a tensor of matching size.
-    """
-
-    def __init__(self):
-        super().__init__()
-        from megatron.core.transformer.module import mark_keep_in_fp32
-
-        # 8192 elements; bf16 after conversion.
-        self.linear1 = torch.nn.Linear(128, 64, bias=False)
-        # 512 elements; stays fp32. Kept 2-D so the standard weight-decay
-        # overrides leave it in the same param group as the linear weights.
-        # Deliberately declared BETWEEN the bf16 linears — see class docstring.
-        self.alpha = mark_keep_in_fp32(torch.nn.Parameter(torch.ones(16, 32)))
-        # 2048 elements; bf16 after conversion.
-        self.linear2 = torch.nn.Linear(64, 32, bias=False)
-
-    def forward(self, x):
-        y = self.linear2(self.linear1(x))
-        return y.float() * self.alpha.mean()
 
 
 class SwigluFactoryModel(torch.nn.Module):
@@ -304,23 +259,32 @@ class TestOptimizer:
             ]
         )
 
-    def test_float16_optimizer_with_fp32_marked_params(self):
-        """Params kept in FP32 (mark_keep_in_fp32) land in fp32_from_fp32_groups, so
-        the optimizer state ids must not be assumed to enumerate float16 params only."""
+    def test_float16_optimizer_with_native_fp32_and_frozen_params(self):
+        """Native FP32 and frozen param ids must not shift BF16 checkpoint state."""
         from megatron.core.optimizer import OptimizerConfig
         from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
-        from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+        from megatron.core.transformer.module import (
+            convert_module_to_dtype_except_fp32_marked,
+            mark_keep_in_fp32,
+        )
 
         Utils.initialize_model_parallel(1, 1)
-        model = Fp32MarkedModel().cuda()
+        model = NativeFp32Model().cuda()
+        model.gate = mark_keep_in_fp32(model.gate)
         convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
         assert model.pre.weight.dtype == torch.bfloat16
+        assert model.frozen.weight.dtype == torch.bfloat16
+        assert not model.frozen.weight.requires_grad
         assert model.gate.dtype == torch.float32
+        assert model.post.weight.dtype == torch.bfloat16
 
-        # Force optimizer state initialization
-        for p in model.parameters():
-            p.grad = torch.zeros_like(p)
-        inner_optim = Adam(model.parameters())
+        # Use an explicit trainable BF16/frozen BF16/FP32/trainable BF16 order.
+        # Module.parameters() would yield the root gate before child parameters.
+        ordered_params = [model.pre.weight, model.frozen.weight, model.gate, model.post.weight]
+        for param in ordered_params:
+            if param.requires_grad:
+                param.grad = torch.zeros_like(param)
+        inner_optim = Adam(ordered_params)
         inner_optim.step()
 
         optim = Float16OptimizerWithFloat16Params(
@@ -331,171 +295,28 @@ class TestOptimizer:
         )
         sharded_state_dict = optim.sharded_state_dict(model.sharded_state_dict())
 
-        # FP32 main copies pair with the bf16 params only, in order.
+        # FP32 main copies pair with the BF16 params only, in optimizer order.
         fp32_params = sharded_state_dict['fp32_from_fp16_params'][0]
-        assert [(sh_ten.key, tuple(sh_ten.data.shape)) for sh_ten in fp32_params] == [
+        assert [(sharded.key, tuple(sharded.data.shape)) for sharded in fp32_params] == [
             ('optimizer.state.fp32_param.pre.weight', (8, 8)),
             ('optimizer.state.fp32_param.post.weight', (8, 8)),
         ]
 
-        # Per-param state maps every param, including the FP32-kept one,
-        # to the right model key and shape.
+        # The frozen parameter has neither optimizer state nor an fp32 main copy.
         state = sharded_state_dict['optimizer']['state']
-        # parameters() yields the root module's own params first, then submodules.
-        expected = {0: ('gate', (24,)), 1: ('pre.weight', (8, 8)), 2: ('post.weight', (8, 8))}
+        assert 1 not in state
+
+        # Per-param state maps every trainable param, including native FP32, to the right key.
+        expected = {0: ('pre.weight', (8, 8)), 2: ('gate', (24,)), 3: ('post.weight', (8, 8))}
         for param_id, (model_key, shape) in expected.items():
             for state_key in ('exp_avg', 'exp_avg_sq'):
-                sh_ten = state[param_id][state_key]
-                assert sh_ten.key == f'optimizer.state.{state_key}.{model_key}', sh_ten.key
-                assert tuple(sh_ten.data.shape) == shape, (param_id, sh_ten.key, sh_ten.data.shape)
-
-
-class TestMixedDtypeParamGroups:
-    def setup_method(self, method):
-        pass
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-    @pytest.mark.skipif(
-        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
-    )
-    def test_distrib_optimizer_mixed_dtype_param_group_dp_reshardable(self, tmp_path_dist_ckpt):
-        """Mixed fp32/bf16 param group: dp_reshardable save/load round-trip.
-
-        Regression test for two bugs surfaced by param groups that mix fp32 and
-        float16 model params (e.g. hyper-connections params marked keep_in_fp32
-        under bf16 training):
-
-        1. ``_build_model_and_main_param_groups()`` installs each optimizer
-           group's params as [*fp32 shards, *fp32-from-float16 shards], which
-           reorders the group relative to the gbuf-iteration order recorded in
-           ``model_param_group_index_map``. Unless the map is rebuilt to match
-           the installed order, ``_get_main_param_and_optimizer_states()``
-           fetches the wrong param's shard and checkpoint save with
-           ``metadata={'distrib_optim_sharding_type': 'dp_reshardable'}`` crashes
-           on a shape assertion in ``sharded_param_state_dp_reshardable()``.
-
-        2. For fp32 model params the optimizer group entry is an
-           autograd-tracked view of the model param (built without detach()), so
-           the load path's in-place copy in
-           ``_set_main_param_and_optimizer_states()`` must run under no_grad or
-           ``load_parameter_state_from_dp_reshardable()`` raises "a view of a
-           leaf Variable that requires grad is being used in an in-place
-           operation".
-        """
-        from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
-
-        Utils.initialize_model_parallel()
-
-        model = MixedDtypeNet().cuda()
-        # Same conversion path as Float16Module: everything becomes bf16
-        # except params marked with mark_keep_in_fp32.
-        convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
-        assert model.linear1.weight.dtype == torch.bfloat16
-        assert model.linear2.weight.dtype == torch.bfloat16
-        assert model.alpha.dtype == torch.float32
-
-        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
-        model = DistributedDataParallel(
-            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-        )
-        optimizer_config = OptimizerConfig(
-            optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=True
-        )
-        optim = get_megatron_optimizer(optimizer_config, [model])
-        distrib_optim = optim.chained_optimizers[0]
-
-        # Sanity check of the repro precondition: at least one param group on
-        # this rank must mix fp32 and bf16 model params.
-        assert any(
-            fp32_params and float16_params
-            for fp32_params, float16_params in zip(
-                distrib_optim.model_fp32_groups, distrib_optim.model_float16_groups
-            )
-        ), "setup error: expected a param group mixing fp32 and bf16 model params"
-
-        # The map must point at the very shard that was installed for each
-        # model param, not merely at a shard of the right size.
-        for model_param, (
-            group_index,
-            group_order,
-        ) in distrib_optim.model_param_group_index_map.items():
-            shard = distrib_optim.optimizer.param_groups[group_index]["params"][group_order]
-            local_range = distrib_optim._get_model_param_range_map(model_param)["gbuf_local"]
-            assert shard.numel() == local_range.size, (
-                f"optimizer group ({group_index}, {group_order}) holds a shard of numel "
-                f"{shard.numel()}, but the {tuple(model_param.shape)} {model_param.dtype} "
-                f"model param owns a local gbuf range of numel {local_range.size}"
-            )
-            if model_param.dtype == torch.float32:
-                # fp32 shards are views into the model param itself.
-                assert (
-                    shard.untyped_storage().data_ptr() == model_param.untyped_storage().data_ptr()
-                ), "fp32 group entry is not a view of the mapped model param"
-            else:
-                # float16/bf16 shards are the allocated fp32 main-param copies.
-                assert (
-                    shard is model_param.main_param
-                ), "float16 group entry is not the mapped model param's main_param"
-
-        # One step so the Adam state (exp_avg, exp_avg_sq) exists in the saved
-        # parameter state.
-        inputs = torch.randn(8, 128, dtype=torch.bfloat16, device='cuda')
-        loss = model(inputs).sum()
-        loss.backward()
-        optim.step()
-
-        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
-
-        # The customer-visible save crash path: dp_reshardable checkpoint save
-        # asserts every saved tensor matches its local gbuf range.
-        sharded_state_dict = optim.sharded_state_dict(model.sharded_state_dict(), metadata=metadata)
-        assert 'param_state' in sharded_state_dict
-
-        # Snapshot the state the checkpoint should preserve. Skip 'step': it
-        # round-trips as a LocalNonpersistentObject pointing at the live
-        # tensor, so it cannot be perturbed-and-restored.
-        saved_states = {}
-        for model_param in distrib_optim.model_param_group_index_map:
-            tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
-            saved_states[model_param] = {
-                key: tensor.detach().clone() for key, tensor in tensors.items() if key != 'step'
-            }
-
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_mixed_dtype_param_group_dp_reshardable', sync=True
-        ) as ckpt_dir:
-            save(sharded_state_dict, ckpt_dir)
-
-            # Perturb the live main params and optimizer state. The fp32 model
-            # param's main param is an autograd-tracked view of the model
-            # param itself, so these writes must run under no_grad — the same
-            # property the optimizer load path has to respect.
-            with torch.no_grad():
-                for model_param, saved in saved_states.items():
-                    live = distrib_optim._get_main_param_and_optimizer_states(model_param)
-                    for key in saved:
-                        live[key].fill_(123.0)
-                        assert not torch.equal(live[key], saved[key])
-
-            # The customer-visible load crash path: resume from the
-            # dp_reshardable checkpoint. Without the no_grad guard in
-            # _set_main_param_and_optimizer_states(), load_state_dict() raises
-            # a leaf-view in-place RuntimeError on the fp32 main-param view.
-            load_sharded_state_dict = optim.sharded_state_dict(
-                model.sharded_state_dict(), is_loading=True, metadata=metadata
-            )
-            loaded_state_dict = load(load_sharded_state_dict, ckpt_dir)
-            optim.load_state_dict(loaded_state_dict)
-
-            for model_param, saved in saved_states.items():
-                restored = distrib_optim._get_main_param_and_optimizer_states(model_param)
-                for key, saved_tensor in saved.items():
-                    assert torch.equal(restored[key], saved_tensor), (
-                        f"optimizer state '{key}' of the {tuple(model_param.shape)} "
-                        f"{model_param.dtype} model param was not restored from the checkpoint"
-                    )
+                sharded = state[param_id][state_key]
+                assert sharded.key == f'optimizer.state.{state_key}.{model_key}', sharded.key
+                assert tuple(sharded.data.shape) == shape, (
+                    param_id,
+                    sharded.key,
+                    sharded.data.shape,
+                )
 
 
 def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
@@ -606,100 +427,6 @@ class TestDistributedOptimizer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize(
-        ("source_offload", "destination_offload"), [(False, True), (True, False)]
-    )
-    @pytest.mark.parametrize(
-        "use_precision_aware_optimizer",
-        [
-            False,
-            pytest.param(
-                True,
-                marks=pytest.mark.skipif(
-                    not is_te_min_version("2.1.0.dev0"),
-                    reason="Precision-aware FusedAdam requires TE 2.1.0.dev0",
-                ),
-            ),
-        ],
-    )
-    def test_chunked_offload_distributed_checkpoint_compatibility(
-        self, tmp_path_dist_ckpt, source_offload, destination_offload, use_precision_aware_optimizer
-    ):
-        """Offloaded and legacy Adam DistOpt checkpoints load in both directions."""
-
-        Utils.initialize_model_parallel(1, 1)
-        with (
-            TempNamedDir(tmp_path_dist_ckpt / 'chunked_offload_A', sync=True) as ckpt_dir_A,
-            TempNamedDir(tmp_path_dist_ckpt / 'chunked_offload_B', sync=True) as ckpt_dir_B,
-        ):
-            metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
-            model_A, optimizer_A = setup_model_and_optimizer(
-                seed=2,
-                tp=1,
-                pp=1,
-                chunked_optimizer_state_offload=source_offload,
-                optimizer_state_offload_chunk_size_mb=1,
-                use_precision_aware_optimizer=use_precision_aware_optimizer,
-            )
-            model_sharded_sd_A = model_A[0].sharded_state_dict()
-            save(optimizer_A.sharded_state_dict(model_sharded_sd_A, metadata=metadata), ckpt_dir_A)
-
-            dist_optimizer_A = optimizer_A.chained_optimizers[0]
-            source_states = {}
-            for model_param in dist_optimizer_A.model_param_group_index_map:
-                tensors = dist_optimizer_A._get_main_param_and_optimizer_states(model_param)
-                source_states[dist_optimizer_A._param_name(model_param)] = {
-                    key: tensor.detach().cpu().clone()
-                    for key, tensor in tensors.items()
-                    if key != 'step'
-                }
-
-            model_B, optimizer_B = setup_model_and_optimizer(
-                seed=3,
-                tp=1,
-                pp=1,
-                chunked_optimizer_state_offload=destination_offload,
-                optimizer_state_offload_chunk_size_mb=1,
-                use_precision_aware_optimizer=use_precision_aware_optimizer,
-                initialize_optimizer_state=False,
-            )
-            model_sharded_sd_B = model_B[0].sharded_state_dict()
-            load_template = optimizer_B.sharded_state_dict(
-                model_sharded_sd_B, is_loading=True, metadata=metadata
-            )
-            optimizer_B.load_state_dict(load(load_template, ckpt_dir_A))
-
-            dist_optimizer_B = optimizer_B.chained_optimizers[0]
-            destination_param_names = {
-                dist_optimizer_B._param_name(param)
-                for param in dist_optimizer_B.model_param_group_index_map
-            }
-            assert destination_param_names == source_states.keys()
-            for model_param in dist_optimizer_B.model_param_group_index_map:
-                param_name = dist_optimizer_B._param_name(model_param)
-                restored = dist_optimizer_B._get_main_param_and_optimizer_states(model_param)
-                for key, expected in source_states[param_name].items():
-                    assert torch.equal(restored[key].detach().cpu(), expected), (
-                        f"optimizer state '{key}' of parameter '{param_name}' "
-                        "was not restored from the checkpoint"
-                    )
-
-            if destination_offload:
-                manager = dist_optimizer_B._optimizer_state_offloader
-                assert manager is not None
-                for param in manager.selected_params:
-                    for value in manager.optimizer.state[param].values():
-                        if isinstance(value, torch.Tensor) and value.numel() == param.numel():
-                            assert value.device.type == 'cpu'
-                    if manager._master_in_optimizer_state:
-                        master = manager.optimizer.state[param].get('master_param')
-                        assert isinstance(master, torch.Tensor)
-                        assert master.device.type == 'cpu'
-                    elif id(param) in manager._explicit_master_param_ids:
-                        assert param.device.type == 'cpu'
-
-            save(optimizer_B.sharded_state_dict(model_sharded_sd_B, metadata=metadata), ckpt_dir_B)
-
     @pytest.mark.parametrize("fully_parallel", [False, True])
     @pytest.mark.parametrize(
         ("tp_pp_ep", "is_moe", "is_mla", "test_step", "kwargs"),
@@ -750,6 +477,7 @@ class TestDistributedOptimizer:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
             mock_args.use_distributed_optimizer = True
+            mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A
                 if is_moe:
@@ -825,6 +553,7 @@ class TestDistributedOptimizer:
             tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
         ) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
+            mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
                 init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -1228,6 +957,99 @@ class TestDistributedOptimizer:
         same_groups = set(g for g in same_groups if g is not None)
         # Check each dst group has at least 1 rank both in src and dest
         assert same_groups == set(range(num_dest_dp_groups))
+
+    @pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
+    )
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
+    def test_lion_optimizer_checkpoint_round_trip(self, tmp_path_dist_ckpt, sharding_type):
+        """Test DistributedOptimizer checkpoint save/load with Lion (single-moment optimizer).
+
+        Lion is used as the scalar optimizer for Muon (muon_scalar_optimizer='lion'),
+        which is the natural path where Lion ends up inside a DistributedOptimizer.
+        This exercises the dynamic optimizer_state_keys logic with Lion's single
+        moment ('exp_avg') instead of Adam's two ('exp_avg', 'exp_avg_sq').
+        """
+        Utils.initialize_model_parallel(2, 1, order='tp-pp-dp')
+
+        def _get_lion_distopt(optimizer):
+            """Extract the Lion DistributedOptimizer from a Muon+Lion ChainedOptimizer."""
+            assert isinstance(optimizer, ChainedOptimizer)
+            for child in optimizer.chained_optimizers:
+                if isinstance(child, DistributedOptimizer):
+                    return child
+            raise AssertionError("No DistributedOptimizer found in ChainedOptimizer")
+
+        def _seed_random_optimizer_state(distopt, seed):
+            """Seed non-zero random exp_avg values in the DistOpt's raw optimizer state."""
+            torch.manual_seed(seed)
+            for group in distopt.optimizer.param_groups:
+                for p in group['params']:
+                    state = distopt.optimizer.state[p]
+                    if 'exp_avg' in state:
+                        state['exp_avg'].copy_(torch.randn_like(p.data))
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_lion_optimizer_checkpoint', sync=True
+        ) as ckpt_dir_A:
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=2,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='muon',
+                muon_scalar_optimizer='lion',
+                use_param_layout=True,
+            )
+
+            lion_distopt_A = _get_lion_distopt(optimizer_A)
+            assert lion_distopt_A.optimizer_state_keys == ("exp_avg",)
+            _seed_random_optimizer_state(lion_distopt_A, seed=100)
+
+            metadata = {'distrib_optim_sharding_type': sharding_type}
+
+            model_sharded_sd = model_A[0].sharded_state_dict()
+            optim_sd = optimizer_A.sharded_state_dict(model_sharded_sd, metadata=metadata)
+            save(optim_sd, ckpt_dir_A)
+
+            dp_zero_optim_A = lion_distopt_A.get_parameter_state_dp_zero(use_gloo_comm=False)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=2,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='muon',
+                muon_scalar_optimizer='lion',
+                use_param_layout=True,
+            )
+
+            lion_distopt_B = _get_lion_distopt(optimizer_B)
+            _seed_random_optimizer_state(lion_distopt_B, seed=200)
+
+            # Before loading, state should differ.
+            dp_zero_optim_B = lion_distopt_B.get_parameter_state_dp_zero(use_gloo_comm=False)
+            assert not self.check_equal_dp_zero_state(dp_zero_optim_A, dp_zero_optim_B, True)
+
+            model_sharded_sd = model_B[0].sharded_state_dict()
+            load_sharded_state_dict = optimizer_B.sharded_state_dict(
+                model_sharded_sd, metadata=metadata, is_loading=True
+            )
+            state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+            optimizer_B.load_state_dict(state_dict)
+
+            # After loading, state should match.
+            dp_zero_optim_B = lion_distopt_B.get_parameter_state_dp_zero(use_gloo_comm=False)
+            assert self.check_equal_dp_zero_state(
+                dp_zero_optim_A, dp_zero_optim_B, True, raise_if_different=True
+            )
+
+        Utils.destroy_model_parallel()
 
 
 class TestFP32Optimizer:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -11,17 +10,15 @@ import torch
 
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
-    record_dispatch_token_counts,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -258,14 +255,10 @@ class MoELayer(BaseMoELayer):
         )
 
         self.tp_group = pg_collection.tp
-        self.tp_ep_group = pg_collection.tp_ep
 
         # Initialize router.
         self.router = self.submodules.router(
-            config=self.config,
-            pg_collection=pg_collection,
-            is_mtp_layer=is_mtp_layer,
-            layer_number=layer_number,
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
         )
         self.tp_group = pg_collection.tp
 
@@ -278,6 +271,11 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -289,6 +287,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
@@ -301,6 +300,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
 
         # Initialize token dispatcher
@@ -354,12 +354,11 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            if config.inference_grouped_gemm_backend == 'auto':
+            if config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
                 assert HAVE_FLASHINFER, (
-                    "inference_grouped_gemm_backend='auto'"
-                    "requires flashinfer-python. "
+                    "inference_grouped_gemm_backend='flashinfer' requires flashinfer-python. "
                     "Install flashinfer-python or set "
-                    "inference_grouped_gemm_backend to 'torch' or 'te'."
+                    "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
@@ -369,14 +368,14 @@ class MoELayer(BaseMoELayer):
                 from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                 check_flashinfer_jit_cache_installed()
-            elif config.inference_grouped_gemm_backend == 'torch':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
-            elif config.inference_grouped_gemm_backend == 'vllm':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
@@ -386,11 +385,6 @@ class MoELayer(BaseMoELayer):
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
-
-        if self.config.log_moe_overload_factor:
-            get_moe_overload_factor_tracker().set_process_groups(
-                tp_ep_group=self.tp_ep_group, expt_dp_group=pg_collection.expt_dp
-            )
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
@@ -448,21 +442,13 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(
-        self,
-        hidden_states: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        input_ids: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ):
+    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(
-            hidden_states, padding_mask, input_ids, packed_seq_params
-        )
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -507,16 +493,6 @@ class MoELayer(BaseMoELayer):
         )
         return hidden_states, probs
 
-    @staticmethod
-    def _num_token_rows_from_moe_hidden_states(hidden_states: torch.Tensor) -> int:
-        """Product of all dims except the hidden/last (same as view(-1, H) row count)."""
-        if hidden_states.dim() < 2:
-            raise ValueError(
-                "MoE hidden_states must be at least 2D [..., hidden_size], "
-                f"got shape {tuple(hidden_states.shape)}"
-            )
-        return int(math.prod(hidden_states.shape[:-1]))
-
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
 
@@ -556,39 +532,6 @@ class MoELayer(BaseMoELayer):
 
         return shared_expert_output
 
-    def _maybe_record_overload_factor(
-        self, dispatched_input: torch.Tensor, tokens_per_expert: torch.Tensor
-    ) -> torch.Tensor:
-        """Wrap dispatched_input with overload logging when log_moe_overload_factor is set.
-
-        Uses _overload_log_num_local_tokens captured from forward hidden_states and
-        applies AllGather fair-share scaling so report()'s SUM over TP×EP matches one
-        global balanced count when the map is replicated on every rank.
-
-        Recording is skipped when not in training mode (e.g. Megatron validation uses
-        model.eval()) so eval forwards do not pollute train-only overload stats.
-        """
-        if not self.config.log_moe_overload_factor or not self.training:
-            return dispatched_input
-        num_local_tokens = getattr(self, "_overload_log_num_local_tokens", None)
-        if num_local_tokens is None:
-            return dispatched_input
-        tp_ep_world_size = float(self.tp_ep_group.size())
-        local_balanced_count = float(num_local_tokens) * float(self.config.moe_router_topk)
-        token_dispatcher = self.token_dispatcher
-        if isinstance(token_dispatcher, MoEAllGatherTokenDispatcher) and (
-            token_dispatcher.tp_size > 1 or token_dispatcher.ep_size > 1
-        ):
-            local_balanced_count = local_balanced_count / tp_ep_world_size
-        local_balanced = torch.empty((), device=dispatched_input.device, dtype=torch.float32)
-        local_balanced.fill_(local_balanced_count)
-        return record_dispatch_token_counts(
-            tensor=dispatched_input,
-            tokens_per_expert=tokens_per_expert,
-            local_balanced_token_count=local_balanced,
-            layer_number=self.layer_number,
-        )
-
     @internal_api
     def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
@@ -601,23 +544,26 @@ class MoELayer(BaseMoELayer):
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )
-
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
-        if (
-            hasattr(self, "_inference_token_dispatcher")
-            and getattr(self, "is_inference_cuda_graphed_iteration", True)
-            and InferenceMode.is_active()
-        ):
+        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
+            # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
+            # these kwargs).
+            output_buffer, grad_input_buffer = self.token_dispatcher.get_expert_zero_copy_buffers()
+            expert_kwargs = {}
+            if output_buffer is not None:
+                expert_kwargs["output_buffer"] = output_buffer
+            if grad_input_buffer is not None:
+                expert_kwargs["grad_input_buffer"] = grad_input_buffer
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
@@ -670,8 +616,6 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
-        input_ids: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -683,11 +627,9 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape [seq_length, bsz]. True = padding,
-                                                   False = valid. Defaults to None.
-            input_ids (torch.Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
-                                                Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                                   Shape [seq_length, bsz]. True for valid tokens,
+                                                   False for padding tokens. Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -708,29 +650,6 @@ class MoELayer(BaseMoELayer):
             else:
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
-
-        # Align padding_mask to hidden_states sequence dimension before transpose.
-        # padding_mask arrives as [bsz, seq_length] but may need SP scatter when
-        # hidden_states is already TP-scattered (seq_length / TP).
-        if padding_mask is not None and padding_mask.shape[1] != hidden_states.shape[0]:
-            if (
-                self.config.sequence_parallel
-                and padding_mask.shape[1] % self.config.tensor_model_parallel_size == 0
-                and padding_mask.shape[1] // self.config.tensor_model_parallel_size
-                == hidden_states.shape[0]
-            ):
-                padding_mask = (
-                    tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous()
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-            else:
-                raise AssertionError(
-                    f"padding_mask shape {padding_mask.shape} cannot be aligned to "
-                    f"hidden_states sequence length {hidden_states.shape[0]}"
-                )
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
@@ -740,13 +659,7 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    if self.config.log_moe_overload_factor and self.training:
-                        self._overload_log_num_local_tokens = (
-                            self._num_token_rows_from_moe_hidden_states(hidden_states)
-                        )
-                    probs, routing_map = self.route(
-                        hidden_states, padding_mask, input_ids, packed_seq_params
-                    )
+                    probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:

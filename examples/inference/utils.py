@@ -34,10 +34,24 @@ def get_default_sampling_params(termination_id: int = None):
 
 
 def get_curr_time(do_broadcast: bool = True) -> float:
-    """Get synchronized time across ranks."""
+    """Get the current time, optionally synchronized across distributed ranks.
+
+    Args:
+        do_broadcast (bool): Whether multi-rank callers require a rank-zero
+            timestamp broadcast.
+
+    Returns:
+        float: Current time in seconds.
+    """
+    if (
+        not do_broadcast
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() == 1
+    ):
+        return time.time_ns() / 10**9
+
     curr_time = torch.cuda.LongTensor([time.time_ns()])
-    if torch.distributed.is_initialized() and do_broadcast:
-        torch.distributed.broadcast(curr_time, src=0)
+    torch.distributed.broadcast(curr_time, src=0)
     return curr_time.item() / 10**9
 
 
@@ -305,7 +319,7 @@ def build_dynamic_engine_setup_prefix(
     # Buffer limits config
     buffer_limits_str = (
         f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
-        f"{context.kv_block_allocator.active_count} chunks "
+        f"{context.kv_block_allocator.pool_size - 1} usable chunks "
         f"[r {context.max_requests}, t {context.max_tokens}]"
     )
 
@@ -345,7 +359,10 @@ def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -
         unique_prompt_map[req.prompt].append(idx)
 
     for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-        prompt_len = len(results[request_idxs[0]].prompt_tokens)
+        request = results[request_idxs[0]]
+        prompt_len = request.prompt_length
+        if prompt_len is None and request.prompt_tokens is not None:
+            prompt_len = len(request.prompt_tokens)
         print(
             f"\n{unique_idx+1}/{len(unique_prompt_map)}"
             f"[n {len(request_idxs)}, l {prompt_len}] {escape_str(prompt_text)}"
@@ -401,7 +418,9 @@ def dump_inference_results_to_json(
         lifetime_prefill_token_count (int): Total prefill tokens processed.
         async_sched_step_count (int): Number of async scheduling decode steps.
         async_sched_compaction_step_count (int): Number of async scheduling decode
-            steps where post-forward compaction discarded finished rows.
+            steps that discarded speculative rows for finished requests. This
+            includes identity-prefix and all-finished cases that require no GPU
+            gather.
     """
     if not args.output_path:
         return
@@ -442,9 +461,7 @@ def dump_inference_results_to_json(
     json_results.update(peak_mem_stats)
     json_results["lifetime_prefill_token_count"] = lifetime_prefill_token_count
     json_results["async_sched_step_count"] = async_sched_step_count
-    json_results["async_sched_compaction_step_count"] = (
-        async_sched_compaction_step_count
-    )
+    json_results["async_sched_compaction_step_count"] = async_sched_compaction_step_count
 
     print(f' Saving results to {args.output_path}')
     with open(args.output_path, "w") as fp:

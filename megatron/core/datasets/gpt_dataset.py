@@ -59,8 +59,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    dynamic_context_parallel: bool = False
-    """Option to enable dynamic context parallelism. When setting this to True, 
+    hybrid_context_parallel: bool = False
+    """Option to enable hybrid context parallelism. When setting this to True, 
     each sample should be divisible by the data parallel size * context parallel size * 2.
     If sequence parallel is enabled, it should be divisible by the 
     data parallel size * context parallel size * sequence parallel size * 2.
@@ -77,8 +77,22 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
+    inter_document_masking: bool = False
+    """When True, return cu_seqlens marking document boundaries within each sample so
+    that attention is restricted to individual documents."""
     sft_mock_dataset_config_json: Optional[str] = None
-    """This config provides the necessary information for the mock dataset."""
+    """JSON string (or path to a JSON file) configuring the mock SFT dataset's
+    sequence-length distribution. Two modes:
+
+      * ``{"mode": "file", "path": "/path/to/seqlens.csv"}`` -- read the
+        per-sample sequence lengths from a CSV file.
+      * ``{"mode": "distribution", "type": "lognormal", "min_seq_len": 1024,
+        "max_seq_len": 8192, "mean_seq_len": 4096, "lognormal_sigma": 1.1}``
+        -- draw lengths from a clipped lognormal distribution.
+
+    Consumed by ``MockSFTLowLevelDataset`` in
+    ``megatron/training/datasets/sft_dataset.py``, which documents the fields.
+    """
 
     varlen_mock_dataset_config_json: Optional[str] = None
     """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
@@ -90,11 +104,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
     ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
     SBHD reference run that mirrors the THD path's tokenization but skips all
-    packing — useful for THD numerical-correctness validation."""
+    packing — useful for THD numerical-correctness validation.
 
-    inter_document_masking: bool = False
-    """When True, return cu_seqlens marking document boundaries within each sample so
-    that attention is restricted to individual documents."""
+    NOTE: this is a debugging/verification knob, not a training feature.
+    TODO: drop this field once a functional test covers THD-vs-SBHD numerical
+    parity in CI."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -107,9 +121,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.eod_mask_loss is not None
 
         if self.varlen_sbhd_validation:
-            assert not self.dynamic_context_parallel, (
+            assert not self.hybrid_context_parallel, (
                 "--varlen-sbhd-validation is incompatible with "
-                "--dynamic-context-parallel (SBHD mode is not packed)."
+                "--hybrid-context-parallel (SBHD mode is not packed)."
             )
 
         self.token_dtype_code = (
@@ -166,7 +180,7 @@ class GPTDataset(MegatronDataset):
         self.cached_loss_mask = None
         self.cached_position_ids = None
 
-        (self.document_index, self.sample_index, self.shuffle_index) = (
+        self.document_index, self.sample_index, self.shuffle_index = (
             self._build_document_sample_shuffle_indices()
         )
 

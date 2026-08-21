@@ -97,7 +97,9 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
 
         mimo_config = MimoModelConfig(
             language_model_spec=provider.language_spec(
-                args, active_pg if is_language else None, topology.grids[MIMO_LANGUAGE_MODULE_KEY]
+                args,
+                active_pg if is_language else None,
+                topology.grids[MIMO_LANGUAGE_MODULE_KEY],
             ),
             modality_submodules_spec=modality_submodules_spec,
             special_token_ids=special_token_ids,
@@ -123,10 +125,18 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool = True,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if wrap_with_ddp and ddp_config is None:
             raise ValueError("ddp_config is required when wrap_with_ddp is True")
+        # MIMO wraps its submodules via wrap_active_modules_with_ddp() rather than the
+        # shared dist_utils path, which is where the layerwise param layout is applied.
+        if use_layer_wise_distributed_optimizer:
+            raise NotImplementedError(
+                "MIMO does not support the layerwise distributed optimizer "
+                "(--optimizer muon and friends)."
+            )
 
         topology = self._topology
         args = get_args()
@@ -156,13 +166,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             )
         mimo_model = model_list[0]
 
-        wrap_active_modules_with_ddp(
-            args,
-            mimo_model,
-            topology,
-            data_parallel_random_init,
-            use_layer_wise_distributed_optimizer,
-        )
+        wrap_active_modules_with_ddp(args, mimo_model, topology, data_parallel_random_init)
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg
         mimo_model.rng_state_key_prefix = rng_state_key_prefix

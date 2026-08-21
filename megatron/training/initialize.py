@@ -26,7 +26,13 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_pg_rank, get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    get_te_version,
+    is_te_min_version,
+    is_torch_min_version,
+)
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -360,12 +366,24 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
+            if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+                from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+                assert HAVE_GTP, (
+                    "GTP requires TransformerEngine >= 2.19. "
+                    "Set both --gtp_remat-weight-remat-size and "
+                    "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
+                )
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
+                # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
+                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
+                gtp_remat_size=args.gtp_weight_remat_size,
+                expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 dynamic_context_parallel=args.dynamic_context_parallel,
@@ -385,6 +403,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"
+            )
+            print_rank_0(
+                f"> initialized gtp weight remat with size "
+                f"{mpu.get_gtp_weight_remat_world_size()}"
             )
             print_rank_0(
                 f"> initialized pipeline model parallel with size "
@@ -412,10 +434,12 @@ def _set_random_seed(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
     etp_group: Optional[torch.distributed.ProcessGroup] = None,
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+    egtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Set random seed for reproducability.
 
-    The optional pp/dp/tp/ep/etp groups let a caller without an initialized mpu
+    The optional parallel groups let a caller without an initialized mpu
     (e.g. a disjoint-grid run) supply the parallel ranks explicitly; each falls
     back to the mpu group when None.
     """
@@ -434,6 +458,16 @@ def _set_random_seed(
             tp_rank = get_pg_rank(tp_group) if tp_group is not None else None
             ep_rank = get_pg_rank(ep_group) if ep_group is not None else None
             etp_rank = get_pg_rank(etp_group) if etp_group is not None else None
+            gtp_remat_rank = get_pg_rank(gtp_remat_group) if gtp_remat_group is not None else None
+            egtp_remat_rank = (
+                get_pg_rank(egtp_remat_group) if egtp_remat_group is not None else None
+            )
+            gtp_remat_world_size = (
+                get_pg_size(gtp_remat_group) if gtp_remat_group is not None else None
+            )
+            egtp_remat_world_size = (
+                get_pg_size(egtp_remat_group) if egtp_remat_group is not None else None
+            )
             tensor_parallel.model_parallel_cuda_manual_seed(
                 seed,
                 te_rng_tracker,
@@ -442,6 +476,10 @@ def _set_random_seed(
                 tp_rank=tp_rank,
                 ep_rank=ep_rank,
                 etp_rank=etp_rank,
+                gtp_remat_rank=gtp_remat_rank,
+                egtp_remat_rank=egtp_remat_rank,
+                gtp_remat_world_size=gtp_remat_world_size,
+                egtp_remat_world_size=egtp_remat_world_size,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
@@ -581,3 +619,13 @@ def setup_logging() -> None:
         if is_rank0():
             logger.info(f'Setting logging level to {logging_level}')
         logging.getLogger().setLevel(logging_level)
+
+    if not is_rank0():
+        for noisy_logger_name in [
+            'GroupedGemmQuantSm100',
+            'GroupedGemmDsreluSm100',
+            'GroupedGemmSreluSm100',
+            'GroupedGemmWgradSm100',
+            'absl',
+        ]:
+            logging.getLogger(noisy_logger_name).setLevel(logging.ERROR)

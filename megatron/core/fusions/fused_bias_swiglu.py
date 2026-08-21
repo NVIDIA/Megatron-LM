@@ -50,6 +50,7 @@ def weighted_swiglu(y, weights):
 
 @jit_fuser
 def clamped_swiglu(y, clamp_value):
+    """Perform SwiGLU after clamping both halves of the input."""
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1 = y_1.clamp(min=None, max=clamp_value)
@@ -60,12 +61,13 @@ def clamped_swiglu(y, clamp_value):
 
 @jit_fuser
 def bias_clamped_swiglu(y, bias, clamp_value):
-    """SwiGLU with clamping after bias addition."""
+    """Perform clamped SwiGLU after bias addition."""
     return clamped_swiglu(y + bias, clamp_value)
 
 
 @jit_fuser
 def clamped_weighted_swiglu(y, weights, clamp_value):
+    """Perform token-weighted clamped SwiGLU."""
     dtype = y.dtype
     res = clamped_swiglu(y, clamp_value) * weights
     return res.to(dtype)
@@ -122,6 +124,7 @@ def weighted_swiglu_back(g, y, weights):
 
 @jit_fuser
 def clamped_swiglu_back(g, y, clamp_value):
+    """Compute the input gradient for clamped SwiGLU."""
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1c = y_1.clamp(min=None, max=clamp_value)
@@ -142,12 +145,13 @@ def clamped_swiglu_back(g, y, clamp_value):
 
 @jit_fuser
 def bias_clamped_swiglu_back(g, y, bias, clamp_value):
-    """Backward of SwiGLU with clamping after bias addition."""
+    """Compute the input gradient for clamped SwiGLU with bias."""
     return clamped_swiglu_back(g, y + bias, clamp_value)
 
 
 @jit_fuser
 def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
+    """Compute input and weight gradients for token-weighted clamped SwiGLU."""
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = clamped_swiglu_back(g * weights, y, clamp_value)
@@ -169,10 +173,6 @@ class BiasSwiGLUFunction(torch.autograd.Function):
             input (torch.Tensor): Input tensor to apply SwiGLU to.
             bias (torch.Tensor): Bias tensor to be added to input before SwiGLU.
             fp8_input_store (bool): If True, stores intermediate values in FP8 format.
-            cpu_offload_input (bool): If True, mark saved tensors for activation offloading.
-            clamp_value (float | None): If set and positive, clamp the gate input to
-                ``[-inf, clamp_value]`` and the linear input to ``[-clamp_value, clamp_value]``
-                before applying SwiGLU.
 
         Returns:
             torch.Tensor: Result of applying bias addition followed by SwiGLU activation.
@@ -203,8 +203,6 @@ class BiasSwiGLUFunction(torch.autograd.Function):
                 - Gradient with respect to the input tensor
                 - Gradient with respect to the bias tensor
                 - None for fp8_input_store parameter
-                - None for cpu_offload_input parameter
-                - None for clamp_value parameter
         """
         input, bias = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
@@ -227,10 +225,6 @@ class SwiGLUFunction(torch.autograd.Function):
             ctx: Autograd context object for saving tensors for backward pass.
             input (torch.Tensor): Input tensor to apply SwiGLU to.
             fp8_input_store (bool): If True, stores intermediate values in FP8 format.
-            cpu_offload_input (bool): If True, mark saved tensors for activation offloading.
-            clamp_value (float | None): If set and positive, clamp the gate input to
-                ``[-inf, clamp_value]`` and the linear input to ``[-clamp_value, clamp_value]``
-                before applying SwiGLU.
 
         Returns:
             torch.Tensor: Result of applying SwiGLU activation.
@@ -259,8 +253,6 @@ class SwiGLUFunction(torch.autograd.Function):
             tuple: Tuple containing:
                 - Gradient with respect to the input tensor
                 - None for fp8_input_store parameter
-                - None for cpu_offload_input parameter
-                - None for clamp_value parameter
         """
         input = ctx.saved_tensors[0]
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
@@ -280,10 +272,8 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         ctx.fp8_input_store = fp8_input_store
         ctx.clamp_value = clamp_value
         if clamp_value is not None and clamp_value > 0:
-            res = clamped_weighted_swiglu(input, weights, clamp_value)
-        else:
-            res = weighted_swiglu(input, weights)
-        return res
+            return clamped_weighted_swiglu(input, weights, clamp_value)
+        return weighted_swiglu(input, weights)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -308,11 +298,10 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
             uses the bias-free SwiGLU variant.
         fp8_input_store (bool, optional): Whether to store intermediate values in FP8 format.
             Defaults to False.
-        cpu_offload_input (bool, optional): If True, mark saved tensors for activation
+        cpu_offload_input (bool, optional): Whether to mark saved activation inputs for CPU
             offloading. Defaults to False.
-        clamp_value (float | None, optional): If set and positive, clamp the gate input to
-            ``[-inf, clamp_value]`` and the linear input to ``[-clamp_value, clamp_value]``
-            before applying SwiGLU. Defaults to None (no clamping).
+        clamp_value (float, optional): Maximum gate value and absolute linear value. When None,
+            preserve the legacy unclamped SwiGLU behavior.
 
     Returns:
         torch.Tensor: Result of biased SwiGLU activation.

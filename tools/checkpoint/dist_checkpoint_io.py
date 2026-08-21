@@ -28,14 +28,21 @@ from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
 )
-from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
+from torch.distributed.checkpoint.metadata import (
+    BytesStorageMetadata,
+    TensorStorageMetadata,
+)
 
 from megatron.core.dist_checkpointing.core import (
     CheckpointingConfig,
     maybe_load_config,
     save_config,
 )
-from megatron.core.dist_checkpointing.strategies.common import load_common, save_common
+from megatron.core.dist_checkpointing.strategies.common import (
+    load_common,
+    save_common,
+)
+
 
 FORMAT_TORCH_DIST = 'torch_dist'
 FORMAT_FSDP_DTENSOR = 'fsdp_dtensor'
@@ -52,7 +59,11 @@ _PROBE_SUFFIXES = (
     'output_layer.weight',
 )
 # Keys that identify non-model state we drop during architecture conversion.
-_NON_MODEL_TOP_LEVEL_PREFIXES = ('optimizer.', 'rng_state', 'rerun_state_machine_state')
+_NON_MODEL_TOP_LEVEL_PREFIXES = (
+    'optimizer.',
+    'rng_state',
+    'rerun_state_machine_state',
+)
 
 
 def resolve_checkpoint_subdir(load_dir):
@@ -162,7 +173,9 @@ def load_dist_checkpoint_full(load_dir):
     ckpt_dir, iteration = resolve_checkpoint_subdir(load_dir)
     config = maybe_load_config(ckpt_dir)
     if config is None:
-        raise ValueError(f"{load_dir} is not a distributed checkpoint (no metadata.json)")
+        raise ValueError(
+            f"{load_dir} is not a distributed checkpoint (no metadata.json)"
+        )
     backend = config.sharded_backend
 
     reader = FileSystemReader(ckpt_dir)
@@ -176,10 +189,12 @@ def load_dist_checkpoint_full(load_dir):
             continue
         if model_prefix and not key.startswith(model_prefix):
             continue
-        bare_key = key[len(model_prefix) :] if model_prefix else key
+        bare_key = key[len(model_prefix):] if model_prefix else key
         if _is_non_model_key(bare_key):
             continue
-        raw_state_dict[key] = torch.empty(md.size, dtype=md.properties.dtype, device='cpu')
+        raw_state_dict[key] = torch.empty(
+            md.size, dtype=md.properties.dtype, device='cpu'
+        )
 
     if not raw_state_dict:
         raise ValueError(
@@ -191,7 +206,7 @@ def load_dist_checkpoint_full(load_dir):
 
     model_state_dict = OrderedDict()
     for key, tensor in raw_state_dict.items():
-        bare_key = key[len(model_prefix) :] if model_prefix else key
+        bare_key = key[len(model_prefix):] if model_prefix else key
         model_state_dict[bare_key] = tensor
 
     common_state = {}
@@ -204,7 +219,11 @@ def load_dist_checkpoint_full(load_dir):
 
 
 def save_dist_checkpoint_full(
-    model_state_dict, common_state, save_dir, model_prefix='model.', backend=FORMAT_TORCH_DIST
+    model_state_dict,
+    common_state,
+    save_dir,
+    model_prefix='model.',
+    backend=FORMAT_TORCH_DIST,
 ):
     """Save a fully-gathered state dict as a distributed checkpoint.
 
@@ -221,12 +240,14 @@ def save_dist_checkpoint_full(
     raw_state_dict = OrderedDict()
     for bare_key, tensor in model_state_dict.items():
         full_key = f"{model_prefix}{bare_key}" if model_prefix else bare_key
-        raw_state_dict[full_key] = (
-            tensor.contiguous() if tensor.is_contiguous() else tensor.contiguous()
-        )
+        raw_state_dict[full_key] = tensor.contiguous()
 
     writer = FileSystemWriter(save_dir)
-    dcp.save(state_dict=raw_state_dict, storage_writer=writer, planner=DefaultSavePlanner())
+    dcp.save(
+        state_dict=raw_state_dict,
+        storage_writer=writer,
+        planner=DefaultSavePlanner(),
+    )
 
     if common_state:
         save_common(common_state, save_dir)

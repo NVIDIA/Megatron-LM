@@ -11,13 +11,6 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import (
-    ReplicaId,
-    ShardedStateDict,
-    ShardedTensorFactory,
-)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -43,7 +36,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
-from megatron.core.transformer.utils import cat_with_oom_fallback, is_layer_window_attention
+from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -69,10 +62,10 @@ except ImportError:
     rearrange = None
 
 try:
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
-    from flashattn_hopper.flash_attn_interface import _flash_attn_forward
 
     HAVE_FA3 = True
 except ImportError as e:
@@ -89,10 +82,22 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
+# not `flash_attn.__version__` (which reports the 2.x version) or
+# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
+# `is_fa_min_version` here.
+_MIN_FA4_VERSION = "4.0.0b20"
 try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _get_dist_version
 
-    HAVE_FA4 = True
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from packaging.version import Version as _Version
+
+    try:
+        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    except PackageNotFoundError:
+        HAVE_FA4 = False
 except ImportError:
     HAVE_FA4 = False
 
@@ -298,7 +303,6 @@ class Attention(MegatronModule, ABC):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
-        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -310,11 +314,11 @@ class Attention(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
         self._pp_layer_offset = pp_layer_offset
-        self.is_mtp_layer = is_mtp_layer
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+        self.flash_attention_version = config.flash_attention_version
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
         # which is a pure function of the config and is reused on every forward
@@ -330,9 +334,7 @@ class Attention(MegatronModule, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'tp_cp']
-            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         else:
             assert hasattr(
                 pg_collection, 'tp'
@@ -369,7 +371,6 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
-        # TODO: This is built twice when using MLA, should be refactored.
         if self.config.num_query_groups < world_size:
             # TE throws an assertion error if num_kv_heads / num_query_groups
             # is not divisible by TP size.
@@ -420,6 +421,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_proj") if name is not None else None,
         )
 
@@ -440,72 +442,6 @@ class Attention(MegatronModule, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
-
-        # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
-        self.rotary_pos_emb = None
-        if getattr(self.config, 'rotary_base_per_layer', None):
-            rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
-            self._build_per_layer_rotary_pos_emb(rotary_base)
-
-    def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
-        """Build self.rotary_pos_emb using a layer-specific rotary base."""
-        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-
-        seq_len_interpolation_factor = self.config.rotary_scaling_factor
-        if self.config.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            self.rotary_pos_emb = RotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=self.config.rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                rope_scaling=self.config.rope_scaling,
-                rope_scaling_factor=self.config.rope_scaling_factor,
-                use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
-            )
-        elif self.config.position_embedding_type == 'yarn':
-            self.rotary_pos_emb = YarnRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=self.config.rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
-                original_max_position_embeddings=getattr(
-                    self.config, "yarn_original_max_position_embeddings"
-                ),
-                beta_fast=getattr(self.config, "yarn_beta_fast"),
-                beta_slow=getattr(self.config, "yarn_beta_slow"),
-                mscale=getattr(self.config, "yarn_mscale"),
-                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
-                correction_range_round_to_int=getattr(
-                    self.config, "yarn_correction_range_round_to_int"
-                ),
-                use_cpu_initialization=self.config.use_cpu_initialization,
-            )
-        elif (
-            self.config.position_embedding_type == 'mrope'
-            and not self.config.multi_latent_attention
-        ):
-            self.rotary_pos_emb = MultimodalRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=self.config.rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                interleaved_mrope=self.config.mrope_interleaved,
-            )
-            self.mrope_section = self.config.mrope_section
-            assert (
-                self.mrope_section is not None
-            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
-        else:
-            raise NotImplementedError(
-                f"rotary_base_per_layer does not support "
-                f"position_embedding_type={self.config.position_embedding_type!r} "
-                f"(only 'rope' / 'yarn' / 'mrope' are supported)."
-            )
 
     def _checkpointed_attention_forward(
         self,
@@ -808,18 +744,15 @@ class Attention(MegatronModule, ABC):
         hidden_states: Tensor,
         key_value_states: Tensor | None,
         output_gate: bool = False,
-        head_wise_gate: bool = False,
         split_qkv: bool = True,
     ) -> (
-        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
-        | tuple[Tensor, Tensor, Tensor, Tensor]
+        tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
         | tuple[Tensor, list[int]]
     ):
         """
         This method needs to be implemented based on whether the derived class
-        is "self-attn" or "cross-attn". When ``output_gate=True`` / ``head_wise_gate=True``
-        the corresponding gate tensor is appended as a trailing tuple element.
+        is "self-attn" or "cross-attn".
         """
 
     def flash_decode(
@@ -1064,6 +997,29 @@ class Attention(MegatronModule, ABC):
         )
         return output_total, softmax_lse
 
+    def _resolve_flash_version(self) -> Tuple[bool, bool]:
+        """Resolve which FlashAttention generation this attention should run.
+
+        Honors ``config.flash_attention_version`` when pinned, otherwise falls back
+        to the auto preference order (FA4 > FA3 > FA2). Returns ``(use_fa4, use_fa3)``;
+        when both are False the FA2 kernel is used.
+        """
+        pinned = self.flash_attention_version
+        if pinned == 4:
+            assert (
+                HAVE_FA4
+            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            return True, False
+        if pinned == 3:
+            assert (
+                HAVE_FA3
+            ), "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            return False, True
+        if pinned == 2:
+            return False, False
+        # Auto: prefer the newest available generation.
+        return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -1122,6 +1078,8 @@ class Attention(MegatronModule, ABC):
         # the sink (off-by-one / learnable) softmax correction post-hoc.
         need_lse = softmax_offset is not None
 
+        use_fa4, use_fa3 = self._resolve_flash_version()
+
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
@@ -1129,7 +1087,7 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA4:
+            if use_fa4:
                 output_total, softmax_lse = flash_attn4_varlen_func(
                     q,
                     k,
@@ -1142,9 +1100,9 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=1,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                 )
-            elif HAVE_FA3:
+            elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 fa3_ret = self._flash_attention_3_forward_wrapper(
@@ -1245,7 +1203,7 @@ class Attention(MegatronModule, ABC):
                         output_total, softmax_lse, softmax_offset
                     )
             else:
-                if HAVE_FA4:
+                if use_fa4:
                     if getattr(self, "softmax_scale", None) is not None:
                         softmax_scale = self.softmax_scale
                     else:
@@ -1264,7 +1222,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=1,
+                        num_splits=0 if not self.batch_invariant_mode else 1,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
@@ -1288,12 +1246,12 @@ class Attention(MegatronModule, ABC):
                         "softmax_scale": softmax_scale,
                         "causal": True,
                         "window_size": window_size,
-                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "page_table" if use_fa3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
                     if need_lse:
                         flash_attn_args["return_softmax_lse"] = True
-                    if HAVE_FA3:
+                    if use_fa3:
                         kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
                     else:
                         assert (
@@ -1358,26 +1316,6 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
-
-        # here we need to set the right cp group for dynamic-cp
-        _orig_cp_group = self.pg_collection.cp
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
-        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
-            hidden_states=hidden_states,
-            key_value_states=key_value_states,
-            packed_seq_params=packed_seq_params,
-            cp_group=self.pg_collection.cp,
-            tp_group=self.pg_collection.tp,
-            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
-            target_partition_mode="zigzag",
-            sequence_parallel=self.config.sequence_parallel,
-            config=self.config,
-            attention_mask=attention_mask,
-            attention_bias=attention_bias,
-        )
-
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -1385,11 +1323,6 @@ class Attention(MegatronModule, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
-
-        # Per-layer theta: override the model-level RoPE with this layer's own embedding.
-        if self.rotary_pos_emb is not None and rotary_pos_emb is not None:
-            seq_len = rotary_pos_emb.shape[0]
-            rotary_pos_emb = self.rotary_pos_emb(seq_len)
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -1443,19 +1376,12 @@ class Attention(MegatronModule, ABC):
                 self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
             ]
         )
-        output_gate = self.config.attention_output_gate
-        # head_wise_attn_gate is self-attention only (gate rows live in linear_qkv).
-        head_wise_gate_enabled = self.config.head_wise_attn_gate and self.attention_type != "cross"
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
             assert not (
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
-        if output_gate:
-            assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
-        if head_wise_gate_enabled:
-            assert split_qkv, "head_wise_attn_gate is not supported for unsplit mixed_qkv tensor."
 
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
@@ -1463,23 +1389,16 @@ class Attention(MegatronModule, ABC):
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
-                output_gate=output_gate,
-                head_wise_gate=head_wise_gate_enabled,
+                output_gate=self.config.attention_output_gate,
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
-        head_wise_gate = None
         if split_qkv:
-            # qkv_output is (query, key, value, [output_gate], [head_wise_gate]).
-            if output_gate and head_wise_gate_enabled:
-                query, key, value, gate, head_wise_gate = qkv_output
-            elif output_gate:
+            if self.config.attention_output_gate:
                 query, key, value, gate = qkv_output
-            elif head_wise_gate_enabled:
-                query, key, value, head_wise_gate = qkv_output
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
@@ -1523,11 +1442,6 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = apply_module(self.linear_proj)(context_layer)
-            if back_to_input_converter is not None:
-                output = back_to_input_converter.convert(
-                    output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
-                )
-            self.pg_collection.cp = _orig_cp_group
             return output, bias
 
         if (
@@ -1578,9 +1492,14 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
                 rope_max_seqlen_q = packed_seq_params.max_seqlen_q
                 rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+                rope_freqs_max_seqlen = (
+                    max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                    if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                    else None
+                )
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
-                rope_max_seqlen_q = rope_max_seqlen_kv = None
+                rope_freqs_max_seqlen = None
 
             if split_qkv:
                 if q_pos_emb is not None:
@@ -1593,7 +1512,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
-                            max_seqlen=rope_max_seqlen_q,
+                            max_seqlen=rope_freqs_max_seqlen,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1612,7 +1531,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
-                        max_seqlen=rope_max_seqlen_kv,
+                        max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
@@ -1694,17 +1613,7 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        if head_wise_gate is not None:
-            nvtx_range_push(suffix="head_wise_attn_gate")
-            gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
-            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)
-            core_attn_out = core_attn_out * torch.sigmoid(gate_states.float()).to(
-                core_attn_out.dtype
-            )
-            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)
-            nvtx_range_pop(suffix="head_wise_attn_gate")
-
-        # Output gate (attention_output_gate: full head_dim gate fused into QKV)
+        # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
@@ -1720,12 +1629,6 @@ class Attention(MegatronModule, ABC):
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
-        if back_to_input_converter is not None:
-            output = back_to_input_converter.convert(
-                output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
-            )
-
-        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
     @jit_fuser
@@ -1765,7 +1668,6 @@ class SelfAttention(Attention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
-        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -1781,26 +1683,12 @@ class SelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
-            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
-        if self.config.head_wise_attn_gate:
-            # Defensive runtime guards against config-validation bypass; same
-            # invariants enforced earlier in TransformerConfig.__post_init__.
-            tp_world_size = get_pg_size(self.pg_collection.tp)
-            assert self.config.num_query_groups >= tp_world_size, (
-                f"head_wise_attn_gate requires num_query_groups "
-                f"({self.config.num_query_groups}) >= tp world_size ({tp_world_size})"
-            )
-            assert self.config.num_attention_heads % tp_world_size == 0, (
-                f"head_wise_attn_gate requires num_attention_heads "
-                f"({self.config.num_attention_heads}) % tp world_size ({tp_world_size}) == 0"
-            )
-            self.linear_qkv_out_dim += self.config.num_attention_heads
         self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.linear_qkv_out_dim,
@@ -1812,6 +1700,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
 
@@ -1937,44 +1826,20 @@ class SelfAttention(Attention):
         hidden_states: Tensor,
         key_value_states: Tensor | None = None,
         output_gate: bool = False,
-        head_wise_gate: bool = False,
         split_qkv: bool = True,
     ) -> (
-        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
-        | tuple[Tensor, Tensor, Tensor, Tensor]
+        tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
         | tuple[Tensor, list[int]]
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
-        If `output_gate` is True, also returns a per-head head_dim gate.
-        If `head_wise_gate` is True, also returns a per-head scalar gate.
-        If `split_qkv=False`, returns the unsplit mixed_qkv tensor.
+        If `output_gate` is True, then also derives `gate` tensor.
+        If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
         """
-        if head_wise_gate:
-            assert split_qkv and self.config.head_wise_attn_gate
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
-
-        # Peel the trailing per-rank gate scalars before any reshape / AG.
-        # Correct only because (a) ColumnParallelLinear splits axis 0
-        # contiguously, (b) num_attention_heads % tp == 0, (c) global layout
-        # is [QKV; Gate] (preserved across dist-ckpt by
-        # apply_head_wise_attn_gate_sharded_factory). (a)+(b) checked at
-        # config / init time.
-        head_wise_gate_states = None
-        if head_wise_gate:
-            gate_size = self.num_attention_heads_per_partition
-            mixed_qkv, head_wise_gate_states = torch.split(
-                mixed_qkv, [mixed_qkv.size(-1) - gate_size, gate_size], dim=-1
-            )
-            # torch.split on the last dim leaves non-contiguous views: the
-            # outer-dim stride still spans the original (QKV+gate) width, so
-            # downstream key.view(sk, b*np, hn) in dot_product_attention would
-            # fail with "view size is not compatible with input tensor's size
-            # and stride." Materialize a contiguous QKV slab here.
-            mixed_qkv = mixed_qkv.contiguous()
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -2084,12 +1949,7 @@ class SelfAttention(Attention):
                     self.world_size // self.config.num_query_groups
                 )
                 gate = gate[:, :, idx * size : (idx + 1) * size, :]
-            if head_wise_gate:
-                return query, key, value, gate, head_wise_gate_states
             return query, key, value, gate
-
-        if head_wise_gate:
-            return query, key, value, head_wise_gate_states
 
         return query, key, value
 
@@ -2209,83 +2069,6 @@ class SelfAttention(Attention):
 
         return weight_updated
 
-    def sharded_state_dict(
-        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
-    ) -> ShardedStateDict:
-        """Wrap linear_qkv.{weight,bias} with a factory that reshards QKV and
-        gate sub-blocks independently, analogous to apply_swiglu_sharded_factory."""
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        if self.config.head_wise_attn_gate:
-            qkv_size = self.query_projection_size + 2 * self.kv_projection_size
-            gate_size = self.config.num_attention_heads
-            for sub_name in ("weight", "bias"):
-                key = f"{prefix}linear_qkv.{sub_name}"
-                if key in sharded_state_dict:
-                    sharded_state_dict[key] = apply_head_wise_attn_gate_sharded_factory(
-                        sharded_state_dict[key], sharded_offsets, qkv_size, gate_size
-                    )
-        return sharded_state_dict
-
-
-# pylint: disable=missing-function-docstring
-def apply_head_wise_attn_gate_sharded_factory(
-    original_sh_ten, sharded_offsets, qkv_size: int, gate_size: int
-):
-    """Split linear_qkv.{weight,bias} into QKV and gate sub-tensors with
-    distinct keys so each is resharded independently along axis 0 across TP.
-    Default {"weight": 0} sharding would otherwise re-balance the QKV/gate
-    boundary on TP change and turn V/K rows into gate rows (silent miscompute).
-    Same pattern as apply_swiglu_sharded_factory, but with unequal sub-block
-    sizes (QKV >> gate)."""
-    shard_axis = 0
-    prepend_axis_num = len(sharded_offsets)
-    local_axis_size = original_sh_ten.local_shape[shard_axis]
-    axis_frag = original_sh_ten.axis_fragmentations[shard_axis + prepend_axis_num]
-
-    qkv_local_size, qkv_rem = divmod(qkv_size, axis_frag)
-    gate_local_size, gate_rem = divmod(gate_size, axis_frag)
-    assert qkv_rem == 0 and gate_rem == 0, (
-        f"head_wise_attn_gate dist-ckpt requires QKV ({qkv_size}) and gate "
-        f"({gate_size}) divisible by TP world_size ({axis_frag})."
-    )
-    assert local_axis_size == qkv_local_size + gate_local_size
-    rank_offset = original_sh_ten.global_offset[shard_axis + prepend_axis_num] // local_axis_size
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        tensor_qkv, tensor_gate = torch.split(t, [qkv_local_size, gate_local_size], dim=shard_axis)
-        offset_qkv = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
-        offset_gate = (shard_axis + prepend_axis_num, rank_offset, axis_frag)
-        return [
-            ShardedTensor.from_rank_offsets(
-                f"{key}._qkv",
-                tensor_qkv,
-                *sharded_offsets,
-                offset_qkv,
-                replica_id=replica_id,
-                prepend_axis_num=prepend_axis_num,
-            ),
-            ShardedTensor.from_rank_offsets(
-                f"{key}._gate",
-                tensor_gate,
-                *sharded_offsets,
-                offset_gate,
-                replica_id=replica_id,
-                prepend_axis_num=prepend_axis_num,
-            ),
-        ]
-
-    return ShardedTensorFactory(
-        original_sh_ten.key,
-        original_sh_ten.data,
-        sh_ten_build_fn,
-        cat_with_oom_fallback,
-        original_sh_ten.replica_id,
-        flattened_range=original_sh_ten.flattened_range,
-    )
-
 
 class CrossAttention(Attention):
     """Cross-attention layer class
@@ -2302,7 +2085,6 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
-        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         """
@@ -2317,7 +2099,6 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
-            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
@@ -2354,16 +2135,12 @@ class CrossAttention(Attention):
         hidden_states: Tensor,
         key_value_states: Optional[Tensor],
         output_gate: bool = False,
-        head_wise_gate: bool = False,
         split_qkv: bool = True,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
         """
-        assert not output_gate, "Output gate is not supported in cross attention for now."
-        assert not head_wise_gate, "head_wise_attn_gate is self-attention only."
-
         assert split_qkv, "split_qkv must be True for CrossAttention"
         assert not output_gate, "Output gate is not supported in cross attention for now."
 
