@@ -88,8 +88,10 @@ def fully_shard_model(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_buffer_count: int = 2,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    fsdp_ubr_registration_scope: str = 'all',
     enable_fine_grained_param_gather: bool = False,
     prefetch_recompute_forward_weights: bool = False,
     cache_param_bucket_views: bool = False,
@@ -238,6 +240,10 @@ def fully_shard_model(
         fsdp_double_buffer (bool):
             Whether to use double buffer for FSDP. Defaults to False.
 
+        fsdp_buffer_count (int):
+            Number of persistent buffers allocated for each FSDP communication pool.
+            Defaults to two.
+
         fsdp_db_use_persist_buf_on_alloc_fail (bool):
             Whether to fall back to persistent buffer allocator when a bucket does not
             fit FSDP double buffer size.
@@ -246,6 +252,11 @@ def fully_shard_model(
             Whether to disable symmetric (window) registration for NCCL UB registration.
             This option forces conventional (local) UB registration when nccl_ub is set.
             Defaults to False.
+
+        fsdp_ubr_registration_scope (str):
+            FSDP communicator scope for NCCL user-buffer registration. ``all`` preserves
+            the default behavior; ``dense_inner`` registers only dense inner-FSDP
+            parameter all-gathers. Defaults to ``all``.
 
         enable_fine_grained_param_gather (bool):
             Whether to enable "fine-grained" param all-gather, which can improve performance
@@ -386,8 +397,10 @@ def fully_shard_model(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+        fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        fsdp_ubr_registration_scope=fsdp_ubr_registration_scope,
         megatron_fsdp_prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         megatron_fsdp_cache_param_bucket_views=cache_param_bucket_views,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
@@ -695,8 +708,10 @@ def fully_shard(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_buffer_count: int = 2,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    fsdp_ubr_registration_scope: str = 'all',
     enable_fine_grained_param_gather: bool = False,
     prefetch_recompute_forward_weights: bool = False,
     cache_param_bucket_views: bool = False,
@@ -750,8 +765,10 @@ def fully_shard(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
+        fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        fsdp_ubr_registration_scope=fsdp_ubr_registration_scope,
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,
         prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         cache_param_bucket_views=cache_param_bucket_views,

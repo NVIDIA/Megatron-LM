@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -1256,14 +1256,30 @@ def validate_args(args, defaults={}):
                 "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
                 'with --data-parallel-sharding-strategy optim_grads_params.'
             )
-            assert args.recompute_granularity == "full", (
-                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
-                "with full activation recomputation."
-            )
-            assert not args.overlap_moe_expert_parallel_comm, (
-                "--megatron-fsdp-prefetch-recompute-forward-weights is not supported "
-                "with --overlap-moe-expert-parallel-comm."
-            )
+            if args.recompute_granularity == "full":
+                assert not args.overlap_moe_expert_parallel_comm, (
+                    "--megatron-fsdp-prefetch-recompute-forward-weights with full "
+                    "activation recomputation is not supported with "
+                    "--overlap-moe-expert-parallel-comm."
+                )
+            else:
+                assert args.recompute_granularity == "selective", (
+                    "--megatron-fsdp-prefetch-recompute-forward-weights requires "
+                    "full activation recomputation, or selective recomputation of "
+                    "mla_up_proj."
+                )
+                assert "mla_up_proj" in (args.recompute_modules or []), (
+                    "Selective --megatron-fsdp-prefetch-recompute-forward-weights "
+                    "requires mla_up_proj in --recompute-modules."
+                )
+                assert (
+                    args.cuda_graph_impl != "full_iteration"
+                    or args.overlap_moe_expert_parallel_comm
+                ), (
+                    "Selective --megatron-fsdp-prefetch-recompute-forward-weights with "
+                    "full-iteration CUDA graphs requires "
+                    "--overlap-moe-expert-parallel-comm."
+                )
 
         if args.nccl_ub:
             # In Megatron-LM, required implementation for manual registration is already provided.
@@ -4220,6 +4236,15 @@ def _add_distributed_args(parser):
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
     )
     group.add_argument(
+        '--fsdp-ubr-registration-scope',
+        type=str,
+        choices=['all', 'dense_inner'],
+        default='all',
+        help='Select FSDP communicators registered with the NCCL memory pool. '
+        '"all" preserves the default behavior; "dense_inner" registers only the '
+        'dense inner-FSDP parameter all-gather communicator.',
+    )
+    group.add_argument(
         '--fsdp-manual-registration',
         action='store_true',
         dest='fsdp_manual_registration',
@@ -4264,6 +4289,14 @@ def _add_distributed_args(parser):
         "Double-buffering the communication memory improves memory management efficiency by "
         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers in each Megatron FSDP communication pool. "
+        "The default of two provides conventional double buffering; combined 1F1B "
+        "overlap with forward prefetch requires at least three.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',

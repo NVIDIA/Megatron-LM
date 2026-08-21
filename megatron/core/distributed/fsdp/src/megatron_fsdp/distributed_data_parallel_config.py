@@ -83,6 +83,13 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_buffer_count: int = 2
+    """Number of persistent buffers allocated for each Megatron FSDP communication pool.
+      The default of two preserves the conventional double-buffer behavior. Combined 1F1B
+      overlap may require three buffers because a backward/recompute unit, the current
+      forward unit, and its forward-prefetched successor can be live concurrently.
+    """
+
     fsdp_all_gather_in_start_param_sync: bool = True
     """
     If True, use all-gather during the initial Megatron-FSDP parameter
@@ -112,6 +119,14 @@ class DistributedDataParallelConfig:
     """If true, disable symmetric (window) registration for NCCL userbuffer registration.
       This option will force to use conventional (local) userbuffer registration 
       when nccl_ub is set.
+    """
+
+    fsdp_ubr_registration_scope: str = 'all'
+    """Communicator scope for FSDP NCCL user-buffer registration.
+
+    ``all`` registers every supported FSDP communicator. ``dense_inner`` registers
+    only dense inner-FSDP parameter all-gathers, leaving expert and outer-DP
+    collectives on ordinary NCCL kernels.
     """
 
     fsdp_manual_registration: bool = False
@@ -157,7 +172,9 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_prefetch_recompute_forward_weights: bool = False
     """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
-      recomputation during backward before prefetching backward transpose weights.
+      recomputation during backward. Full-layer recomputation prefetches them from
+      the unit pre-backward hook; selective ``mla_up_proj`` recomputation prefetches
+      only the marked up-projection modules.
     """
 
     megatron_fsdp_cache_param_bucket_views: bool = False
@@ -200,6 +217,11 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.fsdp_ubr_registration_scope not in ("all", "dense_inner"):
+            raise ValueError(
+                "fsdp_ubr_registration_scope must be one of: all, dense_inner; "
+                f"got {self.fsdp_ubr_registration_scope!r}."
+            )
         if self.megatron_fsdp_prefetch_recompute_forward_weights:
             assert self.data_parallel_sharding_strategy == "optim_grads_params", (
                 "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "
@@ -216,3 +238,4 @@ class DistributedDataParallelConfig:
         if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
             self.fsdp_double_buffer = True
+        assert self.fsdp_buffer_count >= 2, "fsdp_buffer_count must be at least 2."
