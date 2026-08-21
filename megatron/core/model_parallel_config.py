@@ -579,3 +579,18 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
+
+        if self.sequence_packing_scheduler is not None:
+            supported_schedulers = ['dp_balanced']
+            if self.sequence_packing_scheduler not in supported_schedulers:
+                raise ValueError(
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be set when sequence_packing_scheduler "
+                    "is not None."
+                )
+            # Needed for passing variable sequences between pp stages.
+            self.variable_seq_lengths = True

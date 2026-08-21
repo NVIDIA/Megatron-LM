@@ -2894,6 +2894,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_dropout == 0.0
             ), "Batch invariant mode does not support attention dropout"
 
+        # Scheduler-value, max-seqlen, and variable_seq_lengths handling live in
+        # ModelParallelConfig.__post_init__ next to the field definitions; only the
+        # transformer-stack requirements are validated here.
         if self.sequence_packing_scheduler is not None:
             # Check TE version.
             if not HAVE_PACKAGING:
@@ -2909,24 +2912,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
                 )
 
-            # Needed for passing variable sequences between pp stages.
-            self.variable_seq_lengths = True
-
             # TODO(tailaim): add support for other dispatcher types
             assert self.moe_token_dispatcher_type == "alltoall", (
                 f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
                 f"got '{self.moe_token_dispatcher_type}'"
             )
-
-            supported_schedulers = ['dp_balanced']
-            if (
-                self.sequence_packing_scheduler is not None
-                and self.sequence_packing_scheduler not in supported_schedulers
-            ):
-                raise ValueError(
-                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
-                    f"Available schedulers: {supported_schedulers}"
-                )
 
 
 @dataclass

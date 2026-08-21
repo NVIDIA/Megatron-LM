@@ -1602,18 +1602,18 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
-    # Packed-sequence buffer-size check. Placed after varlen scheduler
-    # auto-select so it validates the final resolved scheduler.
+    # Scheduler-name and max-seqlen validation live in
+    # ModelParallelConfig.__post_init__; only the buffer-size check stays here
+    # because seq_length is not a core config field. The None case for
+    # max_seqlen_per_dp_cp_rank is rejected by the config check.
     if args.sequence_packing_scheduler is not None:
         args.variable_seq_lengths = True
-        assert args.max_seqlen_per_dp_cp_rank is not None, (
-            "--max-seqlen-per-dp-cp-rank must be set when using sequence packing"
-        )
-        total_cp_ranks = args.context_parallel_size
-        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
-            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= single sequence max length ({args.seq_length})'
-        )
+        if args.max_seqlen_per_dp_cp_rank is not None:
+            total_cp_ranks = args.context_parallel_size
+            assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+                f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+                f'must be >= single sequence max length ({args.seq_length})'
+            )
 
     # Data blend checks
     assert args.mock_data + \
