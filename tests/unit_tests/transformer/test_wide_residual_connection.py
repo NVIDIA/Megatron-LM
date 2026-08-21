@@ -286,7 +286,6 @@ def test_wide_residual_config_rejects_negative_map_init_scale():
     ("override", "expected_error"),
     [
         ({"enable_mhc_connections": True}, "mutually exclusive"),
-        ({"mtp_num_layers": 1}, "Multi-Token Prediction"),
         ({"inference_fuse_tp_communication": True}, "fuse_tp_communication"),
         ({"heterogeneous_block_specs": True}, "heterogeneous_block_specs"),
         ({"overlap_moe_expert_parallel_comm": True}, "overlap_moe_expert_parallel_comm"),
@@ -311,6 +310,18 @@ def test_transformer_config_accepts_fp32_wide_residual_stream():
 
     assert config.fp32_residual_connection
     assert config.pipeline_dtype == torch.float32
+
+
+def test_transformer_config_accepts_mtp_with_wide_residual_replay():
+    config = _wide_config(
+        mtp_num_layers=2,
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+
+    assert config.mtp_num_layers == 2
+    assert config.residual_stream_recompute_num_layers == 1
 
 
 class TestStreamwiseSigmoidWideResidualConnection:
