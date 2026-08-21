@@ -15,7 +15,14 @@ logger = logging.getLogger(__name__)
 
 _TransferOpT = TypeVar("_TransferOpT", SendOp, RecvOp)
 
+# nccl-extensions' public M2N header requires NCCL 2.30.5 or newer.
+# _validate_nccl_version checks the loaded libnccl before M2N is initialized.
 _MINIMUM_NCCL_VERSION = (2, 30, 5)
+
+# _operation_layout uses these constants for a deterministic, FNV-inspired
+# fingerprint of each peer's ordered operations. The mask keeps the result in
+# the non-negative torch.int64 range used by _exchange_pair_layouts; the offset
+# is the initial seed, and the prime mixes each operation field and dtype byte.
 _DIGEST_MASK = (1 << 63) - 1
 _DIGEST_OFFSET = 1469598103934665603
 _DIGEST_PRIME = 1099511628211
@@ -90,7 +97,12 @@ def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _operation_layout(ops: list[_TransferOpT]) -> tuple[int, int, int]:
-    """Summarize an ordered peer transfer for cross-rank validation."""
+    """Return the byte count, op count, and digest for one peer's ordered operations.
+
+    ``_exchange_pair_layouts`` gathers this tuple from every rank, then
+    ``_validate_pair_layouts`` compares each sender with its receiver before
+    any payload is submitted to M2N.
+    """
     if not ops:
         return 0, 0, 0
 
