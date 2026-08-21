@@ -941,6 +941,10 @@ class TestTECudaGraphHelper:
             moe_token_dispatcher_type="alltoall",
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=[CudaGraphModule.attn],
+            # The aliasing check only runs for the direct-write arena, which is
+            # opt-in: without the switch this shape captures the whole attention
+            # range and has no arena slot to alias.
+            mhc_recompute_attn_cuda_graph_split=True,
             bf16=True,
         )
         helper = object.__new__(TECudaGraphHelper)
@@ -1644,6 +1648,64 @@ class TestPartialCudaGraph:
                 f"mHC loss mismatch with cuda_graph_modules={cuda_graph_modules}, ep_size={ep_size}. "
                 f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
             )
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_mhc_recompute_whole_attention_cudagraph(self):
+        """mHC selective recompute under whole-attention capture matches eager.
+
+        With mhc_recompute_attn_cuda_graph_split off (the default), an attn-scope
+        graph captures the whole attention range and the replay's non-split tail
+        runs the MLP-side mHC group eagerly: mlp_hyper_connection registers its
+        checkpoints against the manager __call__ stashed on the layer, the block
+        discards at group end, and the unified hook replays them in backward. A
+        graphed run must therefore reproduce the eager loss curve bit for bit --
+        this is the executing coverage for that tail, with a live manager rather
+        than a mocked boundary.
+        """
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            context_parallel_size=self.cp_size,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=self.tp_size,
+            expert_model_parallel_size=1,
+        )
+
+        extra_kwargs = {
+            "enable_hyper_connections": True,
+            "num_residual_streams": 4,
+            "mtp_num_layers": None,  # mHC is incompatible with MTP
+            "recompute_granularity": "selective",
+            "recompute_modules": ["mhc"],
+            "mhc_recompute_layer_num": 2,
+        }
+
+        loss_list_ref = self._run_test_helper(1, "none", None, 0, **extra_kwargs)
+        loss_list = self._run_test_helper(
+            1, "transformer_engine", [CudaGraphModule.attn], 3, **extra_kwargs
+        )
+        assert torch.equal(loss_list, loss_list_ref), (
+            "mHC recompute under whole-attention capture diverged from eager. "
+            f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
+        )
+        # Loss parity alone is blind to an inert manager (an empty recompute
+        # group discards and replays nothing, bit-identically), so pin the
+        # layer-side threading directly: the graphed replay tail must have
+        # created the pre-MLP checkpoint against a live manager.
+        layers = self.cuda_graph_helper.flattened_callables
+        assert any(
+            getattr(layer, "pre_mlp_norm_checkpoint", None) is not None for layer in layers
+        ), (
+            "no layer created pre_mlp_norm_checkpoint during graphed replay: the "
+            "whole-attention tail is not threading the recompute manager"
+        )
 
         Utils.destroy_model_parallel()
 
