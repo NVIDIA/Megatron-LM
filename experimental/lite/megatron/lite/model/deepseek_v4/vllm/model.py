@@ -55,7 +55,7 @@ from megatron.lite.primitive.parallel.mhc import (
     fold_mhc_hidden_for_pipeline,
     unfold_mhc_hidden_from_pipeline,
 )
-from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
 )

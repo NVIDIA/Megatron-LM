@@ -1,4 +1,4 @@
-"""Thin BF16-master adapters over vLLM's block-FP8 deployment path."""
+"""DeepSeek-V4 BF16-master adapters over vLLM's block-FP8 deployment path."""
 
 from __future__ import annotations
 

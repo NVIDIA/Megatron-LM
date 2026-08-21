@@ -38,11 +38,11 @@ from megatron.lite.model.deepseek_v4.quantization import (
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.weights import ResyncFormat
-from megatron.lite.primitive.quantization.checkpoint_block_fp8 import (
+from megatron.lite.model.deepseek_v4.checkpoint_block_fp8 import (
     BLOCK_SHAPE,
     BlockFP8CheckpointDequantAdapter,
 )
-from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
     requantize_block_fp8_weight,
 )
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4

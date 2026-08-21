@@ -12,7 +12,7 @@ from megatron.lite.model.deepseek_v4.quantization import (
     is_release_unquantized_weight,
 )
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
-from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
     requantize_block_fp8_weight,
 )
 from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4

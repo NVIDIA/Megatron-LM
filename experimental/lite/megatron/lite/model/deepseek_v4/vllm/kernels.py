@@ -23,7 +23,7 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
 from vllm.utils.deep_gemm import fp8_gemm_nt
 from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
-from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
     quantize_block_fp8_weight,
 )
 

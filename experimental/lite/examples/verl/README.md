@@ -32,9 +32,11 @@ missing or incompatible.
 MODEL_PATH=/models/DeepSeek-V4-Flash-4L \
 TRAIN_FILES=/data/dapo-train.parquet \
 VAL_FILES=/data/dapo-val.parquet \
-VLLM_BATCH_INVARIANT_KERNEL_LIB=/opt/batch-invariant-kernel/_vllm_batch_invariant_C.so \
 bash experimental/lite/examples/verl/scripts/run_deepseek_v4_4layer_alignment.sh
 ```
+
+The release image installs the batch-invariant extension in the vLLM package;
+`VLLM_BATCH_INVARIANT_KERNEL_LIB` is only an explicit development override.
 
 ## Prerequisites
 

@@ -7,7 +7,6 @@ import math
 import os
 import weakref
 from contextlib import nullcontext
-from enum import Enum
 from typing import Any
 
 import torch
@@ -25,33 +24,15 @@ from tensordict import TensorDict
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
+from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
+from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
 from verl_mlite import qat_export
-from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
-
-try:
-    # Recent VERL wraps per-step metric values in a Metric aggregator that
-    # reduce_metrics() knows how to fold; older VERL expects list-of-scalars.
-    from verl.utils.metric import Metric as _VerlMetric
-except Exception:  # pragma: no cover - older VERL without Metric
-    _VerlMetric = None
 
 from .config import MegatronLiteEngineConfig
-
-_patch_bucketed_weight_sender()
-
-BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
-    load_verl_engine_api()
-)
-
-try:
-    from verl.utils.dataset.dataset_utils import DatasetPadMode
-except ImportError:
-
-    class DatasetPadMode(Enum):
-        NO_PADDING = "no_padding"
 
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
@@ -807,13 +788,8 @@ class MegatronLiteEngine(BaseEngine):
         return {
             "model_output": {},
             "loss": losses,
-            # Pass Metric aggregators through unchanged (reduce_metrics folds them);
-            # list-wrap plain scalars as the legacy contract expects.
             "metrics": {
-                key: value
-                if isinstance(value, list)
-                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
-                else [value]
+                key: value if isinstance(value, list) else [value]
                 for key, value in metrics.items()
             },
         }

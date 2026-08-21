@@ -9,7 +9,7 @@ from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm import kernels as vllm_ds4
 from megatron.lite.model.deepseek_v4.vllm.kernels import o_projection_visible
-from megatron.lite.primitive.quantization import deployment_block_fp8
+from megatron.lite.model.deepseek_v4 import deployment_block_fp8
 
 
 def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) -> None:

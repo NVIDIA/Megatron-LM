@@ -19,7 +19,7 @@ from megatron.lite.model.deepseek_v4.vllm.grouped_moe import (
 )
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
 )
 

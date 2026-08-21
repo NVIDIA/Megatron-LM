@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from megatron.lite.primitive.quantization import deployment_block_fp8 as fp8
+from megatron.lite.model.deepseek_v4 import deployment_block_fp8 as fp8
 
 
 def _weight(device: str = "cpu") -> nn.Parameter:

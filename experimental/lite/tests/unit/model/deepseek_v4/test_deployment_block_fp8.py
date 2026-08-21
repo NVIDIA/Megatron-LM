@@ -11,12 +11,11 @@ import pytest
 import torch
 from torch import nn
 
-import megatron.lite.primitive.quantization.deployment_block_fp8 as deployment_fp8
-from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+import megatron.lite.model.deepseek_v4.deployment_block_fp8 as deployment_fp8
+from megatron.lite.model.deepseek_v4.deployment_block_fp8 import (
     BLOCK_SHAPE,
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
-    PackedBlockFP8Weight,
     fp8_gemm_nt,
     pack_block_fp8_activation,
     pack_block_fp8_weight,
@@ -329,4 +328,3 @@ def test_missing_deep_gemm_entry_fails_closed(fake_vllm, monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="fp8_gemm_nt is unavailable"):
         fp8_gemm_nt(torch.randn(2, 256, dtype=torch.bfloat16), packed)
-

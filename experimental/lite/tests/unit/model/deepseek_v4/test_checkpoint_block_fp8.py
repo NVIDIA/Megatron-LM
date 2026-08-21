@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from megatron.lite.primitive.quantization.checkpoint_block_fp8 import (
+from megatron.lite.model.deepseek_v4.checkpoint_block_fp8 import (
     BlockFP8CheckpointDequantAdapter,
 )
 

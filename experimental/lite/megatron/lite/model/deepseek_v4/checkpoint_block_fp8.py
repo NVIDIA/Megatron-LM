@@ -1,4 +1,4 @@
-"""Dequantize release block-FP8 tensors into BF16 master weights."""
+"""Dequantize DeepSeek-V4 release block-FP8 tensors into BF16 master weights."""
 
 from __future__ import annotations
 

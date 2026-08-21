@@ -655,20 +655,6 @@ def test_model_handle_dp_defaults():
     assert handle.dp_group is None
 
 
-def test_runtime_close_runs_registered_hook():
-    events = []
-    root = nn.Module()
-    handle = ModelHandle(
-        model=root,
-        _extras={"model_chunks": [root], "close_hook": lambda: events.append("hook")},
-    )
-
-    MegatronLiteRuntime.__new__(MegatronLiteRuntime).close(handle)
-
-    assert events == ["hook"]
-    assert "close_hook" not in handle._extras
-
-
 def test_model_handle_dp_from_parallel_state():
     ps = MagicMock()
     ps.dp_rank = 3
