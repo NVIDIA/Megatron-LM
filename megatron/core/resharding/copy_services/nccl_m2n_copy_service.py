@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 _TransferOpT = TypeVar("_TransferOpT", SendOp, RecvOp)
 
 _MINIMUM_NCCL_VERSION = (2, 30, 5)
+_DIGEST_MASK = (1 << 63) - 1
+_DIGEST_OFFSET = 1469598103934665603
+_DIGEST_PRIME = 1099511628211
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,51 @@ def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().reshape(-1).view(torch.uint8)
 
 
+def _operation_layout(ops: list[_TransferOpT]) -> tuple[int, int, int]:
+    """Summarize an ordered peer transfer for cross-rank validation."""
+    if not ops:
+        return 0, 0, 0
+
+    total_bytes = 0
+    digest = _DIGEST_OFFSET
+    for op in ops:
+        if op.task_id is None:
+            raise RuntimeError("NCCL M2N refit requires a task_id for every transfer")
+        size = _tensor_nbytes(op.tensor)
+        total_bytes += size
+        fields = (op.task_id, size, op.tensor.element_size())
+        for value in fields:
+            digest = ((digest ^ (int(value) & _DIGEST_MASK)) * _DIGEST_PRIME) & _DIGEST_MASK
+        for value in str(op.tensor.dtype).encode("ascii"):
+            digest = ((digest ^ value) * _DIGEST_PRIME) & _DIGEST_MASK
+        digest = ((digest ^ 0xFF) * _DIGEST_PRIME) & _DIGEST_MASK
+    return total_bytes, len(ops), digest
+
+
+def _validate_pair_layouts(topology: _M2NTopology, layouts: list[list[list[int]]]) -> int:
+    """Validate source/destination pair layouts and return the uniform slot size."""
+    slot_bytes = 0
+    for src_index, src_rank in enumerate(topology.src_ranks):
+        for dst_index, dst_rank in enumerate(topology.dst_ranks):
+            send_layout = tuple(layouts[src_rank][dst_index])
+            recv_layout = tuple(layouts[dst_rank][src_index])
+            if send_layout != recv_layout:
+                if send_layout[:2] == recv_layout[:2]:
+                    mismatch = "ordered task/dtype layouts differ"
+                else:
+                    mismatch = (
+                        f"source submitted {send_layout[0]} bytes across {send_layout[1]} "
+                        f"tensors, but destination expects {recv_layout[0]} bytes across "
+                        f"{recv_layout[1]} tensors"
+                    )
+                raise RuntimeError(
+                    "NCCL M2N transfer layout mismatch for source rank "
+                    f"{src_rank} and destination rank {dst_rank}: {mismatch}"
+                )
+            slot_bytes = max(slot_bytes, send_layout[0])
+    return slot_bytes
+
+
 def _validate_nccl_version(nccl: Any) -> None:
     """Ensure the loaded NCCL library supports the current M2N API."""
     try:
@@ -128,6 +176,7 @@ class NCCLM2NCopyService(CopyService):
     """
 
     requires_process_group_barrier = False
+    supports_idle_ranks = False
 
     def __init__(self, group=None):
         if not dist.is_initialized():
@@ -145,8 +194,6 @@ class NCCLM2NCopyService(CopyService):
         self._is_source: bool | None = None
         self._is_destination: bool | None = None
         self._topology: _M2NTopology | None = None
-        self._slot_bytes_tensor = torch.empty((), dtype=torch.int64, device=self._device)
-        self._buffer: torch.Tensor | None = None
         self._comm: Any | None = None
         self._closed = False
         self._poisoned = False
@@ -160,8 +207,8 @@ class NCCLM2NCopyService(CopyService):
         requested = (is_source, is_destination)
         if current != (None, None) and current != requested:
             raise RuntimeError(
-                "NCCL M2N model roles cannot change while reusing a copy service; "
-                "create a new service or clear the service cache before changing meshes"
+                "NCCL M2N model roles cannot change during the service lifetime; construct the "
+                "service for exactly one source mesh and one destination mesh"
             )
         self._is_source = is_source
         self._is_destination = is_destination
@@ -186,48 +233,35 @@ class NCCLM2NCopyService(CopyService):
         if not tensor.is_contiguous():
             raise RuntimeError(f"NCCL M2N refit {operation} tensors must be contiguous")
 
-    def _prepare_ops(self) -> tuple[dict[int, list[SendOp]], dict[int, list[RecvOp]], int]:
+    def _prepare_ops(self) -> tuple[dict[int, list[SendOp]], dict[int, list[RecvOp]]]:
         sends = _ordered_ops_by_peer(self.send_ops, is_send=True)
         recvs = _ordered_ops_by_peer(self.recv_ops, is_send=False)
-        pair_bytes = []
         for ops in sends.values():
             for op in ops:
                 self._validate_tensor(op.tensor, "send")
-            pair_bytes.append(sum(_tensor_nbytes(op.tensor) for op in ops))
         for ops in recvs.values():
             for op in ops:
                 self._validate_tensor(op.tensor, "receive")
-            pair_bytes.append(sum(_tensor_nbytes(op.tensor) for op in ops))
-        return sends, recvs, max(pair_bytes, default=0)
+        return sends, recvs
 
-    def _get_topology_and_slot_bytes(self, local_max_pair_bytes: int) -> tuple[_M2NTopology, int]:
+    def _get_topology(self) -> _M2NTopology:
         if self._is_source is None or self._is_destination is None:
             raise RuntimeError(
                 "NCCLM2NCopyService model roles were not configured; call set_model_roles() "
                 "or use swap_model_weights()"
             )
-        topology = self._topology
-        if topology is None:
+        if self._topology is None:
             # The source and destination meshes are fixed for the service lifetime.
-            state = torch.tensor(
-                [int(self._is_source), int(self._is_destination), local_max_pair_bytes],
+            roles = torch.tensor(
+                [int(self._is_source), int(self._is_destination)],
                 dtype=torch.int64,
                 device=self._device,
             )
-            gathered = [torch.empty_like(state) for _ in range(self.world_size)]
-            dist.all_gather(gathered, state, group=self.group)
-            host_states = [tuple(int(value) for value in item.cpu().tolist()) for item in gathered]
-            topology = _validate_role_roster(
-                [(bool(is_src), bool(is_dst)) for is_src, is_dst, _size in host_states]
-            )
-            self._topology = topology
-            slot_bytes = max(size for _is_src, _is_dst, size in host_states)
-        else:
-            # Payload sizes may vary, so only their scalar maximum remains per-run.
-            self._slot_bytes_tensor.fill_(local_max_pair_bytes)
-            dist.all_reduce(self._slot_bytes_tensor, op=dist.ReduceOp.MAX, group=self.group)
-            slot_bytes = int(self._slot_bytes_tensor.item())
-        return topology, slot_bytes
+            gathered = [torch.empty_like(roles) for _ in range(self.world_size)]
+            dist.all_gather(gathered, roles, group=self.group)
+            host_roles = [tuple(bool(value) for value in item.cpu().tolist()) for item in gathered]
+            self._topology = _validate_role_roster(host_roles)
+        return self._topology
 
     def _validate_peers(
         self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
@@ -245,6 +279,29 @@ class NCCLM2NCopyService(CopyService):
             if invalid:
                 raise RuntimeError(f"NCCL M2N receives name non-source ranks: {invalid}")
 
+    def _exchange_pair_layouts(
+        self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
+    ) -> int:
+        """Agree on every pair's ordered byte layout before submitting M2N work."""
+        peer_count = max(len(topology.src_ranks), len(topology.dst_ranks))
+        local_layouts = [[0, 0, 0] for _ in range(peer_count)]
+        if self.rank in topology.src_ranks:
+            peer_indices = {rank: index for index, rank in enumerate(topology.dst_ranks)}
+            local_ops = sends
+        else:
+            peer_indices = {rank: index for index, rank in enumerate(topology.src_ranks)}
+            local_ops = recvs
+        for peer, ops in local_ops.items():
+            local_layouts[peer_indices[peer]] = list(_operation_layout(ops))
+
+        local_tensor = torch.tensor(local_layouts, dtype=torch.int64, device=self._device)
+        gathered = torch.empty(
+            (self.world_size * peer_count, 3), dtype=torch.int64, device=self._device
+        )
+        dist.all_gather_into_tensor(gathered, local_tensor, group=self.group)
+        host_layouts = gathered.view(self.world_size, peer_count, 3).cpu().tolist()
+        return _validate_pair_layouts(topology, host_layouts)
+
     def _get_comm(self) -> Any:
         if self._comm is not None:
             return self._comm
@@ -261,53 +318,59 @@ class NCCLM2NCopyService(CopyService):
         )
         return self._comm
 
-    def _ensure_buffer(self, required_size: int) -> None:
-        if self._buffer is not None and self._buffer.numel() >= required_size:
-            return
-        self._buffer = torch.empty(required_size, dtype=torch.uint8, device=self._device)
-
     def _pack_sends(
-        self, topology: _M2NTopology, sends: dict[int, list[SendOp]], slot_bytes: int
+        self,
+        buffer: torch.Tensor,
+        topology: _M2NTopology,
+        sends: dict[int, list[SendOp]],
+        slot_bytes: int,
     ) -> None:
-        if self._buffer is None:
-            raise RuntimeError("NCCL M2N refit buffer is not allocated")
-        self._buffer[: len(topology.dst_ranks) * slot_bytes].zero_()
         dst_index = {rank: index for index, rank in enumerate(topology.dst_ranks)}
+        destinations = []
+        sources = []
+        for peer, ops in sends.items():
+            offset = dst_index[peer] * slot_bytes
+            for op in ops:
+                size = _tensor_nbytes(op.tensor)
+                destinations.append(buffer[offset : offset + size])
+                sources.append(_byte_view(op.tensor))
+                offset += size
         with torch.no_grad():
-            for peer, ops in sends.items():
-                offset = dst_index[peer] * slot_bytes
-                for op in ops:
-                    size = _tensor_nbytes(op.tensor)
-                    self._buffer[offset : offset + size].copy_(_byte_view(op.tensor))
-                    offset += size
+            if destinations:
+                torch._foreach_copy_(destinations, sources)
 
     def _unpack_recvs(
-        self, topology: _M2NTopology, recvs: dict[int, list[RecvOp]], slot_bytes: int
+        self,
+        buffer: torch.Tensor,
+        topology: _M2NTopology,
+        recvs: dict[int, list[RecvOp]],
+        slot_bytes: int,
     ) -> None:
-        if self._buffer is None:
-            raise RuntimeError("NCCL M2N refit buffer is not allocated")
         src_index = {rank: index for index, rank in enumerate(topology.src_ranks)}
+        destinations = []
+        sources = []
+        for peer, ops in recvs.items():
+            offset = src_index[peer] * slot_bytes
+            for op in ops:
+                size = _tensor_nbytes(op.tensor)
+                destinations.append(_byte_view(op.tensor))
+                sources.append(buffer[offset : offset + size])
+                offset += size
         with torch.no_grad():
-            for peer, ops in recvs.items():
-                offset = src_index[peer] * slot_bytes
-                for op in ops:
-                    size = _tensor_nbytes(op.tensor)
-                    _byte_view(op.tensor).copy_(self._buffer[offset : offset + size])
-                    offset += size
+            if destinations:
+                torch._foreach_copy_(destinations, sources)
 
     def _local_m2n_buffers(
-        self, topology: _M2NTopology, slot_bytes: int
+        self, buffer: torch.Tensor, topology: _M2NTopology, slot_bytes: int
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if self._buffer is None:
-            raise RuntimeError("NCCL M2N refit buffer is not allocated")
         src = None
         dst = None
         if self.rank in topology.src_ranks:
             src_size = len(topology.dst_ranks) * slot_bytes
-            src = self._buffer[:src_size].view(1, len(topology.dst_ranks), slot_bytes)
+            src = buffer[:src_size].view(1, len(topology.dst_ranks), slot_bytes)
         if self.rank in topology.dst_ranks:
             dst_size = len(topology.src_ranks) * slot_bytes
-            dst = self._buffer[:dst_size].view(len(topology.src_ranks), 1, slot_bytes)
+            dst = buffer[:dst_size].view(len(topology.src_ranks), 1, slot_bytes)
         return src, dst
 
     def run(self) -> None:
@@ -326,9 +389,10 @@ class NCCLM2NCopyService(CopyService):
             )
 
         try:
-            sends, recvs, local_max_pair_bytes = self._prepare_ops()
-            topology, slot_bytes = self._get_topology_and_slot_bytes(local_max_pair_bytes)
+            sends, recvs = self._prepare_ops()
+            topology = self._get_topology()
             self._validate_peers(topology, sends, recvs)
+            slot_bytes = self._exchange_pair_layouts(topology, sends, recvs)
             if slot_bytes == 0:
                 return
 
@@ -338,12 +402,11 @@ class NCCLM2NCopyService(CopyService):
                 if self.rank in topology.src_ranks
                 else len(topology.src_ranks)
             )
-            required_size = peer_count * slot_bytes
-            self._ensure_buffer(required_size)
+            buffer = torch.empty(peer_count * slot_bytes, dtype=torch.uint8, device=self._device)
             if self.rank in topology.src_ranks:
-                self._pack_sends(topology, sends, slot_bytes)
+                self._pack_sends(buffer, topology, sends, slot_bytes)
 
-            src, dst = self._local_m2n_buffers(topology, slot_bytes)
+            src, dst = self._local_m2n_buffers(buffer, topology, slot_bytes)
             stream = torch.cuda.current_stream(self._device)
             try:
                 src_count = len(topology.src_ranks)
@@ -369,24 +432,27 @@ class NCCLM2NCopyService(CopyService):
             finally:
                 # nccl.m2n enqueues work outside PyTorch's dispatcher. Teach
                 # the caching allocator that the staging tensor is in use.
-                if self._buffer is not None:
-                    self._buffer.record_stream(stream)
+                buffer.record_stream(stream)
 
             if self.rank in topology.dst_ranks:
-                self._unpack_recvs(topology, recvs, slot_bytes)
+                self._unpack_recvs(buffer, topology, recvs, slot_bytes)
         finally:
             self.send_ops.clear()
             self.recv_ops.clear()
 
     def close(self) -> None:
-        """Collectively drain work and release the official M2N runtime."""
+        """Wait for local work and release M2N resources; this is not collective."""
         if self._closed:
             return
-        torch.cuda.synchronize(self._device)
-        self._buffer = None
-        self._handle.destroy()
-        self._handle = None
-        if self._comm is not None:
-            self._comm.destroy()
-        self._comm = None
         self._closed = True
+        handle, self._handle = self._handle, None
+        comm, self._comm = self._comm, None
+        try:
+            torch.cuda.synchronize(self._device)
+        finally:
+            try:
+                if handle is not None:
+                    handle.destroy()
+            finally:
+                if comm is not None:
+                    comm.destroy()

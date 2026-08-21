@@ -388,20 +388,12 @@ def tuple_type(x):
 
 
 def _validate_rl_refit_method(args: argparse.Namespace) -> None:
-    """Reject ReFIT backends unsupported by the built-in collocated RL loop."""
-    uses_separate_inference_model = args.context_parallel_size > 1 or any(
-        size is not None
-        for size in (
-            args.rl_inference_tensor_model_parallel_size,
-            args.rl_inference_pipeline_model_parallel_size,
-            args.rl_inference_expert_model_parallel_size,
-            args.rl_inference_expert_tensor_model_parallel_size,
-        )
-    )
-    if args.refit_method == 'nccl_m2n' and uses_separate_inference_model:
+    """Reject ReFIT backends the built-in RL loop cannot drive."""
+    if args.refit_method == 'nccl_m2n':
         raise ValueError(
-            "--refit-method nccl_m2n requires non-collocated source and destination ranks; "
-            "the built-in RL loop creates both models on every rank"
+            "--refit-method nccl_m2n requires disjoint source and destination rank sets, "
+            "which the built-in RL loop never creates; use nccl/gloo/nvshmem here, or drive "
+            "NCCL M2N through swap_model_weights directly"
         )
 
 
@@ -2831,13 +2823,20 @@ def _add_rl_args(parser):
             '2) torch_memory_saver (when UVM is not enabled; requires torch_memory_saver to be installed).'
         ),
     )
-    group.add_argument('--refit-method', type=str, default='gloo',
-                       choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem'],
-                       help=('Method to refit the model weights between training and inference models during RL. '
-                             'nccl: use NCCLCopyService to refit using NCCL; '
-                             'nccl_m2n: use the official NCCL M2N copy/staging API for non-collocated refit; '
-                             'gloo: use GlooCopyService over CPU; '
-                             'nvshmem: use NVSHMEMCopyService to refit using the NVSHMEM.'))
+    group.add_argument(
+        '--refit-method',
+        type=str,
+        default='gloo',
+        choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem'],
+        help=(
+            'Method to refit model weights. '
+            'nccl: use NCCLCopyService; '
+            'nccl_m2n: use the official NCCL M2N API from a non-RL launcher such as the '
+            'ReFIT benchmark; '
+            'gloo: use GlooCopyService over CPU; '
+            'nvshmem: use NVSHMEMCopyService.'
+        ),
+    )
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')

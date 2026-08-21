@@ -19,17 +19,10 @@ from megatron.training.arguments import _validate_rl_refit_method
 from megatron.training.config import PretrainConfigContainer
 
 
-def test_nccl_m2n_rejects_collocated_rl_refit():
-    args = Namespace(
-        context_parallel_size=1,
-        refit_method="nccl_m2n",
-        rl_inference_tensor_model_parallel_size=1,
-        rl_inference_pipeline_model_parallel_size=None,
-        rl_inference_expert_model_parallel_size=None,
-        rl_inference_expert_tensor_model_parallel_size=None,
-    )
+def test_nccl_m2n_is_rejected_by_builtin_rl_loop():
+    args = Namespace(refit_method="nccl_m2n")
 
-    with pytest.raises(ValueError, match="requires non-collocated"):
+    with pytest.raises(ValueError, match="built-in RL loop never creates"):
         _validate_rl_refit_method(args)
 
 

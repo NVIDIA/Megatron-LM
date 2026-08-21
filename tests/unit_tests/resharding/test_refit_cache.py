@@ -11,10 +11,12 @@ Covers:
   replaces a buffer).
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
 import megatron.core.resharding.refit as refit
+from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.refit import _PlanCacheKey
 from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
 
@@ -167,6 +169,28 @@ def test_service_cache_distinguishes_process_groups(monkeypatch):
     assert first_again is first
     assert second is not first
     assert second.group is second_group
+
+
+def test_swap_rejects_multiple_pools_for_service_without_idle_ranks():
+    class NoIdleRanksService(CopyService):
+        supports_idle_ranks = False
+
+        def __init__(self):
+            pass
+
+        def submit_send(self, src_tensor, dest_rank, task_id=None):
+            pass
+
+        def submit_recv(self, dest_tensor, src_rank, task_id=None):
+            pass
+
+        def run(self):
+            pass
+
+    service = NoIdleRanksService()
+
+    with pytest.raises(ValueError, match="does not support num_dst_pools > 1"):
+        refit.swap_model_weights(None, None, refit_method=service, num_dst_pools=2)
 
 
 class TestNeedsMxfp8Conversion:

@@ -113,7 +113,8 @@ def _build_plan_cache_key(
 
 # Module-level cache for refit services to avoid repeated allocations. Services
 # own process-group-specific communicators, so the group identity is part of the
-# key. ``id(group)`` also supports ProcessGroup wrappers that are not hashable.
+# key. ``id(group)`` is safe because the cached service retains the group object,
+# preventing its address from being reused while the cache entry exists.
 _service_cache: dict[tuple[str, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
 
@@ -387,6 +388,12 @@ def swap_model_weights(
         service = refit_method
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
+
+    if num_dst_pools > 1 and not service.supports_idle_ranks:
+        raise ValueError(
+            f"{type(service).__name__} does not support num_dst_pools > 1 because each pool "
+            "pass leaves the other destination ranks idle"
+        )
 
     for pool in range(num_dst_pools):
         target = target_model if pool == dst_pool_index else None

@@ -79,7 +79,7 @@ swap_model_weights(None, None, "nccl",
 | Backend | Transport | Best for | Notes |
 |---------|-----------|----------|-------|
 | `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
-| `nccl_m2n` | NCCL M2N copy/staging reshard | Large non-collocated source/destination groups | Requires the official `nccl-extensions` Python package and NCCL 2.30.5+; source ranks must precede destination ranks |
+| `nccl_m2n` | NCCL M2N copy/staging reshard | Large non-collocated source/destination groups | Requires `nccl-extensions` and NCCL 2.30.5+; source ranks must precede destination ranks; pair-size skew adds padding |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
 | `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
@@ -113,15 +113,21 @@ The backend preserves the existing ReFIT planner and packs its operations into
 one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
 0, destination ranks shard dimension 1, and one cross-dimension
 `nccl.m2n.reshard` call moves the entire batch through M2N's managed
-copy/staging transport.
+copy/staging transport. Before each call, ranks exchange byte counts, tensor
+counts, and an ordered layout digest for every source/destination pair; any
+sender/receiver disagreement fails before weight data moves.
 
 This backend supports only non-collocated multi-rank layouts. The communication
 group must contain a contiguous source interval starting at group rank 0,
 immediately followed by a contiguous destination interval, with no overlapping
-or idle ranks. Use a process group scoped to exactly one source/destination pool
-when the application has extra ranks. Tensor data is packed into an ordinary,
-reusable CUDA tensor; model parameter storage itself is not replaced. Supported
-mesh sizes are validated by `nccl-extensions`.
+or idle ranks, and `num_dst_pools > 1` is not supported. Use a process group
+scoped to exactly one source/destination pool when the application has extra
+ranks. The M2N API describes a regular tensor, so every pair uses the largest
+validated pair payload as its trailing extent; skewed pair sizes therefore add
+wire padding. The CUDA staging tensor is transient and returned to PyTorch's
+caching allocator after each refit rather than retained by the service. Model
+parameter storage itself is not replaced. Supported mesh sizes are validated by
+`nccl-extensions`.
 
 The built-in RL loop currently creates its training and inference models on the
 same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public
