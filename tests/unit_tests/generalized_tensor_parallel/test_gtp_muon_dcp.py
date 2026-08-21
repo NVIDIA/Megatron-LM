@@ -8,6 +8,13 @@ matrix params (e.g. the MoE router) are kept whole and must be disambiguated
 by ``replica_id`` so DCP does not see multiple writers for the same shard.
 """
 
+import pytest
+
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+if not HAVE_GTP:
+    pytest.skip("GTP requires TE with hook registry", allow_module_level=True)
+
 import torch
 
 from megatron.core.dist_checkpointing import load, save
