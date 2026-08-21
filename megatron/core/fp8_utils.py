@@ -60,7 +60,16 @@ try:
     HAVE_TE_MXFP8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
+    MXFP8Tensor = None
     HAVE_TE_MXFP8TENSOR = False
+
+try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+
+    HAVE_TE_BLOCKWISE_FP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    Float8BlockwiseQTensor = None
+    HAVE_TE_BLOCKWISE_FP8TENSOR = False
 
 try:
     from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
@@ -136,6 +145,23 @@ def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_MXFP8TENSOR and _is_instance_or_param_data(tensor, MXFP8Tensor)
 
 
+def is_blockwise_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8BlockwiseQTensor."""
+    return HAVE_TE_BLOCKWISE_FP8TENSOR and _is_instance_or_param_data(
+        tensor, Float8BlockwiseQTensor
+    )
+
+
+def is_layerwise_fp8_param(tensor: torch.Tensor) -> bool:
+    """Check if an FP8 parameter uses storage supported by LayerWise parameter gather.
+
+    The compact LayerWise path stages whole parameters in BF16 and requantizes them on
+    copy-back. It supports plain MXFP8 and blockwise tensors only; generic Float8Tensor,
+    NVFP4, and GroupedTensor storage require different handling.
+    """
+    return is_mxfp8tensor(tensor) or is_blockwise_float8tensor(tensor)
+
+
 def is_grouped_tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine GroupedTensor."""
     return HAVE_TE_GROUPED_TENSOR_CLASS and _is_instance_or_param_data(tensor, GroupedTensor)
@@ -148,6 +174,21 @@ def is_grouped_tensor_with_quantized_storage(tensor: torch.Tensor) -> bool:
         return False
     rowwise_data = getattr(tensor, "rowwise_data", None)
     return rowwise_data is not None and rowwise_data.dtype == torch.uint8
+
+
+def pop_high_precision_init_val(param: torch.Tensor) -> Optional[torch.Tensor]:
+    """Return and clear a Transformer Engine preserved high-precision initial value.
+
+    The returned tensor is left unmodified so each optimizer path can preserve its
+    existing slicing, cloning, device placement, and dtype conversion behavior.
+    """
+    getter = getattr(param, "get_high_precision_init_val", None)
+    if getter is None:
+        return None
+
+    high_precision_init_val = getter()
+    param.clear_high_precision_init_val()
+    return high_precision_init_val
 
 
 def _get_grouped_quantized_recipe(tensor: torch.Tensor):
@@ -226,6 +267,46 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
     dst.copy_(src.view(dst.shape))
 
 
+def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+    """List form of :func:`copy_tensor_to_quantized_param`, for a whole bucket of params.
+
+    Same values, minus the per-param ``copy_`` and tensor-subclass dispatch: the quantizer is
+    resolved up front and called directly. Cast kernels are unchanged, one per param. Worth it
+    because those casts are small and issuing them is expensive, and under
+    --reuse-grad-buf-for-mxfp8-param-ag they run inside the forward pass.
+
+    Args:
+        params: quantized model params to write into.
+        srcs: high-precision source values, one per param, in the same order.
+    """
+    if len(params) == 0:
+        return
+
+    srcs_to_cast = []
+    dsts_to_cast = []
+    quantizers = []
+    for param, src in zip(params, srcs):
+        dst = _unwrap_parameter_data(param)
+        quantizer = (
+            None
+            if is_grouped_tensor_with_quantized_storage(dst)
+            else getattr(dst, "_quantizer", None)
+        )
+        if quantizer is None:
+            # Grouped storage quantizes per member; a missing quantizer has to be built. Both
+            # cases are handled by the single-param path.
+            copy_tensor_to_quantized_param(param, src)
+            continue
+        srcs_to_cast.append(src.view(dst.shape))
+        dsts_to_cast.append(dst)
+        quantizers.append(quantizer)
+
+    # Equivalent to dst.copy_(src), but entered directly instead of via the aten::copy_ op,
+    # QuantizedTensor.__torch_dispatch__ (type and usage checks) and dst.quantize_(src).
+    for src, quantizer, dst in zip(srcs_to_cast, quantizers, dsts_to_cast):
+        quantizer.update_quantized(src, dst)
+
+
 def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:
     """Replace a high-precision Transformer Engine GroupedTensor's rowwise storage."""
     tensor = _unwrap_parameter_data(tensor)
@@ -268,29 +349,46 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.from_float8()
 
 
-def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
-    """Requantize a gathered bf16 whole-param into an fp8 (Float8/MXFP8) model param in place.
+def copy_back_gathered_bf16_into_fp8_params(
+    model_params: List[torch.Tensor], srcs_bf16: List[torch.Tensor]
+) -> None:
+    """Copy gathered BF16 whole-params into compact LayerWise bucket parameters.
 
-    mxfp8 columnwise can't be derived from rowwise, so force columnwise before copy_ (TE rebuilds
-    both directions from the bf16); blockwise/Float8 columnwise is a lossless transpose.
+    Plain BF16 parameters are allowed because a LayerWise bucket can contain BF16 siblings of
+    supported FP8 parameters. Quantized destinations are limited to MXFP8 and blockwise tensors.
+    MXFP8 columnwise data cannot be derived from rowwise data, so force both usages before the
+    batched quantized copy. Validate the entire batch before mutating any quantizer usage.
     """
-    if is_mxfp8tensor(model_p):
-        quantizer = model_p.data._get_quantizer()
+    if len(model_params) != len(srcs_bf16):
+        raise ValueError(
+            "LayerWise FP8 parameter gather copy-back requires one source per parameter: "
+            f"got {len(model_params)} parameters and {len(srcs_bf16)} sources."
+        )
+
+    mxfp8_quantizers = []
+    for model_p in model_params:
+        if is_grouped_tensor_with_quantized_storage(model_p):
+            raise TypeError(
+                "LayerWise FP8 parameter gather does not support Transformer Engine "
+                "GroupedTensor quantized storage. Disable --moe-single-grouped-weight."
+            )
+        if is_float8tensor(model_p) and not is_layerwise_fp8_param(model_p):
+            raise TypeError(
+                "LayerWise FP8 parameter gather supports only MXFP8Tensor and "
+                "Float8BlockwiseQTensor destinations."
+            )
+        if is_mxfp8tensor(model_p):
+            mxfp8_quantizers.append(model_p.data._get_quantizer())
+
+    for quantizer in mxfp8_quantizers:
         quantizer.set_usage(rowwise=True, columnwise=True)
-    model_p.data.copy_(src_bf16)
+
+    copy_tensors_to_quantized_params(model_params, srcs_bf16)
 
 
-def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
-    """Stage a param to a detached bf16 whole-param for fp8 param-gather transport.
-
-    Prefer the fp32 master (high-precision source); else dequantize an fp8 param; else copy bf16.
-    """
-    main_param = getattr(p, "main_param", None)
-    if main_param is not None:
-        return main_param.detach().to(torch.bfloat16)
-    if is_float8tensor(p):
-        return dequantize_fp8_tensor(p).detach().to(torch.bfloat16)
-    return p.detach().to(torch.bfloat16)
+def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
+    """Single-parameter compatibility wrapper for LayerWise BF16 copy-back."""
+    copy_back_gathered_bf16_into_fp8_params([model_p], [src_bf16])
 
 
 def _resolve_callable_from_python_import_path(dotted_path: str):
@@ -332,11 +430,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
-            Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+        raise ValueError("""CustomRecipe recipe is not available in this version of
+            Transformer Engine. Please make sure you are using TE version
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 
