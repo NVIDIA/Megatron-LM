@@ -113,6 +113,32 @@ def test_stub_optimizers_contribute_no_chunks_and_stage_nothing():
     assert ('stage', 'stub') not in log, log
 
 
+def test_a_nested_chained_optimizer_stages_its_own_members():
+    """LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one.
+
+    Without ChainedOptimizer._stage_model_params_from_main_params the nested chain inherits
+    the base no-op, and its params -- the quantized weights under Muon -- are never
+    re-derived. That is silent: no error, just weights that did not get refreshed.
+    """
+    log = []
+    config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=True)
+    chunk = _FakeModelChunk(log, 'chunk')
+    inner = ChainedOptimizer(
+        [
+            _FakeOptimizer(log, 'inner_a', config, [chunk]),
+            _FakeOptimizer(log, 'inner_b', config, [chunk]),
+        ]
+    )
+    outer = ChainedOptimizer([inner, _FakeOptimizer(log, 'outer', config, [chunk])])
+
+    outer.quantize_and_sync_model_params_from_main_params()
+
+    staged = [entry[1] for entry in log if entry[0] == 'stage']
+    assert staged == ['inner_a', 'inner_b', 'outer'], log
+    assert log.count(('zero', 'chunk')) == 1, log
+    assert log.count(('sync', 'chunk', True)) == 1, log
+
+
 def test_base_optimizer_refresh_is_a_no_op():
     """Optimizers with no main params inherit a no-op rather than failing."""
 

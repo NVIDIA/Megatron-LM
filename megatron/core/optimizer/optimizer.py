@@ -1617,6 +1617,15 @@ class ChainedOptimizer(MegatronOptimizer):
         return model_chunks
 
     @override
+    def _stage_model_params_from_main_params(self) -> None:
+        # A ChainedOptimizer can itself be a member of another chain -- a
+        # LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one.
+        # Without this the nested chain inherits the base no-op and its params, which are
+        # the quantized weights under Muon, are never re-derived.
+        for optimizer in self.chained_optimizers:
+            optimizer._stage_model_params_from_main_params()
+
+    @override
     @torch.no_grad()
     def quantize_and_sync_model_params_from_main_params(self) -> None:
         """Re-derive and all-gather the model params (see MegatronOptimizer)."""
