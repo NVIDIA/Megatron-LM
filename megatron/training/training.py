@@ -4981,13 +4981,14 @@ def train(
         disable_forward_pre_hook(model, optimizer=optimizer)
 
     ft_integration.on_checkpointing_start()
-    # This will finalize all unfinalized async request and terminate a persistent
-    # async worker if persistent ckpt worker is enabled. Exposed TERMINATE cost:
-    # the trainer BLOCKS here until the final async checkpoint is durably written
-    # (the worker drains) -- a defense cost on the exit path that otherwise reads
-    # as dark/unobserved time (it runs after the last iteration, before shutdown).
+    # This will finalize all unfinalized async request and terminate a
+    # persistent async worker if the code exits and doesn't return from this
+    # function. Exposed TERMINATE cost: the trainer BLOCKS here until the final
+    # async checkpoint is durably written (the worker drains) -- a defense cost
+    # on the exit path that otherwise reads as dark/unobserved time (it runs
+    # after the last iteration, before shutdown).
     with _otel_managed_span('checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True):
-        maybe_finalize_async_save(blocking=True, terminate=True)
+        maybe_finalize_async_save(blocking=True, terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     if args.log_energy:
