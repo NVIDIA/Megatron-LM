@@ -47,7 +47,6 @@ class ImplConfig(LiteImplConfig):
     optimizer: str | None = None
     mtp_enable: bool = False
     dsa_indexer_loss_coeff: float = 0.0
-    max_tokens_per_rank: int = 8192
     logprob_chunk_size: int = 8192
 
 
@@ -62,8 +61,6 @@ def _post_optimizer_step(model: nn.Module) -> None:
 def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
     if impl_cfg.dsa_indexer_loss_coeff < 0.0:
         raise ValueError("dsa_indexer_loss_coeff must be >= 0")
-    if impl_cfg.max_tokens_per_rank <= 0:
-        raise ValueError("max_tokens_per_rank must be positive")
     if impl_cfg.logprob_chunk_size <= 0:
         raise ValueError("logprob_chunk_size must be positive")
     if not 0 <= model_cfg.num_hash_layers <= model_cfg.num_hidden_layers:
@@ -288,12 +285,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         else:
             forward_inputs, token_counts, cp_packed_seq_params = _prepare_cp_forward_inputs(
                 model, batch
-            )
-        local_tokens = sum(token_counts) // parallel_state.cp_size
-        if local_tokens > impl_cfg.max_tokens_per_rank:
-            raise ValueError(
-                f"CP-local packed batch has {local_tokens} tokens, exceeding "
-                f"max_tokens_per_rank={impl_cfg.max_tokens_per_rank}"
             )
         if attention_metadata is None:
             assert current_attention_builders is not None

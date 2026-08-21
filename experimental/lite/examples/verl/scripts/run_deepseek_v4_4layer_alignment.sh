@@ -91,7 +91,6 @@ bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=True" \
   "++actor_rollout_ref.actor.engine.impl_cfg.use_thd=False" \
   "++actor_rollout_ref.actor.engine.impl_cfg.use_deepep=True" \
-  "++actor_rollout_ref.actor.engine.impl_cfg.max_tokens_per_rank=4096" \
   "++actor_rollout_ref.actor.engine.impl_cfg.mtp_enable=False" \
   "++actor_rollout_ref.actor.engine.impl_cfg.mtp_enable_train=False" \
   "++actor_rollout_ref.actor.engine.impl_cfg.qat=null" \
