@@ -124,10 +124,12 @@ or idle ranks, and `num_dst_pools > 1` is not supported. Use a process group
 scoped to exactly one source/destination pool when the application has extra
 ranks. The M2N API describes a regular tensor, so every pair uses the largest
 validated pair payload as its trailing extent; skewed pair sizes therefore add
-wire padding. The CUDA staging tensor is transient and returned to PyTorch's
+wire padding. The logical transfer size is
+`src_count * dst_count * max_pair_bytes`, and each rank temporarily stages
+`peer_count * max_pair_bytes`. The staging tensor is returned to PyTorch's
 caching allocator after each refit rather than retained by the service. Model
-parameter storage itself is not replaced. Supported mesh sizes are validated by
-`nccl-extensions`.
+parameter storage itself is not replaced. Supported mesh sizes are validated
+by `nccl-extensions`.
 
 The built-in RL loop currently creates its training and inference models on the
 same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public
