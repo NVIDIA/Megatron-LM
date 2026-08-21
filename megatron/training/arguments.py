@@ -2182,6 +2182,11 @@ def validate_args(args, defaults={}):
             args.num_experts is not None
         ), "MoE latent projections are applicable only for MoE models."
 
+    if args.moe_latent_output_norm:
+        assert (
+            args.moe_latent_size is not None
+        ), "--moe-latent-output-norm requires --moe-latent-size to be set."
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -2303,6 +2308,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
 
     kw_args['moe_latent_size'] = args.moe_latent_size
+    kw_args['moe_latent_output_norm'] = args.moe_latent_output_norm
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
