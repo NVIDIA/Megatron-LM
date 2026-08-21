@@ -33,10 +33,13 @@ from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
-    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -849,38 +852,59 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "MTP requires both input_ids and position_ids when precomputed "
                     "decoder_input embeddings are not provided."
                 )
-            # Prefetch only after converting to the MTP layout: cached rows belong
+            # Prepare only after converting to the MTP layout: prepared rows belong
             # to these token IDs and this packed metadata, not the decoder layout.
             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, mtp_inputs.packed_seq_params)
             sequence_roll_tokens = (
                 mtp_inputs.input_ids if mtp_inputs.input_ids is not None else mtp_inputs.labels
             )
+            # Build layout-specific metadata once, then prepare every locally owned
+            # MTP field for absolute sequence-roll access in one grouped operation.
             sequence_roll_context = prepare_mtp_sequence_roll_context(
                 tensor=sequence_roll_tokens,
                 cp_group=mtp_cp_group,
                 packed_seq_params=mtp_inputs.packed_seq_params,
             )
-            if sequence_roll_context is not None:
+            roll_padding_mask = mtp_inputs.padding_mask
+            if (
+                roll_padding_mask is not None
+                and self.config.sequence_parallel
+                and roll_padding_mask.shape != sequence_roll_tokens.shape
+            ):
+                roll_padding_mask = tensor_parallel.gather_from_sequence_parallel_region(
+                    roll_padding_mask.transpose(0, 1).contiguous(),
+                    tensor_parallel_output_grad=False,
+                    group=self.tp_group,
+                ).transpose(0, 1)
+            # Absolute rows cover none of precomputed embeddings, a conditioning mask or
+            # the contiguous attention CP layout; their consumers keep the cumulative roll.
+            if (
+                sequence_roll_context is not None
+                and mtp_inputs.decoder_input is None
+                and mtp_inputs.mtp_input_mask is None
+                and getattr(self.config, "attention_cp_layout", None) != "contiguous"
+            ):
                 roll_position_ids = getattr(self.embedding, "add_position_embedding", True)
-                roll_padding_mask = mtp_inputs.padding_mask
-                if (
-                    roll_padding_mask is not None
-                    and self.config.sequence_parallel
-                    and roll_padding_mask.shape != sequence_roll_tokens.shape
-                ):
-                    roll_padding_mask = tensor_parallel.gather_from_sequence_parallel_region(
-                        roll_padding_mask.transpose(0, 1).contiguous(),
-                        tensor_parallel_output_grad=False,
-                        group=self.tp_group,
-                    ).transpose(0, 1)
-                sequence_roll_context = sequence_roll_context.prefetch_halos(
-                    width=self.config.mtp_num_layers + 1,
-                    input_ids=mtp_inputs.input_ids,
-                    position_ids=mtp_inputs.position_ids if roll_position_ids else None,
-                    labels=mtp_inputs.labels if self.post_process else None,
-                    loss_mask=mtp_inputs.loss_mask if self.post_process else None,
-                    padding_mask=roll_padding_mask,
-                    mtp_input_mask=mtp_inputs.mtp_input_mask,
+                fields = []
+                if mtp_inputs.input_ids is not None:
+                    fields.append(MTPSequenceRollField("input_ids", mtp_inputs.input_ids, -1, 0, 0))
+                if roll_position_ids and mtp_inputs.position_ids is not None:
+                    fields.append(
+                        MTPSequenceRollField("position_ids", mtp_inputs.position_ids, -1, 0, 0)
+                    )
+                if self.post_process and mtp_inputs.labels is not None:
+                    fields.append(MTPSequenceRollField("labels", mtp_inputs.labels, -1, 0, 0))
+                if self.post_process and mtp_inputs.loss_mask is not None:
+                    fields.append(MTPSequenceRollField("loss_mask", mtp_inputs.loss_mask, -1, 0, 0))
+                if roll_padding_mask is not None:
+                    fields.append(
+                        MTPSequenceRollField("padding_mask", roll_padding_mask, -1, 0, True)
+                    )
+                max_offset = self.config.mtp_num_layers + int(
+                    self.post_process and mtp_inputs.labels is None
+                )
+                sequence_roll_context = sequence_roll_context.prepare_fields(
+                    fields, max_offset=max_offset
                 )
             mtp_hidden_states = self.mtp(
                 input_ids=mtp_inputs.input_ids,
@@ -896,6 +920,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 decoder_input=mtp_inputs.decoder_input,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
                 padding_mask=mtp_inputs.padding_mask,
+                sequence_roll_padding_mask=roll_padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )
