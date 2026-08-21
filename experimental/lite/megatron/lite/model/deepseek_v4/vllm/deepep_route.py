@@ -176,15 +176,12 @@ def _scatter_deepep_routes_with_padding(
     topk_weights: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     *,
-    return_route_positions: bool = False,
     expected_route_count: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    bool,
     torch.Tensor,
 ]:
     """Build vLLM LL's expert-major DeepEP layout deterministically."""
@@ -253,11 +250,6 @@ def _scatter_deepep_routes_with_padding(
         total_rows = int(counts.sum().item())
     permuted_probs = topk_weights.new_zeros((total_rows,))
     output_index = torch.full_like(topk_indices, -1)
-    routing_map = torch.zeros(
-        (topk_indices.shape[0], num_experts),
-        device=topk_indices.device,
-        dtype=torch.bool,
-    )
     expert_offsets = torch.cumsum(counts, dim=0) - counts
 
     if expected_route_count is not None and valid.is_cuda:
@@ -268,13 +260,6 @@ def _scatter_deepep_routes_with_padding(
         occurrences = compact_route_positions(valid.contiguous(), expected_route_count)
     else:
         occurrences = torch.nonzero(valid, as_tuple=False)
-    # The metadata handle exposes the compact route count as tensor shape.  If
-    # it is available, use that static value instead of forcing nonzero to
-    # report its data-dependent output size to Python.
-    route_count = (
-        occurrences.shape[0] if expected_route_count is None else expected_route_count
-    )
-    all_routes_valid = route_count == topk_indices.numel()
     if occurrences.numel():
         token_rows = occurrences[:, 0]
         topk_columns = occurrences[:, 1]
@@ -299,7 +284,6 @@ def _scatter_deepep_routes_with_padding(
         output_index[token_rows, topk_columns] = destination_rows.to(
             dtype=output_index.dtype
         )
-        routing_map[token_rows, route_experts] = True
 
     torch._assert_async(
         torch.all(~valid | (output_index >= 0)),
@@ -310,18 +294,13 @@ def _scatter_deepep_routes_with_padding(
         output_index,
         total_rows,
     )
-    result = (
+    return (
         permuted_hidden,
         permuted_probs,
         output_index,
         sanitized_indices,
-        routing_map,
-        all_routes_valid,
-        real_counts,
+        occurrences,
     )
-    if return_route_positions:
-        return (*result, occurrences)
-    return result
 
 
 class _VLLMEPGatherWithBF16Backward(torch.autograd.Function):

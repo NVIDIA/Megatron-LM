@@ -155,16 +155,12 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             expert_probs,
             output_index,
             sanitized_indices,
-            _,
-            _,
-            _,
             positions,
         ) = _scatter_deepep_routes_with_padding(
             received_hidden,
             received_indices,
             received_weights,
             received_per_expert,
-            return_route_positions=True,
             expected_route_count=expected_route_count,
         )
         self._metadata_route_rows = _validate_and_order_route_preserving_outputs(
