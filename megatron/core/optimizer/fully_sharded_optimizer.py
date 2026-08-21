@@ -19,6 +19,28 @@ from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
 
 
+def count_replication(tensor: DTensor) -> int:
+    """Return how many ranks hold an identical copy of ``tensor``'s local shard.
+
+    A sharded mesh axis holds disjoint pieces that must all be counted; a replicated
+    axis holds identical copies that must be counted once, so a gradient statistic
+    summed over the grad-stats group has to divide by this.
+
+    MFSDP v2 gradients are always DTensors, so this takes one rather than accepting
+    a plain tensor and guessing a layout for it.
+    """
+    replication = 1
+    for axis, placement in enumerate(tensor.placements):
+        if placement.is_replicate():
+            replication *= tensor.device_mesh.size(axis)
+        elif placement.is_partial():
+            raise RuntimeError(
+                "MFSDP v2 gradient is still Partial when gradient statistics are taken; "
+                "the reduction must be finalized first."
+            )
+    return replication
+
+
 class FullyShardedOptimizer(MixedPrecisionOptimizer):
     """MCore optimizer wrapper for MFSDP-owned sharded parameters and gradients.
 
@@ -107,28 +129,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Build a sharded optimizer state dict."""
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
-    @staticmethod
-    def count_replication(tensor: DTensor) -> int:
-        """Return how many ranks hold an identical copy of ``tensor``'s local shard.
-
-        A sharded mesh axis holds disjoint pieces that must all be counted; a replicated
-        axis holds identical copies that must be counted once, so a gradient statistic
-        summed over the grad-stats group has to divide by this.
-
-        MFSDP v2 gradients are always DTensors, so this takes one rather than accepting
-        a plain tensor and guessing a layout for it.
-        """
-        replication = 1
-        for axis, placement in enumerate(tensor.placements):
-            if placement.is_replicate():
-                replication *= tensor.device_mesh.size(axis)
-            elif placement.is_partial():
-                raise RuntimeError(
-                    "MFSDP v2 gradient is still Partial when gradient statistics are taken; "
-                    "the reduction must be finalized first."
-                )
-        return replication
-
     def get_grad_norm(self):
         """Compute the global gradient L2 norm from each gradient's own DTensor layout.
 
@@ -163,7 +163,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             grad = parameter.grad
             if grad is None:
                 continue
-            replication = self.count_replication(grad)
+            replication = count_replication(grad)
             local_grad = grad.to_local()
             if local_grad.numel():
                 total_norm_squared += local_grad.float().pow(2).sum() / replication
@@ -202,7 +202,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             grad = parameter.grad
             if grad is None:
                 continue
-            replication = self.count_replication(grad)
+            replication = count_replication(grad)
             local_grad = grad.to_local()
             if local_grad.numel():
                 zeros = local_grad.numel() - torch.count_nonzero(local_grad)
