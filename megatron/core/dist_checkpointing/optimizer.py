@@ -58,8 +58,9 @@ def get_param_id_to_sharded_param_map(
             to model sharded parameters.
     """
     model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(model_sharded_state_dict)
+    optim_params = list(optim_params_iter)
     id_to_sharded_param_map = {}
-    param_to_id_map = get_optim_param_to_id_map(optim_params_iter)
+    param_to_id_map = get_optim_param_to_id_map(optim_params)
     # If using PyTorch FSDP2 the values in model_sharded_state_dict would
     # have been converted to local tensors during initialization.
     # See the make_(tp)_sharded_tensor_for_checkpoint functions.
@@ -68,6 +69,10 @@ def get_param_id_to_sharded_param_map(
             id_to_sharded_param_map[param_to_id_map[id(ten.data)]] = ten
         else:
             logger.debug('%s is not tracked by the optimizer', ten)
+
+    _backfill_grouped_param_factories(
+        id_to_sharded_param_map, optim_params, model_sharded_state_dict
+    )
 
     if not id_to_sharded_param_map:
         log_single_rank(
@@ -78,6 +83,102 @@ def get_param_id_to_sharded_param_map(
             " Make sure to call state_dict with `keep_vars=True`.",
         )
     return id_to_sharded_param_map
+
+
+def _backfill_grouped_param_factories(
+    id_to_sharded_param_map: dict,
+    optim_params: list[torch.nn.Parameter],
+    model_sharded_state_dict: ShardedStateDict,
+) -> None:
+    """Map one grouped optimizer parameter to its per-expert model shards.
+
+    Transformer Engine's ``single_grouped_weight`` exposes one optimizer parameter while the
+    model checkpoint contains one view per expert. The factory preserves that checkpoint layout
+    when optimizer states are saved and reconstructs the grouped tensor when they are loaded.
+    """
+    sharded_entries = list(nested_values(model_sharded_state_dict))
+
+    for param_id, param in enumerate(optim_params):
+        if param_id in id_to_sharded_param_map:
+            continue
+        rowwise_data = getattr(param, "rowwise_data", None)
+        num_members = getattr(param, "num_tensors", None)
+        if not isinstance(rowwise_data, torch.Tensor) or not isinstance(num_members, int):
+            continue
+        if num_members <= 0 or param.ndim < 1 or int(param.shape[0]) != num_members:
+            continue
+        if not rowwise_data.is_contiguous() or rowwise_data.numel() != param.numel():
+            continue
+
+        start = rowwise_data.data_ptr()
+        end = start + rowwise_data.numel() * rowwise_data.element_size()
+        candidates = []
+        for entry in sharded_entries:
+            data = getattr(entry, "data", None)
+            if not isinstance(data, torch.Tensor):
+                continue
+            data_start = data.data_ptr()
+            data_end = data_start + data.numel() * data.element_size()
+            if (
+                data.dtype == rowwise_data.dtype
+                and data.device == rowwise_data.device
+                and data.is_contiguous()
+                and start <= data_start < data_end <= end
+            ):
+                candidates.append((data_start - start, entry))
+
+        candidates.sort(key=lambda item: item[0])
+        member_numel = rowwise_data.numel() // num_members
+        member_nbytes = member_numel * rowwise_data.element_size()
+        if len(candidates) != num_members or [offset for offset, _ in candidates] != [
+            idx * member_nbytes for idx in range(num_members)
+        ]:
+            continue
+        templates = [entry.without_data() for _, entry in candidates]
+        if len({template.key for template in templates}) != 1:
+            continue
+
+        def build_grouped_shards(key, tensor, replica_id, flattened_range, templates=templates):
+            if flattened_range is not None:
+                raise ValueError("Grouped optimizer factories do not support flattened ranges")
+            if tensor.ndim < 1 or int(tensor.shape[0]) != len(templates):
+                raise ValueError(
+                    f"Grouped optimizer tensor shape {tuple(tensor.shape)} does not match "
+                    f"{len(templates)} checkpoint members"
+                )
+            built = []
+            for member, template in zip(tensor.unbind(dim=0), templates):
+                if isinstance(template, ShardedTensorFactory):
+                    built.append(template.build_fn(key, member, replica_id, None))
+                else:
+                    built.append(
+                        replace(
+                            template,
+                            key=key,
+                            data=member,
+                            dtype=member.dtype,
+                            replica_id=replica_id,
+                            flattened_range=None,
+                        )
+                    )
+            return built
+
+        def merge_grouped_shards(loaded, templates=templates):
+            members = []
+            for value, template in zip(loaded, templates):
+                if isinstance(template, ShardedTensorFactory):
+                    value = template.merge_fn(value)
+                members.append(value)
+            return torch.stack(members, dim=0)
+
+        first = templates[0]
+        id_to_sharded_param_map[param_id] = ShardedTensorFactory(
+            key=first.key,
+            data=param,
+            build_fn=build_grouped_shards,
+            merge_fn=merge_grouped_shards,
+            replica_id=first.replica_id,
+        )
 
 
 def make_sharded_optimizer_tensor(

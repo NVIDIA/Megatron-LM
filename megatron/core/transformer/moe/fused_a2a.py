@@ -4,7 +4,7 @@
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
 import inspect
-from typing import Callable, Optional
+from typing import Optional
 
 from megatron.core.utils import internal_api
 
@@ -268,29 +268,12 @@ else:
     set_deepep_num_sms = None
 
 
-def _has_parameter(function: Callable, parameter: str) -> bool:
-    """Return whether a callable exposes a named parameter."""
-    try:
-        return parameter in inspect.signature(function).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 try:
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
-    # HybridEP accepts dense [num_tokens, topk] expert ids (topk_idx) when its config carries a
-    # topk field; older builds only take the bool [num_tokens, num_experts] routing map.
-    try:
-        import hybrid_ep_cpp
-
-        HAVE_HYBRIDEP_DENSE_ROUTING = hasattr(hybrid_ep_cpp.HybridEpConfigInstance(), "topk")
-    except (ImportError, AttributeError, TypeError, ValueError):
-        HAVE_HYBRIDEP_DENSE_ROUTING = False
 except ImportError:
     HAVE_HYBRIDEP = False
-    HAVE_HYBRIDEP_DENSE_ROUTING = False
 
 _hybrid_ep_buffer = None
 
@@ -394,15 +377,18 @@ class HybridEPDispatch(torch.autograd.Function):
         pad_multiple=None,
         num_sms_preprocessing_api=108,
         topk_idx=None,
-        num_of_experts=None,
+        topk_weights=None,
+        num_experts=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
         if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
+            import inspect
             import warnings
 
-            if not _has_parameter(HybridEPBuffer.dispatch_with_permute, 'fuse_permute_dispatch'):
+            sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
+            if 'fuse_permute_dispatch' not in sig.parameters:
                 warnings.warn(
                     "Current DeepEP version does not support fused permute dispatch or "
                     "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
@@ -432,16 +418,15 @@ class HybridEPDispatch(torch.autograd.Function):
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
-        use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
-        if use_dense:
-            assert num_of_experts is not None, "num_of_experts is required for dense routing"
-            dispatch_kwargs = {"topk_idx": topk_idx, "num_of_experts": num_of_experts}
-        else:
-            assert (
-                routing_map is not None
-            ), "routing_map is required when dense HybridEP routing is unavailable"
-            dispatch_kwargs = {"routing_map": routing_map}
-
+        # Process the dispatch. Compact top-k routes avoid materializing the dense routing map
+        # used by the standard path; this is used by replica-planned HybridEP.
+        routing_kwargs = {"routing_map": routing_map, "probs": probs}
+        if topk_idx is not None:
+            routing_kwargs = {
+                "topk_idx": topk_idx,
+                "topk_weights": topk_weights,
+                "num_of_experts": num_experts,
+            }
         (
             dispatched_hidden,
             dispatched_probs,
@@ -450,19 +435,19 @@ class HybridEPDispatch(torch.autograd.Function):
             handle,
         ) = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=x,
-            probs=probs,
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
-            **dispatch_kwargs,
+            **routing_kwargs,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
+        ctx.topk_idx = topk_idx
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -484,10 +469,16 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
+        compact_combined_probs = None
+        if ctx.topk_idx is not None and combined_probs is not None:
+            valid = ctx.topk_idx >= 0
+            safe_idx = ctx.topk_idx.masked_fill(~valid, 0).to(torch.int64)
+            compact_combined_probs = combined_probs.gather(1, safe_idx)
+            compact_combined_probs = compact_combined_probs.masked_fill(~valid, 0)
         return (
             combined_hidden,
             None,
-            combined_probs,
+            None if ctx.topk_idx is not None else combined_probs,
             None,
             None,
             None,
@@ -499,6 +490,7 @@ class HybridEPDispatch(torch.autograd.Function):
             None,
             None,
             None,
+            compact_combined_probs,
             None,
         )
 
@@ -561,7 +553,8 @@ if HAVE_HYBRIDEP:
         pad_multiple=None,
         num_sms_preprocessing_api=108,
         topk_idx=None,
-        num_of_experts=None,
+        topk_weights=None,
+        num_experts=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -595,10 +588,6 @@ if HAVE_HYBRIDEP:
                 is performed.
             num_sms_preprocessing_api (int):
                 Number of SMs used by the preprocessing (metadata scan) kernel.
-            topk_idx (torch.Tensor, optional):
-                Dense top-k expert indices with shape [num_tokens, topk].
-            num_of_experts (int, optional):
-                Total number of experts. Required when topk_idx is provided.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -615,7 +604,8 @@ if HAVE_HYBRIDEP:
             pad_multiple,
             num_sms_preprocessing_api,
             topk_idx,
-            num_of_experts,
+            topk_weights,
+            num_experts,
         )
 
     @internal_api
