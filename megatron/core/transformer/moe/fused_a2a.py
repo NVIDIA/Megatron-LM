@@ -376,6 +376,9 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
+        topk_weights=None,
+        num_experts=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -415,7 +418,15 @@ class HybridEPDispatch(torch.autograd.Function):
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
-        # Process the dispatch
+        # Process the dispatch. Compact top-k routes avoid materializing the dense routing map
+        # used by the standard path; this is used by replica-planned HybridEP.
+        routing_kwargs = {"routing_map": routing_map, "probs": probs}
+        if topk_idx is not None:
+            routing_kwargs = {
+                "topk_idx": topk_idx,
+                "topk_weights": topk_weights,
+                "num_of_experts": num_experts,
+            }
         (
             dispatched_hidden,
             dispatched_probs,
@@ -424,19 +435,19 @@ class HybridEPDispatch(torch.autograd.Function):
             handle,
         ) = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=x,
-            routing_map=routing_map,
-            probs=probs,
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
+            **routing_kwargs,
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
+        ctx.topk_idx = topk_idx
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -458,10 +469,16 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
+        compact_combined_probs = None
+        if ctx.topk_idx is not None and combined_probs is not None:
+            valid = ctx.topk_idx >= 0
+            safe_idx = ctx.topk_idx.masked_fill(~valid, 0).to(torch.int64)
+            compact_combined_probs = combined_probs.gather(1, safe_idx)
+            compact_combined_probs = compact_combined_probs.masked_fill(~valid, 0)
         return (
             combined_hidden,
             None,
-            combined_probs,
+            None if ctx.topk_idx is not None else combined_probs,
             None,
             None,
             None,
@@ -471,6 +488,9 @@ class HybridEPDispatch(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            compact_combined_probs,
             None,
         )
 
@@ -532,6 +552,9 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
+        topk_weights=None,
+        num_experts=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -580,6 +603,9 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            topk_idx,
+            topk_weights,
+            num_experts,
         )
 
     @internal_api
