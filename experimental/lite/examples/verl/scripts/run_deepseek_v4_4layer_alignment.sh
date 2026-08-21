@@ -43,7 +43,9 @@ export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-2048}"
 # transport buffers. This does not change model or kernel numerics.
 export UPDATE_WEIGHTS_BUCKET_MEGABYTES="${UPDATE_WEIGHTS_BUCKET_MEGABYTES:-1024}"
 export TOTAL_EPOCHS=1
-export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-1}"
+# Step two is part of the correctness contract: it exercises optimizer update,
+# actor export, rollout layerwise reload, and a second old-logprob comparison.
+export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-2}"
 export SAVE_FREQ=-1
 export TEST_FREQ=-1
 export RESUME_MODE=disable
