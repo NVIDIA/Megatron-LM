@@ -363,6 +363,12 @@ def test_pr_eligibility_gate_is_inline_and_never_executes_pr_code_with_pat():
     assert '"$HAS_LTS" == "true"' in configure
 
 
+def test_cicd_daily_producer_runs_at_10_utc():
+    source = MAIN_WORKFLOW.read_text()
+
+    assert 'schedule:\n    - cron: "0 10 * * *"' in source
+
+
 def test_baseline_workflow_and_dependency_install_are_trusted_and_isolated():
     baseline = BASELINE_WORKFLOW.read_text()
     common_install = COMMON_INSTALL.read_text()
