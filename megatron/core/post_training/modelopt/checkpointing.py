@@ -97,7 +97,6 @@ def _load_extra_state_from_sharded_checkpoint(
     model: torch.nn.Module,
     checkpoint_name: str | Path,
     prefix: str,
-    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Load extra state from sharded checkpoint.
 
@@ -108,12 +107,6 @@ def _load_extra_state_from_sharded_checkpoint(
         model: the model to load extra state into
         checkpoint_name: the checkpoint folder path
         prefix: the prefix to add to the modelopt_state keys
-        metadata: the metadata for distributed checkpointing
-
-    Note:
-        The metadata includes several breaking changes. For example, `singleton_local_shards`
-        is set to `True` (was not set before) in megatron-core-0.15.0. This flag affects the
-        sharded state_dict format and must be consistent between saving and loading.
     """
     sharded_state_dict = model.sharded_state_dict(prefix=prefix)
     extra_sharded_state_dict = {k: v for k, v in sharded_state_dict.items() if "_extra_state" in k}
@@ -135,7 +128,6 @@ def restore_sharded_modelopt_state(
     model: list[torch.nn.Module],
     checkpoint_name: str | Path,
     prefix: str = "",
-    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Restore modelopt_state from the sharded state_dict format.
 
@@ -143,12 +135,6 @@ def restore_sharded_modelopt_state(
         model: the model to restore the modelopt optimization
         checkpoint_name: the checkpoint folder path
         prefix: the prefix to add to the modelopt_state keys ("model." for NeMo)
-        metadata: the metadata for distributed checkpointing
-
-    Note:
-        The metadata includes several breaking changes. For example, `singleton_local_shards`
-        is set to `True` (was not set before) in megatron-core-0.15.0. This flag affects the
-        sharded state_dict format and must be consistent between saving and loading.
     """
     import modelopt
     import modelopt.torch.opt as mto
@@ -175,4 +161,4 @@ def restore_sharded_modelopt_state(
 
     model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
 
-    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix, metadata=metadata)
+    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix)
