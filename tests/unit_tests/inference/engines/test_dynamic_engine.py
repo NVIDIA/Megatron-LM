@@ -6232,8 +6232,13 @@ class TestChunkedPrefillCudaGraphs:
         delete_cuda_graphs()
         return DynamicInferenceEngine(controller, context)
 
-    def _run_to_completion(self, engine, prompts, num_tokens_to_generate):
-        """Add all prompts and run to completion, returning {req_id: generated_tokens}."""
+    def _run_to_completion(self, engine, prompts, num_tokens_to_generate, conv_snapshots=None):
+        """Add all prompts and run to completion, returning {req_id: generated_tokens}.
+
+        `conv_snapshots`, if given, is appended one clone of request 0's conv
+        state per step, so a caller can inspect the state at a chosen step
+        instead of only the generated tokens.
+        """
         for i, prompt in enumerate(prompts):
             request = DynamicInferenceRequest(
                 request_id=i,
@@ -6247,9 +6252,18 @@ class TestChunkedPrefillCudaGraphs:
 
         finished = {}
         step_count = 0
+        # The slot index is read once and reused: by the final step the request
+        # has finished and its entry may already be cleared, but the cache row
+        # itself is only overwritten when a later request is allocated into it.
+        mamba_idx = None
         while engine.has_unfinished_requests():
             result = engine.step_modern()
             step_count += 1
+            if conv_snapshots is not None:
+                if mamba_idx is None:
+                    mamba_idx = engine.context.mamba_metadata.request_to_mamba_state_idx[0].item()
+                    assert mamba_idx >= 0, "request 0 has no mamba slot after its first step"
+                conv_snapshots.append(engine.context.mamba_conv_states[:, mamba_idx].clone())
             for record in result["finished_request_records"]:
                 merged = record.merge()
                 finished[merged.request_id] = list(merged.generated_tokens)
@@ -6331,7 +6345,7 @@ class TestChunkedPrefillCudaGraphs:
 
     # d_conv is 4 for both mixers, so a final chunk of 2 or 3 tokens is shorter
     # than the conv window. Deriving the conv state from that slice alone
-    # zero-fills the taps that predate it, and the first decode step then
+    # zero-fills the columns that predate it, and the first decode step then
     # convolves against zeros instead of the previous chunk's tail.
     @pytest.mark.internal
     @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
@@ -6345,7 +6359,7 @@ class TestChunkedPrefillCudaGraphs:
 
         Regression test for the conv-state carry: without
         `causal_conv1d_varlen_carry_states` the saved state loses its leading
-        taps here and the generated tokens diverge from the unchunked run.
+        columns here and the generated tokens diverge from the unchunked run.
 
         Run under capture as well as eagerly: the carry op's shape-dependent
         branches (the `total_tokens == 0` early return, the out-of-range column
@@ -6375,13 +6389,15 @@ class TestChunkedPrefillCudaGraphs:
         prompts = [torch.arange(prompt_len, dtype=torch.int64, device=device)]
         num_tokens_to_generate = 8
 
+        baseline_snapshots = []
         baseline_engine = self._build_engine(
             model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
         )
         baseline_outputs, _ = self._run_to_completion(
-            baseline_engine, prompts, num_tokens_to_generate
+            baseline_engine, prompts, num_tokens_to_generate, conv_snapshots=baseline_snapshots
         )
 
+        chunked_snapshots = []
         chunked_engine = self._build_engine(
             model,
             enable_chunked_prefill=True,
@@ -6389,11 +6405,54 @@ class TestChunkedPrefillCudaGraphs:
             context_max_tokens=context_max_tokens,
         )
         chunked_outputs, _ = self._run_to_completion(
-            chunked_engine, prompts, num_tokens_to_generate
+            chunked_engine, prompts, num_tokens_to_generate, conv_snapshots=chunked_snapshots
         )
 
         assert baseline_outputs[0] == chunked_outputs[0], (
             f"{ssm_mixer}: a {final_chunk_len}-token final prefill chunk diverged from "
             f"the unchunked baseline (num_cuda_graphs={num_cuda_graphs}); baseline "
             f"{baseline_outputs[0]} != chunked {chunked_outputs[0]}"
+        )
+
+        # Generated tokens are too blunt on their own: a zero-filled carry
+        # perturbs two of the four conv-state columns, and Mamba2 absorbs that
+        # without moving a top-k=1 argmax, so assert on the state directly.
+        #
+        # It has to be the last prefill step. The conv state holds only the last
+        # d_conv tokens, so a few decode steps later those columns have been
+        # rolled out of it and only their knock-on effect remains.
+        baseline_prefill_steps = 1
+        chunked_prefill_steps = math.ceil(prompt_len / context_max_tokens)
+        for name, snapshots, prefill_steps in (
+            ("baseline", baseline_snapshots, baseline_prefill_steps),
+            ("chunked", chunked_snapshots, chunked_prefill_steps),
+        ):
+            # The first generated token comes out of the final prefill step, so
+            # the rest cost one decode step each. Checked rather than assumed: a
+            # different prompt split would otherwise leave the comparison below
+            # on two decode-step snapshots, which match no matter what.
+            assert len(snapshots) == prefill_steps + num_tokens_to_generate - 1, (
+                f"{name}: expected {prefill_steps} prefill steps and "
+                f"{num_tokens_to_generate - 1} decode steps, got {len(snapshots)} steps"
+            )
+
+        baseline_conv = baseline_snapshots[baseline_prefill_steps - 1]
+        chunked_conv = chunked_snapshots[chunked_prefill_steps - 1]
+
+        # Both runs end prefill having seen the same prompt tokens, so the states
+        # should agree. The only SSM layer sits first in the "M*-" pattern, so its
+        # conv input is a projection of the embeddings and accumulates no
+        # cross-chunk error; the tolerance covers GEMM tiling differences between
+        # a long and a short prefill, while a dropped carry shifts a column by O(1).
+        torch.testing.assert_close(
+            baseline_conv,
+            chunked_conv,
+            rtol=2e-2,
+            atol=2e-2,
+            msg=lambda default: (
+                f"{ssm_mixer}: conv state after a {final_chunk_len}-token final prefill "
+                f"chunk does not match the unchunked baseline "
+                f"(num_cuda_graphs={num_cuda_graphs}). The leading columns are the ones "
+                f"the carry restores.\n{default}"
+            ),
         )
