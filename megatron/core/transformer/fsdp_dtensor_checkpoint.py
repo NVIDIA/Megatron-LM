@@ -414,29 +414,27 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
 
 def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
-    """Handle GDN-family fused projections in model and optimizer state dicts.
+    """Handle GDN (Gated DeltaNet) fused projections in model and optimizer state dicts.
 
     GDN layers fuse query/key/value/gate/beta/alpha projections into a single
-    ``in_proj.weight`` ColumnParallelLinear, while KDA uses its own five-way
-    query/key/value/g/gate split and a separate beta projection. Both variants
-    share the query/key/value ``conv1d`` split. For FSDP checkpoints these fused
-    tensors must be split back into their constituent sub-tensors so that each
-    can be independently TP-sharded — otherwise loading a checkpoint written at
-    TP=M into TP=N would slice across logical component boundaries.
+    ``in_proj.weight`` ColumnParallelLinear, and query/key/value into ``conv1d``
+    (weight + optional bias).  For FSDP checkpoints these fused tensors must be
+    split back into their constituent sub-tensors so that each can be
+    independently TP-sharded — otherwise loading a checkpoint written at TP=M
+    into TP=N would slice across logical component boundaries.
 
     This is analogous to :func:`handle_swiglu_in_state_dict` which splits
     ``linear_fc1`` into ``weight_w`` / ``weight_v``.
 
-    Sub-key naming follows each module's ``in_proj_split_names`` and
-    ``in_proj_split_sections`` metadata::
+    Sub-key naming follows ``GatedDeltaNet.sharded_state_dict()``::
 
-        GDN in_proj.weight → .query / .key / .value / .z / .beta / .alpha (6-way)
-        KDA in_proj.weight → .query / .key / .value / .g / .gate (5-way)
+        in_proj.weight  → .query / .key / .value / .z / .beta / .alpha   (6-way)
         conv1d.weight   → .query / .key / .value                         (3-way)
         conv1d.bias     → .query / .key / .value                         (3-way)
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
 
+    GDN_IN_PROJ_NAMES = ["query", "key", "value", "z", "beta", "alpha"]
     GDN_CONV1D_NAMES = ["query", "key", "value"]
 
     def _strip_wrappers(path):
@@ -447,117 +445,36 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return '.'.join(parts)
 
     # ------------------------------------------------------------------
-    # Build the per-GDN-family-module split-size map by walking the model tree.
-    # Both GDN and KDA expose qk_dim / v_dim / in_proj_dim; the split metadata
-    # is authoritative because their in_proj layouts are different.
+    # Build per-GDN-module split-size map by walking the model tree.
+    # GDN modules are identified by the presence of qk_dim / v_dim /
+    # in_proj_dim attributes (set in GatedDeltaNet.__init__).
     # ------------------------------------------------------------------
-    projection_info = {}  # normalized path → split sizes and names
-    for name, module in model.named_modules():
-        if not all(hasattr(module, attr) for attr in ('qk_dim', 'v_dim', 'in_proj_dim')):
+    _gdn_info = {}  # normalized_path → {in_proj_sizes, conv1d_sizes}
+    for name, mod in model.named_modules():
+        if not (hasattr(mod, 'qk_dim') and hasattr(mod, 'v_dim') and hasattr(mod, 'in_proj_dim')):
             continue
-        has_names = hasattr(module, 'in_proj_split_names')
-        has_sections = hasattr(module, 'in_proj_split_sections')
-        if not has_names and not has_sections:
-            continue
-        if not (has_names and has_sections):
-            raise ValueError(
-                f"GDN-family module {name!r} must define both in_proj_split_names and "
-                "in_proj_split_sections."
-            )
-
-        in_proj_names = tuple(module.in_proj_split_names)
-        in_proj_sizes = tuple(module.in_proj_split_sections)
-        if not in_proj_names or len(in_proj_sizes) != len(in_proj_names):
-            raise ValueError(
-                f"GDN-family module {name!r} has mismatched in_proj split metadata: "
-                f"{len(in_proj_sizes)} sizes for {len(in_proj_names)} names."
-            )
-        if any(not isinstance(split_name, str) or not split_name for split_name in in_proj_names):
-            raise ValueError(
-                f"GDN-family module {name!r} has invalid in_proj split names: {in_proj_names}."
-            )
-        if len(set(in_proj_names)) != len(in_proj_names):
-            raise ValueError(
-                f"GDN-family module {name!r} has duplicate in_proj split names: "
-                f"{in_proj_names}."
-            )
-        if any(
-            not isinstance(size, int) or isinstance(size, bool) or size <= 0
-            for size in in_proj_sizes
-        ):
-            raise ValueError(
-                f"GDN-family module {name!r} has invalid in_proj split sizes: {in_proj_sizes}."
-            )
-
-        tp_size = getattr(module, 'tp_size', 1)
-        if not isinstance(tp_size, int) or isinstance(tp_size, bool) or tp_size <= 0:
-            raise ValueError(f"GDN-family module {name!r} has invalid tp_size={tp_size!r}.")
-        if module.in_proj_dim % tp_size != 0:
-            raise ValueError(
-                f"GDN-family module {name!r} has in_proj_dim={module.in_proj_dim} "
-                f"which is not divisible by tp_size={tp_size}."
-            )
-        expected_size = module.in_proj_dim // tp_size
-        if sum(in_proj_sizes) != expected_size:
-            raise ValueError(
-                f"GDN-family module {name!r} has in_proj split sizes totaling "
-                f"{sum(in_proj_sizes)}, expected {expected_size}."
-            )
-
-        qk_size = getattr(module, 'qk_dim_local_tp', None)
-        value_size = getattr(module, 'v_dim_local_tp', None)
-        if qk_size is None or value_size is None:
-            if module.qk_dim % tp_size != 0 or module.v_dim % tp_size != 0:
-                raise ValueError(
-                    f"GDN-family module {name!r} qk_dim/v_dim must be divisible by "
-                    f"tp_size={tp_size}."
-                )
-            qk_size = module.qk_dim // tp_size
-            value_size = module.v_dim // tp_size
-
-        normalized_name = _strip_wrappers(name)
-        if normalized_name in projection_info:
-            raise ValueError(f"Multiple GDN-family modules normalize to path {normalized_name!r}.")
-        projection_info[normalized_name] = {
-            'in_proj_sizes': in_proj_sizes,
-            'in_proj_names': in_proj_names,
-            'conv1d_sizes': (qk_size, qk_size, value_size),
+        tp = getattr(mod, 'tp_size', 1)
+        qk = mod.qk_dim // tp
+        v = mod.v_dim // tp
+        nvh = mod.num_value_heads // tp
+        _gdn_info[_strip_wrappers(name)] = {
+            'in_proj_sizes': [qk, qk, v, v, nvh, nvh],
+            'conv1d_sizes': [qk, qk, v],
         }
 
-    if not projection_info:
+    if not _gdn_info:
         return model_state_dict, optimizer_state_dict
 
-    parameter_map = {}
-    for name, parameter in model.named_parameters():
-        normalized_name = _strip_wrappers(name)
-        if normalized_name in parameter_map and parameter_map[normalized_name] is not parameter:
-            raise ValueError(
-                f"Multiple parameters normalize to GDN-family key {normalized_name!r}."
-            )
-        parameter_map[normalized_name] = parameter
-
-    def _get_parameter(key):
-        normalized_key = _strip_wrappers(key)
-        try:
-            return parameter_map[normalized_key]
-        except KeyError as error:
-            raise KeyError(
-                f"No model parameter matches GDN-family state-dict key {key!r} "
-                f"(normalized as {normalized_key!r})."
-            ) from error
-
     def _match_gdn_key(key):
-        """Return split metadata when ``key`` names a fused GDN-family parameter."""
+        """Return (split_sizes, sub_names, split_dim) if *key* is a GDN fused
+        parameter that needs splitting, else ``None``."""
         norm = _strip_wrappers(key)
-        for module_path, info in projection_info.items():
-            if module_path:
-                if not norm.startswith(module_path + '.'):
-                    continue
-                rel = norm[len(module_path) + 1 :]
-            else:
-                rel = norm
+        for gdn_path, info in _gdn_info.items():
+            if not norm.startswith(gdn_path + '.'):
+                continue
+            rel = norm[len(gdn_path) + 1 :]
             if rel == 'in_proj.weight':
-                return info['in_proj_sizes'], info['in_proj_names'], 0
+                return info['in_proj_sizes'], GDN_IN_PROJ_NAMES, 0
             if rel in ('conv1d.weight', 'conv1d.bias'):
                 return info['conv1d_sizes'], GDN_CONV1D_NAMES, 0
         return None
@@ -571,10 +488,15 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return slice(s.start + offset, s.stop + offset)
 
     def split_gdn_fused(data, dist_param, split_sizes, split_dim):
-        """Split a fused GDN-family projection DTensor into component DTensors.
+        """Split a fused GDN projection DTensor into per-component DTensors.
 
-        The implementation handles both model-state DTensors and optimizer-state
-        tensors while preserving FSDP and tensor-parallel metadata.
+        Args:
+            data: The tensor to split. May be a DTensor (model state dict) or a
+                plain Tensor (optimizer states from FusedAdam).
+            dist_param: The corresponding model parameter (always a DTensor).
+                Used for global shape, numel, FSDP slice, and dist index metadata.
+            split_sizes: List of sizes for each component along split_dim.
+            split_dim: Dimension along which to split.
         """
         total_split = sum(split_sizes)
         if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
@@ -658,7 +580,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
-        dist_param = _get_parameter(key)
+        dist_param = model.get_parameter(f"module.{key}")
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
@@ -686,7 +608,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = _get_parameter(key)
+                    dist_param = model.get_parameter(key[len("module.") :])
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
