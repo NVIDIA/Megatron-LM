@@ -377,6 +377,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
+        use_default_cp_group = not (
+            packed_seq_params is not None and packed_seq_params.local_cp_size == 1
+        )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -417,6 +420,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    use_default_cp_group=use_default_cp_group,
                 )
         elif self.position_embedding_type == 'yarn':
             if not InferenceMode.is_active() or not self.config.flash_decode:
@@ -428,6 +432,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    use_default_cp_group=use_default_cp_group,
                 )
             else:
                 raise NotImplementedError(
@@ -440,6 +445,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    use_default_cp_group=use_default_cp_group,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE

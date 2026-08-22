@@ -21,6 +21,18 @@ except ImportError:
 from tests.unit_tests.test_utilities import Utils
 
 
+class FakeCPGroup:
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
 class TestMultimodalRotaryEmbedding:
     def setup_method(self):
         Utils.initialize_model_parallel(1, 1)
@@ -93,6 +105,17 @@ class TestRotaryEmbedding:
         assert output.shape[3] == self.kv_channels
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_can_disable_default_cp_group(self):
+        self.rope_gpu_init.cp_group = FakeCPGroup(size=2, rank=0)
+
+        output = self.rope_gpu_init(64, use_default_cp_group=False)
+
+        assert output.shape[0] == 64
+        assert output.shape[1] == 1
+        assert output.shape[2] == 1
+        assert output.shape[3] == self.kv_channels
 
 
 class TestQKVRotaryEmbedding:
