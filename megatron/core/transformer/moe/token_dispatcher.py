@@ -35,15 +35,6 @@ from megatron.core.transformer.moe.fused_a2a import (
     new_nccl_ep_buffer,
     set_deepep_num_sms,
 )
-from megatron.core.transformer.moe.replica_planner import (
-    HybridEPReplicaWeightBridge,
-    ReplicaPlannerWorkspace,
-    plan_replica_routes,
-    start_replica_grad_reduce_after_expert_backward,
-    start_replica_weight_prefetch_before_combine_backward,
-    wait_replica_grad_reduce_after_dispatch_backward,
-    wait_replica_weight_prefetch_before_expert_backward,
-)
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -53,6 +44,15 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
+)
+from megatron.core.transformer.moe.replica_planner import (
+    HybridEPReplicaWeightBridge,
+    ReplicaPlannerWorkspace,
+    plan_replica_routes,
+    start_replica_grad_reduce_after_expert_backward,
+    start_replica_weight_prefetch_before_combine_backward,
+    wait_replica_grad_reduce_after_dispatch_backward,
+    wait_replica_weight_prefetch_before_expert_backward,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1174,9 +1174,14 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        align_size = get_align_size_for_quantization(self.config)
-        if align_size > 0:
-            self.pad_multiple = align_size
+        if (
+            self.config.moe_flex_dispatcher_backend != "replica_hybridep"
+            or self.config.fp8
+            or self.config.fp4
+        ):
+            align_size = get_align_size_for_quantization(self.config)
+            if align_size > 0:
+                self.pad_multiple = align_size
         if self._padded_num_tokens is not None and hidden_states.shape[0] < self._padded_num_tokens:
             pad_rows = self._padded_num_tokens - hidden_states.shape[0]
             hidden_states = torch.cat(
@@ -1466,8 +1471,15 @@ class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = int(routing_map.shape[0])
         semantic_probs = probs.reshape(num_tokens, self.semantic_num_experts)
+        semantic_routing_map = routing_map.reshape(
+            num_tokens, self.semantic_num_experts
+        )
+        # The routing map is authoritative. Selecting directly from dense
+        # probabilities can silently change a zero-probability route when
+        # several unselected experts tie at zero.
+        routed_probs = semantic_probs.masked_fill(~semantic_routing_map, float("-inf"))
         self.semantic_token_probs, self.semantic_token_indices = torch.topk(
-            semantic_probs, self.router_topk, dim=-1
+            routed_probs, self.router_topk, dim=-1
         )
         self.semantic_token_indices = self.semantic_token_indices.to(torch.int32)
         self.semantic_tokens_per_expert = torch.zeros(
