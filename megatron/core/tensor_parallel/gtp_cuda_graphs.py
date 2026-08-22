@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
 import torch
 
+from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+    gtp_symm_pool_ctx,
+    is_gtp_symm_pool_registered,
+)
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -242,6 +246,10 @@ def allocate_graph_wgrad_rings(
             )
             params_by_key[key].append(param)
 
+    # Symm-RS: GRAPHED chains send their persistent ring slot directly, so allocating the
+    # slot from the window-registered pool puts the RS send buffer in the NCCL symmetric
+    # window. This runs pre-capture and the pool routing is collective-free, so it is
+    # capture-safe; slot addresses stay stable either way.
     total_bytes = 0
     buffer_count = 0
     new_slots = []
@@ -249,13 +257,19 @@ def allocate_graph_wgrad_rings(
         slot_count = min(ring_size, len(matching_params))
         slots = []
         exemplar = matching_params[0]
+        assert all(p.group is exemplar.group for p in matching_params), (
+            "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
+            "every param sharing a ring key must share its process group"
+        )
+        symm = is_gtp_symm_pool_registered(exemplar.group)
         for slot_index in range(slot_count):
-            tensor = torch.empty(
-                exemplar._unsharded_shape_padded,
-                dtype=exemplar.main_grad.dtype,
-                device=exemplar.device,
-                memory_format=torch.contiguous_format,
-            )
+            with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
+                tensor = torch.empty(
+                    exemplar._unsharded_shape_padded,
+                    dtype=exemplar.main_grad.dtype,
+                    device=exemplar.device,
+                    memory_format=torch.contiguous_format,
+                )
             if exemplar.pad_length > 0:
                 tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
             slot = GraphWgradRingSlot(
@@ -293,6 +307,16 @@ def allocate_graph_wgrad_rings(
         f"[GTP Wgrad Ring] allocated {buffer_count} buffers "
         f"({total_bytes / 1024**2:.1f} MB), ring_size={ring_size}",
     )
+
+
+def clear_graph_wgrad_rings() -> None:
+    """Drop every ring slot so a rebuilt model reallocates them.
+
+    Without this, the stale non-empty dict makes allocate_graph_wgrad_rings a silent
+    no-op on the next build, leaving slots keyed by the old model's groups and shapes.
+    GPU work must be idle (callers synchronize).
+    """
+    _GRAPH_WGRAD_RINGS.clear()
 
 
 _CG_MEMPOOL_DEVICE = None
