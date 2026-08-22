@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -35,6 +36,30 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+
+try:
+    from megatron.core.inference.attention.fused_qk_norm import (
+        can_use_fused_qk_norm as _can_use_fused_qk_norm,
+    )
+    from megatron.core.inference.attention.fused_qk_norm import (
+        can_use_grouped_qk_norm as _can_use_grouped_qk_norm,
+    )
+    from megatron.core.inference.attention.fused_qk_norm import (
+        fused_qk_rmsnorm as _fused_qk_rmsnorm,
+    )
+    from megatron.core.inference.attention.fused_qk_norm import (
+        fused_qk_rmsnorm_grouped as _fused_qk_rmsnorm_grouped,
+    )
+except Exception:  # keep attention importable if the inference helper is unavailable
+    _can_use_fused_qk_norm = None
+    _fused_qk_rmsnorm = None
+    _can_use_grouped_qk_norm = None
+    _fused_qk_rmsnorm_grouped = None
+
+try:
+    from megatron.core.inference.attention import flashinfer_decode as _flashinfer_decode
+except Exception:  # keep attention importable if the inference helper is unavailable
+    _flashinfer_decode = None
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
@@ -55,6 +80,10 @@ from ..models.common.embeddings.yarn_rotary_pos_embedding import (
 )
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+
+# Split QKV with torch.split (views) instead of TE's SplitAlongDim. Under test as the
+# suspected source of one full-QKV-sized copy per decode layer; see COPY-ID-S18.
+_QKV_SPLIT_VIEWS: bool = os.environ.get("MCORE_QKV_SPLIT_VIEWS", "0") == "1"
 
 try:
     from einops import rearrange
@@ -111,6 +140,11 @@ except ImportError:
     HAVE_FMLA = False
 
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+# See _resolve_flash_version: benchmarking-only override for a config field that
+# has no CLI flag. Empty means "leave the config's choice alone".
+_FA_VERSION_ENV = os.environ.get("MCORE_FLASH_ATTN_VERSION", "")
+
 
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -1005,6 +1039,10 @@ class Attention(MegatronModule, ABC):
         when both are False the FA2 kernel is used.
         """
         pinned = self.flash_attention_version
+        # Benchmarking override: `flash_attention_version` has no CLI flag, so this
+        # is the only way to A/B generations from a launch script. Config wins.
+        if pinned is None and _FA_VERSION_ENV:
+            pinned = int(_FA_VERSION_ENV)
         if pinned == 4:
             assert (
                 HAVE_FA4
@@ -1202,6 +1240,17 @@ class Attention(MegatronModule, ABC):
                     output_total = self._apply_sink_softmax_correction_bshd(
                         output_total, softmax_lse, softmax_offset
                     )
+            elif _flashinfer_decode is not None and _flashinfer_decode.can_use(
+                q, block_table, need_lse, window_size, tokens_per_request
+            ):
+                # Blackwell-native paged decode; ~24% under FA2 at these shapes.
+                if getattr(self, "softmax_scale", None) is not None:
+                    softmax_scale = self.softmax_scale
+                else:
+                    softmax_scale = q.shape[-1] ** -0.5
+                output_total = _flashinfer_decode.decode(
+                    q, k, v, block_table, seqlens_k, max_seqlen_k, softmax_scale
+                )
             else:
                 if use_fa4:
                     if getattr(self, "softmax_scale", None) is not None:
@@ -1892,7 +1941,7 @@ class SelfAttention(Attention):
                 self.hidden_size_per_attention_head,
             ]
 
-            if SplitAlongDim is not None:
+            if SplitAlongDim is not None and not _QKV_SPLIT_VIEWS:
                 query, gate, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
                 query, gate, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
@@ -1909,31 +1958,66 @@ class SelfAttention(Attention):
             if not split_qkv:
                 return mixed_qkv, split_arg_list
 
-            if SplitAlongDim is not None:
+            if SplitAlongDim is not None and not _QKV_SPLIT_VIEWS:
                 query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
                 query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
 
-        # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
-        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
-
-        if self.config.num_query_groups < self.world_size:
-            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
-            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
-            # This is step 4 in the list of steps above.
-            idx = get_pg_rank(self.pg_collection.tp) % (
-                self.world_size // self.config.num_query_groups
+        # The [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] reshape below is a *copy*, not a
+        # view: merging the group and head axes needs the group stride to equal
+        # (np/ng) * hn, and it is (np/ng + 2) * hn because each group's k and v head sit
+        # between consecutive groups' q heads. When the fused q/k norm can read the
+        # grouped layout directly it writes that shape itself for free, and the copy --
+        # one full-size strided copy per layer per decode step -- never happens.
+        if (
+            _can_use_grouped_qk_norm is not None
+            and self.config.num_query_groups >= self.world_size
+            and _can_use_grouped_qk_norm(self.q_layernorm, self.k_layernorm, query, key)
+        ):
+            query, key = _fused_qk_rmsnorm_grouped(
+                query,
+                key,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                self.config.layernorm_epsilon,
+                self.config.layernorm_zero_centered_gamma,
             )
-            size = self.num_attention_heads_per_partition // (
-                self.world_size // self.config.num_query_groups
+        else:
+            # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+            query = query.reshape(
+                query.size(0), query.size(1), -1, self.hidden_size_per_attention_head
             )
-            query = query[:, :, idx * size : (idx + 1) * size, :]
 
-        if self.q_layernorm is not None:
-            query = apply_module(self.q_layernorm)(query)
+            if self.config.num_query_groups < self.world_size:
+                # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+                # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+                # This is step 4 in the list of steps above.
+                idx = get_pg_rank(self.pg_collection.tp) % (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = self.num_attention_heads_per_partition // (
+                    self.world_size // self.config.num_query_groups
+                )
+                query = query[:, :, idx * size : (idx + 1) * size, :]
 
-        if self.k_layernorm is not None:
-            key = apply_module(self.k_layernorm)(key)
+            if _can_use_fused_qk_norm is not None and _can_use_fused_qk_norm(
+                self.q_layernorm, self.k_layernorm, query, key
+            ):
+                # Fuse the two per-head RMSNorm launches into one (env-gated, decode).
+                query, key = _fused_qk_rmsnorm(
+                    query,
+                    key,
+                    self.q_layernorm.weight,
+                    self.k_layernorm.weight,
+                    self.config.layernorm_epsilon,
+                    self.config.layernorm_zero_centered_gamma,
+                )
+            else:
+                if self.q_layernorm is not None:
+                    query = apply_module(self.q_layernorm)(query)
+
+                if self.k_layernorm is not None:
+                    key = apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()
