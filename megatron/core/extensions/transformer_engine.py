@@ -457,10 +457,12 @@ def _gtp_pre_init(
     return shard_out, gtp_ctx
 
 
-def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
+def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, replica_group=None):
     """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
 
     ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
+    ``replica_group`` is the caller's gtp_remat-excluded DP x CP group, stamped on each weight for
+    distributed checkpointing (see ``gtp_replica_rank``).
     """
     from megatron.core.tensor_parallel.gtp_api import attach_gtp_to_presharded_module
 
@@ -469,7 +471,9 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
     # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
     # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
     module.out_features = logical_out_features
-    attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+    attach_gtp_to_presharded_module(
+        module, gtp_remat_group, pad_length, is_grouped=is_grouped, replica_group=replica_group
+    )
 
 
 @contextmanager
@@ -483,11 +487,13 @@ def _init_gtp_remat_context(
     is_grouped=False,
     rng_via_kwarg=True,
     out_split_size=1,
+    replica_group=None,
 ):
     """Wrap a plain TE constructor: yield out_features for ``super().__init__`` (pre-sharded under
     GTP), then attach GTP wiring on exit (skipped if construction raises, so it can't half-init).
 
     ``out_split_size`` = tp_size TE splits ``out_features`` by after GTP (column-parallel), else 1.
+    ``replica_group`` = the caller's gtp_remat-excluded DP x CP group (checkpoint writer election).
     """
     if gtp_remat_group is None or gtp_remat_group.size() <= 1:
         yield output_size
@@ -502,7 +508,7 @@ def _init_gtp_remat_context(
         out_split_size=out_split_size,
     )
     yield out_features
-    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
+    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -887,6 +893,7 @@ class TELinear(te.pytorch.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
         gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -1031,6 +1038,7 @@ class TELinear(te.pytorch.Linear):
             extra_kwargs,
             is_expert=is_expert,
             out_split_size=tp_size if te_parallel_mode == "column" else 1,
+            replica_group=gtp_replica_group,
         )
 
         with init_quant_context, init_gtp_remat_context as output_size:
@@ -1260,6 +1268,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             extra_kwargs,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
+            replica_group=getattr(pg_collection, "dp_cp", None),
         )
 
         with init_quant_context, init_gtp_remat_context as gtp_output_size:
@@ -1444,6 +1453,7 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
+            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
         )
 
         # Set proper partition_stride
@@ -1705,6 +1715,7 @@ class TERowParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
+            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -2274,6 +2285,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=True,
                 is_grouped=True,
                 out_split_size=tp_size if parallel_mode == "column" else 1,
+                replica_group=getattr(pg_collection, "expt_dp", None),
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:
