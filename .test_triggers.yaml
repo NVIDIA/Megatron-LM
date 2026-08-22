@@ -1,0 +1,3 @@
+# Repo root: build configs, CI, Dockerfiles, pyproject.toml, etc.
+# Changes here could affect the test environment, so run everything.
+test_buckets: ALL
