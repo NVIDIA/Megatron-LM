@@ -85,21 +85,14 @@ def test_muon_qkv_split_shapes():
 @pytest.mark.parametrize("tp_mode", ["duplicated", "blockwise"])
 @pytest.mark.parametrize("gtp_rank", [0, 1])
 def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mode, gtp_rank):
-    """GTP_remat pads dim 0 for alignment. scaled_orthogonalize_fn itself stays GTP-agnostic
-    (unmodified 3-arg signature); scaled_orthogonalize_fn_with_gtp_remat corrects for it by
-    stripping the padding out of the tensor before the call and restoring it after -- exact,
-    since every rank already holds a uniform, fully-GTP-reconstructed view of the tensor at
-    that point for both duplicated and blockwise. distributed does not correct for the
-    padding (its Newton-Schulz is distributed via scaled_orthogonalize_fn's own internal
-    Gram all-reduce over the still row-sharded tensor, where stripping isn't safe)."""
+    """scaled_orthogonalize_fn_with_gtp_remat strips GTP_remat's dim-0 padding before
+    calling scaled_orthogonalize_fn (unmodified, GTP-agnostic) and restores it after."""
     from types import SimpleNamespace
 
     gtp_group = object()
     pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
 
-    # Logical (unpadded) weight has 6 rows. GTP_remat pads dim 0 to 8 rows for alignment and
-    # shards evenly across 2 ranks, so each local shard has 4 rows; the 2 padding rows land
-    # at the tail of rank 1's shard (see gtp_remat_shard_dim0).
+    # 6 true rows, padded to 8 and sharded across 2 ranks: rank 1's shard holds the 2 pad rows.
     full_grad = torch.tensor(
         [[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [0.0], [0.0]], device='cuda'
     )
@@ -138,15 +131,13 @@ def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mo
     seen_grad, _, _ = calls[0]
 
     if tp_mode == "duplicated":
-        # All-gathered over GTP (uniform on every rank): the 2 trailing pad rows are
-        # stripped before the call (NS sees only the true 6-row tensor) and restored after.
+        # Gathered tensor is uniform on every rank: strip 2, restore after.
         stripped_full = full_grad[:6]
         torch.testing.assert_close(seen_grad, stripped_full)
         restored = torch.nn.functional.pad(stripped_full + 100, (0, 0, 0, 2))
         expected = restored[gtp_rank * 4 : (gtp_rank + 1) * 4]
     else:
-        # blockwise: local block NS, no collective. Only rank 1's block actually contains
-        # padding, and is stripped/restored exactly (rank 0's block is untouched).
+        # blockwise: only rank 1's local block contains padding.
         if gtp_rank == 1:
             stripped_local = local_grad[:2]
             torch.testing.assert_close(seen_grad, stripped_local)
@@ -158,27 +149,19 @@ def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mo
     torch.testing.assert_close(result, expected)
 
 
-@pytest.mark.parametrize(
-    "gtp_rank,expected_local_pad_length", [(0, 0), (1, 1), (2, 2), (3, 2)]
-)
+@pytest.mark.parametrize("gtp_rank,expected_local_pad_length", [(0, 0), (1, 1), (2, 2), (3, 2)])
 def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
     monkeypatch, gtp_rank, expected_local_pad_length
 ):
-    """pad_length can exceed one shard's row count (e.g. small dim0 relative to
-    gtp_remat_size * pad_for_alignment), spreading the padding tail across several
-    trailing GTP ranks rather than only the last one. blockwise mode must attribute to
-    each rank only its own overlap with the padded tail, strip exactly that many rows
-    before scaled_orthogonalize_fn and restore them after. Ranks 2 and 3 here are entirely
-    padding (local_pad_length == shard_size, i.e. true dim0 == 0): scaled_orthogonalize_fn
-    must not even be called, and the result must be exact zero (NS(0) = 0), not derived from
-    a degenerate 0-row scale-factor call."""
+    """pad_length can span multiple ranks' shards, not just the last rank's. Each rank must
+    strip only its own overlap; a fully-padding rank (true dim0 == 0) must skip
+    scaled_orthogonalize_fn entirely and return exact zero."""
     from types import SimpleNamespace
 
     gtp_group = object()
     pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
 
-    # 4 GTP ranks, shard_size=2 rows each (padded dim0=8), pad_length=5: the trailing 5
-    # rows (padded dim0 6,7 fully rank3; 4,5 fully rank2; 3 half of rank1) are padding.
+    # 4 ranks, shard_size=2, pad_length=5: ranks 2 and 3 are fully padding, rank 1 half.
     gtp_remat_size = 4
     shard_size = 2
     pad_length = 5
@@ -215,7 +198,9 @@ def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
     else:
         assert len(calls) == 1
         torch.testing.assert_close(calls[0], local_grad[:true_dim0])
-        expected = torch.nn.functional.pad(local_grad[:true_dim0], (0, 0, 0, expected_local_pad_length))
+        expected = torch.nn.functional.pad(
+            local_grad[:true_dim0], (0, 0, 0, expected_local_pad_length)
+        )
         torch.testing.assert_close(result, expected)
 
 

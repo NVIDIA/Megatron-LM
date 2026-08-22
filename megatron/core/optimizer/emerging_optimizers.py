@@ -288,11 +288,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
           redundant compute; the smaller group is all-gathered beforehand.
 
         GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
-        duplicated strip it before calling scaled_orthogonalize_fn and restore it after,
-        since every rank holds a uniform, fully-GTP-reconstructed tensor at that point.
-        distributed does not correct for it (its Newton-Schulz distributes over the still
-        row-sharded tensor via scaled_orthogonalize_fn's own collective, so stripping isn't
-        safe there) -- see the warning in the distributed branch below.
+        duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
+        after, since every rank holds a uniform, fully-reconstructed tensor by then.
+        distributed does not: it stays row-sharded through its own collective, where
+        stripping isn't safe (known limitation).
         """
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
@@ -323,9 +322,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # rows of the full tensor is this rank's own padding.
             shard_size = grad.size(0)
             ranks_from_end = gtp_remat_size - 1 - gtp_rank
-            local_pad_length = min(
-                shard_size, max(0, pad_length - ranks_from_end * shard_size)
-            )
+            local_pad_length = min(shard_size, max(0, pad_length - ranks_from_end * shard_size))
             if local_pad_length == shard_size:
                 # Entirely padding: grad is exact zero, and NS(0) = 0.
                 return torch.zeros_like(grad)
@@ -335,10 +332,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return self._restore_pad(result, local_pad_length)
 
         if self.tp_mode == "duplicated":
-            # All-gather the full matrix over GTP (dim 0): every rank now holds the same
-            # padded tensor, so the padding can be stripped/restored exactly. Orthogonalize
-            # the whole tensor (scaled_orthogonalize_fn handles any TP sharding per tp_mode),
-            # reshard dim 0.
+            # All-gather over GTP (dim 0), strip/restore padding exactly (every rank now
+            # holds the same padded tensor), orthogonalize the whole matrix
+            # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
             gathered_grad = self._all_gather_tensor(grad, gtp_remat_group, 0)
             result = self.scaled_orthogonalize_fn(
                 self._strip_pad(gathered_grad, pad_length), tp_group, partition_dim
