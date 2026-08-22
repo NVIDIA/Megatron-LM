@@ -29,17 +29,17 @@ from megatron.core.optimizer.layer_sharded_a2a import (
     layer_sharded_all_to_all_bwd,
     layer_sharded_all_to_all_fwd,
 )
-from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, _check_eo_version
+from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+from megatron.core.utils import is_emerging_optimizers_min_version
 
 # The per-matrix baseline (ns_batch_size=1) runs on any emerging-optimizers that
 # ships the newton_schulz API — 0.2.0 included — so the module no longer skips
 # wholesale. Only tests that request batching (ns_batch_size > 1, needing the
 # batched 3-D Newton-Schulz of >= 0.3.0) skip on older installs.
-try:
-    _check_eo_version()
-    _HAVE_BATCHED_NS, _BATCHED_NS_REASON = True, ""
-except ImportError as _e:
-    _HAVE_BATCHED_NS, _BATCHED_NS_REASON = False, str(_e)
+_HAVE_BATCHED_NS = is_emerging_optimizers_min_version("0.3.0")
+_BATCHED_NS_REASON = (
+    "" if _HAVE_BATCHED_NS else "requires emerging-optimizers >= 0.3.0 (batched Newton-Schulz)"
+)
 
 
 def _require_batched_ns(ns_batch_size):
@@ -1204,6 +1204,11 @@ def test_fused_per_group_domains():
 def test_syrk_matches_gemm_relative_to_update():
     if not torch.cuda.is_available() or dist.get_world_size() < 2:
         pytest.skip("Requires CUDA and >= 2 ranks")
+    if not is_emerging_optimizers_min_version("0.4.0.dev0"):
+        # use_syrk=True now hard-raises in the constructor on older installs
+        # (gate inherited from TensorParallelMuon; newton_schulz_tp only gained
+        # use_syrk forwarding in 0.4.0, so the fallback paths cannot do SYRK).
+        pytest.skip("use_syrk requires emerging-optimizers >= 0.4.0")
     S = dist.get_world_size()
     r = dist.get_rank()
     lr, momentum = 1e-2, 0.95
