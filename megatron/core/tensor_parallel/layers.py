@@ -111,10 +111,11 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
 
 
 def copy_gtp_attributes(destination, source):
-    """Copy the GTP dedup tags (is_gtp_weight_remat, allreduce) and the checkpoint replica group
-    onto a param view/copy, so the optimizer's master shards stay classifiable by
-    param_is_not_gtp_duplicate and keep electing their writer off the caller's own groups."""
-    for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group"):
+    """Copy GTP metadata onto a param view/copy, so the optimizer's master shards stay
+    classifiable by param_is_not_gtp_duplicate (is_gtp_weight_remat, allreduce), keep
+    electing their checkpoint writer off the caller's own groups (gtp_replica_group), and
+    stay reconstructable by GTP_remat-aware orthogonalization (pad_length)."""
+    for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group", "pad_length"):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
 

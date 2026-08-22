@@ -265,6 +265,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         torch.distributed.all_gather(shards, t.contiguous(), group)
         return torch.cat(shards, dim=dim)
 
+    @staticmethod
+    def _strip_pad(t, pad_length):
+        """Drop the trailing ``pad_length`` rows of dim 0 (no-op if ``pad_length == 0``)."""
+        return t[:-pad_length] if pad_length else t
+
+    @staticmethod
+    def _restore_pad(t, pad_length):
+        """Re-append ``pad_length`` zero rows to dim 0 (no-op if ``pad_length == 0``)."""
+        return torch.nn.functional.pad(t, (0, 0, 0, pad_length)) if pad_length else t
+
     def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
         """Orthogonalize a (possibly GTP-sharded) momentum, then reshard.
 
@@ -276,6 +286,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         - **distributed**: distribute NS over GTP via small-Gram all-reduce. When both
           GTP and TP are active, NS is distributed over the larger group to minimize
           redundant compute; the smaller group is all-gathered beforehand.
+
+        GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
+        duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
+        after, since every rank holds a uniform, fully-reconstructed tensor by then.
+        distributed does not: it stays row-sharded through its own collective, where
+        stripping isn't safe (known limitation).
         """
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
@@ -295,21 +311,37 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
 
         gtp_remat_size = get_pg_size(gtp_remat_group)
+        gtp_rank = get_pg_rank(gtp_remat_group)
+        pad_length = getattr(p, 'pad_length', 0)
 
         if self.tp_mode == "blockwise":
             # Local block NS on this rank's GTP row-shard (shape [M/gtp_remat_size, K]):
             # partition_dim=None makes scaled_orthogonalize_fn run a plain Newton-Schulz on
-            # the shard with no GTP/TP collective.
-            return self.scaled_orthogonalize_fn(grad, tp_group, None)
+            # the shard with no GTP/TP collective. pad_length can exceed one shard's row
+            # count, so only the overlap between this rank's shard and the trailing padded
+            # rows of the full tensor is this rank's own padding.
+            shard_size = grad.size(0)
+            ranks_from_end = gtp_remat_size - 1 - gtp_rank
+            local_pad_length = min(shard_size, max(0, pad_length - ranks_from_end * shard_size))
+            if local_pad_length == shard_size:
+                # Entirely padding: grad is exact zero, and NS(0) = 0.
+                return torch.zeros_like(grad)
+            result = self.scaled_orthogonalize_fn(
+                self._strip_pad(grad, local_pad_length), tp_group, None
+            )
+            return self._restore_pad(result, local_pad_length)
 
         if self.tp_mode == "duplicated":
-            # All-gather the full matrix over GTP (dim 0), orthogonalize the whole tensor
+            # All-gather over GTP (dim 0), strip/restore padding exactly (every rank now
+            # holds the same padded tensor), orthogonalize the whole matrix
             # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
             gathered_grad = self._all_gather_tensor(grad, gtp_remat_group, 0)
-            gathered_grad = self.scaled_orthogonalize_fn(gathered_grad, tp_group, partition_dim)
-            shard_size = gathered_grad.size(0) // gtp_remat_size
-            gtp_rank = get_pg_rank(gtp_remat_group)
-            return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
+            result = self.scaled_orthogonalize_fn(
+                self._strip_pad(gathered_grad, pad_length), tp_group, partition_dim
+            )
+            result = self._restore_pad(result, pad_length)
+            reshard_size = result.size(0) // gtp_remat_size
+            return result[gtp_rank * reshard_size : (gtp_rank + 1) * reshard_size].contiguous()
 
         # distributed: NS via the small-Gram all-reduce (no redundant full-matrix NS).
         # A momentum with both TP and GTP as sharding axes takes two communication steps: an
@@ -317,6 +349,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
         # communication needed. partition_dim is what says whether TP is a sharding axis here,
         # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
+        #
+        # GTP_remat's alignment padding is not corrected for here -- see the class docstring.
         needs_two_step_communication = (
             partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
         )

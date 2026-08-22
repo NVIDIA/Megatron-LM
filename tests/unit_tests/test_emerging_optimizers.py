@@ -82,6 +82,128 @@ def test_muon_qkv_split_shapes():
     assert _get_qkv_split_shapes(gated_config) == [128, 128, 64, 64]
 
 
+@pytest.mark.parametrize("tp_mode", ["duplicated", "blockwise"])
+@pytest.mark.parametrize("gtp_rank", [0, 1])
+def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mode, gtp_rank):
+    """scaled_orthogonalize_fn_with_gtp_remat strips GTP_remat's dim-0 padding before
+    calling scaled_orthogonalize_fn (unmodified, GTP-agnostic) and restores it after."""
+    from types import SimpleNamespace
+
+    gtp_group = object()
+    pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+
+    # 6 true rows, padded to 8 and sharded across 2 ranks: rank 1's shard holds the 2 pad rows.
+    full_grad = torch.tensor(
+        [[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [0.0], [0.0]], device='cuda'
+    )
+    pad_length = 2
+    local_grad = full_grad[gtp_rank * 4 : (gtp_rank + 1) * 4].clone()
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = pad_length
+
+    optimizer = TensorParallelMuon(
+        params=[param], num_ns_steps=1, pg_collection=pg_collection, tp_mode=tp_mode
+    )
+
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: gtp_rank
+    )
+
+    def fake_all_gather(shards, _local_grad, _group):
+        shards[0].copy_(full_grad[:4])
+        shards[1].copy_(full_grad[4:])
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+
+    calls = []
+
+    def fake_orthogonalize(grad, tp_group, partition_dim=None):
+        calls.append((grad.clone(), tp_group, partition_dim))
+        return grad + 100
+
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn", fake_orthogonalize)
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(param, local_grad, None, None)
+
+    assert len(calls) == 1
+    seen_grad, _, _ = calls[0]
+
+    if tp_mode == "duplicated":
+        # Gathered tensor is uniform on every rank: strip 2, restore after.
+        stripped_full = full_grad[:6]
+        torch.testing.assert_close(seen_grad, stripped_full)
+        restored = torch.nn.functional.pad(stripped_full + 100, (0, 0, 0, 2))
+        expected = restored[gtp_rank * 4 : (gtp_rank + 1) * 4]
+    else:
+        # blockwise: only rank 1's local block contains padding.
+        if gtp_rank == 1:
+            stripped_local = local_grad[:2]
+            torch.testing.assert_close(seen_grad, stripped_local)
+            expected = torch.nn.functional.pad(stripped_local + 100, (0, 0, 0, 2))
+        else:
+            torch.testing.assert_close(seen_grad, local_grad)
+            expected = local_grad + 100
+
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize("gtp_rank,expected_local_pad_length", [(0, 0), (1, 1), (2, 2), (3, 2)])
+def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
+    monkeypatch, gtp_rank, expected_local_pad_length
+):
+    """pad_length can span multiple ranks' shards, not just the last rank's. Each rank must
+    strip only its own overlap; a fully-padding rank (true dim0 == 0) must skip
+    scaled_orthogonalize_fn entirely and return exact zero."""
+    from types import SimpleNamespace
+
+    gtp_group = object()
+    pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+
+    # 4 ranks, shard_size=2, pad_length=5: ranks 2 and 3 are fully padding, rank 1 half.
+    gtp_remat_size = 4
+    shard_size = 2
+    pad_length = 5
+    local_grad = torch.full((shard_size, 1), 3.0, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = pad_length
+
+    optimizer = TensorParallelMuon(
+        params=[param], num_ns_steps=1, pg_collection=pg_collection, tp_mode="blockwise"
+    )
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: gtp_remat_size
+    )
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: gtp_rank
+    )
+
+    calls = []
+
+    def fake_orthogonalize(grad, tp_group, partition_dim=None):
+        calls.append(grad.clone())
+        return grad  # identity: makes the strip/restore round-trip directly checkable
+
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn", fake_orthogonalize)
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(param, local_grad, None, None)
+
+    true_dim0 = shard_size - expected_local_pad_length
+    if true_dim0 <= 0:
+        assert calls == []
+        torch.testing.assert_close(result, torch.zeros_like(local_grad))
+    else:
+        assert len(calls) == 1
+        torch.testing.assert_close(calls[0], local_grad[:true_dim0])
+        expected = torch.nn.functional.pad(
+            local_grad[:true_dim0], (0, 0, 0, expected_local_pad_length)
+        )
+        torch.testing.assert_close(result, expected)
+
+
 def test_muon_optimizer_smoke():
     """Smoke test for TensorParallelMuon optimizer."""
     # Create a simple linear model for testing
