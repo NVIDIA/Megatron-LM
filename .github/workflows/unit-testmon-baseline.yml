@@ -20,14 +20,9 @@ on:
     branches: [main]
     types: [completed]
   workflow_dispatch:
-    inputs:
-      producer_run_id:
-        description: "Run ID of a successful scheduled CICD run whose images still exist"
-        required: true
-        type: string
 
 concurrency:
-  group: unit-testmon-baseline-${{ github.event.workflow_run.id || inputs.producer_run_id || github.run_id }}
+  group: unit-testmon-baseline-${{ github.event.workflow_run.head_sha || github.sha }}
   cancel-in-progress: true
 
 permissions:
@@ -37,7 +32,6 @@ permissions:
 
 jobs:
   prepare:
-    name: Resolve trusted producer
     runs-on: ubuntu-latest
     if: |
       github.repository == 'NVIDIA/Megatron-LM'
@@ -55,86 +49,36 @@ jobs:
         )
       )
     outputs:
-      producer_sha: ${{ steps.verify.outputs.producer_sha }}
-      producer_time: ${{ steps.verify.outputs.producer_time }}
+      producer_sha: ${{ steps.producer.outputs.sha }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - name: Verify scheduled producer run
+      - name: Resolve producer
         id: producer
         shell: bash -e -u -o pipefail {0}
         env:
-          GH_TOKEN: ${{ github.token }}
-          PRODUCER_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.producer_run_id }}
-          REPOSITORY: ${{ github.repository }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PRODUCER_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
-          if [[ ! "$PRODUCER_RUN_ID" =~ ^[0-9]+$ ]]; then
-            echo "Producer run ID must be numeric" >&2
-            exit 1
-          fi
-
-          RUN_JSON=$(gh api "repos/${REPOSITORY}/actions/runs/${PRODUCER_RUN_ID}")
-          if ! jq -e \
-            --arg repository "$REPOSITORY" \
-            --arg default_branch "$DEFAULT_BRANCH" '
-              .name == "CICD Megatron-LM"
-              and .path == ".github/workflows/cicd-main.yml"
-              and .event == "schedule"
-              and .status == "completed"
-              and .conclusion == "success"
-              and .repository.full_name == $repository
-              and .head_repository.full_name == $repository
-              and .head_branch == $default_branch
-              and (.head_sha | test("^[0-9a-fA-F]{40}$"))
-            ' <<< "$RUN_JSON" >/dev/null; then
-            echo "Run $PRODUCER_RUN_ID is not a successful scheduled CICD run on trusted main" >&2
-            exit 1
-          fi
-
-          echo "sha=$(jq -r '.head_sha | ascii_downcase' <<< "$RUN_JSON")" >> "$GITHUB_OUTPUT"
+          [[ "$PRODUCER_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          echo "sha=${PRODUCER_SHA,,}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout producer
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ steps.producer.outputs.sha }}
-          fetch-depth: 0
-
-      - name: Verify trusted main history
-        id: verify
-        shell: bash -e -u -o pipefail {0}
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          EXPECTED_SHA: ${{ steps.producer.outputs.sha }}
-        run: |
-          git fetch --no-tags origin \
-            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-
-          RESOLVED_SHA=$(git rev-parse 'HEAD^{commit}')
-          if [[ "$RESOLVED_SHA" != "$EXPECTED_SHA" ]]; then
-            echo "Checkout resolved to $RESOLVED_SHA, expected $EXPECTED_SHA" >&2
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$RESOLVED_SHA" "origin/${DEFAULT_BRANCH}"; then
-            echo "Producer $RESOLVED_SHA is not an ancestor of origin/${DEFAULT_BRANCH}" >&2
-            exit 1
-          fi
-
-          echo "producer_sha=$RESOLVED_SHA" >> "$GITHUB_OUTPUT"
-          echo "producer_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
       - name: Build baseline matrix
         id: matrix
         shell: bash -e -u -o pipefail {0}
         env:
-          PRODUCER_SHA: ${{ steps.verify.outputs.producer_sha }}
+          PRODUCER_SHA: ${{ steps.producer.outputs.sha }}
           ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
         run: |
           H100=$(yq -o json '[.products[].test_case[]]' \
             tests/test_utils/recipes/h100/unit-tests.yaml | jq -c \
               --arg sha "$PRODUCER_SHA" '
                 map({
-                  bucket: ., platform: "h100", world_size: 8,
-                  runner: "nvidia-ci-aws-gpu-x8", recipe_platform: "dgx_h100",
+                  bucket: ., runner: "nvidia-ci-aws-gpu-x8",
+                  recipe_platform: "dgx_h100",
                   image: ("766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:" + $sha + "-aws-h100")
                 }) | sort_by(.bucket)
               ')
@@ -145,33 +89,22 @@ jobs:
               tests/test_utils/recipes/gb200/unit-tests.yaml | jq -c \
                 --arg sha "$PRODUCER_SHA" '
                   map({
-                    bucket: ., platform: "gb200", world_size: 4,
-                    runner: "nvidia-ci-aws-use2-gpu-x4", recipe_platform: "dgx_gb200",
+                    bucket: ., runner: "nvidia-ci-aws-use2-gpu-x4",
+                    recipe_platform: "dgx_gb200",
                     image: ("766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm:" + $sha + "-gb-gpu")
                   }) | sort_by(.bucket)
                 ')
           fi
 
           MATRIX=$(jq -cn --argjson h100 "$H100" --argjson gb200 "$GB200" '$h100 + $gb200')
-          if ! jq -e '
-            length > 0
-            and any(.[]; .platform == "h100")
-            and (([.[] | .platform + "\u0000" + .bucket] | length)
-              == ([.[] | .platform + "\u0000" + .bucket] | unique | length))
-            and all(.[];
-              (.bucket | type == "string" and length > 0)
-              and (.platform == "h100" or .platform == "gb200")
-              and (if .platform == "h100" then .world_size == 8 else .world_size == 4 end)
-            )
-          ' <<< "$MATRIX" >/dev/null; then
-            echo "Unit-test recipes produced an invalid baseline matrix" >&2
-            exit 1
-          fi
+          jq -e 'length > 0 and all(.[]; (.bucket | type) == "string" and (.bucket | length) > 0)' \
+            <<< "$MATRIX" >/dev/null
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   baseline:
-    name: ${{ matrix.platform }} baseline - ${{ matrix.bucket }}
+    name: ${{ matrix.recipe_platform }} baseline - ${{ matrix.bucket }}
     needs: [prepare]
+    if: needs.prepare.result == 'success'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -184,7 +117,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.producer_sha }}
 
-      - name: Generate rank-zero Testmon databases
+      - name: Generate and cache Testmon baseline
         uses: ./.github/actions
         with:
           test_case: ${{ matrix.bucket }}
@@ -195,55 +128,3 @@ jobs:
           platform: ${{ matrix.recipe_platform }}
           sha: ${{ needs.prepare.outputs.producer_sha }}
           unit_testmon_mode: baseline
-          unit_testmon_cache_dir: assets_dir/testmon
-
-      - name: Validate and finalize baseline
-        id: identity
-        shell: bash -e -u -o pipefail {0}
-        env:
-          BUCKET: ${{ matrix.bucket }}
-          PLATFORM: ${{ matrix.platform }}
-          WORLD_SIZE: ${{ matrix.world_size }}
-          PRODUCER_SHA: ${{ needs.prepare.outputs.producer_sha }}
-          PRODUCER_TIME: ${{ needs.prepare.outputs.producer_time }}
-        run: |
-          sudo chown -R "$(id -u):$(id -g)" assets_dir/testmon
-
-          CONFIG_HASH=$(python tests/unit_tests/testmon_selector.py config-hash \
-            --repo-root . --platform "$PLATFORM" \
-            --world-size "$WORLD_SIZE" --bucket "$BUCKET")
-          BUCKET_HASH=$(python tests/unit_tests/testmon_selector.py bucket-hash \
-            --bucket "$BUCKET")
-          if [[ ! "$CONFIG_HASH" =~ ^[0-9a-f]{64}$ \
-            || ! "$BUCKET_HASH" =~ ^[0-9a-f]{16}$ ]]; then
-            echo "Selector returned an invalid baseline identity" >&2
-            exit 1
-          fi
-
-          python tests/unit_tests/testmon_selector.py finalize \
-            --repo-root . \
-            --cache-dir assets_dir/testmon \
-            --platform "$PLATFORM" \
-            --world-size "$WORLD_SIZE" \
-            --bucket "$BUCKET" \
-            --config-hash "$CONFIG_HASH" \
-            --producer-sha "$PRODUCER_SHA" \
-            --producer-time "$PRODUCER_TIME"
-          test -f assets_dir/testmon/metadata.json
-
-          echo "bucket_hash=$BUCKET_HASH" >> "$GITHUB_OUTPUT"
-          {
-            echo "### ${PLATFORM} Testmon baseline"
-            echo
-            echo "- Bucket: \`$BUCKET\`"
-            echo "- Producer: \`$PRODUCER_SHA\`"
-            echo "- Configuration: \`$CONFIG_HASH\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload immutable bucket baseline
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-testmon-v2-${{ matrix.platform }}-${{ steps.identity.outputs.bucket_hash }}
-          path: assets_dir/testmon
-          if-no-files-found: error
-          retention-days: 7

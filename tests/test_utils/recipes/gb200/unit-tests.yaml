@@ -60,9 +60,6 @@ spec:
       --platform gb200 \
       --unit-test-repeat $UNIT_TEST_REPEAT \
       --unit-testmon-mode {unit_testmon_mode} \
-      --unit-testmon-cache-dir {unit_testmon_cache_dir} \
-      --unit-testmon-base-sha "{unit_testmon_base_sha}" \
-      --unit-testmon-config-hash "{unit_testmon_config_hash}" \
       --log-dir {assets_dir}/logs/1/
 
     ls -al

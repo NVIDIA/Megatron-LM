@@ -2,7 +2,7 @@
 set -euxo pipefail
 
 usage() {
-    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--platform {h100|gb200}] [--unit-test-repeat N] [--unit-test-timeout N] [--unit-testmon-mode {full|enforce|baseline}] [--unit-testmon-cache-dir DIR] [--unit-testmon-base-sha SHA] [--unit-testmon-config-hash HASH] --log-dir LOG_DIR"
+    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--platform {h100|gb200}] [--unit-test-repeat N] [--unit-test-timeout N] [--unit-testmon-mode {full|enforce|baseline}] --log-dir LOG_DIR"
     exit 1
 }
 
@@ -14,9 +14,7 @@ UNIT_TEST_TIMEOUT=10
 LOG_DIR=$(pwd)/logs
 PLATFORM=h100
 UNIT_TESTMON_MODE=full
-UNIT_TESTMON_CACHE_DIR=
-UNIT_TESTMON_BASE_SHA=
-UNIT_TESTMON_CONFIG_HASH=
+UNIT_TESTMON_CACHE_DIR=assets_dir/testmon
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -51,18 +49,6 @@ while [[ $# -gt 0 ]]; do
         UNIT_TESTMON_MODE="$2"
         shift 2
         ;;
-    --unit-testmon-cache-dir)
-        UNIT_TESTMON_CACHE_DIR="$2"
-        shift 2
-        ;;
-    --unit-testmon-base-sha)
-        UNIT_TESTMON_BASE_SHA="$2"
-        shift 2
-        ;;
-    --unit-testmon-config-hash)
-        UNIT_TESTMON_CONFIG_HASH="$2"
-        shift 2
-        ;;
     --log-dir)
         LOG_DIR="$2"
         shift 2
@@ -89,14 +75,6 @@ fi
 if [[ "$UNIT_TESTMON_MODE" != "full" && "$UNIT_TESTMON_MODE" != "enforce" && "$UNIT_TESTMON_MODE" != "baseline" ]]; then
     echo "Error: invalid Testmon mode: $UNIT_TESTMON_MODE"
     usage
-fi
-if [[ "$UNIT_TESTMON_MODE" != "full" && -z "$UNIT_TESTMON_CACHE_DIR" ]]; then
-    echo "Error: --unit-testmon-cache-dir is required in $UNIT_TESTMON_MODE mode"
-    usage
-fi
-if [[ "$UNIT_TESTMON_MODE" == "enforce" && ( -z "$UNIT_TESTMON_BASE_SHA" || -z "$UNIT_TESTMON_CONFIG_HASH" ) ]]; then
-    echo "Incomplete Testmon identity; running the full bucket."
-    UNIT_TESTMON_MODE=full
 fi
 if [[ "$UNIT_TESTMON_MODE" != "full" && ( "$TAG" != "latest" || "$ENVIRONMENT" != "dev" ) ]]; then
     echo "Testmon is only enabled for the latest dev suite; running the full bucket."
@@ -147,7 +125,6 @@ MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
-TESTMON_WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
 DISTRIBUTED_ARGS=(
     --nproc_per_node "$GPUS_PER_NODE"
     --nnodes "$NUM_NODES"
@@ -175,6 +152,8 @@ run_test_cmd() {
     return "$rc"
 }
 
+# Keep this path identical to exhaustive CI. Testmon is installed and invoked
+# only by the baseline/enforce paths below.
 run_full_tests() {
     for i in $(seq "$UNIT_TEST_REPEAT"); do
         echo "Running prod test suite."
@@ -204,48 +183,43 @@ install_testmon() {
     uv sync --locked --only-group testmon --inexact --no-install-project
 }
 
-run_testmon_phase() {
-    local mode="$1"
-    local phase="$2"
-    shift 2
-    uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
-        tests/unit_tests/testmon_selector.py run \
-        --mode "$mode" \
-        --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
-        --phase "$phase" \
-        -- "$@"
-}
-
 write_testmon_summary() {
     local result="$1"
-    local duration="$2"
-    local selected_count="${3:-0}"
-    local cache_age="${4:-unknown}"
-    local selection_ratio="${5:-unknown}"
+    local selected_count="${2:-}"
     mkdir -p "$UNIT_TESTMON_CACHE_DIR"
     {
         echo "### Unit Testmon"
         echo
         echo "- Mode: \`$UNIT_TESTMON_MODE\`"
-        echo "- Platform: \`$PLATFORM\`"
         echo "- Bucket: \`$BUCKET\`"
         echo "- Result: $result"
-        echo "- Cache age: \`$cache_age\`"
-        echo "- Selected files: \`$selected_count\`"
-        echo "- Selection ratio: \`$selection_ratio\`"
-        echo "- Selector duration: \`${duration}s\`"
+        if [[ -n "$selected_count" ]]; then
+            echo "- Selected tests: \`$selected_count\`"
+        fi
     } > "$UNIT_TESTMON_CACHE_DIR/summary.md"
 }
 
-run_baseline_tests() {
-    local target
-    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    install_testmon
-    run_testmon_phase baseline prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
-    run_testmon_phase baseline experimental \
-        -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
-    write_testmon_summary "baseline produced" 0 0
+run_testmon_phase() {
+    local mode="$1"
+    local phase="$2"
+    local with_coverage="$3"
+    shift 3
+    local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
+    if [[ "$with_coverage" == "true" ]]; then
+        command+=(
+            -m coverage run
+            --data-file=.coverage.unit_tests
+            --source=megatron/core
+        )
+    fi
+    command+=(
+        tests/unit_tests/testmon_selector.py
+        --mode "$mode"
+        --cache-dir "$UNIT_TESTMON_CACHE_DIR"
+        --phase "$phase"
+        -- "$@"
+    )
+    "${command[@]}"
 }
 
 run_full_fallback() {
@@ -259,121 +233,118 @@ run_full_fallback() {
     fi
 }
 
-selective_command() {
-    local rc=0
-    set +e
-    "$@"
-    rc=$?
-    set -e
-    if [[ "$rc" -eq 5 ]]; then
-        echo "No tests matched this selected phase; treating it as a pass."
-        return 0
+run_baseline_tests() {
+    local cache_root="${UNIT_TESTMON_CACHE_DIR:?}"
+    local target
+    target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
+    rm -rf -- "$cache_root/prod" "$cache_root/experimental" "$cache_root/.testmon-work"
+    rm -f -- "$cache_root/summary.md"
+    mkdir -p "$cache_root"
+
+    install_testmon
+    run_testmon_phase baseline prod false \
+        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
+    run_testmon_phase baseline experimental false \
+        -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
+    write_testmon_summary "baseline produced"
+}
+
+run_always_tests() {
+    local -a test_files=()
+    if [[ "$BUCKET" == "tests/unit_tests/**/*.py" ]]; then
+        test_files+=(tests/unit_tests/test_basic.py)
     fi
-    return "$rc"
+    if [[ "$PLATFORM" == "h100" && "$BUCKET" == "tests/unit_tests/inference/**/*.py" ]]; then
+        test_files+=(tests/unit_tests/inference/test_data_parallel_inference_coordinator.py)
+    fi
+    [[ "${#test_files[@]}" -gt 0 ]] || return 0
+
+    uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
+        -m coverage run \
+        --data-file=.coverage.unit_tests \
+        --source=megatron/core \
+        -m pytest \
+        -p no:testmon \
+        -p no:pytest-testmon \
+        -vs "${test_files[@]}"
+}
+
+selected_count() {
+    local count_file="$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/rank-0/selected-count"
+    local count
+    [[ -f "$count_file" ]] || return 1
+    count=$(< "$count_file")
+    [[ "$count" =~ ^[0-9]+$ ]] || return 1
+    echo "$count"
+}
+
+selected_test_failed() {
+    local exit_code_file
+    for exit_code_file in "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"/rank-*/pytest-exit-code; do
+        [[ -f "$exit_code_file" ]] || continue
+        [[ "$(< "$exit_code_file")" == "1" ]] && return 0
+    done
+    return 1
 }
 
 run_enforced_tests() {
-    local started=$SECONDS
-    local target head_sha selection_output selection_metrics cache_age selection_ratio rc
-    local -a identity selected_files
+    local target phase=prod prod_count=0 experimental_count=0 rc=0
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
-    head_sha=$(git rev-parse HEAD)
-    identity=(
-        --repo-root .
-        --cache-dir "$UNIT_TESTMON_CACHE_DIR"
-        --metadata "$UNIT_TESTMON_CACHE_DIR/metadata.json"
-        --platform "$PLATFORM"
-        --world-size "$TESTMON_WORLD_SIZE"
-        --bucket "$BUCKET"
-        --config-hash "$UNIT_TESTMON_CONFIG_HASH"
-        --base-sha "$UNIT_TESTMON_BASE_SHA"
-        --head-sha "$head_sha"
-    )
 
-    set +e
-    uv run --no-sync python tests/unit_tests/testmon_selector.py select "${identity[@]}" --validate-only
-    rc=$?
-    set -e
-    if [[ "$rc" -ne 0 ]]; then
-        write_testmon_summary "full fallback: baseline or change validation failed" "$((SECONDS - started))"
+    if ! install_testmon; then
+        write_testmon_summary "full fallback: Testmon installation failed"
         run_full_fallback
         return
     fi
 
     set +e
-    install_testmon
-    rc=$?
-    set -e
-    if [[ "$rc" -ne 0 ]]; then
-        write_testmon_summary "full fallback: Testmon installation failed" "$((SECONDS - started))"
-        run_full_fallback
-        return
-    fi
+    for i in $(seq "$UNIT_TEST_REPEAT"); do
+        phase=prod
+        run_testmon_phase enforce prod true \
+            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
+        rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            break
+        fi
+        prod_count=$(selected_count prod)
+        rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            break
+        fi
+        if [[ "$prod_count" -eq 0 ]]; then
+            rm -f -- .coverage.unit_tests*
+        fi
 
-    set +e
-    run_testmon_phase select prod \
-        -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
-    rc=$?
-    if [[ "$rc" -eq 0 ]]; then
-        run_testmon_phase select experimental \
+        phase=experimental
+        run_testmon_phase enforce experimental false \
             -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
         rc=$?
-    fi
-    set -e
-    if [[ "$rc" -ne 0 ]]; then
-        write_testmon_summary "full fallback: Testmon collection failed" "$((SECONDS - started))"
-        run_full_fallback
-        return
-    fi
-
-    set +e
-    selection_output=$(uv run --no-sync python tests/unit_tests/testmon_selector.py select \
-        "${identity[@]}" --output "$UNIT_TESTMON_CACHE_DIR/selected.json")
-    rc=$?
-    set -e
-    if [[ "$rc" -ne 0 ]]; then
-        write_testmon_summary "full fallback: unsafe selection" "$((SECONDS - started))"
-        run_full_fallback
-        return
-    fi
-
-    selected_files=()
-    while IFS= read -r selected; do
-        [[ -n "$selected" ]] && selected_files+=("$selected")
-    done <<< "$selection_output"
-    selection_metrics=$(uv run --no-sync python -c \
-        'import datetime,json,sys; s=json.load(open(sys.argv[1])); m=json.load(open(sys.argv[2])); t=datetime.datetime.fromisoformat(m["producer_time"].replace("Z", "+00:00")); print("{:.1f}h\t{:.1%}".format((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()/3600, s["selection_ratio"]))' \
-        "$UNIT_TESTMON_CACHE_DIR/selected.json" "$UNIT_TESTMON_CACHE_DIR/metadata.json" 2>/dev/null || true)
-    IFS=$'\t' read -r cache_age selection_ratio <<< "$selection_metrics"
-    write_testmon_summary "selected" "$((SECONDS - started))" "${#selected_files[@]}" \
-        "${cache_age:-unknown}" "${selection_ratio:-unknown}"
-    if [[ ${#selected_files[@]} -gt 0 ]]; then
-        {
-            echo
-            echo "Selected test files:"
-            echo
-            for selected in "${selected_files[@]}"; do
-                echo "- \`$selected\`"
-            done
-        } >> "$UNIT_TESTMON_CACHE_DIR/summary.md"
-    fi
-    if [[ ${#selected_files[@]} -eq 0 ]]; then
-        echo "Testmon selected no files for this bucket."
-        return
-    fi
-
-    for i in $(seq "$UNIT_TEST_REPEAT"); do
-        selective_command uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
-            -m coverage run --data-file=.coverage.unit_tests --source=megatron/core \
-            -m pytest -p no:testmon -p no:pytest-testmon -vs "${IGNORE_ARGS[@]}" \
-            -m "not experimental and ${MARKER_ARG}" "${selected_files[@]}"
-        selective_command uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
-            -m pytest -p no:testmon -p no:pytest-testmon -vs --experimental "${IGNORE_ARGS[@]}" \
-            -m "experimental and ${MARKER_ARG}" "${selected_files[@]}"
+        if [[ "$rc" -ne 0 ]]; then
+            break
+        fi
+        experimental_count=$(selected_count experimental)
+        rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            break
+        fi
     done
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+        if selected_test_failed "$phase"; then
+            write_testmon_summary "selective tests failed"
+            return "$rc"
+        fi
+        write_testmon_summary "full fallback: Testmon execution failed"
+        run_full_fallback
+        return
+    fi
+
+    run_always_tests
     if compgen -G '.coverage.unit_tests*' > /dev/null; then
         coverage combine -q
     fi
+    write_testmon_summary "selective tests passed" "$((prod_count + experimental_count))"
 }
 
 case "$UNIT_TESTMON_MODE" in

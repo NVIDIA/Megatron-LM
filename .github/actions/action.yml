@@ -71,18 +71,10 @@ inputs:
     description: "Unit-test selection mode: full, enforce, or baseline."
     required: false
     default: "full"
-  unit_testmon_baseline_run_id:
-    description: "Trusted Unit Testmon Baseline workflow run containing per-bucket artifacts."
-    required: false
-    default: ""
   unit_testmon_base_sha:
-    description: "Validated PR base SHA used to classify changes."
+    description: "PR base SHA used to validate a restored baseline."
     required: false
     default: ""
-  unit_testmon_cache_dir:
-    description: "Workspace-relative directory containing the rank-zero Testmon baseline."
-    required: false
-    default: "assets_dir/testmon"
 runs:
   using: "composite"
   steps:
@@ -94,8 +86,6 @@ runs:
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         ref: ${{ inputs.sha }}
-        fetch-depth: ${{ inputs.unit_testmon_mode == 'enforce' && '0' || '1' }}
-        persist-credentials: ${{ inputs.unit_testmon_mode != 'enforce' }}
 
     - name: Change ownership of /home/runner/
       shell: bash
@@ -114,11 +104,11 @@ runs:
       with:
         python-version: '3.12'
 
-    - name: Install uuid-runtime
+    - name: Install host utilities
       shell: bash -x -e -u -o pipefail {0}
       run: |
         for i in 1 2 3; do
-          apt-get update && apt-get install -y uuid-runtime && break
+          apt-get update && apt-get install -y jq uuid-runtime && break
           echo "apt attempt $i failed, retrying..."
           sleep 10
         done
@@ -132,7 +122,7 @@ runs:
           sleep 10
         done
 
-    - name: Compute unit Testmon bucket identity
+    - name: Compute unit Testmon cache identity
       id: unit-testmon-identity
       if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode != 'full'
       shell: bash -e -u -o pipefail {0}
@@ -140,15 +130,18 @@ runs:
       env:
         BUCKET: ${{ inputs.test_case }}
         RECIPE_PLATFORM: ${{ inputs.platform }}
+        ENVIRONMENT_HASH: ${{ hashFiles('uv.lock', 'pyproject.toml', 'docker/.ngc_version.dev', 'docker/Dockerfile.ci.dev', 'docker/common/install.sh', '.github/actions/action.yml', '.github/workflows/cicd-main.yml', '.github/workflows/unit-testmon-baseline.yml', 'tests/test_utils/python_scripts/launch_nemo_run_workload.py', 'tests/test_utils/recipes/h100/unit-tests.yaml', 'tests/test_utils/recipes/gb200/unit-tests.yaml', 'tests/unit_tests/**/conftest.py', 'tests/unit_tests/find_test_cases.py', 'tests/unit_tests/run_ci_test.sh', 'tests/unit_tests/testmon_selector.py') }}
+        SOURCE_SHA: ${{ inputs.sha }}
+        REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
+        RUN_ID: ${{ github.run_id }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
       run: |
         case "$RECIPE_PLATFORM" in
           dgx_h100|h100)
             PLATFORM=h100
-            WORLD_SIZE=8
             ;;
           dgx_gb200|gb200)
             PLATFORM=gb200
-            WORLD_SIZE=4
             ;;
           *)
             echo "Unsupported unit Testmon platform: $RECIPE_PLATFORM" >&2
@@ -156,35 +149,33 @@ runs:
             ;;
         esac
 
-        BUCKET_HASH=$(python tests/unit_tests/testmon_selector.py bucket-hash \
-          --bucket "$BUCKET")
-        CONFIG_HASH=$(python tests/unit_tests/testmon_selector.py config-hash \
-          --repo-root . \
-          --platform "$PLATFORM" \
-          --world-size "$WORLD_SIZE" \
-          --bucket "$BUCKET")
+        BUCKET_HASH=$(printf '%s' "$BUCKET" | sha256sum | cut -c1-16)
         [[ "$BUCKET_HASH" =~ ^[0-9a-f]{16}$ ]]
-        [[ "$CONFIG_HASH" =~ ^[0-9a-f]{64}$ ]]
+        [[ "$ENVIRONMENT_HASH" =~ ^[0-9a-f]{64}$ ]]
+        [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+        [[ "$RUN_ID" =~ ^[0-9]+$ && "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]
 
-        echo "platform=$PLATFORM" | tee -a "$GITHUB_OUTPUT"
-        echo "world_size=$WORLD_SIZE" | tee -a "$GITHUB_OUTPUT"
-        echo "bucket_hash=$BUCKET_HASH" | tee -a "$GITHUB_OUTPUT"
-        echo "config_hash=$CONFIG_HASH" | tee -a "$GITHUB_OUTPUT"
-        echo "artifact_name=unit-testmon-v2-$PLATFORM-$BUCKET_HASH" | tee -a "$GITHUB_OUTPUT"
+        CACHE_PREFIX="unit-testmon-v1-${PLATFORM}-dev-${BUCKET_HASH}-${ENVIRONMENT_HASH}-"
+        if [[ "$REQUESTED_MODE" == "baseline" ]]; then
+          CREATED_AT=$(date +%s)
+        else
+          CREATED_AT=0
+        fi
 
-    # Download-only is intentional: PR jobs never mutate or publish a trusted
-    # baseline artifact.
-    - name: Download unit Testmon baseline
-      id: download-unit-testmon
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_baseline_run_id != '' && steps.unit-testmon-identity.outcome == 'success'
-      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        echo "cache_prefix=$CACHE_PREFIX" | tee -a "$GITHUB_OUTPUT"
+        echo "cache_key=${CACHE_PREFIX}${SOURCE_SHA}-${CREATED_AT}-${RUN_ID}-${RUN_ATTEMPT}" | tee -a "$GITHUB_OUTPUT"
+
+    # Restore-only is intentional: PR jobs can consume default-branch caches,
+    # but never create or update them.
+    - name: Restore unit Testmon baseline
+      id: restore-unit-testmon
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       continue-on-error: true
       with:
-        name: ${{ steps.unit-testmon-identity.outputs.artifact_name }}
-        path: ${{ inputs.unit_testmon_cache_dir }}
-        github-token: ${{ github.token }}
-        repository: ${{ github.repository }}
-        run-id: ${{ inputs.unit_testmon_baseline_run_id }}
+        path: assets_dir/testmon
+        key: ${{ steps.unit-testmon-identity.outputs.cache_key }}
+        restore-keys: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
 
     - name: Resolve unit Testmon mode
       id: unit-testmon
@@ -192,15 +183,47 @@ runs:
       shell: bash -e -u -o pipefail {0}
       env:
         REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
-        BASELINE_RUN_ID: ${{ inputs.unit_testmon_baseline_run_id }}
-        BASE_SHA: ${{ inputs.unit_testmon_base_sha }}
-        CACHE_DIR: ${{ inputs.unit_testmon_cache_dir }}
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
-        DOWNLOAD_OUTCOME: ${{ steps.download-unit-testmon.outcome }}
-        CONFIG_HASH: ${{ steps.unit-testmon-identity.outputs.config_hash }}
-        ARTIFACT_NAME: ${{ steps.unit-testmon-identity.outputs.artifact_name }}
+        MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+        CACHE_PREFIX: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
+        BASE_SHA: ${{ inputs.unit_testmon_base_sha }}
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ github.repository }}
       run: |
         FALLBACK_REASON=""
+        BASELINE_VALID=false
+        if [[ "$IDENTITY_OUTCOME" == "success" \
+          && "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ \
+          && "$MATCHED_KEY" =~ ^${CACHE_PREFIX}([0-9a-f]{40})-([0-9]+)-([0-9]+)-([0-9]+)$ ]]; then
+          PRODUCER_SHA=${BASH_REMATCH[1]}
+          CREATED_AT=${BASH_REMATCH[2]}
+          NOW=$(date +%s)
+          if (( CREATED_AT <= NOW && NOW - CREATED_AT <= 259200 )); then
+            if COMPARE=$(curl -fsS --retry 2 --connect-timeout 10 --max-time 30 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$REPOSITORY/compare/$PRODUCER_SHA...$BASE_SHA"); then
+              if jq -e '
+                (.status == "ahead" or .status == "identical")
+                and .total_commits < 250
+                and ((.files // []) | length < 300)
+                and all((.files // [])[];
+                  if (.filename | test("^megatron/.+\\.py$")) then
+                    .status == "modified"
+                  elif (.filename | test("^tests/unit_tests/(.*/)?test_[^/]+\\.py$")) then
+                    (.status == "added" or .status == "modified"
+                      or .status == "removed" or .status == "renamed")
+                    and (.status != "renamed"
+                      or ((.previous_filename // "")
+                        | test("^tests/unit_tests/(.*/)?test_[^/]+\\.py$")))
+                  else false end)
+              ' <<< "$COMPARE" >/dev/null; then
+                BASELINE_VALID=true
+              fi
+            fi
+          fi
+        fi
         case "$REQUESTED_MODE" in
           full)
             EFFECTIVE_MODE=full
@@ -213,16 +236,12 @@ runs:
             EFFECTIVE_MODE=baseline
             ;;
           enforce)
-            if [[ "$BASELINE_RUN_ID" =~ ^[0-9]+$ \
-              && "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ \
-              && "$CONFIG_HASH" =~ ^[0-9a-f]{64}$ \
-              && "$IDENTITY_OUTCOME" == "success" \
-              && "$DOWNLOAD_OUTCOME" == "success" ]]; then
+            if [[ "$BASELINE_VALID" == "true" ]]; then
               EFFECTIVE_MODE=enforce
             else
               EFFECTIVE_MODE=full
-              FALLBACK_REASON="baseline artifact or local identity was unavailable"
-              echo "::warning::Testmon baseline was unavailable; running the full unit-test bucket."
+              FALLBACK_REASON="no recent, compatible ancestor baseline was restored"
+              echo "::warning::Compatible Testmon cache unavailable; running the full unit-test bucket."
             fi
             ;;
           *)
@@ -230,8 +249,8 @@ runs:
             exit 2
             ;;
         esac
-        mkdir -p "$CACHE_DIR"
-        : > "$CACHE_DIR/summary.md"
+        mkdir -p assets_dir/testmon
+        : > assets_dir/testmon/summary.md
         echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
         {
           echo "### Unit Testmon"
@@ -239,8 +258,7 @@ runs:
           echo "- Requested mode: $REQUESTED_MODE"
           echo "- Effective mode: $EFFECTIVE_MODE"
           if [[ "$REQUESTED_MODE" == "enforce" ]]; then
-            echo "- Baseline run: ${BASELINE_RUN_ID:-none}"
-            echo "- Artifact: ${ARTIFACT_NAME:-unresolved}"
+            echo "- Restored cache: ${MATCHED_KEY:-none}"
           fi
           if [[ -n "$FALLBACK_REASON" ]]; then
             echo "- Fallback: $FALLBACK_REASON"
@@ -272,9 +290,6 @@ runs:
           --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \
           --unit-testmon-mode "${{ steps.unit-testmon.outputs.mode }}" \
-          --unit-testmon-cache-dir "${{ inputs.unit_testmon_cache_dir }}" \
-          --unit-testmon-base-sha "${{ inputs.unit_testmon_base_sha }}" \
-          --unit-testmon-config-hash "${{ steps.unit-testmon-identity.outputs.config_hash }}" \
           --container-image ${{ inputs.container-image }} \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
@@ -358,11 +373,29 @@ runs:
         echo "::endgroup::"
         exit $EXIT_CODE
 
+    - name: Prepare unit Testmon baseline cache
+      id: prepare-unit-testmon-cache
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'baseline' && steps.run-main-script.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        CACHE_DIR: assets_dir/testmon
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+        test -f "$CACHE_DIR/prod/.testmondata"
+        test -f "$CACHE_DIR/experimental/.testmondata"
+
+    - name: Save unit Testmon baseline
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: assets_dir/testmon
+        key: ${{ steps.unit-testmon-identity.outputs.cache_key }}
+
     - name: Publish unit Testmon summary
       if: always() && inputs.is_unit_test == 'true'
       shell: bash
       env:
-        SUMMARY_FILE: ${{ inputs.unit_testmon_cache_dir }}/summary.md
+        SUMMARY_FILE: assets_dir/testmon/summary.md
       run: |
         if [[ -f "$SUMMARY_FILE" ]]; then
           cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
