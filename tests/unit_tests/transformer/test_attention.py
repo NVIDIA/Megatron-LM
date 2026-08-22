@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+from importlib.metadata import PackageNotFoundError
 from unittest import mock
 
 import pytest
@@ -20,7 +21,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import SelfAttention, _try_import_flash_attention_4
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
@@ -41,6 +42,32 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+def test_flash_attention_4_distribution_is_checked_before_import():
+    real_import = __import__
+
+    def reject_cute_import(name, *args, **kwargs):
+        if name == "flash_attn.cute":
+            raise AssertionError("flash_attn.cute must not be imported without flash-attn-4")
+        return real_import(name, *args, **kwargs)
+
+    with mock.patch("importlib.metadata.version", side_effect=PackageNotFoundError):
+        with mock.patch("builtins.__import__", side_effect=reject_cute_import):
+            assert _try_import_flash_attention_4() is None
+
+
+def test_flash_attention_4_incompatible_cute_namespace_is_optional():
+    real_import = __import__
+
+    def reject_cute_import(name, *args, **kwargs):
+        if name == "flash_attn.cute":
+            raise AttributeError("incompatible CUTLASS DSL")
+        return real_import(name, *args, **kwargs)
+
+    with mock.patch("importlib.metadata.version", return_value="4.0.0b20"):
+        with mock.patch("builtins.__import__", side_effect=reject_cute_import):
+            assert _try_import_flash_attention_4() is None
 
 
 @pytest.mark.parametrize("output_gate", [False, True])
