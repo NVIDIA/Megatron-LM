@@ -3483,11 +3483,13 @@ def _add_regularization_args(parser):
         '--muon-tp-mode',
         type=str,
         default='duplicated',
-        choices=['blockwise', 'duplicated', 'distributed'],
+        choices=['blockwise', 'duplicated', 'distributed', 'auto'],
         help='How to perform NS calculation for tensor model parallel weights. '
         'blockwise orthogonalizes each shard on its own, so the update rule '
         'depends on the parallelism config; duplicated and distributed both '
-        'orthogonalize the whole matrix and give TP-invariant results.',
+        'orthogonalize the whole matrix and give TP-invariant results; auto '
+        'select between duplicated and distributed mode per-weight for '
+        'dense weights.',
     )
     group.add_argument(
         '--muon-extra-scale-factor',
