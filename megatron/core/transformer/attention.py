@@ -35,6 +35,17 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+
+try:
+    from megatron.core.inference.attention.fused_qk_norm import (
+        can_use_fused_qk_norm as _can_use_fused_qk_norm,
+    )
+    from megatron.core.inference.attention.fused_qk_norm import (
+        fused_qk_rmsnorm as _fused_qk_rmsnorm,
+    )
+except Exception:  # keep attention importable if the inference helper is unavailable
+    _can_use_fused_qk_norm = None
+    _fused_qk_rmsnorm = None
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
@@ -1929,11 +1940,24 @@ class SelfAttention(Attention):
             )
             query = query[:, :, idx * size : (idx + 1) * size, :]
 
-        if self.q_layernorm is not None:
-            query = apply_module(self.q_layernorm)(query)
+        if _can_use_fused_qk_norm is not None and _can_use_fused_qk_norm(
+            self.q_layernorm, self.k_layernorm, query, key
+        ):
+            # Fuse the two per-head RMSNorm launches into one (env-gated, decode).
+            query, key = _fused_qk_rmsnorm(
+                query,
+                key,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                self.config.layernorm_epsilon,
+                self.config.layernorm_zero_centered_gamma,
+            )
+        else:
+            if self.q_layernorm is not None:
+                query = apply_module(self.q_layernorm)(query)
 
-        if self.k_layernorm is not None:
-            key = apply_module(self.k_layernorm)(key)
+            if self.k_layernorm is not None:
+                key = apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()
