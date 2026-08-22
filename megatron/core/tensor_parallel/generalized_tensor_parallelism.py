@@ -1488,15 +1488,18 @@ class GTPShardedParam(torch.nn.Parameter):
                     "cache.get() would return stale data. Check the chain's "
                     "_need_weight_prefetch flag and issuer's prefetch logic."
                 )
+        # This handoff marker is specific to CUDA graphs: capture-side wait_async_comms drains
+        # the producer's Work handle and sets it. In eager execution, the consumer drains the
+        # handle directly instead.
         _was_drained = getattr(self, "_already_ag_drained", False)
         if _was_drained:
-            # Producer already drained via wait_async_comms; skip the captured cross-graph
-            # wait (a CUDA no-op anyway). Correctness comes from the eager main_stream sync.
+            # The producer consumed the Work handle and recorded ag_event. Clear the host-side
+            # handoff marker, but retain the event wait that orders this consumer after the AG.
             self._already_ag_drained = False
         else:
             # Intra-graph or eager consume: drain inline.
             self._wait_param_gather()
-            self.ag_event.wait()
+        self.ag_event.wait()
 
         # Retrieve prefetched results from cache
         result = []
@@ -1534,13 +1537,14 @@ class GTPShardedParam(torch.nn.Parameter):
     def _get_recompute_prefetched_weight(self):
         # Recompute-chain analogue of _get_prefetched_weight (state-neutral; reads the
         # rowwise gather via the _recompute_* slot).
+        # CUDA-graph handoff marker equivalent to _already_ag_drained for recompute AGs.
         if self._recompute_already_drained:
-            # Producer already drained via wait_async_comms (CG capture); skip the
-            # captured cross-graph wait (CUDA no-op anyway).
+            # The producer consumed the Work handle and recorded _recompute_ag_event. Clear the
+            # host-side handoff marker, but retain the event wait that orders this consumer.
             self._recompute_already_drained = False
         else:
             self._wait_recompute_param_gather()
-            self._recompute_ag_event.wait()
+        self._recompute_ag_event.wait()
 
         result = []
         cache = get_global_GTP_cache()
@@ -2341,12 +2345,16 @@ def wait_async_comms(
     finalize_after_drain: bool = False,
     params: Optional[List[GTPShardedParam]] = None,
 ):
-    """Drain in-flight GTP async AG / RS handles.
+    """Drain in-flight GTP asynchronous communication.
 
-    Inside CUDA graph capture the drains are captured into the graph — the producer-side hook
-    for cross-graph overlap. A captured cudaStreamWaitEvent on another capture session's event is
-    a CUDA no-op, so consumers can't wait cross-graph; instead the producer drains here and flags
-    the param, and the consumer skips its captured wait.
+    This drains AG and recompute-AG handles and, unless ``skip_rs`` is set, wgrad RS handles.
+    During CUDA graph capture, draining a handle materializes its wait in the producer graph and
+    records the corresponding external event. Because the event was constructed with
+    ``external=True``, capture emits event-record and event-wait nodes that preserve the dependency
+    between separately captured graphs at replay. The host must launch the producer graph before
+    the consumer graph so its record is the one observed by the wait. An AG handoff marker prevents
+    the consumer from draining the same Work handle again; the consumer still waits on the event.
+    When requested, an RS result is also accumulated into ``main_grad`` before graph completion.
 
     Args:
         chain_id: If specified, only drain params on this chain.
@@ -2356,12 +2364,13 @@ def wait_async_comms(
                  NCCL RS) so it starts during AG drain rather than after,
                  avoiding SM-saturation that blocks cross-graph overlap.
                  Falls back to caller-stream accumulation if no RS handle.
-        params: If specified, drain only async work issued by the owning CUDA graph. Outside graph
-                capture, the process-global in-flight set remains the default.
+        params: If specified, drain only the listed parameters' async work instead of the
+                process-global in-flight set.
 
     Per-param side effects:
-        * _already_ag_drained = True   (if an AG handle was drained)
-        * _already_finalized  = True   (if finalize_after_drain=True)
+        * _already_ag_drained = True          (if an AG handle was drained)
+        * _recompute_already_drained = True   (if a recompute AG handle was drained)
+        * _already_finalized = True           (if an RS result was finalized)
     """
     comm_params = list(_inflight_comm_params) if params is None else params
     for param in comm_params:
@@ -2374,8 +2383,8 @@ def wait_async_comms(
         param._wait_param_gather()
         if had_ag:
             param._already_ag_drained = True
-        # Recompute-forward chain: drain its separate in-flight rowwise AG so the
-        # captured recompute consumer skips its cross-graph wait (full-iteration CG).
+        # Recompute-forward chain: drain its separate in-flight rowwise AG and mark the handoff.
+        # The consumer skips re-draining the Work handle but still waits on the external event.
         if param._recompute_prefetch_handle is not None:
             param._wait_recompute_param_gather()
             param._recompute_already_drained = True
