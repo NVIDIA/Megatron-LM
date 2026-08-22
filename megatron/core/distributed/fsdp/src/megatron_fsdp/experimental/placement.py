@@ -40,6 +40,7 @@ class Flat(Shard):
     """DBuffer-specific flattened dim-0 shard placement."""
 
     def __init__(self) -> None:
+        """Initialize a flattened shard along dimension 0."""
         super().__init__(0)
 
 

@@ -20,12 +20,11 @@ from collections.abc import Iterable
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from megatron_fsdp.experimental.layout import GlobalLayout, Shape, non_leading_numel
+from megatron_fsdp.experimental.placement import Flat, changed_mesh_axis
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate
 from torch.distributed.tensor.placement_types import Placement
-
-from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)

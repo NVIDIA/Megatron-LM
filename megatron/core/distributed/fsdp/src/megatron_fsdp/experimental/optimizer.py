@@ -18,9 +18,11 @@ from itertools import chain
 from typing import Any, NamedTuple
 
 import torch
+from megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+    sync_model_weights_from_main_weights,
+)
 from torch import nn
-
-from .parameter_group import get_containing_parameter_group, sync_model_weights_from_main_weights
 
 
 def fully_shard_optimizer(

@@ -19,14 +19,15 @@ from typing import Literal, cast
 from weakref import ref
 
 import torch
+from megatron_fsdp.experimental.indexed_order import IndexedOrder
+from megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
+    get_containing_parameter_group,
+)
+from megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
-
-from ..mixed_precision import MixedPrecisionPolicy
-from .indexed_order import IndexedOrder
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-
 
 def _is_in_backward() -> bool:
     """Return whether the current thread is executing an autograd GraphTask."""
