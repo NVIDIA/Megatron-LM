@@ -21,14 +21,13 @@ from weakref import ReferenceType, ref
 
 import torch
 import torch.distributed._symmetric_memory as symm_mem
+from megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron_fsdp.experimental.placement import changed_mesh_axis
+from megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Partial, Replicate
 from torch.distributed.tensor.placement_types import Placement
-
-from ..mixed_precision import MixedPrecisionPolicy
-from .dbuffer import DBuffer
-from .placement import changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
