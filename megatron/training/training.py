@@ -4372,6 +4372,10 @@ def train(
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
 
+    print_rank_0(
+        f'params-norm before the start of training: {calc_params_l2_norm(model)!r}'
+    )
+
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
         _run_gpu_sniff_test('before training', span_name='megatron.startup.sniff_test')
