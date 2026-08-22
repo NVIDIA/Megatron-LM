@@ -1,3 +1,5 @@
+"""vLLM routing and contiguous experts on the Lite DS4 MoE container."""
+
 from __future__ import annotations
 
 import torch
@@ -13,7 +15,6 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     block_fp8_linear,
     gate_linear,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.dense import fixed_route_vjp
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (
     VLLMGroupedMoEWithBF16Backward,
 )
@@ -69,6 +70,38 @@ def _hash_route(logits, token_ids, tid2eid, *, topk, renormalize, scale):
     return weights, ids
 
 
+class _VLLMFixedRouteFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, visible_op, renormalize, route_scale):
+        weights, ids = visible_op(logits)
+        ctx.save_for_backward(logits, ids.clone())
+        ctx.renormalize = renormalize
+        ctx.route_scale = route_scale
+        ctx.mark_non_differentiable(ids)
+        return weights, ids
+
+    @staticmethod
+    def backward(ctx, grad_weights, _grad_ids):
+        logits, ids = ctx.saved_tensors
+        with torch.enable_grad():
+            replay = logits.detach().float().requires_grad_(True)
+            scores = torch.sqrt(F.softplus(replay))
+            selected = scores.gather(-1, ids.long())
+            if ctx.renormalize:
+                selected = selected / selected.sum(dim=-1, keepdim=True).clamp_min(
+                    1e-20
+                )
+            selected = selected * ctx.route_scale
+            (dlogits,) = torch.autograd.grad(selected, replay, grad_weights.float())
+        return dlogits.to(logits.dtype), None, None, None
+
+
+def _fixed_route_vjp(visible_op, logits, *, renormalize: bool, route_scale: float):
+    if not torch.is_grad_enabled():
+        return visible_op(logits)
+    return _VLLMFixedRouteFunction.apply(logits, visible_op, renormalize, route_scale)
+
+
 class _VLLMVisibleExperts(Experts):
     def forward(
         self,
@@ -99,7 +132,6 @@ class _VLLMVisibleExperts(Experts):
 
 
 class DeepseekV4MoE(LiteDeepseekV4MoE):
-
     dispatcher_cls = VLLMAlignedNormalDeepEPDispatcher
 
     def __init__(
@@ -184,13 +216,17 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.is_hash_layer and input_ids is None:
             raise NotImplementedError("hash MoE requires explicit input_ids")
-        logits = gate_linear(
-            lambda value: _batch_invariant_gate_logits(
-                value, self.gate.gate.weight
-            ),
-            hidden_states,
-            self.gate.gate.weight,
-        ).float().contiguous()
+        logits = (
+            gate_linear(
+                lambda value: _batch_invariant_gate_logits(
+                    value, self.gate.gate.weight
+                ),
+                hidden_states,
+                self.gate.gate.weight,
+            )
+            .float()
+            .contiguous()
+        )
         if self.is_hash_layer:
             token_ids = input_ids.reshape(-1).to(dtype=torch.int32)
             tid2eid = self.gate.tid2eid.to(dtype=torch.int32).contiguous()
@@ -206,7 +242,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
                 )
                 return self._replay_route(value, weights, ids)
 
-            weights, ids = fixed_route_vjp(
+            weights, ids = _fixed_route_vjp(
                 hash_route,
                 logits,
                 renormalize=self.config.norm_topk_prob,
@@ -221,7 +257,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
                 )
                 return self._replay_route(value, weights, ids)
 
-            weights, ids = fixed_route_vjp(
+            weights, ids = _fixed_route_vjp(
                 learned_route,
                 logits,
                 renormalize=True,

@@ -1,28 +1,48 @@
+"""vLLM-visible sparse attention assembled on the Lite DS4 container."""
+
 from __future__ import annotations
 
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
+from torch import Tensor
+from vllm import envs
 from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    deepgemm_post_process_fp8_weight_block,
+    per_token_group_quant_fp8,
+)
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
+    compute_fp8_einsum_recipe,
+    deep_gemm_fp8_o_proj,
+)
+from vllm.utils.deep_gemm import fp8_gemm_nt
 from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
+    quantize_block_fp8_weight,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
     attach_indexer_aux_loss,
+    compressed_compact_graph,
     visible_sparse_attention,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.metadata import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
     AttentionKernelMetadata,
+    c128_all_visible_topk,
+    compressed_width,
     compressor_operation,
-)
-from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import (
-    insert_qkv,
-    o_projection_visible,
+    gather_cp_compressed_rows,
+    official_compact_compressed_visible,
+    official_indexer_topk,
+    official_local_qk_visible,
+    prepare_cp_compression_geometry,
+    quantized_main_k_visible,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     block_fp8_linear,
@@ -31,7 +51,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     fused_qkv_rms_norm,
-    o_projection,
+    visible_functional_vjp,
 )
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
 from megatron.lite.primitive.parallel import ParallelState
@@ -40,6 +60,140 @@ from megatron.lite.primitive.parallel import ParallelState
 def _fp32_linear(value: torch.Tensor, *weights: torch.Tensor) -> torch.Tensor:
     return torch.mm(
         value.contiguous(), torch.cat(weights, dim=0).T, out_dtype=torch.float32
+    )
+
+
+def insert_qkv(
+    q: Tensor,
+    kv: Tensor,
+    cache: Tensor,
+    slot_mapping: Tensor,
+    positions: Tensor,
+    cos_sin_cache: Tensor,
+    *,
+    eps: float,
+    block_size: int,
+    padded_heads: int,
+) -> Tensor:
+    return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q,
+        kv,
+        cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        padded_heads,
+        eps,
+        block_size,
+    )
+
+
+def o_projection_visible(
+    o: Tensor,
+    positions: Tensor,
+    cos_sin_cache: Tensor,
+    wo_a: Tensor,
+    wo_b: Tensor,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+) -> Tensor:
+    with torch.no_grad():
+        canonical_wa = quantize_block_fp8_weight(wo_a)
+        wa_q, wa_s = deepgemm_post_process_fp8_weight_block(
+            wq=canonical_wa.qweight,
+            ws=canonical_wa.scales,
+            quant_block_shape=(128, 128),
+            use_e8m0=True,
+            is_bmm=True,
+            bmm_batch_size=n_groups,
+        )
+        packed_wa = type("_PackedGroupedWeight", (), {})()
+        packed_wa.weight = wa_q
+        packed_wa.weight_scale = wa_s
+
+        canonical_wb = quantize_block_fp8_weight(wo_b)
+        wb_q, wb_s = deepgemm_post_process_fp8_weight_block(
+            wq=canonical_wb.qweight,
+            ws=canonical_wb.scales,
+            quant_block_shape=(128, 128),
+            use_e8m0=True,
+        )
+
+    def packed_wb(value: Tensor) -> Tensor:
+        aligned = bool(envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES)
+        aq, a_s = per_token_group_quant_fp8(
+            value,
+            128,
+            use_ue8m0=True,
+            column_major_scales=True,
+            tma_aligned_scales=aligned,
+        )
+        output = torch.empty(
+            value.shape[0], wb_q.shape[0], dtype=torch.bfloat16, device=value.device
+        )
+        fp8_gemm_nt(
+            (aq, a_s),
+            (wb_q, wb_s),
+            output,
+            is_deep_gemm_e8m0_used=True,
+        )
+        return output
+
+    with torch.no_grad():
+        recipe, aligned = compute_fp8_einsum_recipe()
+        return deep_gemm_fp8_o_proj(
+            o,
+            positions,
+            cos_sin_cache,
+            packed_wa,
+            packed_wb,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            o_lora_rank=o_lora_rank,
+            einsum_recipe=recipe,
+            tma_aligned_scales=aligned,
+        )
+
+
+def _inverse_rope(o, positions, cache, nope_dim, rope_dim):
+    prefix, rope = o[..., :nope_dim], o[..., nope_dim : nope_dim + rope_dim]
+    selected = cache.index_select(0, positions.long()).float()
+    cos = selected[..., : rope_dim // 2].unsqueeze(-2)
+    sin = selected[..., rope_dim // 2 : rope_dim].unsqueeze(-2)
+    even, odd = rope[..., 0::2].float(), rope[..., 1::2].float()
+    rotated = torch.stack((even * cos + odd * sin, odd * cos - even * sin), dim=-1)
+    return torch.cat((prefix.float(), rotated.flatten(-2)), dim=-1)
+
+
+def _o_projection(
+    visible_op: Callable,
+    o: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_b: torch.Tensor,
+    *,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+):
+    def functional(o_, wa_, wb_):
+        inverse = _inverse_rope(o_, positions, cos_sin_cache, nope_dim, rope_dim)
+        grouped = inverse.reshape(inverse.shape[0], n_groups, -1)
+        wa = wa_.float().reshape(n_groups, o_lora_rank, -1)
+        z = torch.einsum("tgd,grd->tgr", grouped, wa)
+        return F.linear(z.flatten(1), wb_.float()).to(o_.dtype)
+
+    return visible_functional_vjp(
+        visible_op, functional, (o, wo_a, wo_b), version_indices=(1, 2)
     )
 
 
@@ -66,9 +220,7 @@ class VLLMAttention(CompressedSparseAttention):
         self.fused_linear = DeploymentFusedBlockFP8Adapter(
             cache_weight=cache_deployment_weights
         )
-        self.q_linear = DeploymentBlockFP8Adapter(
-            cache_weight=cache_deployment_weights
-        )
+        self.q_linear = DeploymentBlockFP8Adapter(cache_weight=cache_deployment_weights)
         self.indexer_q_linear = DeploymentBlockFP8Adapter(
             cache_weight=cache_deployment_weights
         )
@@ -88,7 +240,7 @@ class VLLMAttention(CompressedSparseAttention):
     ) -> torch.Tensor:
         heads_per_group = self.config.num_attention_heads // self.config.o_groups
         nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
-        return o_projection(
+        return _o_projection(
             lambda value, wa, wb: o_projection_visible(
                 value,
                 positions,
@@ -179,9 +331,6 @@ class VLLMAttention(CompressedSparseAttention):
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
             cp_utils,
         )
-        from megatron.lite.model.deepseek_v4.vllm.primitive.attention.cp import (
-            official_local_qk_visible,
-        )
 
         rows = boundary_hidden.shape[0]
         boundary_qr_kv = fused_block_fp8_linear(
@@ -243,20 +392,6 @@ class VLLMAttention(CompressedSparseAttention):
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
             cp_layout_kernels,
             cp_utils,
-        )
-        from megatron.lite.model.deepseek_v4.vllm.primitive.attention.cp import (
-            c128_all_visible_topk,
-            compressed_width,
-            official_indexer_topk,
-            official_local_qk_visible,
-            quantized_main_k_visible,
-        )
-        from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
-            compressed_compact_graph,
-        )
-        from megatron.lite.model.deepseek_v4.vllm.primitive.attention.cp import (
-            gather_cp_compressed_rows,
-            prepare_cp_compression_geometry,
         )
 
         psp = metadata.packed_seq_params
@@ -338,10 +473,6 @@ class VLLMAttention(CompressedSparseAttention):
                 eps=self.config.rms_norm_eps,
             )
             if ratio in (4, 128):
-                from megatron.lite.model.deepseek_v4.vllm.primitive.attention.cp import (
-                    official_compact_compressed_visible,
-                )
-
                 if metadata.compressor_metadata is None:
                     raise RuntimeError(
                         "C4/C128 CP requires caller-owned official compressor metadata"
@@ -395,12 +526,10 @@ class VLLMAttention(CompressedSparseAttention):
                     eps=self.config.rms_norm_eps,
                 )
                 if cp_size > 1:
-                    index_k_rank_major, index_k_seq_major = (
-                        gather_cp_compressed_rows(
-                            index_k_local,
-                            seq_to_rank_row,
-                            cp_group=cp_group,
-                        )
+                    index_k_rank_major, index_k_seq_major = gather_cp_compressed_rows(
+                        index_k_local,
+                        seq_to_rank_row,
+                        cp_group=cp_group,
                     )
                 else:
                     index_k_seq_major = torch.index_select(
@@ -462,7 +591,9 @@ class VLLMAttention(CompressedSparseAttention):
                 ),
             ).to(torch.int64)
             compressed_count = topk_length.to(torch.int64) - window_count
-            columns = torch.arange(indices.shape[-1], device=indices.device).unsqueeze(0)
+            columns = torch.arange(indices.shape[-1], device=indices.device).unsqueeze(
+                0
+            )
             source = torch.where(
                 columns < compressed_count.unsqueeze(1),
                 window_count.unsqueeze(1) + columns,
@@ -555,9 +686,9 @@ class VLLMAttention(CompressedSparseAttention):
             self.kv_norm.weight,
             self.config.rms_norm_eps,
         )
-        q = block_fp8_linear(
-            self.q_linear, qr, self.wq_b.weight
-        ).view(-1, self.config.num_attention_heads, self.config.head_dim)
+        q = block_fp8_linear(self.q_linear, qr, self.wq_b.weight).view(
+            -1, self.config.num_attention_heads, self.config.head_dim
+        )
         index_q = (
             block_fp8_linear(
                 self.indexer_q_linear,

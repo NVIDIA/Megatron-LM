@@ -1,3 +1,5 @@
+"""Autograd bridges from vLLM-visible dense kernels to BF16-master VJPs."""
+
 from __future__ import annotations
 
 import math
@@ -6,8 +8,32 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from vllm.model_executor.kernels.mhc.tilelang import (
+    hc_head_fused_kernel_tilelang,
+    mhc_fused_post_pre_tilelang,
+    mhc_post_tilelang,
+    mhc_pre_broadcast_tilelang,
+    mhc_pre_tilelang,
+)
 
-from megatron.lite.primitive.modules.attention.hca import HyperConnection, split_sinkhorn
+from megatron.lite.primitive.modules.attention.hca import (
+    HyperConnection,
+    split_sinkhorn,
+)
+
+
+_MHC_KERNELS = {
+    "pre": mhc_pre_tilelang,
+    "pre_broadcast": mhc_pre_broadcast_tilelang,
+    "post": mhc_post_tilelang,
+    "post_pre": mhc_fused_post_pre_tilelang,
+    "head": hc_head_fused_kernel_tilelang,
+}
+
+
+def mhc_kernel(name: str, *args, **kwargs):
+    return _MHC_KERNELS[name](*args, **kwargs)
+
 
 def parameter_versions(parameters: Iterable[torch.Tensor]) -> tuple[int, ...]:
     return tuple(parameter._version for parameter in parameters)
@@ -135,8 +161,10 @@ def _empty_output(value: torch.Tensor, weights: tuple[torch.Tensor, ...]):
 
 def visible_linear(visible_op, value, master_weight):
     if value.numel() == 0:
+
         def visible_op(_value, _weight):
             return _empty_output(_value, (_weight,))
+
     if not torch.is_grad_enabled():
         output = visible_op(value, master_weight)
         return output[0] if isinstance(output, (tuple, list)) else output
@@ -148,8 +176,10 @@ block_fp8_linear = visible_linear
 
 def fused_block_fp8_linear(visible_op, value, *master_weights):
     if value.numel() == 0:
+
         def visible_op(_value, *_weights):
             return _empty_output(_value, _weights)
+
     if not torch.is_grad_enabled():
         output = visible_op(value, *master_weights)
         return output[0] if isinstance(output, (tuple, list)) else output
@@ -198,9 +228,7 @@ def _pre_graph(x, fn, scale, base, *, mult, iters, eps):
             *residual.shape[:-1], mult, residual.shape[-1]
         )
     flat = residual.flatten(-2)
-    rms_inv = 1.0 / (
-        flat.norm(dim=-1, keepdim=True) / math.sqrt(flat.shape[-1]) + eps
-    )
+    rms_inv = 1.0 / (flat.norm(dim=-1, keepdim=True) / math.sqrt(flat.shape[-1]) + eps)
     mixes = F.linear(flat, fn.to(flat.dtype)) * rms_inv
     pre, post, comb = split_sinkhorn(mixes, scale, base, mult, iters, eps)
     hidden = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)
@@ -240,9 +268,7 @@ def mhc_pre_broadcast(
 
 
 def mhc_post(visible_op: Callable, x, residual, post, comb):
-    return visible_functional_vjp(
-        visible_op, _post_graph, (x, residual, post, comb)
-    )
+    return visible_functional_vjp(visible_op, _post_graph, (x, residual, post, comb))
 
 
 def mhc_head(visible_op: Callable, x, fn, scale, base, *, eps: float):
@@ -256,71 +282,3 @@ def mhc_head(visible_op: Callable, x, fn, scale, base, *, eps: float):
     return visible_functional_vjp(
         visible_op, functional, (x, fn, scale, base), version_indices=(1, 2, 3)
     )
-
-
-def _inverse_rope(o, positions, cache, nope_dim, rope_dim):
-    prefix, rope = o[..., :nope_dim], o[..., nope_dim : nope_dim + rope_dim]
-    selected = cache.index_select(0, positions.long()).float()
-    cos = selected[..., : rope_dim // 2].unsqueeze(-2)
-    sin = selected[..., rope_dim // 2 : rope_dim].unsqueeze(-2)
-    even, odd = rope[..., 0::2].float(), rope[..., 1::2].float()
-    rotated = torch.stack(
-        (even * cos + odd * sin, odd * cos - even * sin), dim=-1
-    )
-    return torch.cat((prefix.float(), rotated.flatten(-2)), dim=-1)
-
-
-def o_projection(
-    visible_op: Callable,
-    o: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_b: torch.Tensor,
-    *,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    n_groups: int,
-    heads_per_group: int,
-    nope_dim: int,
-    rope_dim: int,
-    o_lora_rank: int,
-):
-    def functional(o_, wa_, wb_):
-        inverse = _inverse_rope(o_, positions, cos_sin_cache, nope_dim, rope_dim)
-        grouped = inverse.reshape(inverse.shape[0], n_groups, -1)
-        wa = wa_.float().reshape(n_groups, o_lora_rank, -1)
-        z = torch.einsum("tgd,grd->tgr", grouped, wa)
-        return F.linear(z.flatten(1), wb_.float()).to(o_.dtype)
-
-    return visible_functional_vjp(
-        visible_op, functional, (o, wo_a, wo_b), version_indices=(1, 2)
-    )
-
-
-class _VLLMFixedRouteFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, logits, visible_op, renormalize, route_scale):
-        weights, ids = visible_op(logits)
-        ctx.save_for_backward(logits, ids.clone())
-        ctx.renormalize = renormalize
-        ctx.route_scale = route_scale
-        ctx.mark_non_differentiable(ids)
-        return weights, ids
-
-    @staticmethod
-    def backward(ctx: Any, grad_weights, _grad_ids):
-        logits, ids = ctx.saved_tensors
-        with torch.enable_grad():
-            replay = logits.detach().float().requires_grad_(True)
-            scores = torch.sqrt(F.softplus(replay))
-            selected = scores.gather(-1, ids.long())
-            if ctx.renormalize:
-                selected = selected / selected.sum(dim=-1, keepdim=True).clamp_min(1e-20)
-            selected = selected * ctx.route_scale
-            (dlogits,) = torch.autograd.grad(selected, replay, grad_weights.float())
-        return dlogits.to(logits.dtype), None, None, None
-
-
-def fixed_route_vjp(visible_op, logits, *, renormalize: bool, route_scale: float):
-    if not torch.is_grad_enabled():
-        return visible_op(logits)
-    return _VLLMFixedRouteFunction.apply(logits, visible_op, renormalize, route_scale)

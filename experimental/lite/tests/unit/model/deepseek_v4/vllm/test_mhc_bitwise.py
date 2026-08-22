@@ -9,8 +9,8 @@ from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm import model as model_module
 from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Layer
-from megatron.lite.model.deepseek_v4.vllm.primitive import kernels as vllm_ds4
-from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import mhc_kernel
+from megatron.lite.model.deepseek_v4.vllm.primitive import dense as vllm_ds4
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import mhc_kernel
 
 
 def _post_inputs(device: str = "cpu") -> tuple[torch.Tensor, ...]:

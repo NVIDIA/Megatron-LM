@@ -7,18 +7,22 @@ import torch
 import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
-    _inverse_rope,
     _pre_graph,
     block_fp8_linear,
-    fixed_route_vjp,
     fused_block_fp8_linear,
     fused_qkv_rms_norm,
     gate_linear,
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,
-    o_projection,
     rms_norm,
+)
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
+    _inverse_rope,
+    _o_projection,
+)
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import (
+    _fixed_route_vjp,
 )
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.recompute import wrap_checkpoint
@@ -27,7 +31,12 @@ pytestmark = pytest.mark.gpus(1)
 
 
 def _grad_like(value: torch.Tensor) -> torch.Tensor:
-    return torch.arange(1, value.numel() + 1, dtype=torch.float32).reshape_as(value).div(value.numel()).to(value)
+    return (
+        torch.arange(1, value.numel() + 1, dtype=torch.float32)
+        .reshape_as(value)
+        .div(value.numel())
+        .to(value)
+    )
 
 
 def _post_graph(x, residual, post, comb):
@@ -39,12 +48,12 @@ def test_visible_linear_value_and_master_vjp(fused: bool) -> None:
     torch.manual_seed(1)
     x = torch.randn(3, 4, requires_grad=True)
     weights = tuple(
-        torch.randn(rows, 4, requires_grad=True)
-        for rows in ((2, 3) if fused else (5,))
+        torch.randn(rows, 4, requires_grad=True) for rows in ((2, 3) if fused else (5,))
     )
 
     def visible(value, *ws):
         return F.linear(value, torch.cat(ws)) + 0.25
+
     output = (
         fused_block_fp8_linear(visible, x, *weights)
         if fused
@@ -53,17 +62,20 @@ def test_visible_linear_value_and_master_vjp(fused: bool) -> None:
     assert torch.equal(output, visible(x, *weights).detach())
     output.backward(_grad_like(output))
     refs = tuple(value.detach().requires_grad_(True) for value in (x, *weights))
-    F.linear(refs[0].float(), torch.cat(refs[1:]).float()).backward(_grad_like(output).float())
+    F.linear(refs[0].float(), torch.cat(refs[1:]).float()).backward(
+        _grad_like(output).float()
+    )
     for actual, reference in zip((x, *weights), refs, strict=True):
-        torch.testing.assert_close(actual.grad.float(), reference.grad, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            actual.grad.float(), reference.grad, rtol=1e-5, atol=1e-6
+        )
 
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_visible_linear_empty_rows_do_not_call_deployment_kernel(fused: bool) -> None:
     value = torch.empty(0, 4, requires_grad=True)
     weights = tuple(
-        torch.randn(rows, 4, requires_grad=True)
-        for rows in ((2, 3) if fused else (5,))
+        torch.randn(rows, 4, requires_grad=True) for rows in ((2, 3) if fused else (5,))
     )
 
     def unsupported_empty_m(*_args):
@@ -85,12 +97,13 @@ def test_visible_linear_empty_rows_do_not_call_deployment_kernel(fused: bool) ->
 def test_forward_only_uses_visible_path_without_autograd_owner() -> None:
     x = torch.randn(3, 4, requires_grad=True)
     weight = torch.randn(5, 4, requires_grad=True)
+
     def visible(value, master):
         return F.linear(value, master) + 0.25
 
     with torch.inference_mode():
         output = block_fp8_linear(visible, x, weight)
-        projected = o_projection(
+        projected = _o_projection(
             lambda value, *_weights: value.sum(dim=1),
             torch.randn(3, 2, 4),
             torch.randn(2, 8),
@@ -158,17 +171,20 @@ def test_rms_norm_vjp_matches_pytorch(fused: bool) -> None:
     eps = 1e-6
     x = torch.randn(3, 8, requires_grad=True)
     weight = torch.randn(8, requires_grad=True)
+
     def visible(value, w, epsilon):
         return F.rms_norm(value, (8,), w, epsilon)
 
     if fused:
         y = torch.randn(3, 6, requires_grad=True)
         wy = torch.randn(6, requires_grad=True)
+
         def pair(a, b, wa, wb, epsilon):
             return (
                 F.rms_norm(a, (8,), wa, epsilon),
                 F.rms_norm(b, (6,), wb, epsilon),
             )
+
         outputs = fused_qkv_rms_norm(pair, x, y, weight, wy, eps)
         grads = tuple(_grad_like(value) for value in outputs)
         torch.autograd.backward(outputs, grads)
@@ -228,8 +244,17 @@ def test_mhc_head_and_o_projection_cover_parameters() -> None:
 
     def head(value, fn_, scale_, base_):
         flat = value.flatten(-2).float()
-        mixes = F.linear(flat, fn_.float()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
-        return ((torch.sigmoid(mixes * scale_ + base_) + 1e-6).unsqueeze(-1) * value.float()).sum(-2).to(value)
+        mixes = F.linear(flat, fn_.float()) * torch.rsqrt(
+            flat.square().mean(-1, keepdim=True) + 1e-6
+        )
+        return (
+            (
+                (torch.sigmoid(mixes * scale_ + base_) + 1e-6).unsqueeze(-1)
+                * value.float()
+            )
+            .sum(-2)
+            .to(value)
+        )
 
     output = mhc_head(head, x, fn, scale, base, eps=1e-6)
     output.backward(_grad_like(output))
@@ -246,9 +271,18 @@ def test_mhc_head_and_o_projection_cover_parameters() -> None:
         z = torch.einsum("tgd,grd->tgr", inverse, wa_.reshape(2, 3, -1))
         return F.linear(z.flatten(1), wb_)
 
-    projected = o_projection(
-        projection, o, wa, wb, positions=positions, cos_sin_cache=cache,
-        n_groups=2, heads_per_group=2, nope_dim=4, rope_dim=4, o_lora_rank=3,
+    projected = _o_projection(
+        projection,
+        o,
+        wa,
+        wb,
+        positions=positions,
+        cos_sin_cache=cache,
+        n_groups=2,
+        heads_per_group=2,
+        nope_dim=4,
+        rope_dim=4,
+        o_lora_rank=3,
     )
     projected.backward(_grad_like(projected))
     assert all(value.grad is not None for value in (o, wa, wb))
@@ -263,7 +297,7 @@ def test_router_backward_keeps_ids_snapshot_when_consumer_mutates_output() -> No
         scores = torch.sqrt(F.softplus(value)).gather(-1, original_ids.long())
         return scores / scores.sum(-1, keepdim=True), original_ids.clone()
 
-    weights, returned_ids = fixed_route_vjp(
+    weights, returned_ids = _fixed_route_vjp(
         visible, logits, renormalize=True, route_scale=1.0
     )
     assert torch.equal(returned_ids, original_ids)

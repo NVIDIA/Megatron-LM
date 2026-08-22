@@ -14,14 +14,14 @@ from megatron.lite.model.deepseek_v4.lite.model import (
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
     VLLMAttention,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.metadata import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
     AttentionKernelMetadata,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import mhc_kernel
 from megatron.lite.model.deepseek_v4.vllm.primitive.logprob import (
     aligned_selected_log_probs,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
+    mhc_kernel,
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,

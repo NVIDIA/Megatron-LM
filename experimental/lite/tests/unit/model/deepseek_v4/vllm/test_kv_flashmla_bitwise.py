@@ -4,7 +4,7 @@ import importlib.util
 import pytest
 import torch
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import insert_qkv
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import insert_qkv
 
 
 def _production_ready() -> bool:

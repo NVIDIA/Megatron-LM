@@ -5,7 +5,9 @@ import pytest
 import torch
 from torch import nn
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.kernels import o_projection_visible
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
+    o_projection_visible,
+)
 
 
 @pytest.mark.gpus(1)
