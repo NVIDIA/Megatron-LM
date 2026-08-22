@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
+
 import logging
 import os
 import random
@@ -263,8 +264,9 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+def _initialize_distributed(
+    get_embedding_ranks, get_position_embedding_ranks, store, skip_model_parallel_init=False
+):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -370,6 +372,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 dynamic_context_parallel=args.dynamic_context_parallel,
                 min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
+                eager_initialize_dynamic_cp_communicators=(
+                    not args.dynamic_context_parallel
+                    or args.cuda_graph_impl != 'transformer_engine'
+                ),
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -421,11 +427,17 @@ def _set_random_seed(
     """
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+        pp_rank = (
+            get_pg_rank(pp_group)
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_rank()
+        )
         seed = seed_ + (100 * pp_rank)
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            dp_rank = (
+                get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            )
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)
