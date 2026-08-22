@@ -1179,6 +1179,71 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("cp", [1, 2])
+    def test_roll_tensor_packed_seq_uses_padded_boundaries(self, cp):
+        """Rolling a padded THD tensor must follow ``cu_seqlens_q_padded``.
+
+        When the data path pads each packed sequence, the physical tensor is laid out
+        with the padded cumulative lengths, and CP partitions it the same way. Rolling
+        with the unpadded ``cu_seqlens_q`` applies sequence boundaries at the wrong
+        offsets, shifting tokens across sequence boundaries.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group() if cp > 1 else None
+        cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
+
+        if cp == 1:
+            # Two sequences of 3 and 2 real tokens, each padded up to a length of 4.
+            #   seq1 = [1, 2, 3, pad]
+            #   seq2 = [11, 12, pad, pad]
+            tensor = torch.tensor([1, 2, 3, 0, 11, 12, 0, 0], dtype=torch.float32).cuda()
+            cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32).cuda()
+            cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32).cuda()
+            # Each padded sequence is rolled within its own [0:4] / [4:8] window.
+            expected = torch.tensor([2, 3, 0, 0, 12, 0, 0, 0], dtype=torch.float32).cuda()
+            max_seqlen = 4
+        else:
+            # Same physical layout as test_roll_tensor_with_packed_sequences, but the
+            # boundaries [0, 8, 20] are now the padded ones: seq1 holds 6 real tokens
+            # padded to 8, seq2 holds 10 real tokens padded to 12.
+            if cp_rank == 0:
+                tensor = torch.tensor(
+                    [1, 2, 7, 8, 11, 12, 13, 20, 21, 22], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [2, 3, 8, 0, 12, 13, 14, 21, 22, 0], dtype=torch.float32
+                ).cuda()
+            else:
+                tensor = torch.tensor(
+                    [3, 4, 5, 6, 14, 15, 16, 17, 18, 19], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [4, 5, 6, 7, 15, 16, 17, 18, 19, 20], dtype=torch.float32
+                ).cuda()
+            cu_seqlens = torch.tensor([0, 6, 16], dtype=torch.int32).cuda()
+            cu_seqlens_padded = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+            max_seqlen = 6
+
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format='thd',
+        )
+
+        rolled, _ = roll_tensor(
+            tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+
+        assert torch.equal(
+            rolled, expected
+        ), f"CP rank {cp_rank}: expected {expected}, got {rolled}"
+
+        Utils.destroy_model_parallel()
+
 
 class TestMTPLossLoggingHelper:
     def setup_method(self, method):
