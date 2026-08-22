@@ -166,6 +166,7 @@ class TestLayerWiseOptimizer:
         model_kwargs=None,
         copy_from=None,
         overlap_param_gather=True,
+        optimizer_overlap_param_gather=None,
         grad_reduce_in_fp32=False,
         bucket_size=None,
         use_param_layout=False,
@@ -182,6 +183,8 @@ class TestLayerWiseOptimizer:
             model_kwargs: Optional kwargs for model initialization
             copy_from: Optional DDP model to copy weights from
             overlap_param_gather: If True, defer param all-gather to bucket infrastructure
+            optimizer_overlap_param_gather: Optional conflicting OptimizerConfig value used to
+                verify that the DDP config remains authoritative. Defaults to the DDP value.
             grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
             bucket_size: Maximum number of parameters per bucket (None = single bucket)
             use_param_layout: If True, supply DDP a precomputed shard-aligned
@@ -233,6 +236,9 @@ class TestLayerWiseOptimizer:
         else:
             model.broadcast_params()
 
+        if optimizer_overlap_param_gather is None:
+            optimizer_overlap_param_gather = overlap_param_gather
+
         optimizer_config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -240,7 +246,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             use_distributed_optimizer=False,
             clip_grad=clip_grad,
-            overlap_param_gather=overlap_param_gather,
+            overlap_param_gather=optimizer_overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=True,
         )
@@ -615,6 +621,33 @@ class TestLayerWiseOptimizer:
             torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
 
     # ---- Overlap-param-gather tests ----
+
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    @pytest.mark.parametrize(
+        ('ddp_overlap_param_gather', 'optimizer_overlap_param_gather'),
+        [(False, True), (True, False)],
+    )
+    def test_overlap_param_gather_follows_ddp_config(
+        self, use_param_layout, ddp_overlap_param_gather, optimizer_overlap_param_gather
+    ):
+        """DDP's per-model overlap policy must override the global optimizer value."""
+        model, optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            overlap_param_gather=ddp_overlap_param_gather,
+            optimizer_overlap_param_gather=optimizer_overlap_param_gather,
+            use_param_layout=use_param_layout,
+        )
+
+        layer_wise_optimizer = next(
+            (
+                sub_optimizer
+                for sub_optimizer in getattr(optimizer, 'chained_optimizers', [optimizer])
+                if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            ),
+            optimizer,
+        )
+
+        assert layer_wise_optimizer.ddp_config is model.ddp_config
+        assert layer_wise_optimizer.overlap_param_gather == ddp_overlap_param_gather
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_overlap_param_gather_basic(self, use_param_layout):

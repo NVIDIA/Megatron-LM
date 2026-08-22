@@ -519,6 +519,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
 
+        # DDP owns the parameter-gather schedule, so derive the overlap policy from
+        # the wrapped model chunks just like DistributedOptimizer does.  The
+        # OptimizerConfig value can differ across modules that use distinct DDP
+        # configurations (for example, heterogeneous models).
+        self.ddp_config = None
+        if model_chunks:
+            self.ddp_config = model_chunks[0].ddp_config
+            for model_chunk in model_chunks:
+                assert self.ddp_config == model_chunk.ddp_config
+
         # The data-parallel groups this optimizer shards parameters over. Cached here so the
         # sharding, all-gather and broadcast paths read one attribute instead of reaching back
         # into pg_collection at every use.
@@ -557,8 +567,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # path.
         self.use_buffer_param_sync = full_param_layouts is not None
 
-        # Set up overlap param gather using DDP bucket infrastructure.
-        self.overlap_param_gather = config.overlap_param_gather
+        # Set up overlap param gather using DDP bucket infrastructure. Fall back
+        # to OptimizerConfig only for direct legacy construction without model chunks.
+        self.overlap_param_gather = (
+            self.ddp_config.overlap_param_gather
+            if self.ddp_config is not None
+            else config.overlap_param_gather
+        )
         if self.overlap_param_gather and not self.use_buffer_param_sync:
             # Legacy path: set up per-bucket param lists for variable-size all-gather.
             # When use_buffer_param_sync is True, the standard distributed optimizer
