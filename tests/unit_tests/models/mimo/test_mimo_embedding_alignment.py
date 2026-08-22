@@ -480,61 +480,44 @@ class TestEmbeddingAlignment:
                 special_token_ids=special_token_ids,
             )
 
-        # The precomputed path validates its complete-map contract using tensor
-        # metadata only; none of these checks synchronize with the device.
         valid_text_indices = (input_ids.reshape(-1) != vision_token_id).nonzero().flatten()
         valid_vision_indices = (input_ids.reshape(-1) == vision_token_id).nonzero().flatten()
         indexed_modality_embeddings = {
             "vision": vision_embeddings,
             "text": torch.full((valid_text_indices.numel(), hidden_dim), 0.01, device=self.device),
         }
-        with pytest.raises(ValueError, match="Number of vision token indices.*does not match"):
-            self.model.align_embeddings_by_token_positions(
-                modality_embeddings=indexed_modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=special_token_ids,
-                modality_token_indices={
-                    "text": valid_text_indices,
-                    "vision": torch.tensor([1], dtype=torch.long, device=self.device),
-                },
-            )
-
-        with pytest.raises(ValueError, match="must be one-dimensional"):
-            self.model.align_embeddings_by_token_positions(
-                modality_embeddings=indexed_modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=special_token_ids,
-                modality_token_indices={
-                    "text": valid_text_indices,
-                    "vision": torch.tensor([[1, 7]], dtype=torch.long, device=self.device),
-                },
-            )
-
-        with pytest.raises(ValueError, match="same modalities as the embeddings"):
-            self.model.align_embeddings_by_token_positions(
-                modality_embeddings=indexed_modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=special_token_ids,
-                modality_token_indices={"text": valid_text_indices},
-            )
-
         incomplete_text_indices = valid_text_indices[:-1]
         incomplete_modality_embeddings = {
             "vision": vision_embeddings,
-            "text": torch.full(
-                (incomplete_text_indices.numel(), hidden_dim), 0.01, device=self.device
-            ),
+            "text": indexed_modality_embeddings["text"][:-1],
         }
-        with pytest.raises(ValueError, match="must cover .* positions"):
-            self.model.align_embeddings_by_token_positions(
-                modality_embeddings=incomplete_modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=special_token_ids,
-                modality_token_indices={
-                    "text": incomplete_text_indices,
-                    "vision": valid_vision_indices,
-                },
-            )
+        invalid_cases = (
+            (
+                indexed_modality_embeddings,
+                {"text": valid_text_indices, "vision": valid_vision_indices[:1]},
+                "Number of vision token indices.*does not match",
+            ),
+            (
+                indexed_modality_embeddings,
+                {"text": valid_text_indices, "vision": valid_vision_indices.unsqueeze(0)},
+                "must be one-dimensional",
+            ),
+            (
+                indexed_modality_embeddings,
+                {"text": valid_text_indices},
+                "same modalities as the embeddings",
+            ),
+            (
+                incomplete_modality_embeddings,
+                {"text": incomplete_text_indices, "vision": valid_vision_indices},
+                "must cover .* positions",
+            ),
+        )
+        for embeddings, indices, error in invalid_cases:
+            with pytest.raises(ValueError, match=error):
+                self.model._validate_precomputed_token_indices(
+                    embeddings, indices, batch_size * seq_length
+                )
 
     def test_missing_special_token_id(self):
         """Test error when a modality is missing from special_token_ids."""

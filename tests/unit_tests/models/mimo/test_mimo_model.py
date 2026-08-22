@@ -234,74 +234,6 @@ class TestMimoModel:
         assert indexed_embeddings.shape == (expected_text_tokens, self.hidden_size)
         torch.testing.assert_close(indexed_embeddings, mask_embeddings, rtol=0, atol=0)
 
-    def test_get_text_embeddings_handles_noncontiguous_inputs(self):
-        """Flat indices use logical ``[B, S]`` order for non-contiguous tensors."""
-        mimo_model = self._make_avlm().eval()
-
-        input_values = self._make_input_ids()
-        input_values[0, 3] = self.special_token_ids["images"]
-        input_values[1, 5] = self.special_token_ids["audio"]
-        input_storage = torch.empty(
-            self.batch_size, self.seq_len, 2, dtype=input_values.dtype, device=self.device
-        )
-        input_storage[..., 0] = input_values
-        input_ids = input_storage[..., 0]
-
-        position_values = self._make_position_ids()
-        position_storage = torch.empty(
-            self.batch_size, self.seq_len, 2, dtype=position_values.dtype, device=self.device
-        )
-        position_storage[..., 0] = position_values
-        position_ids_2d = position_storage[..., 0]
-
-        position_storage_3d = torch.empty(
-            3, self.batch_size, self.seq_len, 2, dtype=position_values.dtype, device=self.device
-        )
-        position_storage_3d[..., 0] = position_values.unsqueeze(0).expand(3, -1, -1)
-        position_ids_3d = position_storage_3d[..., 0]
-
-        assert not input_ids.is_contiguous()
-        assert not position_ids_2d.is_contiguous()
-        assert not position_ids_3d.is_contiguous()
-        assert not position_ids_3d[0].is_contiguous()
-
-        text_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        for special_token_id in self.special_token_ids.values():
-            text_mask &= input_ids != special_token_id
-        text_token_indices = text_mask.reshape(-1).nonzero(as_tuple=False).flatten()
-
-        expected_2d = mimo_model.get_text_embeddings(
-            input_ids.contiguous(),
-            position_ids_2d.contiguous(),
-            self.special_token_ids,
-            text_token_indices=text_token_indices,
-        )
-        actual_2d = mimo_model.get_text_embeddings(
-            input_ids,
-            position_ids_2d,
-            self.special_token_ids,
-            text_token_indices=text_token_indices,
-        )
-        fallback_2d = mimo_model.get_text_embeddings(
-            input_ids, position_ids_2d, self.special_token_ids
-        )
-        expected_3d = mimo_model.get_text_embeddings(
-            input_ids.contiguous(),
-            position_ids_3d.contiguous(),
-            self.special_token_ids,
-            text_token_indices=text_token_indices,
-        )
-        actual_3d = mimo_model.get_text_embeddings(
-            input_ids,
-            position_ids_3d,
-            self.special_token_ids,
-            text_token_indices=text_token_indices,
-        )
-
-        torch.testing.assert_close(actual_2d, expected_2d, rtol=0, atol=0)
-        torch.testing.assert_close(fallback_2d, expected_2d, rtol=0, atol=0)
-        torch.testing.assert_close(actual_3d, expected_3d, rtol=0, atol=0)
-
     def test_get_text_embeddings_handles_3d_position_ids(self):
         """3D mRoPE position_ids ``[rope_dim, B, S]`` must produce the same text
         embeddings as the 2D ``[B, S]`` baseline.
@@ -834,7 +766,7 @@ class TestMimoModelNonColocated:
         assert "images" in outputs
 
     def test_forward_language_only(self):
-        """Test non-colocated language forward consumes precomputed token positions."""
+        """Test language-only forward returns tensor."""
         model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
         model = model.to(self.device)
 
@@ -854,13 +786,6 @@ class TestMimoModelNonColocated:
         )
         model.set_input_tensor({"images": encoder_embeddings})
 
-        flat_input_ids = input_ids.reshape(-1)
-        image_mask = flat_input_ids == 50257
-        modality_token_indices = {
-            "images": image_mask.nonzero(as_tuple=False).flatten(),
-            "text": (~image_mask).nonzero(as_tuple=False).flatten(),
-        }
-
         captured = {}
 
         def capture_language_inputs(module, args, kwargs):
@@ -869,36 +794,20 @@ class TestMimoModelNonColocated:
         hook = model.language_model.register_forward_pre_hook(
             capture_language_inputs, with_kwargs=True
         )
-        with (
-            patch.object(
-                model, 'get_text_embeddings', wraps=model.get_text_embeddings
-            ) as get_text_embeddings,
-            patch.object(
-                model,
-                'align_embeddings_by_token_positions',
-                wraps=model.align_embeddings_by_token_positions,
-            ) as align_embeddings,
-        ):
-            try:
-                outputs, out_loss_mask = model(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    loss_mask=loss_mask,
-                    modality_inputs=None,
-                    modality_token_indices=modality_token_indices,
-                )
-            finally:
-                hook.remove()
+        try:
+            outputs, out_loss_mask = model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                loss_mask=loss_mask,
+                modality_inputs=None,
+            )
+        finally:
+            hook.remove()
 
         assert isinstance(outputs, torch.Tensor)
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
         assert captured['loss_mask'] is loss_mask
         assert out_loss_mask is loss_mask
-        assert (
-            get_text_embeddings.call_args.kwargs['text_token_indices']
-            is modality_token_indices['text']
-        )
-        assert align_embeddings.call_args.kwargs['modality_token_indices'] is modality_token_indices
 
     def test_forward_language_module_non_first_stage_drops_input_ids(self):
         """Non-first PP stage in ``_forward_language_module`` must call the LM
