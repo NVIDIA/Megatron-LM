@@ -65,7 +65,12 @@ class AsyncZMQCommunicator:
             self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
             gather_socket_addr = self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            self.bcast_sock = zmq_context.socket(zmq.PUB)
+            # XPUB exposes subscription notifications. Needed to ensure that all
+            # inference engine ranks have (asynchronously) subscribed to the ZMQ
+            # leader rank. Helps prevent deadlock when the leader rank begins
+            # publishing before all ranks have subscribed.
+            self.bcast_sock = zmq_context.socket(zmq.XPUB)
+            self.bcast_sock.setsockopt(zmq.XPUB_VERBOSE, 1)
             self.bcast_sock.bind_to_random_port(f"tcp://{local_ip}")
             bcast_socket_addr = self.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
@@ -83,6 +88,27 @@ class AsyncZMQCommunicator:
             self.bcast_sock = zmq_context.socket(zmq.SUB)
             self.bcast_sock.connect(bcast_socket_addr)
             self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
+
+        # Wait until all ProcessGroup peers have subscribed to the ZMQ leader.
+        # Otherwise, ranks that fail to subscribe in time will deadlock.
+        if self.is_leader:
+            # XPUB subscription messages are one byte for an empty-topic
+            # subscription: b"\x01". XPUB_VERBOSE is required so identical
+            # subs from every peer are reported rather than coalesced.
+            subscribed_peers = 0
+            self.bcast_sock.setsockopt(zmq.RCVTIMEO, 60_000)
+            try:
+                while subscribed_peers < self.world_size - 1:
+                    subscription = self.bcast_sock.recv()
+                    if subscription == b"\x01":
+                        subscribed_peers += 1
+            except zmq.Again as exc:
+                raise RuntimeError(
+                    "[AsyncZMQCommunicator] Timed out waiting for ZMQ subscribers: "
+                    f"{subscribed_peers}/{self.world_size - 1} connected"
+                ) from exc
+            finally:
+                self.bcast_sock.setsockopt(zmq.RCVTIMEO, -1)
 
     async def all_reduce_max(self, *local_vals: int, async_op=True) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.
