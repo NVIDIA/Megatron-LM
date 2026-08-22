@@ -28,7 +28,7 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
     pack_routed_experts as pack_routed_experts,
     unpack_forward_output as unpack_forward_output,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.metadata import (
     build_attention_metadata_builders,
 )
 from megatron.lite.model.protocol_utils import add_loss_context_kwargs

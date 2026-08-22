@@ -10,7 +10,7 @@ import torch.nn as nn
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm import protocol
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import (

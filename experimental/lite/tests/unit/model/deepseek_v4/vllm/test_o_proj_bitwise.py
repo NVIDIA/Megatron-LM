@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.projections import (
     o_projection_visible,
 )
 

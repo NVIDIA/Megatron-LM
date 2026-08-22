@@ -8,19 +8,19 @@ import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     block_fp8_linear,
     gate_linear,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.experts import (
     VLLMGroupedMoEWithBF16Backward,
 )
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.parallel import ParallelState
-from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.deployment_fp8 import (
     DeploymentBlockFP8Adapter,
 )
 

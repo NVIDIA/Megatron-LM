@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention import runtime
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention import metadata as runtime
 
 
 def _config(**overrides) -> DeepseekV4Config:

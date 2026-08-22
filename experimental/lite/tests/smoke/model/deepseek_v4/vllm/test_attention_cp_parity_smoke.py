@@ -31,7 +31,7 @@ def test_vllm_attention_cp2_matches_cp1_forward_backward_and_saves_memory() -> N
     from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
         VLLMAttention,
     )
-    from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
+    from megatron.lite.model.deepseek_v4.vllm.primitive.attention.metadata import (
         AttentionMetadataBuilder,
         _build_rope,
     )

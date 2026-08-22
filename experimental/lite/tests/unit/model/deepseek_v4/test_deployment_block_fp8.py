@@ -10,8 +10,8 @@ import pytest
 import torch
 from torch import nn
 
-import megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 as deployment_fp8
-from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
+import megatron.lite.model.deepseek_v4.vllm.primitive.deployment_fp8 as deployment_fp8
+from megatron.lite.model.deepseek_v4.vllm.primitive.deployment_fp8 import (
     BLOCK_SHAPE,
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,

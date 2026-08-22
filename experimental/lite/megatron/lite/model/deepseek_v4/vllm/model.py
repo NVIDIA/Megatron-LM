@@ -14,7 +14,7 @@ from megatron.lite.model.deepseek_v4.lite.model import (
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
     VLLMAttention,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.metadata import (
     AttentionKernelMetadata,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.logprob import (
