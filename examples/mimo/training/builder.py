@@ -130,13 +130,6 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if wrap_with_ddp and ddp_config is None:
             raise ValueError("ddp_config is required when wrap_with_ddp is True")
-        # MIMO wraps its submodules via wrap_active_modules_with_ddp() rather than the
-        # shared dist_utils path, which is where the layerwise param layout is applied.
-        if use_layer_wise_distributed_optimizer:
-            raise NotImplementedError(
-                "MIMO does not support the layerwise distributed optimizer "
-                "(--optimizer muon and friends)."
-            )
 
         topology = self._topology
         args = get_args()
@@ -166,7 +159,15 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             )
         mimo_model = model_list[0]
 
-        wrap_active_modules_with_ddp(args, mimo_model, topology, data_parallel_random_init)
+        wrap_active_modules_with_ddp(
+            args,
+            mimo_model,
+            topology,
+            ddp_config,
+            data_parallel_random_init=data_parallel_random_init,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
+        )
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg
         mimo_model.rng_state_key_prefix = rng_state_key_prefix
