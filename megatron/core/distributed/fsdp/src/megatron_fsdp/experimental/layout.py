@@ -20,10 +20,9 @@ from collections.abc import Iterable
 from typing import TypeAlias
 
 import torch
+from megatron_fsdp.experimental.placement import Flat
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
-
-from .placement import Flat
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 

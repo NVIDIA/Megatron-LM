@@ -117,7 +117,10 @@ def _train(
     target: torch.Tensor,
     loss_reduce_group: dist.ProcessGroup | None = None,
 ) -> list[torch.Tensor]:
-    """Run 5 SGD steps; return the per-step losses (globally averaged if loss_reduce_group given)."""
+    """Run five SGD steps and return the per-step losses.
+
+    Losses are globally averaged when ``loss_reduce_group`` is provided.
+    """
     optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
     losses = []
     for _ in range(5):
