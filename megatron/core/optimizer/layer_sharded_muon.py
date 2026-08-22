@@ -12,88 +12,34 @@ original shards. All collectives use the existing gtp / tp process groups.
 
 import contextlib
 import logging
-from typing import Any
+from typing import Any, Callable, Literal, Optional
 
 import torch
 from torch.optim.optimizer import ParamsT
 
+from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
 from megatron.core.optimizer.layer_sharded_a2a import (
     layer_sharded_all_to_all_bwd,
     layer_sharded_all_to_all_fwd,
     layer_sharded_fused_bwd,
     layer_sharded_fused_fwd,
 )
-from megatron.core.utils import log_single_rank
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.utils import is_emerging_optimizers_min_version, log_single_rank
 
 try:
     from emerging_optimizers import triton_kernels
-    from emerging_optimizers.orthogonalized_optimizers.muon import (
-        Muon,
-        MuonScaleT,
-        get_muon_scale_factor,
-    )
+    from emerging_optimizers.orthogonalized_optimizers.muon import MuonScaleT, get_muon_scale_factor
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz
     from emerging_optimizers.utils import FP32MatmulPrecT, fp32_matmul_precision
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
-    Muon = object
 
 __all__ = ["LayerShardedMuon"]
 
 logger = logging.getLogger(__name__)
-
-
-def _check_eo_version() -> None:
-    """The batched-NS path (ns_batch_size > 1) requires emerging-optimizers >= 0.3.0.
-
-    0.3.0 added batched (3-D) Newton-Schulz -- the ns_batch_size path stacks
-    same-shape matrices and older releases fail inside torch.addmm with
-    "mat1 must be a matrix, got 3-D tensor". Only called when batching is
-    requested: the per-matrix baseline uses the 2-D newton_schulz API (including
-    the use_syrk kwarg) that 0.2.0 already ships, verified signature-identical.
-    """
-    import emerging_optimizers
-
-    version = getattr(emerging_optimizers, '__version__', '0')
-    parts = []
-    for piece in version.split('.')[:2]:
-        digits = ''.join(ch for ch in piece if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
-    if tuple(parts) < (0, 3):
-        raise ImportError(
-            f'LayerShardedMuon requires emerging-optimizers >= 0.3.0 (batched '
-            f'Newton-Schulz, SYRK); found {version}.'
-        )
-
-
-def _resolve_use_syrk(use_syrk: bool) -> bool:
-    """Validate SYRK availability, downgrading to False (with an error log) if unmet.
-
-    SYRK (symmetric rank-k update) halves the FLOPs of the two symmetric-output
-    Newton-Schulz GEMMs (``A = X Xᵀ`` and ``B = bA + cA²``) by computing only one
-    triangle. Requires the Triton tensor-descriptor API (>= 3.4.0) and a validated
-    SM architecture; it only takes effect on the bf16 (``fp32_matmul_prec="medium"``)
-    paths inside ``newton_schulz`` (the batched 3-D path additionally needs the
-    batched SYRK kernel — see :func:`_has_batched_syrk`).
-    """
-    if not use_syrk:
-        return False
-    if torch.cuda.is_available():
-        sm_version = torch.cuda.get_device_capability()
-    else:
-        sm_version = (0, 0)
-    if not triton_kernels.HAS_TRITON_340:  # type: ignore[attr-defined]
-        logger.error("Triton 3.4.0 or higher is required for use_syrk to be True.")
-        return False
-    if sm_version not in ((8, 0), (9, 0), (10, 0), (10, 3)):
-        logger.error(
-            f"Correctness of Triton kernel on SM {sm_version} cannot be guaranteed. "
-            "Setting use_syrk to False."
-        )
-        return False
-    return True
 
 
 def _has_batched_syrk() -> bool:
@@ -126,7 +72,7 @@ def _phase(name: str):
         torch.cuda.nvtx.range_pop()
 
 
-class LayerShardedMuon(Muon):
+class LayerShardedMuon(TensorParallelMuon):
     """Muon with layer sharding over the GTP x TP domain.
 
     Sharding model per 2D weight of full shape ``(P, Q)``:
@@ -190,7 +136,12 @@ class LayerShardedMuon(Muon):
             buffers of all groups are live at once -- lower ``ns_batch_size`` or set
             this to False if that pushes peak memory too high. No effect with fewer
             than two param groups or without CUDA.
-        All other args: same as :class:`~emerging_optimizers.Muon`.
+        All other args: same as :class:`TensorParallelMuon`. In particular
+            ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
+            ``pg_collection`` only take effect on the paths that delegate to the
+            parent (the empty-``param_ns_homes`` fallback and the degenerate
+            single-rank domain, both of which run the parent's TP-aware
+            full-matrix Newton-Schulz).
 
     Note:
         ``None`` for either process group means "no group / size 1", **not** torch's
@@ -223,30 +174,63 @@ class LayerShardedMuon(Muon):
         ns_batch_size: int = 1,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
+        use_decoupled_weight_decay: bool = True,
+        split_qkv: bool = False,
+        is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_split_shapes: list[int] | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
     ) -> None:
-        if ns_batch_size > 1:
+        if ns_batch_size > 1 and not is_emerging_optimizers_min_version("0.3.0"):
             # Only the batched (3-D) Newton-Schulz path needs emerging-optimizers
-            # >= 0.3.0. The per-matrix baseline (ns_batch_size=1, the default) uses
-            # the same newton_schulz API that 0.2.0 already ships, so it must not
-            # raise on older installs.
-            _check_eo_version()
-        super().__init__(
+            # >= 0.3.0 (older releases fail inside torch.addmm with "mat1 must be a
+            # matrix, got 3-D tensor"). The per-matrix baseline (ns_batch_size=1,
+            # the default) uses the 2-D newton_schulz API that 0.2.0 already ships,
+            # so it must not raise on older installs.
+            raise ImportError(
+                'LayerShardedMuon with ns_batch_size > 1 requires emerging-optimizers '
+                '>= 0.3.0 (batched Newton-Schulz).'
+            )
+        # The parent validates num_ns_steps and hard-raises when use_syrk is set on
+        # an emerging-optimizers older than the newton_schulz_tp use_syrk forwarding
+        # (>= 0.4.0.dev0). That gate is inherited deliberately: after this refactor
+        # the fallback and degenerate paths DO go through newton_schulz_tp, so on
+        # older installs those paths genuinely cannot do SYRK and failing loudly
+        # beats a partial silent downgrade.
+        # Explicit class call, matching the convention used by
+        # TensorParallelAdaptiveMuon (see the comment in TensorParallelMuon.__init__).
+        TensorParallelMuon.__init__(
+            self,
             params,
             lr=lr,
             momentum=momentum,
-            weight_decay=weight_decay,
             nesterov=nesterov,
+            weight_decay=weight_decay,
+            use_decoupled_weight_decay=use_decoupled_weight_decay,
+            split_qkv=split_qkv,
+            is_qkv_fn=is_qkv_fn,
+            qkv_split_shapes=qkv_split_shapes,
             fp32_matmul_prec=fp32_matmul_prec,
             coefficient_type=coefficient_type,
             num_ns_steps=num_ns_steps,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
+            pg_collection=pg_collection,
+            tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
         self.gtp_group = gtp_group
         self.tp_group = tp_group
         self.fused_group = fused_group
         self.ns_batch_size = max(1, ns_batch_size)
-        self.use_syrk = _resolve_use_syrk(use_syrk)
+        # TensorParallelMuon does not set these on self -- it only captures them in
+        # its scaled_orthogonalize_fn closure. _run_ns reads them off self, so assign
+        # them as plain attributes here (safe: the parent defines no properties).
+        self.coefficient_type = coefficient_type
+        self.num_ns_steps = num_ns_steps
+        self.scale_mode = scale_mode
+        self.extra_scale_factor = extra_scale_factor
+        self.use_syrk = use_syrk
         # Batched (3-D) chunks can use SYRK only when the installed emerging-optimizers
         # ships the batched kernel; otherwise they fall back to baddbmm as before.
         self._batched_syrk = self.use_syrk and _has_batched_syrk()
@@ -258,10 +242,6 @@ class LayerShardedMuon(Muon):
                 'kernel (needs >= 0.5.0a0, PR #276): batched chunks fall back to '
                 'baddbmm; only unbatched chunks get SYRK.',
             )
-        self.coefficient_type = coefficient_type
-        self.num_ns_steps = num_ns_steps
-        self.scale_mode = scale_mode
-        self.extra_scale_factor = extra_scale_factor
         self.concurrent_groups = concurrent_groups
         self._group_streams: "list | None" = None
         # id(param) -> (g_home, t_home). Set via set_param_ns_homes().
@@ -300,6 +280,23 @@ class LayerShardedMuon(Muon):
                 uses a different (e.g. expert) domain whose flat communicator differs.
         """
         self._group_process_groups = group_process_groups
+
+    def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
+        """Apply one weight update through the base-class hook points.
+
+        ``OrthogonalizedOptimizer.step()`` brackets every ``p.add_`` with
+        ``pre_weight_update_fn_inplace`` / ``post_weight_update_fn_inplace``;
+        this helper keeps layer sharding's overridden ``step()`` honouring them
+        too, and keeps the four update sites (replicated, fused, two-stage,
+        degenerate domain) from diverging. The update is cast to ``p.dtype``
+        before the scaled add on every path — a no-op for Megatron's fp32 main
+        params. TODO: forward the ``weight_update_hook`` constructor parameter
+        once the emerging-optimizers pin moves past EO #224.
+        """
+        update = update.to(p.dtype)
+        self.pre_weight_update_fn_inplace(p, update)
+        p.add_(update, alpha=-lr)
+        self.post_weight_update_fn_inplace(p)
 
     def _run_ns(self, full_by_k: dict) -> dict:
         """Full-matrix Newton-Schulz per home-owned matrix, batched by shape.
@@ -361,17 +358,20 @@ class LayerShardedMuon(Muon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
-        # Fall back to standard Muon (NS on the local shard) when no assignment is set.
+        # Fall back to TensorParallelMuon when no assignment is set: all-gather +
+        # TP-aware full-matrix Newton-Schulz per param. Mathematically correct
+        # (unlike the pre-refactor base-Muon fallback, which silently degraded to
+        # local-shard NS), just redundant — every rank recomputes every matrix.
         if not self._param_ns_homes:
             if not getattr(self, '_warned_no_homes', False):
                 self._warned_no_homes = True
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    "LayerShardedMuon: param_ns_homes is empty — falling back to base "
-                    "Muon (Newton-Schulz runs on each rank's local shard, not the full "
-                    "matrix). Call set_param_ns_homes() before step() to enable layer "
-                    "sharding.",
+                    "LayerShardedMuon: param_ns_homes is empty — falling back to "
+                    "TensorParallelMuon (per-param all-gather + full-matrix "
+                    "Newton-Schulz on every rank; correct but redundant). Call "
+                    "set_param_ns_homes() before step() to enable layer sharding.",
                 )
             return super().step(closure)
 
@@ -440,7 +440,7 @@ class LayerShardedMuon(Muon):
                 group_kwargs = {k: v for k, v in group.items() if k != "params"}
                 with fp32_matmul_precision(self.fp32_matmul_prec):
                     for p, m in zip(params, moms):
-                        p.add_(self.orthogonalize(p, m, **group_kwargs), alpha=-lr)
+                        self._apply_update(p, self.orthogonalize(p, m, **group_kwargs), lr)
                 continue
 
             gtp_rank = torch.distributed.get_rank(gtp_group) if gtp_size > 1 else 0
@@ -488,7 +488,7 @@ class LayerShardedMuon(Muon):
                 # kernels but only 0.74 ms of GPU time per step on a 12-layer MoE.
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
                     for i, upd in self._run_ns({i: moms[i] for i in replicated}).items():
-                        params[i].add_(upd.to(params[i].dtype), alpha=-lr)
+                        self._apply_update(params[i], upd, lr)
                 if not routed:
                     continue
                 params = [params[i] for i in routed]
@@ -551,7 +551,7 @@ class LayerShardedMuon(Muon):
                 with _phase("update"):
                     for p, shard in zip(params, update_shards):
                         if shard is not None:
-                            p.add_(shard.to(p.dtype), alpha=-lr)
+                            self._apply_update(p, shard, lr)
                 continue
 
             with fp32_matmul_precision(self.fp32_matmul_prec):
@@ -612,4 +612,4 @@ class LayerShardedMuon(Muon):
             with _phase("update"):
                 for p, shard in zip(params, update_shards):
                     if shard is not None:
-                        p.add_(shard.to(p.dtype), alpha=-lr)
+                        self._apply_update(p, shard, lr)
