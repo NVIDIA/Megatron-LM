@@ -1431,6 +1431,10 @@ def test_degenerate_domain_honours_use_syrk():
         gtp_group=None,
         use_syrk=True,
     )
+    # Homes must be non-empty so step() takes the degenerate-domain branch under
+    # test instead of the empty-homes fallback (the home itself is unused: with
+    # gtp_size * tp_size <= 1 the branch runs local NS via orthogonalize()).
+    opt.set_param_ns_homes({id(p): (0, 0)})
     p.grad = grad.clone()
     opt.step()
 
@@ -1440,7 +1444,11 @@ def test_degenerate_domain_honours_use_syrk():
     with _prec_ctx("medium"):
         orth = newton_schulz(mom.float(), steps=5, coefficient_type="quintic", use_syrk=True)
     scale = max(full.shape) ** 0.5
-    ref = full - lr * (orth * scale * 1.0).to(full.dtype)
+    # Mirror _apply_update's exact op: cast, then a single fused add_(alpha=-lr).
+    # A separate `full - lr * x` rounds the lr multiply first and is NOT bitwise
+    # equal to add_ with alpha.
+    ref = full.clone()
+    ref.add_((orth * scale * 1.0).to(ref.dtype), alpha=-lr)
     assert torch.equal(p.data, ref), (
         f"Degenerate-domain use_syrk mismatch: max_diff={(p.data - ref).abs().max().item():.2e}"
     )
