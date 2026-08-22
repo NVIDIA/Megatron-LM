@@ -47,7 +47,11 @@ except ImportError:
         multi_tensor_scale_tensor_impl = None
 
 
-from ..tensor_parallel import param_is_not_gtp_duplicate, param_is_not_tensor_parallel_duplicate
+from ..tensor_parallel import (
+    gtp_local_pad_zero_count,
+    param_is_not_gtp_duplicate,
+    param_is_not_tensor_parallel_duplicate,
+)
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
@@ -192,6 +196,28 @@ def clip_grad_by_total_norm_fp32(
         )
 
 
+def _gtp_pad_zero_count(param: torch.Tensor, grad: torch.Tensor) -> int:
+    """Structural GTP alignment-padding zeros to exclude from ``grad``'s raw zero count.
+
+    Padding rows are permanent zeros (never written by the wgrad GEMM), not real zero
+    gradients, so counting them would inflate GTP's num_zeros relative to non-GTP runs.
+
+    - :class:`~megatron.core.optimizer.distrib_optimizer.DistributedOptimizer`, when it
+      byte-slices a GTP shard into DP-optimizer-state fragments, stamps the correction
+      explicitly as ``.gtp_pad_zeros``: a fragment alone can't tell whether it overlaps the
+      padding tail without the slice offset, which only that optimizer has.
+    - Everyone else (``LayerWiseDistributedOptimizer``, which assigns whole params per rank; or
+      ``DistributedOptimizer`` at data-parallel size 1) registers the param's own unsliced GTP
+      shard directly, which already carries ``.pad_length``/``.group``, so the correction is
+      computed here and cached onto ``.gtp_pad_zeros`` -- it's invariant for the param's
+      lifetime, so this only runs once.
+    """
+    pad_zeros = getattr(param, "gtp_pad_zeros", None)
+    if pad_zeros is None and grad.numel() == param.numel():
+        pad_zeros = param.gtp_pad_zeros = gtp_local_pad_zero_count(param, 0, grad.numel())
+    return pad_zeros or 0
+
+
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
@@ -252,6 +278,7 @@ def count_zeros_fp32(
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
+            num_zeros -= _gtp_pad_zero_count(param, grad)  # exclude structural GTP padding
             total_num_zeros = num_zeros + total_num_zeros
 
     if use_megatron_fsdp and data_parallel_group is not None:

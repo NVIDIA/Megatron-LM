@@ -417,6 +417,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                         tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                         copy_optimizer_param_metadata(shard_model_param, model_param)
+                        shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                            model_param, param_range.start, param_range.end
+                        )
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -449,6 +452,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                         tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
                         copy_optimizer_param_metadata(shard_main_param, model_param)
+                        shard_main_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                            model_param, param_range.start, param_range.end
+                        )
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -472,6 +478,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                     tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                     copy_optimizer_param_metadata(shard_model_param, model_param)
+                    shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                        model_param, param_range.start, param_range.end
+                    )
 
                 else:
                     raise TypeError(

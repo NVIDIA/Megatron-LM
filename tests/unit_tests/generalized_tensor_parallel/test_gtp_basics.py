@@ -25,6 +25,8 @@ Test groups
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
 - TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and RS-input correctness
+- TestGTPCountZerosExcludesPadding - real distributed optimizer: count_zeros_fp32 must not
+                                count structural alignment-padding rows as zero gradient
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
@@ -1628,3 +1630,136 @@ class TestGTPCaptureParamReadiness:
             gtp_cuda_graphs.register_capture_params_to_ensure_ready((second,))
 
         assert capture.params_to_ensure_ready == [first, second]
+
+
+# ---------------------------------------------------------------------------
+# count_zeros_fp32 must exclude GTP alignment padding, end-to-end through the
+# real distributed optimizer (build_model_and_main_param_groups stamps
+# .gtp_pad_zeros; count_zeros_fp32 subtracts it).
+# ---------------------------------------------------------------------------
+
+
+def _worker_count_zeros_excludes_gtp_padding(rank, world_size, port):
+    """GTP alignment padding is a permanent structural zero (never written by the wgrad GEMM),
+    not a real zero gradient. Left uncorrected, count_zeros_fp32 over-counts by exactly the
+    padding-element count on whichever (GTP-rank, DP-sub-shard) fragment physically owns it.
+
+    OUT_F=48 with gtp_remat_size=2 forces real padding (48 is not a multiple of
+    pad_for_alignment(16) * gtp_remat_size(2) = 32). With real random bf16 gradients, no element
+    is coincidentally exactly zero, so:
+      - the FIXED count_zeros() must report 0 (padding correctly excluded)
+      - artificially zeroing the .gtp_pad_zeros correction (simulating the pre-fix code) must
+        make count_zeros() jump by exactly pad_length * IN_F -- the total padding this weight
+        carries, summed over however the distributed optimizer's DP-bucket slicing split it
+        across ranks.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed.finalize_model_grads import (
+        _allreduce_replicated_grads_over_gtp_remat_group,
+    )
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    IN_F, OUT_F = 64, 48  # OUT_F not a multiple of pad_for_alignment * gtp_remat_size(2) -> pads.
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    try:
+        model_parallel_cuda_manual_seed(42)
+        gtp_remat_group = ps.get_gtp_weight_remat_group()
+        assert gtp_remat_group.size() == 2, f"expected gtp_remat=2, got {gtp_remat_group.size()}"
+
+        layer = _make_gtp_linear(IN_F, OUT_F, gtp_remat_group)
+        w = layer.weight
+        assert isinstance(w, GTPShardedParam)
+        alignment = gtp_module.GTP_CONFIG.pad_for_alignment * gtp_remat_group.size()
+        expected_pad_length = (alignment - OUT_F % alignment) % alignment
+        assert (
+            w.pad_length == expected_pad_length > 0
+        ), f"test needs real padding to exercise the fix, got pad_length={w.pad_length}"
+        pad_elems = w.pad_length * IN_F
+
+        tconfig = TransformerConfig(
+            num_attention_heads=1, num_layers=1, hidden_size=IN_F, tensor_model_parallel_size=1
+        )
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True, overlap_grad_reduce=False
+        )
+        module = torch.nn.Sequential(layer)
+        ddp_model = DistributedDataParallel(tconfig, ddp_config, module)
+
+        opt_config = OptimizerConfig(
+            optimizer='adam',
+            lr=0.01,
+            bf16=True,
+            use_distributed_optimizer=True,
+            use_precision_aware_optimizer=False,
+            main_params_dtype=torch.float32,
+            main_grads_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.float32,
+            log_num_zeros_in_grad=True,
+        )
+        optim = get_megatron_optimizer(opt_config, [ddp_model])
+
+        optim.zero_grad()
+        ddp_model.zero_grad_buffer()
+        torch.manual_seed(1000 + rank)
+        x = torch.randn(8, IN_F, dtype=torch.bfloat16, device='cuda')
+        out = ddp_model.module(x)
+        loss = out.float().mean()
+        loss.backward()
+        ddp_model.finish_grad_sync()
+        _allreduce_replicated_grads_over_gtp_remat_group(
+            [ddp_model],
+            ps.get_gtp_weight_remat_group(check_initialized=False),
+            ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+        )
+        # count_zeros() reads the master-shard .grad, which optim.step() normally populates as
+        # its first internal step. Do that copy explicitly so count_zeros() can be exercised
+        # standalone, without running (and being coupled to) the rest of step()'s update logic.
+        for sub_optimizer in getattr(optim, 'chained_optimizers', [optim]):
+            sub_optimizer._copy_model_grads_to_main_grads()
+
+        num_zeros_fixed = optim.count_zeros()
+        assert num_zeros_fixed == 0, (
+            f"expected 0 zeros with real random gradients (padding correctly excluded), "
+            f"got {num_zeros_fixed}"
+        )
+
+        # Simulate the pre-fix code: zero out this rank's own .gtp_pad_zeros correction(s) --
+        # whatever fraction of the padding the distributed optimizer's DP-bucket slicing handed
+        # to this rank -- then restore it.
+        params = optim.get_parameters()
+        pad_attrs = [(p, getattr(p, "gtp_pad_zeros", 0)) for p in params]
+        for p, saved in pad_attrs:
+            if saved:
+                p.gtp_pad_zeros = 0
+        try:
+            num_zeros_unfixed = optim.count_zeros()
+        finally:
+            for p, saved in pad_attrs:
+                if saved:
+                    p.gtp_pad_zeros = saved
+
+        assert num_zeros_unfixed - num_zeros_fixed == pad_elems, (
+            f"expected the pre-fix simulation to over-count by exactly pad_elems={pad_elems}, "
+            f"got delta={num_zeros_unfixed - num_zeros_fixed} "
+            f"(fixed={num_zeros_fixed}, unfixed={num_zeros_unfixed})"
+        )
+    finally:
+        ps.destroy_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+class TestGTPCountZerosExcludesPadding:
+    def test_count_zeros_excludes_gtp_padding_end_to_end(self):
+        """Real DistributedOptimizer + count_zeros_fp32: GTP alignment padding must not be
+        counted as zero gradient. Regression test for the count_zeros_fp32 + distrib_optimizer
+        .gtp_pad_zeros wiring."""
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_count_zeros_excludes_gtp_padding, 4)
