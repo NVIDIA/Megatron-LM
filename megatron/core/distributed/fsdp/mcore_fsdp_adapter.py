@@ -675,8 +675,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
         if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP8 or FP4.")
-        if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
-            raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
+        ddp_config.megatron_fsdp_cuda_graph_mode = True
+        #if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
+        #    raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
 
         if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
             raise ValueError(
@@ -743,6 +744,10 @@ def FullyShardedDataParallel(
         if ddp_config.megatron_fsdp_version == 2
         else FullyShardedDataParallelV1
     )
+    # #region agent log
+    # import json as _j, time as _t
+    # open('/home/gkollu/lustre/.cursor/debug-788eac.log', 'a').write(_j.dumps({"sessionId": "788eac", "runId": "pre-fix", "hypothesisId": "H4", "location": "mcore_fsdp_adapter.py:753", "message": "Megatron-FSDP implementation selected", "data": {"fsdp_class": fsdp_class.__name__, "megatron_fsdp_version": ddp_config.megatron_fsdp_version, "cuda_graph_impl": str(getattr(config, 'cuda_graph_impl', None)), "cuda_graph_modules": [str(m) for m in (getattr(config, 'cuda_graph_modules', None) or [])], "megatron_fsdp_cuda_graph_mode": bool(getattr(ddp_config, 'megatron_fsdp_cuda_graph_mode', False)), "sharding_strategy": str(ddp_config.data_parallel_sharding_strategy), "moe_token_dispatcher_type": str(getattr(config, 'moe_token_dispatcher_type', None))}, "timestamp": int(_t.time() * 1000)}) + "\n")
+    # #endregion
     return fsdp_class(
         config, ddp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
     )

@@ -1976,6 +1976,11 @@ def validate_args(args, defaults={}):
     # Print arguments.
     _print_args("arguments", args)
 
+    # #region agent log
+    # import json as _j, time as _t
+    # open('/home/gkollu/lustre/.cursor/debug-788eac.log', 'a').write(_j.dumps({"sessionId": "788eac", "runId": "pre-fix", "hypothesisId": "H1,H2,H3,H4", "location": "arguments.py:1952", "message": "Resolved CUDA-graph / MoE / FSDP args after validate_args", "data": {"cuda_graph_impl": str(args.cuda_graph_impl), "cuda_graph_modules": [str(m) for m in (args.cuda_graph_modules or [])], "cuda_graph_scope_deprecated": str(getattr(args, 'cuda_graph_scope_deprecated', None)), "moe_token_dispatcher_type": str(getattr(args, 'moe_token_dispatcher_type', None)), "moe_expert_capacity_factor": getattr(args, 'moe_expert_capacity_factor', None), "moe_pad_expert_input_to_capacity": bool(getattr(args, 'moe_pad_expert_input_to_capacity', False)), "use_megatron_fsdp": bool(getattr(args, 'use_megatron_fsdp', False)), "megatron_fsdp_version": getattr(args, 'megatron_fsdp_version', None), "num_experts": getattr(args, 'num_experts', None), "ep_size": getattr(args, 'expert_model_parallel_size', None)}, "timestamp": int(_t.time() * 1000)}) + "\n")
+    # #endregion
+
     return args
 
 
