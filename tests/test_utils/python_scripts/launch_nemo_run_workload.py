@@ -160,11 +160,18 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
     help="Workspace-relative Testmon database directory.",
 )
 @click.option(
-    "--unit-testmon-selected-manifest",
+    "--unit-testmon-base-sha",
     type=str,
-    default="assets_dir/testmon/selected.json",
+    default="",
     show_default=True,
-    help="Workspace-relative selected-test manifest.",
+    help="Pull-request base commit used to validate the baseline.",
+)
+@click.option(
+    "--unit-testmon-config-hash",
+    type=str,
+    default="",
+    show_default=True,
+    help="Expected Testmon configuration identity.",
 )
 @click.option(
     "--enable-lightweight-mode",
@@ -198,7 +205,8 @@ def main(
     tag: Optional[str] = None,
     unit_testmon_mode: str = "full",
     unit_testmon_cache_dir: str = "assets_dir/testmon",
-    unit_testmon_selected_manifest: str = "assets_dir/testmon/selected.json",
+    unit_testmon_base_sha: str = "",
+    unit_testmon_config_hash: str = "",
     enable_lightweight_mode: Optional[bool] = False,
     cadence: Optional[str] = None,
 ):
@@ -229,7 +237,8 @@ def main(
     magic_values["test_case"] = workload.spec["test_case"]
     magic_values["unit_testmon_mode"] = unit_testmon_mode
     magic_values["unit_testmon_cache_dir"] = unit_testmon_cache_dir
-    magic_values["unit_testmon_selected_manifest"] = unit_testmon_selected_manifest
+    magic_values["unit_testmon_base_sha"] = unit_testmon_base_sha
+    magic_values["unit_testmon_config_hash"] = unit_testmon_config_hash
     magic_values["name"] = workload.spec["name"].format(**magic_values)
     workload.spec["script"] = workload.spec["script"].format(**magic_values)
 

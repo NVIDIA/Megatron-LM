@@ -159,7 +159,7 @@ test = [
 ]
 # Kept separate so exhaustive unit-test jobs do not even import Testmon.
 # The baseline producer and eligible synthetic PR jobs install this group at
-# runtime before generating or reading their per-rank dependency databases.
+# runtime before generating or reading their rank-zero dependency databases.
 testmon = ["pytest-testmon==2.2.0"]
 docs = [
     "sphinx",

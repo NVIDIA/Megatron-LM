@@ -15,16 +15,14 @@
 name: Unit Testmon Baseline
 
 on:
-  # workflow_run is intentionally filtered again in the prepare job. The
-  # workflow name alone cannot distinguish a scheduled full run from a PR,
-  # merge-queue, release, or manually dispatched run.
   workflow_run:
     workflows: ["CICD Megatron-LM"]
+    branches: [main]
     types: [completed]
   workflow_dispatch:
     inputs:
       producer_run_id:
-        description: "Run ID of a successful scheduled CICD run whose dev images still exist"
+        description: "Run ID of a successful scheduled CICD run whose images still exist"
         required: true
         type: string
 
@@ -37,12 +35,9 @@ permissions:
   contents: read
   id-token: write
 
-env:
-  TESTMON_VERSION: "2.2.0"
-
 jobs:
   prepare:
-    name: Resolve trusted producer and bucket matrices
+    name: Resolve trusted producer
     runs-on: ubuntu-latest
     if: |
       github.repository == 'NVIDIA/Megatron-LM'
@@ -60,13 +55,12 @@ jobs:
         )
       )
     outputs:
-      producer_sha: ${{ steps.verify-producer.outputs.producer_sha }}
-      producer_time: ${{ steps.verify-producer.outputs.producer_time }}
-      h100_matrix: ${{ steps.parse-buckets.outputs.h100_matrix }}
-      gb200_matrix: ${{ steps.parse-buckets.outputs.gb200_matrix }}
+      producer_sha: ${{ steps.verify.outputs.producer_sha }}
+      producer_time: ${{ steps.verify.outputs.producer_time }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - name: Resolve successful scheduled producer run
-        id: producer-input
+      - name: Verify scheduled producer run
+        id: producer
         shell: bash -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,7 +80,9 @@ jobs:
               .name == "CICD Megatron-LM"
               and .path == ".github/workflows/cicd-main.yml"
               and .event == "schedule"
+              and .status == "completed"
               and .conclusion == "success"
+              and .repository.full_name == $repository
               and .head_repository.full_name == $repository
               and .head_branch == $default_branch
               and (.head_sha | test("^[0-9a-fA-F]{40}$"))
@@ -95,22 +91,20 @@ jobs:
             exit 1
           fi
 
-          CANDIDATE_SHA=$(jq -r '.head_sha | ascii_downcase' <<< "$RUN_JSON")
-          echo "run_id=$PRODUCER_RUN_ID" | tee -a "$GITHUB_OUTPUT"
-          echo "sha=$CANDIDATE_SHA" | tee -a "$GITHUB_OUTPUT"
+          echo "sha=$(jq -r '.head_sha | ascii_downcase' <<< "$RUN_JSON")" >> "$GITHUB_OUTPUT"
 
       - name: Checkout producer
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ steps.producer-input.outputs.sha }}
+          ref: ${{ steps.producer.outputs.sha }}
           fetch-depth: 0
 
-      - name: Verify producer is trusted main history
-        id: verify-producer
+      - name: Verify trusted main history
+        id: verify
         shell: bash -e -u -o pipefail {0}
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          EXPECTED_SHA: ${{ steps.producer-input.outputs.sha }}
+          EXPECTED_SHA: ${{ steps.producer.outputs.sha }}
         run: |
           git fetch --no-tags origin \
             "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
@@ -125,480 +119,131 @@ jobs:
             exit 1
           fi
 
-          echo "producer_sha=$RESOLVED_SHA" | tee -a "$GITHUB_OUTPUT"
-          echo "producer_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" | tee -a "$GITHUB_OUTPUT"
+          echo "producer_sha=$RESOLVED_SHA" >> "$GITHUB_OUTPUT"
+          echo "producer_time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
-      - name: Parse unit-test buckets
-        id: parse-buckets
+      - name: Build baseline matrix
+        id: matrix
         shell: bash -e -u -o pipefail {0}
+        env:
+          PRODUCER_SHA: ${{ steps.verify.outputs.producer_sha }}
+          ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
         run: |
-          H100_MATRIX=$(yq -o json \
-            '[.products[].test_case[] | {"bucket": .}] | sort_by(.bucket)' \
-            tests/test_utils/recipes/h100/unit-tests.yaml | jq -c)
-          GB200_MATRIX=$(yq -o json \
-            '[.products[].test_case[] | {"bucket": .}] | sort_by(.bucket)' \
-            tests/test_utils/recipes/gb200/unit-tests.yaml | jq -c)
+          H100=$(yq -o json '[.products[].test_case[]]' \
+            tests/test_utils/recipes/h100/unit-tests.yaml | jq -c \
+              --arg sha "$PRODUCER_SHA" '
+                map({
+                  bucket: ., platform: "h100", world_size: 8,
+                  runner: "nvidia-ci-aws-gpu-x8", recipe_platform: "dgx_h100",
+                  image: ("766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:" + $sha + "-aws-h100")
+                }) | sort_by(.bucket)
+              ')
 
-          if [[ "$(jq 'length' <<<"$H100_MATRIX")" -eq 0 ]]; then
-            echo "H100 unit-test recipe produced no buckets" >&2
+          GB200='[]'
+          if [[ "$ENABLE_GB200_TESTING" == "true" ]]; then
+            GB200=$(yq -o json '[.products[].test_case[]]' \
+              tests/test_utils/recipes/gb200/unit-tests.yaml | jq -c \
+                --arg sha "$PRODUCER_SHA" '
+                  map({
+                    bucket: ., platform: "gb200", world_size: 4,
+                    runner: "nvidia-ci-aws-use2-gpu-x4", recipe_platform: "dgx_gb200",
+                    image: ("766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm:" + $sha + "-gb-gpu")
+                  }) | sort_by(.bucket)
+                ')
+          fi
+
+          MATRIX=$(jq -cn --argjson h100 "$H100" --argjson gb200 "$GB200" '$h100 + $gb200')
+          if ! jq -e '
+            length > 0
+            and any(.[]; .platform == "h100")
+            and (([.[] | .platform + "\u0000" + .bucket] | length)
+              == ([.[] | .platform + "\u0000" + .bucket] | unique | length))
+            and all(.[];
+              (.bucket | type == "string" and length > 0)
+              and (.platform == "h100" or .platform == "gb200")
+              and (if .platform == "h100" then .world_size == 8 else .world_size == 4 end)
+            )
+          ' <<< "$MATRIX" >/dev/null; then
+            echo "Unit-test recipes produced an invalid baseline matrix" >&2
             exit 1
           fi
-          if [[ "$(jq 'length' <<<"$GB200_MATRIX")" -eq 0 ]]; then
-            echo "GB200 unit-test recipe produced no buckets" >&2
-            exit 1
-          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
-          echo "h100_matrix=$H100_MATRIX" | tee -a "$GITHUB_OUTPUT"
-          echo "gb200_matrix=$GB200_MATRIX" | tee -a "$GITHUB_OUTPUT"
-
-  baseline-h100:
-    name: H100 baseline - ${{ matrix.bucket }}
+  baseline:
+    name: ${{ matrix.platform }} baseline - ${{ matrix.bucket }}
     needs: [prepare]
-    runs-on: nvidia-ci-aws-gpu-x8
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.prepare.outputs.h100_matrix) }}
-    env:
-      CONTAINER_IMAGE: 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${{ needs.prepare.outputs.producer_sha }}-aws-h100
-      PLATFORM: h100
-      RECIPE_PLATFORM: dgx_h100
-      WORLD_SIZE: "8"
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout producer
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.prepare.outputs.producer_sha }}
 
-      - name: Setup Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Compute immutable baseline identity
-        id: identity
-        shell: bash -e -u -o pipefail {0}
-        env:
-          BUCKET: ${{ matrix.bucket }}
-          PRODUCER_SHA: ${{ needs.prepare.outputs.producer_sha }}
-        run: |
-          ENVIRONMENT_HASH=$(python tests/unit_tests/testmon/tooling.py environment-hash \
-            --repo-root . \
-            --platform "$PLATFORM" \
-            --testmon-version "$TESTMON_VERSION")
-          BUCKET_HASH=$(python tests/unit_tests/testmon/tooling.py bucket-hash --bucket "$BUCKET")
-
-          if [[ ! "$ENVIRONMENT_HASH" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Invalid environment hash: $ENVIRONMENT_HASH" >&2
-            exit 1
-          fi
-          if [[ ! "$BUCKET_HASH" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Invalid bucket hash: $BUCKET_HASH" >&2
-            exit 1
-          fi
-
-          CACHE_KEY="unit-testmon-v1-main-${PLATFORM}-r${WORLD_SIZE}-dev-${BUCKET_HASH}-${ENVIRONMENT_HASH}-${PRODUCER_SHA}"
-          DEPENDENCY_HASH=$(sha256sum pyproject.toml uv.lock | sha256sum | cut -d' ' -f1)
-          TOPOLOGY_HASH=$(printf '%s' "${PLATFORM}:r${WORLD_SIZE}:prod,experimental:torchrun" \
-            | sha256sum | cut -d' ' -f1)
-
-          echo "environment_hash=$ENVIRONMENT_HASH" | tee -a "$GITHUB_OUTPUT"
-          echo "bucket_hash=$BUCKET_HASH" | tee -a "$GITHUB_OUTPUT"
-          echo "cache_key=$CACHE_KEY" | tee -a "$GITHUB_OUTPUT"
-          echo "dependency_identity=sha256:$DEPENDENCY_HASH" | tee -a "$GITHUB_OUTPUT"
-          echo "topology_identity=sha256:$TOPOLOGY_HASH" | tee -a "$GITHUB_OUTPUT"
-
-      - name: Restore existing immutable H100 bucket baseline
-        id: restore-existing-bucket
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: assets_dir/testmon
-          key: ${{ steps.identity.outputs.cache_key }}
-
-      - name: Generate Testmon databases
-        if: steps.restore-existing-bucket.outputs.cache-hit != 'true'
+      - name: Generate rank-zero Testmon databases
         uses: ./.github/actions
         with:
           test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: "45"
           is_unit_test: "true"
-          container-image: ${{ env.CONTAINER_IMAGE }}
-          platform: ${{ env.RECIPE_PLATFORM }}
+          container-image: ${{ matrix.image }}
+          platform: ${{ matrix.recipe_platform }}
           sha: ${{ needs.prepare.outputs.producer_sha }}
           unit_testmon_mode: baseline
-          unit_testmon_cache_key: ${{ steps.identity.outputs.cache_key }}
           unit_testmon_cache_dir: assets_dir/testmon
-          unit_testmon_selected_manifest: assets_dir/testmon/selected.json
 
-      - name: Validate and finalize bucket manifest
-        shell: bash -e -u -o pipefail {0}
-        env:
-          BUCKET: ${{ matrix.bucket }}
-          PRODUCER_SHA: ${{ needs.prepare.outputs.producer_sha }}
-          PRODUCER_TIME: ${{ needs.prepare.outputs.producer_time }}
-          ENVIRONMENT_HASH: ${{ steps.identity.outputs.environment_hash }}
-          DEPENDENCY_IDENTITY: ${{ steps.identity.outputs.dependency_identity }}
-          TOPOLOGY_IDENTITY: ${{ steps.identity.outputs.topology_identity }}
-          EXPECTED_CACHE_KEY: ${{ steps.identity.outputs.cache_key }}
-          EXISTING_CACHE_HIT: ${{ steps.restore-existing-bucket.outputs.cache-hit }}
-        run: |
-          # The databases are created as root inside the CI container. Make the
-          # mounted cache tree writable before checkpointing SQLite and adding
-          # the host-side manifest.
-          sudo chown -R "$(id -u):$(id -g)" assets_dir/testmon
-
-          if [[ "$EXISTING_CACHE_HIT" == "true" ]]; then
-            jq -e \
-              --arg producer_sha "$PRODUCER_SHA" \
-              --arg cache_key "$EXPECTED_CACHE_KEY" \
-              '.producer_sha == $producer_sha and .cache_key == $cache_key' \
-              assets_dir/testmon/manifest.json >/dev/null
-            python tests/unit_tests/testmon/tooling.py validate-manifest \
-              --cache-dir assets_dir/testmon \
-              --manifest assets_dir/testmon/manifest.json \
-              --platform "$PLATFORM" \
-              --world-size "$WORLD_SIZE" \
-              --bucket "$BUCKET" \
-              --environment-hash "$ENVIRONMENT_HASH"
-          else
-            git ls-files -- '*.py' | LC_ALL=C sort | jq -Rsc \
-              'split("\n")[:-1]' > assets_dir/testmon/tracked-python.json
-
-            ALWAYS_RUN=()
-            if [[ "$BUCKET" == 'tests/unit_tests/**/*.py' ]]; then
-              ALWAYS_RUN+=(--always-run tests/unit_tests/test_basic.py)
-            fi
-
-            python tests/unit_tests/testmon/tooling.py build-manifest \
-              --cache-dir assets_dir/testmon \
-              --platform "$PLATFORM" \
-              --world-size "$WORLD_SIZE" \
-              --bucket "$BUCKET" \
-              --producer-sha "$PRODUCER_SHA" \
-              --producer-time "$PRODUCER_TIME" \
-              --environment-hash "$ENVIRONMENT_HASH" \
-              --container-identity "$CONTAINER_IMAGE" \
-              --dependency-identity "$DEPENDENCY_IDENTITY" \
-              --topology-identity "$TOPOLOGY_IDENTITY" \
-              --tracked-files-json assets_dir/testmon/tracked-python.json \
-              "${ALWAYS_RUN[@]}" \
-              --output assets_dir/testmon/manifest.json
-          fi
-
-      - name: Save immutable bucket cache
-        if: steps.restore-existing-bucket.outputs.cache-hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: assets_dir/testmon
-          key: ${{ steps.identity.outputs.cache_key }}
-
-      - name: Upload bucket manifest
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-testmon-manifest-h100-${{ steps.identity.outputs.bucket_hash }}
-          path: assets_dir/testmon/manifest.json
-          if-no-files-found: error
-          retention-days: 7
-
-  baseline-gb200:
-    name: GB200 baseline - ${{ matrix.bucket }}
-    needs: [prepare]
-    if: vars.ENABLE_GB200_TESTING == 'true'
-    runs-on: nvidia-ci-aws-use2-gpu-x4
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.prepare.outputs.gb200_matrix) }}
-    env:
-      CONTAINER_IMAGE: 766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm:${{ needs.prepare.outputs.producer_sha }}-gb-gpu
-      PLATFORM: gb200
-      RECIPE_PLATFORM: dgx_gb200
-      WORLD_SIZE: "4"
-    steps:
-      - name: Checkout producer
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.prepare.outputs.producer_sha }}
-
-      - name: Setup Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Compute immutable baseline identity
+      - name: Validate and finalize baseline
         id: identity
         shell: bash -e -u -o pipefail {0}
         env:
           BUCKET: ${{ matrix.bucket }}
-          PRODUCER_SHA: ${{ needs.prepare.outputs.producer_sha }}
-        run: |
-          ENVIRONMENT_HASH=$(python tests/unit_tests/testmon/tooling.py environment-hash \
-            --repo-root . \
-            --platform "$PLATFORM" \
-            --testmon-version "$TESTMON_VERSION")
-          BUCKET_HASH=$(python tests/unit_tests/testmon/tooling.py bucket-hash --bucket "$BUCKET")
-
-          if [[ ! "$ENVIRONMENT_HASH" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Invalid environment hash: $ENVIRONMENT_HASH" >&2
-            exit 1
-          fi
-          if [[ ! "$BUCKET_HASH" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Invalid bucket hash: $BUCKET_HASH" >&2
-            exit 1
-          fi
-
-          CACHE_KEY="unit-testmon-v1-main-${PLATFORM}-r${WORLD_SIZE}-dev-${BUCKET_HASH}-${ENVIRONMENT_HASH}-${PRODUCER_SHA}"
-          DEPENDENCY_HASH=$(sha256sum pyproject.toml uv.lock | sha256sum | cut -d' ' -f1)
-          TOPOLOGY_HASH=$(printf '%s' "${PLATFORM}:r${WORLD_SIZE}:prod,experimental:torchrun" \
-            | sha256sum | cut -d' ' -f1)
-
-          echo "environment_hash=$ENVIRONMENT_HASH" | tee -a "$GITHUB_OUTPUT"
-          echo "bucket_hash=$BUCKET_HASH" | tee -a "$GITHUB_OUTPUT"
-          echo "cache_key=$CACHE_KEY" | tee -a "$GITHUB_OUTPUT"
-          echo "dependency_identity=sha256:$DEPENDENCY_HASH" | tee -a "$GITHUB_OUTPUT"
-          echo "topology_identity=sha256:$TOPOLOGY_HASH" | tee -a "$GITHUB_OUTPUT"
-
-      - name: Restore existing immutable GB200 bucket baseline
-        id: restore-existing-bucket
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: assets_dir/testmon
-          key: ${{ steps.identity.outputs.cache_key }}
-
-      - name: Generate Testmon databases
-        if: steps.restore-existing-bucket.outputs.cache-hit != 'true'
-        uses: ./.github/actions
-        with:
-          test_case: ${{ matrix.bucket }}
-          tag: latest
-          timeout: "45"
-          is_unit_test: "true"
-          container-image: ${{ env.CONTAINER_IMAGE }}
-          platform: ${{ env.RECIPE_PLATFORM }}
-          sha: ${{ needs.prepare.outputs.producer_sha }}
-          unit_testmon_mode: baseline
-          unit_testmon_cache_key: ${{ steps.identity.outputs.cache_key }}
-          unit_testmon_cache_dir: assets_dir/testmon
-          unit_testmon_selected_manifest: assets_dir/testmon/selected.json
-
-      - name: Validate and finalize bucket manifest
-        shell: bash -e -u -o pipefail {0}
-        env:
-          BUCKET: ${{ matrix.bucket }}
+          PLATFORM: ${{ matrix.platform }}
+          WORLD_SIZE: ${{ matrix.world_size }}
           PRODUCER_SHA: ${{ needs.prepare.outputs.producer_sha }}
           PRODUCER_TIME: ${{ needs.prepare.outputs.producer_time }}
-          ENVIRONMENT_HASH: ${{ steps.identity.outputs.environment_hash }}
-          DEPENDENCY_IDENTITY: ${{ steps.identity.outputs.dependency_identity }}
-          TOPOLOGY_IDENTITY: ${{ steps.identity.outputs.topology_identity }}
-          EXPECTED_CACHE_KEY: ${{ steps.identity.outputs.cache_key }}
-          EXISTING_CACHE_HIT: ${{ steps.restore-existing-bucket.outputs.cache-hit }}
         run: |
-          # The databases are created as root inside the CI container. Make the
-          # mounted cache tree writable before checkpointing SQLite and adding
-          # the host-side manifest.
           sudo chown -R "$(id -u):$(id -g)" assets_dir/testmon
 
-          if [[ "$EXISTING_CACHE_HIT" == "true" ]]; then
-            jq -e \
-              --arg producer_sha "$PRODUCER_SHA" \
-              --arg cache_key "$EXPECTED_CACHE_KEY" \
-              '.producer_sha == $producer_sha and .cache_key == $cache_key' \
-              assets_dir/testmon/manifest.json >/dev/null
-            python tests/unit_tests/testmon/tooling.py validate-manifest \
-              --cache-dir assets_dir/testmon \
-              --manifest assets_dir/testmon/manifest.json \
-              --platform "$PLATFORM" \
-              --world-size "$WORLD_SIZE" \
-              --bucket "$BUCKET" \
-              --environment-hash "$ENVIRONMENT_HASH"
-          else
-            git ls-files -- '*.py' | LC_ALL=C sort | jq -Rsc \
-              'split("\n")[:-1]' > assets_dir/testmon/tracked-python.json
-
-            python tests/unit_tests/testmon/tooling.py build-manifest \
-              --cache-dir assets_dir/testmon \
-              --platform "$PLATFORM" \
-              --world-size "$WORLD_SIZE" \
-              --bucket "$BUCKET" \
-              --producer-sha "$PRODUCER_SHA" \
-              --producer-time "$PRODUCER_TIME" \
-              --environment-hash "$ENVIRONMENT_HASH" \
-              --container-identity "$CONTAINER_IMAGE" \
-              --dependency-identity "$DEPENDENCY_IDENTITY" \
-              --topology-identity "$TOPOLOGY_IDENTITY" \
-              --tracked-files-json assets_dir/testmon/tracked-python.json \
-              --output assets_dir/testmon/manifest.json
+          CONFIG_HASH=$(python tests/unit_tests/testmon_selector.py config-hash \
+            --repo-root . --platform "$PLATFORM" \
+            --world-size "$WORLD_SIZE" --bucket "$BUCKET")
+          BUCKET_HASH=$(python tests/unit_tests/testmon_selector.py bucket-hash \
+            --bucket "$BUCKET")
+          if [[ ! "$CONFIG_HASH" =~ ^[0-9a-f]{64}$ \
+            || ! "$BUCKET_HASH" =~ ^[0-9a-f]{16}$ ]]; then
+            echo "Selector returned an invalid baseline identity" >&2
+            exit 1
           fi
 
-      - name: Save immutable bucket cache
-        if: steps.restore-existing-bucket.outputs.cache-hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+          python tests/unit_tests/testmon_selector.py finalize \
+            --repo-root . \
+            --cache-dir assets_dir/testmon \
+            --platform "$PLATFORM" \
+            --world-size "$WORLD_SIZE" \
+            --bucket "$BUCKET" \
+            --config-hash "$CONFIG_HASH" \
+            --producer-sha "$PRODUCER_SHA" \
+            --producer-time "$PRODUCER_TIME"
+          test -f assets_dir/testmon/metadata.json
+
+          echo "bucket_hash=$BUCKET_HASH" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${PLATFORM} Testmon baseline"
+            echo
+            echo "- Bucket: \`$BUCKET\`"
+            echo "- Producer: \`$PRODUCER_SHA\`"
+            echo "- Configuration: \`$CONFIG_HASH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable bucket baseline
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
+          name: unit-testmon-v2-${{ matrix.platform }}-${{ steps.identity.outputs.bucket_hash }}
           path: assets_dir/testmon
-          key: ${{ steps.identity.outputs.cache_key }}
-
-      - name: Upload bucket manifest
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-testmon-manifest-gb200-${{ steps.identity.outputs.bucket_hash }}
-          path: assets_dir/testmon/manifest.json
-          if-no-files-found: error
-          retention-days: 7
-
-  publish-h100-index:
-    name: Publish complete H100 baseline index
-    needs: [prepare, baseline-h100]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout producer
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.prepare.outputs.producer_sha }}
-
-      - name: Setup Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Download H100 bucket manifests
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          pattern: unit-testmon-manifest-h100-*
-          path: baseline-manifests/h100
-
-      - name: Build and validate platform index
-        id: index
-        shell: bash -e -u -o pipefail {0}
-        env:
-          PRODUCER_SHA: ${{ needs.prepare.outputs.producer_sha }}
-          PRODUCER_TIME: ${{ needs.prepare.outputs.producer_time }}
-          PLATFORM: h100
-          WORLD_SIZE: "8"
-        run: |
-          ENVIRONMENT_HASH=$(python tests/unit_tests/testmon/tooling.py environment-hash \
-            --repo-root . \
-            --platform "$PLATFORM" \
-            --testmon-version "$TESTMON_VERSION")
-          if [[ ! "$ENVIRONMENT_HASH" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Invalid environment hash: $ENVIRONMENT_HASH" >&2
-            exit 1
-          fi
-
-          mkdir -p assets_dir/testmon-index/h100
-          python tests/unit_tests/testmon/tooling.py build-index \
-            --manifest-root baseline-manifests/h100 \
-            --recipe tests/test_utils/recipes/h100/unit-tests.yaml \
-            --platform "$PLATFORM" \
-            --world-size "$WORLD_SIZE" \
-            --environment-hash "$ENVIRONMENT_HASH" \
-            --producer-time "$PRODUCER_TIME" \
-            --output assets_dir/testmon-index/h100/index.json
-
-          INDEX_KEY="unit-testmon-v1-main-${PLATFORM}-r${WORLD_SIZE}-dev-index-${ENVIRONMENT_HASH}-${PRODUCER_SHA}-${GITHUB_RUN_ID}"
-          echo "cache_key=$INDEX_KEY" | tee -a "$GITHUB_OUTPUT"
-          echo "environment_hash=$ENVIRONMENT_HASH" | tee -a "$GITHUB_OUTPUT"
-
-          MANIFEST_COUNT=$(find baseline-manifests/h100 -name manifest.json -type f | wc -l)
-          {
-            echo "### H100 Testmon baseline"
-            echo
-            echo "- Producer: \`$PRODUCER_SHA\`"
-            echo "- Environment: \`$ENVIRONMENT_HASH\`"
-            echo "- Bucket manifests: \`$MANIFEST_COUNT\`"
-            echo "- Index cache: \`$INDEX_KEY\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Save immutable platform index
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: assets_dir/testmon-index/h100
-          key: ${{ steps.index.outputs.cache_key }}
-
-      - name: Upload platform index
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-testmon-index-h100-${{ needs.prepare.outputs.producer_sha }}
-          path: assets_dir/testmon-index/h100/index.json
-          if-no-files-found: error
-          retention-days: 7
-
-  publish-gb200-index:
-    name: Publish complete GB200 baseline index
-    needs: [prepare, baseline-gb200]
-    if: vars.ENABLE_GB200_TESTING == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout producer
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.prepare.outputs.producer_sha }}
-
-      - name: Setup Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Download GB200 bucket manifests
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          pattern: unit-testmon-manifest-gb200-*
-          path: baseline-manifests/gb200
-
-      - name: Build and validate platform index
-        id: index
-        shell: bash -e -u -o pipefail {0}
-        env:
-          PRODUCER_SHA: ${{ needs.prepare.outputs.producer_sha }}
-          PRODUCER_TIME: ${{ needs.prepare.outputs.producer_time }}
-          PLATFORM: gb200
-          WORLD_SIZE: "4"
-        run: |
-          ENVIRONMENT_HASH=$(python tests/unit_tests/testmon/tooling.py environment-hash \
-            --repo-root . \
-            --platform "$PLATFORM" \
-            --testmon-version "$TESTMON_VERSION")
-          if [[ ! "$ENVIRONMENT_HASH" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Invalid environment hash: $ENVIRONMENT_HASH" >&2
-            exit 1
-          fi
-
-          mkdir -p assets_dir/testmon-index/gb200
-          python tests/unit_tests/testmon/tooling.py build-index \
-            --manifest-root baseline-manifests/gb200 \
-            --recipe tests/test_utils/recipes/gb200/unit-tests.yaml \
-            --platform "$PLATFORM" \
-            --world-size "$WORLD_SIZE" \
-            --environment-hash "$ENVIRONMENT_HASH" \
-            --producer-time "$PRODUCER_TIME" \
-            --output assets_dir/testmon-index/gb200/index.json
-
-          INDEX_KEY="unit-testmon-v1-main-${PLATFORM}-r${WORLD_SIZE}-dev-index-${ENVIRONMENT_HASH}-${PRODUCER_SHA}-${GITHUB_RUN_ID}"
-          echo "cache_key=$INDEX_KEY" | tee -a "$GITHUB_OUTPUT"
-          echo "environment_hash=$ENVIRONMENT_HASH" | tee -a "$GITHUB_OUTPUT"
-
-          MANIFEST_COUNT=$(find baseline-manifests/gb200 -name manifest.json -type f | wc -l)
-          {
-            echo "### GB200 Testmon baseline"
-            echo
-            echo "- Producer: \`$PRODUCER_SHA\`"
-            echo "- Environment: \`$ENVIRONMENT_HASH\`"
-            echo "- Bucket manifests: \`$MANIFEST_COUNT\`"
-            echo "- Index cache: \`$INDEX_KEY\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Save immutable platform index
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: assets_dir/testmon-index/gb200
-          key: ${{ steps.index.outputs.cache_key }}
-
-      - name: Upload platform index
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unit-testmon-index-gb200-${{ needs.prepare.outputs.producer_sha }}
-          path: assets_dir/testmon-index/gb200/index.json
           if-no-files-found: error
           retention-days: 7

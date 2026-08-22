@@ -71,30 +71,18 @@ inputs:
     description: "Unit-test selection mode: full, enforce, or baseline."
     required: false
     default: "full"
-  unit_testmon_cache_key:
-    description: "Exact immutable cache key for an enforce-mode Testmon baseline."
+  unit_testmon_baseline_run_id:
+    description: "Trusted Unit Testmon Baseline workflow run containing per-bucket artifacts."
+    required: false
+    default: ""
+  unit_testmon_base_sha:
+    description: "Validated PR base SHA used to classify changes."
     required: false
     default: ""
   unit_testmon_cache_dir:
-    description: "Workspace-relative directory containing per-rank Testmon databases."
+    description: "Workspace-relative directory containing the rank-zero Testmon baseline."
     required: false
     default: "assets_dir/testmon"
-  unit_testmon_selected_manifest:
-    description: "Workspace-relative JSON manifest written by selection and consumed by pytest."
-    required: false
-    default: "assets_dir/testmon/selected.json"
-  unit_testmon_direct_tests:
-    description: "JSON array of changed unit-test files to add to Testmon's selection."
-    required: false
-    default: "[]"
-  unit_testmon_manifest_sha256:
-    description: "Trusted platform-index checksum of the restored bucket manifest."
-    required: false
-    default: ""
-  unit_testmon_database_checksums:
-    description: "Trusted platform-index JSON array of per-rank database checksums."
-    required: false
-    default: "[]"
 runs:
   using: "composite"
   steps:
@@ -106,6 +94,8 @@ runs:
       uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         ref: ${{ inputs.sha }}
+        fetch-depth: ${{ inputs.unit_testmon_mode == 'enforce' && '0' || '1' }}
+        persist-credentials: ${{ inputs.unit_testmon_mode != 'enforce' }}
 
     - name: Change ownership of /home/runner/
       shell: bash
@@ -142,16 +132,59 @@ runs:
           sleep 10
         done
 
-    # Restore-only is intentional: PR jobs must never mutate or publish the
-    # trusted database produced by unit-testmon-baseline.yml.
-    - name: Restore unit Testmon baseline
-      id: restore-unit-testmon
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_cache_key != ''
-      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+    - name: Compute unit Testmon bucket identity
+      id: unit-testmon-identity
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode != 'full'
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+      run: |
+        case "$RECIPE_PLATFORM" in
+          dgx_h100|h100)
+            PLATFORM=h100
+            WORLD_SIZE=8
+            ;;
+          dgx_gb200|gb200)
+            PLATFORM=gb200
+            WORLD_SIZE=4
+            ;;
+          *)
+            echo "Unsupported unit Testmon platform: $RECIPE_PLATFORM" >&2
+            exit 2
+            ;;
+        esac
+
+        BUCKET_HASH=$(python tests/unit_tests/testmon_selector.py bucket-hash \
+          --bucket "$BUCKET")
+        CONFIG_HASH=$(python tests/unit_tests/testmon_selector.py config-hash \
+          --repo-root . \
+          --platform "$PLATFORM" \
+          --world-size "$WORLD_SIZE" \
+          --bucket "$BUCKET")
+        [[ "$BUCKET_HASH" =~ ^[0-9a-f]{16}$ ]]
+        [[ "$CONFIG_HASH" =~ ^[0-9a-f]{64}$ ]]
+
+        echo "platform=$PLATFORM" | tee -a "$GITHUB_OUTPUT"
+        echo "world_size=$WORLD_SIZE" | tee -a "$GITHUB_OUTPUT"
+        echo "bucket_hash=$BUCKET_HASH" | tee -a "$GITHUB_OUTPUT"
+        echo "config_hash=$CONFIG_HASH" | tee -a "$GITHUB_OUTPUT"
+        echo "artifact_name=unit-testmon-v2-$PLATFORM-$BUCKET_HASH" | tee -a "$GITHUB_OUTPUT"
+
+    # Download-only is intentional: PR jobs never mutate or publish a trusted
+    # baseline artifact.
+    - name: Download unit Testmon baseline
+      id: download-unit-testmon
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_baseline_run_id != '' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
       continue-on-error: true
       with:
+        name: ${{ steps.unit-testmon-identity.outputs.artifact_name }}
         path: ${{ inputs.unit_testmon_cache_dir }}
-        key: ${{ inputs.unit_testmon_cache_key }}
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.unit_testmon_baseline_run_id }}
 
     - name: Resolve unit Testmon mode
       id: unit-testmon
@@ -159,20 +192,37 @@ runs:
       shell: bash -e -u -o pipefail {0}
       env:
         REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
-        CACHE_KEY: ${{ inputs.unit_testmon_cache_key }}
-        CACHE_HIT: ${{ steps.restore-unit-testmon.outputs.cache-hit }}
-        CACHE_RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
+        BASELINE_RUN_ID: ${{ inputs.unit_testmon_baseline_run_id }}
+        BASE_SHA: ${{ inputs.unit_testmon_base_sha }}
+        CACHE_DIR: ${{ inputs.unit_testmon_cache_dir }}
+        IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
+        DOWNLOAD_OUTCOME: ${{ steps.download-unit-testmon.outcome }}
+        CONFIG_HASH: ${{ steps.unit-testmon-identity.outputs.config_hash }}
+        ARTIFACT_NAME: ${{ steps.unit-testmon-identity.outputs.artifact_name }}
       run: |
+        FALLBACK_REASON=""
         case "$REQUESTED_MODE" in
-          full|baseline) EFFECTIVE_MODE="$REQUESTED_MODE" ;;
+          full)
+            EFFECTIVE_MODE=full
+            ;;
+          baseline)
+            if [[ "$IDENTITY_OUTCOME" != "success" ]]; then
+              echo "Unable to compute the Testmon identity for baseline generation." >&2
+              exit 2
+            fi
+            EFFECTIVE_MODE=baseline
+            ;;
           enforce)
-            if [[ -n "$CACHE_KEY" \
-              && "$CACHE_HIT" == "true" \
-              && "$CACHE_RESTORE_OUTCOME" == "success" ]]; then
+            if [[ "$BASELINE_RUN_ID" =~ ^[0-9]+$ \
+              && "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ \
+              && "$CONFIG_HASH" =~ ^[0-9a-f]{64}$ \
+              && "$IDENTITY_OUTCOME" == "success" \
+              && "$DOWNLOAD_OUTCOME" == "success" ]]; then
               EFFECTIVE_MODE=enforce
             else
               EFFECTIVE_MODE=full
-              echo "::warning::Testmon cache was unavailable; running the full unit-test bucket."
+              FALLBACK_REASON="baseline artifact or local identity was unavailable"
+              echo "::warning::Testmon baseline was unavailable; running the full unit-test bucket."
             fi
             ;;
           *)
@@ -180,77 +230,22 @@ runs:
             exit 2
             ;;
         esac
-        echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
-        {
-          echo "### Unit Testmon"
-          echo ""
-          echo "- Requested mode: \`$REQUESTED_MODE\`"
-          echo "- Effective mode: \`$EFFECTIVE_MODE\`"
-          if [[ "$REQUESTED_MODE" == "enforce" ]]; then
-            echo "- Exact cache hit: \`${CACHE_HIT:-false}\`"
-          fi
-        } >> "$GITHUB_STEP_SUMMARY"
-
-    - name: Stage directly changed unit tests
-      id: stage-unit-testmon-direct-tests
-      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'enforce'
-      shell: bash -e -u -o pipefail {0}
-      continue-on-error: true
-      env:
-        CACHE_DIR: ${{ inputs.unit_testmon_cache_dir }}
-        DIRECT_TESTS: ${{ inputs.unit_testmon_direct_tests }}
-        MANIFEST_SHA256: ${{ inputs.unit_testmon_manifest_sha256 }}
-        DATABASE_CHECKSUMS: ${{ inputs.unit_testmon_database_checksums }}
-      run: |
-        mkdir -p "$CACHE_DIR"
-        jq -e '
-          if type == "array" and all(.[]; type == "string")
-          then unique | sort
-          else error("unit_testmon_direct_tests must be a JSON array of strings")
-          end
-        ' <<< "$DIRECT_TESTS" > "$CACHE_DIR/direct-tests.json.tmp"
-        mv "$CACHE_DIR/direct-tests.json.tmp" "$CACHE_DIR/direct-tests.json"
-
-        jq -n -e \
-          --arg manifest_sha256 "$MANIFEST_SHA256" \
-          --argjson database_checksums "$DATABASE_CHECKSUMS" '
-            if ($manifest_sha256 | test("^[0-9a-f]{64}$"))
-              and ($database_checksums | type == "array")
-              and ($database_checksums | length > 0)
-              and all($database_checksums[]; type == "string" and test("^[0-9a-f]{64}$"))
-            then {
-              manifest_sha256: $manifest_sha256,
-              database_checksums: $database_checksums
-            }
-            else error("trusted Testmon index record is malformed")
-            end
-          ' > "$CACHE_DIR/expected-index-record.json.tmp"
-        mv "$CACHE_DIR/expected-index-record.json.tmp" "$CACHE_DIR/expected-index-record.json"
-
-    - name: Resolve final unit Testmon mode
-      id: final-unit-testmon
-      if: inputs.is_unit_test == 'true'
-      shell: bash -e -u -o pipefail {0}
-      env:
-        CACHE_RESOLVED_MODE: ${{ steps.unit-testmon.outputs.mode }}
-        DIRECT_TESTS_OUTCOME: ${{ steps.stage-unit-testmon-direct-tests.outcome }}
-        CACHE_DIR: ${{ inputs.unit_testmon_cache_dir }}
-      run: |
-        EFFECTIVE_MODE="$CACHE_RESOLVED_MODE"
-        if [[ "$CACHE_RESOLVED_MODE" == "enforce" \
-          && "$DIRECT_TESTS_OUTCOME" != "success" ]]; then
-          EFFECTIVE_MODE=full
-          echo "::warning::Changed-test manifest staging failed; running the full unit-test bucket."
-          {
-            echo "- Final effective mode: \`full\`"
-            echo "- Fallback reason: \`changed-test/index-record staging failed\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-        fi
-        # Baseline caches include their producer summary. Clear that restored
-        # copy so a pre-run full fallback cannot publish stale baseline text.
         mkdir -p "$CACHE_DIR"
         : > "$CACHE_DIR/summary.md"
         echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
+        {
+          echo "### Unit Testmon"
+          echo
+          echo "- Requested mode: $REQUESTED_MODE"
+          echo "- Effective mode: $EFFECTIVE_MODE"
+          if [[ "$REQUESTED_MODE" == "enforce" ]]; then
+            echo "- Baseline run: ${BASELINE_RUN_ID:-none}"
+            echo "- Artifact: ${ARTIFACT_NAME:-unresolved}"
+          fi
+          if [[ -n "$FALLBACK_REASON" ]]; then
+            echo "- Fallback: $FALLBACK_REASON"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
@@ -276,9 +271,10 @@ runs:
           --environment dev \
           --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \
-          --unit-testmon-mode ${{ steps.final-unit-testmon.outputs.mode }} \
-          --unit-testmon-cache-dir ${{ inputs.unit_testmon_cache_dir }} \
-          --unit-testmon-selected-manifest ${{ inputs.unit_testmon_selected_manifest }} \
+          --unit-testmon-mode "${{ steps.unit-testmon.outputs.mode }}" \
+          --unit-testmon-cache-dir "${{ inputs.unit_testmon_cache_dir }}" \
+          --unit-testmon-base-sha "${{ inputs.unit_testmon_base_sha }}" \
+          --unit-testmon-config-hash "${{ steps.unit-testmon-identity.outputs.config_hash }}" \
           --container-image ${{ inputs.container-image }} \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
