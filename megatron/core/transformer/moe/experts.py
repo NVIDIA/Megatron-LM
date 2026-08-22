@@ -1127,6 +1127,25 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+def _swap_glu_halves(fc1_weight: torch.Tensor) -> torch.Tensor:
+    """Return a copy of a gated fc1 weight with its two halves swapped.
+
+    Converts between the ``[gate|up]`` concatenation Megatron and Transformer Engine
+    use and the ``[up|gate]`` order FlashInfer's grouped GEMM expects.
+
+    Args:
+        fc1_weight: ``[num_experts, 2 * ffn_hidden_size, in_features]``.
+    """
+    num_experts, fc1_out, in_features = fc1_weight.shape
+    assert fc1_out % 2 == 0, f"gated fc1 out_features must be even, got {fc1_out}"
+    return (
+        fc1_weight.view(num_experts, 2, fc1_out // 2, in_features)
+        .flip(dims=[1])
+        .reshape(num_experts, fc1_out, in_features)
+        .contiguous()
+    )
+
+
 class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
@@ -1171,6 +1190,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
             HAVE_FLASHINFER
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
+        if self.config.gated_linear_unit:
+            # A gated fc1 emits 2 * ffn_hidden_size, so the gated enum is required:
+            # the non-gated ones make FlashInfer expect fc1_out == fc2_in and fail its
+            # shape check (`fc1_expert_weights.size(1) == fc2_expert_weights.size(2)
+            # * mInnerDimMultiplier`).
+            if func == F.silu:
+                return ActivationType.Swiglu
+            elif func == F.gelu:
+                return ActivationType.Geglu
+            raise ValueError(
+                f"No gated FlashInfer ActivationType mapping for activation_func={func}"
+            )
         if func == F.silu:
             return ActivationType.Silu
         elif func == F.gelu:
@@ -1264,6 +1295,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         - TE's forward to work correctly (same Parameter objects, same internal state)
         - Training updates to flow through (param.data is a view into the big tensor)
         - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+
+        The FlashInfer backend additionally needs a gated fc1 as ``[up|gate]``. Since
+        ``_fc1_weight`` shares storage with TE's ``[gate|up]`` parameters, the halves
+        cannot be swapped in place without corrupting the training path, so that
+        backend keeps a second, swapped copy of fc1 (one extra fc1 weight per layer).
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -1294,15 +1330,32 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
 
+        if (
+            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            and self.config.gated_linear_unit
+        ):
+            self.register_buffer(
+                '_fc1_weight_flashinfer', _swap_glu_halves(_fc1_weight), persistent=False
+            )
+
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
+        if self.config.gated_linear_unit:
+            fc1_weight = getattr(self, '_fc1_weight_flashinfer', None)
+            assert fc1_weight is not None, (
+                "FlashInfer needs a gated fc1 in [up|gate] order; the swapped buffer was "
+                "not built. _build_concatenated_weights() only builds it for the FlashInfer "
+                "backend, and the MXFP8 weight path does not support FlashInfer."
+            )
+        else:
+            fc1_weight = self._fc1_weight
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
             routing_map.int(),
             probs,
-            self._fc1_weight,
+            fc1_weight,
             self._fc2_weight,
             hidden_states.dtype,
             quant_scales=None,
