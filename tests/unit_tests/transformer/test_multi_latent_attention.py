@@ -833,12 +833,7 @@ class TestMLAOutputGate:
             native_scale = torch.repeat_interleave(
                 native_scale, self.transformer_config.v_head_dim, dim=-1
             )
-            expanded_fp32_scale = torch.repeat_interleave(
-                sigmoid_fp32, self.transformer_config.v_head_dim, dim=-1
-            )
-            expected_core_gradient = (output_gradient.float() * expanded_fp32_scale).to(
-                core_output.dtype
-            )
+            expected_core_gradient = output_gradient * native_scale
             head_shape = (*core_output.shape[:-1], gate_size, self.transformer_config.v_head_dim)
             scale_gradient = (
                 output_gradient.float().view(head_shape) * core_output.float().view(head_shape)
