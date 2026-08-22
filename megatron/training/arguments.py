@@ -1105,7 +1105,7 @@ def validate_args(args, defaults={}):
                 '--dsa-topk-mass-target must be in (0, 1]'
         assert args.experimental_attention_variant == 'dsa', \
             'DSA main-attention auxiliary losses require --experimental-attention-variant dsa'
-        assert getattr(args, 'dsa_kernel_backend', 'reference') in (
+        assert getattr(args, 'dsa_min_memory_backend', 'reference') in (
             'triton-min-memory', 'torch-min-memory'
         ), 'DSA main-attention auxiliary losses require a min-memory backend'
         assert not getattr(args, 'dsa_fwd_skip_dsa', False), \

@@ -5594,8 +5594,10 @@ def train(
                 )
             if optimizer is not None:
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+                indexer_learning_rate = get_indexer_lr_for_logging(optimizer.param_groups)
             else:
                 learning_rate = None
+                indexer_learning_rate = None
             # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
             # uninstrumented per-iteration overhead outside the train_step span.
             with _otel_managed_span('step', 'megatron.train.log', is_goodput_span=True):
@@ -5603,6 +5605,7 @@ def train(
                     loss_dict,
                     total_loss_dict,
                     learning_rate,
+                    indexer_learning_rate,
                     iteration,
                     loss_scale,
                     report_memory_flag,

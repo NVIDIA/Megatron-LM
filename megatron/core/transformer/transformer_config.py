@@ -3634,12 +3634,12 @@ class TransformerConfig(ModelParallelConfig):
                 assert self.attention_dropout == 0.0, (
                     "DSA main-attention auxiliary losses initially require attention_dropout=0."
                 )
-            assert self.dsa_kernel_backend in (
+            assert self.dsa_min_memory_backend in (
                 'reference',
                 'triton-min-memory',
                 'torch-min-memory',
             ), (
-                "dsa_kernel_backend must be 'reference', 'triton-min-memory', "
+                "dsa_min_memory_backend must be 'reference', 'triton-min-memory', "
                 "or 'torch-min-memory'."
             )
             assert self.dsa_min_memory_profile_rank >= -1, (
