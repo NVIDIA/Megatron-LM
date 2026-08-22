@@ -9,9 +9,12 @@ import torch
 
 from megatron.core import mpu
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
+    _get_batch_on_this_cp_rank_contiguous,
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
+    get_batch_on_this_cp_rank,
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -30,6 +33,7 @@ def initialize_test_environment(
     hybrid_context_parallel: bool = False,
     max_seqlen_per_cp_rank: int = 1024,
     create_attention_mask: bool = False,
+    cp_partition_mode: str = "zigzag",
 ):
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -41,6 +45,7 @@ def initialize_test_environment(
     args.sequence_parallel = True if tp_size > 1 else False
     args.pipeline_model_parallel_size = pp_size
     args.context_parallel_size = cp_size
+    args.cp_partition_mode = cp_partition_mode
     args.hybrid_context_parallel = hybrid_context_parallel
     args.max_seqlen_per_cp_rank = max_seqlen_per_cp_rank
     args.sft = sft
@@ -683,6 +688,158 @@ def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
         assert torch.equal(result['max_seqlen'], max_seqlen)
 
 
+def test_cp_partition_mode_cli_entry(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["test_get_batch.py", "--cp-partition-mode", "contiguous"])
+
+    args = parse_args()
+
+    assert args.cp_partition_mode == "contiguous"
+
+
+def test_transformer_config_accepts_contiguous_sbhd_context_parallelism():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        context_parallel_size=2,
+        cp_partition_mode="contiguous",
+    )
+
+    assert config.cp_partition_mode == "contiguous"
+
+
+@pytest.mark.parametrize(("cp_size", "cp_rank"), [(2, 0), (2, 1), (3, 1)])
+def test_get_batch_on_this_cp_rank_contiguous(cp_size, cp_rank):
+    seq_length = 12
+    tokens = torch.arange(2 * seq_length, dtype=torch.int64).view(2, seq_length)
+    embeddings = torch.arange(2 * seq_length * 3, dtype=torch.float32).view(2, seq_length, 3)
+    attention_mask = torch.arange(2 * seq_length * seq_length, dtype=torch.int64).view(
+        2, 1, seq_length, seq_length
+    )
+    max_seqlen = torch.tensor([seq_length], dtype=torch.int32)
+    hybrid_cp_group = MagicMock()
+    batch = {
+        "tokens": tokens,
+        "embeddings": embeddings,
+        "attention_mask": attention_mask,
+        "loss_mask": None,
+        "cu_seqlens": None,
+        "cu_seqlens_padded": None,
+        "max_seqlen": max_seqlen,
+        "local_cp_size": None,
+        "hybrid_cp_group": hybrid_cp_group,
+    }
+
+    with (
+        patch('torch.distributed.get_world_size', return_value=cp_size),
+        patch('torch.distributed.get_rank', return_value=cp_rank),
+    ):
+        result = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=MagicMock())
+
+    local_seq_length = seq_length // cp_size
+    local_start = cp_rank * local_seq_length
+    assert result is batch
+    assert torch.equal(result["tokens"], tokens.narrow(1, local_start, local_seq_length))
+    assert torch.equal(result["embeddings"], embeddings.narrow(1, local_start, local_seq_length))
+    assert torch.equal(
+        result["attention_mask"], attention_mask.narrow(2, local_start, local_seq_length)
+    )
+    assert result["tokens"].is_contiguous()
+    assert result["embeddings"].is_contiguous()
+    assert result["attention_mask"].is_contiguous()
+    assert result["loss_mask"] is None
+    assert result["max_seqlen"] is max_seqlen
+    assert result["hybrid_cp_group"] is hybrid_cp_group
+
+
+def test_get_batch_on_this_cp_rank_contiguous_rejects_non_divisible_sequence():
+    batch = {"tokens": torch.arange(10).view(1, 10), "cu_seqlens": None}
+
+    with (
+        patch('torch.distributed.get_world_size', return_value=3),
+        patch('torch.distributed.get_rank', return_value=0),
+        pytest.raises(ValueError, match="must be divisible"),
+    ):
+        _get_batch_on_this_cp_rank_contiguous(batch, cp_group=MagicMock())
+
+
+@pytest.mark.parametrize("metadata_key", ["cu_seqlens", "cu_seqlens_padded"])
+def test_get_batch_on_this_cp_rank_contiguous_rejects_packed_thd_batch(metadata_key):
+    batch = {
+        "tokens": torch.arange(8).view(1, 8),
+        metadata_key: torch.tensor([[0, 4, 8]], dtype=torch.int32),
+    }
+
+    with (
+        patch('torch.distributed.get_world_size', return_value=2),
+        patch('torch.distributed.get_rank', return_value=0),
+        pytest.raises(ValueError, match="unpacked SBHD inputs only"),
+    ):
+        _get_batch_on_this_cp_rank_contiguous(batch, cp_group=MagicMock())
+
+
+@pytest.mark.parametrize(
+    ("partition_kwargs", "expected"),
+    [
+        ({}, torch.tensor([[2, 3, 4, 5]])),
+        ({"cp_partition_mode": "zigzag"}, torch.tensor([[2, 3, 4, 5]])),
+        ({"cp_partition_mode": "contiguous"}, torch.tensor([[4, 5, 6, 7]])),
+    ],
+)
+def test_get_batch_on_this_cp_rank_dispatches_partition_mode(partition_kwargs, expected):
+    batch = {"tokens": torch.arange(8).view(1, 8), "cu_seqlens": None}
+
+    with (
+        patch('torch.distributed.get_world_size', return_value=2),
+        patch('torch.distributed.get_rank', return_value=1),
+    ):
+        result = get_batch_on_this_cp_rank(
+            batch, is_hybrid_cp=False, cp_group=MagicMock(), **partition_kwargs
+        )
+
+    assert torch.equal(result["tokens"], expected)
+
+
+@pytest.mark.parametrize(
+    ("batch_updates", "call_updates", "expected_message"),
+    [
+        ({}, {"is_hybrid_cp": True}, "hybrid context parallelism"),
+        ({}, {"use_per_sequence_balancing": True}, "use_per_sequence_balancing"),
+        (
+            {"cu_seqlens": torch.tensor([[0, 4, 8]], dtype=torch.int32)},
+            {},
+            "unpacked SBHD inputs only",
+        ),
+        (
+            {"cu_seqlens_padded": torch.tensor([[0, 4, 8]], dtype=torch.int32)},
+            {},
+            "unpacked SBHD inputs only",
+        ),
+    ],
+)
+def test_get_batch_on_this_cp_rank_contiguous_rejects_unsupported_configuration(
+    batch_updates, call_updates, expected_message
+):
+    batch = {"tokens": torch.arange(8).view(1, 8), "cu_seqlens": None, "cu_seqlens_padded": None}
+    batch.update(batch_updates)
+    call_kwargs = {
+        "is_hybrid_cp": False,
+        "cp_group": MagicMock(),
+        "cp_partition_mode": "contiguous",
+    }
+    call_kwargs.update(call_updates)
+
+    with pytest.raises(AssertionError, match=expected_message):
+        get_batch_on_this_cp_rank(batch, **call_kwargs)
+
+
+def test_get_batch_on_this_cp_rank_rejects_unknown_partition_mode():
+    with pytest.raises(ValueError, match="Unsupported cp_partition_mode"):
+        get_batch_on_this_cp_rank(
+            {"tokens": torch.arange(8).view(1, 8)}, is_hybrid_cp=False, cp_partition_mode="unknown"
+        )
+
+
 def create_pretrain_data_iterator(
     seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False
 ):
@@ -710,6 +867,75 @@ def create_pretrain_data_iterator(
         ).bool()
 
     return iter([batch])
+
+
+def test_pretrain_batch_contiguous():
+    tp_size = 1
+    pp_size = 1
+    cp_size = 2
+    seq_length = 8
+    micro_batch_size = 2
+    if cp_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because cp_size > torch.cuda.device_count() "
+            f"({cp_size} > {torch.cuda.device_count()})"
+        )
+
+    dp_size = int(os.environ.get("WORLD_SIZE", 1)) // cp_size
+    args = initialize_test_environment(
+        tp_size,
+        pp_size,
+        cp_size,
+        seq_length,
+        micro_batch_size,
+        global_batch_size=micro_batch_size * dp_size,
+        sft=False,
+        create_attention_mask=False,
+        cp_partition_mode="contiguous",
+    )
+
+    data_iterator = create_pretrain_data_iterator(
+        seq_length, micro_batch_size=micro_batch_size, create_attention_mask=False
+    )
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        tokens,
+    ) = get_batch(data_iterator)
+
+    local_seq_length = seq_length // cp_size
+    cp_rank = mpu.get_context_parallel_rank()
+    expected_position_ids = (
+        torch.arange(
+            cp_rank * local_seq_length, (cp_rank + 1) * local_seq_length, device=position_ids.device
+        )
+        .unsqueeze(0)
+        .expand(micro_batch_size, -1)
+    )
+    assert args.cp_partition_mode == "contiguous"
+    assert tokens.shape == (micro_batch_size, local_seq_length)
+    assert labels.shape == (micro_batch_size, local_seq_length)
+    assert loss_mask.shape == (micro_batch_size, local_seq_length)
+    assert torch.equal(position_ids, expected_position_ids)
+    assert tokens.is_contiguous()
+    assert labels.is_contiguous()
+    assert loss_mask.is_contiguous()
+    assert position_ids.is_contiguous()
+    assert attention_mask is None
+    assert cu_seqlens is None
+    assert cu_seqlens_padded is None
+    assert hybrid_cp_group is None
+    assert local_cp_size is None
+    assert max_seqlen is None
+
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])

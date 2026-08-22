@@ -301,6 +301,13 @@ class TransformerConfig(ModelParallelConfig):
     'gated_delta_net' is a deprecated alias of 'gdn': it is normalized to 'gdn' in
     __post_init__ and emits a DeprecationWarning."""
 
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How input sequences are partitioned across context-parallel ranks.
+
+    The main training batch path supports both zigzag and contiguous partitioning for unpacked
+    SBHD inputs. Packed THD callers must provide partition metadata matching the selected mode.
+    """
+
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
 
@@ -1397,6 +1404,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

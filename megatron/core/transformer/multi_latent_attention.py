@@ -334,6 +334,24 @@ class MultiLatentAttention(Attention):
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
 
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None
+            else self.pg_collection.cp
+        )
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and cp_group is not None
+            and get_pg_size(cp_group) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            raise ValueError(
+                "MultiLatentAttention requires cp_partition_mode='zigzag', but "
+                f"packed_seq_params has {packed_seq_params.cp_partition_mode!r}. CP partition "
+                "conversion must be handled before entering MLA."
+            )
+
         # =====================
         # Query, Key, and Value
         # =====================

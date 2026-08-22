@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
 import json
@@ -12,10 +12,10 @@ from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import maybe_msc
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -46,7 +46,6 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
-
 
 
 def _compute_norm_2(params_list):
@@ -621,7 +620,7 @@ def get_nvtx_range():
         time: If True, also track with Megatron timers (default: False)
         log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
     """
-    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+    from megatron.core.utils import nvtx_range as core_nvtx_range
 
     @contextmanager
     def nvtx_range(msg, time=False, log_level=1):
@@ -629,10 +628,9 @@ def get_nvtx_range():
             timers = get_timers()
             timers(msg, log_level=log_level).start()
         try:
-            nvtx_range_push(msg)
-            yield
+            with core_nvtx_range(msg):
+                yield
         finally:
-            nvtx_range_pop(msg)
             if time:
                 timers(msg, log_level=log_level).stop()
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import math
@@ -1714,6 +1714,16 @@ class DSAttention(MegatronModule):
                     f"query_rows={sq}, local_rows={local_sequence_rows}, tp_size={tp_size}"
                 )
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        cp_partition_mode = (
+            packed_seq_params.cp_partition_mode if packed_thd else self.config.cp_partition_mode
+        )
+        if cp_size > 1 and cp_partition_mode != "zigzag":
+            raise ValueError(
+                "DSAttention with context parallelism requires "
+                f"cp_partition_mode='zigzag', got {cp_partition_mode!r}. Its allgather path "
+                "reconstructs full sequence order from MCore zigzag rank partitions."
+            )
+
         packed_query_positions = None
         nonpacked_query_positions = None
         kv_reorder_idx = None

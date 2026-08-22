@@ -1,9 +1,13 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from megatron.core.context_parallel_layout import ThdCpRoute
 
 
 @dataclass
@@ -11,6 +15,10 @@ class PackedSeqParams:
     '''
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
+
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
+    Metadata annotation helpers update the current partition mode in-place while
+    preserving the route identity.
     '''
 
     qkv_format: str = None
@@ -26,6 +34,8 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
 
     def __post_init__(self):
@@ -67,3 +77,18 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def resolve_cp_group(
+    static_cp_group: Optional[dist.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams] = None,
+) -> Optional[dist.ProcessGroup]:
+    """Return the dynamic CP group from packed_seq_params when available, else the static one.
+
+    Dynamic CP assigns a per-microbatch CP group that may differ from the
+    process-group stored at model construction time.  This helper centralises
+    process-group stored at model construction time.
+    """
+    if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+        return packed_seq_params.cp_group
+    return static_cp_group

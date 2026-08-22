@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain and SFT Hybrid."""
 
 # Capture the true program start time BEFORE any heavy imports.
@@ -37,11 +37,12 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -90,6 +91,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
 
 # Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
 # to match the historical ``sorted(batch.keys())`` order that callers unpack into.
@@ -183,6 +185,7 @@ def get_batch(data_iterator, vp_stage=None):
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        cp_partition_mode=config.cp_partition_mode,
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
@@ -340,6 +343,9 @@ def forward_step(data_iterator, model: HybridModel):
             cp_group=hybrid_cp_group,
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
+        )
+        finalize_packed_seq_params(
+            packed_seq_params=packed_seq_params, cp_group=get_context_parallel_group()
         )
 
     timers('batch-generator').stop()

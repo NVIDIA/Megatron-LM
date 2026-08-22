@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Compare THD format against SBHD format.
@@ -30,11 +30,18 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.context_parallel_layout import CpPartitionMode, prebuild_thd_cp_partition_routes
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import get_batch_on_this_cp_rank
 from tests.unit_tests.test_utilities import Utils
 
 # =============================================================================
@@ -199,6 +206,7 @@ def make_packed_seq_params(
         max_seqlen_q=max(padded),
         max_seqlen_kv=max(padded),
         qkv_format='thd',
+        cp_partition_mode="zigzag",
     )
 
 
@@ -647,3 +655,261 @@ def test_thd_format(tc: TestCase):
     if tc.forward_bitwise or tc.backward_bitwise:
         torch.use_deterministic_algorithms(False)
         os.environ.pop("NVTE_ALLOW_NONDETERMINISTIC_ALGO", None)
+
+
+# =============================================================================
+# GQA/MTP Model Correctness
+# =============================================================================
+
+
+_GQA_MTP_SEQUENCE_LENGTH = 80
+_GQA_MTP_VOCAB_SIZE = 512
+
+
+def _make_gqa_mtp_config(
+    *, context_parallel_size: int, cp_partition_mode: CpPartitionMode
+) -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=8,
+        num_query_groups=2,
+        context_parallel_size=context_parallel_size,
+        cp_partition_mode=cp_partition_mode,
+        cp_comm_type="p2p" if context_parallel_size > 1 else None,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        calculate_per_token_loss=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        mtp_num_layers=1,
+    )
+
+
+def _build_gqa_mtp_model(config: TransformerConfig) -> GPTModel:
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    mtp_block_spec = get_gpt_mtp_block_spec(
+        config=config, spec=transformer_layer_spec, use_transformer_engine=True
+    )
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        mtp_block_spec=mtp_block_spec,
+        vocab_size=_GQA_MTP_VOCAB_SIZE,
+        max_sequence_length=_GQA_MTP_SEQUENCE_LENGTH,
+        position_embedding_type="rope",
+    ).cuda()
+
+
+def _make_gqa_mtp_full_batch(sequence_indices):
+    device = torch.device("cuda", torch.cuda.current_device())
+    batch_size = len(sequence_indices)
+    tokens = torch.empty((batch_size, _GQA_MTP_SEQUENCE_LENGTH), device=device, dtype=torch.long)
+    labels = torch.empty_like(tokens)
+
+    for row, sequence_index in enumerate(sequence_indices):
+        sequence_tokens = (
+            torch.arange(_GQA_MTP_SEQUENCE_LENGTH, device=device, dtype=torch.long)
+            + 17 * sequence_index
+            + 3
+        ) % _GQA_MTP_VOCAB_SIZE
+        tokens[row] = sequence_tokens
+        labels[row] = (sequence_tokens + 11) % _GQA_MTP_VOCAB_SIZE
+
+    return {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": torch.ones_like(tokens, dtype=torch.float32),
+        "padding_mask": torch.zeros_like(tokens, dtype=torch.bool),
+        "position_ids": torch.arange(_GQA_MTP_SEQUENCE_LENGTH, device=device, dtype=torch.long)
+        .expand(batch_size, -1)
+        .clone(),
+    }
+
+
+def _get_thd_cp_indices(
+    *, batch_size: int, cp_size: int, cp_rank: int, cp_partition_mode: CpPartitionMode, device
+):
+    total_tokens = batch_size * _GQA_MTP_SEQUENCE_LENGTH
+    if cp_size == 1:
+        return torch.arange(total_tokens, device=device, dtype=torch.long)
+    if cp_partition_mode == "contiguous":
+        local_tokens = total_tokens // cp_size
+        local_start = cp_rank * local_tokens
+        return torch.arange(
+            local_start, local_start + local_tokens, device=device, dtype=torch.long
+        )
+    if cp_partition_mode != "zigzag":
+        raise ValueError(f"Unsupported CP partition mode: {cp_partition_mode}")
+
+    chunk_length = _GQA_MTP_SEQUENCE_LENGTH // (2 * cp_size)
+    chunks = []
+    for sequence_index in range(batch_size):
+        sequence_start = sequence_index * _GQA_MTP_SEQUENCE_LENGTH
+        for chunk_index in (cp_rank, 2 * cp_size - cp_rank - 1):
+            chunk_start = sequence_start + chunk_index * chunk_length
+            chunks.append(
+                torch.arange(
+                    chunk_start, chunk_start + chunk_length, device=device, dtype=torch.long
+                )
+            )
+    return torch.cat(chunks)
+
+
+def _prepare_gqa_mtp_batch(
+    sequence_indices, input_format: str, cp_partition_mode: CpPartitionMode, cp_group
+):
+    batch = _make_gqa_mtp_full_batch(sequence_indices)
+    if input_format == "sbhd":
+        return (
+            get_batch_on_this_cp_rank(
+                batch, is_hybrid_cp=False, cp_group=cp_group, cp_partition_mode=cp_partition_mode
+            ),
+            None,
+        )
+    if input_format != "thd":
+        raise ValueError(f"Unsupported input format: {input_format}")
+
+    cp_size = dist.get_world_size(cp_group)
+    cp_rank = dist.get_rank(cp_group)
+    batch_size = len(sequence_indices)
+    indices = _get_thd_cp_indices(
+        batch_size=batch_size,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        cp_partition_mode=cp_partition_mode,
+        device=batch["tokens"].device,
+    )
+    batch = {name: value.reshape(1, -1).index_select(1, indices) for name, value in batch.items()}
+
+    cu_seqlens = torch.arange(
+        0,
+        (batch_size + 1) * _GQA_MTP_SEQUENCE_LENGTH,
+        _GQA_MTP_SEQUENCE_LENGTH,
+        device=batch["tokens"].device,
+        dtype=torch.int32,
+    )
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+        max_seqlen_q=_GQA_MTP_SEQUENCE_LENGTH,
+        max_seqlen_kv=_GQA_MTP_SEQUENCE_LENGTH,
+        cp_group=cp_group,
+        cp_partition_mode=cp_partition_mode,
+        pad_between_seqs=True,
+    )
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    return batch, packed_seq_params
+
+
+def _run_gqa_mtp_model(model, batch, packed_seq_params, dp_cp_group):
+    MTPLossLoggingHelper.tracker = {}
+    loss = model(
+        input_ids=batch["tokens"],
+        position_ids=batch["position_ids"],
+        attention_mask=None,
+        labels=batch["labels"],
+        loss_mask=batch["loss_mask"],
+        packed_seq_params=packed_seq_params,
+        padding_mask=batch["padding_mask"],
+    )
+    local_numerator = (loss.float() * batch["loss_mask"]).sum()
+    local_denominator = batch["loss_mask"].sum()
+    global_stats = torch.stack([local_numerator.detach(), local_denominator.detach()])
+    dist.all_reduce(global_stats, group=dp_cp_group)
+    global_denominator = global_stats[1].clamp(min=1)
+
+    MTPLossAutoScaler.set_loss_scale(global_denominator.reciprocal())
+    (local_numerator / global_denominator).backward()
+
+    MTPLossLoggingHelper.reduce_metrics_in_tracker()
+    assert "loss_values" in MTPLossLoggingHelper.tracker
+    mtp_loss = MTPLossLoggingHelper.tracker["loss_values"].detach().float().clone()
+
+    grads = [
+        (name, param.grad) for name, param in model.named_parameters() if param.grad is not None
+    ]
+    assert grads, "GQA/MTP model did not produce parameter gradients."
+    grad_names, grad_tensors = zip(*grads)
+    grad_vector = torch.cat([grad.detach().float().reshape(-1) for grad in grad_tensors])
+    dist.all_reduce(grad_vector, group=dp_cp_group)
+    return global_stats[0] / global_denominator, mtp_loss, grad_names, grad_vector
+
+
+@pytest.mark.parametrize(
+    ("input_format", "cp_partition_mode"),
+    (
+        pytest.param("thd", "zigzag", id="thd-zigzag"),
+        pytest.param("thd", "contiguous", id="thd-contiguous"),
+        pytest.param("sbhd", "zigzag", id="sbhd-zigzag"),
+        pytest.param("sbhd", "contiguous", id="sbhd-contiguous"),
+    ),
+)
+def test_gqa_mtp_model_cp_correctness(input_format, cp_partition_mode):
+    """Compare fixed-layout GQA/MTP models against a no-CP baseline."""
+    if not torch.cuda.is_available() or Utils.world_size != 8:
+        pytest.skip("GQA/MTP model CP correctness requires exactly 8 CUDA ranks.")
+
+    seed = 1234
+    reference_config = _make_gqa_mtp_config(
+        context_parallel_size=1, cp_partition_mode=cp_partition_mode
+    )
+    Utils.initialize_model_parallel(context_parallel_size=1)
+    try:
+        reference_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        reference_cp_group = parallel_state.get_context_parallel_group()
+        reference_sequence_indices = [dist.get_rank(group=reference_dp_cp_group)]
+
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        reference_model = _build_gqa_mtp_model(reference_config)
+        reference_batch, reference_packed_seq_params = _prepare_gqa_mtp_batch(
+            reference_sequence_indices, input_format, cp_partition_mode, reference_cp_group
+        )
+        reference_stats = _run_gqa_mtp_model(
+            reference_model, reference_batch, reference_packed_seq_params, reference_dp_cp_group
+        )
+        reference_state_dict = {
+            name: value.detach().cpu().clone() if torch.is_tensor(value) else value
+            for name, value in reference_model.state_dict().items()
+        }
+    finally:
+        MTPLossLoggingHelper.tracker = {}
+        Utils.destroy_model_parallel()
+
+    del reference_model, reference_batch, reference_packed_seq_params
+
+    candidate_config = _make_gqa_mtp_config(
+        context_parallel_size=2, cp_partition_mode=cp_partition_mode
+    )
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        candidate_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        candidate_cp_group = parallel_state.get_context_parallel_group()
+        candidate_dp_rank = parallel_state.get_data_parallel_rank()
+        candidate_sequence_indices = range(2 * candidate_dp_rank, 2 * candidate_dp_rank + 2)
+
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        candidate_model = _build_gqa_mtp_model(candidate_config)
+        candidate_model.load_state_dict(reference_state_dict)
+        candidate_batch, candidate_packed_seq_params = _prepare_gqa_mtp_batch(
+            candidate_sequence_indices, input_format, cp_partition_mode, candidate_cp_group
+        )
+        candidate_stats = _run_gqa_mtp_model(
+            candidate_model, candidate_batch, candidate_packed_seq_params, candidate_dp_cp_group
+        )
+
+        reference_loss, reference_mtp_loss, reference_grad_names, reference_grads = reference_stats
+        candidate_loss, candidate_mtp_loss, candidate_grad_names, candidate_grads = candidate_stats
+        assert reference_grad_names == candidate_grad_names
+        torch.testing.assert_close(candidate_loss, reference_loss, atol=5e-3, rtol=0.0)
+        torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
+        assert_close("aggregated parameter gradients", candidate_grads, reference_grads, False)
+    finally:
+        MTPLossLoggingHelper.tracker = {}
+        Utils.destroy_model_parallel()

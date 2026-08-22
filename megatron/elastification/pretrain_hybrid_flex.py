@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain and SFT Mamba."""
 
 import os
@@ -234,6 +234,7 @@ def get_batch(data_iterator, vp_stage=None):
         use_per_sequence_balancing=(
             getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
         ),
+        cp_partition_mode=config.cp_partition_mode,
     )
 
     cu_seqlens = batch.get('cu_seqlens')
