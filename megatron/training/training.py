@@ -3349,13 +3349,22 @@ def training_log(
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
-    # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    _lr_mp_group = pg_collection.mp if pg_collection is not None else None
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
-        learning_rate, group=_lr_mp_group
+    should_log_learning_rate = (
+        iteration % args.log_interval == 0
+        or is_first_iteration
+        or (
+            bool(getattr(args, 'tensorboard_dir', None))
+            and iteration % args.tensorboard_log_interval == 0
+        )
     )
-    if learning_rate is None and args.freeze_all_layers:
-        learning_rate = 0.0
+    if should_log_learning_rate:
+        # Learning rate can be None on ranks without trainable parameters.
+        _lr_mp_group = pg_collection.mp if pg_collection is not None else None
+        learning_rate = reduce_max_stat_across_model_parallel_group(
+            learning_rate, group=_lr_mp_group
+        )
+        if learning_rate is None and args.freeze_all_layers:
+            learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -4847,7 +4856,11 @@ def train(
         try:
 
             # Logging.
-            if optimizer is not None and not optimizer.is_stub_optimizer:
+            if (
+                optimizer is not None
+                and not optimizer.is_stub_optimizer
+                and (optimizer.config.fp16 or optimizer.config.loss_scale)
+            ):
                 # First .item() after the train_step: a device sync draining the
                 # iteration's pending GPU queue (captured under iteration_report).
                 loss_scale = optimizer.get_loss_scale().item()
