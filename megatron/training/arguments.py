@@ -6,15 +6,15 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -23,23 +23,24 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
+    ArgumentGroupFactory,
+    core_transformer_config_from_args,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
-
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
-
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -398,8 +399,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -523,16 +525,32 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        submit_rollouts_at_rollout_granularity = (
-            args.rl_submission_granularity == "R"
-        )
-        if args.rl_generation_lag > 0:
-            assert args.rl_partial_rollouts, \
-                "--rl-generation-lag requires --rl-partial-rollouts."
-        if submit_rollouts_at_rollout_granularity:
-            assert (
-                args.rl_partial_rollouts
-            ), "Rollout submission granularity requires streaming grouped rollouts."
+        if args.rl_max_inflight_requests is not None:
+            requests_per_batch = args.grpo_prompts_per_step * args.grpo_group_size
+            assert args.rl_generation_lag is None, \
+                "--rl-generation-lag and --rl-max-inflight-requests are mutually exclusive."
+            assert args.rl_max_inflight_requests >= 1, \
+                f"--rl-max-inflight-requests ({args.rl_max_inflight_requests}) must be >= 1."
+            if args.rl_max_inflight_requests > requests_per_batch:
+                assert args.rl_partial_rollouts, \
+                    f"--rl-max-inflight-requests above one training batch " \
+                    f"({requests_per_batch} requests) requires --rl-partial-rollouts."
+            # Total in-flight requests = (lag + 1) trainer batches of P * G requests each.
+            args.rl_generation_lag = args.rl_max_inflight_requests / requests_per_batch - 1
+        if args.rl_generation_lag is None:
+            # With --rl-partial-rollouts the lag is autotuned from engine capacity
+            # at inference launch; otherwise generation is fully synchronous.
+            if not args.rl_partial_rollouts:
+                args.rl_generation_lag = 0
+        else:
+            assert args.rl_generation_lag >= -1, \
+                f"--rl-generation-lag ({args.rl_generation_lag}) must be >= -1."
+            if args.rl_generation_lag > 0:
+                assert args.rl_partial_rollouts, \
+                    "--rl-generation-lag requires --rl-partial-rollouts."
+        assert args.rl_submission_granularity == "B" or args.rl_partial_rollouts, \
+            f"--rl-submission-granularity {args.rl_submission_granularity} requires " \
+            "--rl-partial-rollouts."
         assert args.rl_consumption_granularity != "R", \
             "--rl-consumption-granularity R is not currently supported."
         assert not (
@@ -691,9 +709,15 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
-    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
+    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
+    # divides eval_global_batch_size by the same product to get its microbatch count, and without
+    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
+    assert args.eval_global_batch_size % (
+        args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+    ) == 0, \
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
-        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})" \
+        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
 
     if args.perform_rl_step:
         num_generated_samples_per_inference_iteration = (
@@ -740,8 +764,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -1181,6 +1207,23 @@ def validate_args(args, defaults={}):
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
+
+    if args.accumulate_allreduce_grads_in_fp32:
+        # The FP32-accumulation reduce-scatters only exist to recover FP32 accumulation from a
+        # lower-precision wire dtype. With FP32 main_grads the plain ring reduce-scatter already
+        # sums in FP32 on both axes, so they buy no precision and cost one extra
+        # unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.
+        for arg_name in (
+            'ddp_reduce_scatter_with_fp32_accumulation',
+            'gtp_remat_reduce_scatter_with_fp32_accumulation',
+        ):
+            if getattr(args, arg_name, False):
+                setattr(args, arg_name, False)
+                warn_rank_0(
+                    f"Setting args.{arg_name} to False since "
+                    "--accumulate-allreduce-grads-in-fp32 already reduces in fp32"
+                )
+
     if args.cuda_graph_impl == "full_iteration":
         assert not args.check_for_nan_in_loss_and_grad, \
         "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-impl=full_iteration for training."
@@ -1722,6 +1765,25 @@ def validate_args(args, defaults={}):
                 "Currently only the 'broadcast' exchange algorithm is supported for fully parallel load. "
                 "Other algorithms cannot guarantee numerical stability yet."
             )
+
+    # The PG-distribution cache stores one file per parallelization group, keyed by
+    # that group's minimum global rank, and each file holds both the save and the
+    # load distribution. If save and load used different parallelization groups,
+    # two distinct groups could map to the same file (they can share a minimum
+    # global rank), so one side would silently read a distribution computed for the
+    # other group's layout. Require both sides to use the same group.
+    if args.ckpt_pg_tensors_cache_path is not None:
+        assert (
+            args.ckpt_fully_parallel_save_process_group
+            == args.ckpt_fully_parallel_load_process_group
+        ), (
+            "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
+            "--ckpt-fully-parallel-load-process-group to be identical, but got "
+            f"save='{args.ckpt_fully_parallel_save_process_group}' and "
+            f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
+            "parallelization group, so mixing groups can read a distribution computed for a "
+            "different layout."
+        )
 
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
@@ -2490,6 +2552,33 @@ def _add_logging_args(parser):
     log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
 
+    otel_group = parser.add_argument_group(title='opentelemetry')
+    otel_group.add_argument(
+        '--otel-enabled',
+        action='store_true',
+        default=False,
+        help='Enable OpenTelemetry telemetry (traces and metrics). '
+        'See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.',
+    )
+    otel_group.add_argument(
+        '--otel-service-name',
+        type=str,
+        default=None,
+        help='Override OTEL_SERVICE_NAME for this training run.',
+    )
+    otel_group.add_argument(
+        '--otel-span-groups',
+        type=str,
+        default=None,
+        help='Comma-separated span-group spec controlling which OTel '
+        'instrumentation boundaries are active.  Accepts preset keywords '
+        '("default", "per_step", "full", "all") or individual group names '
+        '("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", '
+        '"step", "forward_backward", "optimizer", "microbatch"), or a mix.  '
+        'Defaults to "default" (coarse job/checkpoint/evaluate spans only).  '
+        'Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.',
+    )
+
     return parser
 
 
@@ -2535,9 +2624,12 @@ def _add_regularization_args(parser):
                        'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
-    group.add_argument('--muon-tp-mode', type=str, default='blockwise',
+    group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed'],
-                       help='How to perform NS calculation for tensor model parallel weights')
+                       help='How to perform NS calculation for tensor model parallel weights. '
+                       'blockwise orthogonalizes each shard on its own, so the update rule '
+                       'depends on the parallelism config; duplicated and distributed both '
+                       'orthogonalize the whole matrix and give TP-invariant results.')
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the Gram matrix '
                        'in Newton-Schulz iteration.')
@@ -2576,10 +2668,21 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
-    group.add_argument('--rl-generation-lag', type=int, default=0,
-                       help='Number of trainer batches of rollout generation lag to allow. '
+    group.add_argument('--rl-generation-lag', type=float, default=None,
+                       help='Number of trainer batches of rollout generation lag to allow '
                             'The number of in-flight trainer batches is this value plus one. '
-                            'Requires --rl-partial-rollouts when greater than 0.')
+                            'May be fractional or negative; the minimum of -1 keeps a single unit '
+                            'of generation work in flight. If omitted, the lag is autotuned to the '
+                            'inference engine\'s request capacity when --rl-partial-rollouts is '
+                            'set, and is 0 otherwise. '
+                            'Requires --rl-partial-rollouts when greater than 0. '
+                            'Mutually exclusive with --rl-max-inflight-requests.')
+    group.add_argument('--rl-max-inflight-requests', type=int, default=None,
+                       help='Maximum number of inference requests RL generation may keep inflight: '
+                            'equivalent to (--rl-generation-lag + 1) training batches '
+                            'of grpo_prompts_per_step * grpo_group_size requests each. '
+                            'Requires --rl-partial-rollouts when above one training batch; '
+                            'mutually exclusive with --rl-generation-lag.')
     # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
     group.add_argument('--rl-submission-granularity', type=str,
                        default="B",
@@ -2596,6 +2699,17 @@ def _add_rl_args(parser):
                             'G consumes groups as they complete. '
                             'B consumes complete trainer batches in submission order. '
                             'R is not currently supported.')
+    group.add_argument('--rl-durable-rollout-bank', action='store_true',
+                       help='Persist completed rollout groups to a durable, write-through '
+                            'ledger so they survive a SIGKILL (the SLURM time limit) and are '
+                            'restored at restart instead of regenerated. No-op when unset.')
+    group.add_argument('--rl-rollout-bank-dir', type=str, default=None,
+                       help='Directory for the durable rollout bank (on Lustre). Defaults to '
+                            '<save>/rollout_bank so the bank stays coupled to the checkpoint.')
+    group.add_argument('--rl-rollout-bank-max-bytes', type=int, default=0,
+                       help='Soft cap (bytes) on the rollout bank size; 0 = unbounded. On '
+                            'exceed, a warning is logged. Compaction occurs at the next checkpoint '
+                            'regardless of the cap and never blocks generation.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
@@ -2718,8 +2832,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2869,7 +2982,7 @@ def _add_learning_rate_args(parser):
 def _add_checkpointing_args(parser):
     from megatron.training.config import CheckpointConfig
 
-    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
+    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
     group.add_argument('--no-save-optim', action='store_true', default=None,
@@ -3602,7 +3715,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False

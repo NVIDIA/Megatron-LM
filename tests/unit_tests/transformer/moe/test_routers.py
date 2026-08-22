@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+import dataclasses
 from typing import cast
 
 import pytest
@@ -181,39 +182,59 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_hybridep_router_masks_padding_tokens_from_dispatch(self):
-        """Test that HybridEP dispatch metadata excludes padding tokens."""
-        self.router = self.router.cuda()
-        self.router.config.moe_token_dispatcher_type = "flex"
-        self.router.config.moe_flex_dispatcher_backend = "hybridep"
-        seq_len = 32
+    @pytest.mark.parametrize("with_padding_mask", [False, True])
+    def test_expert_bias_token_counts_with_padding_mask(self, with_padding_mask):
+        """Test expert-bias counts in grad-enabled masked and unmasked forwards."""
+        config = dataclasses.replace(
+            self.transformer_config,
+            moe_router_enable_expert_bias=True,
+            moe_router_load_balancing_type="none",
+            moe_router_score_function="sigmoid",
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=config.num_moe_experts, moe_grouped_gemm=False
+            ).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        router = cast(Router, MoELayer(config, submodules).router).cuda().train()
+
+        seq_len = 5
         batch_size = 2
-        hidden_size = self.router.config.hidden_size
-
-        hidden_states = torch.randn((seq_len, batch_size, hidden_size)).cuda().bfloat16()
-
-        padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
-        padding_mask[seq_len // 2 :, :] = True
-
-        with torch.no_grad():
-            probs, routing_map = self.router(hidden_states, padding_mask=padding_mask)
-            probs_without_mask, routing_map_without_mask = self.router(
-                hidden_states[: seq_len // 2, :, :]
-            )
-
-        probs = probs.reshape(seq_len, batch_size, -1)
-        routing_map = routing_map.reshape(seq_len, batch_size, -1)
-
-        assert torch.count_nonzero(probs[seq_len // 2 :, :, :]) == 0
-        assert not routing_map[seq_len // 2 :, :, :].any()
-        assert (routing_map[: seq_len // 2, :, :].sum(dim=-1) == self.router.topk).all()
-        assert torch.equal(
-            probs[: seq_len // 2, :, :].reshape(-1, probs.shape[-1]), probs_without_mask
+        hidden_states = torch.randn(
+            (seq_len, batch_size, config.hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
         )
-        assert torch.equal(
-            routing_map[: seq_len // 2, :, :].reshape(-1, routing_map.shape[-1]),
-            routing_map_without_mask,
+        assert seq_len * batch_size != config.num_moe_experts
+        padding_mask = None
+        if with_padding_mask:
+            padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device="cuda")
+            padding_mask[-2:, 0] = True
+
+        probs, routing_map = router(hidden_states, padding_mask=padding_mask)
+        valid_routing_map = routing_map
+        if padding_mask is not None:
+            valid_routing_map = routing_map[~padding_mask.reshape(-1)]
+
+        expected_tokens_per_expert = valid_routing_map.sum(dim=0)
+        torch.testing.assert_close(
+            router.local_tokens_per_expert,
+            expected_tokens_per_expert.to(router.local_tokens_per_expert.dtype),
         )
+        expected_valid_tokens = seq_len * batch_size
+        if padding_mask is not None:
+            expected_valid_tokens -= padding_mask.sum().item()
+        assert (
+            router.local_tokens_per_expert.sum() == expected_valid_tokens * config.moe_router_topk
+        )
+
+        probs.sum().backward()
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.isfinite().all()
+        assert router.weight.grad is not None
+        assert router.weight.grad.isfinite().all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

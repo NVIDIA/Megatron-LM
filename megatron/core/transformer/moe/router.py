@@ -678,6 +678,8 @@ class TopKRouter(Router):
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
+            # TODO: repeated-MTP z_loss is scaled after MoEAuxLossAutoScaler.apply(), so this
+            # adjusts logging only; move the scaling above the attach point if z_loss is used.
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
             # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
             # so the total loss is correct.
@@ -746,9 +748,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding tokens.
-                                                   Shape [seq_length, bsz]. True for padding tokens,
-                                                   False for valid tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                                   Shape [seq_length, bsz]. True for valid tokens,
+                                                   False for padding tokens. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -786,15 +788,6 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
-
-        if (
-            padding_mask is not None
-            and self.config.moe_token_dispatcher_type == "flex"
-            and self.config.moe_flex_dispatcher_backend == "hybridep"
-        ):
-            valid_token_mask = (~padding_mask).unsqueeze(-1)
-            routing_map = routing_map & valid_token_mask
-            probs = probs * valid_token_mask.to(dtype=probs.dtype)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
