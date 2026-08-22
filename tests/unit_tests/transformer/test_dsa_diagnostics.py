@@ -16,7 +16,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics im
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import add_megatron_arguments
 from tests.unit_tests.test_utilities import Utils
-from tools.analyze_dsa_diagnostics import _summarize_distribution_width
+from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics import (
+    _summarize_distribution_width,
+)
 
 
 def _diagnostic_config(tmp_path, **overrides):
