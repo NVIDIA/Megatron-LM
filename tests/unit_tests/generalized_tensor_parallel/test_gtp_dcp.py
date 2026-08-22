@@ -109,7 +109,9 @@ def _precreate_subgroups(_torchrun_dist_init):
     yield
 
 
-def _make_gtp_shard(out_features, in_features, gtp_remat_group, dtype=torch.bfloat16):
+def _make_gtp_shard(
+    out_features, in_features, gtp_remat_group, dtype=torch.bfloat16, replica_group=None
+):
     """Build a small GTPShardedParam by wrapping a one-param dummy module."""
 
     class _Dummy(torch.nn.Module):
@@ -122,7 +124,7 @@ def _make_gtp_shard(out_features, in_features, gtp_remat_group, dtype=torch.bflo
             )
 
     mod = _Dummy()
-    wrap_module_params_gtp(mod, ["weight"], gtp_remat_group)
+    wrap_module_params_gtp(mod, ["weight"], gtp_remat_group, replica_group=replica_group)
     return mod.weight  # now a GTPShardedParam
 
 
@@ -658,6 +660,119 @@ def _worker_helper_public_wrapper_delegates(rank, world_size, port):
     assert (
         st.global_shape[0] == full_out
     ), f"rank={rank} global axis-0 {st.global_shape[0]} != {full_out}"
+
+
+def _worker_save_without_mpu_uses_stamped_replica_group(rank, world_size, port):
+    """GTP save must run off the CALLER's groups, with ``parallel_state`` torn down.
+
+    A model built on an explicit process-group grid (MiMo-style / pg_collection-only embedders)
+    never initializes the MPU globals, but the GTP checkpoint path used to elect its shard writer
+    via ``parallel_state.get_data_parallel_rank(..., with_gtp_remat=False)`` -- an unconditional
+    read that asserts "data parallel group with CP is not initialized". Both GTP save helpers now
+    take the gtp_remat-EXCLUDED DP x CP group stamped on the param at wrap time
+    (``pg_collection.dp_cp``), and only fall back to the MPU globals when it is absent.
+
+    world=4 -> tp1 * gtp_remat2 * dp2: gtp peers [0,1] / [2,3] hold DIFFERENT shards, replicas
+    [0,2] / [1,3] hold the SAME shard, so a writer election over the wrong group is visible.
+    """
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    replica_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    world_group = _cached_new_group(list(range(world_size)))
+    gtp_remat_size, per_tp_out, in_features = 2, 8, 4
+    per_shard_out = per_tp_out // gtp_remat_size  # 4
+    gtp_rank = rank % 2
+
+    # Build the params while the MPU is still up (construction is not what regressed), then tear
+    # it down so every group read below must come from the caller-supplied / stamped groups.
+    stamped = _make_gtp_shard(per_tp_out, in_features, gtp_remat_group, replica_group=replica_group)
+    unstamped = _make_gtp_shard(per_tp_out, in_features, gtp_remat_group)
+    assert stamped.gtp_replica_group is replica_group, "wrap did not stamp the replica group"
+    assert not hasattr(unstamped, "gtp_replica_group")
+
+    ps.destroy_model_parallel()
+    try:
+        assert not ps.is_initialized(), "MPU must be down for this regression to bite"
+
+        def _check(st, what):
+            assert isinstance(st, ShardedTensor), f"{what}: got {type(st)}"
+            assert st.global_shape[0] == per_tp_out, f"{what}: global {st.global_shape}"
+            assert (
+                st.global_offset[0] == gtp_rank * per_shard_out
+            ), f"{what}: rank={rank} offset {st.global_offset} (gtp_rank={gtp_rank})"
+            # Writer election over the replica group: rank 0 of [0,2] / [1,3] -> ranks 0 and 1.
+            expected_replica = 0 if rank in (0, 1) else 1
+            assert st.replica_id == (0, 0, expected_replica), f"{what}: {st.replica_id}"
+
+        # Single-tensor helper (VocabParallelEmbedding / direct callers).
+        _check(
+            make_tp_sharded_tensor_for_checkpoint(
+                tensor=stamped,
+                key="single.weight",
+                tp_axis=0,
+                tp_group=None,  # TP=1
+                dp_cp_group=world_group,
+            ),
+            "make_tp_sharded_tensor_for_checkpoint",
+        )
+        # Multi-tensor helper (the path every module's sharded_state_dict takes).
+        _check(
+            make_sharded_tensors_for_checkpoint_with_gtp_remat(
+                {"weight": stamped},
+                prefix="multi.",
+                tensor_parallel_layers_axis_map={"weight": 0},
+                tp_group=None,
+                dp_cp_group=world_group,
+            )["multi.weight"],
+            "make_sharded_tensors_for_checkpoint_with_gtp_remat",
+        )
+
+        # Exactly one writer per GTP shard -- the property a wrong (gtp-inclusive) group breaks
+        # by leaving one of the two shards with no main replica at all.
+        st = make_tp_sharded_tensor_for_checkpoint(
+            tensor=stamped, key="elect.weight", tp_axis=0, tp_group=None, dp_cp_group=world_group
+        )
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, (gtp_rank, is_main_replica(st.replica_id)))
+        for shard in range(gtp_remat_size):
+            writers = [g for g, main in gathered if g == shard and main]
+            assert len(writers) == 1, f"shard {shard} has {len(writers)} writers: {gathered}"
+
+        # The GTP-REPLICATED entries alongside a GTP weight (bias here) take their replica
+        # coordinate from the same stamped group -- or from an explicit override when given.
+        bias = torch.zeros(per_shard_out, dtype=torch.bfloat16, device="cuda")
+        expected_replica = 0 if rank in (0, 1) else 1
+        sd = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {"weight": stamped, "bias": bias},
+            prefix="",
+            tensor_parallel_layers_axis_map={"weight": 0},
+            tp_group=None,
+            dp_cp_group=world_group,
+        )
+        assert sd["bias"].replica_id == (0, gtp_rank, expected_replica), sd["bias"].replica_id
+
+        override = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+        sd = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {"weight": stamped, "bias": bias},
+            prefix="",
+            tensor_parallel_layers_axis_map={"weight": 0},
+            tp_group=None,
+            dp_cp_group=world_group,
+            intra_dp_cp_group=override,
+        )
+        assert sd["bias"].replica_id == (0, gtp_rank, gtp_rank), sd["bias"].replica_id
+
+        # No stamped group and no MPU: refuse with an actionable error instead of guessing a
+        # writer (which would silently drop or duplicate shards).
+        with pytest.raises(RuntimeError, match="gtp_replica_group"):
+            make_tp_sharded_tensor_for_checkpoint(
+                tensor=unstamped,
+                key="unstamped.weight",
+                tp_axis=0,
+                tp_group=None,
+                dp_cp_group=world_group,
+            )
+    finally:
+        ps.initialize_model_parallel()
 
 
 def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
@@ -1341,6 +1456,10 @@ class TestGtpDcpHelper:
     def test_public_wrapper_delegates(self):
         _require_world_size(4)
         _worker_helper_public_wrapper_delegates(dist.get_rank(), 4, None)
+
+    def test_save_without_mpu_uses_stamped_replica_group(self):
+        _require_world_size(4)
+        _worker_save_without_mpu_uses_stamped_replica_group(dist.get_rank(), 4, None)
 
     def test_replicated_sink_rejects_gtp(self):
         _require_world_size(4)
