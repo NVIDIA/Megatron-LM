@@ -2783,7 +2783,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         (
             matched_block_ids,
             num_blocks_from_pool,
-            already_allocated_blocks,
+            chunk_start_block,
             overall_required_blocks,
             prefix_skip_tokens,
             effective_prefill_chunk_length,
@@ -2793,7 +2793,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert matched_block_ids == [7]
         assert num_blocks_from_pool == 0
-        assert already_allocated_blocks == 0
+        assert chunk_start_block == 0
         assert overall_required_blocks == 1
         assert req._mamba_num_matched_blocks == 1
         assert prefix_skip_tokens == 0
