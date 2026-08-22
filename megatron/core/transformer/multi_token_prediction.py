@@ -13,10 +13,9 @@ from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -56,11 +55,6 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
-
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-else:
-    TESpecProvider = None
 
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -587,7 +581,7 @@ def get_mtp_layer_spec(
     """
     return get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec,
-        backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
+        backend=get_backend("transformer_engine" if use_transformer_engine else "local"),
     )
 
 
