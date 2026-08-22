@@ -175,7 +175,11 @@ def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
         json.dumps({"weight_map": {weight_name: shard, scale_name: shard}})
     )
 
-    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    cfg = DeepseekV4Config(
+        num_hidden_layers=1,
+        n_routed_experts=8,
+        quantization_config={"scale_fmt": "ue8m0"},
+    )
     ps = SimpleNamespace(
         tp_size=1,
         etp_size=1,
@@ -263,7 +267,11 @@ def test_ds4_native_fp8_dense_replica_receives_source_scale(tmp_path, monkeypatc
     )
     broadcast_count = _mock_dense_replica_receiver(monkeypatch, master, scale)
     model = _QATStage([0], 128)
-    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    cfg = DeepseekV4Config(
+        num_hidden_layers=1,
+        n_routed_experts=8,
+        quantization_config={"scale_fmt": "ue8m0"},
+    )
 
     ckpt.load_hf_weights(model, str(tmp_path), cfg, _dense_ep4_parallel_state())
 
@@ -271,6 +279,7 @@ def test_ds4_native_fp8_dense_replica_receives_source_scale(tmp_path, monkeypatc
     assert torch.equal(parameter, master)
     assert torch.equal(parameter._fp8_source_scales, scale)
     assert parameter._fp8_source_scale_version == parameter._version
+    assert parameter._fp8_source_scale_fmt == "ue8m0"
     restored = ckpt.requantize_block_fp8_weight(
         parameter.detach().to(torch.bfloat16), scale
     )

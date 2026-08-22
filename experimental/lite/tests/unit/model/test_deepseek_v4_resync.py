@@ -28,7 +28,10 @@ export_resync_weights = _MODULE.export_resync_weights
 def test_fp8_resync_exports_float32_block_scales() -> None:
     config = SimpleNamespace(
         expert_dtype="fp8",
-        quantization_config={"weight_block_size": [128, 128]},
+        quantization_config={
+            "weight_block_size": [128, 128],
+            "scale_fmt": "ue8m0",
+        },
     )
     source = torch.randn(128, 128, dtype=torch.bfloat16)
 

@@ -18,6 +18,7 @@ class CanonicalBlockFP8Weight:
     qweight: torch.Tensor
     scales: torch.Tensor
     block_shape: tuple[int, int] = BLOCK_SHAPE
+    scale_fmt: str | None = None
 
 
 def _validate_weight(weight: torch.Tensor) -> None:
