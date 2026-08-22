@@ -111,11 +111,11 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
 
 
 def copy_gtp_attributes(destination, source):
-    """Copy GTP metadata (is_gtp_weight_remat, allreduce, pad_length) onto a param view/copy,
-    so the optimizer's master shards stay classifiable by param_is_not_gtp_duplicate
-    (is_gtp_weight_remat, allreduce) and reconstructable by GTP_remat-aware orthogonalization
-    (pad_length)."""
-    for attr in ("is_gtp_weight_remat", "allreduce", "pad_length"):
+    """Copy GTP metadata onto a param view/copy, so the optimizer's master shards stay
+    classifiable by param_is_not_gtp_duplicate (is_gtp_weight_remat, allreduce), keep
+    electing their checkpoint writer off the caller's own groups (gtp_replica_group), and
+    stay reconstructable by GTP_remat-aware orthogonalization (pad_length)."""
+    for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group", "pad_length"):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
 
@@ -321,7 +321,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(
+                self,
+                ["weight"],
+                gtp_remat_group,
+                replica_group=getattr(pg_collection, "dp_cp", None),
+            )
             self.gtp_remat_size = gtp_remat_group.size()
             # Nothing prefetches embedding — it is head of the UNGRAPHED
             # chain in fwd, and its bwd bypasses all_gather_and_prefetch_bwd
@@ -1086,7 +1091,15 @@ class ColumnParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(
+                self,
+                ["weight"],
+                gtp_remat_group,
+                # Expert weights replicate over EXPERT dp; dense over dp_cp.
+                replica_group=getattr(
+                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                ),
+            )
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:
@@ -1450,7 +1463,15 @@ class RowParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(
+                self,
+                ["weight"],
+                gtp_remat_group,
+                # Expert weights replicate over EXPERT dp; dense over dp_cp.
+                replica_group=getattr(
+                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                ),
+            )
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:

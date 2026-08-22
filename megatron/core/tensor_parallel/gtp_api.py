@@ -23,6 +23,7 @@ try:
         get_rs_stream,
         gtp_native_fp8_load_context,
         gtp_remat_shard_dim0,
+        gtp_replica_rank,
         initialize_graph_wgrad_rings,
         is_gtp_param,
         make_sharded_tensors_for_checkpoint_with_gtp_remat,
@@ -31,6 +32,7 @@ try:
         wrap_module_params_gtp,
     )
     from megatron.core.tensor_parallel.gtp_cuda_graphs import (
+        preserve_gtp_prefetch_state,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
     )
@@ -55,9 +57,11 @@ __all__ = [
     "get_rs_stream",
     "gtp_native_fp8_load_context",
     "gtp_remat_shard_dim0",
+    "gtp_replica_rank",
     "is_gtp_param",
     "initialize_graph_wgrad_rings",
     "make_sharded_tensors_for_checkpoint_with_gtp_remat",
+    "preserve_gtp_prefetch_state",
     "set_cuda_graph_mempool",
     "track_gtp_capture_comms",
     "wait_async_comms",

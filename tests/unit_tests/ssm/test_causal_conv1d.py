@@ -6,6 +6,7 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.ssm import causal_conv1d as causal_conv1d_module
+from megatron.core.utils import is_causal_conv1d_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -25,7 +26,14 @@ def _contiguous_slice(tensor, cp_rank, local_seq_len):
     not HAVE_CAUSAL_CONV1D or not torch.cuda.is_available() or Utils.world_size < 2,
     reason="CP causal convolution parity requires causal-conv1d and at least two GPUs",
 )
-def test_causal_conv1d_cp_matches_full_sequence():
+@pytest.mark.parametrize(
+    ("batch_size", "packed_sequence_len"),
+    [(1, None), (2, None), (1, 64), (1, 63)],
+    ids=["bshd-b1", "bshd-b2", "thd-cp-boundary", "thd-cp-partial"],
+)
+def test_causal_conv1d_cp_matches_full_sequence(batch_size, packed_sequence_len):
+    if packed_sequence_len is not None and not is_causal_conv1d_min_version("1.7.0"):
+        pytest.skip("THD CP causal convolution requires causal-conv1d >= 1.7.0")
     Utils.initialize_model_parallel(context_parallel_size=Utils.world_size)
     try:
         cp_group = parallel_state.get_context_parallel_group()
@@ -40,16 +48,25 @@ def test_causal_conv1d_cp_matches_full_sequence():
         torch.manual_seed(1234)
 
         channels, width = 16, 4
-        x_global = torch.randn(1, global_seq_len, channels, device=device, dtype=dtype)
+        x_global = torch.randn(batch_size, global_seq_len, channels, device=device, dtype=dtype)
         weight_global = torch.randn(channels, width, device=device, dtype=dtype)
         bias_global = torch.randn(channels, device=device, dtype=dtype)
         dy_global = torch.randn_like(x_global)
-
+        global_seq_idx = (
+            torch.arange(global_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+            // packed_sequence_len
+            if packed_sequence_len is not None
+            else None
+        )
         x_ref = x_global.detach().clone().requires_grad_(True)
         weight_ref = weight_global.detach().clone().requires_grad_(True)
         bias_ref = bias_global.detach().clone().requires_grad_(True)
         output_ref = causal_conv1d_fn(
-            x=x_ref.transpose(1, 2), weight=weight_ref, bias=bias_ref, activation="silu"
+            x=x_ref.transpose(1, 2),
+            weight=weight_ref,
+            bias=bias_ref,
+            seq_idx=global_seq_idx,
+            activation="silu",
         ).transpose(1, 2)
         output_ref.backward(dy_global)
 
@@ -57,7 +74,12 @@ def test_causal_conv1d_cp_matches_full_sequence():
         weight_local = weight_global.detach().clone().requires_grad_(True)
         bias_local = bias_global.detach().clone().requires_grad_(True)
         output_local = causal_conv1d_module.causal_conv1d_cp(
-            x=x_local, weight=weight_local, bias=bias_local, activation="silu", cp_group=cp_group
+            x=x_local,
+            weight=weight_local,
+            bias=bias_local,
+            activation="silu",
+            cp_group=cp_group,
+            global_seq_idx=global_seq_idx,
         )
         output_local.backward(_contiguous_slice(dy_global, cp_rank, local_seq_len))
         dist.all_reduce(weight_local.grad, group=cp_group)

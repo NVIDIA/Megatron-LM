@@ -576,11 +576,17 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     return gtp_shard
 
 
-def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0):
+def _gtp_attach_attrs(
+    gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0, replica_group=None
+):
     """Attach group / gtp_remat_size / routed-expert tags and register in _GTP_PARAMS.
 
     Separate from _gtp_slice_one_param so attrs land on the post-quantize param (when
     quantize fires between slice and attach).
+
+    ``replica_group`` (the caller's gtp_remat-EXCLUDED DP x CP group) is stamped on the param so
+    distributed checkpointing can elect a writer without reading the MPU globals; None leaves
+    the checkpoint path on its MPU fallback. See :func:`gtp_replica_rank`.
     """
     # DistributedWeight requires implementers stay torch.Tensor subclasses; enforce at construction.
     assert isinstance(gtp_shard, torch.Tensor), (
@@ -595,6 +601,8 @@ def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_id
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+    if replica_group is not None:
+        gtp_shard.gtp_replica_group = replica_group
     global _GTP_PARAMS
     _GTP_PARAMS.append(gtp_shard)
 
@@ -647,8 +655,14 @@ def _gtp_reclass_native_fp8_shard(param):
     return param
 
 
-def attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=False):
-    """Turn each pre-sharded weight into a GTP param (FP8/BF16) and attach GTP wiring."""
+def attach_gtp_to_presharded_module(
+    module, gtp_remat_group, pad_length, is_grouped=False, replica_group=None
+):
+    """Turn each pre-sharded weight into a GTP param (FP8/BF16) and attach GTP wiring.
+
+    ``replica_group``: the caller's gtp_remat-excluded DP x CP group
+    (see :func:`_gtp_attach_attrs`).
+    """
     # GTP shards per-expert weight0..weight{num_gemms-1}; a coalesced single weight has no sibling
     # shards to attach, so reject it here (once, at setup) instead of silently attaching nothing.
     if is_grouped:
@@ -672,7 +686,13 @@ def attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grou
         else:
             gtp_param = _gtp_wrap_bf16_shard(module, name, param)
         gtp_param.pad_length = pad_length
-        _gtp_attach_attrs(gtp_param, gtp_remat_group, is_grouped=is_grouped, expert_idx=idx)
+        _gtp_attach_attrs(
+            gtp_param,
+            gtp_remat_group,
+            is_grouped=is_grouped,
+            expert_idx=idx,
+            replica_group=replica_group,
+        )
         new_weights.append(gtp_param)
     if is_grouped and new_weights:
         new_weights[0].weight_list = new_weights
@@ -774,13 +794,18 @@ def gtp_native_fp8_load_context(module):
             param.__class__ = sub_cls
 
 
-def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=None):
+def wrap_module_params_gtp(
+    module, weight_names, gtp_remat_group, is_grouped=None, replica_group=None
+):
     """Shard and re-register module params as GTPShardedParam (post-init slice).
 
     Called post-init for Megatron-style local modules (ColumnParallelLinear, etc.), which build
     the full weight and slice it here. TE modules do NOT use this path — they are constructed
     already-shard-sized (GTP-agnostic init) and wired via :func:`attach_gtp_to_presharded_module`.
     Params that are already GTP are skipped.
+
+    ``replica_group``: the caller's gtp_remat-excluded DP x CP group
+    (see :func:`_gtp_attach_attrs`).
     """
     if gtp_remat_group.size() == 1:
         return
@@ -798,7 +823,13 @@ def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=Non
         delattr(module, name)
         gtp_shard = _gtp_slice_one_param(param, gtp_remat_group, name=name)
         del param
-        _gtp_attach_attrs(gtp_shard, gtp_remat_group, is_grouped=bool(is_grouped), expert_idx=idx)
+        _gtp_attach_attrs(
+            gtp_shard,
+            gtp_remat_group,
+            is_grouped=bool(is_grouped),
+            expert_idx=idx,
+            replica_group=replica_group,
+        )
         # register the newly sharded param back to the module
         module._parameters[name] = gtp_shard
 
@@ -1488,15 +1519,18 @@ class GTPShardedParam(torch.nn.Parameter):
                     "cache.get() would return stale data. Check the chain's "
                     "_need_weight_prefetch flag and issuer's prefetch logic."
                 )
+        # This handoff marker is specific to CUDA graphs: capture-side wait_async_comms drains
+        # the producer's Work handle and sets it. In eager execution, the consumer drains the
+        # handle directly instead.
         _was_drained = getattr(self, "_already_ag_drained", False)
         if _was_drained:
-            # Producer already drained via wait_async_comms; skip the captured cross-graph
-            # wait (a CUDA no-op anyway). Correctness comes from the eager main_stream sync.
+            # The producer consumed the Work handle and recorded ag_event. Clear the host-side
+            # handoff marker, but retain the event wait that orders this consumer after the AG.
             self._already_ag_drained = False
         else:
             # Intra-graph or eager consume: drain inline.
             self._wait_param_gather()
-            self.ag_event.wait()
+        self.ag_event.wait()
 
         # Retrieve prefetched results from cache
         result = []
@@ -1534,13 +1568,14 @@ class GTPShardedParam(torch.nn.Parameter):
     def _get_recompute_prefetched_weight(self):
         # Recompute-chain analogue of _get_prefetched_weight (state-neutral; reads the
         # rowwise gather via the _recompute_* slot).
+        # CUDA-graph handoff marker equivalent to _already_ag_drained for recompute AGs.
         if self._recompute_already_drained:
-            # Producer already drained via wait_async_comms (CG capture); skip the
-            # captured cross-graph wait (CUDA no-op anyway).
+            # The producer consumed the Work handle and recorded _recompute_ag_event. Clear the
+            # host-side handoff marker, but retain the event wait that orders this consumer.
             self._recompute_already_drained = False
         else:
             self._wait_recompute_param_gather()
-            self._recompute_ag_event.wait()
+        self._recompute_ag_event.wait()
 
         result = []
         cache = get_global_GTP_cache()
@@ -2341,12 +2376,16 @@ def wait_async_comms(
     finalize_after_drain: bool = False,
     params: Optional[List[GTPShardedParam]] = None,
 ):
-    """Drain in-flight GTP async AG / RS handles.
+    """Drain in-flight GTP asynchronous communication.
 
-    Inside CUDA graph capture the drains are captured into the graph — the producer-side hook
-    for cross-graph overlap. A captured cudaStreamWaitEvent on another capture session's event is
-    a CUDA no-op, so consumers can't wait cross-graph; instead the producer drains here and flags
-    the param, and the consumer skips its captured wait.
+    This drains AG and recompute-AG handles and, unless ``skip_rs`` is set, wgrad RS handles.
+    During CUDA graph capture, draining a handle materializes its wait in the producer graph and
+    records the corresponding external event. Because the event was constructed with
+    ``external=True``, capture emits event-record and event-wait nodes that preserve the dependency
+    between separately captured graphs at replay. The host must launch the producer graph before
+    the consumer graph so its record is the one observed by the wait. An AG handoff marker prevents
+    the consumer from draining the same Work handle again; the consumer still waits on the event.
+    When requested, an RS result is also accumulated into ``main_grad`` before graph completion.
 
     Args:
         chain_id: If specified, only drain params on this chain.
@@ -2356,12 +2395,13 @@ def wait_async_comms(
                  NCCL RS) so it starts during AG drain rather than after,
                  avoiding SM-saturation that blocks cross-graph overlap.
                  Falls back to caller-stream accumulation if no RS handle.
-        params: If specified, drain only async work issued by the owning CUDA graph. Outside graph
-                capture, the process-global in-flight set remains the default.
+        params: If specified, drain only the listed parameters' async work instead of the
+                process-global in-flight set.
 
     Per-param side effects:
-        * _already_ag_drained = True   (if an AG handle was drained)
-        * _already_finalized  = True   (if finalize_after_drain=True)
+        * _already_ag_drained = True          (if an AG handle was drained)
+        * _recompute_already_drained = True   (if a recompute AG handle was drained)
+        * _already_finalized = True           (if an RS result was finalized)
     """
     comm_params = list(_inflight_comm_params) if params is None else params
     for param in comm_params:
@@ -2374,8 +2414,8 @@ def wait_async_comms(
         param._wait_param_gather()
         if had_ag:
             param._already_ag_drained = True
-        # Recompute-forward chain: drain its separate in-flight rowwise AG so the
-        # captured recompute consumer skips its cross-graph wait (full-iteration CG).
+        # Recompute-forward chain: drain its separate in-flight rowwise AG and mark the handoff.
+        # The consumer skips re-draining the Work handle but still waits on the external event.
         if param._recompute_prefetch_handle is not None:
             param._wait_recompute_param_gather()
             param._recompute_already_drained = True
@@ -2528,6 +2568,49 @@ def reset_gtp_state():
 # into one axis-0 offset (or two offsets), with replica_id = the DP-with-GTP-with-CP rank.
 
 
+def gtp_replica_rank(param, explicit_group=None):
+    """Rank of this process among the true replicas of ``param``'s GTP shard.
+
+    The replicas of a GTP shard are the data-parallel peers EXCLUDING the gtp_remat axis
+    (gtp_remat peers hold *different* shards). Electing over a gtp_remat-inclusive group would
+    leave every shard but one without a writer, so the group must be known to exclude it. Which
+    data-parallel axis applies depends on the param: a routed-expert weight (``allreduce=False``)
+    is replicated over EXPERT DP (``expt_dp``), a dense weight over ``dp_cp``. Resolution order:
+
+    1. ``explicit_group`` passed by the caller,
+    2. ``param.gtp_replica_group``, stamped at wrap time from the caller's collection
+       (``expt_dp`` for expert modules, ``dp_cp`` otherwise),
+    3. the MPU globals, picking the expert or dense axis by the param's ``allreduce`` tag.
+
+    A caller on an explicit process-group grid that never initializes ``parallel_state`` must
+    supply that group in its collection; step 3 cannot serve it and raises instead of guessing.
+    """
+    from megatron.core.utils import get_pg_rank  # noqa: E402
+
+    group = (
+        explicit_group if explicit_group is not None else getattr(param, 'gtp_replica_group', None)
+    )
+    if group is not None:
+        return get_pg_rank(group)
+
+    from megatron.core import parallel_state  # noqa: E402
+
+    if parallel_state.is_initialized():
+        if not getattr(param, 'allreduce', True):  # routed-expert weight
+            return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
+        return parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, with_gtp_remat=False
+        )
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 0  # single-process save: this rank is the only replica.
+    raise RuntimeError(
+        "GTP distributed checkpointing needs the gtp_remat-excluded DP x CP group to elect a "
+        "shard writer, but parallel_state is not initialized and the param carries no "
+        "gtp_replica_group. Pass a pg_collection containing `dp_cp` when building the model "
+        "(it is stamped onto GTP params at wrap time)."
+    )
+
+
 def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     state_dict,
     prefix,
@@ -2544,6 +2627,12 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     Per-tensor (is_gtp_param): GTP tensors layer the axis-0 GTP split on the vanilla offsets (FP8
     shards dequantized to BF16 for save); non-GTP tensors delegate to the vanilla helper unchanged,
     so this is zero-cost when GTP is inactive.
+
+    ``intra_dp_cp_group`` optionally overrides the replica group behind the replica_ids of the
+    GTP-REPLICATED entries here (bias / extra_state); it must EXCLUDE the gtp_remat axis. Left
+    None, the group is taken from the params themselves. GTP-sharded tensors elect their writer
+    inside :func:`make_tp_sharded_tensor_for_checkpoint`, always off their own stamped group.
+    See :func:`gtp_replica_rank`.
     """
     from megatron.core.transformer.utils import (  # noqa: E402
         make_sharded_object_for_checkpoint,
@@ -2575,19 +2664,13 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     tp_size = get_pg_size(tp_group)
     # All GTP params in this state_dict share the same gtp_remat_group (set by the
     # wrap hook at module init), so pick it off the first GTP shard.
-    gtp_remat_group = next(t.group for t in state_dict.values() if is_gtp_param(t))
+    first_gtp_param = next(t for t in state_dict.values() if is_gtp_param(t))
+    gtp_remat_group = first_gtp_param.group
     gtp_rank = get_pg_rank(gtp_remat_group)
     gtp_remat_size = get_pg_size(gtp_remat_group)
 
     # Replicate-group rank — the true replicas of a given GTP chunk live here.
-    if intra_dp_cp_group is not None:
-        dp_replica_rank = get_pg_rank(intra_dp_cp_group)
-    else:
-        from megatron.core import parallel_state  # noqa: E402
-
-        dp_replica_rank = parallel_state.get_data_parallel_rank(
-            with_context_parallel=True, with_gtp_remat=False
-        )
+    dp_replica_rank = gtp_replica_rank(first_gtp_param, intra_dp_cp_group)
 
     sharded_state_dict = {}
     for layer_name, tensor in state_dict.items():
