@@ -14,6 +14,8 @@
 
 name: CICD Megatron-LM
 on:
+  schedule:
+    - cron: 0 0 * * *
   push:
     branches:
       - "pull-request/[0-9]+"
@@ -59,7 +61,7 @@ jobs:
           permission-contents: read
 
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
@@ -67,7 +69,7 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+        uses: nv-gha-runners/get-pr-info@main
 
       - name: Check NVIDIA SSO membership
         id: check-sso
@@ -85,8 +87,8 @@ jobs:
           && vars.DISABLE_EXTERNAL_CONTRIBUTOR == 'true' && steps.check-sso.outputs.is_member != 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.COMMUNITY_BOT_ID }}
-          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
           owner: NVIDIA-NeMo
           permission-members: read
 
@@ -98,8 +100,8 @@ jobs:
           && vars.DISABLE_EXTERNAL_CONTRIBUTOR == 'true' && steps.check-sso.outputs.is_member != 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.COMMUNITY_BOT_ID }}
-          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
           owner: NVIDIA
           permission-members: read
 
@@ -168,7 +170,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
 
   configure:
     runs-on: ubuntu-latest
@@ -181,7 +183,6 @@ jobs:
       lts:            ${{ steps.configure.outputs.lts }}
       mbridge_suite:  ${{ steps.configure.outputs.mbridge_suite }}
       run_mbridge:    ${{ steps.configure.outputs.run_mbridge }}
-      run_nemo_rl:    ${{ steps.configure.outputs.run_nemo_rl }}
       dev:            ${{ steps.configure.outputs.dev }}
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
@@ -190,7 +191,7 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+        uses: nv-gha-runners/get-pr-info@main
 
       # Resolve a single SHA used by the build, every test job, and every
       # downstream checkout so that the container image, golden values, and
@@ -239,7 +240,6 @@ jobs:
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
-          HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
             SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
@@ -278,14 +278,6 @@ jobs:
             RUN_MBRIDGE=false
           fi
 
-          # NeMo RL job gating: PR authors opt in by adding the `Run NeMoRL tests`
-          # label. Merge queue validation intentionally skips the downstream run.
-          if [ "$HAS_NEMO_RL" == "true" ] && [ "$IS_MERGE_GROUP" != "true" ]; then
-            RUN_NEMO_RL=true
-          else
-            RUN_NEMO_RL=false
-          fi
-
           # Cadence: trigger-driven test selection axis (see filter_by_cadence
           # in tests/test_utils/python_scripts/recipe_parser.py). PR labels
           # `Run tests` and `Run functional tests` bypass the cadence filter so
@@ -314,7 +306,6 @@ jobs:
           echo "lts=$HAS_LTS"                   | tee -a $GITHUB_OUTPUT
           echo "mbridge_suite=$MBRIDGE_SUITE"   | tee -a $GITHUB_OUTPUT
           echo "run_mbridge=$RUN_MBRIDGE"       | tee -a $GITHUB_OUTPUT
-          echo "run_nemo_rl=$RUN_NEMO_RL"       | tee -a $GITHUB_OUTPUT
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
@@ -342,7 +333,6 @@ jobs:
           | \`lts\` | \`$HAS_LTS\` |
           | \`dev\` | \`$DEV\` |
           | \`run_mbridge\` | \`$RUN_MBRIDGE\` |
-          | \`run_nemo_rl\` | \`$RUN_NEMO_RL\` |
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
@@ -380,7 +370,6 @@ jobs:
           - **\`dev\`**: uses the latest development container base image (default)
           - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
           - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Off for PR pushes by default; flip on by adding the _Run MBridge tests_ label.
-          - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
           SUMMARY
 
   linting:
@@ -397,52 +386,29 @@ jobs:
       )
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@v8.1.0
         with:
           version: 0.7.2
+
+      - name: Test yq checksum expansion
+        run: .github/scripts/test_yq_checksums.sh
+
+      - name: Test queue approval topology
+        run: .github/scripts/test_approve_test_queue.sh
 
       - name: Install linting tools
         run: |
           uv sync --locked --only-group linting
 
-      - name: Test CI cache keys
-        run: .github/scripts/test_cache_keys.sh
-
-      - name: Test queue approval topology
-        run: .github/scripts/test_approve_test_queue.sh
-
-      - name: Test superseded merge-group cleanup
-        run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
-
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
-
-      - name: Validate updated golden values
-        if: github.event_name == 'merge_group' || (startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push')
-        env:
-          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
-        run: |
-          BASE_REF="${BASE_REF#refs/heads/}"
-          git fetch origin "$BASE_REF"
-          mapfile -t GOLDEN_VALUES_FILES < <(
-            git diff --name-only --diff-filter=ACMR \
-              --merge-base "origin/$BASE_REF" -- \
-              ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
-          )
-
-          if (( ${#GOLDEN_VALUES_FILES[@]} == 0 )); then
-            echo "No golden value files were updated; skipping validation."
-            exit 0
-          fi
-
-          python3 tools/check_golden_values.py "${GOLDEN_VALUES_FILES[@]}"
+        uses: nv-gha-runners/get-pr-info@main
 
       - name: Run linting
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
@@ -491,7 +457,7 @@ jobs:
       mbridge-test-suite: ${{ needs.configure.outputs.mbridge_suite }}
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
 
       - name: How-To
         run: bash .github/scripts/readme.sh
@@ -503,11 +469,8 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
-    # Skip downstream MBridge testing for docs-only changes and PR pushes by
-    # default. Non-docs merge_group and nightly (schedule / workflow_dispatch)
-    # triggers still run it, and PR authors can opt in by adding the
-    # "Run MBridge tests" label — all three cases set
-    # configure.outputs.run_mbridge == 'true'.
+    # Raw App credentials are available only on the explicitly approved
+    # pull-request/<number> push path. Other trigger types skip this job.
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
@@ -517,7 +480,6 @@ jobs:
       && github.event_name == 'push'
       && startsWith(github.ref, 'refs/heads/pull-request/')
       && needs.configure.outputs.run_mbridge == 'true'
-      && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -532,12 +494,12 @@ jobs:
 
       - name: Trigger and wait for MBridge tests
         env:
-          BOT_ID: ${{ vars.COMMUNITY_BOT_ID }}
-          BOT_KEY: ${{ secrets.COMMUNITY_BOT_KEY }}
+          BOT_ID: ${{ vars.BOT_ID }}
+          BOT_KEY: ${{ secrets.BOT_KEY }}
           MBRIDGE_MCORE_REF: ${{ needs.configure.outputs.sha }}
           MBRIDGE_TEST_SUITE: ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}
           MBRIDGE_POLL_TIMEOUT_SECONDS: "12600"
-        run: python3 -u .github/scripts/trigger_workflow_and_wait.py
+        run: python3 .github/scripts/trigger_workflow_and_wait.py
 
   cicd-mbridge-testing-notify:
     runs-on: ubuntu-latest
@@ -549,7 +511,7 @@ jobs:
       && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
     steps:
       - name: Send Slack alert
-        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@209ac7913b0419a5ccbac47b02d00fbea4939243 # main
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@main
         with:
           webhook: ${{ secrets.SLACK_WH_MLM_MB_ALERTS }}
           message: |
@@ -558,105 +520,45 @@ jobs:
             • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
             ${{ needs.cicd-mbridge-testing.result == 'failure' && format('cc <!subteam^{0}>', secrets.SLACK_NEMO_MB_CODEOWNERS_GROUP_ID) || '' }}
 
-  cicd-nemo-rl-testing:
+  cicd-compute-build-matrix:
     runs-on: ubuntu-latest
-    needs:
-      - pre-flight
-      - configure
-      - cicd-wait-in-queue
-      - cicd-parse-downstream-testing
-    # Skip downstream NeMo RL testing for docs-only and merge queue changes.
-    # PR authors opt in with the "Run NeMoRL tests" label.
-    if: |
-      needs.pre-flight.result != 'cancelled'
-      && needs.configure.result != 'cancelled'
-      && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-parse-downstream-testing.result != 'cancelled'
-      && needs.configure.outputs.run_nemo_rl == 'true'
-      && github.event_name != 'merge_group'
-      && needs.pre-flight.outputs.docs_only == 'false'
-      && (
-        success()
-        || needs.pre-flight.outputs.force_run_all == 'true'
-      )
-      && !cancelled()
+    needs: [is-not-external-contributor]
+    outputs:
+      matrix: ${{ steps.compute.outputs.matrix }}
     steps:
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
-
-      - name: Checkout NeMo RL
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: main
-          repository: NVIDIA-NeMo/RL
-          path: nemo-rl
-          token: ${{ secrets.PAT }}
-
-      - name: Create testing branch
+      - name: Compute build matrix
+        id: compute
         env:
-          NEMO_RL_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
+          IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
+          ENABLE_GB_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
+          SELECTED_RUNNER: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+          SELECTED_RUNNER_GB_GPU: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+          REGISTRY_AWS: ${{ env.container-registry }}
+          REGISTRY_GB_GPU: ${{ env.container-registry-gb200 }}
         run: |
-          cd nemo-rl
-          git fetch origin main
-          git checkout -b ${{ env.NEMO_RL_BRANCH_NAME }} origin/main
-          git push origin ${{ env.NEMO_RL_BRANCH_NAME }} --force
-
-      # Dispatch on a per-run branch so NeMo RL's concurrency policy does not
-      # cancel an unrelated MCore-triggered workflow running against `main`.
-      - name: Trigger NeMo RL tests
-        uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # v1.6.5
-        env:
-          NEMO_RL_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        with:
-          owner: NVIDIA-NeMo
-          repo: RL
-          workflow_file_name: cicd-main.yml
-          github_token: ${{ secrets.PAT }}
-          ref: ${{ env.NEMO_RL_BRANCH_NAME }}
-          wait_interval: 60
-          propagate_failure: true
-          client_payload: |
-            {
-              "test_to_run": "L1",
-              "test_script_pattern": "L1_Functional_Tests_Megatron_4",
-              "test_platform": "h100",
-              "megatron_lm_commit": "${{ github.sha }}"
-            }
-
-      - name: Delete testing branch
-        if: always()
-        env:
-          NEMO_RL_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        run: |
-          cd nemo-rl
-          git push origin --delete ${{ env.NEMO_RL_BRANCH_NAME }}
-
-  cicd-nemo-rl-testing-notify:
-    runs-on: ubuntu-latest
-    needs: [cicd-nemo-rl-testing]
-    # Notify on both success and failure of the NeMo RL downstream tests.
-    # Skipped/cancelled runs are intentionally not announced.
-    if: |
-      always()
-      && (needs.cicd-nemo-rl-testing.result == 'success' || needs.cicd-nemo-rl-testing.result == 'failure')
-    steps:
-      - name: Send Slack alert
-        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@209ac7913b0419a5ccbac47b02d00fbea4939243 # main
-        with:
-          webhook: ${{ secrets.SLACK_WH_MLM_RL_ALERTS }}
-          message: |
-            ${{ needs.cicd-nemo-rl-testing.result == 'success' && ':white_check_mark: *NeMo RL downstream tests passed*' || ':rotating_light: *NeMo RL downstream tests failed*' }}
-            • Trigger: `${{ github.event_name }}` on `${{ github.ref_name }}`
-            • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
+          AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
+            '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+          if [ "$IS_MAINTAINER" == "true" ] && [ "$ENABLE_GB_TESTING" == "true" ]; then
+            GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
+              '{"cloud": "gb-gpu", "registry": $registry, "runner": $runner}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
+              '{"include": [$aws, $gb_gpu]}')
+          else
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" '{"include": [$aws]}')
+          fi
+          echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
 
   cicd-container-build:
-    needs: [is-not-external-contributor, pre-flight, configure, cicd-wait-in-queue]
+    needs: [is-not-external-contributor, pre-flight, configure, cicd-wait-in-queue, cicd-compute-build-matrix]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.cicd-compute-build-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-compute-build-matrix.result != 'cancelled'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -664,13 +566,101 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
-    uses: ./.github/workflows/_build_ci_container.yml
-    with:
-      is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
-      selected-runner: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-      selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
-      source-sha: ${{ needs.configure.outputs.sha }}
-      lts: ${{ needs.configure.outputs.lts == 'true' }}
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+
+      - name: Setup python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.12
+
+      - name: Download test data
+        shell: bash
+        run: |
+          echo "::group::Download test data"
+          for attempt in 1 2 3; do
+            if pip install --no-cache-dir click requests \
+              && python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets; then
+              break
+            fi
+            echo "Download test data attempt ${attempt} failed, retrying..." >&2
+            if [ "${attempt}" -eq 3 ]; then
+              echo "Download test data failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::endgroup::"
+
+      - name: Compute cache config
+        id: cache_keys
+        shell: bash
+        run: |
+          KEY="${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}"
+
+          # Single coherent cache donor. Dockerfile.ci builds non-reproducible
+          # from-source layers: the same BuildKit cache key yields a different
+          # result digest on every cold build. Listing more than one cache-from
+          # donor lets BuildKit chain from a conflicting copy of such a layer and
+          # miss every layer downstream — a long cold rebuild even when a warm
+          # cache exists. So read EXACTLY ONE donor.
+          #
+          # Key 0 is the no-PR build cache: it is written by the daily schedule
+          # (from main HEAD), the merge queue, and deploy-release builds, so it is
+          # the integration baseline. PR builds seed from it and write their own
+          # ${KEY}-buildcache; baseline builds (KEY=0) seed from and write 0.
+          SEED="0"
+
+          echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "seed=$SEED" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Parse baseimage
+        shell: bash
+        id: base-image
+        env:
+          HAS_LTS_LABEL: ${{ needs.configure.outputs.lts }}
+        run: |
+          if [ "$HAS_LTS_LABEL" == "true" ]; then
+            NGC_VERSION=$(cat docker/.ngc_version.lts)
+            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
+            echo "image_type=lts" | tee -a $GITHUB_OUTPUT
+            echo "dockerfile=./docker/Dockerfile.ci.lts" | tee -a $GITHUB_OUTPUT
+          else
+            NGC_VERSION=$(cat docker/.ngc_version.dev)
+            echo "version=$NGC_VERSION" | tee -a $GITHUB_OUTPUT
+            echo "image_type=dev" | tee -a $GITHUB_OUTPUT
+            echo "dockerfile=./docker/Dockerfile.ci.dev" | tee -a $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.0.0
+
+      - name: Build and push
+        uses: docker/build-push-action@v7.1.0
+        env:
+          BUILDX_NO_DEFAULT_OCI_ARTIFACT: "true"
+        with:
+          file: ${{ steps.base-image.outputs.dockerfile }}
+          push: true
+          context: .
+          target: main
+          build-args: |
+            FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
+            IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
+          cache-from: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.seed }}-buildcache-${{ matrix.cloud }},mode=max
+          cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
+          no-cache: false
+          tags: |
+            ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
+            ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-${{ matrix.cloud }}
 
   cicd-parse-unit-tests:
     runs-on: ubuntu-latest
@@ -695,7 +685,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
@@ -741,7 +731,7 @@ jobs:
       PIP_RETRIES: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -780,7 +770,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
@@ -828,7 +818,7 @@ jobs:
       PIP_RETRIES: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -918,7 +908,7 @@ jobs:
       integration-tests-h100: ${{ steps.main.outputs.integration-tests-h100 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -983,7 +973,7 @@ jobs:
       && needs.cicd-parse-integration-tests-h100.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -1016,7 +1006,7 @@ jobs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -1083,7 +1073,7 @@ jobs:
       && vars.ENABLE_GB200_TESTING == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -1124,7 +1114,7 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
 
       - name: Get workflow result
         id: result
@@ -1199,7 +1189,6 @@ jobs:
               and (.conclusion == "failure" or .conclusion == "cancelled")
               and .name != "merge-queue-notification"
               and .name != "cicd-mbridge-testing"
-              and .name != "cicd-nemo-rl-testing"
             )] | length
           ') || BAD_JOBS=0
 
@@ -1211,7 +1200,6 @@ jobs:
                 and (.conclusion == "failure" or .conclusion == "cancelled")
                 and .name != "merge-queue-notification"
                 and .name != "cicd-mbridge-testing"
-                and .name != "cicd-nemo-rl-testing"
               ) | .name + " → " + .conclusion
             '
             FAILED=true
@@ -1239,12 +1227,12 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.COMMUNITY_BOT_ID }}
-          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
           permission-statuses: write
 
       - name: Generate fake coverage report
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@v8
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
@@ -1275,13 +1263,13 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+        uses: nv-gha-runners/get-pr-info@main
 
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
@@ -1302,7 +1290,7 @@ jobs:
           ls -al
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
+        uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
@@ -1310,7 +1298,7 @@ jobs:
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
@@ -1334,12 +1322,12 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.COMMUNITY_BOT_ID }}
-          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
-          permission-pull-requests: write
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-issues: write
 
       - name: Comment on PR with action run URL
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@v8
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |

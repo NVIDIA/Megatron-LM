@@ -386,7 +386,12 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                dynamic_context_parallel=args.dynamic_context_parallel,
+                # ``hybrid_context_parallel`` is the deprecated spelling retained by
+                # main's training path. Dev's process-group implementation renamed
+                # the same mechanism to dynamic context parallelism.
+                dynamic_context_parallel=(
+                    args.dynamic_context_parallel or args.hybrid_context_parallel
+                ),
                 min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
