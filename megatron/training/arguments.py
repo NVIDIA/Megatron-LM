@@ -3620,6 +3620,71 @@ def _add_experimental_attention_variant_args(parser):
         help='Number of source tokens selected per query token by DSA.',
     )
     _maybe_add_argument(
+        '--dsa-kernel-backend',
+        type=str,
+        default='reference',
+        choices=['reference', 'triton-min-memory', 'torch-min-memory'],
+        help=(
+            'DSA-GQA backend. triton-min-memory uses optional Triton kernels; '
+            'torch-min-memory uses the same min-memory algorithm with Triton dispatch disabled.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-min-memory-profile',
+        action='store_true',
+        help='Print per-layer DSA min-memory forward/backward timing breakdowns.',
+    )
+    _maybe_add_argument(
+        '--dsa-min-memory-profile-rank',
+        type=int,
+        default=0,
+        help='Global rank that prints DSA min-memory timings. Set to -1 to print on every rank.',
+    )
+    _maybe_add_argument(
+        '--dsa-kernel-query-block-size',
+        type=int,
+        default=None,
+        help='Query tile size for DSA min-memory kernel backends.',
+    )
+    _maybe_add_argument(
+        '--dsa-kernel-key-block-size',
+        type=int,
+        default=None,
+        help='Key tile size for DSA min-memory kernel backends.',
+    )
+    _maybe_add_argument(
+        '--dsa-kernel-cache-routing',
+        action='store_true',
+        help=(
+            'Save DSA kernel routing top-k indices from forward for backward speed. '
+            'This trades activation memory for less recomputation.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-kernel-cache-indexer-k',
+        action='store_true',
+        help=(
+            'Save full-sequence projected DSA indexer K for min-memory backend speed. '
+            'This adds O(sequence * batch * indexer_head_dim) activation memory.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-kernel-cache-selected-scores',
+        action='store_true',
+        help=(
+            'Save selected DSA indexer scores for min-memory backend backward speed. '
+            'This adds O(batch * sequence * topk) activation memory, stored by query tile.'
+        ),
+    )
+    _maybe_add_argument(
+        '--dsa-fwd-use-dense-attn',
+        action='store_true',
+        help=(
+            'Use dense GQA attention forward with dense tiled DSA indexer KL loss for '
+            'min-memory DSA warmup. Requires dsa_indexer_use_sparse_loss to be unset.'
+        ),
+    )
+    _maybe_add_argument(
         '--dsa-indexer-topk-key-chunk-size',
         type=int,
         default=None,

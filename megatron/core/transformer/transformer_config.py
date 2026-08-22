@@ -339,6 +339,40 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
+    dsa_min_memory_backend: Literal[
+        'reference', 'triton-min-memory', 'torch-min-memory'
+    ] = 'reference'
+    """Which min-memory DSA-over-GQA implementation to use.
+
+    Distinct from dsa_kernel_backend, which selects the fused kernel backend for
+    DSA over MLA (none/tilelang/cudnn). This selects the streamed min-memory
+    implementation used by the GQA path. Both names existed independently
+    before this branch was rebased onto main."""
+
+    dsa_min_memory_profile: bool = False
+    """Whether to print per-layer DSA min-memory forward/backward timing breakdowns."""
+
+    dsa_min_memory_profile_rank: int = 0
+    """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
+
+    dsa_kernel_query_block_size: Optional[int] = None
+    """Optional query tile size for DSA min-memory kernel backends."""
+
+    dsa_kernel_key_block_size: Optional[int] = None
+    """Optional key tile size for DSA min-memory kernel backends."""
+
+    dsa_kernel_cache_routing: bool = False
+    """Whether DSA kernel backends may save forward routing top-k indices for backward speed."""
+
+    dsa_kernel_cache_indexer_k: bool = False
+    """Whether DSA kernel backends may save full-sequence projected indexer K for speed."""
+
+    dsa_kernel_cache_selected_scores: bool = False
+    """Whether DSA kernel backends may save selected indexer scores for speed."""
+
+    dsa_fwd_use_dense_attn: bool = False
+    """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
+
     dsa_indexer_topk_key_chunk_size: Optional[int] = None
     """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
 
@@ -3254,6 +3288,10 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
+        assert (
+            not self.dsa_fwd_use_dense_attn or self.experimental_attention_variant == "dsa"
+        ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
+
         if self.experimental_attention_variant == "dsa":
             assert self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0, (
                 "dsa_indexer_n_heads must be set to a positive integer when using DSA."
@@ -3268,6 +3306,51 @@ class TransformerConfig(ModelParallelConfig):
                 self.dsa_indexer_topk_key_chunk_size is None
                 or self.dsa_indexer_topk_key_chunk_size > 0
             ), "dsa_indexer_topk_key_chunk_size must be a positive integer when set."
+            min_memory_dsa_backend = self.dsa_min_memory_backend in (
+                'triton-min-memory',
+                'torch-min-memory',
+            )
+            dense_dsa_warmup = self.dsa_fwd_use_dense_attn
+            sparse_fwd_dense_loss = (
+                min_memory_dsa_backend
+                and not dense_dsa_warmup
+                and not self.dsa_indexer_use_sparse_loss
+            )
+            assert self.dsa_kernel_backend in (
+                'reference',
+                'triton-min-memory',
+                'torch-min-memory',
+            ), (
+                "dsa_kernel_backend must be 'reference', 'triton-min-memory', "
+                "or 'torch-min-memory'."
+            )
+            assert self.dsa_min_memory_profile_rank >= -1, (
+                "dsa_min_memory_profile_rank must be -1 or a non-negative global rank."
+            )
+            assert (
+                self.dsa_kernel_query_block_size is None or self.dsa_kernel_query_block_size > 0
+            ), "dsa_kernel_query_block_size must be a positive integer when set."
+            assert (
+                self.dsa_kernel_key_block_size is None or self.dsa_kernel_key_block_size > 0
+            ), "dsa_kernel_key_block_size must be a positive integer when set."
+            assert (
+                not self.dsa_kernel_cache_routing
+                or min_memory_dsa_backend
+            ), "dsa_kernel_cache_routing requires a min-memory dsa_min_memory_backend."
+            assert (
+                not self.dsa_kernel_cache_indexer_k
+                or min_memory_dsa_backend
+            ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_min_memory_backend."
+            assert (
+                not self.dsa_kernel_cache_selected_scores
+                or min_memory_dsa_backend
+            ), (
+                "dsa_kernel_cache_selected_scores requires "
+                "a min-memory dsa_min_memory_backend."
+            )
+            assert (
+                not dense_dsa_warmup or min_memory_dsa_backend
+            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_min_memory_backend."
             assert (
                 not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
             ), (
@@ -3284,9 +3367,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_indexer_loss_query_chunk_size is None
                 or self.dsa_indexer_sparse_loss_use_topk_only
+                or min_memory_dsa_backend
             ), (
                 "dsa_indexer_loss_query_chunk_size requires "
-                "dsa_indexer_sparse_loss_use_topk_only."
+                "dsa_indexer_sparse_loss_use_topk_only or a min-memory dsa_min_memory_backend."
             )
             assert (
                 not self.dsa_indexer_topk_recompute
@@ -3300,9 +3384,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.dsa_sparse_attention_query_chunk_size is None
                 or self.dsa_sparse_attention_use_gather
+                or min_memory_dsa_backend
             ), (
                 "dsa_sparse_attention_query_chunk_size requires "
-                "dsa_sparse_attention_use_gather."
+                "dsa_sparse_attention_use_gather or a min-memory dsa_min_memory_backend."
             )
             assert (
                 self.context_parallel_size == 1
@@ -3311,6 +3396,68 @@ class TransformerConfig(ModelParallelConfig):
                 "Currently sequence parallelism is not supported by DSAttention."
             )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if min_memory_dsa_backend:
+                assert self.dsa_sparse_attention_query_chunk_size is None, (
+                    "min-memory dsa_min_memory_backend uses dsa_kernel_query_block_size; "
+                    "leave dsa_sparse_attention_query_chunk_size for legacy/reference paths."
+                )
+                assert self.dsa_indexer_loss_query_chunk_size is None, (
+                    "min-memory dsa_min_memory_backend uses dsa_kernel_query_block_size; "
+                    "leave dsa_indexer_loss_query_chunk_size for legacy/reference paths."
+                )
+                assert self.dsa_indexer_topk_key_chunk_size is None, (
+                    "min-memory dsa_min_memory_backend uses dsa_kernel_key_block_size; "
+                    "leave dsa_indexer_topk_key_chunk_size for legacy/reference paths."
+                )
+                assert not self.dsa_indexer_topk_recompute, (
+                    "min-memory dsa_min_memory_backend recomputes or caches routing internally; "
+                    "leave dsa_indexer_topk_recompute for legacy/reference paths."
+                )
+                assert not self.dsa_indexer_loss_recompute, (
+                    "min-memory dsa_min_memory_backend recomputes indexer-loss intermediates "
+                    "internally; leave dsa_indexer_loss_recompute for legacy/reference paths."
+                )
+                assert not self.dsa_sparse_attention_recompute, (
+                    "min-memory dsa_min_memory_backend recomputes sparse attention internally; "
+                    "leave dsa_sparse_attention_recompute for legacy/reference paths."
+                )
+                assert not self.dsa_sparse_attention_use_gather, (
+                    "min-memory dsa_min_memory_backend bypasses the reference gather backend; "
+                    "leave dsa_sparse_attention_use_gather for legacy/reference paths."
+                )
+                if dense_dsa_warmup:
+                    assert not self.dsa_indexer_use_sparse_loss, (
+                        "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
+                        "dsa_indexer_use_sparse_loss."
+                    )
+                    assert (self.dsa_indexer_loss_coeff or 0.0) > 0.0, (
+                        "dsa_fwd_use_dense_attn requires dsa_indexer_loss_coeff > 0."
+                    )
+                    assert not self.dsa_kernel_cache_routing, (
+                        "dsa_fwd_use_dense_attn bypasses routing; do not set "
+                        "dsa_kernel_cache_routing."
+                    )
+                    assert not self.dsa_kernel_cache_indexer_k, (
+                        "dsa_fwd_use_dense_attn recomputes dense indexer K; do not set "
+                        "dsa_kernel_cache_indexer_k."
+                    )
+                    assert not self.dsa_kernel_cache_selected_scores, (
+                        "dsa_fwd_use_dense_attn has no selected scores; do not set "
+                        "dsa_kernel_cache_selected_scores."
+                    )
+                else:
+                    assert (self.dsa_indexer_loss_coeff or 0.0) > 0.0, (
+                        "min-memory dsa_min_memory_backend requires dsa_indexer_loss_coeff > 0."
+                    )
+                    if sparse_fwd_dense_loss:
+                        assert not self.dsa_kernel_cache_selected_scores, (
+                            "Sparse-forward dense-loss mode has no selected scores; do not set "
+                            "dsa_kernel_cache_selected_scores."
+                        )
+                assert self.dsa_indexer_use_hadamard, (
+                    "min-memory dsa_min_memory_backend requires "
+                    "dsa_indexer_use_hadamard to match the DeepSeek indexer."
+                )
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
