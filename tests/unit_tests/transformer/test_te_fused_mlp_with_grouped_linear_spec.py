@@ -50,11 +50,15 @@ def _patch_fake_te_ops(monkeypatch):
     class FakeSequential(list):
         pass
 
-    class FakeLayerNormLinear:
-        pass
+    class FakeLayerNormLinear(torch.nn.Module):
 
-    class FakeLinear:
-        pass
+        def __init__(self):
+            super().__init__()
+
+    class FakeLinear(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
 
     class FakeNorm:
 
@@ -100,6 +104,7 @@ def _patch_fake_te_ops(monkeypatch):
 
 def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm"):
     module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
+    torch.nn.Module.__init__(module)
 
     fc1 = fake_te.LayerNormLinear()
     fc1.normalization = normalization
@@ -118,10 +123,6 @@ def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm"):
     module.linear_fc1 = fc1
     module.linear_fc2 = fc2
 
-    def fake_register_hooks(fused_impl):
-        module._hooked_fused_impl = fused_impl
-
-    object.__setattr__(module, "_register_hooks_on_fused_impl", fake_register_hooks)
     return module
 
 
@@ -183,10 +184,25 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
 
         fused_impl = TEFusedMLPWithGroupedLinear._make_fused_impl(module)
 
+        def fake_register_main(self, hook_target, *, pre_forward_submodules=None):
+            self._hooked_fused_impl = hook_target
+            self._main_pre_forward_submodules = tuple(pre_forward_submodules or ())
+
+        def fake_register_norm(hook_target, source_submodules):
+            module._hooked_norm_seq = hook_target
+            module._norm_pre_forward_submodules = tuple(source_submodules)
+
+        monkeypatch.setattr(TEFusedMLP, "_register_hooks_on_fused_impl", fake_register_main)
+        object.__setattr__(module, "_register_forward_pre_hooks_on_fused_impl", fake_register_norm)
+
         norm = module._norm_seq[0][0]
         fc1_op, fc2_op = fake_te.GroupedLinear.instances
         assert isinstance(fused_impl, fake_te.Sequential)
+        TEFusedMLPWithGroupedLinear._register_hooks_on_fused_impl(module, fused_impl)
         assert module._hooked_fused_impl is fused_impl
+        assert module._hooked_norm_seq is module._norm_seq[0]
+        assert module._norm_pre_forward_submodules == tuple(module.linear_fc1.modules())
+        assert module._main_pre_forward_submodules == tuple(module.linear_fc2.modules())
         assert norm.norm_shape == 4
         assert norm.weight is module.linear_fc1.layer_norm_weight
         if normalization == "LayerNorm":
@@ -224,6 +240,51 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         with pytest.raises(ValueError, match="Unsupported normalization"):
             TEFusedMLPWithGroupedLinear._make_fused_impl(module)
 
+    def test_get_fused_impl_registers_grouped_hooks_once(self, monkeypatch):
+        fake_te = _patch_fake_te_ops(monkeypatch)
+        module = _make_fake_grouped_mlp(fake_te)
+        module._fused_impl = None
+        module._norm_seq = None
+        make_calls = []
+        main_registration_calls = []
+        norm_registration_calls = []
+
+        original_make_fused_impl = module._make_fused_impl
+
+        def make_fused_impl():
+            make_calls.append(None)
+            return original_make_fused_impl()
+
+        def fake_register_main(self, hook_target, *, pre_forward_submodules=None):
+            main_registration_calls.append((hook_target, tuple(pre_forward_submodules or ())))
+
+        def fake_register_norm(hook_target, source_submodules):
+            norm_registration_calls.append((hook_target, tuple(source_submodules)))
+
+        object.__setattr__(module, "_make_fused_impl", make_fused_impl)
+        monkeypatch.setattr(TEFusedMLP, "_register_hooks_on_fused_impl", fake_register_main)
+        object.__setattr__(module, "_register_forward_pre_hooks_on_fused_impl", fake_register_norm)
+
+        fused_impl = module._get_fused_impl()
+
+        assert module._get_fused_impl() is fused_impl
+        assert make_calls == [None]
+        assert main_registration_calls == [(fused_impl, tuple(module.linear_fc2.modules()))]
+        assert norm_registration_calls == [
+            (module._norm_seq[0], tuple(module.linear_fc1.modules()))
+        ]
+
+    def test_reset_fused_impl_clears_both_grouped_execution_views(self):
+        module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
+        torch.nn.Module.__init__(module)
+        module._fused_impl = (torch.nn.Identity(),)
+        module._norm_seq = (torch.nn.Identity(),)
+
+        module._reset_fused_impl()
+
+        assert module._fused_impl is None
+        assert module._norm_seq is None
+
     def test_forward_falls_back_to_base_for_tensor_parallel(self, monkeypatch):
         import megatron.core.extensions.transformer_engine as te_ext
 
@@ -255,6 +316,12 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         module._norm_seq = (lambda hidden_states: hidden_states,)
         module.linear_fc2 = SimpleNamespace(te_return_bias=True, bias=torch.empty(0))
         object.__setattr__(module, "_make_fused_impl", lambda: fused_impl)
+        registration_calls = []
+        object.__setattr__(
+            module,
+            "_register_hooks_on_fused_impl",
+            lambda hook_target: registration_calls.append(hook_target),
+        )
 
         def make_recipe(name):
             recipe_calls.append(name)
@@ -293,6 +360,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert bias is None
         assert module._recipe is recipe
         assert recipe_calls == [recipe_name]
+        assert registration_calls == [fused_impl]
 
     def test_dense_grouped_spec_selected_only_with_te_op_fuser(self):
         grouped_spec = gpt_layer_specs.get_mlp_module_spec_for_backend(
