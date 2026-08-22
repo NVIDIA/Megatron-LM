@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
@@ -6,14 +6,16 @@
 import math
 from dataclasses import dataclass
 from functools import partial
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
@@ -21,9 +23,9 @@ from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
     a2a_hp_to_cp,
+    build_cp_context,
     causal_conv1d,
     get_parameter_local_cp,
-    l2norm,
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
@@ -70,8 +72,9 @@ class KimiDeltaAttention(_GDNBase):
         *,
         name: str | None = None,
         cp_comm_type: str | None = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
-        self._validate_config(config)
         if not HAVE_FLA or not HAVE_FLA_KDA:  # pragma: no cover
             raise ImportError(
                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
@@ -89,8 +92,12 @@ class KimiDeltaAttention(_GDNBase):
             pg_collection=pg_collection,
             name=name,
             cp_comm_type=cp_comm_type,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
         )
 
+        # KDA keeps beta in a separate projection so its checkpoint layout remains
+        # independent from the direct Q/K/V/F/G projection.
         self.beta_proj = build_module(
             submodules.beta_proj,
             self.hidden_size,
@@ -117,40 +124,16 @@ class KimiDeltaAttention(_GDNBase):
         # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
         self.use_gate_in_kernel = True
 
-    @staticmethod
-    def _validate_config(config: TransformerConfig) -> None:
-        """Validate the direct-projection KDA layout supported by this implementation."""
-
-        if config.kda_safe_gate:
-            if config.kda_lower_bound is None:
-                raise ValueError(
-                    "KimiDeltaAttention requires kda_lower_bound when kda_safe_gate=True."
-                )
-            if not (-5.0 <= config.kda_lower_bound < 0.0):
-                raise ValueError(
-                    "KimiDeltaAttention requires kda_lower_bound to be in [-5, 0) "
-                    "when kda_safe_gate=True."
-                )
-
-        if config.linear_num_key_heads != config.linear_num_value_heads:
-            raise ValueError(
-                "KimiDeltaAttention currently requires equal key and value head counts."
-            )
-        if config.linear_key_head_dim != config.linear_value_head_dim:
-            raise ValueError(
-                "KimiDeltaAttention currently requires equal key and value head dimensions."
-            )
-        tp_cp_size = config.tensor_model_parallel_size * config.context_parallel_size
-        if config.linear_num_key_heads % tp_cp_size != 0:
-            raise ValueError(
-                "KimiDeltaAttention key heads must be divisible by tensor parallel size times "
-                "context parallel size."
-            )
-
     def _setup_variant_attrs(self) -> None:
-        """Set KDA dimensions and projection checkpoint metadata."""
+        """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
 
+        self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
+
+        # Channel-wise raw memory-decay gate g.
         self.in_proj_extra_dim = self.qk_dim
+
+        # Per-section sizes (and names) of the in_proj output, local to this TP rank.
+        # Used for the CP head permutation, post-a2a split, and sharded checkpoint split.
         self.in_proj_split_names = ["query", "key", "value", "g", "gate"]
         self.in_proj_split_sections = (
             self.qk_dim_local_tp,
@@ -159,38 +142,48 @@ class KimiDeltaAttention(_GDNBase):
             self.qk_dim_local_tp,
             self.v_dim_local_tp,
         )
-        self.feat_dim_split = (
-            (2 * self.qk_dim_local_tp + self.v_dim_local_tp) // self.cp_size,
-            self.qk_dim_local_tp // self.cp_size,
-            self.v_dim_local_tp // self.cp_size,
-        )
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = chunk_kda
 
-    def reset_parameters(self) -> None:
-        """Initialize convolution and KDA gate parameters."""
+    def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int]:
+        """Return KDA qkv/raw-g/output-gate split sizes for runtime headwise CP."""
 
-        if not self.config.perform_initialization:
-            return
+        return (
+            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,
+            self.qk_dim_local_tp // cp_size_headwise,
+            self.v_dim_local_tp // cp_size_headwise,
+        )
 
-        with tensor_parallel.get_cuda_rng_tracker().fork():
-            if self.conv_init is not None:
-                torch.nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+    def _reset_dt_bias(self) -> None:
+        """Initialize the KDA channel-wise step-size bias in inverse-softplus space."""
 
-            dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
-            dt = torch.exp(
-                torch.rand(self.dt_bias_dim, device=self.dt_bias.device, dtype=torch.float32)
-                * (math.log(dt_max) - math.log(dt_min))
-                + math.log(dt_min)
-            ).clamp(min=dt_init_floor)
-            self.dt_bias.data.copy_(dt + torch.log(-torch.expm1(-dt)))
+        dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+        dt = torch.exp(
+            torch.rand(self.dt_bias_dim, device=self.dt_bias.device, dtype=self.dt_bias.dtype)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        self.dt_bias.data.copy_(dt + torch.log(-torch.expm1(-dt)))
 
-            A = torch.empty(self.a_log_dim, device=self.A_log.device, dtype=torch.float32).uniform_(
-                *self.A_init_range
-            )
-            self.A_log.data.copy_(torch.log(A))
+    @jit_fuser
+    def _compute_gates(
+        self,
+        A_log_local_cp: torch.Tensor,
+        dt_bias_local_cp: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        *gate_feats: tuple[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Shape the raw channel-wise decay gate and activate the write strength."""
+
+        # ``gate_feats`` follows the KDA pre-GDR order: raw g, then separate beta.
+        raw_g, beta = gate_feats
+        num_key_heads = A_log_local_cp.numel()
+        raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
+        beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
+        return raw_g, {"beta": beta.contiguous()}
 
     @jit_fuser
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -202,41 +195,452 @@ class KimiDeltaAttention(_GDNBase):
         gate = gate.reshape(-1, self.value_head_dim)
         return (x * torch.sigmoid(gate.float())).to(x_dtype)
 
-    def _prepare_kda_inputs(
+    def forward(
         self,
-        qkv: torch.Tensor,
-        raw_g: torch.Tensor,
-        beta: torch.Tensor,
-        output_gate: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the direct-projection KDA training path."""
+
+        del attention_mask, sequence_len_offset, kwargs
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        active_pg_collection = pg_collection if pg_collection is not None else self.pg_collection
+        base_cp_group = active_pg_collection.cp
+        cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
+        if self.config.linear_cp_mode == "chunkwise":
+            cp_group_chunkwise = cp_group
+            cp_group_headwise = None
+        elif self.config.linear_cp_mode == "headwise":
+            cp_group_chunkwise = None
+            cp_group_headwise = cp_group
+        elif cp_group.size() == 1:
+            cp_group_chunkwise = None
+            cp_group_headwise = None
+        else:
+            raise ValueError(
+                f"Unsupported linear_cp_mode {self.config.linear_cp_mode!r}; "
+                "expected 'headwise' or 'chunkwise'."
+            )
+
+        cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
+        cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
+        cp_size_runtime = cp_group.size()
+        back_to_input_converter = None
+        if self.config.linear_cp_mode == "chunkwise":
+            hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+                hidden_states=hidden_states,
+                packed_seq_params=packed_seq_params,
+                cp_group=cp_group_chunkwise,
+                tp_group=self.tp_group,
+                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
+                target_partition_mode="contiguous",
+                sequence_parallel=self.config.sequence_parallel,
+                config=self.config,
+            )
+
+        seq_len_local, batch, _ = hidden_states.shape
+        seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
+        seq_len_global = seq_len_post_headwise * cp_size_chunkwise
+
+        if inference_context is not None:
+            assert (
+                inference_context.is_static_batching()
+            ), "KimiDeltaAttention does not currently support dynamic inference batching."
+            assert not self.config.sequence_parallel
+            raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
+
+        if cp_size_headwise > 1 and (
+            (
+                packed_seq_params is not None
+                and packed_seq_params.qkv_format == "thd"
+                and packed_seq_params.cp_partition_mode != "zigzag"
+            )
+            or (
+                (packed_seq_params is None or packed_seq_params.qkv_format != "thd")
+                and self.config.cp_partition_mode != "zigzag"
+            )
+        ):
+            raise ValueError(
+                "KimiDeltaAttention with headwise CP requires zigzag layout. CP partition "
+                "conversion must be handled before calling KimiDeltaAttention."
+            )
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            if batch != 1:
+                raise ValueError("Packed KDA expects batch dimension to be 1.")
+            cu_seqlens_q = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_q_padded,
+                packed_seq_params.cu_seqlens_q,
+                seq_len_global,
+                "cu_seqlens_q",
+                cp_size=cp_size_runtime,
+            )
+            cu_seqlens_kv = self._resolve_cu_seqlens(
+                packed_seq_params.cu_seqlens_kv_padded,
+                packed_seq_params.cu_seqlens_kv,
+                seq_len_global,
+                "cu_seqlens_kv",
+                cp_size=cp_size_runtime,
+            )
+            self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
+        else:
+            cu_seqlens_q = None
+
+        if cp_size_chunkwise > 1:
+            if cu_seqlens_q is None:
+                cache_key = (seq_len_global, batch)
+                cached = self._chunkwise_cp_context_cache.get(cache_key)
+                if cached is None:
+                    cached_cu_seqlens = (
+                        torch.arange(
+                            batch + 1, device=torch.cuda.current_device(), dtype=torch.long
+                        )
+                        * seq_len_global
+                    )
+                    cached_ctx = build_cp_context(
+                        cu_seqlens=cached_cu_seqlens,
+                        group=cp_group_chunkwise,
+                        conv1d_kernel_size=self.conv_kernel_dim,
+                    )
+                    cached = (cached_cu_seqlens, cached_ctx)
+                    self._chunkwise_cp_context_cache[cache_key] = cached
+                cu_seqlens_q, chunkwise_cp_context = cached
+            else:
+                chunkwise_cp_context = build_cp_context(
+                    cu_seqlens=cu_seqlens_q,
+                    group=cp_group_chunkwise,
+                    conv1d_kernel_size=self.conv_kernel_dim,
+                )
+        else:
+            chunkwise_cp_context = None
+
+        if self.recompute_gdn and self.training:
+
+            def _checkpointed_compute(hidden_states):
+                return self._forward_compute(
+                    hidden_states,
+                    batch,
+                    seq_len_post_headwise,
+                    cp_size_headwise,
+                    cp_group_headwise,
+                    cp_size_chunkwise,
+                    cp_group_chunkwise,
+                    cu_seqlens_q,
+                    packed_seq_params,
+                    chunkwise_cp_context,
+                )
+
+            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+        else:
+            out, out_bias = self._forward_compute(
+                hidden_states,
+                batch,
+                seq_len_post_headwise,
+                cp_size_headwise,
+                cp_group_headwise,
+                cp_size_chunkwise,
+                cp_group_chunkwise,
+                cu_seqlens_q,
+                packed_seq_params,
+                chunkwise_cp_context,
+            )
+
+        if back_to_input_converter is not None:
+            out = back_to_input_converter.convert(
+                out, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+
+        return out, out_bias
+
+    def _forward_compute(
+        self,
+        hidden_states,
+        batch,
+        seq_len_post_headwise,
+        cp_size_headwise,
+        cp_group_headwise,
+        cp_size_chunkwise,
+        cp_group_chunkwise,
+        cu_seqlens_q,
+        packed_seq_params,
+        chunkwise_cp_context,
+    ):
+        """Core KDA computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
+
+        # Input projections. Beta intentionally remains a separate matrix.
+        nvtx_range_push(suffix="in_proj")
+        qkvfg, _ = self.in_proj(hidden_states)
+        beta, _ = self.beta_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+
+        qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
+            qkvfg,
+            self.in_proj_split_sections,
+            cp_size_headwise,
+            cp_group_headwise,
+            cu_seqlens_q,
+            seq_len_post_headwise,
+            packed_seq_params,
+        )
+        beta, _ = a2a_cp_to_hp(
+            beta,
+            (self.num_k_heads_local_tp,),
+            cp_size_headwise,
+            cp_group_headwise,
+            cu_seqlens_q,
+            seq_len_post_headwise,
+            packed_seq_params,
+        )
+
+        if self.gdn_pre_gated_delta_rule_fusion:
+            raise NotImplementedError(
+                "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
+            )
+
+        if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
+            raise ValueError(
+                "KDA chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
+                "when cp_context is used. Use packed THD input or micro_batch_size=1."
+            )
+        if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
+            raise ValueError(
+                "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. Padding "
+                "chunk-local causal-conv inputs can change later chunk numerics."
+            )
+
+        nvtx_range_push(suffix="pre_gated_delta_rule")
+        query, key, value, gate, beta, raw_g, A_log, dt_bias = self.pre_gated_delta_rule(
+            qkvfg,
+            beta,
+            batch,
+            seq_len_post_headwise,
+            cp_size_headwise,
+            cp_group_headwise,
+            cu_seqlens_q,
+            chunkwise_cp_context,
+            packed_seq_params=packed_seq_params,
+        )
+        kernel_inputs = {
+            "q": query,
+            "k": key,
+            "v": value,
+            "g": raw_g,
+            "beta": beta,
+            "A_log": A_log,
+            "dt_bias": dt_bias,
+        }
+        nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            **kernel_inputs,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            use_gate_in_kernel=self.use_gate_in_kernel,
+            safe_gate=self.config.kda_safe_gate,
+            lower_bound=self.config.kda_lower_bound,
+            cu_seqlens=cu_seqlens_q,
+            cp_context=chunkwise_cp_context,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        if self.recompute_norm_out and self.training:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_func = partial(
+                self._gated_norm_and_layout_restore,
+                thd_cp_a2a_inv=thd_cp_a2a_inv,
+                batch=batch,
+                seq_len=seq_len_post_headwise,
+                packed_seq_params=packed_seq_params,
+                cp_size_headwise=cp_size_headwise,
+                cp_group_headwise=cp_group_headwise,
+                cp_size_chunkwise=cp_size_chunkwise,
+                cp_group_chunkwise=cp_group_chunkwise,
+                cu_seqlens_q=cu_seqlens_q,
+            )
+            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
+        else:
+            norm_out = self._gated_norm_and_layout_restore(
+                core_attn_out,
+                gate,
+                thd_cp_a2a_inv,
+                batch,
+                seq_len_post_headwise,
+                packed_seq_params,
+                cp_size_headwise,
+                cp_group_headwise,
+                cp_size_chunkwise,
+                cp_group_chunkwise,
+                cu_seqlens_q,
+            )
+
+        # Output projection.
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        if self.recompute_norm_out and self.training:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
+        return out, out_bias
+
+    def _gated_norm_and_layout_restore(
+        self,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
+        thd_cp_a2a_inv: torch.Tensor | None,
         batch: int,
         seq_len: int,
-    ) -> tuple[torch.Tensor, ...]:
-        """Split, normalize, and reshape tensors for the FLA KDA kernel."""
+        packed_seq_params: PackedSeqParams | None,
+        cp_size_headwise: int,
+        cp_group_headwise: torch.distributed.ProcessGroup | None,
+        cp_size_chunkwise: int,
+        cp_group_chunkwise: torch.distributed.ProcessGroup | None,
+        cu_seqlens_q: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply KDA's gated output norm and restore its context-parallel layout."""
 
-        query_key, value = torch.split(
+        nvtx_range_push(suffix="gated_norm")
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        norm_out = norm_out.reshape(batch, seq_len, -1)
+        norm_out = norm_out.transpose(0, 1).contiguous()
+
+        return a2a_hp_to_cp(
+            norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
+        )
+
+    def pre_gated_delta_rule(
+        self,
+        qkvfg,
+        beta,
+        batch,
+        seq_len,
+        cp_size_headwise,
+        cp_group_headwise,
+        cu_seqlens_q=None,
+        chunkwise_cp_context=None,
+        packed_seq_params=None,
+    ):
+        """Prepare QKV, output gate, beta, and raw decay tensors before KDA."""
+
+        qkvfg = qkvfg.transpose(0, 1)
+        beta = beta.transpose(0, 1)
+        qkv, raw_g, gate = torch.split(qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1)
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+
+        nvtx_range_push(suffix="conv1d")
+        kernel_seq_len = qkv.shape[1]
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=cp_group_headwise,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=cp_group_headwise,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
+        if self.config.deterministic_mode or causal_conv1d is None:
+            qkv = qkv.transpose(1, 2).contiguous()
+            conv_out = F.conv1d(
+                input=qkv,
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // cp_size_headwise,
+            )
+            qkv = self.act_fn(conv_out[..., :kernel_seq_len])
+            qkv = qkv.transpose(1, 2).contiguous()
+        else:
+            if self.activation not in ("silu", "swish"):
+                raise ValueError(f"FLA causal convolution requires SiLU, got {self.activation}.")
+            orig_seq = qkv.shape[1]
+            pad_n = 0
+            conv_input = qkv.contiguous()
+            conv_cu_seqlens = cu_seqlens_q
+            conv_cp_context = chunkwise_cp_context
+            if self.config.gdn_conv_pad_alignment is not None:
+                if packed_seq_params is None or cu_seqlens_q is None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is only supported with packed sequence "
+                        "parameters in THD format. SBHD inputs do not need causal-conv padding."
+                    )
+                if chunkwise_cp_context is not None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. Padding "
+                        "chunk-local causal-conv inputs can change later chunk numerics."
+                    )
+                pad_n = -orig_seq % self.config.gdn_conv_pad_alignment
+            if pad_n > 0:
+                conv_input = torch.nn.functional.pad(conv_input, (0, 0, 0, pad_n))
+                conv_cu_seqlens = cu_seqlens_q.clone()
+                conv_cu_seqlens[-1] += pad_n
+            qkv, _ = causal_conv1d(
+                x=conv_input,
+                weight=conv1d_weight.squeeze(1),
+                bias=conv1d_bias,
+                activation=self.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=conv_cu_seqlens,
+                cp_context=conv_cp_context,
+            )
+            if pad_n > 0:
+                qkv = qkv[:, :orig_seq, :]
+        nvtx_range_pop(suffix="conv1d")
+
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
+
+        nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
+        kernel_inputs = self._prepare_input_for_gated_delta_rule(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
+            gate,
+            A_log_local_cp,
+            dt_bias_local_cp,
+            batch,
+            kernel_seq_len,
+            raw_g,
+            beta,
+            cp_size_headwise=cp_size_headwise,
         )
-        query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
-        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
-        if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+        nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
-        num_key_heads = self.num_k_heads_local_tp // self.cp_size
-        query, key = torch.split(query_key, [num_key_heads, num_key_heads], dim=2)
-        raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
-        beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
-        output_gate = output_gate.reshape(
-            batch, seq_len, self.num_v_heads_local_tp // self.cp_size, self.value_head_dim
-        )
+        gate = kernel_inputs.pop("gate")
+
         return (
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            raw_g.contiguous(),
-            beta.contiguous(),
-            output_gate.contiguous(),
+            kernel_inputs["q"],
+            kernel_inputs["k"],
+            kernel_inputs["v"],
+            gate,
+            kernel_inputs["beta"],
+            kernel_inputs["g"],
+            A_log_local_cp,
+            dt_bias_local_cp,
         )
 
     @staticmethod
@@ -257,197 +661,6 @@ class KimiDeltaAttention(_GDNBase):
                 f"but got shapes {tuple(cu_seqlens_q.shape)} and "
                 f"{tuple(cu_seqlens_kv.shape)}."
             )
-
-    def _gated_norm_and_a2a(
-        self,
-        core_attn_out: torch.Tensor,
-        gate: torch.Tensor,
-        thd_cp_a2a_inv: torch.Tensor | None,
-        batch: int,
-        seq_len: int,
-        packed_seq_params: PackedSeqParams | None = None,
-    ) -> torch.Tensor:
-        """Apply KDA's gated output norm and restore its context-parallel layout."""
-
-        nvtx_range_push(suffix="gated_norm")
-        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
-        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
-        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
-
-        return a2a_hp_to_cp(
-            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        inference_context: BaseInferenceContext | None = None,
-        packed_seq_params: PackedSeqParams | None = None,
-        sequence_len_offset: int | None = None,
-        *,
-        inference_params: BaseInferenceContext | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the direct-projection KDA training path."""
-
-        del attention_mask, sequence_len_offset, kwargs
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-        if inference_context is not None:  # pragma: no cover
-            raise NotImplementedError("KDA recurrent inference is not implemented.")
-
-        seq_len, batch, _ = hidden_states.shape
-        total_seq_len = seq_len * self.sp_size * self.cp_size
-
-        cu_seqlens_q = None
-        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
-            if batch != 1:
-                raise ValueError("Packed KDA expects batch dimension to be 1.")
-            cu_seqlens_q = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_q_padded,
-                packed_seq_params.cu_seqlens_q,
-                total_seq_len,
-                "cu_seqlens_q",
-                cp_size=self.cp_size,
-            )
-            cu_seqlens_kv = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_kv_padded,
-                packed_seq_params.cu_seqlens_kv,
-                total_seq_len,
-                "cu_seqlens_kv",
-                cp_size=self.cp_size,
-            )
-            self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
-
-        nvtx_range_push(suffix="kda_in_proj")
-        qkvfg, _ = self.in_proj(hidden_states)
-        beta, _ = self.beta_proj(hidden_states)
-        nvtx_range_pop(suffix="kda_in_proj")
-
-        qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
-            qkvfg,
-            self.in_proj_split_sections,
-            self.cp_size,
-            self.pg_collection.cp,
-            cu_seqlens_q,
-            total_seq_len,
-            packed_seq_params,
-        )
-        beta, _ = a2a_cp_to_hp(
-            beta,
-            (self.num_k_heads_local_tp,),
-            self.cp_size,
-            self.pg_collection.cp,
-            cu_seqlens_q,
-            total_seq_len,
-            packed_seq_params,
-        )
-
-        qkvfg = qkvfg.transpose(0, 1)
-        beta = beta.transpose(0, 1)
-        seq_len = qkvfg.shape[1]
-        qkv, raw_g, output_gate = torch.split(qkvfg, self.feat_dim_split, dim=-1)
-
-        nvtx_range_push(suffix="kda_conv1d")
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
-            )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode or causal_conv1d is None:
-            qkv = qkv.transpose(1, 2).contiguous()
-            conv_out = F.conv1d(
-                qkv,
-                conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len]).transpose(1, 2).contiguous()
-        else:
-            if self.activation not in ("silu", "swish"):
-                raise ValueError(f"FLA causal convolution requires SiLU, got {self.activation}.")
-            qkv, _ = causal_conv1d(
-                x=qkv,
-                weight=conv1d_weight.squeeze(1),
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
-            )
-        nvtx_range_pop(suffix="kda_conv1d")
-
-        query, key, value, raw_g, beta, output_gate = self._prepare_kda_inputs(
-            qkv, raw_g, beta, output_gate, batch, seq_len
-        )
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
-
-        nvtx_range_push(suffix="kda_chunk")
-        core_attn_out, _ = self.gated_delta_rule(
-            q=query,
-            k=key,
-            v=value,
-            g=raw_g,
-            beta=beta,
-            A_log=A_log_local_cp,
-            dt_bias=dt_bias_local_cp,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            use_gate_in_kernel=self.use_gate_in_kernel,
-            safe_gate=self.config.kda_safe_gate,
-            lower_bound=self.config.kda_lower_bound,
-            cu_seqlens=cu_seqlens_q,
-        )
-        nvtx_range_pop(suffix="kda_chunk")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_func = partial(
-                self._gated_norm_and_a2a,
-                thd_cp_a2a_inv=thd_cp_a2a_inv,
-                batch=batch,
-                seq_len=seq_len,
-                packed_seq_params=packed_seq_params,
-            )
-            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, output_gate)
-        else:
-            norm_out = self._gated_norm_and_a2a(
-                core_attn_out, output_gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
-            )
-
-        nvtx_range_push(suffix="kda_out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="kda_out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
 
     def backward_dw(self) -> None:
         """Execute weight-gradient computation for all KDA projections."""

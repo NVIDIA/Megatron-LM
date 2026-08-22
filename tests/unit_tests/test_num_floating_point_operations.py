@@ -54,6 +54,7 @@ def _make_gpt_args(
     args.group_query_attention = False
     args.num_query_groups = num_attention_heads
     args.attention_output_gate = False
+    args.gated_attention_proj_granularity = "elementwise"
     args.multi_latent_attention = False
     # MoE / MTP disabled.
     args.num_experts = None
@@ -114,6 +115,7 @@ def _make_ling_hybrid_args(pattern):
     args.kv_lora_rank = 256
     args.v_head_dim = 64
     args.attention_output_gate = True
+    args.gated_attention_proj_granularity = "headwise"
     return args
 
 
@@ -274,10 +276,9 @@ class TestHybridTHDScaling:
 
     def test_mla_attention_variants_are_counted(self):
         """Regression: DSv4 MLA attention variants (CSA 'C', HCA 'H', Window 'W',
-        DS_ATTENTION 'D') must contribute attention FLOPs. Previously only the
-        plain ATTENTION symbol '*' was counted, so a pattern made entirely of
-        C/H/W layers reported ZERO attention FLOPs -- roughly halving the
-        throughput estimate vs. the equivalent gpt_model."""
+        DS_ATTENTION 'D') must contribute attention FLOPs. Previously these symbols
+        were omitted, so a pattern made entirely of C/H/W layers reported zero
+        attention FLOPs -- roughly halving the throughput estimate."""
         args = _make_hybrid_args()
         args.multi_latent_attention = True
         # MLA dims (DSv4-like; values only need to be self-consistent and positive).
@@ -288,16 +289,16 @@ class TestHybridTHDScaling:
         args.v_head_dim = 64
         batch_size = 4
 
-        # MLA attention variants (C, H) must be counted exactly like the plain
-        # ATTENTION symbol '*'. Both patterns are 2 attention + 2 Mamba layers, so
-        # with the fix they yield identical FLOPs. Under the old bug, C/H counted
-        # as ZERO attention layers while '*' counted as 2, so the two diverged.
+        # MLA attention variants (C, H) must be counted exactly like dense MLA '+'.
+        # Both patterns are 2 MLA + 2 Mamba layers, so they yield identical FLOPs.
+        # Regular attention '*' is intentionally not the reference: hybrid grammar
+        # assigns different projection work to '*' and '+'.
         args.hybrid_layer_pattern = "CMHM"
         flops_mla_variants = num_floating_point_operations(args, batch_size)
-        args.hybrid_layer_pattern = "*M*M"
-        flops_plain_attn = num_floating_point_operations(args, batch_size)
+        args.hybrid_layer_pattern = "+M+M"
+        flops_dense_mla = num_floating_point_operations(args, batch_size)
 
-        assert flops_mla_variants == flops_plain_attn
+        assert flops_mla_variants == flops_dense_mla
         # And attention must be a non-trivial contributor: dropping the two
         # attention layers entirely (all Mamba) changes the estimate.
         args.hybrid_layer_pattern = "MMMM"
@@ -333,9 +334,10 @@ class TestHybridMatchesStandard:
         hybrid.mamba_head_dim = 64
         hybrid.mamba_num_groups = 8
         hybrid.mamba_num_heads = 128
-        # N attention layers ('*') + N MLP layers ('-'), matching the dense
-        # Transformer's N (attention + MLP) blocks.
-        hybrid.hybrid_layer_pattern = "*-" * num_layers
+        # Match the standard model's attention implementation explicitly:
+        # '*' is regular attention and '+' is dense MLA in the hybrid grammar.
+        attention_symbol = "+" if hybrid.multi_latent_attention else "*"
+        hybrid.hybrid_layer_pattern = (attention_symbol + "-") * num_layers
         return standard, hybrid
 
     def _assert_match(self, configure):
@@ -397,6 +399,21 @@ class TestHybridMatchesStandard:
 
         self._assert_match(configure)
 
+    @pytest.mark.parametrize("gate_granularity", ("elementwise", "headwise"))
+    def test_mla_output_gate(self, gate_granularity):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = 256
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+            args.attention_output_gate = True
+            args.gated_attention_proj_granularity = gate_granularity
+
+        self._assert_match(configure)
+
 
 class TestLingHybridAttentionFlops:
     """KDA and MLA layers must contribute to Ling-V3 Tiny MFU accounting."""
@@ -445,6 +462,47 @@ class TestLingHybridAttentionFlops:
             * (args.qk_head_dim + args.qk_pos_emb_head_dim + args.v_head_dim)
         )
         assert flops_full - flops_half == expected_delta
+
+    def test_mla_gate_granularity_changes_only_projection_work(self):
+        args = _make_ling_hybrid_args("+")
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.gated_attention_proj_granularity = "headwise"
+        headwise_flops = num_floating_point_operations(args, batch_size)
+        args.gated_attention_proj_granularity = "elementwise"
+        elementwise_flops = num_floating_point_operations(args, batch_size)
+
+        expected_delta = (
+            3
+            * 2
+            * total_tokens
+            * args.hidden_size
+            * args.num_attention_heads
+            * (args.v_head_dim - 1)
+        )
+        assert elementwise_flops - headwise_flops == expected_delta
+
+    @pytest.mark.parametrize(
+        ("gate_granularity", "gate_projection_size"), (("elementwise", 512), ("headwise", 8))
+    )
+    def test_hybrid_regular_attention_output_gate(self, gate_granularity, gate_projection_size):
+        args = _make_ling_hybrid_args("*")
+        # The model-wide MLA flag is also enabled in mixed '*' / '+' models, but '*' remains
+        # regular attention. Use a different MLA value-head width to make that distinction visible.
+        args.multi_latent_attention = True
+        args.v_head_dim = 32
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.attention_output_gate = False
+        ungated_flops = num_floating_point_operations(args, batch_size)
+        args.attention_output_gate = True
+        args.gated_attention_proj_granularity = gate_granularity
+        gated_flops = num_floating_point_operations(args, batch_size)
+
+        expected_delta = 3 * 2 * total_tokens * args.hidden_size * gate_projection_size
+        assert gated_flops - ungated_flops == expected_delta
 
 
 class TestPaddingRemoval:

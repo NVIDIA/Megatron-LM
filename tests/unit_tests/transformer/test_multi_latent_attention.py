@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from inspect import signature
@@ -690,10 +690,11 @@ class TestContextParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+@pytest.mark.parametrize("gate_granularity", ("elementwise", "headwise"))
 class TestMLAOutputGate:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self):
+    def setup_and_teardown(self, gate_granularity):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = MLATransformerConfig(
@@ -710,6 +711,7 @@ class TestMLAOutputGate:
             rotary_base=10000,
             original_max_position_embeddings=32,
             attention_output_gate=True,
+            gated_attention_proj_granularity=gate_granularity,
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
@@ -721,40 +723,51 @@ class TestMLAOutputGate:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_constructor_builds_head_wise_gate(self):
+    def test_constructor_builds_configured_gate_projection(self, gate_granularity):
         gate = self.parallel_attention.linear_gate
         assert gate is not None
-        assert gate.weight.shape == (
-            self.transformer_config.num_attention_heads,
-            self.transformer_config.hidden_size,
+        expected_projection_size = (
+            self.parallel_attention.query_projection_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
         )
+        assert gate.weight.shape == (expected_projection_size, self.transformer_config.hidden_size)
         assert gate.bias is None or gate.bias.numel() == 0
 
-    def test_gate_is_applied_per_head(self):
-        core_attn_out = torch.arange(24, dtype=torch.bfloat16).view(2, 1, 12)
-        gate = torch.tensor([[[-2.0, -1.0, 0.0, 1.0]], [[2.0, 3.0, 4.0, 5.0]]]).bfloat16()
+    def test_gate_matches_independent_fp32_sigmoid_reference(self, gate_granularity):
+        output_size = self.parallel_attention.query_projection_size
+        core_attn_out = torch.linspace(-2.0, 2.0, 2 * output_size, dtype=torch.bfloat16).view(
+            2, 1, output_size
+        )
+        gate_size = (
+            output_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
+        )
+        gate = torch.linspace(-4.0, 4.0, 2 * gate_size, dtype=torch.bfloat16).view(2, 1, gate_size)
 
         output = self.parallel_attention._apply_mla_output_gate(core_attn_out, gate)
-        expected = core_attn_out.view(2, 1, 4, 3) * torch.sigmoid(gate.float()).to(
-            core_attn_out.dtype
-        ).unsqueeze(-1)
+        reference_scale = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
+        if gate_granularity == "headwise":
+            reference_scale = torch.repeat_interleave(
+                reference_scale, self.transformer_config.v_head_dim, dim=-1
+            )
+        expected = core_attn_out * reference_scale
 
-        torch.testing.assert_close(output, expected.reshape_as(output), atol=0, rtol=0)
+        assert output.dtype == core_attn_out.dtype
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
-    def test_gate_uses_fp32_sigmoid_vjp(self):
-        if not torch.cuda.is_available():
-            pytest.skip("FP32 sigmoid VJP check requires CUDA")
-
-        generator = torch.Generator(device="cuda").manual_seed(20260814)
-        gate_input = torch.randn(
-            (8, 1, 4), generator=generator, device="cuda", dtype=torch.bfloat16
+    def test_gate_matches_fp32_sigmoid_reference_vjp(self, gate_granularity):
+        generator = torch.Generator().manual_seed(20260814)
+        output_size = self.parallel_attention.query_projection_size
+        gate_size = (
+            output_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
         )
-        core_output = torch.randn(
-            (8, 1, 32), generator=generator, device="cuda", dtype=torch.bfloat16
-        )
-        output_gradient = torch.randn(
-            core_output.shape, generator=generator, device="cuda", dtype=torch.bfloat16
-        )
+        gate_input = torch.randn((8, 1, gate_size), generator=generator, dtype=torch.bfloat16)
+        core_output = torch.randn((8, 1, output_size), generator=generator, dtype=torch.bfloat16)
+        output_gradient = torch.randn(core_output.shape, generator=generator, dtype=torch.bfloat16)
 
         actual_gate = gate_input.detach().clone().requires_grad_(True)
         actual_core = core_output.detach().clone().requires_grad_(True)
@@ -763,21 +776,37 @@ class TestMLAOutputGate:
             actual_output, (actual_gate, actual_core), output_gradient
         )
 
-        reference_gate = gate_input.detach().clone().requires_grad_(True)
-        reference_core = core_output.detach().clone().requires_grad_(True)
-        reference_output = (
-            reference_core.view(8, 1, 4, 8)
-            * torch.sigmoid(reference_gate.float()).to(reference_core.dtype).unsqueeze(-1)
-        ).reshape_as(reference_core)
-        reference_gradients = torch.autograd.grad(
-            reference_output, (reference_gate, reference_core), output_gradient
+        sigmoid_fp32 = torch.sigmoid(gate_input.float())
+        native_scale = sigmoid_fp32.to(core_output.dtype)
+        if gate_granularity == "headwise":
+            native_scale = torch.repeat_interleave(
+                native_scale, self.transformer_config.v_head_dim, dim=-1
+            )
+            expanded_fp32_scale = torch.repeat_interleave(
+                sigmoid_fp32, self.transformer_config.v_head_dim, dim=-1
+            )
+            expected_core_gradient = (output_gradient.float() * expanded_fp32_scale).to(
+                core_output.dtype
+            )
+            head_shape = (*core_output.shape[:-1], gate_size, self.transformer_config.v_head_dim)
+            scale_gradient = (
+                output_gradient.float().view(head_shape) * core_output.float().view(head_shape)
+            ).sum(dim=-1)
+            # The fused broadcast reduction returns a native-dtype gradient to the
+            # FP32-sigmoid cast before applying the sigmoid derivative.
+            scale_gradient = scale_gradient.to(gate_input.dtype).float()
+        else:
+            expected_core_gradient = output_gradient * native_scale
+            scale_gradient = (output_gradient * core_output).float()
+
+        expected_output = core_output * native_scale
+        expected_gate_gradient = (scale_gradient * sigmoid_fp32 * (1.0 - sigmoid_fp32)).to(
+            gate_input.dtype
         )
 
-        # Allow exactly one BF16 quantization step from the compiled sigmoid/cast path.
-        bf16_eps = torch.finfo(torch.bfloat16).eps
-        torch.testing.assert_close(actual_output, reference_output, atol=bf16_eps, rtol=0.0)
-        for actual, reference in zip(actual_gradients, reference_gradients):
-            torch.testing.assert_close(actual, reference, atol=bf16_eps, rtol=0.0)
+        torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
+        torch.testing.assert_close(actual_gradients[0], expected_gate_gradient, atol=0, rtol=0)
+        torch.testing.assert_close(actual_gradients[1], expected_core_gradient, atol=0, rtol=0)
 
     def test_missing_gate_spec_raises(self):
         submodules = get_mla_self_attn_submodules()
@@ -790,7 +819,7 @@ class TestMLAOutputGate:
                 attn_mask_type=AttnMaskType.causal,
             )
 
-    def test_fused_down_projection_is_rejected(self):
+    def test_fused_down_projection_is_rejected(self, gate_granularity):
         with pytest.raises(ValueError, match="does not support fused down projections"):
             MLATransformerConfig(
                 num_layers=2,
@@ -805,6 +834,7 @@ class TestMLAOutputGate:
                 rotary_base=10000,
                 original_max_position_embeddings=32,
                 attention_output_gate=True,
+                gated_attention_proj_granularity=gate_granularity,
                 mla_down_proj_fusion=True,
             )
 
@@ -1545,20 +1575,22 @@ class TestMLAClipQK:
     ],
 )
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp", "output_gate"),
+    ("tp", "sp", "cp", "output_gate", "gate_granularity"),
     [
-        (4, False, 1, False),  # TP w/o SP
-        (4, True, 1, False),  # TP w/ SP
-        (1, False, 4, False),  # CP
-        (2, False, 2, False),  # CP + TP w/o SP
-        (2, True, 2, False),  # CP + TP w/ SP
-        (4, True, 1, True),  # Gated MLA with TP + SP
-        (1, False, 2, True),  # Gated MLA with CP
+        (4, False, 1, False, "elementwise"),  # TP w/o SP
+        (4, True, 1, False, "elementwise"),  # TP w/ SP
+        (1, False, 4, False, "elementwise"),  # CP
+        (2, False, 2, False, "elementwise"),  # CP + TP w/o SP
+        (2, True, 2, False, "elementwise"),  # CP + TP w/ SP
+        (4, True, 1, True, "elementwise"),  # Elementwise gate with TP + SP
+        (4, True, 1, True, "headwise"),  # Headwise gate with TP + SP
+        (1, False, 2, True, "elementwise"),  # Elementwise gate with CP
+        (1, False, 2, True, "headwise"),  # Headwise gate with CP
     ],
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, output_gate
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, output_gate, gate_granularity
 ):
     if output_gate and (rope_type != "yarn" or apply_rope_fusion):
         pytest.skip("Gated MLA parallel coverage uses one representative YARN configuration.")
@@ -1636,6 +1668,7 @@ def test_parallel_multi_latent_attention_correctness(
         rope_type=rope_type,
         apply_rope_fusion=apply_rope_fusion,
         attention_output_gate=output_gate,
+        gated_attention_proj_granularity=gate_granularity,
         hidden_dropout=0.0,
         attention_dropout=0.0,
     )

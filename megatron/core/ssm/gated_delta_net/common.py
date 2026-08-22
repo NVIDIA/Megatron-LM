@@ -362,9 +362,7 @@ class _GDNBase(MegatronModule):
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                 self._reset_dt_bias()
                 A = torch.empty(
-                    self.A_log.shape[0],
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
+                    self.A_log.shape[0], dtype=self.A_log.dtype, device=self.A_log.device
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 

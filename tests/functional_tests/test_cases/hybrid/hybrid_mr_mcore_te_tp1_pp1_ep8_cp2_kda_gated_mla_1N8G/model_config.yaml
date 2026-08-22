@@ -45,6 +45,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 1
   --expert-model-parallel-size: 8
   --context-parallel-size: 2
+  --linear-cp-mode: headwise
   --cp-comm-type: p2p
   --distributed-backend: nccl
 
@@ -83,6 +84,7 @@ MODEL_ARGS:
   --v-head-dim: 64
   --qk-layernorm: true
   --attention-output-gate: true
+  --gated-attention-proj-granularity: headwise
 
   # One MTP depth represented by the pattern suffix after '/'.
   --mtp-num-layers: 1
