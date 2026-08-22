@@ -277,6 +277,7 @@ class DSAIndexerLossLoggingHelper:
     @staticmethod
     def save_loss_to_tracker(
         loss: torch.Tensor,
+        raw_loss: Optional[torch.Tensor],
         layer_number: int,
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
@@ -286,6 +287,7 @@ class DSAIndexerLossLoggingHelper:
 
         Args:
             loss: The loss tensor.
+            raw_loss: The raw unscaled KL loss tensor before applying the loss coefficient.
             layer_number: Layer index of the loss, 1-indexed.
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
@@ -298,7 +300,11 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "raw_values" not in tracker:
+            tracker["raw_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         tracker["values"][layer_number - 1] += loss.detach()
+        if raw_loss is not None:
+            tracker["raw_values"][layer_number - 1] += raw_loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -308,6 +314,8 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" in tracker:
             tracker["values"].zero_()
+        if "raw_values" in tracker:
+            tracker["raw_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
@@ -318,19 +326,32 @@ class DSAIndexerLossLoggingHelper:
         if "values" not in tracker:
             return
         values = tracker["values"]
+        raw_values = tracker["raw_values"]
 
         torch.distributed.all_reduce(
             values, group=parallel_state.get_pipeline_model_parallel_group()
         )
+        torch.distributed.all_reduce(
+            raw_values, group=parallel_state.get_pipeline_model_parallel_group()
+        )
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            torch.distributed.all_reduce(raw_values, group=tracker.get('reduce_group'))
         if tracker.get('avg_group') is not None:
             torch.distributed.all_reduce(
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
+            torch.distributed.all_reduce(
+                raw_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+            )
         torch.distributed.all_reduce(
             values,
+            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+            op=torch.distributed.ReduceOp.AVG,
+        )
+        torch.distributed.all_reduce(
+            raw_values,
             group=parallel_state.get_data_parallel_group(with_context_parallel=False),
             op=torch.distributed.ReduceOp.AVG,
         )
@@ -360,10 +381,12 @@ class DSAIndexerLossLoggingHelper:
             return
 
         indexer_loss_values = tracker["values"] * loss_scale
+        raw_indexer_loss_values = tracker["raw_values"] * loss_scale
         num_layers = indexer_loss_values.shape[0]
 
         # Average across all layers (assuming all layers have sparse attention)
         avg_indexer_loss = indexer_loss_values.sum() / num_layers
+        avg_raw_indexer_loss = raw_indexer_loss_values.sum() / num_layers
 
         # Log average loss
         if total_loss_dict is not None:
@@ -371,12 +394,18 @@ class DSAIndexerLossLoggingHelper:
                 total_loss_dict["indexer loss"] += avg_indexer_loss
             else:
                 total_loss_dict["indexer loss"] = avg_indexer_loss
+            if "indexer raw loss" in total_loss_dict:
+                total_loss_dict["indexer raw loss"] += avg_raw_indexer_loss
+            else:
+                total_loss_dict["indexer raw loss"] = avg_raw_indexer_loss
 
         if writer is not None:
             writer.add_scalar("indexer loss", avg_indexer_loss, iteration)
+            writer.add_scalar("indexer raw loss", avg_raw_indexer_loss, iteration)
 
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
+            wandb_writer.log({"indexer raw loss": avg_raw_indexer_loss}, iteration)
 
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
@@ -607,6 +636,66 @@ def fused_qk_topk_naive(
         )
 
     return index_scores, topk_indices
+
+
+def _merge_topk_scores(
+    running_scores: Optional[torch.Tensor],
+    running_indices: Optional[torch.Tensor],
+    block_scores: torch.Tensor,
+    block_indices: torch.Tensor,
+    topk_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Merge two candidate top-k sets into an exact top-k set."""
+    if running_scores is None or running_indices is None:
+        return block_scores, block_indices
+
+    merged_scores = torch.cat((running_scores, block_scores), dim=-1)
+    merged_indices = torch.cat((running_indices, block_indices), dim=-1)
+    keep_k = min(topk_k, merged_scores.size(-1))
+    keep = merged_scores.topk(keep_k, dim=-1)[1]
+    running_scores = torch.gather(merged_scores, -1, keep)
+    running_indices = torch.gather(merged_indices, -1, keep)
+    return running_scores, running_indices
+
+
+def fused_qk_topk_chunked(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    mask: Optional[torch.Tensor] = None,
+    key_chunk_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Exact top-k routing over key chunks.
+
+    Returns the exact same top-k result as the dense implementation, but avoids materializing the
+    full score tensor when `key_chunk_size` is set.
+    """
+    sk = k.size(0)
+    topk_k = min(index_topk, sk)
+    if key_chunk_size is None or key_chunk_size <= 0 or key_chunk_size >= sk:
+        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, index_topk, mask)
+        topk_scores = torch.gather(index_scores, -1, topk_indices)
+        return topk_scores, topk_indices
+
+    running_scores = None
+    running_indices = None
+    for k_start in range(0, sk, key_chunk_size):
+        k_end = min(k_start + key_chunk_size, sk)
+        block_scores = _compute_index_scores(q, weights, k[k_start:k_end])
+        if mask is not None:
+            block_mask = mask[..., k_start:k_end]
+            assert block_mask.dtype == block_scores.dtype, "Mask dtype must match index scores dtype"
+            block_scores = block_scores + block_mask
+
+        block_topk_k = min(topk_k, k_end - k_start)
+        block_scores, block_indices = block_scores.topk(block_topk_k, dim=-1)
+        block_indices = block_indices + k_start
+        running_scores, running_indices = _merge_topk_scores(
+            running_scores, running_indices, block_scores, block_indices, topk_k
+        )
+
+    return running_scores, running_indices
 
 
 def fwd_fused_indexer_loss_naive(
@@ -2161,6 +2250,7 @@ class DSAttention(MegatronModule):
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
+                    raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                     reduce_group=indexer_reduce_group,

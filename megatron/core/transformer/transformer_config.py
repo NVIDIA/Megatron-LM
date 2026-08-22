@@ -296,6 +296,15 @@ class TransformerConfig(ModelParallelConfig):
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
 
+    rope_type: str = "rope"
+    """Type of RoPE to use. Common attention defaults to rope."""
+
+    rotary_base: float = 10000
+    """Rotary base for the rotary embeddings."""
+
+    rotary_percent: float = 1.0
+    """Rotary percent for the rotary embeddings."""
+
     ####################
     # attention variant
     ####################
@@ -330,9 +339,26 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
+    dsa_indexer_topk_key_chunk_size: Optional[int] = None
+    """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
+
+    dsa_indexer_topk_recompute: bool = False
+    """Whether to recompute chunked DSA top-k routing during backward to reduce activation memory."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+
+    dsa_indexer_loss_recompute: bool = False
+    """Whether to recompute the DSA indexer KL loss during backward to reduce activation memory."""
+
+    dsa_sparse_attention_recompute: bool = False
+    """Whether to recompute sparse DSA attention during backward to reduce activation memory."""
+
+    dsa_sparse_attention_use_gather: bool = False
+    """Whether to use the gather-based sparse DSA attention backend instead of the dense-mask reference path."""
+
+    dsa_sparse_attention_query_chunk_size: Optional[int] = None
+    """Optional query chunk size for sparse DSA attention. If unset, process all queries at once."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
@@ -357,6 +383,14 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+    dsa_indexer_sparse_loss_use_topk_only: bool = False
+    """When using sparse DSA indexer loss, compute KL only on the selected top-k support."""
+
+    dsa_indexer_loss_query_chunk_size: Optional[int] = None
+    """Optional query chunk size for the DSA indexer loss top-k-only sparse KL path."""
+
+    dsa_indexer_use_hadamard: bool = False
+    """Whether to apply Hadamard rotation to DSA indexer queries and keys."""
 
     ####################
     # linear attention
@@ -3221,6 +3255,61 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.use_kitchen
 
         if self.experimental_attention_variant == "dsa":
+            assert self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0, (
+                "dsa_indexer_n_heads must be set to a positive integer when using DSA."
+            )
+            assert self.dsa_indexer_head_dim is not None and self.dsa_indexer_head_dim > 0, (
+                "dsa_indexer_head_dim must be set to a positive integer when using DSA."
+            )
+            assert self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0, (
+                "dsa_indexer_topk must be set to a positive integer when using DSA."
+            )
+            assert (
+                self.dsa_indexer_topk_key_chunk_size is None
+                or self.dsa_indexer_topk_key_chunk_size > 0
+            ), "dsa_indexer_topk_key_chunk_size must be a positive integer when set."
+            assert (
+                not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
+            ), (
+                "dsa_indexer_sparse_loss_use_topk_only requires dsa_indexer_use_sparse_loss."
+            )
+            assert (
+                self.dsa_indexer_loss_query_chunk_size is None
+                or self.dsa_indexer_loss_query_chunk_size > 0
+            ), "dsa_indexer_loss_query_chunk_size must be a positive integer when set."
+            assert (
+                self.dsa_sparse_attention_query_chunk_size is None
+                or self.dsa_sparse_attention_query_chunk_size > 0
+            ), "dsa_sparse_attention_query_chunk_size must be a positive integer when set."
+            assert (
+                self.dsa_indexer_loss_query_chunk_size is None
+                or self.dsa_indexer_sparse_loss_use_topk_only
+            ), (
+                "dsa_indexer_loss_query_chunk_size requires "
+                "dsa_indexer_sparse_loss_use_topk_only."
+            )
+            assert (
+                not self.dsa_indexer_topk_recompute
+                or (
+                    self.dsa_indexer_topk_key_chunk_size is not None
+                    and self.dsa_indexer_topk_key_chunk_size > 0
+                )
+            ), (
+                "dsa_indexer_topk_recompute requires dsa_indexer_topk_key_chunk_size."
+            )
+            assert (
+                self.dsa_sparse_attention_query_chunk_size is None
+                or self.dsa_sparse_attention_use_gather
+            ), (
+                "dsa_sparse_attention_query_chunk_size requires "
+                "dsa_sparse_attention_use_gather."
+            )
+            assert (
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.sequence_parallel, (
+                "Currently sequence parallelism is not supported by DSAttention."
+            )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if self.context_parallel_size > 1:
                 cp_comm_types = (

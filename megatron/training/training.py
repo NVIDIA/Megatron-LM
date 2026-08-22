@@ -181,10 +181,13 @@ from .global_vars import (
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
     append_to_progress_log,
+    calc_dsa_split_grad_norms,
+    calc_dsa_split_grad_num_zeros,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
     is_last_rank,
     logical_and_across_model_parallel_group,
+    reduce_max_stat_across_model_parallel_group,
     print_rank_0,
     print_rank_last,
     reduce_max_stat_across_model_parallel_group,
@@ -3281,8 +3284,12 @@ def training_log(
     report_memory_flag,
     skipped_iter,
     grad_norm,
+    non_indexer_grad_norm,
+    indexer_grad_norm,
     params_norm,
     num_zeros_in_grad,
+    non_indexer_num_zeros_in_grad,
+    indexer_num_zeros_in_grad,
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
@@ -3428,6 +3435,24 @@ def training_log(
             writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
+        if non_indexer_grad_norm is not None:
+            writer.add_scalar('non-indexer-grad-norm', non_indexer_grad_norm, iteration)
+            writer.add_scalar(
+                'non-indexer-grad-norm vs samples',
+                non_indexer_grad_norm,
+                args.consumed_train_samples,
+            )
+            if wandb_writer:
+                wandb_writer.log({'non-indexer-grad-norm': non_indexer_grad_norm}, iteration)
+        if indexer_grad_norm is not None:
+            writer.add_scalar('indexer-grad-norm', indexer_grad_norm, iteration)
+            writer.add_scalar(
+                'indexer-grad-norm vs samples',
+                indexer_grad_norm,
+                args.consumed_train_samples,
+            )
+            if wandb_writer:
+                wandb_writer.log({'indexer-grad-norm': indexer_grad_norm}, iteration)
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar(
@@ -3435,6 +3460,26 @@ def training_log(
             )
             if wandb_writer:
                 wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
+        if non_indexer_num_zeros_in_grad is not None:
+            writer.add_scalar('non-indexer-num-zeros', non_indexer_num_zeros_in_grad, iteration)
+            writer.add_scalar(
+                'non-indexer-num-zeros vs samples',
+                non_indexer_num_zeros_in_grad,
+                args.consumed_train_samples,
+            )
+            if wandb_writer:
+                wandb_writer.log(
+                    {'non-indexer-num-zeros': non_indexer_num_zeros_in_grad}, iteration
+                )
+        if indexer_num_zeros_in_grad is not None:
+            writer.add_scalar('indexer-num-zeros', indexer_num_zeros_in_grad, iteration)
+            writer.add_scalar(
+                'indexer-num-zeros vs samples',
+                indexer_num_zeros_in_grad,
+                args.consumed_train_samples,
+            )
+            if wandb_writer:
+                wandb_writer.log({'indexer-num-zeros': indexer_num_zeros_in_grad}, iteration)
         if params_norm is not None:
             writer.add_scalar('params-norm', params_norm, iteration)
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
@@ -3643,8 +3688,16 @@ def training_log(
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
+        if non_indexer_grad_norm is not None:
+            log_string += f' non-indexer grad norm: {non_indexer_grad_norm:.3f} |'
+        if indexer_grad_norm is not None:
+            log_string += f' indexer grad norm: {indexer_grad_norm:.3f} |'
         if num_zeros_in_grad is not None:
             log_string += f' num zeros: {num_zeros_in_grad} |'
+        if non_indexer_num_zeros_in_grad is not None:
+            log_string += f' non-indexer num zeros: {non_indexer_num_zeros_in_grad} |'
+        if indexer_num_zeros_in_grad is not None:
+            log_string += f' indexer num zeros: {indexer_num_zeros_in_grad} |'
         if params_norm is not None:
             log_string += f' params norm: {params_norm:.3f} |'
         log_string += ' number of skipped iterations: {:3d} |'.format(
@@ -4882,6 +4935,10 @@ def train(
             else:
                 loss_scale = 1.0
             params_norm = None
+            indexer_grad_norm = None
+            non_indexer_grad_norm = None
+            indexer_num_zeros_in_grad = None
+            non_indexer_num_zeros_in_grad = None
 
             if args.log_params_norm:
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
@@ -4890,6 +4947,25 @@ def train(
                 # cost span (it stalls the critical path), unlike passive monitors.
                 with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
                     params_norm = calc_params_l2_norm(model)
+            if grad_norm is not None and iteration % args.tensorboard_log_interval == 0:
+                indexer_grad_norm, non_indexer_grad_norm = calc_dsa_split_grad_norms(
+                    model, optimizer
+                )
+                indexer_grad_norm = reduce_max_stat_across_model_parallel_group(indexer_grad_norm)
+                non_indexer_grad_norm = reduce_max_stat_across_model_parallel_group(
+                    non_indexer_grad_norm
+                )
+            if num_zeros_in_grad is not None and iteration % args.tensorboard_log_interval == 0:
+                (
+                    indexer_num_zeros_in_grad,
+                    non_indexer_num_zeros_in_grad,
+                ) = calc_dsa_split_grad_num_zeros(model, optimizer)
+                indexer_num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
+                    indexer_num_zeros_in_grad
+                )
+                non_indexer_num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
+                    non_indexer_num_zeros_in_grad
+                )
             if optimizer is not None:
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
             else:
@@ -4906,8 +4982,12 @@ def train(
                     report_memory_flag,
                     skipped_iter,
                     grad_norm,
+                    non_indexer_grad_norm,
+                    indexer_grad_norm,
                     params_norm,
                     num_zeros_in_grad,
+                    non_indexer_num_zeros_in_grad,
+                    indexer_num_zeros_in_grad,
                     max_attention_logit,
                     pg_collection=model_pg_collection,
                     is_first_iteration=is_first_iteration,
@@ -4921,6 +5001,7 @@ def train(
                 from opentelemetry import context as _octx
                 _octx.detach(_report_token)
                 _report_span.end()
+
         is_first_iteration = False
 
         # Evaluation.

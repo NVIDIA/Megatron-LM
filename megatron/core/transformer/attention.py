@@ -443,6 +443,23 @@ class Attention(MegatronModule, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _get_core_attention_extra_kwargs(
+        self,
+        hidden_states: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]],
+        rotary_pos_cos: Optional[Tensor],
+        rotary_pos_sin: Optional[Tensor],
+        rotary_pos_cos_sin: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> dict:
+        """Hook for attention variants that need extra inputs in core attention."""
+        return {}
     def _checkpointed_attention_forward(
         self,
         query,
@@ -1276,6 +1293,25 @@ class Attention(MegatronModule, ABC):
 
         return output_total
 
+    def _dynamic_core_attention_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: BaseInferenceContext,
+        block_table: Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        **kwargs,
+    ) -> Tensor:
+        """Hook for attention variants that need a custom dynamic-batching path."""
+        raise NotImplementedError(
+            "Dynamic batching is not supported for attention variants that require extra "
+            "core-attention kwargs."
+        )
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -1549,10 +1585,27 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
+            hidden_states=hidden_states,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attn_mask_type=attn_mask_type,
+            packed_seq_params=packed_seq_params,
+        )
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
         if self.checkpoint_core_attention and self.training:
+            # Upstream _checkpointed_attention_forward now threads tensor-valued
+            # core-attention kwargs (e.g. DSA's x/qr) through the checkpoint, so the
+            # variant no longer has to opt out of checkpointing.
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -1561,6 +1614,7 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -1574,33 +1628,48 @@ class Attention(MegatronModule, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
                     )
 
             else:
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                if core_attention_extra_kwargs:
+                    core_attn_out = self._dynamic_core_attention_forward(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        inference_context,
+                        block_table,
+                        attn_mask_type,
+                        attention_bias,
+                        packed_seq_params,
+                        **core_attention_extra_kwargs,
+                    )
+                else:
+                    # Dynamic batching attention kernel.
+                    q, k, v = (query, key, value)
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                    softmax_offset=self._get_inference_softmax_offset(),
-                )
-                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                        softmax_offset=self._get_inference_softmax_offset(),
+                    )
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                # Clear the outputs for padding tokens when using quantization scales
-                # to avoid corrupting amax calculations
-                if is_using_quantization_scales(self.config):
-                    core_attn_out[inference_context.padding_slice] = 0.0
+                    # Clear the outputs for padding tokens when using quantization scales
+                    # to avoid corrupting amax calculations
+                    if is_using_quantization_scales(self.config):
+                        core_attn_out[inference_context.padding_slice] = 0.0
 
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
