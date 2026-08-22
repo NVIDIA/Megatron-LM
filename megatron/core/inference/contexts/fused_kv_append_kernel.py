@@ -42,6 +42,7 @@ def _append_kv_cache_kernel(
     n_tokens: tl.int32,
     num_heads: tl.int32,
     H_DIM: tl.int32,
+    dummy_block_idx: tl.int32,
     # --- Compile-Time Constants ---
     BLOCK_SIZE_H: tl.constexpr,
 ):
@@ -86,8 +87,9 @@ def _append_kv_cache_kernel(
     value_dest_ptr = value_cache_ptr + dest_offset
 
     # --- Store the head data into the cache ---
-    tl.store(key_dest_ptr + offs_h * stride_cache_hdim, key_to_write, mask=mask_h)
-    tl.store(value_dest_ptr + offs_h * stride_cache_hdim, value_to_write, mask=mask_h)
+    write_mask = mask_h & (block_idx != dummy_block_idx)
+    tl.store(key_dest_ptr + offs_h * stride_cache_hdim, key_to_write, mask=write_mask)
+    tl.store(value_dest_ptr + offs_h * stride_cache_hdim, value_to_write, mask=write_mask)
 
 
 def triton_append_key_value_cache(
@@ -98,6 +100,7 @@ def triton_append_key_value_cache(
     padded_active_token_count: int,
     token_to_block_idx: Tensor,
     token_to_local_position_within_kv_block: Tensor,
+    dummy_block_idx: int,
 ) -> None:
     """
     Append to KV cache using a high-performance, standalone Triton kernel.
@@ -112,6 +115,7 @@ def triton_append_key_value_cache(
         the cache.
         token_to_local_position_within_kv_block (Tensor): Tensor mapping token index
         to its position within a block.
+        dummy_block_idx (int): Sentinel block index that must not receive KV writes.
     """
     # --- Input Validation and Preparation ---
     assert (
@@ -182,6 +186,7 @@ def triton_append_key_value_cache(
         n_tokens=n_tokens,
         num_heads=num_heads,
         H_DIM=h_dim,
+        dummy_block_idx=dummy_block_idx,
         # Compile-time constant
         BLOCK_SIZE_H=BLOCK_SIZE_H,
     )

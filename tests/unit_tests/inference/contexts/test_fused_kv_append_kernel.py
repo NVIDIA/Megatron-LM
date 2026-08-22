@@ -83,6 +83,7 @@ class TestKVAppendLargeBlockIdx:
             padded_active_token_count=n_tokens,
             token_to_block_idx=block_indices,
             token_to_local_position_within_kv_block=local_positions,
+            dummy_block_idx=-1,
         )
 
         try:
