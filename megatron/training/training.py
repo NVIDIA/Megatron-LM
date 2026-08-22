@@ -1531,6 +1531,46 @@ def _freeze_dsa_indexer_parameters(model):
     )
 
 
+def apply_dsa_param_freezing(model):
+    """Apply --dsa-train-indexer-only / --dsa-train-main-only parameter freezing.
+
+    Must run before the model is wrapped for distributed training: DDP and the
+    optimizer capture ``requires_grad`` when they take the parameters, so freezing
+    afterwards silently does nothing.
+
+    Called from two places, because the two model-building paths do not share code:
+    ``megatron.training.training.get_model`` (legacy) and
+    ``megatron.training.models.dist_utils.unimodal_build_distributed_models`` (the
+    GPT/Hybrid builders). Omitting the second is a silent correctness bug -- training
+    proceeds with every parameter trainable and only the loss curve reveals it.
+    """
+    args = get_args()
+    if getattr(args, "dsa_train_indexer_only", False):
+        if getattr(args, "experimental_attention_variant", None) != "dsa":
+            raise RuntimeError(
+                "--dsa-train-indexer-only requires --experimental-attention-variant dsa."
+            )
+        if getattr(args, "overlap_param_gather", False):
+            raise RuntimeError(
+                "--dsa-train-indexer-only is not compatible with --overlap-param-gather. "
+                "DSA min-memory indexer paths use indexer parameter tensors directly, bypassing "
+                "the module forward pre-hooks that overlapped param gather depends on."
+            )
+        _freeze_non_dsa_indexer_parameters(model)
+    elif getattr(args, "dsa_train_main_only", False):
+        if getattr(args, "experimental_attention_variant", None) != "dsa":
+            raise RuntimeError(
+                "--dsa-train-main-only requires --experimental-attention-variant dsa."
+            )
+        if getattr(args, "use_torch_fsdp2", False) or getattr(
+            args, "use_megatron_fsdp", False
+        ):
+            raise RuntimeError(
+                "--dsa-train-main-only currently supports DDP/distributed-optimizer models only."
+            )
+        _freeze_dsa_indexer_parameters(model)
+
+
 def _is_dsa_indexer_param_name(name: str) -> bool:
     """Return true when a parameter name belongs to a DSA indexer module."""
     return name.startswith("indexer.") or ".indexer." in name
@@ -2980,30 +3020,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
-    if getattr(args, "dsa_train_indexer_only", False):
-        if getattr(args, "experimental_attention_variant", None) != "dsa":
-            raise RuntimeError(
-                "--dsa-train-indexer-only requires --experimental-attention-variant dsa."
-            )
-        if getattr(args, "overlap_param_gather", False):
-            raise RuntimeError(
-                "--dsa-train-indexer-only is not compatible with --overlap-param-gather. "
-                "DSA min-memory indexer paths use indexer parameter tensors directly, bypassing "
-                "the module forward pre-hooks that overlapped param gather depends on."
-            )
-        _freeze_non_dsa_indexer_parameters(model)
-    elif getattr(args, "dsa_train_main_only", False):
-        if getattr(args, "experimental_attention_variant", None) != "dsa":
-            raise RuntimeError(
-                "--dsa-train-main-only requires --experimental-attention-variant dsa."
-            )
-        if getattr(args, "use_torch_fsdp2", False) or getattr(
-            args, "use_megatron_fsdp", False
-        ):
-            raise RuntimeError(
-                "--dsa-train-main-only currently supports DDP/distributed-optimizer models only."
-            )
-        _freeze_dsa_indexer_parameters(model)
+    apply_dsa_param_freezing(model)
 
     # Print number of parameters.
     num_parameters = sum(
