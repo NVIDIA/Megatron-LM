@@ -22,7 +22,7 @@ from megatron.lite.primitive.modules.attention.hca import (
 )
 
 
-_MHC_KERNELS = {
+_MHC_ENTRIES = {
     "pre": mhc_pre_tilelang,
     "pre_broadcast": mhc_pre_broadcast_tilelang,
     "post": mhc_post_tilelang,
@@ -32,7 +32,7 @@ _MHC_KERNELS = {
 
 
 def mhc_kernel(name: str, *args, **kwargs):
-    return _MHC_KERNELS[name](*args, **kwargs)
+    return _MHC_ENTRIES[name](*args, **kwargs)
 
 
 def parameter_versions(parameters: Iterable[torch.Tensor]) -> tuple[int, ...]:
