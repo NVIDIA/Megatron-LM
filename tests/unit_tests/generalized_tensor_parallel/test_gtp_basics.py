@@ -55,6 +55,7 @@ from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPWeightCache,
     wrap_module_params_gtp,
 )
+from megatron.core.tensor_parallel.gtp_cuda_graphs import preserve_gtp_prefetch_state
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
@@ -73,6 +74,7 @@ class _FakeGroup:
     def __init__(self, size=1, rank=0):
         self._size = size
         self._rank = rank
+        self.group_name = f"fake_group_{id(self)}"
 
     def size(self):
         return self._size
@@ -1485,9 +1487,11 @@ class TestGTPGraphWgradRing:
         assert logical_view.data_ptr() == slot_1.tensor.data_ptr()
 
         logical_view.fill_(7)
-        prepared = weights[1]._prepare_wgrad_reduce_scatter_inputs([logical_view])
+        send_bufs, release_bufs = weights[1]._prepare_wgrad_reduce_scatter_inputs([logical_view])
         assert capture_state.wgrad_ring_slots == [slot_1]
-        assert prepared[0] is slot_1.tensor
+        assert send_bufs[0] is slot_1.tensor
+        # The ring slot is sent but never released; the feeding wgrad is released instead.
+        assert release_bufs[0] is logical_view
         assert torch.count_nonzero(slot_1.tensor[4:]) == 0
 
         with pytest.raises(RuntimeError, match="increase GTP_CONFIG.graph_wgrad_ring_size"):
@@ -1541,9 +1545,11 @@ class TestGTPGraphWgradRing:
         gtp_module.initialize_graph_wgrad_rings()
 
         wgrad = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
-        rs_input = weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])[0]
+        send_bufs, release_bufs = weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])
+        rs_input = send_bufs[0]
 
         assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
+        assert release_bufs[0] is wgrad
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
 
@@ -1630,6 +1636,158 @@ class TestGTPCaptureParamReadiness:
             gtp_cuda_graphs.register_capture_params_to_ensure_ready((second,))
 
         assert capture.params_to_ensure_ready == [first, second]
+
+    def test_warmup_preserves_cross_graph_prefetch_state(self):
+        class FakeParam:
+            is_gtp_weight_remat = True
+            _prefetch_handle = None
+            _recompute_prefetch_handle = None
+
+            def __init__(self, already_drained, recompute_already_drained):
+                self._already_ag_drained = already_drained
+                self._recompute_already_drained = recompute_already_drained
+
+        incoming = FakeParam(already_drained=True, recompute_already_drained=True)
+        ordinary = FakeParam(already_drained=False, recompute_already_drained=False)
+
+        observed = []
+        for _ in range(2):
+            with preserve_gtp_prefetch_state(iter((incoming, ordinary))):
+                observed.append((incoming._already_ag_drained, incoming._recompute_already_drained))
+                # Each warmup consumes the incoming handoff and creates outgoing readiness.
+                incoming._already_ag_drained = False
+                incoming._recompute_already_drained = False
+                ordinary._already_ag_drained = True
+                ordinary._recompute_already_drained = True
+
+        assert observed == [(True, True), (True, True)]
+        assert incoming._already_ag_drained is True
+        assert incoming._recompute_already_drained is True
+        assert ordinary._already_ag_drained is False
+        assert ordinary._recompute_already_drained is False
+        assert incoming._prefetch_handle is None
+
+    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch):
+        class ExpectedEventWait(Exception):
+            pass
+
+        calls = []
+
+        class FakeEvent:
+            def wait(self):
+                calls.append("event_wait")
+                raise ExpectedEventWait
+
+        param = type(
+            "Param",
+            (),
+            {
+                "_already_ag_drained": True,
+                "_weights": (),
+                "ag_event": FakeEvent(),
+                "_wait_param_gather": lambda self: calls.append("handle_wait"),
+            },
+        )()
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
+
+        with pytest.raises(ExpectedEventWait):
+            GTPShardedParam._get_prefetched_weight(param, fwd=True)
+
+        assert calls == ["event_wait"]
+        assert param._already_ag_drained is False
+
+    def test_drained_recompute_prefetch_still_waits_on_ag_event(self):
+        class ExpectedEventWait(Exception):
+            pass
+
+        calls = []
+
+        class FakeEvent:
+            def wait(self):
+                calls.append("event_wait")
+                raise ExpectedEventWait
+
+        param = type(
+            "Param",
+            (),
+            {
+                "_recompute_already_drained": True,
+                "_weights": (),
+                "_recompute_ag_event": FakeEvent(),
+                "_wait_recompute_param_gather": lambda self: calls.append("handle_wait"),
+            },
+        )()
+
+        with pytest.raises(ExpectedEventWait):
+            GTPShardedParam._get_recompute_prefetched_weight(param)
+
+        assert calls == ["event_wait"]
+        assert param._recompute_already_drained is False
+
+    def test_warmup_exception_is_not_masked_by_leaked_handle(self):
+        class WarmupError(Exception):
+            pass
+
+        param = type(
+            "Param",
+            (),
+            {
+                "is_gtp_weight_remat": True,
+                "_already_ag_drained": True,
+                "_recompute_already_drained": True,
+                "_prefetch_handle": None,
+                "_recompute_prefetch_handle": None,
+            },
+        )()
+
+        with pytest.raises(WarmupError):
+            with preserve_gtp_prefetch_state((param,)):
+                param._already_ag_drained = False
+                param._prefetch_handle = object()
+                raise WarmupError
+
+        assert param._already_ag_drained is True
+        assert param._recompute_already_drained is True
+
+    def test_successful_warmup_rejects_leaked_handle_after_restoring_state(self):
+        param = type(
+            "Param",
+            (),
+            {
+                "is_gtp_weight_remat": True,
+                "_already_ag_drained": True,
+                "_recompute_already_drained": False,
+                "_prefetch_handle": None,
+                "_recompute_prefetch_handle": None,
+            },
+        )()
+
+        with pytest.raises(RuntimeError, match="undrained AG work"):
+            with preserve_gtp_prefetch_state((param,)):
+                param._already_ag_drained = False
+                param._prefetch_handle = object()
+
+        assert param._already_ag_drained is True
+        assert param._recompute_already_drained is False
+
+    def test_capture_comm_selection_keeps_chain_and_ownership_scoped(self):
+        state = gtp_cuda_graphs.GTPCaptureCommState()
+        graphed_param = type("Param", (), {"chain_id": GTPChain.GRAPHED.value})()
+        ungraphed_param = type("Param", (), {"chain_id": GTPChain.UNGRAPHED.value})()
+        graphed_ag_stream = object()
+        graphed_rs_stream = object()
+        ungraphed_ag_stream = object()
+
+        state.register_comm(graphed_param, graphed_ag_stream, reduce_scatter=False)
+        state.register_comm(graphed_param, graphed_ag_stream, reduce_scatter=False)
+        state.register_comm(graphed_param, graphed_rs_stream, reduce_scatter=True)
+        state.register_comm(ungraphed_param, ungraphed_ag_stream, reduce_scatter=False)
+
+        params, ag_streams, rs_streams = state.get_comms_for_chain(GTPChain.GRAPHED.value)
+
+        assert params == [graphed_param]
+        assert ag_streams == [graphed_ag_stream]
+        assert rs_streams == [graphed_rs_stream]
 
 
 # ---------------------------------------------------------------------------

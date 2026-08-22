@@ -1081,7 +1081,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     if HAVE_GTP:
         from megatron.core.fp8_utils import is_float8tensor
-        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8, is_gtp_param
+        from megatron.core.tensor_parallel.gtp_api import (
+            dequantize_gtp_native_fp8,
+            gtp_replica_rank,
+            is_gtp_param,
+        )
 
         if is_gtp_param(tensor):
             gtp_rank = get_pg_rank(tensor.group)
@@ -1096,10 +1100,9 @@ def make_tp_sharded_tensor_for_checkpoint(
             else:
                 # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
                 new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
-            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas).
-            dp_replica_id = parallel_state.get_data_parallel_rank(
-                with_context_parallel=True, with_gtp_remat=False
-            )
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas): the
+            # group stamped on the param by the caller's pg_collection, else the MPU globals.
+            dp_replica_id = gtp_replica_rank(tensor)
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):
                 kwargs.setdefault("allow_shape_mismatch", True)
