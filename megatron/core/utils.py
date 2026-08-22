@@ -542,10 +542,9 @@ def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
 def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
     """Return missing cuDNN DSA kernel dependencies."""
     missing = []
-    try:
-        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-    except ImportError:
-        missing.append("flash_mla")
+    # NOTE: flash_mla is only used by the absorbed-MLA sparse-attention fast path
+    # (_dsa_fwd_flash_mla), which is guarded at runtime by _ensure_flash_mla().
+    # The GQA cuDNN DSA path never calls it, so it is not required up front here.
     try:
         from cudnn import DSA  # noqa: F401
     except ImportError:

@@ -337,6 +337,23 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_gqa_kernel: Literal["min_memory", "reference"] = "min_memory"
+    """Implementation used by DSA-over-GQA attention layers.
+    ``min_memory`` runs the streamed kernels, which keep O(tile) activation memory by
+    recomputing routing and attention in the backward. ``reference`` expands the GQA K/V to
+    full heads and delegates to the MLA-shaped DSAttention path; it is kept for numerical
+    A/B and materializes MHA-sized K/V, so it is only practical at short sequence lengths."""
+
+    dsa_min_memory_use_triton: bool = False
+    """Use the Triton sparse-attention and indexer top-k kernels on the DSA-over-GQA
+    ``min_memory`` path. Falls back to the PyTorch implementation where Triton is
+    unavailable or the shapes are unsupported."""
+
+    dsa_min_memory_use_cudnn: bool = False
+    """Use the cuDNN indexer top-k on the DSA-over-GQA ``min_memory`` path. Takes precedence
+    over Triton for the top-k. Falls back to PyTorch when cuDNN is unavailable or the indexer
+    head count is not 32 or 64."""
+
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
     """Optional fused DSA kernel backend.
     ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
