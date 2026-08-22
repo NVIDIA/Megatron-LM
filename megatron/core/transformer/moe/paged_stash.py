@@ -1178,8 +1178,11 @@ class PagedStashRunner:
         if self.copy_main_params:
 
             def _try_copy_main_params(opt):
-                if isinstance(opt, DistributedOptimizer) and hasattr(
-                    opt, 'shard_fp32_from_float16_groups'
+                if (
+                    isinstance(opt, DistributedOptimizer)
+                    and hasattr(opt, 'shard_fp32_from_float16_groups')
+                    and opt.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                    and opt.ddp_config.overlap_param_gather
                 ):
                     opt._copy_main_params_to_param_buffer()
 

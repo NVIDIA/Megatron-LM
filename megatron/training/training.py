@@ -3058,7 +3058,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
+                    if (
+                        isinstance(optim_instance, DistributedOptimizer)
+                        and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                        and optim_instance.ddp_config.overlap_param_gather
+                    ):
                         optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
