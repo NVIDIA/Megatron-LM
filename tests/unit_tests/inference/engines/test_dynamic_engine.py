@@ -1007,6 +1007,26 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_create_cuda_graphs_skips_ep_zmq_when_ep_is_one(self) -> None:
+        """EP ZMQ setup is only required when expert parallelism is enabled."""
+        with mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.AsyncZMQCommunicator"
+        ) as mock_ep_zmq:
+            self._build_test_env(
+                DynamicEngineTestConfig(
+                    model_provider="gpt",
+                    expert_model_parallel_size=1,
+                    num_cuda_graphs=1,
+                    force_build_cuda_graphs=True,
+                    context_max_requests=128,
+                )
+            )
+        mock_ep_zmq.assert_not_called()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_deprecated_full_iteration_inference_scope_matches_new_flag_runtime_behavior(
         self,
     ) -> None:
@@ -5935,6 +5955,29 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         )
         assert all(request.status == Status.COMPLETED for request in env.requests)
         assert all(len(request.generated_tokens) == 4 for request in env.requests)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_create_cuda_graphs_initializes_ep_zmq_before_capture(self) -> None:
+        """EP ZMQ must be wired before CUDA graph capture when EP > 1."""
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs for EP=2")
+        with mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.AsyncZMQCommunicator"
+        ) as mock_ep_zmq:
+            env = self._build_test_env(
+                DynamicEngineTestConfig(
+                    model_provider="gpt",
+                    expert_model_parallel_size=2,
+                    num_cuda_graphs=1,
+                    force_build_cuda_graphs=True,
+                    context_max_requests=128,
+                )
+            )
+        assert mock_ep_zmq.called
+        assert hasattr(env.engine, "expert_parallel_zmq_communicator")
 
     @pytest.mark.internal
     @pytest.mark.skipif(

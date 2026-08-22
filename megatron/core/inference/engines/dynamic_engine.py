@@ -507,6 +507,42 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError(f"Cannot wait for transient state {state}")
         await event.wait()
 
+    def _init_expert_parallel_zmq_communicator(self, hostname: str | None = None) -> None:
+        """Wire EP ZMQ before CUDA graph capture when expert parallelism is enabled.
+
+        ``DynamicInferenceEngine.__init__`` calls ``create_cuda_graphs()`` before
+        ``start_listening_to_data_parallel_coordinator()`` would otherwise create
+        the EP communicator. During graph capture, ``match_graph_config()`` needs
+        the ZMQ MAX-reduction path; without it EP batch-dimension sync falls back
+        to NCCL AllReduce on the compute stream, which can desync across multinode
+        EP groups during warmup.
+        """
+        ep_size = get_pg_size(self.pg_collection.ep)
+        if ep_size <= 1:
+            return
+
+        if getattr(self, "expert_parallel_zmq_communicator", None) is not None:
+            if hasattr(self.context, "set_ep_zmq_communicator"):
+                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
+            return
+
+        assert HAVE_ZMQ, (
+            "please install the pyzmq library for expert-parallel inference with CUDA graphs\n"
+            "pip install pyzmq"
+        )
+
+        if not getattr(self, "zmq_context", None):
+            self.zmq_context = zmq.Context.instance()
+
+        local_hostname = hostname or socket.gethostname()
+        self.ep_rank = get_pg_rank(self.pg_collection.ep)
+        self.ep_world_size = ep_size
+        self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
+            self.zmq_context, process_group=self.pg_collection.ep, hostname=local_hostname
+        )
+        if hasattr(self.context, "set_ep_zmq_communicator"):
+            self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
+
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
 
@@ -522,6 +558,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.cuda_graph_impl != "local":
             return
+
+        self._init_expert_parallel_zmq_communicator()
 
         context = self.context
         controller = self.controller
@@ -844,19 +882,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         torch.distributed.barrier(mp_group)
 
-        # initialize zmq-based EP communicator
+        # initialize zmq-based EP communicator (may already exist from create_cuda_graphs)
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
-        self._ep_consensus_loop_counter = 0
-        self._last_ep_consensus: tuple[int, bool] = (0, False)
-        if self.ep_world_size > 1:
-            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
-            )
-            # Give the context a CPU-side MAX-reduction primitive so
-            # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
-            if hasattr(self.context, "set_ep_zmq_communicator"):
-                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
+        if not hasattr(self, "_ep_consensus_loop_counter"):
+            self._ep_consensus_loop_counter = 0
+            self._last_ep_consensus: tuple[int, bool] = (0, False)
+        self._init_expert_parallel_zmq_communicator(hostname=local_ip)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
