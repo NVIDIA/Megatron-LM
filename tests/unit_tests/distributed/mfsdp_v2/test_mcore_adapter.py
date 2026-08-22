@@ -30,6 +30,39 @@ from tests.unit_tests.test_utilities import Utils
 logger = logging.getLogger(__name__)
 
 
+class _RankInitializedLinear(torch.nn.Linear):
+    """Linear whose CUDA reset values identify the rank that initialized it."""
+
+    def reset_parameters(self) -> None:
+        if self.weight.is_meta:
+            return
+        rank = torch.distributed.get_rank()
+        with torch.no_grad():
+            self.weight.fill_(rank + 2)
+            if self.bias is not None:
+                self.bias.fill_(rank + 3)
+
+
+class _RankInitializedModel(torch.nn.Module):
+    """Exercise reset methods on both an FSDP root and a nested parameter owner."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.root_bias = torch.nn.Parameter(torch.empty(hidden_size))
+        self.linear = _RankInitializedLinear(hidden_size, hidden_size)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.root_bias.is_meta:
+            return
+        rank = torch.distributed.get_rank()
+        with torch.no_grad():
+            self.root_bias.fill_(rank + 1)
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        return self.linear(input_tensor) + self.root_bias
+
+
 def _build_layer(config: TransformerConfig) -> TransformerLayer:
     return TransformerLayer(
         config=config,
@@ -103,6 +136,39 @@ class TestMcoreAdapterDense:
         }
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
+
+    def test_initializes_meta_device_parameters(self):
+        hidden_size = 4
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=1,
+            ffn_hidden_size=8,
+            init_model_with_meta_device=True,
+        )
+        with torch.device("meta"):
+            model = _RankInitializedModel(hidden_size)
+
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert all(not parameter.is_meta for parameter in model.parameters())
+        input_tensor = torch.ones(2, hidden_size, device="cuda")
+        output = model(input_tensor)
+        # Rank zero initializes weight=2, linear bias=3, and root bias=1. The
+        # adapter broadcasts those values before resharding, so every DP rank
+        # computes hidden_size * 2 + 3 + 1.
+        expected = torch.full_like(output, hidden_size * 2 + 4)
+        torch.testing.assert_close(output, expected)
 
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(

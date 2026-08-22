@@ -54,6 +54,7 @@ try:
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -596,6 +597,52 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
             )
         super().__init__(config=config, module=module)
+        if config.init_model_with_meta_device:
+            self._reset_parameters_for_meta_device_init()
+
+    def _reset_parameters_for_meta_device_init(self) -> None:
+        """Initialize meta-device parameters one FSDP unit at a time.
+
+        ``fully_shard`` materializes sharded buffers for meta parameters without
+        initializing their values. For each FSDP unit, materialize its full
+        parameters, invoke each direct parameter owner's reset method once, copy
+        the initialized values into the sharded optimizer and compute buffers,
+        and release the full parameters before processing the next unit.
+        """
+        for fsdp_module in self.module.modules():
+            if not isinstance(fsdp_module, FsdpModule):
+                continue
+
+            fsdp_module._unshard_parameter_groups()
+            if fsdp_module._unshard_event is not None:
+                fsdp_module.context.current_stream().wait_event(fsdp_module._unshard_event)
+
+            parameter_owners = []
+            seen_parameter_owners = set()
+            for group in fsdp_module.parameter_groups:
+                for fsdp_parameter in group.fsdp_parameters:
+                    parameter_fqn = fsdp_parameter.fqns[0]
+                    module_fqn, separator, _ = parameter_fqn.rpartition(".")
+                    owner = fsdp_module.get_submodule(module_fqn) if separator else fsdp_module
+                    if owner not in seen_parameter_owners:
+                        seen_parameter_owners.add(owner)
+                        parameter_owners.append(owner)
+
+            for owner in parameter_owners:
+                if hasattr(owner, "reset_parameters"):
+                    owner.reset_parameters()
+                elif hasattr(owner, "_reset_parameters"):
+                    owner._reset_parameters()
+                else:
+                    raise ValueError(
+                        "MFSDP v2 meta-device initialization requires every direct "
+                        f"parameter owner to define reset_parameters() or _reset_parameters(); "
+                        f"{type(owner).__name__} defines neither."
+                    )
+
+            for group in fsdp_module.parameter_groups:
+                group.sync_model_weight_from_unsharded_weight()
+            fsdp_module._reshard_parameter_groups()
 
     @staticmethod
     def _validate_config(
