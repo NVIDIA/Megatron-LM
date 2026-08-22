@@ -283,7 +283,8 @@ class OptimizerConfig:
     """How to perform NS calculation for tensor parallel weights. "blockwise" orthogonalizes
     each shard independently, which makes the update rule depend on the parallelism config;
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
-    change as TP changes. Defaults to "duplicated"."""
+    change as TP changes. "auto" select between duplicated and distributed mode per-weight for
+    dense weights. Defaults to "duplicated"."""
 
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
