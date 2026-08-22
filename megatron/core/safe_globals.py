@@ -123,3 +123,44 @@ class SafeUnpickler(pickle.Unpickler):
                 f"Refusing to unpickle disallowed class '{module}.{name}' "
             )
         return super().find_class(module, name)
+
+
+_PG_DIST_CACHE_SAFE_CLASSES = frozenset(
+    {
+        ("builtins", "slice"),
+        ("megatron.core.dist_checkpointing.exchange_utils", "ShardDistribution"),
+        ("megatron.core.dist_checkpointing.mapping", "ShardedTensor"),
+        *(
+            ("torch", name)
+            for name in (
+                "bfloat16",
+                "bool",
+                "complex128",
+                "complex64",
+                "float16",
+                "float32",
+                "float64",
+                "float8_e8m0fnu",
+                "float8_e4m3fn",
+                "float8_e4m3fnuz",
+                "float8_e5m2",
+                "float8_e5m2fnuz",
+                "int16",
+                "int32",
+                "int64",
+                "int8",
+                "uint8",
+                "uint16",
+                "uint32",
+                "uint64",
+            )
+            if hasattr(torch, name)
+        ),
+    }
+)
+
+
+class _PgDistCacheUnpickler(SafeUnpickler):
+    """Restricted unpickler for process-group distribution cache metadata."""
+
+    _SAFE_CLASSES = _PG_DIST_CACHE_SAFE_CLASSES

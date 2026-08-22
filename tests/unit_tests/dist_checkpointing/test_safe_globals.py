@@ -175,3 +175,12 @@ class TestSafeNumpyLoad:
         assert not errors
         for i, arr in arrays.items():
             np.testing.assert_array_equal(results[i], arr)
+
+
+class TestPgDistCacheUnpickler:
+    def test_does_not_inherit_fp8_safe_classes(self):
+        from megatron.core.safe_globals import _PgDistCacheUnpickler
+
+        raw = pickle.dumps(OrderedDict(a=1))
+        with pytest.raises(pickle.UnpicklingError, match="Refusing to unpickle"):
+            _PgDistCacheUnpickler(io.BytesIO(raw)).load()

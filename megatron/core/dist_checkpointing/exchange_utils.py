@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
+from megatron.core.safe_globals import _PgDistCacheUnpickler
 
 from .core import CheckpointingException
 from .dict_utils import nested_values
@@ -340,7 +341,7 @@ def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
         Dict[bool, ShardDistribution]: the {ignore_groups: distribution} map.
     """
     with open(cache_file, "rb") as f:
-        return pickle.load(f)
+        return _PgDistCacheUnpickler(f).load()
 
 
 def _create_pg_dist_cache(
