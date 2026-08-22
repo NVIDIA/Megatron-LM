@@ -386,6 +386,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
+        mhc_recompute_manager: Optional[CheckpointManager] = None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw TransformerLayer branch output when the wrapped layer is split.
 
@@ -417,6 +418,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
+                    mhc_recompute_manager=mhc_recompute_manager,
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -430,6 +432,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             padding_mask=padding_mask,
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
+            mhc_recompute_manager=mhc_recompute_manager,
         )
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
@@ -473,6 +476,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             packed_seq_params,
             padding_mask,
             input_ids,
+            mhc_recompute_manager=mhc_recompute_manager,
         )
 
         if fast_path_result is None:

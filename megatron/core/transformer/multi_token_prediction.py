@@ -2492,12 +2492,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
+            # Hybrid MTP instead owns a nested HybridStack, which consumes the global
+            # recompute_num_layers setting to chunk its layer pattern. The outer MTP layer
+            # remains one checkpoint unit in either case.
+            if self.mtp_layer_pattern is None:
+                assert (
+                    self.config.recompute_num_layers == 1
+                ), "recompute_num_layers must be 1 for MTP recompute"
             with outer_quantization_context:
                 outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
@@ -2932,7 +2934,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
+            hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
