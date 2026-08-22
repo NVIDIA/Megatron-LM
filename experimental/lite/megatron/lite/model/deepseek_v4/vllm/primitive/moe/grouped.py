@@ -15,6 +15,17 @@ _EXPERTS_PER_FORWARD_GROUP = 4
 _BACKWARD_CHUNK_ROWS = 1024
 
 
+def _require_power_of_two_scales(name: str, scales: torch.Tensor) -> None:
+    if scales.dtype != torch.float32:
+        return
+    bits = scales.contiguous().view(torch.int32)
+    invalid = (bits & 0x807FFFFF) != 0
+    if bool(invalid.any().item()):
+        raise RuntimeError(
+            f"{name} contains {int(invalid.sum().item())} non-UE8M0 FP32 scales"
+        )
+
+
 def _pad_expert_rows(
     value: torch.Tensor, counts: tuple[int, ...]
 ) -> tuple[torch.Tensor, tuple[int, ...], torch.Tensor | None]:
@@ -87,7 +98,9 @@ def _vllm_quantize_contiguous_input(
         dtype=torch.float8_e4m3fn,
         column_major_scales=True,
         tma_aligned_scales=bool(envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES),
-        use_ue8m0=False,
+        use_ue8m0=(
+            scale_format == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
+        ),
     )
 
 
@@ -147,6 +160,8 @@ def _vllm_grouped_forward(
         m_indices = _build_m_indices(padded_counts, hidden_states.device)
         packed_input = _vllm_quantize_contiguous_input(padded)
         packed_w13 = pack_grouped_block_fp8_weight(w13[expert_start:expert_end])
+        _require_power_of_two_scales("grouped input", packed_input[1])
+        _require_power_of_two_scales("grouped w13", packed_w13.scales)
         gate_up = hidden_states.new_empty((padded.shape[0], w13[0].shape[0]))
         m_grouped_fp8_gemm_nt_contiguous(
             packed_input,
@@ -165,6 +180,8 @@ def _vllm_grouped_forward(
             swiglu_limit=swiglu_limit,
         )
         packed_w2 = pack_grouped_block_fp8_weight(w2[expert_start:expert_end])
+        _require_power_of_two_scales("grouped activation", activated_scale)
+        _require_power_of_two_scales("grouped w2", packed_w2.scales)
         group_output = hidden_states.new_empty(
             (padded.shape[0], w2[0].shape[0])
         )

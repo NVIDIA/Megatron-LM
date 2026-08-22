@@ -44,10 +44,12 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         *,
         indexer_loss_coeff: float = 0.0,
         cache_deployment_weights: bool = False,
+        moe_token_dispatcher_type: str = "deepep",
     ):
         self.config = config
         self._vllm_indexer_loss_coeff = indexer_loss_coeff
         self._cache_deployment_weights = cache_deployment_weights
+        self._moe_token_dispatcher_type = moe_token_dispatcher_type
         super().__init__(
             config,
             ps or ParallelState(),
@@ -80,6 +82,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
             ps,
             layer_idx=layer_idx,
             cache_deployment_weights=self._cache_deployment_weights,
+            moe_token_dispatcher_type=self._moe_token_dispatcher_type,
         )
 
     def _mhc_pre(
@@ -185,10 +188,12 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         indexer_loss_coeff: float = 0.0,
         logprob_chunk_size: int = 8192,
         cache_deployment_weights: bool = False,
+        moe_token_dispatcher_type: str = "deepep",
     ):
         ps = ps or ParallelState()
         self._vllm_indexer_loss_coeff = indexer_loss_coeff
         self._cache_deployment_weights = cache_deployment_weights
+        self._moe_token_dispatcher_type = moe_token_dispatcher_type
         if logprob_chunk_size <= 0:
             raise ValueError("logprob_chunk_size must be positive")
         self._logprob_chunk_size = int(logprob_chunk_size)
@@ -236,6 +241,7 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             layer_idx=layer_idx,
             indexer_loss_coeff=self._vllm_indexer_loss_coeff,
             cache_deployment_weights=self._cache_deployment_weights,
+            moe_token_dispatcher_type=self._moe_token_dispatcher_type,
         )
 
     def forward(

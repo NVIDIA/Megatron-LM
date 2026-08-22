@@ -51,6 +51,13 @@ class ImplConfig:
     dsa_indexer_loss_coeff: float = 0.0
     logprob_chunk_size: int = 8192
     cache_deployment_weights: bool | None = None
+    moe_token_dispatcher_type: str = "deepep"
+
+    def __post_init__(self) -> None:
+        if self.moe_token_dispatcher_type not in {"deepep", "hybridep"}:
+            raise ValueError(
+                "moe_token_dispatcher_type must be 'deepep' or 'hybridep'"
+            )
 
 
 def _deployment_weight_cache_enabled(impl_cfg: ImplConfig) -> bool:
@@ -229,6 +236,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         indexer_loss_coeff=impl_cfg.dsa_indexer_loss_coeff,
         logprob_chunk_size=impl_cfg.logprob_chunk_size,
         cache_deployment_weights=_deployment_weight_cache_enabled(impl_cfg),
+        moe_token_dispatcher_type=impl_cfg.moe_token_dispatcher_type,
     )
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:

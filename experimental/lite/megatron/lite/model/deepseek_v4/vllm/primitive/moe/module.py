@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.moe import DeepseekV4MoE as LiteDeepseekV4MoE
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
+    VLLMAlignedHybridEPDispatcher,
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
@@ -149,6 +150,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         *,
         layer_idx: int,
         cache_deployment_weights: bool = False,
+        moe_token_dispatcher_type: str = "deepep",
     ):
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             is_batch_invariant_quant_kernel_enabled,
@@ -162,6 +164,17 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
             raise RuntimeError(
                 "DeepSeek V4 vLLM requires the batch-invariant quantization kernel"
             )
+        dispatchers = {
+            "deepep": VLLMAlignedNormalDeepEPDispatcher,
+            "hybridep": VLLMAlignedHybridEPDispatcher,
+        }
+        try:
+            dispatcher_cls = dispatchers[moe_token_dispatcher_type]
+        except KeyError as exc:
+            raise ValueError(
+                "moe_token_dispatcher_type must be 'deepep' or 'hybridep'"
+            ) from exc
+        object.__setattr__(self, "dispatcher_cls", dispatcher_cls)
         ps = ps or ParallelState()
         super().__init__(
             config,

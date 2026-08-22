@@ -13,6 +13,7 @@ from megatron.lite.primitive.modules.dispatcher import (
     _DeepEPDispatch,
     deep_ep,
 )
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe import hybridep
 
 
 @triton.jit
@@ -952,3 +953,56 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         self._source_all_routes_valid = source_all_routes_valid
         self._local_tpe_list = received_per_expert.tolist()
         return expert_hidden, received_per_expert, expert_probs
+
+
+class VLLMAlignedHybridEPDispatcher(TokenDispatcher):
+    """Preserve vLLM route slots over the dedicated HybridEP transport."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["use_deepep"] = False
+        super().__init__(*args, **kwargs)
+        if self.ep_size <= 1:
+            raise RuntimeError("hybridep requires expert parallel size greater than one")
+        if self.ps.ep_group is None:
+            raise RuntimeError("hybridep requires an expert-parallel process group")
+        hybridep.require_available()
+        hybridep.validate_topology(self.ps.ep_group)
+        self._hybridep_group = self.ps.ep_group
+        self._hybridep_state = None
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._hybridep_state is not None:
+            raise RuntimeError("hybridep dispatch state is still awaiting combine")
+        result = hybridep.dispatch_routes(
+            hidden_states,
+            topk_scores.float().contiguous(),
+            topk_indices.long().contiguous(),
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            group=self._hybridep_group,
+        )
+        self._hybridep_state = result.state
+        self._local_tpe_list = result.tokens_per_expert.tolist()
+        return result.hidden, result.tokens_per_expert, result.probs
+
+    def combine(self, expert_output: torch.Tensor) -> torch.Tensor:
+        if self._hybridep_state is None:
+            raise RuntimeError("hybridep combine has no matching dispatch state")
+        state = self._hybridep_state
+        source_routes = hybridep.combine_routes(expert_output, state)
+        output = _VLLMEPGatherWithBF16Backward.apply(
+            source_routes,
+            state.source_indices,
+            state.source_weights,
+            state.source_output_index,
+            False,
+            state.source_all_routes_valid,
+        )
+        self._hybridep_state = None
+        self._local_tpe_list = None
+        return output
