@@ -394,6 +394,13 @@ class TransformerConfig(ModelParallelConfig):
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
 
+    muon_ht_radius: Optional[float] = None
+    """If set and parameter initialization is enabled, Megatron places every Muon-managed
+    matrix on this fixed-radius Hyperball sphere before mixed-precision and distributed wrapping."""
+
+    muon_ht_eps: float = 1e-15
+    """Numerical-zero threshold used while applying the Muon Hyperball initialization."""
+
     embedding_init_method: Optional[Callable] = None
     """
     Method to initialize weights of the embedding layer. If None, will be set as described 

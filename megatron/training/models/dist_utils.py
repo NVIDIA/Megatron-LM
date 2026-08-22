@@ -12,6 +12,7 @@ from megatron.core.distributed import (
     FullyShardedDataParallel,
 )
 from megatron.core.full_cuda_graph import get_shared_capture_stream
+from megatron.core.model_initialization import maybe_initialize_muon_ht_parameters
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -30,7 +31,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config, get_pg_rank
-
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -189,6 +189,9 @@ def prepare_existing_model_chunks_for_distributed_training(
         for model_module in model_list:
             model_module.cuda(torch.cuda.current_device())
 
+    if not init_model_with_meta_device:
+        maybe_initialize_muon_ht_parameters(model_list, transformer_config, pg_collection)
+
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
@@ -197,6 +200,7 @@ def prepare_existing_model_chunks_for_distributed_training(
             to_empty_if_meta_device(model_module, device=torch.device("cuda"))
             for model_module in model_list
         ]
+        maybe_initialize_muon_ht_parameters(model_list, transformer_config, pg_collection)
 
     if correct_amax_history_if_needed is not None:
         correct_amax_history_if_needed(model_list)

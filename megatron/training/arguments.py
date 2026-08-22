@@ -2267,6 +2267,9 @@ def _add_network_size_args(parser):
         "init_method",
         "output_layer_init_method",
         "embedding_init_method",
+        # optimizer-specific model initialization; declared in regularization args
+        "muon_ht_radius",
+        "muon_ht_eps",
         "activation_func",
         "experimental_attention_variant_loss_scale_func",
         # types affect docstring
@@ -2639,6 +2642,18 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument(
+        '--muon-ht-eps',
+        type=float,
+        default=1e-15,
+        help='Minimum norm used for numerical stability by muon_ht',
+    )
+    group.add_argument(
+        '--muon-ht-radius',
+        type=float,
+        default=None,
+        help='Fixed global Frobenius norm required to initialize all muon_ht parameters',
+    )
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')
@@ -2887,11 +2902,15 @@ def _add_training_args(parser):
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
-    group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
-                       help='Optimizer function. '
-                            'Note: dist_muon is deprecated; use --optimizer muon '
-                            'with --use-distributed-optimizer instead.')
+    group.add_argument(
+        '--optimizer',
+        type=str,
+        default='adam',
+        choices=['adam', 'sgd', 'muon', 'muon_ht', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+        help='Optimizer function. '
+        'Note: dist_muon is deprecated; use --optimizer muon '
+        'with --use-distributed-optimizer instead.',
+    )
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',
