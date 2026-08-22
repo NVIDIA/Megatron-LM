@@ -137,6 +137,7 @@ def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
         output.copy_(torch.cat([input_, remote]))
 
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
     monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
     monkeypatch.setattr(
         torch.distributed,
