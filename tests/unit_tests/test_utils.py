@@ -179,7 +179,10 @@ def _init_distributed(world, rank):
     Utils.initialize_distributed()
     assert torch.distributed.is_initialized() == True
     assert torch.distributed.get_rank() == rank
-    assert torch.cuda.device_count() == world
+    # The number of visible GPUs is independent of the process-group world size:
+    # a single-process test may legitimately see every GPU on the node.
+    assert torch.cuda.device_count() > 0
+    assert torch.cuda.current_device() == Utils.rank % torch.cuda.device_count()
     torch.distributed.barrier()
 
 
