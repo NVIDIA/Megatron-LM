@@ -163,6 +163,34 @@ def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
     assert torch.equal(received[2]['padded_seq_len'], torch.tensor([4], dtype=torch.int32))
     assert gather_groups == [dp_cp_group] * 6
 
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=_Group(size=2, rank=1),
+            dp_cp_group=dp_cp_group,
+        )
+
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        'get_process_group_ranks',
+        lambda group: [0, 1] if group is dp_group else [0, 2],
+    )
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=dp_group,
+            dp_cp_group=dp_cp_group,
+        )
+
 
 def test_scheduler_reroute_rejects_unsupported_sample_keys():
     group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)

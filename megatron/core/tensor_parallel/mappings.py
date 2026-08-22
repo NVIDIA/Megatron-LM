@@ -39,8 +39,8 @@ def _reduce(input_, group):
 
 def _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
     """Reduce a contiguous dynamic-CP subgroup through one parent communicator."""
-    assert subgroup is not None, "subgroup should not be None"
-    assert parent_group is not None, "parent_group should not be None"
+    if subgroup is None or parent_group is None:
+        raise RuntimeError("Dynamic-CP parent reduction requires subgroup and parent_group.")
 
     parent_ranks = torch.distributed.get_process_group_ranks(parent_group)
     subgroup_ranks = torch.distributed.get_process_group_ranks(subgroup)

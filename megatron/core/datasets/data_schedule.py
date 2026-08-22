@@ -13,6 +13,7 @@ from megatron.core.datasets.data_schedule_utils import (
     create_data_iterator,
     get_batch_and_global_seqlens,
     get_cp_slice_for_thd,
+    get_data_parallel_gather_group,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
@@ -263,12 +264,7 @@ class DpBalancedScheduler(BasePackingScheduler):
         """
 
         total_dcp_gpus = dp_cp_group.size()
-        scheduler_dp_group = dp_group
-        if dp_group.size() == total_dcp_gpus:
-            assert (
-                dp_group.rank() == dp_cp_group.rank()
-            ), "Equivalent DP and DPxCP groups must use the same rank order."
-            scheduler_dp_group = dp_cp_group
+        scheduler_dp_group = get_data_parallel_gather_group(dp_group, dp_cp_group)
         is_first_pp = pp_group.rank() == 0
         is_last_pp = pp_group.rank() == pp_group.size() - 1
 

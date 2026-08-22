@@ -355,6 +355,22 @@ def create_data_iterator(
     return new_data_iterator
 
 
+def get_data_parallel_gather_group(dp_group, dp_cp_group):
+    """Reuse DPxCP only when it has exactly the same ordered ranks as DP."""
+    if dp_group.size() != dp_cp_group.size():
+        return dp_group
+
+    if dp_group is not dp_cp_group and torch.distributed.is_initialized():
+        dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+        dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+        groups_match = dp_ranks == dp_cp_ranks
+    else:
+        groups_match = dp_group.rank() == dp_cp_group.rank()
+    if not groups_match:
+        raise RuntimeError("Equivalent DP and DPxCP groups must use the same rank order.")
+    return dp_cp_group
+
+
 def reroute_samples_to_dcp_ranks(
     batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets, dp_group, dp_cp_group
 ):
@@ -381,10 +397,7 @@ def reroute_samples_to_dcp_ranks(
     dcp_rank = dp_cp_group.rank()
     dp_rank = dp_group.rank()
     dp_size = dp_group.size()
-    gather_group = dp_group
-    if dp_size == dp_cp_group.size():
-        assert dp_rank == dcp_rank, "Equivalent DP and DPxCP groups must use the same rank order."
-        gather_group = dp_cp_group
+    gather_group = get_data_parallel_gather_group(dp_group, dp_cp_group)
 
     # Keep collective ordering independent of dictionary insertion order. Unknown
     # keys require an explicit layout classification rather than being silently dropped.

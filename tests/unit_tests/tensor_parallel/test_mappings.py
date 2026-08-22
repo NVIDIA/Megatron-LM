@@ -84,6 +84,13 @@ def test_ReduceFromMixedDynamicCPSubgroupsViaParent():
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("subgroup,parent_group", ((None, object()), (object(), None)))
+def test_ReduceFromDynamicCPSubgroupRejectsMissingGroups(subgroup, parent_group):
+    with pytest.raises(RuntimeError, match="requires subgroup and parent_group"):
+        mappings._reduce_dynamic_cp_subgroup_via_parent(torch.ones(1), subgroup, parent_group)
+
+
+@pytest.mark.internal
 def test_ScatterToModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).cuda()

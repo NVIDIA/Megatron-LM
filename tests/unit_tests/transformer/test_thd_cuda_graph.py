@@ -1422,6 +1422,11 @@ class TestDynamicMicrobatchSlots:
         for value in static_inputs.values():
             assert value.tolist() == list(boundaries)
 
+        with pytest.raises(RuntimeError, match="has 4 entries, but 5 boundaries"):
+            TECudaGraphHelper._seed_thd_capture_cu_seqlens(
+                {"cu_seqlens_q": torch.zeros(4, dtype=torch.int32)}, boundaries
+            )
+
     @pytest.mark.internal
     def test_mla_rope_tensor_follows_te_graph_lifetime(self, monkeypatch):
         from megatron.core.transformer import cuda_graphs

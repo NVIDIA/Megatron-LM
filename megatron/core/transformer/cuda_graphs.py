@@ -2035,7 +2035,11 @@ class TECudaGraphHelper:
             if name not in static_inputs:
                 continue
             target = static_inputs[name]
-            assert target.numel() == len(boundaries)
+            if target.numel() != len(boundaries):
+                raise RuntimeError(
+                    f"THD capture input {name} has {target.numel()} entries, "
+                    f"but {len(boundaries)} boundaries were prepared."
+                )
             target.copy_(torch.tensor(boundaries, dtype=target.dtype, device=target.device))
 
     def _get_sample_arguments(self, order, chunk_id_list=None):

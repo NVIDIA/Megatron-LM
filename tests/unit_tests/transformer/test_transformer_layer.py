@@ -981,6 +981,33 @@ class TestMHCWithCudaGraph:
         assert not layer._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size
         assert not layer._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size
 
+    def test_dynamic_cp_graph_bank_rejects_invalid_runtime_metadata(self, monkeypatch):
+        """Runtime graph selection must keep its guards under optimized Python."""
+        expected_group = object()
+        layer = SimpleNamespace(
+            cuda_graphs_by_dynamic_cp_size={2: [object()]},
+            activate_te_cuda_graph_static_hidden_inputs=lambda _cp_size: None,
+        )
+        monkeypatch.setattr(
+            parallel_state,
+            "get_dynamic_data_context_parallel_groups",
+            lambda group_size: expected_group,
+        )
+
+        for params in (None, SimpleNamespace(local_cp_size=None, cp_group=expected_group)):
+            with pytest.raises(RuntimeError, match="requires packed sequence metadata"):
+                TransformerLayer._activate_dynamic_cp_cuda_graph(layer, params)
+
+        with pytest.raises(RuntimeError, match="No layer CUDA graph bank entry"):
+            TransformerLayer._activate_dynamic_cp_cuda_graph(
+                layer, SimpleNamespace(local_cp_size=4, cp_group=expected_group)
+            )
+
+        with pytest.raises(RuntimeError, match="process group that does not match"):
+            TransformerLayer._activate_dynamic_cp_cuda_graph(
+                layer, SimpleNamespace(local_cp_size=2, cp_group=object())
+            )
+
     def _create_split_layer(self):
         layer, config = self._create_mhc_layer(
             bf16=True,

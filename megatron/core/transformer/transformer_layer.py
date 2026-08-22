@@ -1411,16 +1411,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if not graph_bank:
             return
 
-        assert packed_seq_params is not None and packed_seq_params.local_cp_size is not None
+        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+            raise RuntimeError(
+                "Dynamic-CP CUDA graph replay requires packed sequence metadata with "
+                "local_cp_size."
+            )
         dynamic_cp_size = int(packed_seq_params.local_cp_size)
-        assert dynamic_cp_size in graph_bank, (
-            f"No layer CUDA graph bank entry for local_cp_size={dynamic_cp_size}; "
-            f"available sizes are {sorted(graph_bank)}."
-        )
+        if dynamic_cp_size not in graph_bank:
+            raise RuntimeError(
+                f"No layer CUDA graph bank entry for local_cp_size={dynamic_cp_size}; "
+                f"available sizes are {sorted(graph_bank)}."
+            )
         expected_group = parallel_state.get_dynamic_data_context_parallel_groups(
             group_size=dynamic_cp_size
         )
-        assert packed_seq_params.cp_group is expected_group
+        if packed_seq_params.cp_group is not expected_group:
+            raise RuntimeError(
+                "Dynamic-CP CUDA graph replay received a process group that does not match "
+                f"local_cp_size={dynamic_cp_size}."
+            )
         self.cuda_graphs = graph_bank[dynamic_cp_size]
         self.activate_te_cuda_graph_static_hidden_inputs(dynamic_cp_size)
 
