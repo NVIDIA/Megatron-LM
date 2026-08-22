@@ -47,7 +47,6 @@ from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
     parse_expert_idx,
-    remap_layer_index,
     to_global_layer_name,
 )
 
@@ -232,9 +231,7 @@ def load_hf_weights(
         payload = json.loads(index_path.read_text(encoding="utf-8"))
         weight_map = payload.get("weight_map", {})
         source_block_fp8 = any(str(name).endswith(".scale") for name in weight_map)
-    spec = DeepseekV4WeightSpec(
-        config, source_block_fp8=source_block_fp8
-    )
+    spec = DeepseekV4WeightSpec(config, source_block_fp8=source_block_fp8)
     _load(model, path, spec, ps, vocab_size=config.vocab_size)
     spec.bind_source_scales(unwrap_model(model), ps)
 
@@ -272,9 +269,7 @@ class DeepseekV4WeightSpec:
     ``weight<local>`` ids to global before calling ``native_to_hf``.
     """
 
-    def __init__(
-        self, config: DeepseekV4Config, *, source_block_fp8: bool = False
-    ):
+    def __init__(self, config: DeepseekV4Config, *, source_block_fp8: bool = False):
         self.config = config
         self.source_block_fp8 = source_block_fp8
         self.source_block_scales: dict[str, torch.Tensor] = {}
@@ -351,9 +346,9 @@ class DeepseekV4WeightSpec:
             ):
                 if weight.dtype == torch.float8_e4m3fn:
                     fp32_scale = _scale_to_float32(scale)
-                    master = dequantize_block_fp8(
-                        weight, fp32_scale, BLOCK_SHAPE
-                    ).to(torch.bfloat16)
+                    master = dequantize_block_fp8(weight, fp32_scale, BLOCK_SHAPE).to(
+                        torch.bfloat16
+                    )
                     restored = requantize_block_fp8_weight(master, fp32_scale)
                     if not torch.equal(restored.qweight, weight):
                         changed = int((restored.qweight != weight).sum().item())
@@ -412,19 +407,15 @@ class DeepseekV4WeightSpec:
     def bind_source_scales(self, model: nn.Module, ps: ParallelState) -> None:
         parameters = dict(model.named_parameters())
         registry: dict[str, torch.Tensor] = {}
-        global_to_local = {
-            global_idx: local_idx
-            for local_idx, global_idx in enumerate(
-                getattr(model, "layer_indices", ())
-            )
+        local_to_global = {
+            local_idx: global_idx
+            for local_idx, global_idx in enumerate(getattr(model, "layer_indices", ()))
         }
         local_start = ps.ep_rank * ensure_divisible(
             self.config.n_routed_experts, ps.ep_size
         )
-        for global_name, scale in self.source_block_scales.items():
-            name = remap_layer_index(global_name, global_to_local)
-            if name is None:
-                continue
+        for name, scale in self.source_block_scales.items():
+            global_name = to_global_layer_name(name, local_to_global)
             expert_id = self.expert_global_id(name)
             if expert_id is not None:
                 name = self.expert_local_name(name, expert_id - local_start)
@@ -432,6 +423,13 @@ class DeepseekV4WeightSpec:
             value = scale.to(parameter.device, dtype=torch.float32).contiguous()
             parameter._fp8_source_scales = value
             parameter._fp8_source_scale_version = parameter._version
+            module_name, _, parameter_name = name.rpartition(".")
+            owner = model.get_submodule(module_name) if module_name else model
+            owner_scales = getattr(owner, "_fp8_source_scales_by_parameter", None)
+            if owner_scales is None:
+                owner_scales = {}
+                owner._fp8_source_scales_by_parameter = owner_scales
+            owner_scales[parameter_name] = value
             registry[global_name] = scale.detach().cpu().float().contiguous()
         model._fp8_source_scales_by_name = registry
         model._fp8_source_scales_valid = True
@@ -565,6 +563,10 @@ def invalidate_bound_source_scales(model: nn.Module) -> None:
 
     model._fp8_source_scales_valid = False
     model._fp8_source_scales_by_name = {}
+    for module in model.modules():
+        scales = getattr(module, "_fp8_source_scales_by_parameter", None)
+        if scales is not None:
+            scales.clear()
 
 
 def _export_source_scales(
@@ -586,9 +588,7 @@ def _export_source_scales(
         ).items():
             global_name = to_global_layer_name(native_name, layer_map)
             names = _hf_names_for_state_key(global_name, config)
-            values = (
-                scale.chunk(2, dim=0) if len(names) == 2 else (scale,)
-            )
+            values = scale.chunk(2, dim=0) if len(names) == 2 else (scale,)
             for name, value in zip(names, values, strict=True):
                 value = value.detach().cpu().float().contiguous()
                 previous = local.get(name)
@@ -596,20 +596,47 @@ def _export_source_scales(
                     raise RuntimeError(f"conflicting source scales for {name}")
                 local[name] = value
 
-    if ps.pp_size <= 1:
+    local = _gather_source_scale_registry(
+        local,
+        size=ps.ep_size,
+        group=ps.ep_group,
+        parallelism="EP",
+    )
+    return _gather_source_scale_registry(
+        local,
+        size=ps.pp_size,
+        group=ps.pp_group,
+        parallelism="PP",
+    )
+
+
+def _gather_source_scale_registry(
+    local: dict[str, torch.Tensor],
+    *,
+    size: int,
+    group,
+    parallelism: str,
+) -> dict[str, torch.Tensor]:
+    if size <= 1:
         return local
-    if not dist.is_initialized() or ps.pp_group is None:
-        raise RuntimeError("PP source-scale export requires an initialized PP group")
-    gathered: list[dict[str, torch.Tensor] | None] = [None] * ps.pp_size
-    dist.all_gather_object(gathered, local, group=ps.pp_group)
+    if not dist.is_initialized() or group is None:
+        raise RuntimeError(
+            f"{parallelism} source-scale export requires an initialized group"
+        )
+    gathered: list[dict[str, torch.Tensor] | None] = [None] * size
+    dist.all_gather_object(gathered, local, group=group)
     combined: dict[str, torch.Tensor] = {}
     for registry in gathered:
         if registry is None:
-            raise RuntimeError("PP source-scale gather returned an empty stage")
+            raise RuntimeError(
+                f"{parallelism} source-scale gather returned an empty registry"
+            )
         for name, value in registry.items():
             previous = combined.get(name)
             if previous is not None and not torch.equal(previous, value):
-                raise RuntimeError(f"conflicting PP source scales for {name}")
+                raise RuntimeError(
+                    f"conflicting {parallelism} source scales for {name}"
+                )
             combined[name] = value
     return combined
 

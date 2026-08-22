@@ -192,6 +192,12 @@ def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
     assert torch.equal(restored.qweight, qweight)
     assert master._fp8_source_scale_version == master._version
     assert torch.equal(
+        model.layers["0"].self_attn.self_attn.wq_a._fp8_source_scales_by_parameter[
+            "weight"
+        ],
+        scale,
+    )
+    assert torch.equal(
         model._fp8_source_scales_by_name[
             "layers.0.self_attn.self_attn.wq_a.weight"
         ],
@@ -307,7 +313,7 @@ def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
 
     ckpt = _checkpoint_module()
     model = nn.Module()
-    model.layer_indices = [0]
+    model.layer_indices = [2]
     model.layers = nn.ModuleDict({"0": nn.Module()})
     layer = model.layers["0"]
     layer.mlp = nn.Module()
@@ -319,6 +325,8 @@ def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
     cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=256)
     spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
     scale = torch.ones(1, 1, dtype=torch.float32)
+    # The shared loader has already remapped the PP-stage layer to its local
+    # index, while the expert suffix remains global until EP binding.
     spec.source_block_scales["layers.0.mlp.experts.fc1.weight128"] = scale
     ps = SimpleNamespace(ep_size=2, ep_rank=1)
 
@@ -326,7 +334,31 @@ def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
 
     parameter = layer.mlp.experts.fc1.weight0
     assert torch.equal(parameter._fp8_source_scales, scale)
-    assert "layers.0.mlp.experts.fc1.weight128" in model._fp8_source_scales_by_name
+    assert torch.equal(
+        layer.mlp.experts.fc1._fp8_source_scales_by_parameter["weight0"], scale
+    )
+    assert "layers.2.mlp.experts.fc1.weight128" in model._fp8_source_scales_by_name
+
+
+def test_ds4_source_scale_export_gathers_remote_ep_experts(monkeypatch):
+    ckpt = _checkpoint_module()
+    local = {"layers.0.ffn.experts.0.w1.weight": torch.tensor([[1.0]])}
+    remote = {"layers.0.ffn.experts.128.w1.weight": torch.tensor([[2.0]])}
+    group = object()
+
+    monkeypatch.setattr(ckpt.dist, "is_initialized", lambda: True)
+
+    def fake_all_gather_object(output, value, *, group):
+        output[:] = [value, remote]
+
+    monkeypatch.setattr(ckpt.dist, "all_gather_object", fake_all_gather_object)
+
+    combined = ckpt._gather_source_scale_registry(
+        local, size=2, group=group, parallelism="EP"
+    )
+
+    assert set(combined) == set(local) | set(remote)
+    assert torch.equal(combined[next(iter(remote))], next(iter(remote.values())))
 
 
 def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):

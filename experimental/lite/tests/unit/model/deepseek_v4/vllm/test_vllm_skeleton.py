@@ -276,9 +276,11 @@ def test_post_optimizer_step_invalidates_all_deployment_weights() -> None:
     model = nn.Sequential(CacheOwner(), CacheOwner())
     model._fp8_source_scales_valid = True
     model._fp8_source_scales_by_name = {"weight": torch.ones(1)}
+    model[0]._fp8_source_scales_by_parameter = {"weight": torch.ones(1)}
 
     protocol._post_optimizer_step(model)
 
     assert model._fp8_source_scales_valid is False
     assert model._fp8_source_scales_by_name == {}
+    assert model[0]._fp8_source_scales_by_parameter == {}
     assert [module.cleared for module in model] == [1, 1]

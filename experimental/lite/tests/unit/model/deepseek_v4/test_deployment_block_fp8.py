@@ -15,6 +15,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     BLOCK_SHAPE,
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
+    bind_source_scale_to_visible_weight,
     fp8_gemm_nt,
     pack_block_fp8_activation,
     pack_block_fp8_weight,
@@ -138,6 +139,22 @@ def test_fixed_scale_requantization_reconstructs_fp8_bitwise() -> None:
 
     assert torch.equal(reconstructed.qweight, qweight)
     assert reconstructed.scales is scales
+
+
+def test_module_owned_source_scale_applies_to_plain_visible_weight() -> None:
+    owner = nn.Module()
+    qweight = torch.randn(128, 256).clamp(-4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.125, 0.25]], dtype=torch.float32)
+    expanded = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    visible_weight = nn.Parameter((qweight.float() * expanded).to(torch.bfloat16))
+    owner._fp8_source_scales_by_parameter = {"weight": scale}
+
+    bound = bind_source_scale_to_visible_weight(owner, "weight", visible_weight)
+    reconstructed = deployment_fp8.quantize_block_fp8_weight(bound)
+
+    assert bound is visible_weight
+    assert torch.equal(reconstructed.qweight, qweight)
+    assert reconstructed.scales is scale
 
 
 def test_grouped_weight_scales_are_transformed_jointly(fake_vllm) -> None:

@@ -26,6 +26,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
     quantize_block_fp8_weight,
+    bind_source_scale_to_visible_weight,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
     attach_indexer_aux_loss,
@@ -240,6 +241,8 @@ class VLLMAttention(CompressedSparseAttention):
     ) -> torch.Tensor:
         heads_per_group = self.config.num_attention_heads // self.config.o_groups
         nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
+        bind_source_scale_to_visible_weight(self.wo_a, "weight", self.wo_a.weight)
+        bind_source_scale_to_visible_weight(self.wo_b, "weight", self.wo_b.weight)
         return _o_projection(
             lambda value, wa, wb: o_projection_visible(
                 value,
@@ -266,6 +269,9 @@ class VLLMAttention(CompressedSparseAttention):
         )
 
     def _input_projections(self, hidden_states: torch.Tensor):
+        bind_source_scale_to_visible_weight(self.wq_a, "weight", self.wq_a.weight)
+        bind_source_scale_to_visible_weight(self.wkv, "weight", self.wkv.weight)
+
         def fused_projection():
             return fused_block_fp8_linear(
                 self.fused_linear,
@@ -686,6 +692,7 @@ class VLLMAttention(CompressedSparseAttention):
             self.kv_norm.weight,
             self.config.rms_norm_eps,
         )
+        bind_source_scale_to_visible_weight(self.wq_b, "weight", self.wq_b.weight)
         q = block_fp8_linear(self.q_linear, qr, self.wq_b.weight).view(
             -1, self.config.num_attention_heads, self.config.head_dim
         )
@@ -693,7 +700,9 @@ class VLLMAttention(CompressedSparseAttention):
             block_fp8_linear(
                 self.indexer_q_linear,
                 qr,
-                self.indexer.wq_b.weight,
+                bind_source_scale_to_visible_weight(
+                    self.indexer.wq_b, "weight", self.indexer.wq_b.weight
+                ),
             )
             .view(-1, self.config.index_n_heads, self.config.index_head_dim)
             .contiguous()

@@ -22,6 +22,7 @@ from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     DeploymentBlockFP8Adapter,
+    bind_source_scale_to_visible_weight,
 )
 
 
@@ -117,10 +118,16 @@ class _VLLMVisibleExperts(Experts):
                 dtype=tokens_per_expert.dtype,
             )
         w13 = tuple(
-            getattr(self.fc1, f"weight{i}") for i in range(self.num_local_experts)
+            bind_source_scale_to_visible_weight(
+                self.fc1, f"weight{i}", getattr(self.fc1, f"weight{i}")
+            )
+            for i in range(self.num_local_experts)
         )
         w2 = tuple(
-            getattr(self.fc2, f"weight{i}") for i in range(self.num_local_experts)
+            bind_source_scale_to_visible_weight(
+                self.fc2, f"weight{i}", getattr(self.fc2, f"weight{i}")
+            )
+            for i in range(self.num_local_experts)
         )
         return VLLMGroupedMoEWithBF16Backward.apply(
             hidden_states,
@@ -178,6 +185,16 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         return _VLLMVisibleExperts(config, ps)
 
     def _shared_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        bind_source_scale_to_visible_weight(
+            self.shared_experts.gate_up,
+            "weight",
+            self.shared_experts.gate_up.weight,
+        )
+        bind_source_scale_to_visible_weight(
+            self.shared_experts.down,
+            "weight",
+            self.shared_experts.down.weight,
+        )
         gate_up = block_fp8_linear(
             self.shared_gate_up_fp8,
             hidden_states,

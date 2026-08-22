@@ -30,20 +30,31 @@ class PackedBlockFP8Activation:
 
 
 def _key(weight: nn.Parameter):
-    return (id(weight), weight._version, weight.device, weight.dtype, tuple(weight.shape))
+    return (
+        id(weight),
+        weight._version,
+        weight.device,
+        weight.dtype,
+        tuple(weight.shape),
+    )
 
 
 def _validate_weight(weight: torch.Tensor) -> None:
     if weight.dtype != torch.bfloat16 or weight.ndim != 2:
         raise TypeError("block-FP8 master weight must be a 2-D BF16 tensor")
     if any(size % block for size, block in zip(weight.shape, BLOCK_SHAPE, strict=True)):
-        raise ValueError(f"weight shape {tuple(weight.shape)} must be divisible by {BLOCK_SHAPE}")
+        raise ValueError(
+            f"weight shape {tuple(weight.shape)} must be divisible by {BLOCK_SHAPE}"
+        )
 
 
 def quantize_block_fp8_weight(weight: torch.Tensor):
     _validate_weight(weight)
     scales = getattr(weight, "_fp8_source_scales", None)
-    if scales is not None and getattr(weight, "_fp8_source_scale_version", None) == weight._version:
+    if (
+        scales is not None
+        and getattr(weight, "_fp8_source_scale_version", None) == weight._version
+    ):
         return requantize_block_fp8_weight(weight, scales)
     with torch.no_grad():
         from vllm.utils.deep_gemm import per_block_cast_to_fp8
@@ -52,6 +63,18 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
             weight.detach(), block_size=list(BLOCK_SHAPE), use_ue8m0=False
         )
     return CanonicalBlockFP8Weight(qweight, scales)
+
+
+def bind_source_scale_to_visible_weight(
+    module: nn.Module, parameter_name: str, weight: torch.Tensor
+):
+    """Apply model-owned checkpoint scale metadata to the visible weight."""
+
+    scales = getattr(module, "_fp8_source_scales_by_parameter", {}).get(parameter_name)
+    if scales is not None:
+        weight._fp8_source_scales = scales
+        weight._fp8_source_scale_version = weight._version
+    return weight
 
 
 def _post_process(qweight, scales):
@@ -80,13 +103,23 @@ def pack_grouped_block_fp8_weight(weights: Iterable[nn.Parameter]):
         torch.stack([item.qweight for item in canonical]),
         torch.stack([item.scales for item in canonical]),
     )
-    return PackedBlockFP8Weight(qweight, scales, tuple(_key(weight) for weight in weights))
+    return PackedBlockFP8Weight(
+        qweight, scales, tuple(_key(weight) for weight in weights)
+    )
 
 
 def pack_block_fp8_activation(x: torch.Tensor):
-    if x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] % 128 or x.stride(-1) != 1:
-        raise ValueError("block-FP8 activation must be contiguous 2-D BF16 with K divisible by 128")
+    if (
+        x.dtype != torch.bfloat16
+        or x.ndim != 2
+        or x.shape[1] % 128
+        or x.stride(-1) != 1
+    ):
+        raise ValueError(
+            "block-FP8 activation must be contiguous 2-D BF16 with K divisible by 128"
+        )
     from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
     oracle = DeepGemmQuantScaleFMT.from_oracle()
     packed = getattr(oracle, "name", "") == "UE8M0"
     fp8_utils = importlib.import_module(
@@ -115,7 +148,9 @@ def fp8_gemm_nt(x: torch.Tensor, weight: PackedBlockFP8Weight):
     if x.ndim != 2 or x.shape[1] != weight.qweight.shape[-1]:
         raise ValueError("activation K does not match packed weight K")
     activation = pack_block_fp8_activation(x)
-    output = torch.empty((x.shape[0], weight.qweight.shape[-2]), dtype=torch.bfloat16, device=x.device)
+    output = torch.empty(
+        (x.shape[0], weight.qweight.shape[-2]), dtype=torch.bfloat16, device=x.device
+    )
     with torch.no_grad():
         from vllm.utils.deep_gemm import fp8_gemm_nt as deep_gemm_fp8_gemm_nt
 
@@ -138,7 +173,11 @@ class DeploymentBlockFP8Adapter:
 
     def pack_weight(self, weight: nn.Parameter):
         key = _key(weight)
-        if self.cache_weight and self._cached_weight is not None and self._cached_weight.cache_key == key:
+        if (
+            self.cache_weight
+            and self._cached_weight is not None
+            and self._cached_weight.cache_key == key
+        ):
             return self._cached_weight
         packed = pack_block_fp8_weight(weight)
         if self.cache_weight:
@@ -153,7 +192,11 @@ class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
     def pack_weight(self, weights):
         weights = tuple(weights)
         key = tuple(_key(weight) for weight in weights)
-        if self.cache_weight and self._cached_weight is not None and self._cached_weight.cache_key == key:
+        if (
+            self.cache_weight
+            and self._cached_weight is not None
+            and self._cached_weight.cache_key == key
+        ):
             return self._cached_weight
         canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
         qweight, scales = _post_process(
