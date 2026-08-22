@@ -228,7 +228,8 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
     )
     assert all("ncclSymk" in kernel.name for kernel in reduce_scatter_kernels), (
         "Expected all zero-CTA reduce-scatter kernels to be ncclSymk kernels. "
-        f"Observed reduce-scatter kernels: {[kernel.name for kernel in reduce_scatter_kernels[:20]]}"
+        "Observed reduce-scatter kernels: "
+        f"{[kernel.name for kernel in reduce_scatter_kernels[:20]]}"
     )
 
     # Release the dedicated communicator (leaks only on a test failure above, which is fine).
