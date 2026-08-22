@@ -1306,6 +1306,7 @@ class TestRLUtils:
             initial_sizes == restored_sizes
         ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
 
+    @pytest.mark.parametrize("use_tms_offload", [False, True])
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [
@@ -1315,8 +1316,10 @@ class TestRLUtils:
         ],
         indirect=["initialize_model_parallel"],
     )
-    def test_optimizer_offload(self, initialize_model_parallel):
-        """Test that optimizer offload_to_cpu/restore_from_cpu correctly moves state to/from CPU."""
+    def test_optimizer_offload(self, initialize_model_parallel, use_tms_offload):
+        """Test the optimizer offload/restore round trip with TMS, and fail-loud without it."""
+        if use_tms_offload:
+            pytest.importorskip("torch_memory_saver")
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         model_parallel_cuda_manual_seed(123)
@@ -1345,76 +1348,65 @@ class TestRLUtils:
 
         # Create optimizer
         optimizer_config = OptimizerConfig(
-            optimizer='adam', bf16=True, use_distributed_optimizer=True
+            optimizer='adam',
+            bf16=True,
+            use_distributed_optimizer=True,
+            rl_offload_optimizer_during_inference=use_tms_offload,
         )
         optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
 
-        # Manually initialize optimizer state (simulating what happens after first step)
-        # This avoids needing to run a full forward/backward/step cycle
-        for opt in optimizer.chained_optimizers:
-            if hasattr(opt, 'optimizer') and opt.optimizer is not None:
-                for group in opt.optimizer.param_groups:
-                    for p in group['params']:
-                        if len(opt.optimizer.state[p]) == 0:
-                            # Initialize Adam state (exp_avg and exp_avg_sq) on GPU
-                            opt.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                            opt.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
-                            opt.optimizer.state[p]['step'] = torch.tensor(1)
-
-        # Helper to check if optimizer state tensors are on GPU or CPU
-        def get_optimizer_state_devices():
-            devices = set()
+        def iter_state_tensors():
             for opt in optimizer.chained_optimizers:
                 if hasattr(opt, 'optimizer') and opt.optimizer is not None:
-                    for state_dict in opt.optimizer.state.values():
-                        for v in state_dict.values():
+                    for state in opt.optimizer.state.values():
+                        for v in state.values():
                             if isinstance(v, torch.Tensor):
-                                devices.add(str(v.device))
-            return devices
+                                yield v
 
-        # Verify optimizer state is initially on GPU
-        initial_devices = get_optimizer_state_devices()
-        assert any(
-            'cuda' in d for d in initial_devices
-        ), f"Expected optimizer state on GPU initially, got devices: {initial_devices}"
+        if use_tms_offload:
+            # TMS path: the optimizer state must be materialized eagerly during construction.
+            recorded = []  # (live state tensor, expected values)
+            for v in iter_state_tensors():
+                if v.is_floating_point():
+                    assert v.is_cuda, f"Expected optimizer state on GPU, got {v.device}"
+                    v.normal_()
+                    recorded.append((v, v.detach().clone()))
+            assert recorded, (
+                "Expected optimizer state to be eagerly materialized inside the TMS region during "
+                "construction when rl_offload_optimizer_during_inference is set, but it was empty."
+            )
 
-        # Record GPU memory before offload
-        torch.cuda.synchronize()
-        memory_before_offload = torch.cuda.memory_allocated()
+            # The fp32 master weights are in the region too.
+            for opt in optimizer.chained_optimizers:
+                if hasattr(opt, 'optimizer') and opt.optimizer is not None:
+                    for group in opt.optimizer.param_groups:
+                        for p in group['params']:
+                            if isinstance(p, torch.Tensor):
+                                assert p.is_cuda, f"Expected master weights on GPU, got {p.device}"
+                                p.data.normal_()
+                                recorded.append((p.data, p.data.detach().clone()))
 
-        # Offload optimizer state to CPU
-        optimizer.offload_to_cpu()
+            optimizer.offload_to_cpu()
+            for v, _ in recorded:
+                assert v.is_cuda, (
+                    f"TMS offload must keep optimizer state at its cuda virtual address "
+                    f"(pause/resume), got {v.device}"
+                )
 
-        # Verify GPU memory decreased (optimizer state should be freed)
-        torch.cuda.synchronize()
-        memory_after_offload = torch.cuda.memory_allocated()
-        assert memory_after_offload < memory_before_offload, (
-            f"Expected GPU memory to decrease after offload. "
-            f"Before: {memory_before_offload}, After: {memory_after_offload}"
-        )
-
-        # Verify optimizer state is now on CPU
-        offloaded_devices = get_optimizer_state_devices()
-        assert all(
-            'cpu' in d for d in offloaded_devices
-        ), f"Expected all optimizer state on CPU after offload, got devices: {offloaded_devices}"
-
-        # Restore optimizer state to GPU
-        optimizer.restore_from_cpu()
-
-        # Verify optimizer state is back on GPU
-        restored_devices = get_optimizer_state_devices()
-        assert any(
-            'cuda' in d for d in restored_devices
-        ), f"Expected optimizer state on GPU after restore, got devices: {restored_devices}"
-
-        # Verify GPU memory increased after restore (optimizer state reallocated)
-        torch.cuda.synchronize()
-        memory_after_restore = torch.cuda.memory_allocated()
-        assert memory_after_restore > memory_after_offload, (
-            f"Expected GPU memory to increase after restore. "
-            f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
-        )
+            optimizer.restore_from_cpu()
+            for v, expected in recorded:
+                assert v.is_cuda, f"Expected optimizer state on GPU after restore, got {v.device}"
+                torch.testing.assert_close(
+                    v, expected, msg="Optimizer state must be identical after offload/restore"
+                )
+        else:
+            # There is deliberately no non-TMS fallback: offload/restore must fail loudly
+            # rather than silently degrade to the .cpu()/.cuda() round trip, which would
+            # re-allocate optimizer state inside the CUDA-graph memory pool on restore.
+            with pytest.raises(RuntimeError, match="torch_memory_saver"):
+                optimizer.offload_to_cpu()
+            with pytest.raises(RuntimeError, match="torch_memory_saver"):
+                optimizer.restore_from_cpu()
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

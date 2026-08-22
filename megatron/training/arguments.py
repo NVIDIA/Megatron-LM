@@ -512,6 +512,22 @@ def validate_args(args, defaults={}):
             not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
         ), "Cannot recapture CUDA graphs while offloading KV cache."
 
+        # Validate optimizer offloading requires the distributed optimizer and torch_memory_saver.
+        if args.rl_offload_optimizer_during_inference:
+            assert args.use_distributed_optimizer, \
+                "--rl-offload-optimizer-during-inference requires --use-distributed-optimizer."
+            assert not args.optimizer_cpu_offload, \
+                "--rl-offload-optimizer-during-inference is incompatible with " \
+                "--optimizer-cpu-offload."
+            try:
+                from torch_memory_saver import torch_memory_saver
+            except ImportError:
+                raise AssertionError(
+                    "--rl-offload-optimizer-during-inference requires torch_memory_saver "
+                    "to keep optimizer tensors out of the CUDA graph memory pool. "
+                    "See https://github.com/fzyzcjy/torch_memory_saver."
+                )
+
         # Validate inference model offloading - requires either UVM or torch_memory_saver
         if args.rl_offload_inference_model_weights_when_idle:
             if args.rl_inference_model_unified_memory_level != 1:
