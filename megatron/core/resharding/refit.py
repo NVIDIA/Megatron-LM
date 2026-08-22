@@ -410,6 +410,26 @@ def swap_model_weights(
             pool_index=pool,
         )
 
+        if target is not None:
+            _refresh_inference_weight_caches(target)
+
+
+def _refresh_inference_weight_caches(target_model) -> None:
+    """Recompute any values a module derives from weights and caches for decode.
+
+    A refit updates weights in place while the target stays in eval mode, so the
+    ``train()`` transition that normally invalidates such caches never happens.
+    Modules that keep one expose ``refresh_inference_weight_caches``; without
+    this call they would keep decoding from values derived from the weights the
+    target held before the refit.
+    """
+    chunks = target_model if isinstance(target_model, (list, tuple)) else [target_model]
+    for chunk in chunks:
+        for module in chunk.modules():
+            refresh = getattr(module, "refresh_inference_weight_caches", None)
+            if refresh is not None:
+                refresh()
+
 
 def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
     """Bring destination persistent-buffer dtypes into agreement with source.
