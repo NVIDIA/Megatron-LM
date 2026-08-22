@@ -140,6 +140,13 @@ class ProcessGroupCollection:
     # _EXPERT_GTP_WEIGHT_REMAT_GROUP
     expt_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
+    # _TP_GTP_WEIGHT_REMAT_GROUP — fused (tp x gtp_remat) domain for layer-sharded
+    # Muon's single all_to_all (None unless both axes are non-trivial).
+    tp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP
+    expt_tp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
@@ -307,6 +314,12 @@ class ProcessGroupCollection:
             ),
             'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
+            ),
+            'tp_gtp_remat': partial(
+                parallel_state.get_tp_gtp_weight_remat_group, check_initialized=False
+            ),
+            'expt_tp_gtp_remat': partial(
+                parallel_state.get_expert_tp_gtp_weight_remat_group, check_initialized=False
             ),
         }
 

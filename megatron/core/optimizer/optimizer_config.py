@@ -285,11 +285,60 @@ class OptimizerConfig:
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
     change as TP changes. Defaults to "duplicated"."""
 
-    muon_use_syrk: bool = False
-    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
-
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK (symmetric rank-k) kernel for the symmetric-output
+    Newton-Schulz GEMMs (all Muon modes; TensorParallelMuon additionally needs
+    emerging-optimizers >= 0.4.0 for the TP entry point), computing one triangle only —
+    roughly a third off total NS FLOPs for near-square matrices. Only takes effect
+    with muon_fp32_matmul_prec='medium', 8-aligned dims, Triton >= 3.4 and a
+    validated SM arch. Unbatched (2-D) NS chunks always qualify; batched (3-D)
+    chunks additionally need an emerging-optimizers that ships the batched SYRK
+    kernel (batched_tsyrk_ex, >= 0.5.0a0) and otherwise fall back to baddbmm
+    with a one-time warning. Same math,
+    different kernel: results differ from the GEMM path by kernel-level rounding.
+
+    MEASURED: on GB300 (SM 10.3, Triton 3.4) SYRK is a steady-state WIN — NS5 on a
+    (12288, 10240) matrix runs 17.5 ms with SYRK vs 23.4 ms without (0.75x, warm
+    median; ratio identical at NS16 and across emerging-optimizers 0.4.0/main).
+    An earlier in-training profile reported SYRK slower (30.8 vs 26.0 ms); that was
+    a measurement artifact of the first-call cost. The operational caveat is that
+    first call: each rank pays a one-time ~30 s Triton autotune+compile per distinct
+    matrix shape (measured 32-34 s on this shape), so the first optimizer step of a
+    run is minutes slower on a cold Triton cache — budget for it in step-time
+    monitoring, or persist TRITON_CACHE_DIR across runs. Defaults to False."""
+
+    muon_ns_batch_size: int = 1
+    """Max number of same-shape matrices fused into one batched Newton-Schulz under
+    layer-sharded muon. MoE assigns hundreds of identically shaped expert weights to a
+    single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
+    transient stack of this many matrices for far fewer launches. Batches of more than
+    one use baddbmm instead of addmm, so results differ from the per-matrix path by
+    kernel-level floating point rounding and bitwise parity with duplicated mode is
+    lost. Only used when use_layer_sharding_muon is set. Defaults to 1 (bit-exact
+    per-matrix path); raise (e.g. to 32) to trade bitwise parity for fewer kernel
+    launches on MoE expert homes. Values > 1 require emerging-optimizers >= 0.3.0
+    (batched 3-D Newton-Schulz); the default runs on any version with the
+    newton_schulz API."""
+
+    use_layer_sharding_muon: bool = False
+    """If true, use LayerShardedMuon instead of TensorParallelMuon when optimizer is 'muon'.
+    Each 2D weight is assigned one NS home rank in the (GTP x TP) domain; all_to_all stages
+    over the gtp and tp groups assemble the complete (P, Q) momentum on the home, the exact
+    same full-matrix Newton-Schulz as duplicated mode runs there with zero communication and
+    zero redundancy, and reverse all_to_all stages scatter the result back to the original
+    shards. Requires the layer-wise distributed optimizer path; muon_tp_mode is ignored
+    (layer sharding replaces the duplicated/distributed mode selection entirely).
+    Defaults to False."""
+
+    muon_concurrent_groups: bool = True
+    """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
+    on its own CUDA stream so one group's compute fills another group's all_to_all stall.
+    Bitwise-neutral (op order within a group is unchanged), but the transient buffers of
+    all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
+    tight. Only used when use_layer_sharding_muon is set. Defaults to True."""
 
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.

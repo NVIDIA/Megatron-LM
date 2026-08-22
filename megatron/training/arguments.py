@@ -1740,6 +1740,29 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
+        if getattr(args, 'use_layer_sharding_muon', False):
+            assert args.optimizer == 'muon', (
+                f"--use-layer-sharding-muon is only supported with --optimizer muon "
+                f"(got --optimizer {args.optimizer}). Other Muon variants such as "
+                "adaptive_muon do not implement layer sharding."
+            )
+            assert args.use_layer_wise_distributed_optimizer, (
+                "--use-layer-sharding-muon requires the layer-wise distributed "
+                "optimizer path (--optimizer muon with --use-distributed-optimizer)."
+            )
+            assert not args.muon_split_qkv, (
+                "--use-layer-sharding-muon does not implement split-QKV Newton-Schulz "
+                "yet; pass --muon-no-split-qkv."
+            )
+            if args.muon_tp_mode != 'blockwise':
+                # The kwargs builder matches constructor parameters reflectively, so
+                # an unmatched muon_tp_mode is dropped silently — surface it instead.
+                warn_rank_0(
+                    f"--muon-tp-mode {args.muon_tp_mode} is ignored under "
+                    "--use-layer-sharding-muon: layer sharding replaces the "
+                    "duplicated/distributed mode selection entirely."
+                )
+
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2653,9 +2676,32 @@ def _add_regularization_args(parser):
                        'blockwise orthogonalizes each shard on its own, so the update rule '
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results.')
+    group.add_argument('--use-layer-sharding-muon', action='store_true',
+                       help='Use LayerShardedMuon: each 2D weight is assigned one NS home '
+                       'rank in the (gtp_remat x tp) domain; all_to_all exchanges assemble '
+                       'the full matrix there, Newton-Schulz runs locally with zero '
+                       'communication and zero redundancy, and the result is scattered '
+                       'back. Mathematically identical to duplicated-mode NS. Requires '
+                       'the layer-wise distributed optimizer path (emerging optimizer + '
+                       '--use-distributed-optimizer).')
+    group.add_argument('--muon-ns-batch-size', type=int, default=1,
+                       help='Max number of same-shape matrices fused into one batched '
+                       'Newton-Schulz on an NS home under --use-layer-sharding-muon. '
+                       'The default of 1 keeps the bit-exact per-matrix path; raise '
+                       '(e.g. to 32) to cut kernel launches on MoE expert homes at '
+                       'the cost of bitwise parity (baddbmm vs addmm rounding).')
     group.add_argument('--muon-use-syrk', action='store_true',
-                       help='Use the Triton SYRK kernel for the Gram matrix '
-                       'in Newton-Schulz iteration.')
+                       help='Use the Triton SYRK kernel for the symmetric-output '
+                       'Newton-Schulz GEMMs in Muon (~1/3 off '
+                       'NS FLOPs for near-square matrices). Requires '
+                       '--muon-fp32-matmul-prec medium; auto-disabled when Triton/SM '
+                       'requirements are unmet.')
+    group.add_argument('--muon-no-concurrent-groups', action='store_false',
+                       dest='muon_concurrent_groups',
+                       help='Serialize param groups on one CUDA stream under '
+                       '--use-layer-sharding-muon instead of overlapping one group\'s '
+                       'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
+                       'when the concurrent transient buffers push peak memory too high.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',

@@ -104,9 +104,12 @@ class EmergingOptimizerEntry:
     """Everything needed to create and configure an emerging optimizer.
 
     Attributes:
-        optimizer_cls: The torch optimizer class.
+        optimizer_cls: The torch optimizer class (default when config_to_cls is None).
         init_state_fn: Lazily initialises optimizer state (needed for checkpoint formats).
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
+        config_to_cls: Optional ``(config) -> type`` callable. When provided, overrides
+            ``optimizer_cls`` so the instantiated class can vary based on config (e.g.
+            selecting ``LayerShardedMuon`` when ``use_layer_sharding_muon`` is set).
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
     """
@@ -114,6 +117,7 @@ class EmergingOptimizerEntry:
     optimizer_cls: type
     init_state_fn: Callable = _eopt_init_state_fn
     config_to_kwargs: Callable | None = None
+    config_to_cls: Callable | None = None
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
         default_factory=_default_param_overrides_factory
     )
@@ -128,7 +132,10 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
         eopt_kwargs = _default_adam_based_eopt_config_to_kwargs(
             eopt_name, config, model_chunks, pg_collection
         )
-    optimizer = entry.optimizer_cls(param_groups, **eopt_kwargs)
+    optimizer_cls = (
+        entry.config_to_cls(config) if entry.config_to_cls is not None else entry.optimizer_cls
+    )
+    optimizer = optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
 
 
@@ -551,13 +558,72 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
     return kwargs
 
 
+def _use_layer_sharding_muon(config) -> bool:
+    return getattr(config, 'use_layer_sharding_muon', False)
+
+
+def _muon_config_to_cls(config) -> type:
+    """Return the Muon optimizer class based on config.
+
+    Returns ``LayerShardedMuon`` when ``use_layer_sharding_muon`` is set;
+    ``TensorParallelMuon`` otherwise.
+    """
+    if _use_layer_sharding_muon(config):
+        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+        return LayerShardedMuon
+    return TensorParallelMuon
+
+
+def _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to LayerShardedMuon constructor kwargs.
+
+    Layered on top of :func:`_muon_config_to_kwargs` the same way
+    :func:`_adaptive_muon_config_to_kwargs` is: the parent-class kwargs
+    (including ``is_qkv_fn``, ``qkv_split_shapes`` and ``pg_collection`` — the
+    latter is what makes the empty-``param_ns_homes`` fallback TP-correct) come
+    from the shared TensorParallelMuon builder, then LayerShardedMuon's own
+    muon-prefixed attrs and the (GTP, TP) process groups are added. NS home
+    assignments are wired after construction by
+    ``LayerWiseDistributedOptimizer._wire_layer_sharding_ns_homes``.
+    """
+    from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+    kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    kwargs.update(_kwargs_from_config(LayerShardedMuon, "muon", config))
+    kwargs['gtp_group'] = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
+    kwargs['tp_group'] = getattr(pg_collection, 'tp', None) if pg_collection else None
+    return kwargs
+
+
 def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Convert OptimizerConfig to TensorParallelMuon constructor kwargs."""
+    """Convert OptimizerConfig to TensorParallelMuon constructor kwargs.
+
+    Deliberately does NOT dispatch on ``use_layer_sharding_muon``: this helper is
+    shared by optimizers that do not support layer sharding (``adaptive_muon``
+    layers :func:`_adaptive_muon_config_to_kwargs` on top of it), so it must stay
+    a pure :class:`TensorParallelMuon` kwargs builder. Layer-sharding dispatch
+    lives in :func:`_muon_entry_config_to_kwargs`, wired only to the ``muon``
+    registry entry alongside its ``config_to_cls``.
+    """
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
     kwargs["pg_collection"] = pg_collection
     return kwargs
+
+
+def _muon_entry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """``config_to_kwargs`` for the ``muon`` registry entry only.
+
+    Dispatches to :func:`_layer_sharded_muon_config_to_kwargs` when
+    ``use_layer_sharding_muon`` is set (paired with :func:`_muon_config_to_cls`
+    selecting ``LayerShardedMuon``); plain :class:`TensorParallelMuon` kwargs
+    otherwise.
+    """
+    if _use_layer_sharding_muon(config):
+        return _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection)
+    return _muon_config_to_kwargs(config, model_chunks, pg_collection)
 
 
 def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
@@ -584,7 +650,8 @@ _EMERGING_OPTIMIZERS.update(
         'muon': EmergingOptimizerEntry(
             optimizer_cls=TensorParallelMuon,
             init_state_fn=_eopt_init_state_fn,
-            config_to_kwargs=_muon_config_to_kwargs,
+            config_to_kwargs=_muon_entry_config_to_kwargs,
+            config_to_cls=_muon_config_to_cls,
             default_param_overrides={
                 ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
                     'optimizer': 'adam'
