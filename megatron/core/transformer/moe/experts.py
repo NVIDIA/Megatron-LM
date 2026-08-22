@@ -242,7 +242,14 @@ class TEGroupedMLP(MegatronModule):
                 else self.config.moe_latent_size
             ),
             config=self.config,
-            init_method=not_none(self.config.output_layer_init_method),
+            # For latent MoE, linear_fc2 projects to the latent dim, not the hidden dim,
+            # so it is an intermediate layer. The residual-scaled output_layer_init_method
+            # belongs to fc2_latent_proj (latent -> hidden), the true output projection.
+            init_method=(
+                not_none(self.config.init_method)
+                if self.config.moe_latent_size is not None
+                else not_none(self.config.output_layer_init_method)
+            ),
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
             is_expert=True,
