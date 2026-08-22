@@ -86,6 +86,19 @@ def _native_to_hf(spec: HFWeights, name: str, tensor: torch.Tensor):
         return mapped
 
 
+def _sync_replica_load_metadata(
+    spec: HFWeights,
+    native_name: str,
+    target: torch.Tensor,
+    ps,
+    replica_group,
+    source_global_rank: int,
+) -> None:
+    hook = getattr(spec, "sync_replica_load_metadata", None)
+    if callable(hook):
+        hook(native_name, target, ps, replica_group, source_global_rank)
+
+
 DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES = 2 * 1024**3
 
 
@@ -1052,6 +1065,14 @@ def load_hf_weights(
                     dist.broadcast(
                         target.data, src=source_global_rank, group=replica_group
                     )
+                    _sync_replica_load_metadata(
+                        spec,
+                        mapped,
+                        target,
+                        ps,
+                        replica_group,
+                        source_global_rank,
+                    )
                     loaded_names.add(actual)
                     continue
 
@@ -1118,6 +1139,14 @@ def load_hf_weights(
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
+                _sync_replica_load_metadata(
+                    spec,
+                    mapped,
+                    target,
+                    ps,
+                    replica_group,
+                    source_global_rank,
+                )
             loaded_names.add(actual)
             del hf_tensors, tensor, converted
 
@@ -1190,6 +1219,14 @@ def _load_expert_weight(
         source_global_rank = replica_ranks[source_group_rank]
         if dist.get_rank() != source_global_rank:
             dist.broadcast(target.data, src=source_global_rank, group=replica_group)
+            _sync_replica_load_metadata(
+                spec,
+                native_name,
+                target,
+                ps,
+                replica_group,
+                source_global_rank,
+            )
             return actual
 
     try:
@@ -1217,6 +1254,14 @@ def _load_expert_weight(
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
+        _sync_replica_load_metadata(
+            spec,
+            native_name,
+            target,
+            ps,
+            replica_group,
+            source_global_rank,
+        )
     del hf_tensors, tensor, converted
     return actual
 

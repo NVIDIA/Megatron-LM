@@ -436,6 +436,44 @@ class DeepseekV4WeightSpec:
         model._fp8_source_scales_by_name = registry
         model._fp8_source_scales_valid = True
 
+    def sync_replica_load_metadata(
+        self,
+        native_name: str,
+        target: torch.Tensor,
+        ps: ParallelState,
+        replica_group,
+        source_global_rank: int,
+    ) -> None:
+        """Replicate checkpoint FP8 scales with their replicated BF16 master."""
+
+        del ps
+        if not self._source_is_quantized(native_name):
+            return
+        local_target = target
+        device = local_target.device
+        source_scale = self.source_block_scales.get(native_name)
+        present = torch.tensor(
+            [source_scale is not None], dtype=torch.uint8, device=device
+        )
+        dist.broadcast(present, src=source_global_rank, group=replica_group)
+        if not bool(present.item()):
+            return
+        scale_shape = tuple(
+            (int(size) + block - 1) // block
+            for size, block in zip(local_target.shape, BLOCK_SHAPE, strict=True)
+        )
+        if source_scale is None:
+            scale = torch.empty(scale_shape, dtype=torch.float32, device=device)
+        else:
+            scale = source_scale.to(device=device, dtype=torch.float32).contiguous()
+            if tuple(scale.shape) != scale_shape:
+                raise RuntimeError(
+                    f"{native_name} source scale shape {tuple(scale.shape)} "
+                    f"does not match replicated target scale shape {scale_shape}"
+                )
+        dist.broadcast(scale, src=source_global_rank, group=replica_group)
+        self.source_block_scales[native_name] = scale
+
     @staticmethod
     def replica_group_for_load(native_name: str, ps: ParallelState):
         if EXPERT_CLASSIFIER(native_name):
