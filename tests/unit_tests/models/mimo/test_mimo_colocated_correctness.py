@@ -195,6 +195,7 @@ def _generate_and_broadcast_global_batches(
     num_batches,
     image_token_id=50257,
     mask_pattern="uniform",
+    modality_dtype=torch.float32,
 ):
     """Generate global batches on rank 0 and broadcast so every rank sees
     identical data. Dist pre-slices per rank; ref consumes the full batch.
@@ -220,7 +221,11 @@ def _generate_and_broadcast_global_batches(
     for batch_idx in range(num_batches):
         if rank == 0:
             encoder_hidden_states = torch.randn(
-                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
+                image_seq_length,
+                global_mbs,
+                hidden_size,
+                device='cuda',
+                dtype=modality_dtype,
             )
             image_tokens = torch.full(
                 (global_mbs, image_seq_length), image_token_id, dtype=torch.long, device='cuda'
@@ -231,7 +236,11 @@ def _generate_and_broadcast_global_batches(
             input_ids = torch.cat([image_tokens, text_tokens], dim=1)
         else:
             encoder_hidden_states = torch.empty(
-                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
+                image_seq_length,
+                global_mbs,
+                hidden_size,
+                device='cuda',
+                dtype=modality_dtype,
             )
             input_ids = torch.empty(global_mbs, seq_length, dtype=torch.long, device='cuda')
 
