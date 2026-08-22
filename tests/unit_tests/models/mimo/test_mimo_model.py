@@ -622,7 +622,8 @@ class TestMimoModel:
             )
 
     @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (1, 2), (2, 2)])
-    def test_mtp_forward_uses_parallel_local_token_metadata(self, tp, cp):
+    @pytest.mark.parametrize("position_dims", [2, 3])
+    def test_mtp_forward_uses_parallel_local_token_metadata(self, tp, cp, position_dims):
         """Run real MIMO+MTP for the supported TP/CP combinations.
 
         MIMO owns CP partitioning for its pre-combined decoder embeddings, so
@@ -637,7 +638,7 @@ class TestMimoModel:
 
         seq_len = 16
         vocab_size = 128
-        invalid_token_id = 127
+        special_token_ids = {"images": 126, "audio": 127}
         config = TransformerConfig(
             mtp_num_layers=1,
             num_layers=2,
@@ -673,7 +674,7 @@ class TestMimoModel:
             MimoModelConfig(
                 language_model_spec=language_model_spec,
                 modality_submodules_spec={},
-                special_token_ids={"images": invalid_token_id},
+                special_token_ids=special_token_ids,
             ),
             cp_group=pg_collection.cp,
             tp_group=pg_collection.tp,
@@ -703,12 +704,16 @@ class TestMimoModel:
             for mtp_layer in model.language_model.mtp.layers:
                 mtp_layer.mtp_model_layer = _IdentityMTPLayer()
 
-        input_ids = torch.randint(1, vocab_size - 1, (1, seq_len), device="cuda")
-        input_ids[0, 3] = invalid_token_id
+        input_ids = torch.randint(1, min(special_token_ids.values()), (1, seq_len), device="cuda")
+        input_ids[0, 3] = special_token_ids["images"]
+        input_ids[0, 12] = special_token_ids["audio"]
         position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+        if position_dims == 3:
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).contiguous()
         labels = torch.roll(input_ids, shifts=-1, dims=-1)
         loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
-        loss_mask[input_ids == invalid_token_id] = 0
+        for special_token_id in special_token_ids.values():
+            loss_mask[input_ids == special_token_id] = 0
 
         output, local_loss_mask = model(
             input_ids=input_ids,
@@ -722,11 +727,18 @@ class TestMimoModel:
         assert output.shape == local_loss_mask.shape == (1, seq_len // cp)
         output.mean().backward()
 
-    def test_non_first_pipeline_stage_runs_real_mtp(self):
-        """Run real MIMO+MTP on the last stage of a two-stage LM pipeline."""
+    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (1, 2), (4, 1), (1, 4), (2, 2)])
+    def test_non_first_pipeline_stage_runs_real_mtp(self, tp, cp):
+        """Run real MIMO+MTP on the last stage with combined parallelism."""
+        required_world_size = 2 * tp * cp
+        if torch.distributed.get_world_size() < required_world_size:
+            pytest.skip(f"requires {required_world_size} distributed ranks")
+
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp, pipeline_model_parallel_size=2, context_parallel_size=cp
+        )
         model_parallel_cuda_manual_seed(123)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         is_first_stage = parallel_state.is_pipeline_first_stage()
@@ -741,6 +753,9 @@ class TestMimoModel:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=tp > 1,
+            context_parallel_size=cp,
             pipeline_model_parallel_size=2,
             pipeline_dtype=torch.float32,
             attention_dropout=0.0,
@@ -760,6 +775,7 @@ class TestMimoModel:
                 "pre_process": is_first_stage,
                 "post_process": is_last_stage,
                 "position_embedding_type": "rope",
+                "scatter_embedding_sequence_parallel": False,
                 "share_embeddings_and_output_weights": True,
                 "pg_collection": pg_collection,
             },
@@ -769,7 +785,9 @@ class TestMimoModel:
                 language_model_spec=language_model_spec,
                 modality_submodules_spec={},
                 special_token_ids={"images": invalid_token_id},
-            )
+            ),
+            cp_group=pg_collection.cp,
+            tp_group=pg_collection.tp,
         ).cuda()
         model.role = RankRole(
             modules={
@@ -783,13 +801,36 @@ class TestMimoModel:
         if not is_last_stage:
             return
 
+        if cp > 1:
+            # The validation image has no TE attention backend for CP. Preserve
+            # real PP/CP metadata partitioning and the MTP embedding/projection/loss
+            # path while replacing only the attention-bearing blocks.
+            class _IdentityDecoder(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.input_tensor = None
+
+                def set_input_tensor(self, input_tensor):
+                    self.input_tensor = input_tensor
+
+                def forward(self, hidden_states, **kwargs):
+                    return hidden_states if hidden_states is not None else self.input_tensor
+
+            class _IdentityMTPLayer(torch.nn.Module):
+                def forward(self, hidden_states, **kwargs):
+                    return hidden_states, None
+
+            model.language_model.decoder = _IdentityDecoder()
+            for mtp_layer in model.language_model.mtp.layers:
+                mtp_layer.mtp_model_layer = _IdentityMTPLayer()
+
         input_ids = torch.randint(1, vocab_size - 1, (1, seq_len), device="cuda")
         input_ids[0, 2] = invalid_token_id
         position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
         labels = torch.roll(input_ids, shifts=-1, dims=-1)
         loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
         loss_mask[input_ids == invalid_token_id] = 0
-        hidden_states = torch.randn(seq_len, 1, config.hidden_size, device="cuda")
+        hidden_states = torch.randn(seq_len // (tp * cp), 1, config.hidden_size, device="cuda")
 
         output, _ = model._forward_language_module(
             input_ids=input_ids,
@@ -800,7 +841,7 @@ class TestMimoModel:
             input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
         )
 
-        assert output.shape == loss_mask.shape
+        assert output.shape == (1, seq_len // cp)
         output.mean().backward()
 
 

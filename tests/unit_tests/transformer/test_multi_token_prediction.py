@@ -206,6 +206,103 @@ class TestMultiTokenPredictionLayer:
         assert torch.equal(rolled_position_ids, expected_position_ids)
         assert torch.equal(rolled_padding_mask, expected_padding_mask)
 
+    @pytest.mark.parametrize("with_mask", [False, True])
+    def test_get_embeddings_does_not_add_a_mask_roll(self, monkeypatch, with_mask):
+        """Conditioning validity shares the token-ID roll instead of adding an exchange."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        position_ids = torch.arange(input_ids.size(1), dtype=torch.int64).unsqueeze(0)
+        hidden_states = torch.randn(input_ids.size(1), 1, config.hidden_size)
+        mtp_input_mask = input_ids != 2 if with_mask else None
+        rolled_shapes = []
+
+        def capture_roll(tensor, *args, **kwargs):
+            rolled_shapes.append(tensor.shape)
+            return roll_tensor(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction.roll_tensor", capture_roll
+        )
+
+        mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=lambda input_ids, position_ids: torch.zeros(
+                input_ids.size(1), input_ids.size(0), config.hidden_size
+            ),
+            hidden_states=hidden_states,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        assert len(rolled_shapes) == 2  # Token metadata and position IDs.
+        expected_metadata_batch = 2 * input_ids.size(0) if with_mask else input_ids.size(0)
+        assert rolled_shapes[0][0] == expected_metadata_batch
+
+    @pytest.mark.parametrize("cp", [1, 2])
+    def test_get_embeddings_rolls_packed_ids_and_validity_together(self, cp):
+        """Packed CP rolling keeps token IDs and their validity exactly aligned."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=cp, use_te=cp > 1)
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+        cp_group = get_context_parallel_group() if cp > 1 else None
+        cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
+
+        if cp == 1:
+            input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64).cuda()
+            expected_ids = torch.tensor([[2, 3, 0, 5, 0]], dtype=torch.int64).cuda()
+            cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32).cuda()
+            max_seqlen = 3
+        elif cp_rank == 0:
+            input_ids = torch.tensor(
+                [[1, 2, 7, 8, 11, 12, 13, 20, 21, 22]], dtype=torch.int64
+            ).cuda()
+            expected_ids = torch.tensor(
+                [[2, 3, 8, 0, 12, 13, 14, 21, 22, 0]], dtype=torch.int64
+            ).cuda()
+            cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+            max_seqlen = 6
+        else:
+            input_ids = torch.tensor(
+                [[3, 4, 5, 6, 14, 15, 16, 17, 18, 19]], dtype=torch.int64
+            ).cuda()
+            expected_ids = torch.tensor(
+                [[4, 5, 6, 7, 15, 16, 17, 18, 19, 20]], dtype=torch.int64
+            ).cuda()
+            cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+            max_seqlen = 6
+
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format='thd',
+        )
+        mtp_input_mask = (input_ids != 3) & (input_ids != 14)
+        position_ids = torch.arange(input_ids.size(1), device="cuda").unsqueeze(0)
+        hidden_states = torch.randn(input_ids.size(1), 1, config.hidden_size, device="cuda")
+
+        def fake_embedding(input_ids, position_ids):
+            return torch.zeros(
+                input_ids.size(1), input_ids.size(0), config.hidden_size, device="cuda"
+            )
+
+        rolled_ids, _, _, rolled_mask, _, _ = mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=fake_embedding,
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        expected_mask = (expected_ids != 0) & (expected_ids != 3) & (expected_ids != 14)
+        torch.testing.assert_close(rolled_ids, expected_ids)
+        torch.testing.assert_close(rolled_mask, expected_mask)
+
     def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
         """Test forward passes rolled padding_mask to transformer path."""
         torch.manual_seed(_SEED)
@@ -424,7 +521,8 @@ class TestMultiTokenPredictionLayer:
             assert hidden_states.grad is not None
             assert emb_weight.grad is not None
 
-    def test_invalid_conditioning_embedding_has_no_input_gradient(self):
+    @pytest.mark.parametrize("mtp_num_layers", [1, 2])
+    def test_invalid_conditioning_embedding_has_no_input_gradient(self, mtp_num_layers):
         """A later causal loss must not update an invalid tied embedding row.
 
         The selected output position can attend to the earlier invalid MTP input.
@@ -435,7 +533,7 @@ class TestMultiTokenPredictionLayer:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
         model_parallel_cuda_manual_seed(_SEED)
         config = TransformerConfig(
-            mtp_num_layers=1,
+            mtp_num_layers=mtp_num_layers,
             num_layers=2,
             hidden_size=32,
             num_attention_heads=4,
@@ -450,7 +548,7 @@ class TestMultiTokenPredictionLayer:
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
 
         vocab_size = 16
-        invalid_token_id = 9
+        invalid_token_ids = (9, 10)
 
         class SharedEmbedding(torch.nn.Module):
             def __init__(self):
@@ -463,9 +561,13 @@ class TestMultiTokenPredictionLayer:
                 return torch.nn.functional.embedding(input_ids, self.weight).transpose(0, 1)
 
         embedding = SharedEmbedding()
-        input_ids = torch.tensor([[4, invalid_token_id, 5, 6]], device="cuda")
+        input_ids = torch.tensor(
+            [[4, invalid_token_ids[0], 5, invalid_token_ids[1], 6, 7]], device="cuda"
+        )
         position_ids = torch.arange(input_ids.size(1), device="cuda").unsqueeze(0)
-        mtp_input_mask = input_ids != invalid_token_id
+        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for invalid_token_id in invalid_token_ids:
+            mtp_input_mask &= input_ids != invalid_token_id
         hidden_states = torch.randn(
             input_ids.size(1), 1, config.hidden_size, device="cuda", requires_grad=True
         )
@@ -479,11 +581,14 @@ class TestMultiTokenPredictionLayer:
             mtp_input_mask=mtp_input_mask,
         )
 
-        # After the MTP shift, the invalid token is at position 0. A loss on
-        # position 2 can attend to it through causal self-attention.
-        output[input_ids.size(1) + 2].square().sum().backward()
+        # Each MTP output at position 4 can causally attend to every invalid
+        # shifted embedding that remains in that prediction depth.
+        seq_len = input_ids.size(1)
+        mtp_outputs = output[seq_len:].reshape(mtp_num_layers, seq_len, 1, config.hidden_size)
+        mtp_outputs[:, 4].square().sum().backward()
 
-        assert torch.count_nonzero(embedding.weight.grad[invalid_token_id]) == 0
+        for invalid_token_id in invalid_token_ids:
+            assert torch.count_nonzero(embedding.weight.grad[invalid_token_id]) == 0
         assert torch.count_nonzero(embedding.weight.grad[6]) > 0
 
     @pytest.mark.parametrize("detach_heads", [False, True])
