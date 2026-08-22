@@ -617,6 +617,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -624,8 +625,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+        checkpoint_input_layernorm = self.recompute_input_layernorm or (
+            mhc_recompute_manager is not None and not isinstance(self.input_layernorm, IdentityOp)
+        )
+        if checkpoint_input_layernorm:
+            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=mhc_recompute_manager
+            )
             with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     apply_module(self.input_layernorm), hidden_states
@@ -669,7 +675,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention")
 
-        if self.recompute_input_layernorm:
+        if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
@@ -867,10 +873,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return output, context
 
-    def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
+    def _forward_pre_mlp_layernorm(
+        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
+    ):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
-        if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+        checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
+            mhc_recompute_manager is not None and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+        )
+        if checkpoint_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=mhc_recompute_manager
+            )
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     apply_module(self.pre_mlp_layernorm), hidden_states
@@ -927,9 +940,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         padding_mask: Tensor | None = None,
         input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm + MLP/MoE and return the raw output before BDA."""
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
 
         if isinstance(pre_mlp_layernorm_output, tuple):
             if len(pre_mlp_layernorm_output) != 2:
