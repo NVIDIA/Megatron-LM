@@ -72,11 +72,17 @@ jobs:
 
           pushd $BUILD_DIR
             rm LICENSE || true
-            for i in 1 2 3; do
+            for attempt in {1..5}; do
               docker pull "$IMAGE" && break
-              echo "docker pull attempt $i failed, retrying..."
-              sleep 10
+              if (( attempt == 5 )); then
+                echo "docker pull failed after $attempt attempts"
+                exit 1
+              fi
+              delay=$((10 * attempt))
+              echo "docker pull attempt $attempt failed, retrying in ${delay}s..."
+              sleep "$delay"
             done
+            docker image inspect "$IMAGE" >/dev/null
             docker run --rm -e NO_VCS_VERSION=1 -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
               for python_version in cp311 cp312 cp313; do \
                 /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools>=80" build; \
