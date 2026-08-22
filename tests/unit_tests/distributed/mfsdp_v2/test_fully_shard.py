@@ -7,6 +7,7 @@ import logging
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
@@ -457,7 +458,12 @@ def test_fused_wgrad_zero_token_expert_overwrites_staging_buffer(distributed_set
     assert torch.count_nonzero(zero_token_grad) == 0
 
 
-def test_trace_pool_losses_match_baseline_after_planning(distributed_setup):
+@pytest.mark.parametrize(
+    "use_symmetric_memory", [False, True], ids=["default_memory", "symmetric_memory"]
+)
+def test_trace_pool_losses_match_baseline_after_planning(
+    distributed_setup, use_symmetric_memory
+):
     """Trace-planned storage must preserve saved weight views and optimizer parity."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -465,12 +471,20 @@ def test_trace_pool_losses_match_baseline_after_planning(distributed_setup):
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
+    if use_symmetric_memory:
+        # NCCL window registration can fail when symmetric-memory rendezvous is the
+        # communicator's first operation. Initialize it before exercising the pool.
+        dist.barrier(device_ids=[device.index])
     torch.manual_seed(1234)
     baseline = TinyModel().to(device)
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
-    with fully_shard_context(device=device, enable_trace_pool=True) as context:
+    with fully_shard_context(
+        device=device,
+        use_symmetric_memory=use_symmetric_memory,
+        enable_trace_pool=True,
+    ) as context:
         fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
@@ -499,6 +513,13 @@ def test_trace_pool_losses_match_baseline_after_planning(distributed_setup):
 
     assert context.trace_pool_allocator is not None
     assert context.trace_pool_allocator.phase == "optimized"
+    assert context.trace_pool_allocator.use_symmetric_memory is use_symmetric_memory
+    if use_symmetric_memory:
+        assert context.trace_pool_allocator._slots
+        assert all(
+            symm_mem.is_symm_mem_tensor(slot.tensor)
+            for slot in context.trace_pool_allocator._slots
+        )
     torch.testing.assert_close(torch.stack(pooled_losses), torch.stack(baseline_losses))
 
 
