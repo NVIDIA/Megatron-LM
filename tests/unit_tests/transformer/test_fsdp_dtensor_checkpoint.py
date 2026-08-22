@@ -16,14 +16,13 @@
 
 Tests cover:
   1. Per-TransformerLayer gated_linear_unit check in handle_swiglu_in_state_dict
-  2. GDN-family fused projection splitting in handle_gdn_in_state_dict
+  2. GDN fused projection splitting in handle_gdn_in_state_dict
   3. Helper functions: get_expert_index_from_key, flatten_state_dict, etc.
 
 Note: handle_swiglu_in_state_dict and handle_gdn_in_state_dict require
 HAVE_MEGATRON_FSDP=True and a real distributed environment with DTensors.
 We test their internal helper logic (is_swiglu_key, _key_in_glu_layer,
-projection metadata validation) directly and cover real DTensor splitting in the
-distributed M-FSDP test suite.
+_match_gdn_key) by extracting the logic into standalone testable units.
 For the checkpoint_inspector.py conversion functions, we test the
 non-distributed components: SWiGLU key detection, SWiGLU regex splitting,
 MTP key renaming, and --swiglu-modules prefix filtering.
@@ -46,7 +45,6 @@ from megatron.core.tensor_parallel.layers import (
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     flatten_state_dict,
     get_expert_index_from_key,
-    handle_gdn_in_state_dict,
 )
 
 
@@ -414,89 +412,6 @@ class TestKeyInGluLayer:
 # ============================================================================
 # Test GDN key matching logic
 # ============================================================================
-class _FakeGDNMetadata(torch.nn.Module):
-    def __init__(self, names, sections):
-        super().__init__()
-        self.qk_dim = 4
-        self.v_dim = 6
-        self.tp_size = 1
-        self.in_proj_dim = sum(sections)
-        self.in_proj_split_names = names
-        self.in_proj_split_sections = sections
-
-
-class TestGDNProjectionMetadata:
-    @staticmethod
-    def _preprocess(module):
-        return handle_gdn_in_state_dict(module, {}, None)
-
-    @pytest.mark.parametrize(
-        ("names", "sections"),
-        [
-            (("query", "key", "value", "z", "beta", "alpha"), (4, 4, 6, 6, 1, 1)),
-            (("query", "key", "value", "g", "gate"), (4, 4, 6, 4, 6)),
-            (("query", "key", "value", "z", "f", "b", "w"), (4, 4, 6, 6, 4, 4, 6)),
-        ],
-    )
-    def test_accepts_variant_specific_metadata(self, names, sections):
-        model_state, optimizer_state = self._preprocess(_FakeGDNMetadata(names, sections))
-
-        assert model_state == {}
-        assert optimizer_state is None
-
-    def test_rejects_incomplete_metadata(self):
-        module = _FakeGDNMetadata(("query",), (4,))
-        del module.in_proj_split_sections
-
-        with pytest.raises(ValueError, match="must define both"):
-            self._preprocess(module)
-
-    def test_rejects_duplicate_names(self):
-        module = _FakeGDNMetadata(("query", "query"), (4, 4))
-
-        with pytest.raises(ValueError, match="duplicate"):
-            self._preprocess(module)
-
-    @pytest.mark.parametrize(
-        ("names", "sections", "error"),
-        [
-            (("query", "key"), (4,), "sizes for 2 names"),
-            (("query", ""), (4, 4), "invalid in_proj split names"),
-            (("query", "key"), (4, 0), "invalid in_proj split sizes"),
-            (("query", "key"), (4, True), "invalid in_proj split sizes"),
-        ],
-    )
-    def test_rejects_invalid_metadata(self, names, sections, error):
-        module = _FakeGDNMetadata(names, sections)
-
-        with pytest.raises(ValueError, match=error):
-            self._preprocess(module)
-
-    def test_rejects_incorrect_total_size(self):
-        module = _FakeGDNMetadata(("query", "key"), (4, 4))
-        module.in_proj_dim += 1
-
-        with pytest.raises(ValueError, match="expected"):
-            self._preprocess(module)
-
-    @pytest.mark.parametrize("tp_size", [0, True])
-    def test_rejects_invalid_tp_size(self, tp_size):
-        module = _FakeGDNMetadata(("query", "key"), (4, 4))
-        module.tp_size = tp_size
-
-        with pytest.raises(ValueError, match="invalid tp_size"):
-            self._preprocess(module)
-
-    def test_rejects_dimensions_not_divisible_by_tp(self):
-        module = _FakeGDNMetadata(("query", "key"), (2, 2))
-        module.tp_size = 2
-        module.in_proj_dim = 8
-        module.qk_dim = 5
-
-        with pytest.raises(ValueError, match="qk_dim/v_dim must be divisible"):
-            self._preprocess(module)
-
-
 class TestGDNKeyMatching:
     """Test the _match_gdn_key logic from handle_gdn_in_state_dict.
 

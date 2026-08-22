@@ -1379,12 +1379,15 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
         else:
             model_state_dict, _ = handle_swiglu_in_state_dict(model, state_dict["model"], None)
             state_dict["model"] = model_state_dict
-    model_state_dict, optimizer_state_dict = handle_gdn_in_state_dict(
-        model, state_dict["model"], state_dict.get("optimizer")
-    )
-    state_dict["model"] = model_state_dict
-    if optimizer_state_dict is not None:
+    if "optimizer" in state_dict:
+        model_state_dict, optimizer_state_dict = handle_gdn_in_state_dict(
+            model, state_dict["model"], state_dict["optimizer"]
+        )
+        state_dict["model"] = model_state_dict
         state_dict["optimizer"] = optimizer_state_dict
+    else:
+        model_state_dict, _ = handle_gdn_in_state_dict(model, state_dict["model"], None)
+        state_dict["model"] = model_state_dict
     if args.num_experts:
         state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], args.num_experts)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
