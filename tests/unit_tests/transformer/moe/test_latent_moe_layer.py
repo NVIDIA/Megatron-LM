@@ -7,12 +7,71 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+class _RecordingLinear(torch.nn.Module):
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.calls.append((args, kwargs))
+
+
+class _DummyDispatcher(torch.nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+
+class _FakeProcessGroup:
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
+
+
+def _build_dummy_module(*args, **kwargs):
+    return torch.nn.Module()
+
+
+def test_latent_projections_receive_owning_tp_group(monkeypatch):
+    """Latent-MoE checkpoint metadata must use the layer's custom TP group."""
+    tp_group = _FakeProcessGroup()
+    ep_group = _FakeProcessGroup()
+    pg_collection = ProcessGroupCollection(tp=tp_group, ep=ep_group)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=1,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type="allgather",
+        moe_ffn_hidden_size=16,
+        moe_latent_size=4,
+        use_cpu_initialization=True,
+        add_bias_linear=False,
+    )
+    submodules = MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module)
+
+    _RecordingLinear.calls.clear()
+    monkeypatch.setattr(moe_layer_module, "HAVE_TE", True)
+    monkeypatch.setattr(moe_layer_module, "TELinear", _RecordingLinear)
+    monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
+
+    MoELayer(config, submodules, pg_collection=pg_collection)
+
+    assert len(_RecordingLinear.calls) == 2
+    assert all(kwargs["parallel_mode"] == "duplicated" for _, kwargs in _RecordingLinear.calls)
+    assert all(kwargs["tp_group"] is tp_group for _, kwargs in _RecordingLinear.calls)
 
 
 class TestLatentMoELayer:

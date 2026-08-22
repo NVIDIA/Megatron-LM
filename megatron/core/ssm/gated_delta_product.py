@@ -127,9 +127,15 @@ class ExtendedRMSNorm(RMSNormGated):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
@@ -412,6 +418,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            self.norm.tp_group = self.pg_collection.tp
             setattr(self.norm.weight, 'tensor_model_parallel', True)
 
         # Assume sequence parallelism: input is partitioned along d_inner and
@@ -1213,6 +1220,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 "D": 0,
             },  # parameters sharded across TP
             sharded_offsets=sharded_offsets,
+            tp_group=self.pg_collection.tp,
+            dp_cp_group=metadata["dp_cp_group"],
         )
         # Submodules
         for name, module in self.named_children():
@@ -1220,12 +1229,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 # Add TP sharding for Conv1d
                 module_sd = module.state_dict(prefix="", keep_vars=True)
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd, f"{prefix}{name}.", {f"weight": 0, f"bias": 0}, sharded_offsets
+                    module_sd,
+                    f"{prefix}{name}.",
+                    {"weight": 0, "bias": 0},
+                    sharded_offsets,
+                    tp_group=self.pg_collection.tp,
+                    dp_cp_group=metadata["dp_cp_group"],
                 )
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f"{prefix}{name}.", sharded_offsets, metadata
+                    module,
+                    f"{prefix}{name}.",
+                    sharded_offsets,
+                    metadata,
+                    tp_group=self.pg_collection.tp,
                 )
 
             sharded_state_dict.update(module_sharded_sd)

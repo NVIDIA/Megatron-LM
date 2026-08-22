@@ -286,6 +286,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                tp_group=self.tp_group,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 gtp_remat_group=gtp_remat_group,
             )
@@ -299,6 +300,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                tp_group=self.tp_group,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
                 gtp_remat_group=gtp_remat_group,
             )
