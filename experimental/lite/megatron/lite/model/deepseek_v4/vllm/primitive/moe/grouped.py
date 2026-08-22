@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
-from megatron.lite.model.deepseek_v4.vllm.primitive.deployment_fp8 import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     pack_grouped_block_fp8_weight,
 )
 

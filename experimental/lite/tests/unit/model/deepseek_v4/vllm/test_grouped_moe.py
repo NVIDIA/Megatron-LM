@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe import experts as vllm_grouped_moe
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe import grouped as vllm_grouped_moe
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
 
 

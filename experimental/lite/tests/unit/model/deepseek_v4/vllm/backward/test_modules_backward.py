@@ -17,9 +17,9 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     mhc_pre_broadcast,
     rms_norm,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.projections import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
     _inverse_rope,
-    o_projection,
+    _o_projection,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import (
     _fixed_route_vjp,
@@ -103,7 +103,7 @@ def test_forward_only_uses_visible_path_without_autograd_owner() -> None:
 
     with torch.inference_mode():
         output = block_fp8_linear(visible, x, weight)
-        projected = o_projection(
+        projected = _o_projection(
             lambda value, *_weights: value.sum(dim=1),
             torch.randn(3, 2, 4),
             torch.randn(2, 8),
@@ -271,7 +271,7 @@ def test_mhc_head_and_o_projection_cover_parameters() -> None:
         z = torch.einsum("tgd,grd->tgr", inverse, wa_.reshape(2, 3, -1))
         return F.linear(z.flatten(1), wb_)
 
-    projected = o_projection(
+    projected = _o_projection(
         projection,
         o,
         wa,

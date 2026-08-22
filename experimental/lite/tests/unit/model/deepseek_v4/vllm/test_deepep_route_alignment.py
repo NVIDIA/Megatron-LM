@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import pytest
 
-from megatron.lite.model.deepseek_v4.vllm.primitive.moe.dispatcher import (
+from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
     _ordered_route_backward,
     _validate_and_order_route_preserving_outputs,
 )
