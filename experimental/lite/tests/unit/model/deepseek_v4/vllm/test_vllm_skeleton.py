@@ -75,15 +75,17 @@ def test_gate_logits_use_one_batch_invariant_gemm(tokens: int) -> None:
 
 @pytest.mark.parametrize(
     ("optimizer", "override", "expected"),
-    [("dist_opt", None, True), ("fsdp2", None, False),
-     ("fsdp2", True, True), ("dist_opt", False, False)],
+    [
+        ("dist_opt", None, True),
+        ("fsdp2", None, False),
+        ("fsdp2", True, True),
+        ("dist_opt", False, False),
+    ],
 )
 def test_deployment_weight_cache_policy_tracks_optimizer(
     optimizer, override, expected
 ) -> None:
-    config = protocol.ImplConfig(
-        optimizer=optimizer, cache_deployment_weights=override
-    )
+    config = protocol.ImplConfig(optimizer=optimizer, cache_deployment_weights=override)
     assert protocol._deployment_weight_cache_enabled(config) is expected
 
 
@@ -177,7 +179,9 @@ def test_forward_builds_model_owned_training_metadata(monkeypatch) -> None:
             return "metadata"
 
     monkeypatch.setattr(protocol, "init_batch_invariance", lambda: None)
-    monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
+    monkeypatch.setattr(
+        protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0)
+    )
     monkeypatch.setattr(
         protocol,
         "_vllm_forward_context",
@@ -200,13 +204,12 @@ def test_forward_builds_model_owned_training_metadata(monkeypatch) -> None:
     monkeypatch.setattr(
         protocol,
         "_forward_step",
-        lambda _model, _batch, **kwargs: captured.update(kwargs) or {"loss": torch.tensor(0.0)},
+        lambda _model, _batch, **kwargs: captured.update(kwargs)
+        or {"loss": torch.tensor(0.0)},
     )
     bundle = protocol.build_model(
         _tiny_config(layers=1),
-        impl_cfg=protocol.ImplConfig(
-            parallel=ParallelConfig(ep=1), hf_path="/unused"
-        ),
+        impl_cfg=protocol.ImplConfig(parallel=ParallelConfig(ep=1), hf_path="/unused"),
     )
     batch = PackedBatch(
         input_ids=torch.tensor([1, 2, 3]),
@@ -216,9 +219,7 @@ def test_forward_builds_model_owned_training_metadata(monkeypatch) -> None:
     )
     bundle.forward_step(bundle.chunks[0], batch)
     assert captured["attention_metadata"] == {0: "metadata"}
-    assert torch.equal(
-        built["positions"], torch.arange(built["positions"].numel())
-    )
+    assert torch.equal(built["positions"], torch.arange(built["positions"].numel()))
     assert built["packed"] is not None
 
 
@@ -239,9 +240,13 @@ def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
         return None, None, None, "dist_opt"
 
     monkeypatch.setattr(protocol, "init_batch_invariance", lambda: None)
-    monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
+    monkeypatch.setattr(
+        protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0)
+    )
     monkeypatch.setattr(protocol, "build_training_backend", fake_build_training_backend)
-    monkeypatch.setitem(sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object()))
+    monkeypatch.setitem(
+        sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object())
+    )
     monkeypatch.setitem(
         sys.modules,
         "vllm.v1.worker.workspace",
@@ -254,9 +259,7 @@ def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
 
     bundle = protocol.build_model(
         _tiny_config(layers=1),
-        impl_cfg=protocol.ImplConfig(
-            parallel=ParallelConfig(ep=1), hf_path="/unused"
-        ),
+        impl_cfg=protocol.ImplConfig(parallel=ParallelConfig(ep=1), hf_path="/unused"),
     )
 
     assert bundle.chunks == [captured["wrapped"]]

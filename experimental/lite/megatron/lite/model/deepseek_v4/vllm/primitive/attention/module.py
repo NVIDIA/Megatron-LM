@@ -269,8 +269,7 @@ class VLLMAttention(CompressedSparseAttention):
         )
 
     def _input_projections(self, hidden_states: torch.Tensor):
-        bind_source_scale_to_visible_weight(self.wq_a, "weight", self.wq_a.weight)
-        bind_source_scale_to_visible_weight(self.wkv, "weight", self.wkv.weight)
+        self._bind_input_projection_source_scales()
 
         def fused_projection():
             return fused_block_fp8_linear(
@@ -321,6 +320,17 @@ class VLLMAttention(CompressedSparseAttention):
             if isinstance(output, torch.Tensor):
                 output.record_stream(current_stream)
         return default_output, aux_outputs
+
+    def _bind_input_projection_source_scales(self) -> None:
+        projections = [self.wq_a, self.wkv]
+        if self.compressor is not None:
+            projections.extend((self.compressor.wkv, self.compressor.wgate))
+        if self.indexer is not None:
+            projections.extend(
+                (self.indexer.compressor.wkv, self.indexer.compressor.wgate)
+            )
+        for projection in projections:
+            bind_source_scale_to_visible_weight(projection, "weight", projection.weight)
 
     def _project_boundary_k(
         self,
