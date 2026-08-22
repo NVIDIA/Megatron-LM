@@ -147,7 +147,7 @@ class DistributedDataParallelConfig:
     """If true, Megatron-FSDP v2 traces one global batch of temporary communication
       buffer lifetimes, then reuses a fixed set of physical storage slots. This avoids
       steady-state CUDA caching-allocator churn and permits non-overlapping FSDP units
-      to share storage. It is incompatible with NCCL user buffers/symmetric memory.
+      to share storage. With NCCL user buffers, the slots use PyTorch symmetric memory.
     """
 
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
