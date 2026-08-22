@@ -209,6 +209,7 @@ hybrid_stack_spec = ModuleSpec(
                         linear_kv_down_proj=TELinear,
                         linear_kv_up_proj=TEColumnParallelLinear,
                         core_attention=TEDotProductAttention,
+                        linear_gate=TEColumnParallelLinear,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=IdentityOp,
                         kv_layernorm=IdentityOp,
