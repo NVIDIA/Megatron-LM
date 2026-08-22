@@ -2085,6 +2085,8 @@ class DSGroupedSelfAttention(SelfAttention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        # Upstream's TransformerLayer now passes a module instance name top-down.
+        name: str | None = None,
     ):
         if config.experimental_attention_variant == "dsa":
             submodules = copy.copy(submodules)
@@ -2122,6 +2124,7 @@ class DSGroupedSelfAttention(SelfAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
     def _use_indexer_rope(self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin) -> bool:
