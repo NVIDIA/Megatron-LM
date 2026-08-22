@@ -684,7 +684,12 @@ def maybe_get_rollout_bank(args):
         from megatron.rl.rollout_bank import RolloutBank
 
         bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
-        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
+        _ROLLOUT_BANK = RolloutBank(
+            bank_dir,
+            max_bytes=args.rl_rollout_bank_max_bytes,
+            rollouts_per_group=args.grpo_group_size,
+            drop_zero_variance=args.grpo_filter_groups_with_same_reward,
+        )
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
     return _ROLLOUT_BANK
@@ -696,10 +701,28 @@ def get_rollout_bank():
 
 
 def maybe_compact_rollout_bank(iteration):
-    """Compact the bank at a durable-checkpoint boundary."""
+    """Compact the bank at a durable-checkpoint boundary.
+
+    Called from synchronous checkpointing code (both the sync-save path and the
+    async-save durability callback), so the queue drain has to be driven through
+    the loop rather than awaited. Compaction rewrites and reclaims segments, so
+    queued records must reach disk first or they would be written against a
+    segment that no longer exists.
+    """
     bank = get_rollout_bank()
-    if bank is not None:
-        bank.checkpoint(iteration)
+    if bank is None:
+        return
+    if _ROLLOUT_PIPELINE is not None:
+        loop = get_asyncio_loop()
+        if loop.is_running():
+            logger.warning(
+                "Skipping rollout-bank compaction at iteration %d: the asyncio loop "
+                "is already running, so queued records cannot be drained safely.",
+                iteration,
+            )
+            return
+        loop.run_until_complete(_ROLLOUT_PIPELINE.drain_bank())
+    bank.checkpoint(iteration)
 
 
 def _get_or_create_rollout_agent(env_config_path):
@@ -877,6 +900,7 @@ def get_environment_rollouts(
                     # rollback (restart before this update) the marker > T rule restores
                     # these; once a checkpoint includes the update they are pruned.
                     if bank is not None:
+                        loop.run_until_complete(_ROLLOUT_PIPELINE.drain_bank())
                         bank.mark_consumed_many(
                             (group.uid for group in rollouts), args.curr_iteration + 1
                         )
@@ -1456,7 +1480,7 @@ def _bounded_artifact_key(key, limit=100):
 
     keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
     a 7-char CRC suffix by wandb's sanitizer.
-    
+
     Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
     """
     if len(key) <= limit:

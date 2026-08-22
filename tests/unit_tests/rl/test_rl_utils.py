@@ -2173,3 +2173,36 @@ def _ledger_record(epoch, num_evictions=0):
     return FinishedRequestRecord(
         policy_epoch=[(0, epoch)], kv_cache_epoch=[(0, epoch)], num_evictions=num_evictions
     )
+
+
+class TestDurableBankBarriers:
+    """The rollout bank's durability barriers on the production path.
+
+    Nothing else exercises rl_utils with a bank attached, so a rename in the bank
+    or pipeline can silently orphan these call sites. That already happened once:
+    a stale ``bank.flush()`` survived a refactor that deleted the method.
+    """
+
+    def test_consumption_marks_are_preceded_by_a_drain(self):
+        """A marker must never name a record still sitting in the queue."""
+        import inspect
+
+        from megatron.rl import rl_utils
+        from megatron.rl.agent.rollout_pipeline import RolloutPipeline
+        from megatron.rl.rollout_bank import RolloutBank
+
+        source = inspect.getsource(rl_utils.get_environment_rollouts)
+        assert "drain_bank" in source, "no bank drain before mark_consumed_many"
+        assert hasattr(RolloutPipeline, "drain_bank")
+        assert not hasattr(
+            RolloutBank, "flush"
+        ), "a stale bank.flush() call site would AttributeError at runtime"
+
+    def test_compaction_drains_before_reclaiming_segments(self):
+        """Compaction rewrites segments; queued records must land first."""
+        import inspect
+
+        from megatron.rl import rl_utils
+
+        source = inspect.getsource(rl_utils.maybe_compact_rollout_bank)
+        assert "drain_bank" in source, "compaction does not drain queued records first"

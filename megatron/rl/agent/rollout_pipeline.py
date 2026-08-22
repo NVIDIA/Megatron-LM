@@ -14,14 +14,17 @@ from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..inference import ReturnsRaw
+from ..rollout_bank import _PendingProblem, _PendingRollout
 from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
 from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
+
+logger = logging.getLogger(__name__)
+
+BANK_WRITE_MAX_RECORDS = 64
 
 if TYPE_CHECKING:
     from ..rollout_bank import RolloutBank
     from .api import GroupedRolloutGenerator, Rollout, TokenRollout
-
-logger = logging.getLogger(__name__)
 
 
 class _GranularityConfig(NamedTuple):
@@ -171,6 +174,11 @@ class _InferWorkItem(NamedTuple):
     Timestamps are wall-clock monotonic seconds: `prepared_at` is stamped at
     construction and `infer_dequeued_at` is filled in via `_replace` when an
     infer worker dequeues the item. Zero means "not yet reached".
+
+    `bank_uid` is the owning group's durable bank identity, reserved before any
+    member exists and None whenever the durable rollout bank is disabled. It is
+    distinct from `group_id`, which is the pipeline-local assemble-bucket key and
+    is always present.
     """
 
     group_id: int
@@ -179,6 +187,7 @@ class _InferWorkItem(NamedTuple):
     index_in_batch: int
     params: GroupRolloutParams
     env_index: int = 0
+    bank_uid: str | None = None
     prepared_at: float = 0.0
     infer_dequeued_at: float = 0.0
 
@@ -242,6 +251,9 @@ class RolloutPipeline:
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
         self.output_queue = asyncio_Queue()
+        self.bank_queue = asyncio_Queue()
+        self._bank_task: asyncio.Task | None = None
+        self._bank_error: Exception | None = None
 
         # Track regenerated groups and tasks for proper shutdown.
         self._next_regen_group_id = -1
@@ -250,7 +262,7 @@ class RolloutPipeline:
         self._regen_tasks: set[asyncio.Task] = set()
 
         # Buffers of partial results.
-        self._assemble_pending: dict[int, list[_InferredItem]] = {}
+        self._assemble_pending: dict[int, dict[int, RolloutGroup]] = {}
         self._consume_pending: dict[int, list[RolloutGroup]] = {}
         self._output_enqueued_at: dict[tuple[int, int], float] = {}
 
@@ -267,6 +279,7 @@ class RolloutPipeline:
         self.filtered_count = 0
         self.refilled_placeholder_groups = 0
         self.restored_count = 0
+        self.restored_rollout_count = 0
         self.yielded_count = 0
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.assembled_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
@@ -280,11 +293,14 @@ class RolloutPipeline:
         Yields:
             RolloutGroup: Groups in consumption-granularity order.
         """
-        tasks = (
+        tasks = [
             asyncio.create_task(self.stage_prepare()),
             asyncio.create_task(self.stage_infer()),
             asyncio.create_task(self.stage_assemble()),
-        )
+        ]
+        if self.bank is not None:
+            self._bank_task = asyncio.create_task(self.stage_bank())
+            tasks.append(self._bank_task)
         try:
             async for group in self.stage_consume():
                 yield group
@@ -311,15 +327,44 @@ class RolloutPipeline:
             await asyncio.gather(*tasks, *regen_tasks, return_exceptions=True)
 
     async def _submit_group_to_infer_queue(
-        self, *, group_id: int, batch_id: int, index_in_batch: int
+        self,
+        *,
+        group_id: int,
+        batch_id: int,
+        index_in_batch: int,
+        restored: RolloutGroup | None = None,
     ) -> None:
-        """Enqueue one group's inference items, acquiring per-rollout gate slots."""
+        """Enqueue one group's inference items, acquiring per-rollout gate slots.
+
+        Args:
+            group_id: Pipeline-local key for this group's assemble bucket.
+            batch_id: Trainer batch this group belongs to.
+            index_in_batch: Slot within that batch.
+            restored: An incomplete group recovered from the bank. Its members seed
+                the assemble bucket and only its missing slots are generated, using
+                the persisted problem state so they answer the same prompt.
+        """
         env_index = self.gran_policy.env_of_index(index_in_batch)
         agent = self.allocations[env_index].agent
-        params: GroupRolloutParams = await agent.prepare_group_rollout(self.request)
+        params: GroupRolloutParams = await agent.prepare_group_rollout(
+            self.request, problem_state=restored.problem_state if restored else None
+        )
         self.prepared_groups_per_env[env_index] += 1
 
-        for rollout_idx in range(self.request.rollouts_per_group):
+        if restored is not None:
+            bank_uid = restored.uid
+            indices = restored.missing_indices(self.request.rollouts_per_group)
+            self._assemble_pending[group_id] = dict(
+                zip(restored.member_indices, restored.rollouts, strict=True)
+            )
+            self.restored_rollout_count += len(restored.rollouts)
+        else:
+            bank_uid = self.bank.reserve_group_uid() if self.bank is not None else None
+            indices = list(range(self.request.rollouts_per_group))
+            if self.bank is not None and params.problem_state is not None:
+                self.bank_queue.put_nowait(_PendingProblem(bank_uid, params.problem_state))
+
+        for rollout_idx in indices:
             await self.gate.acquire_for("R")
             item = _InferWorkItem(
                 group_id=group_id,
@@ -328,6 +373,7 @@ class RolloutPipeline:
                 index_in_batch=index_in_batch,
                 params=params,
                 env_index=env_index,
+                bank_uid=bank_uid,
                 prepared_at=time.monotonic(),
             )
             await self.infer_queue.put(item)
@@ -339,7 +385,12 @@ class RolloutPipeline:
             self.infer_queue.shutdown()
 
     def assert_no_inflight_rollouts(self) -> None:
-        """Verify no rollouts are buffered or in-flight at an iteration boundary for lag=0."""
+        """Verify no rollouts are buffered or in-flight at an iteration boundary for lag=0.
+
+        Counts rollouts rather than groups: dropped groups consume prepared
+        rollouts without ever being yielded, and a partially restored group is
+        yielded having consumed only some of its members from the gate.
+        """
         buffered = {
             "infer_queue": self.infer_queue.qsize(),
             "assemble_queue": self.assemble_queue.qsize(),
@@ -352,16 +403,16 @@ class RolloutPipeline:
             f"The rollout pipeline has buffered rollouts at iteration boundary: {buffered}. "
             "The generator has run ahead under a stale policy."
         )
-        # Dropped groups consume prepared rollouts without ever being yielded;
-        # restored groups are yielded without being freshly prepared.
-        fresh_yielded_count = self.yielded_count - self.restored_count
+        yielded_rollouts = (
+            self.yielded_count * self.request.rollouts_per_group - self.restored_rollout_count
+        )
         in_flight = self.prepared_count - (
-            (fresh_yielded_count + self.dropped_count) * self.request.rollouts_per_group
+            yielded_rollouts + self.dropped_count * self.request.rollouts_per_group
         )
         assert in_flight == 0, (
             f"The rollout pipeline prepared {self.prepared_count} rollout(s) but yielded "
-            f"{self.yielded_count} ({self.restored_count} restored) and dropped "
-            f"{self.dropped_count} group(s) of {self.request.rollouts_per_group} "
+            f"{self.yielded_count} group(s) ({self.restored_rollout_count} restored member(s)) "
+            f"and dropped {self.dropped_count} group(s) of {self.request.rollouts_per_group} "
             f"({self.filtered_count} same-reward-filtered, "
             f"{self.refilled_placeholder_groups} placeholder-refilled); "
             f"{in_flight} rollout(s) in flight at iteration boundary."
@@ -380,19 +431,29 @@ class RolloutPipeline:
                     self._groups_in_flight += 1
                     env_index = self.gran_policy.env_of_index(index_in_batch)
                     allocation = self.allocations[env_index]
-                    restored = self.agent.take_restored_group(allocation.env_id)
+                    restored: RolloutGroup | None = self.agent.take_restored_group(allocation.env_id)
                     if restored is not None:
                         assert all(rollout.env_id == allocation.env_id for rollout in restored), (
                             f"Restored rollout group routed to env {allocation.env_id!r} contains "
                             f"members for {[rollout.env_id for rollout in restored]}"
                         )
-                        restored.batch_id = batch_id
-                        restored.index_in_batch = index_in_batch
-                        self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
-                        await self.output_queue.put(restored)
-                        self.restored_count += 1
-                        self._groups_in_flight -= 1
-                        self._maybe_close_intake()
+                        if restored.is_complete(self.request.rollouts_per_group):
+                            restored.batch_id = batch_id
+                            restored.index_in_batch = index_in_batch
+                            self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
+                            await self.output_queue.put(restored)
+                            self.restored_count += 1
+                            self.restored_rollout_count += len(restored.rollouts)
+                            self._groups_in_flight -= 1
+                            self._maybe_close_intake()
+                            group_id += 1
+                            continue
+                        await self._submit_group_to_infer_queue(
+                            group_id=group_id,
+                            batch_id=batch_id,
+                            index_in_batch=index_in_batch,
+                            restored=restored,
+                        )
                         group_id += 1
                         continue
                     await self._submit_group_to_infer_queue(
@@ -406,6 +467,66 @@ class RolloutPipeline:
         finally:
             self._prepare_done = True
             self._maybe_close_intake()
+
+    async def stage_bank(self) -> None:
+        """Write graded rollouts to the durable bank, off the event loop.
+
+        fsync is a blocking syscall, so the write is handed to a worker thread. A
+        single consumer means only one write is ever in flight, which is what lets
+        the bank keep its running sidecar offsets without a lock.
+
+        ``bank_queue`` is deliberately never shut down: the asyncio_Queue shim
+        injects a sentinel on shutdown that ``get_nowait`` would hand to the
+        batching loop as if it were a record. This stage is drained and cancelled
+        instead, so nothing here awaits inside a teardown ``finally``.
+        """
+        while True:
+            records = [await self.bank_queue.get()]
+            while len(records) < BANK_WRITE_MAX_RECORDS and self.bank_queue.qsize():
+                records.append(self.bank_queue.get_nowait())
+            try:
+                await asyncio.to_thread(self._write_records_latching, records)
+            finally:
+                for _ in records:
+                    self.bank_queue.task_done()
+
+    def _write_records_latching(self, records: list) -> None:
+        """Write one set of records, recording any failure instead of raising.
+
+        Runs on a worker thread. The failure is latched *here* rather than around
+        the ``await`` because cancelling the stage at teardown would otherwise win
+        the race and discard an error from a write that already happened.
+        """
+        try:
+            self.bank.write_records(records)
+        except Exception as exc:
+            self._bank_error = exc
+            logger.exception("Rollout bank write failed; %d record(s) lost", len(records))
+
+    async def drain_bank(self) -> None:
+        """Block until every queued bank record is durable.
+
+        The barrier before consumption markers and before compaction: a marker must
+        never name a record that is still sitting in the queue.
+
+        Works whether or not ``stage_bank`` is still alive. After the pipeline is
+        torn down the stage is gone, so waiting on the queue would block forever;
+        in that case the remaining records are written inline instead of dropped.
+        """
+        if self.bank is None:
+            return
+        if self._bank_task is not None and not self._bank_task.done():
+            await self.bank_queue.join()
+        else:
+            pending = []
+            while self.bank_queue.qsize():
+                pending.append(self.bank_queue.get_nowait())
+                self.bank_queue.task_done()
+            if pending:
+                await asyncio.to_thread(self._write_records_latching, pending)
+        if self._bank_error is not None:
+            error, self._bank_error = self._bank_error, None
+            raise error
 
     async def stage_infer(self) -> None:
         """Run a persistent pool of inference workers, spawned once per pipeline."""
@@ -448,7 +569,18 @@ class RolloutPipeline:
         )
 
     async def stage_assemble(self) -> None:
-        """Build complete rollout groups, and regenerate dropped groups."""
+        """Grade each rollout as it arrives, emit groups once they fill, and
+        regenerate dropped ones.
+
+        Grading moved here from group completion so a member can be persisted the
+        moment it is durable-worthy. It does not run more often: every rollout is
+        graded either way, because the drop decision needs the rewards.
+
+        Placeholders are not persisted. A failed episode has an empty trajectory
+        and no decode work to save, and banking one would let a restored group
+        carry a placeholder past the refill path in ``_decide_drop``; leaving the
+        slot empty means restore regenerates it instead.
+        """
         pending = self._assemble_pending
         try:
             while True:
@@ -459,22 +591,33 @@ class RolloutPipeline:
                 dequeued_at = time.monotonic()
                 if inferred.inferred_at:
                     self.assemble_queue_dwell.append(dequeued_at - inferred.inferred_at)
-                bucket = pending.setdefault(inferred.item.group_id, [])
-                bucket.append(inferred)
+
+                item = inferred.item
+                rollout = await item.params.build_rollout(inferred.episode)
+                if (
+                    self.bank is not None
+                    and item.bank_uid is not None
+                    and not rollout.is_placeholder
+                ):
+                    self.bank_queue.put_nowait(
+                        _PendingRollout(item.bank_uid, item.rollout_idx, rollout)
+                    )
+
+                bucket = pending.setdefault(item.group_id, {})
+                bucket[item.rollout_idx] = rollout
                 if len(bucket) < self.request.rollouts_per_group:
                     continue
-                completed = pending.pop(inferred.item.group_id)
-                completed.sort(key=lambda item: item.item.rollout_idx)
-                rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.episode) for item in completed]
-                )
-                first = completed[0]
+
+                pending.pop(item.group_id)
+                indices = sorted(bucket)
                 self.assembled_count += 1
-                self.assembled_groups_per_env[first.item.env_index] += 1
+                self.assembled_groups_per_env[item.env_index] += 1
                 group = RolloutGroup(
-                    rollouts=rollouts,
-                    batch_id=first.item.batch_id,
-                    index_in_batch=first.item.index_in_batch,
+                    rollouts=[bucket[index] for index in indices],
+                    batch_id=item.batch_id,
+                    index_in_batch=item.index_in_batch,
+                    uid=item.bank_uid,
+                    member_indices=indices,
                 )
                 if self._decide_drop(group):
                     self.dropped_count += 1
@@ -484,8 +627,6 @@ class RolloutPipeline:
                     self._regen_tasks.add(task)
                     task.add_done_callback(self._regen_tasks.discard)
                     continue
-                if self.bank is not None:
-                    group.uid = self.bank.append(group)
                 self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
                     time.monotonic()
                 )
