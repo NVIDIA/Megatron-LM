@@ -14,8 +14,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, GatedDeltaNet, KimiDeltaAttention
-from megatron.core.ssm.gated_delta_net.common import _GDNBase
+from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
@@ -30,12 +29,6 @@ os.environ.update({"NCCL_NVLS_ENABLE": "0"})
 
 _KDA_INPUT_GRAD_ATOL = 3.2e-2
 _KDA_INPUT_GRAD_RELATIVE_L2 = 5e-3
-
-
-def test_kda_and_gdn_are_sibling_gdn_family_variants():
-    assert issubclass(GatedDeltaNet, _GDNBase)
-    assert issubclass(KimiDeltaAttention, _GDNBase)
-    assert not issubclass(KimiDeltaAttention, GatedDeltaNet)
 
 
 def _make_config(

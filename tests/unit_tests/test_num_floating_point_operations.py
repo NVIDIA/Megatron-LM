@@ -100,15 +100,22 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     return args
 
 
-def _make_ling_hybrid_args(pattern):
-    """Minimal direct-KDA/MLA dimensions for hybrid FLOPs tests."""
+def _make_kda_hybrid_args():
+    """Minimal KDA dimensions for hybrid FLOPs tests."""
     args = _make_hybrid_args()
-    args.hybrid_layer_pattern = pattern
+    args.hybrid_layer_pattern = "K"
     args.linear_key_head_dim = 32
     args.linear_value_head_dim = 32
     args.linear_num_key_heads = 8
     args.linear_num_value_heads = 8
     args.linear_conv_kernel_dim = 4
+    return args
+
+
+def _make_mla_hybrid_args():
+    """Minimal head-wise gated MLA dimensions for hybrid FLOPs tests."""
+    args = _make_hybrid_args()
+    args.hybrid_layer_pattern = "+"
     args.q_lora_rank = 128
     args.qk_head_dim = 48
     args.qk_pos_emb_head_dim = 16
@@ -415,11 +422,11 @@ class TestHybridMatchesStandard:
         self._assert_match(configure)
 
 
-class TestLingHybridAttentionFlops:
-    """KDA and MLA layers must contribute to Ling-V3 Tiny MFU accounting."""
+class TestKimiDeltaAttentionFlops:
+    """KDA layers must contribute their projection and kernel work."""
 
-    def test_kda_direct_projection_formula(self):
-        args = _make_ling_hybrid_args("K")
+    def test_direct_projection_formula(self):
+        args = _make_kda_hybrid_args()
         batch_size = 2
         total_tokens = batch_size * args.seq_length
         qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
@@ -445,8 +452,12 @@ class TestLingHybridAttentionFlops:
 
         assert num_floating_point_operations(args, batch_size) == 3 * (kda_forward + logits_forward)
 
-    def test_mla_uses_ragged_attention_work(self):
-        args = _make_ling_hybrid_args("+")
+
+class TestMLAHeadwiseOutputGateFlops:
+    """Head-wise gated MLA must account for gate projection and ragged attention work."""
+
+    def test_uses_ragged_attention_work(self):
+        args = _make_mla_hybrid_args()
         batch_size = 2
         bshd_sum = batch_size * args.seq_length**2
         flops_full = num_floating_point_operations(
@@ -463,31 +474,29 @@ class TestLingHybridAttentionFlops:
         )
         assert flops_full - flops_half == expected_delta
 
-    def test_mla_gate_granularity_changes_only_projection_work(self):
-        args = _make_ling_hybrid_args("+")
+    def test_headwise_gate_projection_work(self):
+        args = _make_mla_hybrid_args()
         batch_size = 2
         total_tokens = batch_size * args.seq_length
 
-        args.gated_attention_proj_granularity = "headwise"
-        headwise_flops = num_floating_point_operations(args, batch_size)
-        args.gated_attention_proj_granularity = "elementwise"
-        elementwise_flops = num_floating_point_operations(args, batch_size)
+        args.attention_output_gate = False
+        ungated_flops = num_floating_point_operations(args, batch_size)
+        args.attention_output_gate = True
+        gated_flops = num_floating_point_operations(args, batch_size)
 
-        expected_delta = (
-            3
-            * 2
-            * total_tokens
-            * args.hidden_size
-            * args.num_attention_heads
-            * (args.v_head_dim - 1)
-        )
-        assert elementwise_flops - headwise_flops == expected_delta
+        expected_delta = 3 * 2 * total_tokens * args.hidden_size * args.num_attention_heads
+        assert gated_flops - ungated_flops == expected_delta
+
+
+class TestHybridAttentionOutputGateFlops:
+    """Regular attention output gating must use the regular attention projection width."""
 
     @pytest.mark.parametrize(
         ("gate_granularity", "gate_projection_size"), (("elementwise", 512), ("headwise", 8))
     )
-    def test_hybrid_regular_attention_output_gate(self, gate_granularity, gate_projection_size):
-        args = _make_ling_hybrid_args("*")
+    def test_projection_work(self, gate_granularity, gate_projection_size):
+        args = _make_hybrid_args()
+        args.hybrid_layer_pattern = "*"
         # The model-wide MLA flag is also enabled in mixed '*' / '+' models, but '*' remains
         # regular attention. Use a different MLA value-head width to make that distinction visible.
         args.multi_latent_attention = True
