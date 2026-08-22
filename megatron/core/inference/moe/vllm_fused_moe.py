@@ -124,6 +124,7 @@ def _fused_moe_kernel(
     # Flags / constexprs
     MUL_ROUTED_WEIGHT: tl.constexpr,
     FUSE_SQUARED_RELU: tl.constexpr,
+    FUSE_SWIGLU: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -186,6 +187,13 @@ def _fused_moe_kernel(
                 + off_experts * stride_be
                 + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
             )
+            # SwiGLU epilogue fusion: the same [BLOCK_M, BLOCK_N] output tile of
+            # the activated intermediate needs both the gate columns (offs_bn) and
+            # the paired up columns (offs_bn + N), where N is the activated width.
+            # A second accumulator reads the up half from the same B tensor.
+            if FUSE_SWIGLU:
+                b_up_ptrs = b_ptrs + N * stride_bn
+                up_accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
             for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -196,6 +204,12 @@ def _fused_moe_kernel(
                 )
                 b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
                 accumulator += tl.dot(a, b)
+                if FUSE_SWIGLU:
+                    b_up = tl.load(
+                        b_up_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                    )
+                    up_accumulator += tl.dot(a, b_up)
+                    b_up_ptrs += BLOCK_SIZE_K * stride_bk
                 a_ptrs += BLOCK_SIZE_K * stride_ak
                 b_ptrs += BLOCK_SIZE_K * stride_bk
 
@@ -204,6 +218,15 @@ def _fused_moe_kernel(
             if FUSE_SQUARED_RELU:
                 accumulator = tl.maximum(accumulator, 0.0)
                 accumulator *= accumulator
+
+            # SwiGLU fused on the fp32 accumulators: SiLU(gate) * up. The
+            # arithmetic matches the standalone `bounded_silu_mul` kernel, but the
+            # results are not bit-identical (measured max_abs 3.9e-5): that kernel
+            # reads gate and up after they have been rounded to bf16, while these
+            # accumulators have not been. The fused result is the less rounded of
+            # the two. Removes that kernel and the 2N intermediate round-trip.
+            if FUSE_SWIGLU:
+                accumulator = accumulator * tl.sigmoid(accumulator) * up_accumulator
 
             if MUL_ROUTED_WEIGHT:
                 moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -387,12 +410,18 @@ def _invoke_fused_moe_kernel(
     config: dict,
     grid_size: int,
     fuse_squared_relu: bool = False,
+    fuse_swiglu: bool = False,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass.
 
     Body matches upstream vLLM `fused_moe_kernel` (1 CTA per (pid_m, pid_n)
     tile, raw pointer arithmetic with `% N` on the N axis), apart from the
     optional fused squared-relu activation in fp32.
+
+    When ``fuse_swiglu`` is set, B is the [E, 2*Nf, K] gate|up FC1 weight and the
+    kernel emits the activated [num_valid, Nf] intermediate directly (SiLU(gate) *
+    up), so ``N`` is the activated width ``Nf = B.size(1) // 2`` and each program
+    also reads the paired up columns at ``+N`` in B.
 
     `grid_size` is sized host-side from `num_tokens_hint` so launch overhead
     at decode is small.  When the actual padded length exceeds the hinted
@@ -402,6 +431,8 @@ def _invoke_fused_moe_kernel(
     """
     M = A.size(0)
     num_tokens = M * top_k
+    # For fused SwiGLU, N is the activated width (half the 2*Nf FC1 output).
+    n_dim = B.size(1) // 2 if fuse_swiglu else B.size(1)
 
     _fused_moe_kernel[(grid_size,)](
         A,
@@ -411,7 +442,7 @@ def _invoke_fused_moe_kernel(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        B.size(1),
+        n_dim,
         B.size(2),
         num_tokens,
         A.stride(0),
@@ -423,6 +454,7 @@ def _invoke_fused_moe_kernel(
         C.stride(1),
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
+        FUSE_SWIGLU=fuse_swiglu,
         top_k=top_k,
         BLOCK_SIZE_M=config['BLOCK_SIZE_M'],
         BLOCK_SIZE_N=config['BLOCK_SIZE_N'],
@@ -557,6 +589,7 @@ def vllm_fused_moe(
     routing_map: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
+    fuse_fc1_activation: bool = False,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -580,6 +613,9 @@ def vllm_fused_moe(
         num_tokens_hint: optional host-side int with the expected number of
             valid tokens (e.g. batch_size * ep_size). Used to select a better
             BLOCK_SIZE_M instead of using the worst-case buffer size.
+        fuse_fc1_activation: for SwiGLU, fuse SiLU(gate)*up into the FC1 GEMM
+            epilogue instead of running the standalone ``bounded_silu_mul`` kernel
+            over the 2N-wide intermediate. Ignored for other activations.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -606,6 +642,14 @@ def vllm_fused_moe(
     N = fc1_weight.size(1)
     K = fc1_weight.size(2)
 
+    assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
+    is_swiglu = activation_type == ActivationType.SWIGLU
+    # When enabled for SwiGLU, FC1 fuses SiLU(gate)*up into its epilogue and
+    # writes the activated [num_valid, N//2] intermediate directly, removing the
+    # standalone bounded_silu_mul kernel and the 2N intermediate round-trip.
+    use_fused_swiglu = is_swiglu and fuse_fc1_activation
+    fc1_out_width = N // 2 if use_fused_swiglu else N
+
     # Grid sized for the typical-case token count (num_tokens_hint).  When the
     # actual num_tokens_post_padded exceeds this, the kernel's outer tl.range
     # makes each CTA stride over additional tiles — correct but with reduced
@@ -614,21 +658,20 @@ def vllm_fused_moe(
     block_m = config['BLOCK_SIZE_M']
     em_hint = effective_tokens * topk + block_m * num_local_experts
     num_pid_m_hint = _ceil_div(em_hint, block_m)
-    num_pid_n_fc1 = _ceil_div(N, config['BLOCK_SIZE_N'])
+    num_pid_n_fc1 = _ceil_div(fc1_out_width, config['BLOCK_SIZE_N'])
     num_pid_n_fc2 = _ceil_div(K, config['BLOCK_SIZE_N'])
     grid_size_fc1 = num_pid_m_hint * num_pid_n_fc1
     grid_size_fc2 = num_pid_m_hint * num_pid_n_fc2
 
     topk_weights_flat = probs.reshape(-1).contiguous()
 
-    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    # SQUARED_RELU fuses into the GEMM epilogue (elementwise). SwiGLU pairs column c
-    # with c+N/2 across tiles and cannot, so FC1 runs unfused to the 2N-wide
-    # intermediate and gate/up is applied separately below.
-    assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
-    is_swiglu = activation_type == ActivationType.SWIGLU
+    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, fc1_out_width]
+    # SQUARED_RELU fuses into the GEMM epilogue (elementwise). SwiGLU pairs column
+    # c with c+N/2 across N-tiles; the unfused path writes the 2N intermediate and
+    # applies gate/up separately below, while the fused path (use_fused_swiglu)
+    # reads both halves per program and writes the N//2 activated output directly.
     intermediate1 = torch.empty(
-        num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
+        num_valid, fc1_out_width, dtype=hidden_states.dtype, device=hidden_states.device
     )
     _invoke_fused_moe_kernel(
         hidden_states,
@@ -643,8 +686,9 @@ def vllm_fused_moe(
         config=config,
         grid_size=grid_size_fc1,
         fuse_squared_relu=not is_swiglu,
+        fuse_swiglu=use_fused_swiglu,
     )
-    if is_swiglu:
+    if is_swiglu and not use_fused_swiglu:
         # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
         n_rows = (valid_tokens * topk).to(torch.int32)
