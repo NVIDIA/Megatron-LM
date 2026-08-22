@@ -39,7 +39,7 @@ def _run(*, args_overrides=None, model=None, optimizer=None, **kwargs):
         setattr(args, name, value)
     captured = {}
     model = model or [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
-    optimizer = optimizer or SimpleNamespace(zero_grad=lambda: None)
+    optimizer = optimizer or SimpleNamespace(zero_grad=lambda: None, chained_optimizers=[])
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
@@ -72,7 +72,7 @@ def test_train_step_defaults_to_none():
     assert captured["p2p_communicator"] is None and captured["pg_collection"] is None
 
 
-def test_train_step_stages_only_overlapped_mxfp8_optimizers():
+def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
     class _DistributedOptimizer:
         def __init__(self, overlap_param_gather):
             self.ddp_config = SimpleNamespace(
@@ -94,10 +94,11 @@ def test_train_step_stages_only_overlapped_mxfp8_optimizers():
     ]
 
     with mock.patch.object(training_mod, "DistributedOptimizer", _DistributedOptimizer):
+        # Global args intentionally disagree; the optimizer DDP config is authoritative.
         _run(
             args_overrides={
-                "reuse_grad_buf_for_mxfp8_param_ag": True,
-                "overlap_param_gather": True,
+                "reuse_grad_buf_for_mxfp8_param_ag": False,
+                "overlap_param_gather": False,
             },
             model=model,
             optimizer=optimizer,
