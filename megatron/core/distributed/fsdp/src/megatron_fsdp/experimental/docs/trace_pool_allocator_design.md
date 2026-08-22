@@ -26,6 +26,9 @@ The pool must preserve three properties of the existing implementation:
 3. VPP + combined 1F1B uses `FsdpExecutionRunner` to trace occurrence order,
    prefetch the next unit, and skip redundant reshards. Storage planning must
    not replace or bypass that execution path.
+4. Symmetric-memory allocations and storage restorations must happen in the
+   PyTorch NCCL symmetric-memory pool. Corresponding data-parallel ranks must
+   observe the same allocation sizes and order so rendezvous remains valid.
 
 ## Lifecycle
 
@@ -43,6 +46,12 @@ Storage to zero, and the next `allocate()` restores the same Storage object.
 This deliberately does not share physical storage between keys during the
 trace phase: doing so before future lifetimes are known could invalidate a
 weight view saved by GEMM for backward.
+
+With symmetric memory enabled, the initial `torch.empty()` and every non-zero
+Storage resize run under `torch.cuda.use_mem_pool(symm_mem.get_mem_pool(device))`.
+The zero-size release needs no allocation context. Keeping the same Storage
+object preserves autograd aliases while the allocation produced by each
+restoration remains symmetric-memory eligible.
 
 Allocation and free events are recorded in the actual VPP/1F1B occurrence
 order. `FsdpExecutionRunner` continues to record its independent prefetch trace
@@ -73,6 +82,12 @@ The allocator:
 5. reuses trace `Storage` objects as the fixed physical slots; and
 6. calls `torch.cuda.empty_cache()` once, after the live pool has claimed its
    storage, to discard surplus trace fragmentation.
+
+Step 6 trims the default CUDA caching allocator. PyTorch keeps freed blocks in
+a live custom `MemPool`, so surplus symmetric trace allocations may remain
+reserved at the symmetric pool's trace-phase high-water mark even though only
+the colored slots remain allocated. This is a PyTorch `MemPool` lifecycle
+constraint and must be included in memory measurements.
 
 The coloring is a memory-oriented heuristic, not a proof of the minimum
 weighted coloring.
@@ -118,8 +133,19 @@ collective input directly; no extra `torch.empty` is created.
 - The feature pools M-FSDP unshard and partial-gradient communication buffers.
   Persistent sharded weights, main gradients, optimizer state, activations, and
   MXFP8 quantization temporaries remain under their existing allocators.
-- NCCL user buffers and PyTorch symmetric-memory pools require separately
-  registered storage, so they cannot be combined with `--fsdp-trace-pool`.
+- PyTorch NCCL symmetric memory can back trace-pool slots for regular parameter
+  groups. MXFP8 primary weights and fused-wgrad accumulation retain their
+  existing symmetric-memory restrictions.
+- Every rank in a symmetric-memory collective group must trace the same slot
+  allocation order and sizes. An asymmetric model or divergent schedule can
+  fail during symmetric-memory rendezvous even before the normal slot-collision
+  check detects schedule divergence.
+- A pooled symmetric partial-gradient buffer is persistent across backwards.
+  The non-pooled symmetric path intentionally allocates this buffer afresh
+  because reuse previously introduced a host-visible synchronization in the
+  next gradient copy. Correctness tests are necessary but not sufficient;
+  profiles must verify that this synchronization does not erase the symmetric
+  collective benefit.
 - The traced execution must be repeatable. Runtime slot-collision checks cover
   changed overlap; late-key warnings cover newly observed allocations.
 - Planning introduces one synchronization and cache trim after the observed
@@ -128,8 +154,9 @@ collective input directly; no extra `torch.empty` is created.
 ## Validation
 
 Correctness tests cover Storage identity across trace release/reallocation,
-slot sharing and collisions, arena isolation, DBuffer rebinding, and multi-step
-loss parity across the trace-to-optimized transition. Performance validation
-should compare identical 24-GPU PP3/VPP2/EP8 jobs, discard at least the initial
-execution trace, first replay, and first five steps, and report allocated,
-reserved, and device-used memory on one rank from every pipeline stage.
+slot sharing and collisions, arena isolation, DBuffer rebinding, symmetric
+slot provenance, and multi-step loss parity across the trace-to-optimized
+transition. Performance validation should compare identical 24-GPU
+PP3/VPP2/EP8 jobs, discard at least the initial execution trace, first replay,
+and first five steps, and report allocated, reserved, and device-used memory on
+one rank from every pipeline stage.
