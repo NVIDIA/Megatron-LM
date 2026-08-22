@@ -227,6 +227,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_pre_softmax": False,
     "moe_router_quantile_balancing_ema": 0.0,
     "moe_router_score_function": "sigmoid",
+    "moe_router_skip_muon": True,
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
@@ -500,6 +501,7 @@ class TestHybridMoEModel:
         args.moe_grouped_gemm = True
         args.moe_shared_expert_intermediate_size = 3712
         args.moe_router_score_function = "sigmoid"
+        args.moe_router_skip_muon = True
         args.moe_router_enable_expert_bias = True
         args.moe_router_topk_scaling_factor = 2.5
         args.mamba_state_dim = 128
