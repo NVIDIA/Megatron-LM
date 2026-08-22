@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
-# Some of this code was adopted from https://github.com/huggingface/transformers
-# This source code is licensed under the Apache license found in the
-# LICENSE file in the root directory of this source tree.
+"""Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
+import math
+from dataclasses import dataclass
 from functools import partial
 from typing import Optional
 
@@ -18,61 +18,154 @@ from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
+    HAVE_FLA,
+    GatedDeltaNetSubmodules,
     _GDNBase,
     a2a_cp_to_hp,
     a2a_hp_to_cp,
     build_cp_context,
     causal_conv1d,
-    chunk_gated_delta_rule,
     get_parameter_local_cp,
-    l2norm,
 )
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.module import mark_keep_in_fp32
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
+try:
+    from fla.ops.kda import chunk_kda
 
-class GatedDeltaNet(_GDNBase):
-    """Gated DeltaNet with a head-wise scalar memory-decay gate."""
+    # KDA also relies on the shared FLA convolution, normalization, and CP helpers.
+    HAVE_FLA_KDA = HAVE_FLA
+except ImportError:  # pragma: no cover
+    chunk_kda = None
+    HAVE_FLA_KDA = False
 
-    def _setup_variant_attrs(self):
-        """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
-        self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
-        if self.config.deterministic_mode and self.gdn_pre_gated_delta_rule_fusion:
-            raise ValueError(
-                "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
-                "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
+
+@dataclass
+class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
+    """Submodules used by Kimi Delta Attention."""
+
+    beta_proj: ModuleSpec | type = IdentityOp
+
+
+class KimiDeltaAttention(_GDNBase):
+    """Channel-wise Gated DeltaNet variant with direct Q/K/V/F/G projections.
+
+    The initial implementation supports training with equal query/key and value
+    head layouts. Optional low-rank F/B/G projections and recurrent inference
+    are intentionally outside this implementation.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: KimiDeltaAttentionSubmodules,
+        layer_number: int | None = None,
+        bias: bool = False,
+        conv_bias: bool = False,
+        conv_init: float | None = None,
+        use_qk_l2norm: bool = True,
+        A_init_range: tuple[float, float] = (1, 16),
+        pg_collection: ProcessGroupCollection | None = None,
+        *,
+        name: str | None = None,
+        cp_comm_type: str | None = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
+    ) -> None:
+        if not HAVE_FLA or not HAVE_FLA_KDA:  # pragma: no cover
+            raise ImportError(
+                "FLA KDA is not installed. Install flash-linear-attention with KDA support."
             )
 
-        # alpha, beta
-        self.in_proj_extra_dim = self.num_value_heads * 2
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            bias=bias,
+            conv_bias=conv_bias,
+            conv_init=conv_init,
+            use_qk_l2norm=use_qk_l2norm,
+            A_init_range=A_init_range,
+            pg_collection=pg_collection,
+            name=name,
+            cp_comm_type=cp_comm_type,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
+        )
+
+        # KDA keeps beta in a separate projection so its checkpoint layout remains
+        # independent from the direct Q/K/V/F/G projection.
+        self.beta_proj = build_module(
+            submodules.beta_proj,
+            self.hidden_size,
+            self.num_key_heads,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name="beta_proj",
+            tp_group=self.pg_collection.tp,
+            name=(name + ".beta_proj") if name is not None else None,
+        )
+
+        # These kernel parameters participate in FP32 gate math and must remain
+        # FP32 through model casting, optimizer construction, and checkpointing.
+        mark_keep_in_fp32(self.dt_bias)
+        mark_keep_in_fp32(self.A_log)
+        self.dt_bias._no_reinit = True
+        self.dt_bias._no_weight_decay = True
+        self.A_log._no_weight_decay = True
+
+        # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
+        self.use_gate_in_kernel = True
+
+    def _setup_variant_attrs(self) -> None:
+        """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
+
+        self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
+
+        # Channel-wise raw memory-decay gate g.
+        self.in_proj_extra_dim = self.qk_dim
 
         # Per-section sizes (and names) of the in_proj output, local to this TP rank.
-        # Used for the CP head permutation (pre-a2a), for splitting the projection
-        # output (post-a2a), and for the sharded checkpoint split of in_proj.weight.
-        self.in_proj_split_names = ["query", "key", "value", "z", "beta", "alpha"]
+        # Used for the CP head permutation, post-a2a split, and sharded checkpoint split.
+        self.in_proj_split_names = ["query", "key", "value", "g", "gate"]
         self.in_proj_split_sections = (
-            self.qk_dim_local_tp,  # q
-            self.qk_dim_local_tp,  # k
-            self.v_dim_local_tp,  # v
-            self.v_dim_local_tp,  # gate (z)
-            self.num_value_heads // self.tp_size,  # beta
-            self.num_value_heads // self.tp_size,  # alpha
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
         )
-        self.dt_bias_dim = self.num_v_heads_local_tp
-        self.a_log_dim = self.num_v_heads_local_tp
+        self.dt_bias_dim = self.qk_dim_local_tp
+        self.a_log_dim = self.num_k_heads_local_tp
+        self.gate_params_dtype = torch.float32
+        self.gated_delta_rule = chunk_kda
 
-        if self.config.deterministic_mode:
-            self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
-            self.gated_delta_rule = chunk_gated_delta_rule
+    def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int]:
+        """Return KDA qkv/raw-g/output-gate split sizes for runtime headwise CP."""
 
-    def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
-        """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""
         return (
             (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,
+            self.qk_dim_local_tp // cp_size_headwise,
             self.v_dim_local_tp // cp_size_headwise,
-            self.num_value_heads // self.tp_size // cp_size_headwise,
-            self.num_value_heads // self.tp_size // cp_size_headwise,
         )
+
+    def _reset_dt_bias(self) -> None:
+        """Initialize the KDA channel-wise step-size bias in inverse-softplus space."""
+
+        dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+        dt = torch.exp(
+            torch.rand(self.dt_bias_dim, device=self.dt_bias.device, dtype=self.dt_bias.dtype)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        self.dt_bias.data.copy_(dt + torch.log(-torch.expm1(-dt)))
 
     @jit_fuser
     def _compute_gates(
@@ -83,12 +176,24 @@ class GatedDeltaNet(_GDNBase):
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute the per-head log-decay g and the write strength beta."""
-        # ``gate_feats`` arrives in ``in_proj_split_names`` order: beta, then alpha.
-        beta, alpha = gate_feats
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
-        return g, {"beta": beta.contiguous()}
+        """Shape the raw channel-wise decay gate and activate the write strength."""
+
+        # ``gate_feats`` follows the KDA pre-GDR order: raw g, then separate beta.
+        raw_g, beta = gate_feats
+        num_key_heads = A_log_local_cp.numel()
+        raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
+        beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
+        return raw_g, {"beta": beta.contiguous()}
+
+    @jit_fuser
+    def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply per-head RMSNorm followed by KDA's sigmoid output gate."""
+
+        x_dtype = x.dtype
+        x = x.reshape(-1, self.value_head_dim)
+        x = self.out_norm(x)
+        gate = gate.reshape(-1, self.value_head_dim)
+        return (x * torch.sigmoid(gate.float())).to(x_dtype)
 
     def forward(
         self,
@@ -101,14 +206,10 @@ class GatedDeltaNet(_GDNBase):
         pg_collection: Optional[ProcessGroupCollection] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ):
-        """
-        Perform a forward pass through the GDN module.
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the direct-projection KDA training path."""
 
-        Return:
-            (tuple[torch.Tensor, torch.Tensor]) GDN output and bias.
-        """
-
+        del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         active_pg_collection = pg_collection if pg_collection is not None else self.pg_collection
@@ -128,6 +229,7 @@ class GatedDeltaNet(_GDNBase):
                 f"Unsupported linear_cp_mode {self.config.linear_cp_mode!r}; "
                 "expected 'headwise' or 'chunkwise'."
             )
+
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
         cp_size_runtime = cp_group.size()
@@ -151,10 +253,9 @@ class GatedDeltaNet(_GDNBase):
         if inference_context is not None:
             assert (
                 inference_context.is_static_batching()
-            ), "GDN does not currently support dynamic inference batching."
+            ), "KimiDeltaAttention does not currently support dynamic inference batching."
             assert not self.config.sequence_parallel
-            # TODO: support inference
-            raise NotImplementedError("GDN does not support inference for now.")
+            raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
 
         if cp_size_headwise > 1 and (
             (
@@ -168,17 +269,13 @@ class GatedDeltaNet(_GDNBase):
             )
         ):
             raise ValueError(
-                "GatedDeltaNet with headwise CP requires zigzag layout. CP partition "
-                "conversion must be handled before calling GatedDeltaNet."
+                "KimiDeltaAttention with headwise CP requires zigzag layout. CP partition "
+                "conversion must be handled before calling KimiDeltaAttention."
             )
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            assert batch == 1, "Packed sequence expects batch dimension to be 1"
-            assert (
-                not self.config.deterministic_mode
-            ), "Packed sequence does not support deterministic mode."
-
-            # Resolve cu_seqlens with alignment padding handling.
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            if batch != 1:
+                raise ValueError("Packed KDA expects batch dimension to be 1.")
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
@@ -193,18 +290,9 @@ class GatedDeltaNet(_GDNBase):
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
-            num_packed_seqs = cu_seqlens_q.shape[0] - 1
-            assert num_packed_seqs > 0, (
-                "Number of packed sequences must be greater than 0, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
         else:
             cu_seqlens_q = None
-            cu_seqlens_kv = None
 
         if cp_size_chunkwise > 1:
             if cu_seqlens_q is None:
@@ -285,15 +373,26 @@ class GatedDeltaNet(_GDNBase):
         packed_seq_params,
         chunkwise_cp_context,
     ):
-        """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
-        # Input projection
+        """Core KDA computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
+
+        # Input projections. Beta intentionally remains a separate matrix.
         nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
+        qkvfg, _ = self.in_proj(hidden_states)
+        beta, _ = self.beta_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
-        qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
-            qkvzba,
+        qkvfg, thd_cp_a2a_inv = a2a_cp_to_hp(
+            qkvfg,
             self.in_proj_split_sections,
+            cp_size_headwise,
+            cp_group_headwise,
+            cu_seqlens_q,
+            seq_len_post_headwise,
+            packed_seq_params,
+        )
+        beta, _ = a2a_cp_to_hp(
+            beta,
+            (self.num_k_heads_local_tp,),
             cp_size_headwise,
             cp_group_headwise,
             cu_seqlens_q,
@@ -302,65 +401,43 @@ class GatedDeltaNet(_GDNBase):
         )
 
         if self.gdn_pre_gated_delta_rule_fusion:
-            if cp_size_chunkwise > 1 and batch > 1:
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
-            if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
-                raise ValueError(
-                    "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
-                    "chunk-local causal-conv inputs can change later chunk numerics."
-                )
-            nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
-            seq_idx = (
-                packed_seq_params.seq_idx
-                if packed_seq_params is not None
-                and packed_seq_params.qkv_format == 'thd'
-                and cp_size_chunkwise == 1
-                else None
+            raise NotImplementedError(
+                "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
             )
-            fused_cu_seqlens_q = (
-                cu_seqlens_q
-                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-                else None
+
+        if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
+            raise ValueError(
+                "KDA chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
+                "when cp_context is used. Use packed THD input or micro_batch_size=1."
             )
-            query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
-                qkvzba,
-                cu_seqlens_q=fused_cu_seqlens_q,
-                seq_idx=seq_idx,
-                cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
-                cp_group_headwise=cp_group_headwise,
+        if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
+            raise ValueError(
+                "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. Padding "
+                "chunk-local causal-conv inputs can change later chunk numerics."
             )
-            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
-            nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
-        else:
-            nvtx_range_push(suffix="pre_gated_delta_rule")
-            if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
-                # TODO: If additional gated delta rule backends are added, handle this
-                # SBHD + chunkwise CP + batch>1 case per backend instead of
-                # unconditionally rejecting it.
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
-            if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
-                raise ValueError(
-                    "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
-                    "chunk-local causal-conv inputs can change later chunk numerics."
-                )
-            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-                qkvzba,
-                batch,
-                seq_len_post_headwise,
-                cp_size_headwise,
-                cp_group_headwise,
-                cu_seqlens_q,
-                chunkwise_cp_context,
-                packed_seq_params=packed_seq_params,
-            )
-            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
-            nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        nvtx_range_push(suffix="pre_gated_delta_rule")
+        query, key, value, gate, beta, raw_g, A_log, dt_bias = self.pre_gated_delta_rule(
+            qkvfg,
+            beta,
+            batch,
+            seq_len_post_headwise,
+            cp_size_headwise,
+            cp_group_headwise,
+            cu_seqlens_q,
+            chunkwise_cp_context,
+            packed_seq_params=packed_seq_params,
+        )
+        kernel_inputs = {
+            "q": query,
+            "k": key,
+            "v": value,
+            "g": raw_g,
+            "beta": beta,
+            "A_log": A_log,
+            "dt_bias": dt_bias,
+        }
+        nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
@@ -368,6 +445,9 @@ class GatedDeltaNet(_GDNBase):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
+            use_gate_in_kernel=self.use_gate_in_kernel,
+            safe_gate=self.config.kda_safe_gate,
+            lower_bound=self.config.kda_lower_bound,
             cu_seqlens=cu_seqlens_q,
             cp_context=chunkwise_cp_context,
         )
@@ -403,7 +483,7 @@ class GatedDeltaNet(_GDNBase):
                 cu_seqlens_q,
             )
 
-        # Output projection
+        # Output projection.
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
@@ -427,6 +507,8 @@ class GatedDeltaNet(_GDNBase):
         cp_group_chunkwise: torch.distributed.ProcessGroup | None,
         cu_seqlens_q: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Apply KDA's gated output norm and restore its context-parallel layout."""
+
         nvtx_range_push(suffix="gated_norm")
         norm_out = self._apply_gated_norm(core_attn_out, gate)
         nvtx_range_pop(suffix="gated_norm")
@@ -440,7 +522,8 @@ class GatedDeltaNet(_GDNBase):
 
     def pre_gated_delta_rule(
         self,
-        qkvzba,
+        qkvfg,
+        beta,
         batch,
         seq_len,
         cp_size_headwise,
@@ -449,12 +532,11 @@ class GatedDeltaNet(_GDNBase):
         chunkwise_cp_context=None,
         packed_seq_params=None,
     ):
-        """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
+        """Prepare QKV, output gate, beta, and raw decay tensors before KDA."""
 
-        qkvzba = qkvzba.transpose(0, 1)
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba, self._get_feat_dim_split(cp_size_headwise), dim=-1
-        )
+        qkvfg = qkvfg.transpose(0, 1)
+        beta = beta.transpose(0, 1)
+        qkv, raw_g, gate = torch.split(qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
         nvtx_range_push(suffix="conv1d")
@@ -480,7 +562,7 @@ class GatedDeltaNet(_GDNBase):
             if self.conv_bias
             else None
         )
-        if self.config.deterministic_mode:
+        if self.config.deterministic_mode or causal_conv1d is None:
             qkv = qkv.transpose(1, 2).contiguous()
             conv_out = F.conv1d(
                 input=qkv,
@@ -492,9 +574,10 @@ class GatedDeltaNet(_GDNBase):
                 groups=self.conv_dim_local_tp // cp_size_headwise,
             )
             qkv = self.act_fn(conv_out[..., :kernel_seq_len])
-            qkv = qkv.transpose(1, 2)
+            qkv = qkv.transpose(1, 2).contiguous()
         else:
-            assert self.activation in ["silu", "swish"]
+            if self.activation not in ("silu", "swish"):
+                raise ValueError(f"FLA causal convolution requires SiLU, got {self.activation}.")
             orig_seq = qkv.shape[1]
             pad_n = 0
             conv_input = qkv.contiguous()
@@ -508,7 +591,7 @@ class GatedDeltaNet(_GDNBase):
                     )
                 if chunkwise_cp_context is not None:
                     raise ValueError(
-                        "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
+                        "gdn_conv_pad_alignment is incompatible with KDA chunkwise CP. Padding "
                         "chunk-local causal-conv inputs can change later chunk numerics."
                     )
                 pad_n = -orig_seq % self.config.gdn_conv_pad_alignment
@@ -541,8 +624,8 @@ class GatedDeltaNet(_GDNBase):
             dt_bias_local_cp,
             batch,
             kernel_seq_len,
+            raw_g,
             beta,
-            alpha,
             cp_size_headwise=cp_size_headwise,
         )
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
@@ -556,174 +639,31 @@ class GatedDeltaNet(_GDNBase):
             gate,
             kernel_inputs["beta"],
             kernel_inputs["g"],
+            A_log_local_cp,
+            dt_bias_local_cp,
         )
 
-    def _fused_streamed_pre_gated_delta_rule(
-        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None, cp_group_headwise=None
-    ):
-        """Call the streamed fused pre-GDR wrapper."""
+    @staticmethod
+    def _validate_packed_cu_seqlens(
+        cu_seqlens_q: torch.Tensor, cu_seqlens_kv: torch.Tensor
+    ) -> None:
+        """Validate the self-attention boundary contract for packed KDA."""
 
-        try:
-            from megatron.core.fusions.fused_pre_gated_delta_rule import (
-                fused_streamed_pre_gated_delta_rule,
+        if cu_seqlens_q.numel() < 2 or cu_seqlens_kv.numel() < 2:
+            raise ValueError(
+                "Packed KDA requires at least one sequence in both Q and KV boundaries."
             )
-        except ImportError as exc:
-            raise ImportError(
-                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
-                "dependencies, including causal-conv1d."
-            ) from exc
-
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=cp_group_headwise,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=cp_group_headwise,
-                split_sections=qkv_channels_split_sections,
+        if cu_seqlens_q.shape != cu_seqlens_kv.shape or not torch.equal(
+            cu_seqlens_q, cu_seqlens_kv
+        ):
+            raise ValueError(
+                "Packed KDA requires cu_seqlens_q to equal cu_seqlens_kv, "
+                f"but got shapes {tuple(cu_seqlens_q.shape)} and "
+                f"{tuple(cu_seqlens_kv.shape)}."
             )
-            if self.conv_bias
-            else None
-        )
-        A_log = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
-        dt_bias = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
-        num_value_heads = A_log.numel()
-        num_key_heads = (conv1d_weight.shape[0] - num_value_heads * self.value_head_dim) // (
-            2 * self.key_head_dim
-        )
 
-        return fused_streamed_pre_gated_delta_rule(
-            qkvzba,
-            conv1d_weight,
-            conv1d_bias,
-            A_log,
-            dt_bias,
-            num_key_heads=num_key_heads,
-            num_value_heads=num_value_heads,
-            key_head_dim=self.key_head_dim,
-            value_head_dim=self.value_head_dim,
-            use_qk_l2norm=self.use_qk_l2norm,
-            cu_seqlens=cu_seqlens_q,
-            seq_idx=seq_idx,
-            cp_group=cp_group,
-        )
+    def backward_dw(self) -> None:
+        """Execute weight-gradient computation for all KDA projections."""
 
-
-####################
-# Torch native gated delta rule
-####################
-def torch_chunk_gated_delta_rule(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    chunk_size=64,
-    initial_state=None,
-    output_final_state=False,
-    use_qk_l2norm_in_kernel=False,
-    cu_seqlens=None,
-    cp_context=None,
-    scale=None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    # pylint: disable=line-too-long
-    '''
-    Torch-native implementation of chunked gated delta rule for deterministic mode.
-    Need this because FLA is not deterministic.
-
-    ``scale`` defaults to ``1 / sqrt(K)``, matching the FLA kernel.
-
-    Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
-    '''
-
-    assert (
-        cu_seqlens is None
-    ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
-    assert (
-        cp_context is None
-    ), "cp_context is not supported for torch_chunk_gated_delta_rule for now."
-
-    initial_dtype = q.dtype
-    if use_qk_l2norm_in_kernel:
-        q = l2norm(q, dim=-1, eps=1e-6)
-        k = l2norm(k, dim=-1, eps=1e-6)
-    q, k, v, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
-    ]
-
-    batch_size, num_heads, sequence_length, k_head_dim = k.shape
-    v_head_dim = v.shape[-1]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    q = F.pad(q, (0, 0, 0, pad_size))
-    k = F.pad(k, (0, 0, 0, pad_size))
-    v = F.pad(v, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, pad_size))
-    total_sequence_length = sequence_length + pad_size
-    if scale is None:
-        scale = 1 / (q.shape[-1] ** 0.5)
-    q = q * scale
-
-    v_beta = v * beta.unsqueeze(-1)
-    k_beta = k * beta.unsqueeze(-1)
-    # reshape to chunks
-    q, k, v, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (q, k, v, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0
-    )
-
-    # chunk decay
-    g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ k.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    v = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(v)
-        if initial_state is None
-        else initial_state.to(v)
-    )
-    core_attn_out = torch.zeros_like(v)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1
-    )
-
-    # for each chunk
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
-
-    if not output_final_state:
-        last_recurrent_state = None
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-    )
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, last_recurrent_state
+        super().backward_dw()
+        self.beta_proj.backward_dw()

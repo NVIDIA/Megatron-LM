@@ -715,6 +715,8 @@ def _test_parallel_attention_correctness(
     sequence_packing=False,
     cp_partition_mode="zigzag",
     compare_param_grads=False,
+    input_grad_atol=None,
+    input_grad_rtol=None,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -922,13 +924,15 @@ def _test_parallel_attention_correctness(
                 ~torch.isinf(bias_hidden_states_parallel)
             ), "bias_hidden_states_parallel contains inf"
 
-        def assert_close_or_cosine_similarity(baseline, parallel, tensor_name):
+        def assert_close_or_cosine_similarity(
+            baseline, parallel, tensor_name, tensor_atol=atol, tensor_rtol=rtol
+        ):
             try:
                 torch.testing.assert_close(
                     baseline,
                     parallel,
-                    atol=atol,
-                    rtol=rtol,
+                    atol=tensor_atol,
+                    rtol=tensor_rtol,
                     msg=lambda msg: f"Mismatch in {tensor_name}: {msg}",
                 )
                 return
@@ -957,7 +961,13 @@ def _test_parallel_attention_correctness(
         assert_close_or_cosine_similarity(
             output_hidden_states_baseline, output_hidden_states_parallel, "output_hidden_states"
         )
-        assert_close_or_cosine_similarity(input_grad_baseline, input_grad_parallel, "input_grad")
+        assert_close_or_cosine_similarity(
+            input_grad_baseline,
+            input_grad_parallel,
+            "input_grad",
+            tensor_atol=atol if input_grad_atol is None else input_grad_atol,
+            tensor_rtol=rtol if input_grad_rtol is None else input_grad_rtol,
+        )
         if has_bias:
             assert_close_or_cosine_similarity(
                 bias_hidden_states_baseline, bias_hidden_states_parallel, "bias_hidden_states"
