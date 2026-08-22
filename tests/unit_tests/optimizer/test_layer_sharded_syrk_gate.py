@@ -16,20 +16,24 @@ import torch
 
 pytest.importorskip("emerging_optimizers", reason="requires emerging-optimizers")
 
+from megatron.core.optimizer import emerging_optimizers as eo_mod
 from megatron.core.optimizer import layer_sharded_muon as lsm
 from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 
 # No version skip on purpose: these tests pin gate/dispatch LOGIC and never execute
 # a real batched Newton-Schulz (newton_schulz is mocked, step() is never called),
 # so they must run — and give CI signal — on any installed emerging-optimizers.
-# Constructions with ns_batch_size > 1 bypass the >= 0.3.0 batched-NS floor via
-# _make_opt(monkeypatch, ...), because the floor guards kernel availability the
-# mocked path never reaches.
+# Constructions with ns_batch_size > 1 or use_syrk=True bypass the constructor's
+# emerging-optimizers version gates via _make_opt(monkeypatch, ...): the >= 0.3.0
+# batched-NS floor in LayerShardedMuon.__init__ and the >= 0.4.0 use_syrk gate
+# inherited from TensorParallelMuon both guard kernel availability the mocked
+# path never reaches.
 
 
 def _make_opt(monkeypatch=None, **kwargs):
     if monkeypatch is not None:
-        monkeypatch.setattr(lsm, "_check_eo_version", lambda: None)
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
+        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: True)
     p = torch.nn.Parameter(torch.randn(4, 4))
     return LayerShardedMuon([p], lr=0.1, gtp_group=None, **kwargs)
 
@@ -55,9 +59,8 @@ class TestInitDerivesBatchedSyrk:
 
     @pytest.mark.parametrize("has_symbol,expected", [(False, False), (True, True)])
     def test_syrk_arms_batched_only_with_symbol(self, monkeypatch, has_symbol, expected):
-        # Bypass the CUDA/Triton/SM environment gate: this test pins the
-        # version-capability derivation, not the hardware validation.
-        monkeypatch.setattr(lsm, "_resolve_use_syrk", lambda flag: flag)
+        # _make_opt(monkeypatch) bypasses the parent's >= 0.4.0 use_syrk version
+        # gate: this test pins the batched-capability derivation, not the gate.
         monkeypatch.setattr(lsm, "_has_batched_syrk", lambda: has_symbol)
         opt = _make_opt(monkeypatch, use_syrk=True, ns_batch_size=4)
         assert opt.use_syrk is True
