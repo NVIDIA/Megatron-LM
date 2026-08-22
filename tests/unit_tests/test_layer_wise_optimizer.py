@@ -481,6 +481,29 @@ class TestLayerWiseOptimizer:
 
         assert update_successful, "Optimizer step should be successful"
 
+    def test_bf16_wrapper_uses_preserved_high_precision_initializer(self):
+        """FP32 masters must not be initialized from an already-quantized model weight."""
+        model_param = torch.nn.Parameter(
+            torch.full((2, 2), -1.0, dtype=torch.bfloat16, device='cuda')
+        )
+        preserved_init = torch.full((2, 2), 1.25, dtype=torch.bfloat16)
+        init_state = {'value': preserved_init}
+        model_param.get_high_precision_init_val = lambda: init_state['value']
+        model_param.clear_high_precision_init_val = lambda: init_state.update(value=None)
+
+        base_optimizer = torch.optim.SGD([model_param], lr=0.1)
+        wrapped_optimizer = Float16OptimizerWithFloat16Params(
+            base_optimizer,
+            OptimizerConfig(optimizer='sgd', lr=0.1, bf16=True),
+            None,
+            lambda opt, config: None,
+        )
+
+        main_param = wrapped_optimizer.fp32_from_float16_groups[0][0]
+        torch.testing.assert_close(main_param, preserved_init.cuda().float(), rtol=0, atol=0)
+        assert init_state['value'] is None
+        assert model_param.main_param is main_param
+
     def test_bf16_error(self):
         """Test LayerWiseDistributedOptimizer raises error when receiving pre-wrapped Float16 optimizer."""
         model = SimpleModel().bfloat16().cuda()

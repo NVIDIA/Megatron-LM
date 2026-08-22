@@ -26,7 +26,12 @@ from megatron.training.global_vars import (
     set_args,
     set_global_variables,
 )
-from megatron.training.training import force_param_sync, get_model, setup_model_and_optimizer
+from megatron.training.training import (
+    force_param_sync,
+    get_model,
+    setup_model_and_optimizer,
+    should_disable_forward_pre_hook,
+)
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,13 +61,6 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
-
-
-def should_disable_forward_pre_hook(args):
-    """Block forward pre-hook for certain configurations."""
-    return (
-        not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
-    )
 
 
 class TestFP8Param:
@@ -108,6 +106,12 @@ class TestFP8Param:
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
         )
+
+    def _on_model_built(self, model_chunks, optimizer, args):
+        """Optional test hook after distributed model and optimizer construction."""
+
+    def _on_forward_complete(self, model_chunks, optimizer, args, step, num_steps):
+        """Optional test hook after a forward has consumed synchronized parameters."""
 
     def create_test_args(
         self,
@@ -248,9 +252,11 @@ class TestFP8Param:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             expert_model_parallel_size=args.expert_model_parallel_size,
+            expert_tensor_parallel_size=args.expert_tensor_parallel_size,
             # Enable GTP weight-remat when the test requested it (default 1 => no GTP, so
             # non-GTP fp8 tests are unaffected).
             gtp_remat_size=getattr(args, "gtp_weight_remat_size", 1),
+            expert_gtp_remat_size=getattr(args, "expert_gtp_weight_remat_size", 1),
         )
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
@@ -266,7 +272,8 @@ class TestFP8Param:
             use_cudagraphable_rng=args.cuda_graph_impl != "none",
             force_reset_rng=True,
         )
-        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        model_class = "hybrid" if args.hybrid_layer_pattern is not None else "gpt"
+        cfg_container = Utils.pretrain_config_from_global_args(args, model_class)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:
             model_cfg = cfg_container.model
@@ -291,6 +298,7 @@ class TestFP8Param:
                 "LayerWise test did not enter the requested parameter-layout path: "
                 f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
             )
+        self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"
         cuda_graph_impl = "transformer_engine"
@@ -354,6 +362,17 @@ class TestFP8Param:
         loss_list = []
         eval_loss_list = []
 
+        # Production starts overlapped training with parameter-gather pre-hooks disabled: model
+        # initialization/checkpoint loading has already populated the forward weights, and the
+        # reused grad buffer must stay empty for the first backward. Enable the hooks only after
+        # the first successful optimizer step. CUDA-graph tests retain their existing capture-time
+        # hook lifecycle, which handles this transition separately.
+        first_iteration_pre_hook_disabled = (
+            not inference and not use_cuda_graph and should_disable_forward_pre_hook(args)
+        )
+        if first_iteration_pre_hook_disabled:
+            disable_forward_pre_hook(gpt_model, param_sync=False)
+
         # Optional: generate the sharded_state_dict (the checkpoint-save metadata path) at these
         # steps to catch save side-effects on the live weights — a correct save must not perturb
         # the subsequent training step (regression guard for GTP native-FP8 save corruption).
@@ -389,7 +408,14 @@ class TestFP8Param:
             # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
             # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
             # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            forward_pre_hook_enabled = bool(
+                getattr(gpt_model[0], 'remove_forward_pre_hook_handles', {})
+            )
+            if (
+                args.reuse_grad_buf_for_mxfp8_param_ag
+                and args.overlap_param_gather
+                and forward_pre_hook_enabled
+            ):
                 self.copy_main_params_to_param_buffer(gpt_model, optimizer)
 
             gpt_model[0].set_is_first_microbatch()
@@ -400,6 +426,7 @@ class TestFP8Param:
                 labels=labels,
                 loss_mask=loss_mask,
             )
+            self._on_forward_complete(gpt_model, optimizer, args, i, num_steps)
 
             # Check output shapes
             assert output.shape[0] == self.micro_batch_size
@@ -420,6 +447,10 @@ class TestFP8Param:
 
             update_successful, _, _ = optimizer.step()
             assert update_successful
+
+            if first_iteration_pre_hook_disabled:
+                enable_forward_pre_hook(gpt_model)
+                first_iteration_pre_hook_disabled = False
 
             loss_list.append(loss.item())
 
