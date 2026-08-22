@@ -31,6 +31,11 @@ from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
 class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
     """Dynamic-inference adapter for canonical, expanded-sequence Nemotron Omni."""
 
+    supports_text = True
+    supports_image = True
+    supports_video = True
+    supports_audio = False
+
     def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
         """Return Nemotron Omni's compact visual-span contract."""
         model = resolve_wrapped_model(self.model)

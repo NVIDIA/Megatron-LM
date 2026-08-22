@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import abc
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, ClassVar, Dict, Iterable, Optional, Union
 
 import torch
 
@@ -35,6 +35,12 @@ class AbstractModelInferenceWrapper(abc.ABC):
         inference_context (BaseInferenceContext): Context for managing KV
             cache and other inference params.
     """
+
+    # Input modalities accepted by this wrapper.
+    supports_text: ClassVar[bool] = True
+    supports_image: ClassVar[bool] = False
+    supports_video: ClassVar[bool] = False
+    supports_audio: ClassVar[bool] = False
 
     @deprecate_args(*DEPRECATED_ARGS)
     def __init__(

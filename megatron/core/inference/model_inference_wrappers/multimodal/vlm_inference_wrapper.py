@@ -24,6 +24,10 @@ from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
 class VLMInferenceWrapper(GPTInferenceWrapper):
     """Inference wrapper for VLMs"""
 
+    supports_text = True
+    supports_image = True
+    supports_video = True
+    supports_audio = False
     _recv_only_vision_embeds: bool = False
     _encoder_only: bool = False
 
