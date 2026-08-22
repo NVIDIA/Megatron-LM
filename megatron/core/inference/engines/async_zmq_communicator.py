@@ -141,6 +141,27 @@ class AsyncZMQCommunicator:
         if self.is_leader:
             broadcast_pub_sub.wait_for_subscribers(self.bcast_sock, range(1, self.world_size))
 
+        # Wait until all ProcessGroup peers have subscribed to the ZMQ leader.
+        # Otherwise, ranks that fail to subscribe in time will deadlock.
+        if self.is_leader:
+            # XPUB subscription messages are one byte for an empty-topic
+            # subscription: b"\x01". XPUB_VERBOSE is required so identical
+            # subs from every peer are reported rather than coalesced.
+            subscribed_peers = 0
+            self.bcast_sock.setsockopt(zmq.RCVTIMEO, 60_000)
+            try:
+                while subscribed_peers < self.world_size - 1:
+                    subscription = self.bcast_sock.recv()
+                    if subscription == b"\x01":
+                        subscribed_peers += 1
+            except zmq.Again as exc:
+                raise RuntimeError(
+                    "[AsyncZMQCommunicator] Timed out waiting for ZMQ subscribers: "
+                    f"{subscribed_peers}/{self.world_size - 1} connected"
+                ) from exc
+            finally:
+                self.bcast_sock.setsockopt(zmq.RCVTIMEO, -1)
+
     async def all_reduce_max(self, *local_vals: int, async_op=True) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.
 
