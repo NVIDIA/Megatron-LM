@@ -2901,6 +2901,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_chunk.zero_grad_buffer()
         self._copy_main_params_to_param_buffer()
 
+    @torch.no_grad()
+    def _stage_model_params_from_main_params(self) -> None:
+        if self.is_stub_optimizer:
+            return
+        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # The param buffer is BF16, so the masters land there down-cast; the MXFP8
+            # quantization happens after the all-gather, in _post_param_sync.
+            self._copy_main_params_to_param_buffer()
+        else:
+            self._copy_main_params_to_model_params()
+
+    @torch.no_grad()
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive and all-gather the model params (see MegatronOptimizer)."""
+        if self.is_stub_optimizer:
+            return
+        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # The param buffer aliases the grad buffer, so zero it before staging into it.
+            for model_chunk in self.model_chunks:
+                model_chunk.zero_grad_buffer()
+        self._stage_model_params_from_main_params()
+        # Each rank only owns a shard of the main params, so the full params have to be
+        # gathered. The caller is outside the training loop, so gather synchronously
+        # instead of relying on the next step's overlapped gather.
+        for model_chunk in self.model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
+
     def _copy_main_params_to_param_buffer(self):
         """
         This function is only used for MXFP8 params.

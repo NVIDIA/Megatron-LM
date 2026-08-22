@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import gc
 import os
 import sys
 from datetime import timedelta
@@ -18,14 +19,16 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
     set_args,
     set_global_variables,
 )
-from megatron.training.training import get_model, setup_model_and_optimizer
+from megatron.training.training import force_param_sync, get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 cuda_graph_supported = False
@@ -391,6 +394,159 @@ class TestFP4Param:
         loss_list_2 = self._run_test_helper(tp_size, fp4_param_gather=fp4_param_gather, **kwargs)
 
         torch.testing.assert_close(loss_list_1, loss_list_2, atol=0, rtol=0)
+
+    # ------------------------------------------------------------------
+    # Checkpoint round trip
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def quantized_param_state(model_chunk):
+        """Raw element codes and dequantized values of every NVFP4 param, by name.
+
+        Comparing the dequantized values alone would be weak: a block scale can change
+        without moving any value, and that still means the resumed tensor is not the one
+        that was saved. Comparing the raw codes alone would be weak the other way round,
+        since codes only mean something paired with a scale. So compare both.
+
+        The scale arrays are deliberately not compared directly. TE keeps block scales in a
+        padded, swizzled layout, and the padding entries are never read and not reproducible
+        across allocations, so they raise false mismatches. A scale that is actually used
+        shows up in the dequantized values.
+        """
+        data_attrs = ("_data", "_rowwise_data", "_columnwise_data")
+        state = {}
+        for name, param in model_chunk.named_parameters():
+            if not is_nvfp4tensor(param):
+                continue
+            # A quantized tensor may be the Parameter itself or its .data payload.
+            for holder in (param, param.data):
+                tensors = {
+                    attr: getattr(holder, attr).detach().clone()
+                    for attr in data_attrs
+                    if torch.is_tensor(getattr(holder, attr, None))
+                }
+                if tensors:
+                    break
+            assert tensors, f"no quantized storage found on {name} ({type(param).__name__})"
+            # .float() and not .dequantize(): on a quantized Parameter the latter recurses
+            # through __torch_dispatch__ until the stack overflows.
+            tensors["dequantized"] = param.detach().float().clone()
+            state[name] = tensors
+        return state
+
+    def setup_checkpoint_case(self, tp_size, ckpt_dir, **kwargs):
+        args = self.create_test_args(
+            tp_size,
+            self.seq_length,
+            self.micro_batch_size,
+            inference=False,
+            fp4_param_gather=True,
+            save=ckpt_dir,
+            load=ckpt_dir,
+            save_interval=1,
+            ckpt_format="torch_dist",
+            async_save=False,
+            save_tokenizer_assets=False,
+            **kwargs,
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        model_parallel_cuda_manual_seed(_SEED)
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, self.model_provider
+        )
+        assert len(model) == 1
+        return args, model, optimizer, opt_param_scheduler
+
+    def run_train_steps(self, args, model, optimizer, num_steps):
+        input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
+            self.seq_length, self.micro_batch_size
+        )
+        for _ in range(num_steps):
+            model[0].zero_grad_buffer()
+            optimizer.zero_grad()
+            model[0].set_is_first_microbatch()
+            output = model[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+            output.mean().backward()
+            if args.overlap_grad_reduce:
+                model[0].finish_grad_sync()
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+
+    def cleanup_between_runs(self):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_nvfp4_checkpoint_resume_is_bitwise_exact(
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size
+    ):
+        """A resumed run must hold exactly the NVFP4 weights the saving run held.
+
+        NVFP4 is block-scaled like MXFP8: an E4M3 scale per 16-element block on top of a
+        per-tensor FP32 scale. Quantized params are stored dequantized to BF16 and the block
+        scales are not stored, so loading re-quantizes a value that has already been through
+        one quantization round trip, whereas a training step quantizes the FP32 master. That
+        costs MXFP8 its block scales; NVFP4 is measured to survive it today, so this is a
+        regression guard rather than a reproduction of a known break.
+        """
+        # TE refuses to load a pickled extra state by default. This checkpoint is created
+        # by the test and is therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
+        # TempNamedDir(sync=True) barriers, so the process group has to exist first.
+        Utils.initialize_distributed()
+        with TempNamedDir(tmp_path_dist_ckpt / "test_nvfp4_ckpt_resume", sync=True) as ckpt_dir:
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, str(ckpt_dir), **kwargs
+            )
+            self.run_train_steps(args, model, optimizer, num_steps=3)
+            # Mirror save_checkpoint_and_time: the params are staged from the FP32 masters
+            # and gathered before the state dict is taken.
+            force_param_sync(model, optimizer=optimizer)
+            saved_state = self.quantized_param_state(model[0])
+            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
+            torch.distributed.barrier()
+
+            self.cleanup_between_runs()
+
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, str(ckpt_dir), **kwargs
+            )
+            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+            assert iteration == 3
+            loaded_state = self.quantized_param_state(model[0])
+
+        # Each layer contributes 4 GEMM weights: qkv, proj, fc1, fc2. Assert the count rather
+        # than just non-emptiness, so a config change that quietly drops --fp4-param-gather
+        # cannot turn this into a vacuous pass.
+        assert len(saved_state) == 4 * args.num_layers, sorted(saved_state)
+        assert saved_state.keys() == loaded_state.keys()
+        mismatches = []
+        for name, saved_tensors in saved_state.items():
+            for attr, saved_tensor in saved_tensors.items():
+                loaded_tensor = loaded_state[name][attr]
+                num_differing = int((saved_tensor != loaded_tensor).sum())
+                if num_differing:
+                    mismatches.append(f"{name}{attr}: {num_differing}/{saved_tensor.numel()}")
+        assert not mismatches, "NVFP4 params changed across a checkpoint round trip:\n" + "\n".join(
+            mismatches
+        )
 
 
 if __name__ == "__main__":

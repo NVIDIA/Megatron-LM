@@ -3053,7 +3053,33 @@ def load_checkpoint(
                 'exiting ...'.format(checkpoint_name)
             )
             raise e
+
+        # Quantized weights are stored dequantized to BF16 with no block scales, so loading
+        # them re-quantizes a value that has already been through one quantization round
+        # trip, while a training step quantizes the main weights. Same quantizer, different
+        # input, so for MXFP8 the block scales do not come back the same. Recover the compute
+        # weights from the main weights in the optimizer state instead. Reaching here already
+        # implies they were loaded: the enclosing block excludes --no-load-optim, --finetune
+        # and release checkpoints, and the load above re-raises on failure.
+        if (
+            not skip_load_to_model_and_opt
+            and optimizer is not None
+            and not getattr(optimizer, 'is_stub_optimizer', False)
+            and (
+                getattr(args, 'fp8_param_gather', False)
+                or getattr(args, 'fp4_param_gather', False)
+            )
+        ):
+            optimizer.quantize_and_sync_model_params_from_main_params()
     else:
+        if getattr(args, 'fp8_param_gather', False) or getattr(args, 'fp4_param_gather', False):
+            print_rank_0(
+                'WARNING: quantized params were loaded without the optimizer main params, so '
+                'they were re-quantized from the dequantized values in the checkpoint rather '
+                'than re-derived from the main params. The block scales need not match the '
+                'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
+                'identical to those saved. Load the optimizer state to avoid this.'
+            )
         if (args.fp16 or args.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
