@@ -282,6 +282,17 @@ class TransformerLayerNode(ScheduleNode):
         """Free-input policy hook. Subclasses override to specialize."""
         return should_free_input(name, is_moe, config, num_local_experts)
 
+    def reset_for_recompute(self):
+        """Release this node's forward activations, keeping it reusable for a replay.
+
+        Under full recompute only each segment's input survives the forward->backward
+        gap; the same node is later re-run with grad enabled to rebuild its state.
+        """
+        self.inputs = None
+        self.output = None
+        self.detached = tuple()
+        self.before_detached = tuple()
+
     def detach(self, t):
         """Detach a tensor and remember it for backward through the schedule node."""
         detached = make_viewless(t).detach()

@@ -3018,15 +3018,50 @@ class TransformerConfig(ModelParallelConfig):
                 'flex',
             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
-            assert (
-                self.recompute_granularity != 'full'
-            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_method is None
-            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_num_layers is None
-            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            if self.recompute_granularity == 'full':
+                # Full recompute runs per layer segment; recompute_method /
+                # recompute_num_layers keep their non-overlap meaning and are validated
+                # by the shared checks in __post_init__. See
+                # megatron/core/models/common/model_chunk_schedule_plan.py.
+                # The replay is hand-rolled rather than a checkpoint primitive, so it
+                # cannot shard the retained segment input across TP ranks.
+                assert not self.distribute_saved_activations, (
+                    'overlap_moe_expert_parallel_comm full recompute does not support '
+                    'distribute_saved_activations: the segment replay does not go through '
+                    'a checkpoint primitive, so the retained input is not sharded.'
+                )
+                # MTP is segmented under both methods here, so unlike
+                # MultiTokenPredictionLayer._checkpointed_forward there is no 'block'
+                # exemption. The 'uniform' restriction below is config parity with that
+                # function's own assert, not a constraint of this schedule - multi-layer
+                # decoder segments hand the MTP bridge over correctly.
+                if self.mtp_num_layers and self.recompute_method == 'uniform':
+                    assert (
+                        self.recompute_num_layers == 1
+                    ), 'recompute_num_layers must be 1 for MTP recompute'
+                # With dropout the forward RNG stream is interleaved across microbatches
+                # in the 1F1B schedule and cannot yet be faithfully replayed.
+                assert self.attention_dropout == 0.0 and self.hidden_dropout == 0.0, (
+                    'overlap_moe_expert_parallel_comm full recompute currently requires '
+                    'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '
+                    'interleaved 1F1B schedule is not yet supported for nonzero dropout)'
+                )
+                # The offload manager pairs a forward-pushed group with the backward that
+                # pops it. Under full recompute the initial forward saves nothing and the
+                # replay pushes its groups immediately before its own backward, which does
+                # not fit that pairing.
+                assert not self.fine_grained_activation_offloading, (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'together with fine_grained_activation_offloading.'
+                )
+            else:
+                assert self.recompute_method is None, (
+                    'disable recomputation method when enabling ' 'overlap_moe_expert_parallel_comm'
+                )
+                assert self.recompute_num_layers is None, (
+                    'recompute_num_layers must be None when enabling '
+                    'overlap_moe_expert_parallel_comm'
+                )
             assert (
                 "moe" not in self.recompute_modules
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
