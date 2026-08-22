@@ -9,6 +9,7 @@ spec:
   build: mcore-pyt-{environment}
   gpus: 8
   platforms: dgx_h100
+  pytest_launcher: distributed
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -51,12 +52,21 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    if [[ "{pytest_launcher}" == "single-process" ]]; then
+        cd "$TEST_PATH"
+        uv run --no-sync python -m coverage run \
+          --data-file=.coverage.unit_tests \
+          --source=megatron/core \
+          -m pytest -vs "$BUCKET"
+        coverage combine -q
+    else
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+    fi
 
     ls -al 
 
@@ -85,6 +95,15 @@ products:
       - environment: [lts, dev]
         tag: [latest, legacy]
         scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/models/mimo/test_mimo_hetero_e2e_train_checkpoint.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        platforms: [dgx_h100]
+        pytest_launcher: [single-process]
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/models/**/*.py]
