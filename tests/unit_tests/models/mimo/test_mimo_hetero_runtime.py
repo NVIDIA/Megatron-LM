@@ -150,6 +150,39 @@ def test_supplied_ddp_config_wins_over_global_args(mocker):
     assert mimo_model.modality_submodules[ENCODER] is wrapped_encoder
 
 
+def test_layer_wise_layout_flags_reach_ddp_wrapper(mocker):
+    encoder = mocker.MagicMock()
+    mimo_model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: encoder})
+    topology = SimpleNamespace(module_pgs={ENCODER: mocker.MagicMock()})
+    prepare = mocker.patch(
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
+        return_value=[mocker.MagicMock()],
+    )
+    mocker.patch("examples.mimo.training.runtime._freeze_modality_submodule")
+    mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.MagicMock())
+    mocker.patch("examples.mimo.training.runtime.print_rank_0")
+    base_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True, overlap_param_gather=True, use_distributed_optimizer=False
+    )
+
+    wrap_active_modules_with_ddp(
+        _args(encoder_ddp_overlap=False),
+        mimo_model,
+        topology,
+        base_ddp_config,
+        use_layer_wise_distributed_optimizer=True,
+        use_layer_wise_param_layout=False,
+    )
+
+    wrapped_ddp_config = prepare.call_args.kwargs["ddp_config"]
+    assert not wrapped_ddp_config.overlap_grad_reduce
+    assert not wrapped_ddp_config.overlap_param_gather
+    assert not wrapped_ddp_config.use_distributed_optimizer
+    assert prepare.call_args.kwargs["use_layer_wise_distributed_optimizer"]
+    assert not prepare.call_args.kwargs["use_layer_wise_param_layout"]
+    assert base_ddp_config.overlap_grad_reduce and base_ddp_config.overlap_param_gather
+
+
 def _eight_gpu_topology():
     """Encoder dp=4 at ranks 0-3; language dp=4 at ranks 4-7 (non-colocated, tiles world)."""
     return create_topology(
@@ -188,13 +221,23 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
 
     ddp_config = DistributedDataParallelConfig()
     assert builder.build_distributed_models(
-        mocker.Mock(), ddp_config=ddp_config, data_parallel_random_init=True
+        mocker.Mock(),
+        ddp_config=ddp_config,
+        data_parallel_random_init=True,
+        use_layer_wise_distributed_optimizer=True,
+        use_layer_wise_param_layout=False,
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
     seed.assert_called_once_with(args, groups, _LANGUAGE_SEED_OFFSET, True)
     wrap.assert_called_once_with(
-        args, model, topology, ddp_config=ddp_config, data_parallel_random_init=True
+        args,
+        model,
+        topology,
+        ddp_config=ddp_config,
+        data_parallel_random_init=True,
+        use_layer_wise_distributed_optimizer=True,
+        use_layer_wise_param_layout=False,
     )
     grad_sync.assert_called_once_with(args, model, topology)
     # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.

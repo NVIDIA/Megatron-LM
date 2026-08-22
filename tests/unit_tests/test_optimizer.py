@@ -91,6 +91,44 @@ def test_copy_optimizer_param_metadata_preserves_allreduce():
     assert destination.allreduce is False
 
 
+def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker):
+    """Disjoint module domains must not import each other's optimizer-group keys."""
+    module_group = object()
+    foreign_key = ((('lr_mult', 2.0),), False)
+    get_world_size = mocker.patch("torch.distributed.get_world_size")
+    all_gather_object = mocker.patch("torch.distributed.all_gather_object")
+
+    def world_size(*, group=None):
+        return 1 if group is module_group else 2
+
+    def gather(output, local_keys, *, group=None):
+        output[0] = local_keys
+        if group is None:
+            output[1] = [foreign_key]
+
+    get_world_size.side_effect = world_size
+    all_gather_object.side_effect = gather
+    net = Net()
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+    module_groups = _get_param_groups([net], config, {}, process_group=module_group)
+
+    assert len(module_groups) == 1
+    assert module_groups[0]['params'] == list(net.parameters())
+    get_world_size.assert_called_once_with(group=module_group)
+    assert all_gather_object.call_count == 1
+    assert all_gather_object.call_args.kwargs == {'group': module_group}
+
+    get_world_size.reset_mock()
+    all_gather_object.reset_mock()
+    world_groups = _get_param_groups([net], config, {})
+
+    assert len(world_groups) == 2
+    assert any(not group['params'] and group['lr_mult'] == 2.0 for group in world_groups)
+    get_world_size.assert_called_once_with()
+    assert all_gather_object.call_args.kwargs == {}
+
+
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)

@@ -405,6 +405,7 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                     model_chunks=[module],
                     pg_collection=pg_collection,
                     use_gloo_process_groups=False,
+                    param_group_process_group=pg_collection.intra_dist_opt,
                 )
 
         module_infos[module_name] = ModuleOptimizerInfo(

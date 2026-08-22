@@ -302,6 +302,7 @@ def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -320,6 +321,8 @@ def _get_param_groups(
             specified on a per-layer basis. NOTE: if you want to skip applying weight decay on bias
             and length 1 parameters, and also do not want to do any other overrides, set this to an
             empty dictionary rather than the default value of None.
+        process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks must construct
+            aligned parameter groups. ``None`` preserves the WORLD-group behavior.
     Returns:
         List of parameter groups.
     """
@@ -362,8 +365,14 @@ def _get_param_groups(
     # so we need to align the param groups across ranks, otherwise we may have
     # runtime error when loading the checkpoint or numerical error when resuming training.
     params_key = list(params_map.keys())
-    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather_object(gathered_params_key, params_key)
+    if process_group is None:
+        gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather_object(gathered_params_key, params_key)
+    else:
+        gathered_params_key = [
+            None for _ in range(torch.distributed.get_world_size(group=process_group))
+        ]
+        torch.distributed.all_gather_object(gathered_params_key, params_key, group=process_group)
     for keys in gathered_params_key:
         for key in keys:
             if key not in params_key:
@@ -421,6 +430,7 @@ def _get_param_groups_and_buffers(
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     filter_fn: Callable,
     buffer_name: str,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
@@ -435,11 +445,13 @@ def _get_param_groups_and_buffers(
         min_lr (float): minimum learning rate.
         filter_fn (callable): filtering function for param_groups.
         buffer_name (str): name of buffer.
+        process_group (Optional[torch.distributed.ProcessGroup]): group used to align parameter
+            groups across ranks. ``None`` preserves the WORLD-group behavior.
 
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(model_chunks, config, config_overrides)
+    param_groups = _get_param_groups(model_chunks, config, config_overrides, process_group)
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -729,6 +741,7 @@ def _get_megatron_emerging_optimizer(
     model_chunks: List[MegatronModule],
     config_overrides: Optional[Dict[ParamKey, Any]] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
 
@@ -815,7 +828,9 @@ def _get_megatron_emerging_optimizer(
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
-    all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
+    all_param_groups = _get_param_groups(
+        model_chunks, config, config_overrides, param_group_process_group
+    )
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
@@ -997,6 +1012,7 @@ def get_megatron_optimizer(
     use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
     dump_param_to_param_group_map: Optional[str] = None,
+    param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -1015,6 +1031,8 @@ def get_megatron_optimizer(
             in underlying Megatron optimizers.
         pg_collection: Optional unified process group for distributed training.
         dump_param_to_param_group_map (Optional[str]): path to dump parameter to param group map.
+        param_group_process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks
+            must construct aligned optimizer parameter groups. ``None`` preserves WORLD alignment.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -1047,6 +1065,7 @@ def get_megatron_optimizer(
             model_chunks=model_chunks,
             config_overrides=config_overrides,
             pg_collection=pg_collection,
+            param_group_process_group=param_group_process_group,
         )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
@@ -1106,7 +1125,9 @@ def get_megatron_optimizer(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
             if is_mfsdp_v2:
-                param_groups = _get_param_groups(model_chunk, config, config_overrides)
+                param_groups = _get_param_groups(
+                    model_chunk, config, config_overrides, param_group_process_group
+                )
                 # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
                 # https://github.com/NVIDIA/TransformerEngine/issues/3207.
                 # Empty local shards have no optimizer state or data to update, so omit them.
@@ -1130,6 +1151,7 @@ def get_megatron_optimizer(
                     config_overrides=config_overrides,
                     filter_fn=lambda g: True,
                     buffer_name='buffers',
+                    process_group=param_group_process_group,
                 )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
@@ -1181,6 +1203,7 @@ def get_megatron_optimizer(
             config_overrides=config_overrides,
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
+            process_group=param_group_process_group,
         )
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
@@ -1218,6 +1241,7 @@ def get_megatron_optimizer(
         config_overrides=config_overrides,
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
+        process_group=param_group_process_group,
     )
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:
