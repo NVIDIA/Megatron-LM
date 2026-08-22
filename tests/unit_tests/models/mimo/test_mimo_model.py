@@ -5,6 +5,7 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/mimo/test_mim
 '''
 
 import math
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,14 +15,25 @@ import torch.distributed as dist
 import torch.nn as nn
 from transformers import WhisperConfig, WhisperModel
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core import parallel_state
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout
+from megatron.core.models.mimo.config.role import (
+    MIMO_LANGUAGE_MODULE_KEY,
+    ModuleLayout,
+    ModuleStageInfo,
+    RankRole,
+)
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -257,18 +269,18 @@ class TestMimoModel:
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
 
     def test_forward_threads_position_ids_to_language_model(self):
-        """``MimoModel.forward`` must thread ``position_ids`` through to
-        ``self.language_model`` so multimodal RoPE can compute its rotary
-        embeddings.
+        """Thread token, position, and MTP-mask inputs to the language model.
 
         Multimodal RoPE (e.g. Qwen3-VL) consumes ``position_ids`` even when
-        the language model receives a pre-combined ``decoder_input`` (which
-        replaces the embedding lookup). ``input_ids`` is therefore unused on
-        this path and must not be forwarded — its shape would not match the
-        expanded ``decoder_input`` sequence.
+        the language model receives a pre-combined ``decoder_input``. The main
+        embedding lookup ignores ``input_ids`` on this path, but MTP still uses
+        them to build shifted-token embeddings and its conditioning mask.
         """
         mimo_model = self._make_vlm()
+        mimo_model.language_model.mtp_process = True
         input_ids = self._make_input_ids()
+        input_ids[0, 1] = self.special_token_ids['images']
+        input_ids[1, 2] = self.special_token_ids['audio']
         position_ids = self._make_position_ids()
         loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
 
@@ -279,6 +291,7 @@ class TestMimoModel:
             captured['position_ids'] = kwargs.get('position_ids')
             captured['decoder_input'] = kwargs.get('decoder_input')
             captured['loss_mask'] = kwargs.get('loss_mask')
+            captured['mtp_input_mask'] = kwargs.get('mtp_input_mask')
             return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
 
         with patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
@@ -293,13 +306,17 @@ class TestMimoModel:
             captured['decoder_input'] is not None
         ), "MimoModel.forward must pass a pre-combined decoder_input to the language model"
         assert (
-            captured['input_ids'] is None
-        ), "MimoModel.forward must not forward input_ids when decoder_input is pre-combined"
+            captured['input_ids'] is input_ids
+        ), "MimoModel.forward must preserve input_ids for MTP"
         assert (
             captured['position_ids'] is not None
         ), "MimoModel.forward must pass position_ids to the language model (got None)"
         torch.testing.assert_close(captured['position_ids'], position_ids)
         assert captured['loss_mask'] is loss_mask
+        expected_mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in self.special_token_ids.values():
+            expected_mtp_input_mask &= input_ids != special_token_id
+        torch.testing.assert_close(captured['mtp_input_mask'], expected_mtp_input_mask)
 
     def test_forward_with_image_modality(self):
         """Test forward pass with text and image input."""
@@ -457,14 +474,17 @@ class TestMimoModel:
         assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
 
     def test_forward_with_partition_adapter(self):
-        """shard() receives sequence-first embeddings and returns LM-layout [S/cp, B, H].
+        """MTP token metadata must use the same CP-local sequence as hidden states.
 
         The caller no longer transposes around shard(): it passes the sequence-first
         ``(S, B, H)`` combined embeddings straight in, and shard()'s LM-layout output
-        flows straight into the language model as ``decoder_input``.
+        flows straight into the language model as ``decoder_input``. Token and position
+        IDs used by MTP must be partitioned to that same local sequence.
         """
         mimo_model = self._make_vlm()
+        mimo_model.language_model.mtp_process = True
         input_ids = self._make_input_ids()
+        input_ids[0, 1] = self.special_token_ids['images']
         position_ids = self._make_position_ids()
         loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
 
@@ -474,8 +494,13 @@ class TestMimoModel:
             sharded_seq_len, self.batch_size, self.hidden_size, device=self.device
         )
         sharded_loss_mask = torch.ones(self.batch_size, sharded_seq_len, device=self.device)
+        sharded_input_ids = input_ids[:, :sharded_seq_len].clone()
+        sharded_position_ids = position_ids[:, :sharded_seq_len].clone()
         mock_adapter = MagicMock()
-        mock_adapter.shard.return_value = (sharded_emb, None, sharded_loss_mask, None)
+        mock_adapter.shard.side_effect = [
+            (sharded_emb, None, sharded_loss_mask, None),
+            (None, sharded_position_ids, sharded_input_ids, None),
+        ]
         mimo_model.partition_adapter = mock_adapter
 
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
@@ -486,8 +511,11 @@ class TestMimoModel:
         captured = {}
 
         def capture_lm_forward(*args, **kwargs):
+            captured['input_ids'] = kwargs.get('input_ids')
+            captured['position_ids'] = kwargs.get('position_ids')
             captured['decoder_input'] = kwargs.get('decoder_input')
             captured['loss_mask'] = kwargs.get('loss_mask')
+            captured['mtp_input_mask'] = kwargs.get('mtp_input_mask')
             return torch.zeros(
                 self.batch_size, sharded_seq_len, self.vocab_size, device=self.device
             )
@@ -506,11 +534,15 @@ class TestMimoModel:
                 modality_inputs=None,
             )
 
-        mock_adapter.shard.assert_called_once()
-        shard_kwargs = mock_adapter.shard.call_args[1]
+        assert mock_adapter.shard.call_count == 2
+        shard_kwargs = mock_adapter.shard.call_args_list[0].kwargs
         # The helper passes sequence-first [S, B, H] embeddings straight to shard().
         assert shard_kwargs['embeddings'].shape == (self.seq_len, self.batch_size, self.hidden_size)
         assert shard_kwargs['loss_mask'] is loss_mask
+        mtp_shard_kwargs = mock_adapter.shard.call_args_list[1].kwargs
+        assert mtp_shard_kwargs['embeddings'] is None
+        assert mtp_shard_kwargs['labels'] is position_ids
+        assert mtp_shard_kwargs['loss_mask'] is input_ids
         # shard()'s LM-layout output flows straight into the LM (no extra transpose).
         assert captured['decoder_input'].shape == (
             sharded_seq_len,
@@ -518,6 +550,12 @@ class TestMimoModel:
             self.hidden_size,
         )
         assert captured['loss_mask'] is sharded_loss_mask
+        assert captured['input_ids'] is sharded_input_ids
+        assert captured['position_ids'] is sharded_position_ids
+        assert captured['mtp_input_mask'].dtype == torch.bool
+        assert torch.equal(
+            captured['mtp_input_mask'], sharded_input_ids != self.special_token_ids['images']
+        )
         # forward() returns the (possibly sharded) loss mask from shard().
         assert out_loss_mask is sharded_loss_mask
 
@@ -582,6 +620,229 @@ class TestMimoModel:
                 labels=None,
                 input_tensors=None,
             )
+
+    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (1, 2), (2, 2)])
+    @pytest.mark.parametrize("position_dims", [2, 3])
+    def test_mtp_forward_uses_parallel_local_token_metadata(self, tp, cp, position_dims):
+        """Run real MIMO+MTP for the supported TP/CP combinations.
+
+        MIMO owns CP partitioning for its pre-combined decoder embeddings, so
+        the token and position IDs consumed by MTP must be partitioned to the
+        same CP-local sequence. TP additionally exercises MTP's SP scatter.
+        """
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(123)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        seq_len = 16
+        vocab_size = 128
+        special_token_ids = {"images": 126, "audio": 127}
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=tp > 1,
+            context_parallel_size=cp,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_model_spec = ModuleSpec(
+            module=GPTModel,
+            params={
+                "config": config,
+                "transformer_layer_spec": layer_spec,
+                "mtp_block_spec": get_gpt_mtp_block_spec(
+                    config=config, spec=layer_spec, use_transformer_engine=True
+                ),
+                "vocab_size": vocab_size,
+                "max_sequence_length": seq_len,
+                "pre_process": True,
+                "post_process": True,
+                "position_embedding_type": "rope",
+                "scatter_embedding_sequence_parallel": False,
+                "share_embeddings_and_output_weights": True,
+                "pg_collection": pg_collection,
+            },
+        )
+        model = MimoModel(
+            MimoModelConfig(
+                language_model_spec=language_model_spec,
+                modality_submodules_spec={},
+                special_token_ids=special_token_ids,
+            ),
+            cp_group=pg_collection.cp,
+            tp_group=pg_collection.tp,
+        ).cuda()
+
+        if cp > 1:
+            # The test container has no TE attention backend for CP. Keep the real
+            # MIMO partitioning and MTP embedding/projection/loss path, but replace
+            # the main decoder and the inner attention layer with identities so the
+            # test reaches the CP-local MTP concatenation this regression covers.
+            class _IdentityDecoder(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.input_tensor = None
+
+                def set_input_tensor(self, input_tensor):
+                    self.input_tensor = input_tensor
+
+                def forward(self, hidden_states, **kwargs):
+                    return hidden_states if hidden_states is not None else self.input_tensor
+
+            class _IdentityMTPLayer(torch.nn.Module):
+                def forward(self, hidden_states, **kwargs):
+                    return hidden_states, None
+
+            model.language_model.decoder = _IdentityDecoder()
+            for mtp_layer in model.language_model.mtp.layers:
+                mtp_layer.mtp_model_layer = _IdentityMTPLayer()
+
+        input_ids = torch.randint(1, min(special_token_ids.values()), (1, seq_len), device="cuda")
+        input_ids[0, 3] = special_token_ids["images"]
+        input_ids[0, 12] = special_token_ids["audio"]
+        position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+        if position_dims == 3:
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).contiguous()
+        labels = torch.roll(input_ids, shifts=-1, dims=-1)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+        for special_token_id in special_token_ids.values():
+            loss_mask[input_ids == special_token_id] = 0
+
+        output, local_loss_mask = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=None,
+            modality_inputs=None,
+        )
+
+        assert output.shape == local_loss_mask.shape == (1, seq_len // cp)
+        output.mean().backward()
+
+    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (1, 2), (4, 1), (1, 4), (2, 2)])
+    def test_non_first_pipeline_stage_runs_real_mtp(self, tp, cp):
+        """Run real MIMO+MTP on the last stage with combined parallelism."""
+        required_world_size = 2 * tp * cp
+        if torch.distributed.get_world_size() < required_world_size:
+            pytest.skip(f"requires {required_world_size} distributed ranks")
+
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp, pipeline_model_parallel_size=2, context_parallel_size=cp
+        )
+        model_parallel_cuda_manual_seed(123)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        is_first_stage = parallel_state.is_pipeline_first_stage()
+        is_last_stage = parallel_state.is_pipeline_last_stage()
+
+        seq_len = 8
+        vocab_size = 128
+        invalid_token_id = 127
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=tp > 1,
+            context_parallel_size=cp,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_model_spec = ModuleSpec(
+            module=GPTModel,
+            params={
+                "config": config,
+                "transformer_layer_spec": layer_spec,
+                "mtp_block_spec": get_gpt_mtp_block_spec(
+                    config=config, spec=layer_spec, use_transformer_engine=True
+                ),
+                "vocab_size": vocab_size,
+                "max_sequence_length": seq_len,
+                "pre_process": is_first_stage,
+                "post_process": is_last_stage,
+                "position_embedding_type": "rope",
+                "scatter_embedding_sequence_parallel": False,
+                "share_embeddings_and_output_weights": True,
+                "pg_collection": pg_collection,
+            },
+        )
+        model = MimoModel(
+            MimoModelConfig(
+                language_model_spec=language_model_spec,
+                modality_submodules_spec={},
+                special_token_ids={"images": invalid_token_id},
+            ),
+            cp_group=pg_collection.cp,
+            tp_group=pg_collection.tp,
+        ).cuda()
+        model.role = RankRole(
+            modules={
+                MIMO_LANGUAGE_MODULE_KEY: ModuleStageInfo(
+                    is_first_stage=is_first_stage, is_last_stage=is_last_stage
+                )
+            },
+            mode=ModuleLayout.NON_COLOCATED,
+        )
+
+        if not is_last_stage:
+            return
+
+        if cp > 1:
+            # The validation image has no TE attention backend for CP. Preserve
+            # real PP/CP metadata partitioning and the MTP embedding/projection/loss
+            # path while replacing only the attention-bearing blocks.
+            class _IdentityDecoder(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.input_tensor = None
+
+                def set_input_tensor(self, input_tensor):
+                    self.input_tensor = input_tensor
+
+                def forward(self, hidden_states, **kwargs):
+                    return hidden_states if hidden_states is not None else self.input_tensor
+
+            class _IdentityMTPLayer(torch.nn.Module):
+                def forward(self, hidden_states, **kwargs):
+                    return hidden_states, None
+
+            model.language_model.decoder = _IdentityDecoder()
+            for mtp_layer in model.language_model.mtp.layers:
+                mtp_layer.mtp_model_layer = _IdentityMTPLayer()
+
+        input_ids = torch.randint(1, vocab_size - 1, (1, seq_len), device="cuda")
+        input_ids[0, 2] = invalid_token_id
+        position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0)
+        labels = torch.roll(input_ids, shifts=-1, dims=-1)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+        loss_mask[input_ids == invalid_token_id] = 0
+        hidden_states = torch.randn(seq_len // (tp * cp), 1, config.hidden_size, device="cuda")
+
+        output, _ = model._forward_language_module(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            loss_mask=loss_mask,
+            labels=labels,
+            input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
+        )
+
+        assert output.shape == (1, seq_len // cp)
+        output.mean().backward()
 
 
 class MockProcessGroup:
@@ -796,17 +1057,20 @@ class TestMimoModelNonColocated:
         assert captured['loss_mask'] is loss_mask
         assert out_loss_mask is loss_mask
 
-    def test_forward_language_module_non_first_stage_drops_input_ids(self):
-        """Non-first PP stage in ``_forward_language_module`` must call the LM
-        with ``input_ids=None`` (hidden states arrive via ``set_input_tensor``)
-        while still threading ``position_ids`` through for mRoPE.
+    def test_forward_language_module_non_first_stage_threads_mtp_mask(self):
+        """A non-first PP stage that owns MTP must preserve token IDs and its mask.
+
+        Hidden states arrive through ``set_input_tensor`` while the conditioning
+        token IDs remain available for MTP's shifted embedding lookup.
         """
         model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
         model = model.to(self.device)
+        model.language_model.mtp_process = True
 
         input_ids = torch.randint(
             0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device
         )
+        input_ids[0, 1] = model.special_token_ids['images']
         position_ids = (
             torch.arange(self.seq_len, device=self.device).unsqueeze(0).expand(self.batch_size, -1)
         )
@@ -836,9 +1100,11 @@ class TestMimoModelNonColocated:
                 input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
             )
 
-        assert captured['input_ids'] is None
+        assert captured['input_ids'] is input_ids
         assert captured['decoder_input'] is None
         assert captured['loss_mask'] is loss_mask
+        assert captured['mtp_input_mask'][0, 1].item() is False
+        assert captured['mtp_input_mask'][0, 0].item() is True
         torch.testing.assert_close(captured['position_ids'], position_ids)
 
 
