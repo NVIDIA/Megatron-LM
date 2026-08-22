@@ -250,6 +250,14 @@ class CUDAGraphBatchDimensionBuilder:
         if sizing_distribution is None:
             sizing_distribution = CudaGraphSizingDistribution.EXPONENTIAL
 
+        # HYBRID names a pair of distributions, one per graph family, so it must be resolved
+        # by the caller that knows which family it is building. Falling through here would
+        # silently produce exponential decode graphs.
+        assert sizing_distribution != CudaGraphSizingDistribution.HYBRID, (
+            "HYBRID must be resolved to EXPONENTIAL (prefill) or LINEAR (decode) before "
+            "reaching _calculate_cuda_graph_token_counts"
+        )
+
         if sizing_distribution == CudaGraphSizingDistribution.LINEAR:
             return CUDAGraphBatchDimensionBuilder._calculate_token_counts_linear(
                 tp_size, num_cuda_graphs, cuda_graph_max_tokens
@@ -464,6 +472,15 @@ class CUDAGraphBatchDimensionBuilder:
                 # the token counts based on the max_tokens value and the step size.
                 num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
 
+            # HYBRID applies a different distribution to each of the two families below,
+            # so resolve it here rather than inside the generator, which sees only one
+            # range at a time and cannot tell which family it is serving.
+            if sizing_distribution == CudaGraphSizingDistribution.HYBRID:
+                prefill_distribution = CudaGraphSizingDistribution.EXPONENTIAL
+                decode_distribution = CudaGraphSizingDistribution.LINEAR
+            else:
+                prefill_distribution = decode_distribution = sizing_distribution
+
             # Calculate token counts for prefill and mixed graphs.
             # These need the full cuda_graph_max_tokens to handle variable-length sequences.
             cuda_graph_prefill_token_counts = (
@@ -471,7 +488,7 @@ class CUDAGraphBatchDimensionBuilder:
                     tp_size=tp_size,
                     num_cuda_graphs=num_cuda_graphs,
                     cuda_graph_max_tokens=cuda_graph_max_tokens,
-                    sizing_distribution=sizing_distribution,
+                    sizing_distribution=prefill_distribution,
                 )
             )
 
@@ -484,7 +501,7 @@ class CUDAGraphBatchDimensionBuilder:
                     tp_size=tp_size,
                     num_cuda_graphs=num_cuda_graphs,
                     cuda_graph_max_tokens=cuda_graph_max_tokens_decode,
-                    sizing_distribution=sizing_distribution,
+                    sizing_distribution=decode_distribution,
                 )
             )
 
