@@ -387,6 +387,24 @@ class InferenceConfig:
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
+    mamba_replay_ssm: bool = False
+    """For Mamba speculative decoding: enable ReplaySSM-style state management
+    (https://tridao.me/blog/2026/replayssm/). Instead of writing the SSM state to HBM every decode
+    step (and checkpointing per-draft states for rollback), keep a checkpoint state plus a small
+    per-(layer, slot) ring buffer of cached SSM inputs (post-conv `x`/`B` and raw `dt`).
+    Decode outputs are computed directly from the checkpoint and the cached inputs without
+    materializing intermediate states; the checkpoint is re-materialized only on (early-)flush
+    steps, and speculative rollback becomes a device-side ring-pointer move. Requires a per-head
+    scalar `A` (Mamba-2 / TIE_HDIM). Only affects the SSM state; conv-state rollback is
+    unchanged. No effect when `num_speculative_tokens == 0`."""
+
+    mamba_replay_buffer_len: int = 16
+    """ReplaySSM committed-history buffer length `B` (tokens). The logical flush threshold is
+    `L = B + W` where `W = 1 + num_speculative_tokens` is the verification-window length, and
+    the physical ring buffer is padded to the next power of two of `L`. A flush is scheduled one
+    window early (`write_pos + 2W > L`) so a full window always fits. Must satisfy `B >= W`.
+    Only used when `mamba_replay_ssm` is True."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 

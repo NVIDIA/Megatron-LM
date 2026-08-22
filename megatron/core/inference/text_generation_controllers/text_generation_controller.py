@@ -71,6 +71,7 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import commit_replayssm_spec
 
 
 @dataclass
@@ -938,6 +939,7 @@ class TextGenerationController:
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ].to(cuda_device, non_blocking=True)
+            # Conv state rollback (full-window checkpoint copy).
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
@@ -946,14 +948,33 @@ class TextGenerationController:
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
-            mamba_state_selective_copy(
-                intermediate_states=context.mamba_intermediate_ssm_states,
-                current_states=context.mamba_ssm_states,
-                prefill_status=prefill_status_gpu,
-                state_idx=mamba_state_idx,
-                accepted_counts=accepted_counts_gpu,
-                num_layers=context.num_mamba_layers,
-            )
+            # SSM state rollback: ReplaySSM ring-pointer commit, or the full
+            # intermediate-state copy.
+            if context.mamba_replay_ssm:
+                # ReplaySSM: no state copy at all. Advance each slot's ring cursor by
+                # (accepted drafts + bonus token); rejected drafts are simply left
+                # behind the new write_pos and get overwritten next step. Also
+                # precomputes the next step's per-slot flush flag on device.
+                commit_replayssm_spec(
+                    write_pos=context.mamba_replay_write_pos,
+                    post_conv_state_pos=context.mamba_replay_origin,
+                    is_flush=context.mamba_replay_is_flush,
+                    accepted_draft_counts=accepted_counts_gpu,
+                    prefill_status=prefill_status_gpu,
+                    state_batch_indices=mamba_state_idx,
+                    max_cache_len=context.mamba_replay_flush_threshold,
+                    max_spec_len=context.mamba_replay_window,
+                    cache_buf_len=context.mamba_replay_cache_buf_len,
+                )
+            else:
+                mamba_state_selective_copy(
+                    intermediate_states=context.mamba_intermediate_ssm_states,
+                    current_states=context.mamba_ssm_states,
+                    prefill_status=prefill_status_gpu,
+                    state_idx=mamba_state_idx,
+                    accepted_counts=accepted_counts_gpu,
+                    num_layers=context.num_mamba_layers,
+                )
 
         return blocks_to_release, remove_mask
 

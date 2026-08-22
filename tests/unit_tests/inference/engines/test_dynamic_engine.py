@@ -189,6 +189,8 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    mamba_replay_ssm: bool = False
+    mamba_replay_buffer_len: int = 16
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
     temperature: float = 1.0
@@ -357,6 +359,8 @@ class DynamicInferenceEngineTestBase:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                mamba_replay_ssm=test_config.mamba_replay_ssm,
+                mamba_replay_buffer_len=test_config.mamba_replay_buffer_len,
                 sampling_backend=test_config.sampling_backend,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
@@ -5681,8 +5685,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ["all_accepted", "all_rejected", "partial"],
         ids=["accept_all", "reject_all", "partial_reject"],
     )
+    @pytest.mark.parametrize("mamba_replay_ssm", [False, True], ids=["baseline", "replay"])
     @torch.inference_mode()
-    def test_speculative_decoding_mamba_hybrid(self, rejection_mode):
+    def test_speculative_decoding_mamba_hybrid(self, rejection_mode, mamba_replay_ssm):
         """Test speculative decoding with a Mamba hybrid model.
 
         Exercises the intermediate Mamba state commit/rewind path with
@@ -5709,6 +5714,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=4,
             num_tokens_to_generate=num_tokens_to_generate,
             num_speculative_tokens=2,
+            mamba_replay_ssm=mamba_replay_ssm,
+            # Small buffer so multiple flush cycles happen within 8 generated tokens.
+            mamba_replay_buffer_len=4,
             materialize_only_last_token_logits=False,
             model_provider="hybrid",
         )

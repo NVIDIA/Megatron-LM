@@ -2135,6 +2135,19 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--mamba-replay-ssm',
+                       dest='mamba_replay_ssm',
+                       action='store_true', default=False,
+                       help='For Mamba speculative decoding: enable ReplaySSM state management '
+                            '(checkpoint SSM state + ring buffer of cached post-conv inputs, '
+                            'output-only decode, flush-on-buffer-full, pointer-move rollback). '
+                            'Requires a per-head scalar A (Mamba-2 / TIE_HDIM).')
+    group.add_argument('--mamba-replay-buffer-len',
+                       dest='mamba_replay_buffer_len',
+                       type=int, default=16,
+                       help='ReplaySSM committed-history buffer length B (tokens). Logical flush '
+                            'threshold is B + (1 + num_speculative_tokens); must satisfy '
+                            'B >= 1 + num_speculative_tokens.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,

@@ -173,6 +173,15 @@ class InferenceSetupConfig:
     num_speculative_tokens: int = 0
     """Number of speculative tokens generated during decode."""
 
+    mamba_replay_ssm: bool = False
+    """For Mamba speculative decoding: enable ReplaySSM state management — checkpoint SSM state +
+    ring buffer of cached inputs, output-only decode, flush-on-buffer-full, and pointer-move
+    rollback. Requires a per-head scalar A (Mamba-2 / TIE_HDIM). Mirrors `--mamba-replay-ssm`."""
+
+    mamba_replay_buffer_len: int = 16
+    """ReplaySSM committed-history buffer length B (tokens); logical flush threshold is
+    B + (1 + num_speculative_tokens). Mirrors `--mamba-replay-buffer-len`."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -375,6 +384,8 @@ class InferenceSetupConfig:
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
+            mamba_replay_ssm=self.mamba_replay_ssm,
+            mamba_replay_buffer_len=self.mamba_replay_buffer_len,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
