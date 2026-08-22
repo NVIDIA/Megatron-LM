@@ -510,6 +510,8 @@ def scatter_to_tensor_model_parallel_region(input_, group=None):
 def gather_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: AG, backward: split <last dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
+    if group.size() == 1:
+        return input_
     return _GatherFromModelParallelRegion.apply(input_, group)
 
 
