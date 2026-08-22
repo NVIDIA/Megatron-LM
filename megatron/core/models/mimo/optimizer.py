@@ -40,6 +40,8 @@ class MimoOptimizer(MegatronOptimizer):
     across all modules via all_reduce MAX.
     """
 
+    step_stats_are_global = True
+
     def __init__(self, module_infos: Dict[str, ModuleOptimizerInfo], config: OptimizerConfig):
         self.module_infos = module_infos
         self.config = config
@@ -50,6 +52,7 @@ class MimoOptimizer(MegatronOptimizer):
         ]
         self.is_stub_optimizer = len(self._active_optimizers) == 0
         self.optimizer = None  # Base class compat
+        self._has_loss_scaler = bool(config.fp16 or config.loss_scale)
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -67,8 +70,12 @@ class MimoOptimizer(MegatronOptimizer):
 
         for i, (name, info) in enumerate(sorted(self.module_infos.items())):
             if info.is_active and info.optimizer:
-                module_norm = info.optimizer.get_grad_norm() or 0.0
-                norm_sq[i] = module_norm**2
+                module_norm = info.optimizer.get_grad_norm()
+                if module_norm is not None:
+                    module_norm = torch.as_tensor(
+                        module_norm, device=norm_sq.device, dtype=norm_sq.dtype
+                    ).reshape(())
+                    norm_sq[i].copy_(module_norm.square())
 
         torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
         return torch.sqrt(norm_sq.sum()).item()
@@ -77,12 +84,11 @@ class MimoOptimizer(MegatronOptimizer):
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
         """Run one optimizer step across all active module optimizers."""
         found_inf = self.prepare_grads()
-        # Synchronize found_inf across all ranks to prevent deadlock:
-        # if encoder ranks detect inf but LLM ranks don't, the early return
-        # would skip the all_reduce in get_grad_norm(), causing a hang.
-        found_inf_tensor = torch.tensor([found_inf], dtype=torch.float32, device="cuda")
-        torch.distributed.all_reduce(found_inf_tensor, op=torch.distributed.ReduceOp.MAX)
-        found_inf = found_inf_tensor.item() > 0
+        if self._has_loss_scaler:
+            # All module grids must agree on overflow before any rank returns early.
+            found_inf_tensor = torch.tensor([found_inf], dtype=torch.float32, device="cuda")
+            torch.distributed.all_reduce(found_inf_tensor, op=torch.distributed.ReduceOp.MAX)
+            found_inf = found_inf_tensor.item() > 0
         if found_inf:
             return False, None, None
 
@@ -104,10 +110,11 @@ class MimoOptimizer(MegatronOptimizer):
         num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         success = self.step_with_ready_grads()
 
-        # Reduce update success across the world (MIN) so disjoint-grid ranks agree.
-        success_tensor = torch.tensor([1 if success else 0], dtype=torch.int, device="cuda")
-        torch.distributed.all_reduce(success_tensor, op=torch.distributed.ReduceOp.MIN)
-        success = bool(success_tensor.item())
+        if self._has_loss_scaler:
+            # Scaled optimizers can skip an update independently, so disjoint grids must agree.
+            success_tensor = torch.tensor([1 if success else 0], dtype=torch.int, device="cuda")
+            torch.distributed.all_reduce(success_tensor, op=torch.distributed.ReduceOp.MIN)
+            success = bool(success_tensor.item())
 
         return success, grad_norm, num_zeros
 

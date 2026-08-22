@@ -15,7 +15,9 @@ def test_step_success_is_world_min():
     """One rank's failed update must propagate to every rank via the MIN reduction."""
     Utils.initialize_distributed()
     try:
-        opt = MimoOptimizer(module_infos={}, config=OptimizerConfig(log_num_zeros_in_grad=False))
+        opt = MimoOptimizer(
+            module_infos={}, config=OptimizerConfig(fp16=True, log_num_zeros_in_grad=False)
+        )
         last_rank = torch.distributed.get_world_size() - 1
         opt.step_with_ready_grads = lambda: torch.distributed.get_rank() != last_rank
         success, _, _ = opt.step()

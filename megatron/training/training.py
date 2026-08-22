@@ -3177,16 +3177,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
     dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
-    # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
-    # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
-    # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
-    # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
-        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
-            num_zeros_in_grad, group=mp_group
+    if not getattr(optimizer, "step_stats_are_global", False):
+        # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
+        # so we must gather across mp ranks
+        update_successful = logical_and_across_model_parallel_group(
+            update_successful, group=mp_group
         )
+        # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
+        # so we must gather across mp ranks
+        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
+        if args.log_num_zeros_in_grad:
+            num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
+                num_zeros_in_grad, group=mp_group
+            )
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
