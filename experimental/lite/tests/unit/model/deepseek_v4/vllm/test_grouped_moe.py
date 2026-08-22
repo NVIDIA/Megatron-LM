@@ -56,6 +56,34 @@ def test_vllm_visible_silu_quant_has_no_layout_dependent_fallback(monkeypatch):
     assert calls[0][1]["masked_m"] is None
 
 
+def test_vllm_visible_silu_quant_preserves_ds4_clamp(monkeypatch):
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+    calls = []
+
+    def packed(value, **kwargs):
+        calls.append((value, kwargs))
+        return kwargs["output_q"], torch.ones(1)
+
+    monkeypatch.setattr(
+        DeepGemmQuantScaleFMT,
+        "from_oracle",
+        staticmethod(lambda: DeepGemmQuantScaleFMT.UE8M0),
+    )
+    monkeypatch.setattr(fp8_utils, "silu_mul_quant_fp8_packed_triton", packed)
+    value = torch.randn(2, 256, dtype=torch.bfloat16)
+    output = torch.empty(2, 128, dtype=torch.float8_e4m3fn)
+
+    quantized, _scales = vllm_grouped_moe._vllm_silu_mul_quant(
+        value, output=output, swiglu_limit=10.0
+    )
+
+    assert quantized is output
+    assert len(calls) == 1
+    assert calls[0][1]["clamp_limit"] == 10.0
+
+
 def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     monkeypatch,
 ) -> None:
