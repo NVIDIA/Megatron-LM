@@ -306,6 +306,9 @@ def forward_step_calc_loss(
 ):
     """Calculate the loss and number of tokens for forward_step()"""
 
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
