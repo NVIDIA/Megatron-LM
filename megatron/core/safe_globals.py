@@ -130,7 +130,9 @@ _PG_DIST_CACHE_SAFE_CLASSES = frozenset(
         ("builtins", "slice"),
         ("megatron.core.dist_checkpointing.exchange_utils", "ShardDistribution"),
         ("megatron.core.dist_checkpointing.mapping", "ShardedTensor"),
-        *(("torch", name) for name in (
+        *(
+            ("torch", name)
+            for name in (
             "bfloat16",
             "bool",
             "complex128",
@@ -151,7 +153,9 @@ _PG_DIST_CACHE_SAFE_CLASSES = frozenset(
             "uint16",
             "uint32",
             "uint64",
-        ) if hasattr(torch, name)),
+            )
+            if hasattr(torch, name)
+        ),
     }
 )
 
