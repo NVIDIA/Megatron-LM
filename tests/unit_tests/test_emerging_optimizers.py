@@ -12,10 +12,12 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
+    _PROFILES,
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
     _get_qkv_split_shapes,
+    _select_tp_mode,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
@@ -64,6 +66,123 @@ class Net(nn.Module):
 # ===========================================================================
 # Muon optimizer tests
 # ===========================================================================
+
+
+def test_select_tp_mode_flops_only_fallback():
+    """Without a hardware profile, select by FLOPs or the cross-domain fallback."""
+    assert (
+        _select_tp_mode(
+            m=8192,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=None,
+        )
+        == "distributed"
+    )
+    assert (
+        _select_tp_mode(
+            m=8192,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=True,
+            profile=None,
+        )
+        == "duplicated"
+    )
+
+
+def test_select_tp_mode_with_profile():
+    """A hardware profile selects different modes for tall and wide matrices."""
+    profile = _PROFILES["GB200"]
+
+    assert (
+        _select_tp_mode(
+            m=8192,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=profile,
+        )
+        == "distributed"
+    )
+    assert (
+        _select_tp_mode(
+            m=1024,
+            n=8192,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=profile,
+        )
+        == "duplicated"
+    )
+
+
+def test_select_tp_mode_syrk_changes_selection():
+    """SYRK halves the Gram-op cost differently per mode -- can flip the selected mode."""
+    assert (
+        _select_tp_mode(
+            m=640,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=None,
+        )
+        == "duplicated"
+    )
+    assert (
+        _select_tp_mode(
+            m=640,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=True,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=None,
+        )
+        == "distributed"
+    )
+
+
+def test_resolve_tp_mode_caches(monkeypatch):
+    """Repeated resolution of the same shape invokes the cost model only once."""
+    call_count = 0
+
+    def mock_select_tp_mode(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        return "distributed"
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers._select_tp_mode", mock_select_tp_mode
+    )
+
+    optimizer = TensorParallelMuon(
+        params=[torch.nn.Parameter(torch.zeros(1))], tp_mode="auto", pg_collection=None
+    )
+
+    first = optimizer._resolve_tp_mode(4096, 1024, 8)
+    second = optimizer._resolve_tp_mode(4096, 1024, 8)
+
+    assert first == second == "distributed"
+    assert call_count == 1
+    assert list(optimizer._tp_mode_cache) == [(4096, 1024, 8)]
 
 
 def test_muon_qkv_split_shapes():
@@ -119,7 +238,7 @@ def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mo
 
     calls = []
 
-    def fake_orthogonalize(grad, tp_group, partition_dim=None):
+    def fake_orthogonalize(grad, tp_group, partition_dim=None, tp_mode_this_group=None):
         calls.append((grad.clone(), tp_group, partition_dim))
         return grad + 100
 
@@ -183,7 +302,7 @@ def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
 
     calls = []
 
-    def fake_orthogonalize(grad, tp_group, partition_dim=None):
+    def fake_orthogonalize(grad, tp_group, partition_dim=None, tp_mode_this_group=None):
         calls.append(grad.clone())
         return grad  # identity: makes the strip/restore round-trip directly checkable
 
