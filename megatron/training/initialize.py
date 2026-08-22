@@ -100,8 +100,12 @@ def initialize_megatron(
     )
 
     if args.batch_invariant_mode:
-        print_rank_0("Enabling batch invariant mode globally")
-        enable_batch_invariant_mode()
+        backend = args.batch_invariant_backend
+        collective = args.batch_invariant_collective
+        print_rank_0(
+            f"Enabling batch invariant mode globally (backend={backend}, collective={collective})"
+        )
+        enable_batch_invariant_mode(backend, collective)
 
     # torch.distributed initialization
     def finish_mpu_init():

@@ -641,10 +641,18 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            get_batch_invariant_collective,
+        )
+
+        use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        # Under batch-invariant mode the "multimem" option keeps the native
+        # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
+        # bitwise-equal to an fp64 reference), deterministic and
+        # batch-invariant; "ordered" (default) uses the explicit fixed
+        # rank-order fp32 kernel, deterministic by construction anywhere.
         reduce_scatter_v = (
-            batch_invariant.ordered_reduce_scatter_v
-            if batch_invariant.enabled()
-            else multimem_reduce_scatter_v
+            batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
         )
         reduce_scatter_v(
             output,
