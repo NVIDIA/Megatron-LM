@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -8,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed.checkpoint
+import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -19,6 +21,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.training.async_utils import maybe_finalize_async_save
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -30,7 +33,9 @@ from megatron.training.checkpointing import (
     read_metadata,
     save_checkpoint,
 )
+from megatron.training.config.container import ConfigContainerBase
 from megatron.training.global_vars import set_args
+from megatron.training.models.gpt import GPTModelConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -74,6 +79,40 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@dataclass
+class CheckpointSettingsFixture:
+    save_rng: bool
+
+
+@dataclass
+class CheckpointConfigFixture(ConfigContainerBase):
+    model: Optional[GPTModelConfig]
+    checkpoint: CheckpointSettingsFixture
+
+
+def make_checkpoint_config_fixture(include_model: bool = True) -> CheckpointConfigFixture:
+    return CheckpointConfigFixture(
+        model=(
+            GPTModelConfig(
+                transformer=TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=1),
+                vocab_size=256,
+            )
+            if include_model
+            else None
+        ),
+        checkpoint=CheckpointSettingsFixture(save_rng=True),
+    )
+
+
+def assert_run_config(run_config: dict) -> None:
+    assert run_config["_target_"] == "tests.unit_tests.test_checkpointing.CheckpointConfigFixture"
+    assert run_config["checkpoint"]["save_rng"] is True
+    assert run_config["model"]["_target_"] == "megatron.training.models.gpt.GPTModelConfig"
+    assert run_config["model"]["_builder_"] == GPTModelConfig.builder
+    assert run_config["model"]["vocab_size"] == 256
+    assert run_config["model"]["transformer"]["hidden_size"] == 128
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
@@ -357,6 +396,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         optimizer = MockState({"state": {}})
     opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
     num_floating_point_operations_so_far = 456
+    config_container = make_checkpoint_config_fixture()
 
     with TempNamedDir(tmp_path_dist_ckpt / "test_save_checkpoint", sync=True) as save_dir:
         args.save = save_dir
@@ -364,7 +404,12 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         set_args(args)
 
         save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+            iteration,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            checkpointing_context={"config_container": config_container},
         )
 
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
@@ -379,6 +424,81 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+
+        run_config_path = ckpt_dir / "run_config.yaml"
+        if args.use_dist_ckpt:
+            with open(run_config_path, "r") as f:
+                run_config = yaml.safe_load(f)
+            assert_run_config(run_config)
+        else:
+            assert not run_config_path.exists()
+
+
+def test_save_run_config_after_async_checkpoint(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+):
+    args = create_ckpt_load_args
+    args.async_save = True
+    args.ckpt_format = "torch_dist"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = True
+    args.save_tokenizer_assets = False
+
+    config_container = make_checkpoint_config_fixture()
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with mock.patch("megatron.training.async_utils._async_calls_queue", None):
+        with TempNamedDir(tmp_path_dist_ckpt / "test_async_run_config", sync=True) as save_dir:
+            args.save = save_dir
+            set_args(args)
+            run_config_path = save_dir / "iter_0000123" / "run_config.yaml"
+
+            save_checkpoint(
+                123,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                456,
+                checkpointing_context={"config_container": config_container},
+            )
+
+            assert not run_config_path.exists()
+            maybe_finalize_async_save(blocking=True)
+
+            with open(run_config_path, "r") as f:
+                assert_run_config(yaml.safe_load(f))
+
+
+def test_save_run_config_requires_model_config(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+):
+    args = create_ckpt_load_args
+    args.async_save = False
+    args.ckpt_format = "torch_dist"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = True
+    args.save_tokenizer_assets = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_run_config_without_model", sync=True) as save_dir:
+        args.save = save_dir
+        set_args(args)
+
+        save_checkpoint(
+            123,
+            [MockModel(config)],
+            MockState({"optimizer": "optimizer_state"}),
+            MockState({"opt_param_scheduler": "scheduler_state"}),
+            456,
+            checkpointing_context={
+                "config_container": make_checkpoint_config_fixture(include_model=False)
+            },
+        )
+
+        assert not (save_dir / "iter_0000123" / "run_config.yaml").exists()
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])

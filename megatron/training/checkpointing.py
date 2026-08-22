@@ -1030,6 +1030,18 @@ def save_checkpoint(
         or torch.distributed.get_rank() == 0
     ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
+        config_container = (
+            checkpointing_context.get('config_container')
+            if checkpointing_context is not None
+            else None
+        )
+        run_config_filename = (
+            os.path.join(checkpoint_name, 'run_config.yaml')
+            if ckpt_type == CheckpointType.GLOBAL
+            and config_container is not None
+            and getattr(config_container, 'model', None) is not None
+            else None
+        )
 
         if ckpt_type == CheckpointType.LOCAL:
 
@@ -1080,6 +1092,8 @@ def save_checkpoint(
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
+                if run_config_filename is not None:
+                    config_container.to_yaml(run_config_filename)
                 with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write('release' if release else str(iteration))
                 print_rank_0(
