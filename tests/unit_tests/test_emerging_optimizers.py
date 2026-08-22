@@ -1710,3 +1710,41 @@ def test_lion_optimizer_multi_layer_net():
             params_updated += 1
 
     assert params_updated > 0, "At least some parameters should be updated after optimizer step"
+
+
+# ===========================================================================
+# use_syrk version gate
+# ===========================================================================
+
+
+@pytest.mark.parametrize("optimizer_cls", [TensorParallelMuon, TensorParallelAdaptiveMuon])
+def test_muon_use_syrk_rejected_on_old_emerging_optimizers(monkeypatch, optimizer_cls):
+    """use_syrk must raise on emerging_optimizers < 0.4.0 rather than silently falling back.
+
+    Covers TensorParallelAdaptiveMuon too, since it forwards use_syrk through
+    TensorParallelMuon.__init__ and that forwarding is what applies the gate to both.
+    """
+    import megatron.core.optimizer.emerging_optimizers as eo_module
+
+    monkeypatch.setattr(eo_module, "is_emerging_optimizers_min_version", lambda _version: False)
+    monkeypatch.setattr(eo_module, "get_emerging_optimizers_version", lambda: "0.2.0")
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    with pytest.raises(ValueError, match="use_syrk requires emerging_optimizers"):
+        optimizer_cls(
+            params=[model.weight], lr=0.01, pg_collection=None, tp_mode="duplicated", use_syrk=True
+        )
+
+
+@pytest.mark.parametrize("optimizer_cls", [TensorParallelMuon, TensorParallelAdaptiveMuon])
+def test_muon_use_syrk_default_off_ignores_version(monkeypatch, optimizer_cls):
+    """The gate only fires when use_syrk is requested; the default path stays version-agnostic."""
+    import megatron.core.optimizer.emerging_optimizers as eo_module
+
+    monkeypatch.setattr(eo_module, "is_emerging_optimizers_min_version", lambda _version: False)
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    optimizer = optimizer_cls(
+        params=[model.weight], lr=0.01, pg_collection=None, tp_mode="duplicated"
+    )
+    assert optimizer is not None

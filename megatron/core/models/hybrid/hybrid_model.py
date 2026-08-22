@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -13,7 +14,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -27,7 +28,6 @@ from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_han
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
-    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -84,6 +84,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
+        logit_dtype (torch.dtype, optional): Dtype for the output-layer GEMM result.
+            Defaults to None, which uses the hidden-state dtype.
         parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
@@ -114,6 +116,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
@@ -145,6 +148,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
@@ -240,6 +244,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
@@ -323,6 +328,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
+                pg_collection=self.pg_collection,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:
@@ -427,12 +434,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        compute_mtp_loss: bool = True,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given or the final hidden units
+
+        Args:
+            compute_mtp_loss (bool): Whether to compute the non-inference MTP auxiliary
+                objective. Disabling it skips the MTP branch while leaving its parameters
+                loaded. This does not control speculative decoding. On post-process stages,
+                ``labels`` still determine whether the model returns loss or logits.
+                Defaults to True.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -478,9 +493,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
-        # Model-level rotary_pos_emb is only for regular attention. Regular
-        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
-        # variants must ignore this external RoPE and build/apply RoPE internally.
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -488,7 +500,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
         elif self.position_embedding_type == 'yarn':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -498,7 +509,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -517,32 +527,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         #   be None, so this assert will succeed.
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
-        # Pass input_ids to decoder for hash-based MoE routing.
-        decoder_extra_block_kwargs = {}
-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
-            decoder_extra_block_kwargs['input_ids'] = input_ids
-
         # Run decoder.
-        decoder_output = self.decoder(
+        hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
-            **decoder_extra_block_kwargs,
         )
-        # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
-        # (hidden_states, mhc_multistream) in exactly one case: enable_hyper_connections and
-        # post_process and mtp_num_layers > 0 and not is_mtp_layer — where MTP's mHC branch
-        # needs the pre-contraction multi-stream tensor for `_concat_embeddings`. Any other
-        # tuple return would be misinterpreted here, so keep that contract in sync with
-        # HybridStack.forward (see hybrid_block.py).
-        if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
-        else:
-            hidden_states = decoder_output
-            mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -557,47 +550,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
-        mtp_cp_group = None
-        sequence_roll_context = None
-        if (
-            self.config.mtp_num_layers
-            and self.mtp_process
-            and not (in_inference_mode or is_spec_decode)
-        ):
-            mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
-            # Build layout-specific metadata once, then fetch every locally owned
-            # MTP field's compact successor rows in one grouped operation. The extra
-            # row covers RL's initial label derivation before the per-layer rolls.
-            sequence_roll_context = prepare_mtp_sequence_roll_context(
-                tensor=input_ids if input_ids is not None else labels,
-                cp_group=mtp_cp_group,
-                packed_seq_params=packed_seq_params,
-            )
-            if sequence_roll_context is not None:
-                roll_position_ids = getattr(self.embedding, "add_position_embedding", True)
-                sequence_roll_context = sequence_roll_context.prefetch_halos(
-                    width=self.config.mtp_num_layers + 1,
-                    input_ids=input_ids,
-                    position_ids=position_ids if roll_position_ids else None,
-                    labels=labels if self.post_process else None,
-                    loss_mask=loss_mask if self.post_process else None,
-                    padding_mask=padding_mask,
-                )
 
-        mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
+        mtp_forward_ran = (
+            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
+        )
         if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
-                mhc_multistream=mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
-                sequence_roll_context=sequence_roll_context,
                 embedding=self.embedding,
-                padding_mask=padding_mask,
             )
 
         if not self.post_process:
@@ -605,9 +571,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
-                self._decoder_hidden_states_cache = hidden_states
-            else:
+            if is_spec_decode:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    # Block-scope CUDA graph mode: copy_() into the
+                    # pre-allocated buffer so every graph replay writes to
+                    # the same fixed GPU address regardless of batch size.
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    # Non-block scope: direct assignment; the controller will set
+                    # this back to None after reading to allow GC.
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif mtp_forward_ran:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
@@ -620,10 +598,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=mtp_cp_group,
+                    cp_group=self.pg_collection.cp,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
-                    sequence_roll_context=sequence_roll_context,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
                 )

@@ -2,12 +2,18 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
-from typing import List, Optional, Union
+from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -38,7 +44,12 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
     ) -> None:
+        # Resolve the default at call time so tests can monkey-patch
+        # ``GPTInferenceWrapper`` on this module.
+        if inference_wrapper_cls is None:
+            inference_wrapper_cls = GPTInferenceWrapper
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
         # synchronous ``engine.generate()`` from inside the caller's asyncio
         # loop, which collides with the engine's loop-bound internal state
@@ -60,14 +71,14 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             use_coordinator=use_coordinator,
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
+            inference_wrapper_cls=inference_wrapper_cls,
         )
-        # Set in serve() when this rank starts the HTTP frontend; consulted by shutdown().
-        self._serve_started: bool = False
 
     async def generate(
         self,
         prompts: Union[str, List[int], List[str], List[List[int]]],
         sampling_params: Optional[SamplingParams] = None,
+        multi_modal_data=None,
     ) -> Union["DynamicInferenceRequest", List["DynamicInferenceRequest"]]:
         """Run inference for one prompt or a batch of prompts.
 
@@ -75,6 +86,18 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         ``DynamicInferenceRequest``; batched input (``list[str]`` or
         ``list[list[int]]``) returns ``list[DynamicInferenceRequest]`` in
         input order.
+
+        ``multi_modal_data`` follows vLLM's modality-dictionary shape.
+
+        Images:
+            ``"image"`` accepts raw image bytes, a list of raw image bytes, or
+            a preprocessed image tensor dictionary.
+        Video:
+            Video does not yet have any supported data preprocessing or
+            modeling formats.
+        Audio:
+            Audio does not yet have any supported data preprocessing or
+            modeling formats.
 
         Raises:
             RuntimeError: if called on a non-primary rank.
@@ -90,9 +113,13 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             # here since single input is wrapped to a one-element list.
             return []
 
+        per_prompt_multi_modal_data = self._normalize_multi_modal_data_list(
+            multi_modal_data, num_prompts=len(normalized), is_batch=is_batch
+        )
+
         assert self._loop_manager is not None
         results = await self._loop_manager.run_async(
-            self._generate_impl(normalized, sampling_params)
+            self._generate_impl(normalized, sampling_params, per_prompt_multi_modal_data)
         )
         return results if is_batch else results[0]
 
@@ -147,17 +174,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             return
         self._shutdown_called = True
 
-        # If we started an HTTP frontend, stop it first so no new requests
-        # arrive while we tear down the coordinator. Invariant:
-        # ``_serve_started`` can only be True when ``use_coordinator=True``
-        # because ``serve()`` raises otherwise.
-        if self._serve_started:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (  # pylint: disable=line-too-long
-                stop_text_gen_server,
-            )
-
-            stop_text_gen_server()
-            self._serve_started = False
+        self._stop_frontend_if_started()
 
         if not self._use_coordinator:
             return
@@ -205,6 +222,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 verbose=serve_config.verbose,
                 num_replicas=serve_config.frontend_replicas,
                 hostname=serve_config.host,
+                sock=serve_config.sock,
             )
             self._serve_started = True
 

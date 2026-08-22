@@ -17,7 +17,13 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import (
+    get_emerging_optimizers_version,
+    get_pg_rank,
+    get_pg_size,
+    is_emerging_optimizers_min_version,
+    log_single_rank,
+)
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -42,6 +48,12 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# newton_schulz_tp() gained the use_syrk kwarg in emerging_optimizers 0.4.0. Earlier releases
+# expose use_syrk on the non-TP newton_schulz() only, so 0.3.x still rejects it here. Spelled
+# ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
+# elsewhere in the tree are written.
+_SYRK_MIN_EO_VERSION = "0.4.0.dev0"
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -130,6 +142,11 @@ def _is_nonlinear_or_embedding(param):
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 
+def _is_muon_excluded(param):
+    """True for parameters that should use the scalar optimizer instead of Muon."""
+    return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
+
+
 def _get_qkv_split_shapes(model_cfg) -> list[int]:
     """Compute QKV split shapes from model config."""
     query_projection_size = (
@@ -178,9 +195,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
+            raise ValueError(
+                f"use_syrk requires emerging_optimizers >= {_SYRK_MIN_EO_VERSION}, but "
+                f"{get_emerging_optimizers_version()} is installed. Upgrade "
+                "emerging_optimizers or drop --muon-use-syrk."
+            )
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -197,6 +221,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             size = [grad.size(-2), grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
+            # Only forward the kwarg when enabled; older emerging_optimizers do not
+            # accept it at all, and __init__ has already rejected use_syrk on those.
+            ns_kwargs = {"use_syrk": True} if use_syrk else {}
             orth_grad = newton_schulz_tp(
                 grad,
                 steps=num_ns_steps,
@@ -204,6 +231,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 tp_group=tp_group,
                 partition_dim=partition_dim,
                 tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
+                **ns_kwargs,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
@@ -230,11 +258,98 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
+    @staticmethod
+    def _all_gather_tensor(t, group, dim):
+        """All-gather equal-size shards of ``t`` over ``group`` and concat along ``dim``."""
+        shards = [torch.empty_like(t) for _ in range(get_pg_size(group))]
+        torch.distributed.all_gather(shards, t.contiguous(), group)
+        return torch.cat(shards, dim=dim)
+
+    def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
+        """Orthogonalize a (possibly GTP-sharded) momentum, then reshard.
+
+        When GTP is inactive this is a plain passthrough to ``scaled_orthogonalize_fn``.
+        Otherwise, ``self.tp_mode`` controls how GTP sharding is handled:
+
+        - **blockwise**: orthogonalize the local GTP shard independently, no collective.
+        - **duplicated**: all-gather over GTP, run whole-matrix NS (TP-aware), reshard.
+        - **distributed**: distribute NS over GTP via small-Gram all-reduce. When both
+          GTP and TP are active, NS is distributed over the larger group to minimize
+          redundant compute; the smaller group is all-gathered beforehand.
+        """
+        # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
+        is_expert = getattr(p, 'expert_tp', False)
+        gtp_remat_group = (
+            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
+            if self.pg_collection
+            else None
+        )
+
+        if gtp_remat_group is None or get_pg_size(gtp_remat_group) <= 1:
+            return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+
+        # Parameters with is_gtp_weight_remat=False are not sharded along the
+        # GTP process group, and do not require all-gathering prior to
+        # orthogonalization.
+        if not getattr(p, 'is_gtp_weight_remat', False):
+            return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+
+        gtp_remat_size = get_pg_size(gtp_remat_group)
+
+        if self.tp_mode == "blockwise":
+            # Local block NS on this rank's GTP row-shard (shape [M/gtp_remat_size, K]):
+            # partition_dim=None makes scaled_orthogonalize_fn run a plain Newton-Schulz on
+            # the shard with no GTP/TP collective.
+            return self.scaled_orthogonalize_fn(grad, tp_group, None)
+
+        if self.tp_mode == "duplicated":
+            # All-gather the full matrix over GTP (dim 0), orthogonalize the whole tensor
+            # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
+            gathered_grad = self._all_gather_tensor(grad, gtp_remat_group, 0)
+            gathered_grad = self.scaled_orthogonalize_fn(gathered_grad, tp_group, partition_dim)
+            shard_size = gathered_grad.size(0) // gtp_remat_size
+            gtp_rank = get_pg_rank(gtp_remat_group)
+            return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
+
+        # distributed: NS via the small-Gram all-reduce (no redundant full-matrix NS).
+        # A momentum with both TP and GTP as sharding axes takes two communication steps: an
+        # all-gather that eliminates one axis, then the Gram all-reduce that distributes NS over
+        # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
+        # communication needed. partition_dim is what says whether TP is a sharding axis here,
+        # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
+        needs_two_step_communication = (
+            partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
+        )
+
+        if not needs_two_step_communication:
+            # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
+            return self.scaled_orthogonalize_fn(grad, gtp_remat_group, partition_dim=0)
+
+        # GTP + TP: distributed NS can only operate over one (group, dim) at a
+        # time. Distribute over the larger group so that the NS GEMMs are sharded
+        # across more ranks (less redundant compute), and all-gather the smaller
+        # group to eliminate its sharding beforehand.
+        tp_size = get_pg_size(tp_group)
+        if gtp_remat_size >= tp_size:
+            smaller_group, smaller_dim = tp_group, partition_dim
+            larger_group, larger_dim = gtp_remat_group, 0
+        else:
+            smaller_group, smaller_dim = gtp_remat_group, 0
+            larger_group, larger_dim = tp_group, partition_dim
+
+        gathered_grad = self._all_gather_tensor(grad, smaller_group, smaller_dim)
+        orthogonalized_grad = self.scaled_orthogonalize_fn(gathered_grad, larger_group, larger_dim)
+        shard_size = orthogonalized_grad.size(smaller_dim) // get_pg_size(smaller_group)
+        reshard_rank = get_pg_rank(smaller_group)
+        return orthogonalized_grad.narrow(
+            smaller_dim, reshard_rank * shard_size, shard_size
+        ).contiguous()
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
         Args:
-            p: The parameter tensor. i is necessary to pass param tensor in addition to
+            p: The parameter tensor. It is necessary to pass param tensor in addition to
                 momentum because a lot of information is only available in the param tensor,
                 attributes for example.
             grad: The momentum tensor.
@@ -280,14 +395,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
 
             qkv_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                self.scaled_orthogonalize_fn_with_gtp_remat(p, g, tp_group, partition_dim).view(
                     num_query_groups, -1, grad_shape[-1]
                 )
                 for g in qkv_grads
             ]
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
         else:
-            grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+            grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
         return grad
 
 
@@ -317,6 +432,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: The additional scale factor to use for the update.
         pg_collection: Process group collection for distributed training.
         tp_mode: Tensor parallel mode ("blockwise", "duplicated", or "distributed").
+        use_syrk: Whether to use the Triton SYRK kernel for the Gram matrix in
+            Newton-Schulz. Requires emerging_optimizers >= 0.4.0.
         moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
         beta2: The exponential decay rate for second moment.
         eps: Small constant for numerical stability.
@@ -340,6 +457,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -362,6 +480,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
             tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
@@ -433,11 +552,9 @@ _EMERGING_OPTIMIZERS.update(
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_muon_config_to_kwargs,
             default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
+                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
+                    'optimizer': 'adam'
+                }
             },
         ),
         "adaptive_muon": EmergingOptimizerEntry(
@@ -445,11 +562,9 @@ _EMERGING_OPTIMIZERS.update(
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_adaptive_muon_config_to_kwargs,
             default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
+                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
+                    'optimizer': 'adam'
+                }
             },
         ),
     }

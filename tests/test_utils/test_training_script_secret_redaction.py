@@ -38,8 +38,7 @@ def test_training_wrappers_redact_sensitive_arguments_from_output():
 
 def test_run_training_redacts_sensitive_values_from_model_config(tmp_path):
     fake_yq = tmp_path / "yq"
-    fake_yq.write_text(
-        """#!/bin/bash
+    fake_yq.write_text("""#!/bin/bash
 if [[ "$1" == *".ENV_VARS"* ]]; then
     printf 'WANDB_API_KEY=%s\\nCI_JOB_TOKEN=%s\\nINTERNAL_API_URL=%s\\nVISIBLE_ENV=visible-value\\n' \
         "$TEST_KEY_VALUE" "$TEST_TOKEN_VALUE" "$TEST_API_VALUE"
@@ -48,8 +47,7 @@ elif [[ "$1" == ".BEFORE_SCRIPT" ]]; then
 else
     printf 'null\\n'
 fi
-"""
-    )
+""")
     fake_yq.chmod(0o755)
 
     script = tmp_path / "run_training.sh"

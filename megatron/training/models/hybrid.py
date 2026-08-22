@@ -4,11 +4,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Literal, override
 
+import torch
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
+    hybrid_inference_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -17,7 +19,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
+from megatron.training.models.base import (
+    ModelBuilder,
+    ModelConfig,
+    compose_hooks,
+)
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -46,6 +52,7 @@ class HybridModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     hybrid_attention_ratio: float = 0.0
@@ -82,9 +89,7 @@ class HybridModelConfig(ModelConfig):
             raise AttributeError(f"HybridModelConfig has no attribute '{name}'")
         if hasattr(transformer, name):
             return getattr(transformer, name)
-        raise AttributeError(
-            f"Neither HybridModelConfig nor TransformerConfig has any attribute '{name}'."
-        )
+        raise AttributeError(f"Neither HybridModelConfig nor TransformerConfig has any attribute '{name}'.")
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
@@ -152,14 +157,13 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                 hybrid_stack_spec = hybrid_inference_stack_spec
             elif self._model_config.restore_modelopt_state:
                 hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-                    local_core_attention=False, remap_te_layernorm=False
+                    local_core_attention=False,
+                    remap_te_layernorm=False,
                 )
             else:
                 hybrid_stack_spec = default_hybrid_stack_spec
 
-        assert (
-            self._model_config.vocab_size is not None
-        ), "vocab_size must be configured before calling build_model()"
+        assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:
             padded_vocab_size = calculate_padded_vocab_size(
                 self._model_config.vocab_size,
@@ -169,12 +173,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        pre_process = (
-            pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
-        )
-        post_process = (
-            post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
-        )
+        pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
+        post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
         return HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -182,6 +182,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,
@@ -203,11 +204,10 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = False,
-        mixed_precision_wrapper: (
-            Callable[[Any, MegatronModule], MegatronModule] | None
-        ) = Float16Module,
+        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool = True,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -222,8 +222,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
-            use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
-                parameters for the layer-wise distributed optimizer.
+            use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+                controls whether to compute and supply a shard-aligned param layout to DDP.
 
         Returns:
             List of model stages.
@@ -244,6 +245,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

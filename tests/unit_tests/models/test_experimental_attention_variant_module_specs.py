@@ -110,7 +110,14 @@ class TestIsLinearAttentionVariant:
 
     @pytest.mark.parametrize(
         "variant, expected",
-        [("gated_delta_net", True), ("dsa", False), (None, False), ("some_unknown_variant", False)],
+        [
+            ("gdn", True),
+            ("gdn2", True),
+            ("gated_delta_net", True),
+            ("dsa", False),
+            (None, False),
+            ("some_unknown_variant", False),
+        ],
     )
     def test_variants(self, variant, expected):
         """Validate linear-attention variant classification across supported and unsupported names."""
@@ -416,6 +423,8 @@ class TestGetExperimentalAttentionVariantModuleSpec:
     @pytest.mark.parametrize(
         "variant, target_fn",
         [
+            ("gdn", "get_gated_delta_net_module_spec"),
+            ("gdn2", "get_gated_delta_net_module_spec"),
             ("gated_delta_net", "get_gated_delta_net_module_spec"),
             ("dsa", "get_dsa_module_spec_for_backend"),
             ("dsv4_hybrid", "get_dsv4_hybrid_module_spec_for_backend"),

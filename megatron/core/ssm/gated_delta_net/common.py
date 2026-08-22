@@ -1,16 +1,20 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pylint: disable=unused-import
+
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Protocol, Union
+from typing import Callable, Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -34,39 +38,22 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
-    build_cp_context = None
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
 
-__all__ = [
-    "HAVE_FLA",
-    "GatedDeltaNetSubmodules",
-    "_GDNBase",
-    "_build_head_perm_for_split_sections",
-    "_build_thd_cp_a2a_perm",
-    "_split_tensor_factory",
-    "a2a_cp_to_hp",
-    "a2a_hp_to_cp",
-    "build_cp_context",
-    "causal_conv1d",
-    "chunk_gated_delta_rule",
-    "get_parameter_local_cp",
-    "l2norm",
-    "tensor_a2a_cp2hp",
-    "tensor_a2a_hp2cp",
-]
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,7 +69,10 @@ class GatedDeltaNetSubmodules:
 
 class GatedDeltaRuleInterface(Protocol):
     """
-    Unified typing protocol for GDN core computation interfaces.
+    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
+
+    Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
+    variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
     """
 
     def __call__(
@@ -91,7 +81,6 @@ class GatedDeltaRuleInterface(Protocol):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        beta: torch.Tensor,
         *,
         scale: float | None = None,
         initial_state: torch.Tensor | None = None,
@@ -103,15 +92,16 @@ class GatedDeltaRuleInterface(Protocol):
 
 
 class _GDNBase(MegatronModule):
-    """Shared implementation for the Gated Delta Net (GDN) layer.
+    """Common base class for the Gated Delta Net (GDN) family of layers.
 
-    Hosts the fused input projection, causal convolution on q/k/v, CP all-to-all
-    plumbing, kernel-input preparation, gated output norm + projection, and
-    sharded checkpointing.
+    Hosts everything the GDN variants share: the fused input projection, causal
+    convolution on q/k/v, the CP all-to-all plumbing, the kernel-input preparation
+    skeleton, the gated output norm + projection, and sharded checkpointing.
     """
 
     dt_bias_dim: int
     a_log_dim: int
+    in_proj_qkvg_dim: int
     in_proj_extra_dim: int
     in_proj_dim: int
 
@@ -134,8 +124,7 @@ class _GDNBase(MegatronModule):
         *,
         name: str | None = None,
         cp_comm_type: str | None = None,
-        pp_layer_offset: Optional[int] = None,
-        is_mtp_layer: bool = False,
+        pp_layer_offset: int = 0,
     ):
         """
         Args:
@@ -149,13 +138,11 @@ class _GDNBase(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
-            name (str | None): Optional module path prefix used for child module names.
+            name (str | None): module instance name passed top-down from its paranet module
             cp_comm_type (Optional[str]): Accepted for TransformerLayer compatibility and
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
-            pp_layer_offset (Optional[int]): Pipeline layer offset forwarded by
-                TransformerLayer. Stored for MTP/TransformerLayer API compatibility.
-            is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
+            pp_layer_offset: Offset of this pipeline stage's first global layer.
         """
         if not HAVE_FLA:
             raise ImportError(
@@ -167,8 +154,7 @@ class _GDNBase(MegatronModule):
 
         # Attributes from arguments
         self.layer_number = layer_number
-        self._pp_layer_offset = pp_layer_offset
-        self.is_mtp_layer = is_mtp_layer
+        self.pp_layer_offset = pp_layer_offset
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -178,8 +164,6 @@ class _GDNBase(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
-        # Static/max CP size from model construction. Runtime dynamic CP paths must resolve
-        # the effective group from packed_seq_params instead of using this value.
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
@@ -199,22 +183,8 @@ class _GDNBase(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
-        # Headwise CP shards heads over the CP group; chunkwise CP keeps heads local.
-        if self.config.linear_cp_mode == "headwise":
-            num_key_heads_per_tp = self.num_key_heads // self.tp_size
-            num_value_heads_per_tp = self.num_value_heads // self.tp_size
-            assert num_key_heads_per_tp % self.cp_size == 0, (
-                f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
-                f"to evenly divide num_key_heads per TP rank ({num_key_heads_per_tp}); "
-                f"all runtime dynamic cp_size values divide the static one and so will also divide."
-            )
-            assert num_value_heads_per_tp % self.cp_size == 0, (
-                f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
-                f"to evenly divide num_value_heads per TP rank ({num_value_heads_per_tp}); "
-                f"all runtime dynamic cp_size values divide the static one and so will also divide."
-            )
-
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
+        self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
         attrs_to_check = (
             "dt_bias_dim",
@@ -222,14 +192,15 @@ class _GDNBase(MegatronModule):
             "in_proj_extra_dim",
             "in_proj_split_names",
             "in_proj_split_sections",
+            "feat_dim_split",
             "gated_delta_rule",
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
-            assert hasattr(self, attr), f"Attribute {attr} for GDN is not set"
-            assert getattr(self, attr) is not None, f"Attribute {attr} for GDN is not set"
-        # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+            assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
+        # QK, V, gate, shared across all variants
+        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -297,10 +268,8 @@ class _GDNBase(MegatronModule):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
-        self.recompute_gdn = False
-        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
+        if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
-            self.recompute_gdn = "gdn" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -316,20 +285,17 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
-        # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
-        # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
-        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
 
     def _setup_variant_attrs(self):
-        """Set GDN projection sections, gate parameter sizes, and kernel callable.
+        """Set variant specifics on the module. Called once from ``__init__``.
 
         Must set:
-        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the base
-          class derives ``in_proj_dim`` from it)
+        - ``in_proj_dim``
         - ``in_proj_split_names``
         - ``in_proj_split_sections``
+        - ``feat_dim_split``
         - ``dt_bias_dim`` / ``a_log_dim`` (sizes of the gate parameters, which the
           base class creates after the conv1d module to preserve the original
           parameter registration order)
@@ -340,8 +306,8 @@ class _GDNBase(MegatronModule):
     def _reset_dt_bias(self):
         """Initialize ``dt_bias``. Called from ``reset_parameters`` under the RNG tracker.
 
-        Defaults to ones; subclasses can override this if their kernel expects a
-        different step-size parametrization.
+        Defaults to ones; variants whose kernel expects a different step-size
+        parametrization override this.
         """
         torch.ones(
             self.dt_bias_dim,
@@ -378,6 +344,29 @@ class _GDNBase(MegatronModule):
         # pylint: disable=missing-function-docstring
         raise NotImplementedError
 
+    def _gated_norm_and_a2a(
+        self,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
+        thd_cp_a2a_inv: torch.Tensor | None,
+        batch: int,
+        seq_len: int,
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> torch.Tensor:
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
+
+        return a2a_hp_to_cp(
+            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
+        )
+
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
         # Output Norm
@@ -400,25 +389,24 @@ class _GDNBase(MegatronModule):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
-        cp_size_headwise: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
 
         Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
-        contiguous operations. ``gate_feats`` holds the in_proj sections after qkv
-        and gate, which ``_compute_gates`` turns into the decay and gating tensors.
+        contiguous operations. ``gate_feats`` holds the variant-specific in_proj
+        sections, which ``_compute_gates`` turns into the decay and gating tensors.
 
         Returns:
             (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
-            ``k``, ``v``, ``g``, and ``beta``), and the output
+            ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
-        cp_size = 1 if cp_size_headwise is None else cp_size_headwise
-
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
+            qkv,
+            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            dim=-1,
         )
 
         # Reshape query_key and value
@@ -430,7 +418,7 @@ class _GDNBase(MegatronModule):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
@@ -462,18 +450,19 @@ class _GDNBase(MegatronModule):
         *gate_feats: tuple[torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        Compute the log-decay ``g`` and remaining kernel inputs.
+        Compute the log-decay ``g`` and the variant-specific kernel inputs.
 
         Args:
             A_log_local_cp: CP-local slice of ``A_log``.
             dt_bias_local_cp: CP-local slice of ``dt_bias``.
             batch: Batch size.
             seq_len: Sequence length.
-            gate_feats: The in_proj output sections after the qkv and output-gate sections.
+            gate_feats: The variant-specific in_proj output sections (everything after
+                the qkv and output-gate sections, in ``feat_dim_split`` order).
 
         Returns:
             (tuple[Tensor, dict[str, Tensor]]): The log-decay ``g`` and a dict of the
-            remaining kernel inputs keyed by kernel argument name.
+            remaining variant-specific kernel inputs keyed by kernel argument name.
         """
         raise NotImplementedError
 
@@ -658,7 +647,7 @@ def _build_head_perm_for_split_sections(
 def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
-    cp_group: torch.distributed.ProcessGroup | None,
+    cp_group: torch.distributed.ProcessGroup,
     split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
@@ -676,14 +665,12 @@ def get_parameter_local_cp(
         torch.Tensor: The local parameter for the current context parallel rank.
     """
 
-    cp_size = cp_group.size() if cp_group is not None else 1
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
 
     # No need to split if CP size is 1.
     if cp_size == 1:
         return param
-
-    assert cp_group is not None
-    cp_rank = cp_group.rank()
 
     # Split first if needed.
     if split_sections is not None:
@@ -706,7 +693,7 @@ def tensor_a2a_cp2hp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup | None,
+    cp_group: torch.distributed.ProcessGroup,
     split_sections: Optional[list[int]] = None,
     undo_attention_load_balancing: bool = True,
 ):
@@ -727,13 +714,11 @@ def tensor_a2a_cp2hp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size() if cp_group is not None else 1
+    cp_size = cp_group.size()
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
-
-    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_cp2hp.
     assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
@@ -771,7 +756,7 @@ def tensor_a2a_hp2cp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup | None,
+    cp_group: torch.distributed.ProcessGroup,
     split_sections: Optional[list[int]] = None,
     redo_attention_load_balancing: bool = True,
 ):
@@ -792,13 +777,11 @@ def tensor_a2a_hp2cp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size() if cp_group is not None else 1
+    cp_size = cp_group.size()
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
-
-    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
     assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"

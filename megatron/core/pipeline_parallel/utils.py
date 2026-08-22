@@ -1,8 +1,8 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 import torch
@@ -17,7 +17,44 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+try:
+    from transformer_engine.pytorch.ep import is_symm_backed
+except ImportError:
+    is_symm_backed = None
+
 logger = logging.getLogger(__name__)
+
+
+class StageDispatchBwdGrad(torch.autograd.Function):
+    """1F1B + NCCL-EP zero-copy only: redirect the dispatch-backward grad into the persistent
+    symm buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the 1F1B overlap schedule the dispatch output is consumed by the next node, which
+    detaches it into a leaf; autograd therefore hands ``dispatch_bwd`` a non-symm
+    ``AccumulateGrad`` clone. Applying this identity node to the dispatch output — while it is
+    still inside the dispatch node's own graph segment — makes it the sole consumer, moving that
+    accumulation to *our* output; the backward then does a single plain->symm copy into the
+    dispatcher's ``_zc_bwd_token_buf``. That buffer is free to stage into precisely because
+    ``get_expert_zero_copy_buffers`` withholds it from the op-fuser under overlap.
+    Forward is identity (no numeric effect).
+    """
+
+    @staticmethod
+    def forward(ctx, dispatched_tokens, token_dispatcher):  # type: ignore[override]
+        """Identity forward; stashes the dispatcher so backward can reach its symm buffer."""
+        ctx.token_dispatcher = token_dispatcher
+        return dispatched_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
+        buf = ctx.token_dispatcher._comm_manager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        buf.copy_(grad)
+        return buf, None
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -156,8 +193,7 @@ class ScheduleNode:
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
-        forward_nvtx_name: Optional[str] = None,
-        backward_nvtx_name: Optional[str] = None,
+        ncclep_zero_copy: bool = False,
     ):
         """Initialize a schedule node.
 
@@ -175,22 +211,16 @@ class ScheduleNode:
             free_input (bool): Flag to indicate if the input should be freed after the
                 forward pass.
             name (str): Name of the node for debugging purposes.
-            forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
-            backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
         """
         self.name = name
-        self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
-        self.backward_nvtx_name = backward_nvtx_name or f"{name} backward"
         self.forward_func = forward_func
         self.backward_func = backward_func if backward_func else self.default_backward_func
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
         self.outputs = None
-        # When True, the forward runs under torch.no_grad() so no autograd graph is
-        # retained; the layer-level full recompute path replays it with grad at backward.
-        self.forward_no_grad = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -215,21 +245,16 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.forward_nvtx_name):
+        with self.stream_acquire_context(f"{self.name} forward"):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
                     input.requires_grad = inputs[i].requires_grad
 
             data = tuple(self.inputs)
-            # Full recompute: skip the graph now, rebuild it by re-running at backward.
-            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
-            with grad_ctx:
-                data = self.forward_func(*data)
+            data = self.forward_func(*data)
 
-            if data is None:
-                pass
-            elif not isinstance(data, tuple):
+            if not isinstance(data, tuple):
                 data = make_viewless(data)
             else:
                 data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
@@ -242,7 +267,13 @@ class ScheduleNode:
             for input in inputs:
                 if input is not None:
                     input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+                    # Skip symmetric-memory (zero-copy EP) buffers
+                    if not (
+                        self.ncclep_zero_copy
+                        and is_symm_backed is not None
+                        and is_symm_backed(input)
+                    ):
+                        input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -260,7 +291,7 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.backward_nvtx_name):
+        with self.stream_acquire_context(f"{self.name} backward"):
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)

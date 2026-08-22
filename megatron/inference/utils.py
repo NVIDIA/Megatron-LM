@@ -12,7 +12,10 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+from megatron.core.inference.quantization.utils import (
+    quantize_model_to_mxfp8,
+    resolve_mxfp8_backend,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -87,7 +90,9 @@ def get_model_for_inference() -> MegatronModule:
     else:
         builder = get_model_builder(args)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
+        model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
 
     # Load checkpoint.
     assert args.load is not None
@@ -107,13 +112,7 @@ def get_model_for_inference() -> MegatronModule:
     model.eval()
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
-        backend = args.inference_grouped_gemm_backend
-        if backend == "auto" or backend == "torch":
-            quant_backend = "triton"
-        elif backend == "te":
-            raise ValueError(
-                "MXFP8 quantization is not supported with " "inference_grouped_gemm_backend='te'."
-            )
+        quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
         quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
 
@@ -318,7 +317,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of decode steps to trace (inference). Default is unlimited. "
-        "Training uses --moe-routing-trace-max-training-iters instead.",
+             "Training uses --moe-routing-trace-max-training-iters instead.",
     )
 
     return parser

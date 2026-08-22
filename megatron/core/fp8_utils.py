@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
@@ -226,6 +226,46 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
     dst.copy_(src.view(dst.shape))
 
 
+def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+    """List form of :func:`copy_tensor_to_quantized_param`, for a whole bucket of params.
+
+    Same values, minus the per-param ``copy_`` and tensor-subclass dispatch: the quantizer is
+    resolved up front and called directly. Cast kernels are unchanged, one per param. Worth it
+    because those casts are small and issuing them is expensive, and under
+    --reuse-grad-buf-for-mxfp8-param-ag they run inside the forward pass.
+
+    Args:
+        params: quantized model params to write into.
+        srcs: high-precision source values, one per param, in the same order.
+    """
+    if len(params) == 0:
+        return
+
+    srcs_to_cast = []
+    dsts_to_cast = []
+    quantizers = []
+    for param, src in zip(params, srcs):
+        dst = _unwrap_parameter_data(param)
+        quantizer = (
+            None
+            if is_grouped_tensor_with_quantized_storage(dst)
+            else getattr(dst, "_quantizer", None)
+        )
+        if quantizer is None:
+            # Grouped storage quantizes per member; a missing quantizer has to be built. Both
+            # cases are handled by the single-param path.
+            copy_tensor_to_quantized_param(param, src)
+            continue
+        srcs_to_cast.append(src.view(dst.shape))
+        dsts_to_cast.append(dst)
+        quantizers.append(quantizer)
+
+    # Equivalent to dst.copy_(src), but entered directly instead of via the aten::copy_ op,
+    # QuantizedTensor.__torch_dispatch__ (type and usage checks) and dst.quantize_(src).
+    for src, quantizer, dst in zip(srcs_to_cast, quantizers, dsts_to_cast):
+        quantizer.update_quantized(src, dst)
+
+
 def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:
     """Replace a high-precision Transformer Engine GroupedTensor's rowwise storage."""
     tensor = _unwrap_parameter_data(tensor)
@@ -268,31 +308,6 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.from_float8()
 
 
-def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
-    """Requantize a gathered bf16 whole-param into an fp8 (Float8/MXFP8) model param in place.
-
-    mxfp8 columnwise can't be derived from rowwise, so force columnwise before copy_ (TE rebuilds
-    both directions from the bf16); blockwise/Float8 columnwise is a lossless transpose.
-    """
-    if is_mxfp8tensor(model_p):
-        quantizer = model_p.data._get_quantizer()
-        quantizer.set_usage(rowwise=True, columnwise=True)
-    model_p.data.copy_(src_bf16)
-
-
-def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
-    """Stage a param to a detached bf16 whole-param for fp8 param-gather transport.
-
-    Prefer the fp32 master (high-precision source); else dequantize an fp8 param; else copy bf16.
-    """
-    main_param = getattr(p, "main_param", None)
-    if main_param is not None:
-        return main_param.detach().to(torch.bfloat16)
-    if is_float8tensor(p):
-        return dequantize_fp8_tensor(p).detach().to(torch.bfloat16)
-    return p.detach().to(torch.bfloat16)
-
-
 def _resolve_callable_from_python_import_path(dotted_path: str):
     """Resolve a Python import path like 'pkg.mod.func' to a callable.
 
@@ -332,11 +347,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
+        raise ValueError("""CustomRecipe recipe is not available in this version of 
             Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 
@@ -796,6 +809,26 @@ if HAVE_TE:
             )
         return fp8_recipe
 
+    def get_fp8_recipe_for_a2a(a2a_dtype: str):
+        """Return the fp8 recipe for quantizing an MoE dispatch/combine (a2a) payload over
+        the wire, or None for a high-precision wire.
+
+        Dedicated helper rather than get_fp8_recipe: the wire payload is E4M3
+        activations/activation-grads in both directions, independent of the compute recipe
+        (whose format selection and compute-only knobs like fp8_dpa do not apply to a
+        communication payload).
+
+        Arguments:
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+        """
+        if a2a_dtype == 'bf16':
+            return None
+        if a2a_dtype == 'mxfp8':
+            return transformer_engine.common.recipe.MXFP8BlockScaling(
+                fp8_format=transformer_engine.common.recipe.Format.E4M3
+            )
+        raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
+
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return fp8 context manager.
 
@@ -857,20 +890,19 @@ if HAVE_TE:
         return fp8_context
 
     def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
-        """Return a context manager that forces high-precision execution.
+        """Return a context manager that disables TE quantization.
 
-        Use this around the construction or forward pass of submodules that must stay in
-        high precision (BF16/FP32) while the enclosing layer is built or run under an
-        FP8/FP4 quantization context (e.g. the DeepSeek V4 CSA compressor and indexer).
+        Use this around submodule construction or execution that must stay in a higher
+        precision while its enclosing module uses an FP8 or FP4 context.
 
-        Arguments:
-            config (TransformerConfig): Configuration object.
-            is_init (bool): Whether the context is used for module initialization
-                (overrides fp8_model_init) or for the forward pass (overrides fp8_autocast).
+        Args:
+            config: Transformer configuration that controls quantization.
+            is_init: Whether to disable the parameter-initialization context instead of
+                the forward autocast context.
 
         Returns:
-            A context manager that disables any enclosing TE quantization context, or
-            nullcontext() when no quantization is configured.
+            A disabled TE quantization context when quantization is active, otherwise a
+            no-op context.
         """
         if is_init:
             if not (config.fp8_param or config.fp4_param):
@@ -886,12 +918,20 @@ else:
         """Returns None since TE is not available."""
         return None
 
+    def get_fp8_recipe_for_a2a(a2a_dtype: str):
+        """Raises for a quantized wire dtype since TE is not available."""
+        if a2a_dtype == 'bf16':
+            return None
+        raise RuntimeError(
+            f"a2a wire dtype {a2a_dtype!r} requires TransformerEngine, which is not available."
+        )
+
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""
         return nullcontext()
 
     def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
-        """Returns dummy context manager since TE is not available."""
+        """Return a no-op context manager since TE is not available."""
         return nullcontext()
 
 

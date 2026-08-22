@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Optional
 from unittest.mock import MagicMock
@@ -52,17 +52,12 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
     if token_idx == -1:
         token_idx = tl.full((), 0, dtype=tl.int64)
     if cp_size > 1:
-        first_cp_seg = (this_seq_len + 1) // 2
-        second_cp_seg = this_seq_len // 2
-        if token_idx < first_cp_seg:
-            token_idx = token_idx + cp_rank * first_cp_seg
+        if token_idx < this_seq_len // 2:
+            token_idx = token_idx + cp_rank * this_seq_len // 2
         else:
-            token_idx = (
-                token_idx
-                - first_cp_seg
-                + cp_size * first_cp_seg
-                + (cp_size - cp_rank - 1) * second_cp_seg
-            )
+            token_idx = (token_idx - this_seq_len // 2) + (
+                2 * cp_size - cp_rank - 1
+            ) * this_seq_len // 2
     return token_idx
 
 
@@ -418,7 +413,7 @@ def fused_mla_rope_inplace(
     inverse: bool = False,
     remove_interleaving: bool = False,
     position_ids: Optional[torch.Tensor] = None,
-):
+) -> torch.Tensor:
     """
     Fused RoPE applied inplace to the trailing emb_dim elements of a tensor,
     leaving the first nope_dim elements unchanged.
@@ -473,6 +468,7 @@ def fused_mla_rope_out_of_place(
     rotary_interleaved: bool = False,
     inverse: bool = False,
     remove_interleaving: bool = False,
+    position_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Apply the fused RoPE kernel without modifying the input tensor.
 
@@ -492,6 +488,7 @@ def fused_mla_rope_out_of_place(
         rotary_interleaved=rotary_interleaved,
         inverse=inverse,
         remove_interleaving=remove_interleaving,
+        position_ids=position_ids,
     )
 
 
@@ -900,7 +897,7 @@ def fused_mla_rope_kv_split(
     cp_size: int = 1,
     rotary_interleaved: bool = False,
     remove_interleaving: bool = False,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused function for applying RoPE to MLA's key and value.
     It splits the input tensor kv into key and value,
@@ -940,8 +937,60 @@ def fused_mla_rope_kv_split(
     )
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatible aliases (deprecated, prefer the new names above)
-# ---------------------------------------------------------------------------
-fused_apply_mla_rope_for_q = fused_mla_rope_inplace
-fused_apply_mla_rope_for_kv = fused_mla_rope_kv_split
+def fused_apply_mla_rope_for_q(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    qk_head_dim: int,
+    emb_dim: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+) -> torch.Tensor:
+    """Backward-compatible in-place MLA query RoPE API.
+
+    New callers should choose :func:`fused_mla_rope_inplace` or
+    :func:`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
+    its original mutation behavior and does not add a clone to the hot path.
+    """
+    return fused_mla_rope_inplace(
+        t,
+        cos,
+        sin,
+        qk_head_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens_q,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+    )
+
+
+def fused_apply_mla_rope_for_kv(
+    kv: torch.Tensor,
+    k_pos_emb: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    emb_dim: int,
+    k_dim: int,
+    v_dim: int,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compatible name for the MLA key/value split RoPE API."""
+    return fused_mla_rope_kv_split(
+        kv,
+        k_pos_emb,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        cu_seqlens_kv=cu_seqlens_kv,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+    )
