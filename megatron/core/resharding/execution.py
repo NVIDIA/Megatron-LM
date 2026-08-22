@@ -89,6 +89,8 @@ def execute_reshard_plan(
     transform's prepare_send / prepare_recv / finalize_recv methods instead
     of the default slice-and-copy logic.
     """
+    service.set_plan(plan, transform=transform)
+
     # Extract parameters and persistent buffers from models if present.
     # Persistent buffers carry training state (e.g. MoE router expert_bias)
     # and must be refit alongside parameters.  Cached on each module so the
