@@ -41,6 +41,27 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.internal
+def test_vlm_wrapper_builds_preexpanded_media_token_mask():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace(image_token_index=99)
+
+    mask = wrapper.build_preexpanded_media_token_mask(
+        torch.tensor([10, 99, 99, 20]), "image"
+    )
+
+    assert mask.tolist() == [-1, 0, 1, -1]
+
+
+@pytest.mark.internal
+def test_vlm_wrapper_preexpanded_mask_requires_model_token_id():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="does not define a model token id"):
+        wrapper.build_preexpanded_media_token_mask(torch.tensor([10, 20]), "image")
+
+
+@pytest.mark.internal
 def test_dynamic_video_embedding_counts_support_video_and_tubelet_markers():
     frame_counts = dynamic_media_embedding_counts(
         torch.tensor([[448, 576]] * 4),

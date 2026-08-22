@@ -16,7 +16,9 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
+    resolve_multimodal_data_for_engine,
     serialize_ndarray,
+    serialize_multimodal_data,
     serialize_tensor,
     unwrap_serialized_tensors,
 )
@@ -55,6 +57,37 @@ def test_serialization_helpers_round_trip():
     assert out["a"] == [1, 2, 3]
     assert out["b"] == "plain"
     assert out["c"] == ("ndarray", {"data": [], "dtype": "int32"})
+
+
+def test_preexpanded_multimodal_request_round_trip():
+    media = {
+        "image": {
+            "imgs": torch.ones(1, 2, 4),
+            "imgs_sizes": torch.tensor([[2, 2]]),
+        },
+        "media_tokens_preexpanded": True,
+    }
+
+    wire = serialize_multimodal_data(media)
+    assert wire["media_tokens_preexpanded"] is True
+
+    resolved = resolve_multimodal_data_for_engine(wire)
+    assert resolved["media_tokens_preexpanded"] is True
+    assert torch.equal(resolved["imgs"], media["image"]["imgs"])
+    assert torch.equal(resolved["imgs_sizes"], media["image"]["imgs_sizes"])
+
+
+def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
+    wire = serialize_multimodal_data(
+        {
+            "image": {
+                "imgs": torch.ones(1, 2, 4),
+                "imgs_sizes": torch.tensor([[2, 2]]),
+            }
+        }
+    )
+    assert "media_tokens_preexpanded" not in wire
+    assert "media_tokens_preexpanded" not in resolve_multimodal_data_for_engine(wire)
 
 
 def test_compute_block_hashes_batched():

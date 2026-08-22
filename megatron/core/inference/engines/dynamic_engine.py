@@ -1409,6 +1409,7 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
         media_cache_key: Optional[str] = None,
+        media_tokens_preexpanded: bool = False,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1418,7 +1419,7 @@ class DynamicInferenceEngine(AbstractEngine):
         resolution or imgs_sizes for dynamic resolution.
 
         When multimodal kwargs are provided the method will:
-        1. Expand image tokens in the prompt (replace <image> with padding).
+        1. Expand compact media tokens, or derive a mask from pre-expanded tokens.
         2. Run the vision encoder to produce image embeddings.
         3. Store the embeddings and mask in the context for later use by the
            controller's forward step.
@@ -1441,6 +1442,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_frames (Optional[Tensor]): Number of frames per image/video item.
             media_cache_key (Optional[str]): Stable identity for the exact
                 preprocessed media. Equal keys reuse projected vision embeddings.
+            media_tokens_preexpanded (bool): Whether prompt token IDs already contain
+                one model token per projected media embedding.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1493,6 +1496,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 precomputed_block_hashes=precomputed_block_hashes,
                 num_frames=num_frames,
                 media_cache_key=media_cache_key,
+                media_tokens_preexpanded=media_tokens_preexpanded,
             )
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
@@ -1547,9 +1551,10 @@ class DynamicInferenceEngine(AbstractEngine):
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
         media_cache_key: Optional[str] = None,
+        media_tokens_preexpanded: bool = False,
     ) -> DynamicVLMInferenceRequest:
-        """Expand image tokens, run the vision encoder, register per-request
-        image data on the context, and return a DynamicVLMInferenceRequest.
+        """Prepare media tokens, run the vision encoder, register per-request
+        media data on the context, and return a DynamicVLMInferenceRequest.
         """
         # PP>1 needs a non-first-stage embedding recv path (the wrapper's
         # _recv_only_vision_embeds TODO). Until that lands, only PP=1 is
@@ -1592,40 +1597,45 @@ class DynamicInferenceEngine(AbstractEngine):
         compact_prompt_tokens: Optional[Tensor] = None
 
         if has_images:
-            compact_prompt_tokens = tokens.clone()
-            token_list: List[List[int]] = [tokens.tolist()]
-            expansion_kwargs = {
-                "num_tiles": num_tiles,
-                "imgs_sizes": imgs_sizes,
-            }
-            if num_frames is not None:
-                expansion_kwargs["num_frames"] = num_frames
-            expanded_tokens_list, mask_list = (
-                self.controller.inference_wrapped_model.expand_image_tokens(
-                    token_list, **expansion_kwargs
+            if media_tokens_preexpanded:
+                modality = "video" if num_frames is not None else "image"
+                mask_tensor = (
+                    self.controller.inference_wrapped_model.build_preexpanded_media_token_mask(
+                        tokens, modality
+                    )
                 )
-            )
-            # expand_image_tokens pads the embedding slots with -1, but the mask
-            # below is what splices the embeddings in, so keep a real token id in
-            # prompt_tokens where the model has one: they are echoed to HTTP
-            # clients, detokenized for raw_text and hashed for prefix caching, and
-            # none of those accept a negative id.
-            expanded_tokens = expanded_tokens_list[0]
-            image_token_id = self._resolve_image_token_id()
-            if image_token_id is not None:
-                expanded_tokens = [
-                    image_token_id if token < 0 else token for token in expanded_tokens
-                ]
-            tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
-            mask_tensor = torch.tensor(
-                [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
-            )
+            else:
+                compact_prompt_tokens = tokens.clone()
+                token_list: List[List[int]] = [tokens.tolist()]
+                expansion_kwargs = {
+                    "num_tiles": num_tiles,
+                    "imgs_sizes": imgs_sizes,
+                }
+                if num_frames is not None:
+                    expansion_kwargs["num_frames"] = num_frames
+                expanded_tokens_list, mask_list = (
+                    self.controller.inference_wrapped_model.expand_image_tokens(
+                        token_list, **expansion_kwargs
+                    )
+                )
+                # expand_image_tokens pads the embedding slots with -1, but the mask
+                # below is what splices the embeddings in, so keep a real token id in
+                # prompt_tokens where the model has one: they are echoed to HTTP
+                # clients, detokenized for raw_text and hashed for prefix caching, and
+                # none of those accept a negative id.
+                expanded_tokens = expanded_tokens_list[0]
+                image_token_id = self._resolve_image_token_id()
+                if image_token_id is not None:
+                    expanded_tokens = [
+                        image_token_id if token < 0 else token for token in expanded_tokens
+                    ]
+                tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
+                mask_tensor = torch.tensor(
+                    [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
+                )
             image_embeddings = self._get_cached_vision_embedding(media_cache_key)
             if image_embeddings is not None:
-                referenced_indices = [int(v) for v in mask_list[0] if v is not None]
-                expected_embedding_count = (
-                    max(referenced_indices) + 1 if referenced_indices else 0
-                )
+                expected_embedding_count = int((mask_tensor >= 0).sum().item())
                 cached_embedding_count = (
                     image_embeddings.numel() // image_embeddings.shape[-1]
                     if image_embeddings.ndim > 0
@@ -1652,7 +1662,22 @@ class DynamicInferenceEngine(AbstractEngine):
                             imgs, **encoder_kwargs
                         )
                     )
-                self._cache_vision_embedding(media_cache_key, image_embeddings)
+
+        if has_images and image_embeddings is not None and mask_tensor is not None:
+            expected_embedding_count = int((mask_tensor >= 0).sum().item())
+            actual_embedding_count = (
+                image_embeddings.numel() // image_embeddings.shape[-1]
+                if image_embeddings.ndim > 0
+                else 0
+            )
+            if actual_embedding_count != expected_embedding_count:
+                prompt_kind = "Pre-expanded" if media_tokens_preexpanded else "Expanded"
+                raise ValueError(
+                    f"{prompt_kind} prompt has {expected_embedding_count} media-token "
+                    f"position(s), but the vision encoder produced "
+                    f"{actual_embedding_count} embedding(s)."
+                )
+            self._cache_vision_embedding(media_cache_key, image_embeddings)
 
         self.context.add_vlm_request_data(
             request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor

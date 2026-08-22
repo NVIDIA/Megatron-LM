@@ -49,6 +49,20 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
+def _with_multimodal_metadata(
+    payload: Dict[str, Any],
+    *,
+    media_cache_key: Optional[str],
+    media_tokens_preexpanded: bool,
+) -> Dict[str, Any]:
+    """Attach optional request-level metadata to a multimodal payload."""
+    if media_cache_key is not None:
+        payload["media_cache_key"] = media_cache_key
+    if media_tokens_preexpanded:
+        payload["media_tokens_preexpanded"] = True
+    return payload
+
+
 def serialize_multimodal_data(
     multi_modal_data: Any,
 ) -> Optional[Dict[str, Any]]:
@@ -73,7 +87,12 @@ def serialize_multimodal_data(
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
-    unsupported = set(multi_modal_data) - {"image", "video", "media_cache_key"}
+    unsupported = set(multi_modal_data) - {
+        "image",
+        "video",
+        "media_cache_key",
+        "media_tokens_preexpanded",
+    }
     if unsupported:
         raise NotImplementedError(
             f"Unsupported multimodal modalities: {sorted(unsupported)}; "
@@ -87,6 +106,12 @@ def serialize_multimodal_data(
     modality_data = multi_modal_data.get(modality)
     if modality_data is None:
         return None
+    media_tokens_preexpanded = multi_modal_data.get("media_tokens_preexpanded", False)
+    if not isinstance(media_tokens_preexpanded, bool):
+        raise TypeError(
+            "multi_modal_data['media_tokens_preexpanded'] must be a bool, "
+            f"got {type(media_tokens_preexpanded)}."
+        )
     media_cache_key = multi_modal_data.get("media_cache_key")
     if media_cache_key is not None and not isinstance(media_cache_key, str):
         raise TypeError(
@@ -103,16 +128,15 @@ def serialize_multimodal_data(
             digest.update(item)
         return digest.hexdigest()
 
-    def with_cache_key(payload: Dict[str, Any]) -> Dict[str, Any]:
-        if media_cache_key is not None:
-            payload["media_cache_key"] = media_cache_key
-        return payload
-
     if isinstance(modality_data, (bytes, bytearray)):
         items = [bytes(modality_data)]
         if media_cache_key is None:
             media_cache_key = key_for_bytes(items)
-        return with_cache_key({modality: items})
+        return _with_multimodal_metadata(
+            {modality: items},
+            media_cache_key=media_cache_key,
+            media_tokens_preexpanded=media_tokens_preexpanded,
+        )
     if isinstance(modality_data, list):
         if any(not isinstance(item, (bytes, bytearray)) for item in modality_data):
             raise TypeError(
@@ -121,7 +145,11 @@ def serialize_multimodal_data(
         items = [bytes(item) for item in modality_data]
         if media_cache_key is None:
             media_cache_key = key_for_bytes(items)
-        return with_cache_key({modality: items})
+        return _with_multimodal_metadata(
+            {modality: items},
+            media_cache_key=media_cache_key,
+            media_tokens_preexpanded=media_tokens_preexpanded,
+        )
     if not isinstance(modality_data, dict):
         raise TypeError(
             f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
@@ -148,7 +176,15 @@ def serialize_multimodal_data(
         wire["num_img_embeddings_per_tile"] = int(
             modality_data["num_img_embeddings_per_tile"]
         )
-    return with_cache_key({modality: wire}) if wire else None
+    return (
+        _with_multimodal_metadata(
+            {modality: wire},
+            media_cache_key=media_cache_key,
+            media_tokens_preexpanded=media_tokens_preexpanded,
+        )
+        if wire
+        else None
+    )
 
 
 def resolve_multimodal_data_for_engine(
@@ -177,7 +213,12 @@ def resolve_multimodal_data_for_engine(
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
-    unsupported = set(multi_modal_data) - {"image", "video", "media_cache_key"}
+    unsupported = set(multi_modal_data) - {
+        "image",
+        "video",
+        "media_cache_key",
+        "media_tokens_preexpanded",
+    }
     if unsupported:
         raise NotImplementedError(
             f"Unsupported multimodal modalities: {sorted(unsupported)}; "
@@ -191,17 +232,18 @@ def resolve_multimodal_data_for_engine(
     modality_data = multi_modal_data.get(modality)
     if modality_data is None:
         return {}
+    media_tokens_preexpanded = multi_modal_data.get("media_tokens_preexpanded", False)
+    if not isinstance(media_tokens_preexpanded, bool):
+        raise TypeError(
+            "multi_modal_data['media_tokens_preexpanded'] must be a bool, "
+            f"got {type(media_tokens_preexpanded)}."
+        )
     media_cache_key = multi_modal_data.get("media_cache_key")
     if media_cache_key is not None and not isinstance(media_cache_key, str):
         raise TypeError(
             "multi_modal_data['media_cache_key'] must be a string or None, "
             f"got {type(media_cache_key)}."
         )
-
-    def with_cache_key(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        if media_cache_key is not None:
-            kwargs["media_cache_key"] = media_cache_key
-        return kwargs
 
     if isinstance(modality_data, list):
         if modality == "video":
@@ -218,10 +260,12 @@ def resolve_multimodal_data_for_engine(
                 if torch.cuda.is_available()
                 else None
             )
-            return with_cache_key(
+            return _with_multimodal_metadata(
                 preprocess_video_bytes_list(
                     modality_data, video_preprocessing_config, device=device
-                )
+                ),
+                media_cache_key=media_cache_key,
+                media_tokens_preexpanded=media_tokens_preexpanded,
             )
 
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
@@ -233,10 +277,12 @@ def resolve_multimodal_data_for_engine(
         device = (
             torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
         )
-        return with_cache_key(
+        return _with_multimodal_metadata(
             preprocess_image_bytes_list(
                 modality_data, image_preprocessing_config, device=device
-            )
+            ),
+            media_cache_key=media_cache_key,
+            media_tokens_preexpanded=media_tokens_preexpanded,
         )
     if not isinstance(modality_data, dict):
         raise TypeError(
@@ -281,7 +327,11 @@ def resolve_multimodal_data_for_engine(
                 "Preprocessed video payload requires imgs, imgs_sizes, and num_frames; "
                 f"missing {sorted(missing)}."
             )
-    return with_cache_key(kwargs)
+    return _with_multimodal_metadata(
+        kwargs,
+        media_cache_key=media_cache_key,
+        media_tokens_preexpanded=media_tokens_preexpanded,
+    )
 
 
 def serialize_ndarray(arr: np.ndarray) -> dict:
