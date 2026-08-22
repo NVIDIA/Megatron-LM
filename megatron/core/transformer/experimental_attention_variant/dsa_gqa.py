@@ -28,6 +28,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_naive,
     rotate_activation,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+    dsa_dense_indexer_loss,
+    dsa_min_memory_gqa,
+    dsa_min_memory_gqa_forward_only,
+)
 from megatron.core.utils import is_using_quantization_scales
 
 
@@ -272,7 +277,19 @@ def _dense_grouped_dsa_fn(
             torch.full((sq, skv), float("-inf"), dtype=torch.float32, device=index_mask.device),
             diagonal=1,
         )
-    index_mask = index_mask + mask.view(1, sq, skv)
+    elif mask.dtype == torch.bool:
+        mask = torch.zeros(
+            mask.shape,
+            dtype=torch.float32,
+            device=mask.device,
+        ).masked_fill(mask, float("-inf"))
+    else:
+        mask = mask.to(dtype=torch.float32, device=index_mask.device)
+    if mask.dim() == 2:
+        mask = mask.view(1, sq, skv)
+    else:
+        assert mask.shape == (b, sq, skv), "mask shape must be [sq, skv] or [b, sq, skv]"
+    index_mask = index_mask + mask
     attention_scores = attention_scores + index_mask.unsqueeze(1)
     attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
 
@@ -406,6 +423,7 @@ class DSGQAIndexerSubmodules:
 @dataclass
 class DSGQAAttentionSubmodules:
     indexer: Union[ModuleSpec, type] = None
+    dense_core_attention: Union[ModuleSpec, type] = None
 
 
 class DSGQAIndexer(MegatronModule):
@@ -494,6 +512,9 @@ class DSGQAIndexer(MegatronModule):
             skip_weight_param_allocation=False,
             parallel_mode="duplicated",
         )
+        if self.pg_collection.tp.size() > 1:
+            for param in self.parameters():
+                setattr(param, "average_gradients_across_tp_domain", True)
 
     def _apply_rope(self, x: torch.Tensor, use_rope: bool, packed_seq_params=None):
         if not use_rope or self.rotary_pos_emb is None or self.index_rotary_dim == 0:
@@ -522,7 +543,7 @@ class DSGQAIndexer(MegatronModule):
         return torch.cat([x_nope, x_pe], dim=-1)
 
     def _get_dynamic_rotary_pos_emb(self, inference_context) -> Tuple[torch.Tensor, float]:
-        n = inference_context.padded_active_token_count
+        n = inference_context.active_token_count
         if n == 0:
             rotary_seq_len = 1
         else:
@@ -544,19 +565,35 @@ class DSGQAIndexer(MegatronModule):
         k_nope, k_pe = torch.split(
             k, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
         )
-        cu_seqlens_q, _ = inference_context.cu_query_lengths()
-        q_pe = inference_context.apply_rotary_emb_query(
-            q_pe,
-            rotary_pos_emb,
-            self.config,
-            cu_seqlens_q,
-            self.pg_collection.cp,
-            mscale=mscale,
-        )
-        k_pe = inference_context.apply_rotary_emb_key(
-            k_pe, rotary_pos_emb, self.config, self.pg_collection.cp, mscale=mscale
-        )
-        return torch.cat([q_nope, q_pe], dim=-1), torch.cat([k_nope, k_pe], dim=-1)
+
+        active_token_count = inference_context.active_token_count
+        q_pe = q_pe.clone()
+        k_pe = k_pe.clone()
+        if active_token_count > 0:
+            q_positions = inference_context.token_to_pos_ids[:active_token_count]
+            k_positions = inference_context.token_to_position_in_request[:active_token_count]
+            q_pe[:active_token_count] = apply_rotary_pos_emb(
+                q_pe[:active_token_count],
+                rotary_pos_emb[q_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+            k_pe[:active_token_count] = apply_rotary_pos_emb(
+                k_pe[:active_token_count],
+                rotary_pos_emb[k_positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+        q = torch.cat([q_nope, q_pe], dim=-1)
+        k = torch.cat([k_nope, k_pe], dim=-1)
+        if active_token_count < q.size(0):
+            q[active_token_count:] = 0
+            k[active_token_count:] = 0
+        return q, k
 
     def forward_before_topk(
         self,
@@ -660,6 +697,20 @@ class DSGQACoreAttention(MegatronModule):
         self.indexer = build_module(
             submodules.indexer, config=config, pg_collection=pg_collection
         )
+        self.dense_core_attention = None
+        if getattr(config, "dsa_fwd_use_dense_attn", False) and (
+            submodules.dense_core_attention is not None
+        ):
+            self.dense_core_attention = build_module(
+                submodules.dense_core_attention,
+                config=config,
+                layer_number=layer_number,
+                attn_mask_type=attn_mask_type,
+                attention_type=attention_type,
+                softmax_scale=softmax_scale,
+                cp_comm_type=cp_comm_type,
+                pg_collection=pg_collection,
+            )
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(
                 k_channels if k_channels is not None else config.kv_channels
@@ -692,6 +743,20 @@ class DSGQACoreAttention(MegatronModule):
 
         sq, b, _, _ = query.size()
         skv = key.size(0)
+        dsa_min_memory_backend = getattr(self.config, "dsa_min_memory_backend", "reference")
+        if dsa_min_memory_backend in ("triton-min-memory", "torch-min-memory"):
+            return self._forward_min_memory(
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=attention_mask,
+                hidden_states=hidden_states,
+                use_indexer_rope=use_indexer_rope,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+
         sparse_attention_use_gather = getattr(self.config, "dsa_sparse_attention_use_gather", False)
 
         hidden_states = hidden_states.detach()
@@ -894,6 +959,205 @@ class DSGQACoreAttention(MegatronModule):
             use_gather=sparse_attention_use_gather,
         )
 
+    def _forward_min_memory(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        use_indexer_rope: bool = False,
+        attn_mask_type: AttnMaskType = None,
+        attention_bias: torch.Tensor = None,
+        packed_seq_params: PackedSeqParams = None,
+    ) -> torch.Tensor:
+        """Minimum-activation DSA-GQA path for training and no-grad validation."""
+        dsa_min_memory_backend = getattr(self.config, "dsa_min_memory_backend", "reference")
+        dense_warmup = getattr(self.config, "dsa_fwd_use_dense_attn", False)
+        sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
+        sparse_fwd_dense_loss = not dense_warmup and not sparse_indexer_loss
+        assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
+        assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
+        if attn_mask_type != AttnMaskType.causal:
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' only supports causal fixed-length batches."
+            )
+        if query.size(0) != key.size(0) or key.size(0) != hidden_states.size(0):
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' requires full-sequence self attention."
+            )
+        if getattr(self.config, "dsa_sparse_attention_use_gather", False):
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' bypasses the reference gather backend; "
+                "do not set dsa_sparse_attention_use_gather."
+            )
+        if dense_warmup and getattr(self.config, "dsa_indexer_use_sparse_loss", False):
+            raise NotImplementedError(
+                "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
+                "dsa_indexer_use_sparse_loss."
+            )
+        if dense_warmup and (
+            getattr(self.config, "dsa_kernel_cache_routing", False)
+            or getattr(self.config, "dsa_kernel_cache_indexer_k", False)
+            or getattr(self.config, "dsa_kernel_cache_selected_scores", False)
+        ):
+            raise NotImplementedError("dsa_fwd_use_dense_attn does not support DSA cache flags.")
+        if sparse_fwd_dense_loss and getattr(
+            self.config, "dsa_kernel_cache_selected_scores", False
+        ):
+            raise NotImplementedError(
+                "Sparse-forward dense-loss mode has no selected-score sparse loss; do not set "
+                "dsa_kernel_cache_selected_scores."
+            )
+        if not getattr(self.config, "dsa_indexer_use_hadamard", False):
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' requires dsa_indexer_use_hadamard."
+            )
+        if self.config.fp8 is not None or self.config.fp8_param or is_using_quantization_scales(
+            self.config
+        ):
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' does not yet support quantized/FP8 "
+                "indexer projections."
+            )
+        if self.config.layernorm_zero_centered_gamma:
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' does not yet support "
+                "layernorm_zero_centered_gamma in the DSA indexer norm."
+            )
+        if dense_warmup:
+            if self.dense_core_attention is None:
+                raise RuntimeError("Dense DSA warmup requires an original dense core attention spec.")
+            if not torch.is_grad_enabled():
+                return self.dense_core_attention(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                )
+            if not self.training:
+                raise NotImplementedError(
+                    f"dsa_min_memory_backend='{dsa_min_memory_backend}' currently supports training only."
+                )
+
+            indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+            if indexer_loss_coeff <= 0:
+                raise NotImplementedError(
+                    f"dsa_min_memory_backend='{dsa_min_memory_backend}' expects dsa_indexer_loss_coeff > 0 "
+                    "for dense indexer warmup."
+                )
+
+            output = self.dense_core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+            indexer_loss = dsa_dense_indexer_loss(
+                query=query.detach(),
+                key=key.detach(),
+                hidden_states=hidden_states.detach(),
+                indexer=self.indexer,
+                softmax_scale=self.softmax_scale,
+                loss_coeff=indexer_loss_coeff,
+                use_indexer_rope=use_indexer_rope,
+                query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+                key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+                profile_label=f"layer={self.layer_number}",
+                use_triton=dsa_min_memory_backend == "triton-min-memory",
+            )
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=indexer_loss,
+                raw_loss=indexer_loss / indexer_loss_coeff,
+                layer_number=self.layer_number,
+                num_layers=self.config.num_layers,
+            )
+            return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+
+        del attention_mask
+        if not torch.is_grad_enabled():
+            return dsa_min_memory_gqa_forward_only(
+                query=query,
+                key=key,
+                value=value,
+                hidden_states=hidden_states.detach(),
+                indexer=self.indexer,
+                softmax_scale=self.softmax_scale,
+                use_indexer_rope=use_indexer_rope,
+                query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+                key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+                cache_indexer_k=getattr(self.config, "dsa_kernel_cache_indexer_k", False),
+                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+                profile_label=f"layer={self.layer_number}",
+                use_triton=dsa_min_memory_backend == "triton-min-memory",
+            )
+        if not self.training:
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' currently supports training only."
+            )
+
+        indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+        if indexer_loss_coeff <= 0:
+            raise NotImplementedError(
+                f"dsa_min_memory_backend='{dsa_min_memory_backend}' expects dsa_indexer_loss_coeff > 0 "
+                "for indexer training."
+            )
+
+        sparse_loss_coeff = indexer_loss_coeff if sparse_indexer_loss else 0.0
+        output, indexer_loss = dsa_min_memory_gqa(
+            query=query,
+            key=key,
+            value=value,
+            hidden_states=hidden_states.detach(),
+            indexer=self.indexer,
+            softmax_scale=self.softmax_scale,
+            loss_coeff=sparse_loss_coeff,
+            use_indexer_rope=use_indexer_rope,
+            query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+            key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+            cache_routing=getattr(self.config, "dsa_kernel_cache_routing", False),
+            cache_indexer_k=getattr(self.config, "dsa_kernel_cache_indexer_k", False),
+            cache_selected_scores=getattr(
+                self.config, "dsa_kernel_cache_selected_scores", False
+            ),
+            profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+            profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+            profile_label=f"layer={self.layer_number}",
+            use_triton=dsa_min_memory_backend == "triton-min-memory",
+        )
+        if sparse_fwd_dense_loss:
+            indexer_loss = dsa_dense_indexer_loss(
+                query=query.detach(),
+                key=key.detach(),
+                hidden_states=hidden_states.detach(),
+                indexer=self.indexer,
+                softmax_scale=self.softmax_scale,
+                loss_coeff=indexer_loss_coeff,
+                use_indexer_rope=use_indexer_rope,
+                query_chunk_size=getattr(self.config, "dsa_kernel_query_block_size", None),
+                key_chunk_size=getattr(self.config, "dsa_kernel_key_block_size", None),
+                profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
+                profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
+                profile_label=f"layer={self.layer_number}",
+                use_triton=dsa_min_memory_backend == "triton-min-memory",
+            )
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=indexer_loss,
+            raw_loss=indexer_loss / indexer_loss_coeff,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers,
+        )
+        return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+
     def forward_dynamic(
         self,
         query: torch.Tensor,
@@ -1017,6 +1281,7 @@ class DSGroupedSelfAttention(SelfAttention):
     ):
         if config.experimental_attention_variant == "dsa":
             submodules = copy.copy(submodules)
+            dense_core_attention = submodules.core_attention
             submodules.core_attention = ModuleSpec(
                 module=DSGQACoreAttention,
                 submodules=DSGQAAttentionSubmodules(
@@ -1028,7 +1293,8 @@ class DSGroupedSelfAttention(SelfAttention):
                             k_norm=ModuleSpec(module=TENorm),
                             linear_weights_proj=ModuleSpec(module=TELinear),
                         ),
-                    )
+                    ),
+                    dense_core_attention=dense_core_attention,
                 ),
             )
         super().__init__(
