@@ -1313,3 +1313,186 @@ def test_fused_group_wrong_rank_order_is_rejected(monkeypatch):
     p.grad = torch.randn_like(p)
     with pytest.raises(AssertionError, match="TP innermost"):
         opt.step()
+
+
+# ---------------------------------------------------------------------------
+# Reparent-specific coverage (LayerShardedMuon on TensorParallelMuon):
+#   1. The empty-param_ns_homes fallback resolves to TensorParallelMuon's
+#      all-gather + full-matrix NS and matches duplicated mode bitwise (it used
+#      to silently degrade to local-shard NS on base Muon).
+#   2. The degenerate single-rank domain honours use_syrk (it used to be
+#      hardcoded off because use_syrk was never forwarded to the parent).
+#   3. Every weight-update site honours pre/post_weight_update_fn_inplace
+#      (LayerShardedMuon used to be the only Muon variant dropping them).
+# ---------------------------------------------------------------------------
+
+
+class _PGStub:
+    """Duck-typed stand-in for ProcessGroupCollection: TensorParallelMuon only
+    getattrs gtp_remat / expt_gtp_remat / tp / expt_tp off it."""
+
+    def __init__(self, gtp_remat=None, expt_gtp_remat=None, tp=None, expt_tp=None):
+        self.gtp_remat = gtp_remat
+        self.expt_gtp_remat = expt_gtp_remat
+        self.tp = tp
+        self.expt_tp = expt_tp
+
+
+def test_empty_homes_fallback_matches_duplicated():
+    """With param_ns_homes unset, step() must equal duplicated-mode NS bitwise.
+
+    The fallback rides TensorParallelMuon's GTP-duplicated path, which needs the
+    pg_collection to find the gtp_remat group — exactly what the layered kwargs
+    builder now supplies in the wired path.
+    """
+    _require_multi_rank()
+    S = dist.get_world_size()
+    r = dist.get_rank()
+    P, Q, N = 16 * S, 24, 3
+    P_shard = P // S
+    lr, momentum = 1e-2, 0.95
+
+    torch.manual_seed(_SEED + 400)
+    NUM_STEPS = 2
+    full_weights = [torch.randn(P, Q) for _ in range(N)]
+    step_grads = [[torch.randn(P, Q) for _ in range(N)] for _ in range(NUM_STEPS)]
+
+    def _shard(t):
+        return t[r * P_shard : (r + 1) * P_shard, :].clone()
+
+    ref_weights = [_shard(w) for w in full_weights]
+    ref_momentums = [torch.zeros_like(w) for w in ref_weights]
+    params = [_gtp_param(_shard(w)) for w in full_weights]
+
+    optimizer = LayerShardedMuon(
+        params,
+        lr=lr,
+        momentum=momentum,
+        weight_decay=0.0,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        fp32_matmul_prec="highest",
+        gtp_group=_world(),
+        pg_collection=_PGStub(gtp_remat=_world()),
+    )
+    # Deliberately NOT calling set_param_ns_homes: this is the fallback.
+
+    for step in range(NUM_STEPS):
+        for i, p in enumerate(params):
+            p.grad = _shard(step_grads[step][i])
+        optimizer.step()
+
+        for i in range(N):
+            g_shard = _shard(step_grads[step][i])
+            ref_momentums[i].lerp_(g_shard, 1 - momentum)
+            eff_grad = ref_momentums[i]  # nesterov=False default
+
+            shards = [torch.zeros_like(eff_grad) for _ in range(S)]
+            dist.all_gather(shards, eff_grad.contiguous(), group=_world())
+            full_eff = torch.cat(shards, dim=0)
+            full_orth = newton_schulz(full_eff.float(), steps=5, coefficient_type="quintic")
+            scale = max(P, Q) ** 0.5  # spectral
+            full_orth = full_orth * scale * 1.0  # match the closure's multiply order
+            ref_weights[i].add_(full_orth[r * P_shard : (r + 1) * P_shard, :], alpha=-lr)
+
+            assert torch.equal(params[i].data, ref_weights[i]), (
+                f"Fallback/duplicated mismatch for param {i} on rank {r} at step {step}: "
+                f"max_diff={(params[i].data - ref_weights[i]).abs().max().item():.2e}"
+            )
+
+
+def test_degenerate_domain_honours_use_syrk():
+    """gtp_size * tp_size <= 1 with use_syrk=True must run the SYRK NS path.
+
+    Pre-refactor, use_syrk was never forwarded to the parent, so the degenerate
+    branch always ran plain GEMM NS. Pins the fix by matching a direct
+    newton_schulz(use_syrk=True) reference bitwise. Needs CUDA (Triton),
+    emerging-optimizers >= 0.4 (constructor gate) and medium precision
+    (SYRK is inert elsewhere).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA (Triton SYRK)")
+    if not is_emerging_optimizers_min_version("0.4.0.dev0"):
+        pytest.skip("use_syrk requires emerging-optimizers >= 0.4.0")
+    lr, momentum = 1e-2, 0.95
+    torch.manual_seed(_SEED + 410)
+    full = torch.randn(64, 128)  # 8-aligned dims (SYRK/TMA requirement)
+    grad = torch.randn(64, 128)
+
+    p = torch.nn.Parameter(full.clone())
+    opt = LayerShardedMuon(
+        [p],
+        lr=lr,
+        momentum=momentum,
+        weight_decay=0.0,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        fp32_matmul_prec="medium",
+        gtp_group=None,
+        use_syrk=True,
+    )
+    p.grad = grad.clone()
+    opt.step()
+
+    from emerging_optimizers.utils import fp32_matmul_precision as _prec_ctx
+
+    mom = torch.zeros_like(full).lerp_(grad, 1 - momentum)
+    with _prec_ctx("medium"):
+        orth = newton_schulz(mom.float(), steps=5, coefficient_type="quintic", use_syrk=True)
+    scale = max(full.shape) ** 0.5
+    ref = full - lr * (orth * scale * 1.0).to(full.dtype)
+    assert torch.equal(p.data, ref), (
+        f"Degenerate-domain use_syrk mismatch: max_diff={(p.data - ref).abs().max().item():.2e}"
+    )
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["two_stage", "fused"])
+def test_weight_update_hooks_called_on_all_paths(fused):
+    """pre/post_weight_update_fn_inplace must fire once per updated param on the
+    replicated, routed (two-stage and fused) and degenerate paths."""
+    _require_multi_rank()
+    S = dist.get_world_size()
+    r = dist.get_rank()
+    torch.manual_seed(_SEED + 420)
+
+    # Mixed group: two GTP-sharded params (routed) + one replicated param.
+    routed_params = [_gtp_param(torch.randn(4, 8)) for _ in range(2)]
+    replicated = torch.nn.Parameter(torch.randn(6, 6))
+    params = routed_params + [replicated]
+
+    opt = LayerShardedMuon(
+        params,
+        lr=1e-2,
+        weight_decay=0.0,
+        num_ns_steps=5,
+        fp32_matmul_prec="highest",
+        gtp_group=_world(),
+        fused_group=_world() if fused else None,
+    )
+    opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(routed_params)})
+
+    calls = {"pre": 0, "post": 0}
+    opt.pre_weight_update_fn_inplace = lambda p, update: calls.__setitem__(
+        "pre", calls["pre"] + 1
+    )
+    opt.post_weight_update_fn_inplace = lambda p: calls.__setitem__("post", calls["post"] + 1)
+
+    for p in params:
+        p.grad = torch.randn_like(p)
+    opt.step()
+    assert calls == {"pre": 3, "post": 3}, f"hooks missed on the sharded paths: {calls}"
+
+    # Degenerate domain: same hooks, no process groups.
+    p2 = torch.nn.Parameter(torch.randn(8, 8))
+    opt2 = LayerShardedMuon(
+        [p2], lr=1e-2, weight_decay=0.0, num_ns_steps=5,
+        fp32_matmul_prec="highest", gtp_group=None,
+    )
+    calls2 = {"pre": 0, "post": 0}
+    opt2.pre_weight_update_fn_inplace = lambda p, update: calls2.__setitem__(
+        "pre", calls2["pre"] + 1
+    )
+    opt2.post_weight_update_fn_inplace = lambda p: calls2.__setitem__("post", calls2["post"] + 1)
+    p2.grad = torch.randn_like(p2)
+    opt2.step()
+    assert calls2 == {"pre": 1, "post": 1}, f"hooks missed on the degenerate path: {calls2}"
