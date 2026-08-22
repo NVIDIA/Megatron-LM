@@ -3,6 +3,7 @@
 import copy
 import gc
 import hashlib
+import inspect
 
 # Keep this to make the env registered.
 import itertools
@@ -14,7 +15,7 @@ import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import (
     Any,
@@ -62,6 +63,7 @@ from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel import vocab_parallel_cross_entropy
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
@@ -949,6 +951,120 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def _vocab_parallel_selected_logprobs(
+    local_logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    temperature: float,
+    tp_group: torch.distributed.ProcessGroup,
+    loss_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute selected-token logprobs without gathering TP vocabulary shards."""
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"logprob temperature must be finite and positive, got {temperature}")
+    if local_logits.shape[:-1] != target.shape:
+        raise ValueError(
+            f"local logits/target shape mismatch: {local_logits.shape[:-1]} != {target.shape}"
+        )
+
+    safe_target = target
+    if loss_mask is not None:
+        if loss_mask.shape != target.shape:
+            raise ValueError(
+                f"loss mask/target shape mismatch: {loss_mask.shape} != {target.shape}"
+            )
+        safe_target = torch.where(loss_mask.to(dtype=torch.bool), target, torch.zeros_like(target))
+
+    selected_logprobs = -vocab_parallel_cross_entropy(
+        local_logits.float() / temperature, safe_target, label_smoothing=0.0, tp_group=tp_group
+    )
+    if loss_mask is not None:
+        selected_logprobs = selected_logprobs * loss_mask.to(selected_logprobs.dtype)
+    return selected_logprobs
+
+
+def _vocab_parallel_logprobs_output_processor(**kwargs) -> torch.Tensor:
+    """GPT output processor for selected-token logprobs from local vocabulary shards."""
+    context = kwargs["context"]
+    nvtx_range = get_nvtx_range()
+    with nvtx_range("rl/local-output-layer", time=True):
+        local_logits, _ = kwargs["output_layer"](
+            kwargs["hidden_states"], weight=kwargs["output_weight"], runtime_gather_output=False
+        )
+        local_logits = kwargs["scale_logits"](local_logits)
+
+    targets = kwargs["input_ids"][:, 1:].transpose(0, 1).contiguous()
+    loss_mask = context["loss_mask"]
+    if loss_mask is not None:
+        loss_mask = loss_mask.transpose(0, 1).contiguous()
+    with nvtx_range("rl/vocab-parallel-cross-entropy", time=True):
+        selected_logprobs = _vocab_parallel_selected_logprobs(
+            local_logits[:-1],
+            targets,
+            temperature=context["temperature"],
+            tp_group=context["tp_group"],
+            loss_mask=loss_mask,
+        )
+
+    return selected_logprobs.transpose(0, 1).contiguous().to(local_logits.dtype)
+
+
+def _vocab_parallel_logprobs_fallback_reason(
+    model,
+    pg_collection: ProcessGroupCollection,
+    *,
+    cuda_graph_impl: str,
+    label_smoothing: float,
+    consumer_requires_full_logits: bool,
+    consumer_requires_entropy: bool,
+    consumer_top_n_logprobs: int,
+    output_processor_in_use: bool,
+) -> str | None:
+    """Return a stable reason code when the selected-token path is ineligible."""
+    if consumer_requires_full_logits:
+        return "FULL_LOGITS_REQUESTED"
+    if consumer_requires_entropy:
+        return "FULL_ENTROPY_REQUESTED"
+    if consumer_top_n_logprobs:
+        return "TOP_N_LOGPROBS_REQUESTED"
+    if output_processor_in_use:
+        return "OUTPUT_PROCESSOR_CONFLICT"
+    if label_smoothing != 0.0:
+        return "NONZERO_LABEL_SMOOTHING"
+    if get_pg_size(pg_collection.cp) > 1:
+        return "UNVERIFIED_CP_GT_1"
+    if get_pg_size(pg_collection.pp) > 1:
+        return "UNVERIFIED_PP_GT_1"
+    if is_batch_invariant_mode_enabled():
+        return "BATCH_INVARIANT_MODE"
+
+    config = get_attr_wrapped_model(model, "config")
+    if getattr(config, "mtp_num_layers", None):
+        return "MTP_ENABLED"
+    if cuda_graph_impl != "none" or getattr(config, "cuda_graph_impl", None) not in (None, "none"):
+        return "CUDA_GRAPH_UNVERIFIED"
+
+    try:
+        core_model = get_attr_wrapped_model(model, "output_layer", return_model_obj=True)
+        forward_parameters = inspect.signature(core_model.forward).parameters
+    except (TypeError, ValueError, RuntimeError):
+        return "OUTPUT_PROCESSOR_UNAVAILABLE"
+    if "output_processor" not in forward_parameters:
+        return "OUTPUT_PROCESSOR_UNAVAILABLE"
+    return None
+
+
+@lru_cache(maxsize=None)
+def _log_vocab_parallel_fallback_once(reason: str) -> None:
+    """Log each fallback reason once per process and only on rank zero."""
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        "Vocab-parallel selected-token logprobs requested; using gathered logits: %s",
+        reason,
+    )
+
+
 @dataclass
 class _CPScatterCache:
     """Per-bin CP partition artifacts, derived once from (packed_seq_params, cp_group).
@@ -1064,7 +1180,23 @@ def _scatter_for_context_parallel(
     )
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(
+    model,
+    tokens,
+    position_ids,
+    no_grad=False,
+    sequence_packing=False,
+    packed_seq_params=None,
+    *,
+    loss_mask=None,
+    use_vocab_parallel_selected_logprobs=False,
+    logprob_temperature=1.0,
+    label_smoothing=0.0,
+    consumer_requires_full_logits=False,
+    consumer_requires_entropy=False,
+    consumer_top_n_logprobs=0,
+    output_processor_in_use=False,
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -1077,11 +1209,21 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             When provided with qkv_format='thd', the input tokens are sliced to
             remove padding before the forward pass, and outputs are padded back.
 
+        loss_mask: Optional mask aligned with the selected next-token logprobs.
+        use_vocab_parallel_selected_logprobs: Default-off path that avoids gathering
+            the tensor-parallel vocabulary when only selected-token logprobs are needed.
+        logprob_temperature: Positive temperature applied to both paths.
+        label_smoothing: Requested label smoothing. Nonzero values use the baseline path.
     Returns:
         Next-token logprobs from `forward()` over the input sequences  [batch, seq_len - 1].
     """
 
     args = get_args()
+    if not math.isfinite(logprob_temperature) or logprob_temperature <= 0.0:
+        raise ValueError(
+            "logprob temperature must be finite and positive, got " f"{logprob_temperature}"
+        )
+
     # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
     # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
     # When sequence_packing is disabled, construct a single-sequence default so the CUDA
@@ -1113,6 +1255,22 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("rl/get-logprobs", time=True):
+        use_vocab_parallel = use_vocab_parallel_selected_logprobs
+        if use_vocab_parallel:
+            fallback_reason = _vocab_parallel_logprobs_fallback_reason(
+                model,
+                pg_collection,
+                cuda_graph_impl=getattr(args, "cuda_graph_impl", "none"),
+                label_smoothing=label_smoothing,
+                consumer_requires_full_logits=consumer_requires_full_logits,
+                consumer_requires_entropy=consumer_requires_entropy,
+                consumer_top_n_logprobs=consumer_top_n_logprobs,
+                output_processor_in_use=output_processor_in_use,
+            )
+            if fallback_reason is not None:
+                _log_vocab_parallel_fallback_once(fallback_reason)
+                use_vocab_parallel = False
+
         with nvtx_range("rl/forward-pass", time=True):
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
 
@@ -1135,14 +1293,24 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     packed_seq_params,
                 )
 
+            model_kwargs = {
+                "packed_seq_params": packed_seq_params_in,
+                "runtime_gather_output": not use_vocab_parallel,
+                "fp32_output": fp32_output,
+            }
+            if use_vocab_parallel:
+                model_kwargs.update(
+                    output_processor=_vocab_parallel_logprobs_output_processor,
+                    output_processor_context={
+                        "temperature": logprob_temperature,
+                        "tp_group": pg_collection.tp,
+                        "loss_mask": loss_mask,
+                    },
+                )
+
             with torch.no_grad() if no_grad else nullcontext():
                 logits_or_hidden_states = model(
-                    tokens_in,
-                    position_ids_in,
-                    attention_mask_for_forward,
-                    packed_seq_params=packed_seq_params_in,
-                    runtime_gather_output=True,
-                    fp32_output=fp32_output,
+                    tokens_in, position_ids_in, attention_mask_for_forward, **model_kwargs
                 )
 
             set_model_config_attribute(model, "flash_decode", flash_decode)
@@ -1150,6 +1318,9 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         pp_group = pg_collection.pp
 
         if not is_pp_last_stage(pp_group):
+            return logits_or_hidden_states
+
+        if use_vocab_parallel:
             return logits_or_hidden_states
 
         logits = logits_or_hidden_states
@@ -1166,7 +1337,14 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 logprobs = full[:, :-1]
             else:
                 # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+                selected_logits = logits[:, :-1, :]
+                cast_logprobs_to_model_dtype = False
+                if logprob_temperature != 1.0:
+                    selected_logits = selected_logits.float() / logprob_temperature
+                    cast_logprobs_to_model_dtype = True
+                logprobs = selective_log_softmax(selected_logits, tokens[:, 1:])
+                if cast_logprobs_to_model_dtype:
+                    logprobs = logprobs.to(logits.dtype)
         return logprobs
 
 
@@ -2166,14 +2344,17 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     if packing_context is not None:
         # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
         bin_tensor = next(data_iterator)[0]
-        #TODO(jalbericiola): change for named tuple
-        (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
+        # TODO(jalbericiola): change for named tuple
+        b_trajs, _, _, b_loss_mask, b_posids, _, _, _, _, _, b_packed_seq_params = (
             load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
         )
     else:
-        b_trajs, b_posids = next(data_iterator)
+        batch = next(data_iterator)
+        b_trajs, b_posids = batch[:2]
+        b_loss_mask = batch[2] if len(batch) > 2 else None
         b_packed_seq_params = None
 
+    args = get_args()
     logprobs = (
         get_logprobs(
             model,
@@ -2182,6 +2363,10 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             no_grad=True,
             sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
+            loss_mask=b_loss_mask.cuda() if b_loss_mask is not None else None,
+            use_vocab_parallel_selected_logprobs=getattr(
+                args, "rl_use_vocab_parallel_selected_logprobs", False
+            ),
         ),
         None,
     )
@@ -2396,7 +2581,9 @@ def prepare_data_for_update(
                 compute_trajs = trajs
                 compute_position_ids = original_position_ids
                 data_loader = DataLoader(
-                    TensorDataset(compute_trajs, compute_position_ids),
+                    TensorDataset(
+                        compute_trajs, compute_position_ids, original_loss_mask[:, 1:].contiguous()
+                    ),
                     batch_size=args.micro_batch_size,
                 )
                 logprobs_batch_size = args.micro_batch_size

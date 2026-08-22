@@ -2777,6 +2777,16 @@ def _add_rl_args(parser):
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
+    group.add_argument(
+        '--rl-use-vocab-parallel-selected-logprobs',
+        action=argparse.BooleanOptionalAction,
+        type=bool,
+        default=False,
+        help=(
+            'Compute selected-token logprobs from tensor-parallel vocabulary shards. '
+            'Unsupported execution modes explicitly use the gathered-logits path.'
+        ),
+    )
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
                        help='Maximum number of sequences that can be packed into a single bin. ')
     group.add_argument('--rl-sequence-packing-algo', type=str, default='fifo',
