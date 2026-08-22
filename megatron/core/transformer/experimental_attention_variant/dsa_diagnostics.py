@@ -8,6 +8,8 @@ stores compact request-local records for later analysis.
 """
 
 from __future__ import annotations
+from collections import defaultdict
+from typing import Iterable, List
 
 import json
 import re
@@ -559,3 +561,65 @@ def compute_dsa_attention_diagnostics(
         "model_support": model_metrics,
         "supports": supports,
     }
+
+
+
+def _summarize_distribution_width(rows: Iterable[dict]) -> List[dict]:
+    grouped = defaultdict(lambda: {"values": [], "unresolved_caps": [], "total_count": 0})
+    metadata = {
+        "dp_rank",
+        "request_id",
+        "layer",
+        "phase",
+        "offset",
+        "query_position",
+        "context_length",
+        "max_measured_topk",
+        "head",
+    }
+    for row in rows:
+        for metric, value in row.items():
+            if metric in metadata or value is None:
+                continue
+            group = grouped[(row["layer"], row["phase"], metric)]
+            group["total_count"] += 1
+            if metric.startswith("k") and value < 0:
+                measurement_cap = row.get("max_measured_topk")
+                if measurement_cap is not None:
+                    group["unresolved_caps"].append(float(measurement_cap))
+                continue
+            group["values"].append(float(value))
+
+    summary = []
+    for (layer, phase, metric), group in sorted(grouped.items()):
+        values = group["values"]
+        unresolved_caps = group["unresolved_caps"]
+        total_count = group["total_count"]
+        resolved_count = len(values)
+        unresolved_count = total_count - resolved_count
+        summary.append(
+            {
+                "layer": layer,
+                "phase": phase,
+                "metric": metric,
+                "count": total_count,
+                "resolved_count": resolved_count,
+                "unresolved_count": unresolved_count,
+                "unresolved_fraction": unresolved_count / total_count,
+                "mean": mean(values) if values else None,
+                "p50": _percentile(values, 0.50) if values else None,
+                "p90": _percentile(values, 0.90) if values else None,
+                "p99": _percentile(values, 0.99) if values else None,
+                "max": max(values) if values else None,
+                "unresolved_measurement_cap_min": (
+                    min(unresolved_caps) if unresolved_caps else None
+                ),
+                "unresolved_measurement_cap_mean": (
+                    mean(unresolved_caps) if unresolved_caps else None
+                ),
+                "unresolved_measurement_cap_max": (
+                    max(unresolved_caps) if unresolved_caps else None
+                ),
+            }
+        )
+    return summary
