@@ -1200,6 +1200,122 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_sustained_kv_cache_saturation_with_paused_retention(self) -> None:
+        """Many concurrent requests against a KV pool far too small to hold them all.
+
+        The other eviction tests pin the paused buffer to zero, so every pause turns
+        into an immediate eviction and the retention budget is never consulted. Here
+        the budget holds two blocks, which is smaller than the number of requests that
+        pause, so `update_requests` has to retain some paused requests, resume others,
+        and evict only the overflow -- repeatedly, over many steps.
+
+        This is the shape high-concurrency RL workloads hit and standalone inference
+        tests do not: the invariants worth pinning are that the retention budget is
+        never exceeded, that requeued requests still generate their full output, and
+        that the pool drains completely afterwards. A block leaked during a saturation
+        storm silently shrinks capacity for every later request.
+        """
+        num_requests = 16
+        prompt_length = 256
+        num_tokens_to_generate = 64
+        block_size_tokens = 256
+        pool_block_count = 8
+        paused_block_count = 2
+
+        probe_env = self._build_test_env(DynamicEngineTestConfig())
+        block_size_bytes = probe_env.engine.context.block_size_bytes
+
+        # A prompt fills exactly one block, so every request needs a second block on
+        # its first decode step -- the pause trigger. Sizing in whole blocks (+1 byte
+        # to survive the float GB round trip) keeps the pool arithmetic exact.
+        test_config = DynamicEngineTestConfig(
+            num_requests=num_requests,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            context_block_size_tokens=block_size_tokens,
+            context_buffer_size_gb=(pool_block_count * block_size_bytes + 1) / 1024**3,
+            context_paused_buffer_size_gb=(paused_block_count * block_size_bytes + 1) / 1024**3,
+            context_max_requests=num_requests,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+        context = env.engine.context
+        allocator = context.kv_block_allocator
+
+        # Fail loudly if the buffer sizing did not land where the test assumes, rather
+        # than silently running a differently-shaped workload.
+        assert allocator.pool_size == pool_block_count
+        assert allocator.paused_limit == paused_block_count
+
+        # Deterministic logits: random weights make torch.multinomial trip over NaNs.
+        vocab_size = test_config.vocab_size
+
+        def mock_greedy_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            logits[:, :, 0] = 100.0
+            if test_config.materialize_only_last_token_logits:
+                logits = context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        env.engine.controller.inference_wrapped_model.model.forward = mock_greedy_forward
+
+        # Every request arrives up front, so the engine has to queue and reschedule
+        # rather than admitting them at a comfortable rate.
+        for request in env.requests:
+            request.sampling_params.termination_id = -1  # run the full output length
+            env.engine._add_request(request)
+
+        finished_records = []
+        max_paused_block_count = 0
+
+        # Bound the loop so a scheduling regression fails instead of hanging.
+        for _ in range(4000):
+            if not env.engine.has_unfinished_requests():
+                break
+            env.engine.schedule_waiting_requests()
+            finished_records.extend(env.engine.step_modern()["finished_request_records"])
+
+            # Checked at a step boundary, i.e. after the pause/resume/evict lifecycle
+            # has settled: paused requests may only retain blocks within the budget.
+            paused_block_count_now = allocator.get_paused_used()
+            assert paused_block_count_now <= allocator.paused_limit
+            max_paused_block_count = max(max_paused_block_count, paused_block_count_now)
+
+        assert not env.engine.has_unfinished_requests()
+
+        # The workload has to have actually saturated the cache, otherwise the
+        # assertions above are vacuous and the test rots into a no-op. A request
+        # surviving a step boundary while paused is what a zero budget cannot
+        # produce -- with no retention every paused request must resume or be
+        # evicted immediately -- so together with an eviction this pins the
+        # partial-retention path the other tests skip.
+        assert max_paused_block_count > 0, "no request was ever retained paused"
+        assert env.engine.evicted_request_count > 0, "no request overflowed the budget"
+
+        # Requeued requests resume from a checkpointed prompt, so the output length is
+        # what catches a token double-counted or dropped across an eviction.
+        assert len(finished_records) == num_requests
+        for record in finished_records:
+            request = record.merge()
+            assert request.status == Status.COMPLETED, f"request {request.request_id} unfinished"
+            assert len(request.generated_tokens) == num_tokens_to_generate
+
+        # No block, request row, or token slot may survive the storm.
+        assert allocator.get_total_used() == 0
+        assert allocator.pool_avail == allocator.pool_size - 1
+        assert context.total_request_count == 0
+        assert context.paused_request_count == 0
+        assert context.active_token_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_cuda_graph_padding_uses_dummy_block(self) -> None:
         """One real request in a four-request graph bucket: the padded block-table
         rows must hold the dummy block index, not the old -1 sentinel (OOB reads)."""
