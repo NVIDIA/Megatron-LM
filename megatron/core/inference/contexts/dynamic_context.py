@@ -38,6 +38,9 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics import (
+    DSADiagnosticsCollector,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
@@ -363,12 +366,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._request_to_image_embeddings: Dict[int, Optional[Tensor]] = {}
         self._request_to_image_token_mask: Dict[int, Optional[Tensor]] = {}
         self._request_to_image_token_count: Dict[int, int] = {}
+        self.dsa_diagnostics = DSADiagnosticsCollector(model_config)
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
         self.cache_dsa_indexer_keys = (
             getattr(model_config, "experimental_attention_variant", None) == "dsa"
+            and (
+                getattr(model_config, "dsa_indexer_mode", "standard") != "simplified"
+                or getattr(model_config, "dsa_simplified_use_learned_k", False)
+            )
         )
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0

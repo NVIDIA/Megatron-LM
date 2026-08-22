@@ -410,6 +410,128 @@ class DSAIndexerLossLoggingHelper:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
 
+class DSAMainAttentionAuxLossLoggingHelper:
+    """Track opt-in main-attention shaping losses without affecting disabled paths."""
+
+    tracker = {}
+
+    @staticmethod
+    def save_loss_to_tracker(
+        captured_mass: torch.Tensor,
+        mass_loss: torch.Tensor,
+        raw_mass_loss: torch.Tensor,
+        output_loss: torch.Tensor,
+        raw_output_loss: torch.Tensor,
+        layer_number: int,
+        num_layers: int,
+        tp_group: torch.distributed.ProcessGroup,
+    ):
+        if layer_number is None:
+            return
+        tracker = DSAMainAttentionAuxLossLoggingHelper.tracker
+        device = captured_mass.device
+        for name in (
+            "captured_mass",
+            "mass_loss",
+            "raw_mass_loss",
+            "output_loss",
+            "raw_output_loss",
+        ):
+            if name not in tracker:
+                tracker[name] = torch.zeros(num_layers, device=device, dtype=torch.float32)
+        if "active_layers" not in tracker:
+            tracker["active_layers"] = torch.zeros(
+                num_layers, device=device, dtype=torch.float32
+            )
+        layer_idx = layer_number - 1
+        tracker["captured_mass"][layer_idx] += captured_mass.detach()
+        tracker["mass_loss"][layer_idx] += mass_loss.detach()
+        tracker["raw_mass_loss"][layer_idx] += raw_mass_loss.detach()
+        tracker["output_loss"][layer_idx] += output_loss.detach()
+        tracker["raw_output_loss"][layer_idx] += raw_output_loss.detach()
+        tracker["active_layers"][layer_idx] = 1.0
+        tracker["tp_group"] = tp_group
+
+    @staticmethod
+    def clean_loss_in_tracker():
+        tracker = DSAMainAttentionAuxLossLoggingHelper.tracker
+        for name in (
+            "captured_mass",
+            "mass_loss",
+            "raw_mass_loss",
+            "output_loss",
+            "raw_output_loss",
+            "active_layers",
+        ):
+            if name in tracker:
+                tracker[name].zero_()
+        tracker["tp_group"] = None
+
+    @staticmethod
+    def reduce_loss_in_tracker():
+        tracker = DSAMainAttentionAuxLossLoggingHelper.tracker
+        if "captured_mass" not in tracker:
+            return
+        value_names = (
+            "captured_mass",
+            "mass_loss",
+            "raw_mass_loss",
+            "output_loss",
+            "raw_output_loss",
+        )
+        tp_group = tracker.get("tp_group")
+        if tp_group is not None and tp_group.size() > 1:
+            for name in value_names:
+                torch.distributed.all_reduce(tracker[name], group=tp_group)
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        for name in value_names:
+            torch.distributed.all_reduce(tracker[name], group=pp_group)
+        torch.distributed.all_reduce(tracker["active_layers"], group=pp_group)
+        dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
+        for name in value_names:
+            torch.distributed.all_reduce(
+                tracker[name], group=dp_group, op=torch.distributed.ReduceOp.AVG
+            )
+
+    @staticmethod
+    def track_metrics(
+        loss_scale: float,
+        iteration: int,
+        writer,
+        wandb_writer=None,
+        total_loss_dict=None,
+    ):
+        DSAMainAttentionAuxLossLoggingHelper.reduce_loss_in_tracker()
+        tracker = DSAMainAttentionAuxLossLoggingHelper.tracker
+        if "captured_mass" not in tracker:
+            return
+        active_count = tracker["active_layers"].sum().clamp_min(1.0)
+        metrics = {
+            "dsa captured mass": tracker["captured_mass"].sum() * loss_scale / active_count,
+            "dsa captured mass loss": tracker["mass_loss"].sum()
+            * loss_scale
+            / active_count,
+            "dsa captured mass raw loss": tracker["raw_mass_loss"].sum()
+            * loss_scale
+            / active_count,
+            "dsa output consistency loss": tracker["output_loss"].sum()
+            * loss_scale
+            / active_count,
+            "dsa output consistency raw loss": tracker["raw_output_loss"].sum()
+            * loss_scale
+            / active_count,
+        }
+        if total_loss_dict is not None:
+            for name, value in metrics.items():
+                total_loss_dict[name] = total_loss_dict.get(name, 0.0) + value
+        if writer is not None:
+            for name, value in metrics.items():
+                writer.add_scalar(name, value, iteration)
+        if wandb_writer is not None:
+            wandb_writer.log(metrics, iteration)
+        DSAMainAttentionAuxLossLoggingHelper.clean_loss_in_tracker()
+
+
 def compute_dsa_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -1144,6 +1266,35 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
             DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
         else:
             DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
+
+
+class DSAMainAttentionAuxLossAutoScaler(torch.autograd.Function):
+    """Attach enabled main-attention auxiliary losses to the normal model backward."""
+
+    main_loss_backward_scale: torch.Tensor = None
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (aux_loss,) = ctx.saved_tensors
+        if DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale is None:
+            DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                1.0, device=aux_loss.device
+            )
+        return grad_output, torch.ones_like(aux_loss) * (
+            DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale
+        )
+
+    @staticmethod
+    def set_loss_scale(scale: torch.Tensor):
+        if DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale is None:
+            DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            DSAMainAttentionAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
 @dataclass
@@ -2027,6 +2178,16 @@ class DSAttention(MegatronModule):
         indexer_avg_group = (
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
+
+        if self.training and torch.is_grad_enabled() and getattr(
+            self.config, "dsa_train_main_only", False
+        ):
+            # Train the main attention only: skip the indexer loss entirely and route
+            # with detached top-k indices.
+            _, topk_indices = self.indexer.forward_with_scores(
+                x, qr, mask=float_mask, packed_seq_params=packed_seq_params
+            )
+            return unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
