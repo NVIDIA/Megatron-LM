@@ -2649,13 +2649,10 @@ def _add_regularization_args(parser):
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed'],
-<<<<<<< HEAD
                        help='How to perform NS calculation for tensor model parallel weights. '
                        'blockwise orthogonalizes each shard on its own, so the update rule '
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results.')
-=======
-                       help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--use-layer-sharding-muon', action='store_true',
                        help='Use LayerShardedMuon: each 2D weight is assigned one NS home '
                        'rank in the (gtp_remat x tp) domain; all_to_all exchanges assemble '
@@ -2667,14 +2664,9 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '
                        'Newton-Schulz on an NS home under --use-layer-sharding-muon. '
-<<<<<<< HEAD
-                       'Set to 1 to disable batching (bit-exact per-matrix path).')
->>>>>>> 31d6e4180 (Wire LayerShardedMuon into the layer-wise distributed optimizer path)
-=======
                        'The default of 1 keeps the bit-exact per-matrix path; raise '
                        '(e.g. to 32) to cut kernel launches on MoE expert homes at '
                        'the cost of bitwise parity (baddbmm vs addmm rounding).')
->>>>>>> 0b20d07f8 (Default muon ns_batch_size to 1 to keep bitwise parity out of the box)
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the symmetric-output '
                        'Newton-Schulz GEMMs in Muon (~1/3 off '
