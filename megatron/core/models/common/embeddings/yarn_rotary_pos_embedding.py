@@ -103,6 +103,14 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             # method causes a memory leak in NeMo-RL.
             self.forward.cache_clear()
 
+    def _apply(self, fn, recurse=True):
+        module = super()._apply(fn, recurse=recurse)
+        # ``forward`` is cached independently of registered buffers. Invalidate it after
+        # device or dtype migration so an identical call cannot return a tensor from the
+        # module's previous device.
+        self.forward.cache_clear()
+        return module
+
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -117,13 +125,16 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             not self.rotary_interleaved
         ), "Yarn RoPE does not support interleaved rotary embeddings"
 
-        if self.inv_freq_extra.device.type == 'cpu':
-            # move `inv_freq_extra` to GPU once at the first micro-batch forward pass
-            self.inv_freq_extra = self.inv_freq_extra.to(device=torch.cuda.current_device())
-
-        if self.inv_freq_inter.device.type == 'cpu':
-            # move `inv_freq_inter` to GPU once at the first micro-batch forward pass
-            self.inv_freq_inter = self.inv_freq_inter.to(device=torch.cuda.current_device())
+        # The initial cache is built during construction, before ``cos_cached`` exists. Keep
+        # that work on the requested initialization device. On later cache rebuilds, follow
+        # the registered cache buffer so CPU-initialized models still migrate correctly.
+        target_device = (
+            self.cos_cached.device if hasattr(self, 'cos_cached') else self.inv_freq_extra.device
+        )
+        if self.inv_freq_extra.device != target_device:
+            self.inv_freq_extra = self.inv_freq_extra.to(device=target_device)
+        if self.inv_freq_inter.device != target_device:
+            self.inv_freq_inter = self.inv_freq_inter.to(device=target_device)
 
         low, high = _yarn_find_correction_range(
             self.beta_fast,
