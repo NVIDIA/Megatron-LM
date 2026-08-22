@@ -68,6 +68,7 @@ models/index
 user-guide/features/moe
 user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
+user-guide/features/checkpoint-merge
 user-guide/features/optimizer_cpu_offload
 user-guide/features/fine_grained_activation_offloading
 user-guide/data-loading
