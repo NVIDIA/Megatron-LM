@@ -72,6 +72,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
     _MODULE_TYPE_REGISTRY: Dict[str, set] = {
         "column": {
             "ColumnParallelLinear",
+            "LinearCrossEntropyModule",
             "TEColumnParallelLinear",
             "TELayerNormColumnParallelLinear",
             "TEColumnParallelGroupedLinear",
