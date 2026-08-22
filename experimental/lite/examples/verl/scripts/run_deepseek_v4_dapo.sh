@@ -106,7 +106,8 @@ case "${ROLLOUT_WEIGHT_BITS}" in
     ROLLOUT_RESYNC_FORMAT=block_fp8
     ROLLOUT_EXPERT_DTYPE=fp8
     ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-flashinfer_cutlass}"
-    ROLLOUT_SCALE_FMT=float32
+    ROLLOUT_SCALE_FMT="$(python3 "${VALIDATOR}" scale-format \
+      --model-config "${MODEL_PATH}/config.json" --weight-bits 8)"
     ;;
   *)
     echo "ROLLOUT_WEIGHT_BITS must be 4 or 8, got ${ROLLOUT_WEIGHT_BITS}" >&2

@@ -29,6 +29,23 @@ MINIMUM_DEPENDENCIES = {
     "transformer-engine": "2.15.0",
     "nvidia-cudnn-frontend": "1.27.0",
 }
+
+
+def resolve_rollout_scale_format(model_config: Path, weight_bits: int) -> str:
+    if weight_bits == 4:
+        return "ue8m0"
+    if weight_bits != 8:
+        raise ValueError(f"unsupported rollout weight bits: {weight_bits}")
+
+    config = json.loads(model_config.read_text(encoding="utf-8"))
+    scale_format = config.get("quantization_config", {}).get(
+        "scale_fmt", "float32"
+    )
+    if scale_format not in {"float32", "float32_ceil_ue8m0", "ue8m0"}:
+        raise ValueError(f"unsupported FP8 scale format: {scale_format}")
+    return scale_format
+
+
 def installed(name: str) -> str:
     try:
         return metadata.version(name)
@@ -114,6 +131,9 @@ def parse_args() -> argparse.Namespace:
     geometry = subparsers.add_parser("geometry")
     geometry.add_argument("--model-config", type=Path, required=True)
     geometry.add_argument("--rollout-tp", type=int, required=True)
+    scale_format = subparsers.add_parser("scale-format")
+    scale_format.add_argument("--model-config", type=Path, required=True)
+    scale_format.add_argument("--weight-bits", type=int, required=True)
     subparsers.add_parser("environment")
     return parser.parse_args()
 
@@ -122,6 +142,8 @@ def main() -> None:
     args = parse_args()
     if args.command == "geometry":
         validate_geometry(args.model_config, args.rollout_tp)
+    elif args.command == "scale-format":
+        print(resolve_rollout_scale_format(args.model_config, args.weight_bits))
     else:
         validate_environment()
 
