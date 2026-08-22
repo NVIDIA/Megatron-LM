@@ -134,6 +134,33 @@ def param_is_not_gtp_duplicate(param):
     return get_gtp_weight_remat_rank() == 0
 
 
+def gtp_local_pad_zero_count(gtp_shard, range_start, range_end):
+    """Count structural GTP alignment-padding elements in
+    ``gtp_shard.view(-1)[range_start:range_end]`` (see ``_gtp_slice_one_param``).
+
+    Padding is a contiguous suffix of the *unsharded* padded buffer (``shard_dim0 *
+    group.size()`` rows), sliced evenly across the GTP group. It usually lands entirely in the
+    last rank's shard, but when ``pad_length`` exceeds one shard's own row count (small ``dim0``
+    relative to ``pad_for_alignment * gtp_remat_size``) it spills backward from the tail into
+    lower-numbered ranks' shards too. Computed via each rank's row offset in the unsharded
+    buffer -- not special-cased to the last rank -- so both cases come out correct.
+    """
+    pad_length = getattr(gtp_shard, "pad_length", 0)
+    if not pad_length:
+        return 0
+    group = getattr(gtp_shard, "group", None)
+    if group is None:
+        return 0
+    shard_dim0 = gtp_shard.shape[0]
+    unsharded_padded_dim0 = shard_dim0 * group.size()
+    unsharded_real_dim0 = unsharded_padded_dim0 - pad_length
+    trailing_numel = gtp_shard.numel() // shard_dim0
+    shard_row_start = group.rank() * shard_dim0
+    pad_start_in_shard = max(0, unsharded_real_dim0 - shard_row_start) * trailing_numel
+    overlap_start = max(range_start, pad_start_in_shard)
+    return max(0, range_end - overlap_start)
+
+
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
     """Sets tp attributes to tensor"""
     # Make sure the attributes are not set.
