@@ -176,6 +176,7 @@ class TopKRouter(Router):
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
         self.frozen_expert_bias = False
+        self.qb_estimation_scope = self.config.moe_router_quantile_balancing_estimation_scope
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
@@ -220,40 +221,72 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
-        # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
-        # and reset each global batch.
         if self.routing_type == "quantile_balancing":
             assert not self.is_aux_loss_enabled(), (
                 "Quantile balancing handles load balance via the bias update; "
                 "aux losses must be disabled (set moe_aux_loss_coeff to 0)."
             )
-            self.register_buffer(
-                'qb_beta',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-            )
-            self.register_buffer(
-                'qb_beta_accum',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                'qb_beta_count',
-                torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
-                persistent=False,
-            )
+            if self.qb_estimation_scope == "micro_batch":
+                self.register_buffer(
+                    'qb_beta',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                )
+                self.register_buffer(
+                    'qb_beta_accum',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    'qb_beta_count',
+                    torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
+                    persistent=False,
+                )
+                self.qb_bias = None
+                self.qb_histogram = None
+                self.qb_bin_bounds = None
+            else:
+                self.qb_beta = None
+                self.qb_beta_accum = None
+                self.qb_beta_count = None
+                self.register_buffer(
+                    'qb_bias',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                )
+                self.register_buffer(
+                    'qb_histogram',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        self.config.moe_router_qb_num_bins,
+                        dtype=torch.int32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    'qb_bin_bounds',
+                    torch.tensor(
+                        [-1.0, 1.0], dtype=torch.float32, device=torch.cuda.current_device()
+                    ),
+                )
         else:
             self.qb_beta = None
             self.qb_beta_accum = None
             self.qb_beta_count = None
+            self.qb_bias = None
+            self.qb_histogram = None
+            self.qb_bin_bounds = None
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
@@ -276,6 +309,12 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+        if hasattr(self, 'qb_bias') and self.qb_bias is not None:
+            if self.qb_bias.dtype != torch.float32:
+                self.qb_bias.data = self.qb_bias.data.to(torch.float32)
+        if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
+            if self.qb_bin_bounds.dtype != torch.float32:
+                self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -324,6 +363,22 @@ class TopKRouter(Router):
             Tuple[torch.Tensor, torch.Tensor]: Sparse routing probs and boolean
             routing map, each shaped ``[num_tokens, num_experts]``.
         """
+        if self.qb_estimation_scope == "global_batch":
+            accumulate_histogram = (
+                self.training and torch.is_grad_enabled() and not self.frozen_expert_bias
+            )
+            return topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.qb_bias,
+                fused=self.config.moe_router_fusion,
+                qb_histogram=self.qb_histogram if accumulate_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+            )
+
         assert (
             not self.config.moe_router_fusion
         ), "Quantile balancing routing does not support moe_router_fusion."
@@ -953,7 +1008,8 @@ class InferenceTopKRouter(TopKRouter):
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
-        # QB selects on (logits - qb_beta); at inference qb_beta is fixed, so it's per-token.
+        # Micro-batch QB selects on (logits - qb_beta). Global-batch QB passes its
+        # fixed additive bias through the normal score-function route.
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
@@ -971,7 +1027,7 @@ class InferenceTopKRouter(TopKRouter):
             group_topk=self.config.moe_router_group_topk,
             scaling_factor=self.config.moe_router_topk_scaling_factor,
             score_function=self.score_function,
-            expert_bias=self.expert_bias,
+            expert_bias=self.qb_bias if self.qb_bias is not None else self.expert_bias,
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
             dense_output=True,

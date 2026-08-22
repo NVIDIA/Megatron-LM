@@ -21,7 +21,10 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 from .. import parallel_state
-from ..transformer.moe.moe_utils import get_updated_expert_bias
+from ..transformer.moe.moe_utils import (
+    get_updated_expert_bias,
+    get_updated_expert_bias_with_quantile,
+)
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
     get_attr_wrapped_model,
@@ -329,6 +332,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
             if getattr(module, 'qb_beta_accum', None) is not None:
                 module.qb_beta_accum.zero_()
                 module.qb_beta_count.zero_()
+            if getattr(module, 'qb_histogram', None) is not None:
+                module.qb_histogram.zero_()
 
 
 def _update_router_expert_bias(
@@ -411,6 +416,45 @@ def _update_router_qb_beta(
 
     for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
         qb_beta.copy_(new_beta)
+
+
+def _update_router_qb_histogram(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    reduction_groups: tuple[Optional[torch.distributed.ProcessGroup], ...] = (),
+):
+    """Pool K3 histograms and update every local router once per global batch."""
+    qb_bias_list = []
+    qb_histogram_list = []
+    qb_bin_bounds_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if (
+                getattr(module, 'qb_histogram', None) is not None
+                and module.training
+                and not getattr(module, 'frozen_expert_bias', False)
+            ):
+                qb_bias_list.append(module.qb_bias)
+                qb_histogram_list.append(module.qb_histogram)
+                qb_bin_bounds_list.append(module.qb_bin_bounds)
+
+    if not qb_bias_list:
+        return
+
+    stacked_bias = torch.stack(qb_bias_list, dim=0)
+    stacked_histogram = torch.stack(qb_histogram_list, dim=0)
+    stacked_bin_bounds = torch.stack(qb_bin_bounds_list, dim=0)
+    for group in reduction_groups:
+        if get_pg_size(group) > 1:
+            torch.distributed.all_reduce(stacked_histogram, group=group)
+    updated_bias, updated_bin_bounds = get_updated_expert_bias_with_quantile(
+        stacked_histogram, stacked_bin_bounds, stacked_bias, config.moe_router_topk
+    )
+    for bias, bounds, next_bias, next_bounds in zip(
+        qb_bias_list, qb_bin_bounds_list, updated_bias, updated_bin_bounds
+    ):
+        bias.copy_(next_bias)
+        bounds.copy_(next_bounds)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -589,10 +633,15 @@ def finalize_model_grads(
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
         assert hasattr(pg_collection, 'dp_cp')
-        if config.moe_router_enable_expert_bias:
-            assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
-                "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
-            )
+        needs_tp_dp_cp_router_group = config.moe_router_enable_expert_bias or (
+            config.moe_router_load_balancing_type == "quantile_balancing"
+            and config.moe_router_quantile_balancing_estimation_scope == "global_batch"
+            and config.gtp_weight_remat_size <= 1
+        )
+        if needs_tp_dp_cp_router_group:
+            assert (
+                hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None
+            ), "pg_collection must have tp_dp_cp when global router bias updates are enabled."
             tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
@@ -687,7 +736,18 @@ def finalize_model_grads(
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     if config.moe_router_load_balancing_type == "quantile_balancing":
-        _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
+        if config.moe_router_quantile_balancing_estimation_scope == "micro_batch":
+            _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
+        else:
+            if config.gtp_weight_remat_size > 1:
+                qb_reduction_groups = (tp_group, dp_cp_group)
+            else:
+                if pg_collection is None:
+                    tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                        with_context_parallel=True
+                    )
+                qb_reduction_groups = (tp_dp_cp_group,)
+            _update_router_qb_histogram(model, config, reduction_groups=qb_reduction_groups)
 
     reset_model_temporary_tensors(config, model)
 
