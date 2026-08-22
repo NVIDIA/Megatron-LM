@@ -30,12 +30,13 @@ RUN bash -ex <<"EOF"
     python -m venv /opt/jet
     ARCH=$(uname -m)
     case "${ARCH}" in \
-      "x86_64") YQ_ARCH=amd64 ;; \
-      "aarch64") YQ_ARCH=arm64 ;; \
-      "armv7l") YQ_ARCH=arm ;; \
+      "x86_64") YQ_ARCH=amd64; YQ_SHA256=6dc2d0cd4e0caca5aeffd0d784a48263591080e4a0895abe69f3a76eb50d1ba3 ;; \
+      "aarch64") YQ_ARCH=arm64; YQ_SHA256=8c12fcc10e14774ca6624cc282f092a526568b036fe1192258c3aecbad56d063 ;; \
+      "armv7l") echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
       *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     esac
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
+    echo "\${YQ_SHA256}  /usr/local/bin/yq" | sha256sum --check -
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
