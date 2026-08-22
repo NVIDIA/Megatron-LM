@@ -159,8 +159,6 @@ class FsdpParameterGroup:
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
         if use_symmetric_memory and fuse_wgrad_accumulation:
             raise ValueError("MFSDP v2 fused wgrad does not yet support symmetric-memory buffers.")
-        if use_symmetric_memory and trace_pool_allocator is not None:
-            raise ValueError("MFSDP trace-pool and symmetric-memory buffers are incompatible.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -573,10 +571,11 @@ class FsdpParameterGroup:
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer.
 
-        The default path deliberately creates fresh storage across microbatches:
-        caching symmetric-memory storage made the next backward's ``copy_`` force
-        a device sync. The trace-pool path is mutually exclusive with symmetric
-        memory and safely reuses a slot within the ordered reduce-scatter arena.
+        The default symmetric-memory path deliberately creates fresh storage across
+        microbatches because caching that storage made the next backward's ``copy_``
+        force a device sync. The trace-pool experiment instead reuses a persistent
+        symmetric slot within the ordered reduce-scatter arena; its synchronization
+        and performance behavior must therefore be measured independently.
         """
         assert self.requires_grad
 
@@ -605,6 +604,11 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=partial_placements,
                 tensor_shapes=tensor_shapes,
+                allocation_stream=(
+                    torch.cuda.current_stream(local_buffer.device)
+                    if local_buffer.is_cuda
+                    else None
+                ),
             )
 
         with self._symmetric_memory_context():

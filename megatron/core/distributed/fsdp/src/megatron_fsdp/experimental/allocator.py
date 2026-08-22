@@ -13,8 +13,10 @@ import dataclasses
 import logging
 from collections import defaultdict
 from collections.abc import Hashable
+from contextlib import nullcontext
 
 import torch
+import torch.distributed._symmetric_memory as symm_mem
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +52,22 @@ class TracePoolAllocator:
     zero on free and restored on its next allocation. This matches the storage
     aliasing required by autograd-saved weight views. ``plan`` then colors the
     resulting conflict graph and assigns every key a fixed steady-state slot.
+    When ``use_symmetric_memory`` is enabled, slot creation and every storage
+    restoration run inside PyTorch's NCCL symmetric-memory pool.
 
     Slots are also partitioned by ``arena``. Callers use one arena per ordered
     CUDA stream so host-side non-overlap never aliases asynchronous operations
     executing on different streams.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, use_symmetric_memory: bool = False) -> None:
+        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
+            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
+        if use_symmetric_memory:
+            # PyTorch caches this in C++ and returns early when the backend is already NCCL.
+            symm_mem.set_backend("NCCL")
+
+        self._use_symmetric_memory = use_symmetric_memory
         self._phase = "trace"
         self._sequence = 0
         self._trace: list[_TraceEvent] = []
@@ -79,6 +90,11 @@ class TracePoolAllocator:
     def phase(self) -> str:
         """Return ``trace`` or ``optimized``."""
         return self._phase
+
+    @property
+    def use_symmetric_memory(self) -> bool:
+        """Whether physical slots come from PyTorch's symmetric-memory pool."""
+        return self._use_symmetric_memory
 
     @property
     def total_pool_bytes(self) -> int:
@@ -158,7 +174,7 @@ class TracePoolAllocator:
         if slot_index is None:
             slot_index = len(self._trace_slots)
             slot = _Slot(
-                tensor=torch.empty(size, dtype=dtype, device=device),
+                tensor=self._empty(size, dtype, device),
                 capacity=size,
                 dtype=dtype,
                 device=device,
@@ -169,11 +185,10 @@ class TracePoolAllocator:
         else:
             slot = self._trace_slots[slot_index]
             if size > slot.capacity:
-                slot.tensor.untyped_storage().resize_(size * slot.tensor.element_size())
-                slot.tensor.resize_(size)
+                self._resize_slot(slot, size)
                 slot.capacity = size
             else:
-                slot.tensor.untyped_storage().resize_(slot.capacity * slot.tensor.element_size())
+                self._resize_slot(slot, slot.capacity)
 
         slot.in_use = True
         self._active_keys.add(key)
@@ -317,8 +332,7 @@ class TracePoolAllocator:
             _, index = min(candidates)
             available.remove(index)
             slot = self._trace_slots[index]
-            slot.tensor.untyped_storage().resize_(size * slot.tensor.element_size())
-            slot.tensor.resize_(size)
+            self._resize_slot(slot, size)
             slot.capacity = size
             slot.in_use = False
             final_slots[required_index] = slot
@@ -377,7 +391,7 @@ class TracePoolAllocator:
         arena: AllocatorKey | None,
     ) -> None:
         slot_index = len(self._slots)
-        tensor = torch.empty(size, dtype=dtype, device=device)
+        tensor = self._empty(size, dtype, device)
         self._slots.append(_Slot(tensor, size, dtype, device, arena))
         self._metadata[key] = (size, dtype, device, arena)
         self._key_to_slot[key] = slot_index
@@ -398,6 +412,25 @@ class TracePoolAllocator:
         self._slots.clear()
         self._key_to_slot.clear()
         self._key_to_view.clear()
+
+    def _empty(self, size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Allocate a flat slot from the configured CUDA memory pool."""
+        with self._allocation_context(device):
+            return torch.empty(size, dtype=dtype, device=device)
+
+    def _resize_slot(self, slot: _Slot, size: int) -> None:
+        """Resize a slot while preserving its Storage object and allocation pool."""
+        with self._allocation_context(slot.device):
+            slot.tensor.untyped_storage().resize_(size * slot.tensor.element_size())
+            slot.tensor.resize_(size)
+
+    def _allocation_context(self, device: torch.device):
+        """Select PyTorch's symmetric-memory pool when requested."""
+        if not self._use_symmetric_memory:
+            return nullcontext()
+        if device.type != "cuda":
+            raise ValueError(f"Symmetric-memory trace-pool allocations require CUDA, got {device}.")
+        return torch.cuda.use_mem_pool(symm_mem.get_mem_pool(device))
 
 
 def _intervals_overlap(left: list[tuple[int, int]], right: list[tuple[int, int]]) -> bool:

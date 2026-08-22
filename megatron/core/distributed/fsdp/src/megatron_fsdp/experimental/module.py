@@ -84,10 +84,9 @@ class FsdpContext:
                 and replay it for later prefetches. Defaults to static-order lookahead.
             enable_trace_pool: Trace temporary-buffer lifetimes, then reuse a fixed
                 storage pool. With execution replay, planning waits until one full
-                prefetch-enabled replay batch has also been observed.
+                prefetch-enabled replay batch has also been observed. If symmetric
+                memory is enabled, the allocator backs its slots with that pool.
         """
-        if use_symmetric_memory and enable_trace_pool:
-            raise ValueError("MFSDP trace-pool and symmetric-memory buffers are incompatible.")
         self.device = device
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
@@ -95,7 +94,11 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self.runner = FsdpExecutionRunner(context=self, use_trace_replay=use_trace_replay)
-        self.trace_pool_allocator = TracePoolAllocator() if enable_trace_pool else None
+        self.trace_pool_allocator = (
+            TracePoolAllocator(use_symmetric_memory=use_symmetric_memory)
+            if enable_trace_pool
+            else None
+        )
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False

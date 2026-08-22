@@ -62,7 +62,8 @@ def fully_shard_context(
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
         enable_trace_pool: Trace temporary-buffer lifetimes for one global batch,
-            then reuse fixed physical slots. Incompatible with symmetric memory.
+            then reuse fixed physical slots. When symmetric memory is also enabled,
+            allocate and resize those slots inside PyTorch's symmetric-memory pool.
     """
     requested_device = torch.device(device) if device is not None else torch.device("cuda")
     if requested_device.type == "cuda" and requested_device.index is None:
