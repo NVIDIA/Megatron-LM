@@ -1247,3 +1247,30 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
         assert l['loss_reduced'] == expected['loss_reduced']
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "make_output",
+    [
+        lambda t: t,
+        lambda t: {"image": t},
+        lambda t: [t],
+        lambda t: {"vision": [{"hidden": t}]},
+    ],
+)
+def test_get_tensor_device_valid(make_output):
+    tensor = torch.randn(2, 2)
+    assert schedule.get_tensor_device(make_output(tensor)) == tensor.device
+
+
+@pytest.mark.parametrize(
+    "output, message",
+    [
+        ({}, "Empty dict"),
+        ([], "Empty list"),
+        (123, "Unsupported type"),
+    ],
+)
+def test_get_tensor_device_invalid(output, message):
+    with pytest.raises(RuntimeError, match=message):
+        schedule.get_tensor_device(output)
