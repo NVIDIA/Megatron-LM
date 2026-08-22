@@ -36,9 +36,13 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -49,6 +53,65 @@ BLOCK_SIZE = 256
 VOCAB_SIZE = 10000
 MAX_SEQ_LEN = 2048
 NUM_TOKENS_TO_GENERATE = 8
+
+try:
+    import einops  # noqa: F401
+    import fla  # noqa: F401
+    import mamba_ssm  # noqa: F401
+
+    HAVE_GDP_DEPS = True
+except ImportError:
+    HAVE_GDP_DEPS = False
+
+
+def skip_if_sequence_packing_not_available(ssm_mixer="mamba"):
+    """Skip unless the packing support the given mixer's kernels need is present."""
+    if ssm_mixer == "gdp":
+        if not HAVE_GDP_DEPS:
+            pytest.skip("GDP requires fla + mamba_ssm + einops")
+        available, reason = check_fla_sequence_packing_support()
+    else:
+        available, reason = _check_mamba_sequence_packing_support()
+    if not available:
+        pytest.skip(reason)
+
+
+def hybrid_mixer_kwargs(ssm_mixer):
+    """TransformerConfig kwargs selecting the hybrid stack's linear-attention mixer.
+
+    GDP needs its head/group/state dims spelled out, plus the Householder count
+    that sizes its chunk descriptors.
+    """
+    if ssm_mixer == "gdp":
+        return dict(
+            gdp_num_householder=2,
+            mamba_num_heads=8,
+            mamba_head_dim=32,
+            mamba_num_groups=8,
+            mamba_state_dim=64,
+        )
+    return dict(mamba_num_heads=16)
+
+
+def hybrid_stack_spec_for(ssm_mixer):
+    """The stack spec that builds the requested mixer."""
+    return gated_delta_product_stack_spec if ssm_mixer == "gdp" else hybrid_stack_spec
+
+
+def ssm_state_config(model):
+    """Inference state config with an FP32 recurrent state.
+
+    Prefix caching round trips a request's recurrent state through the cache,
+    where the uncached baseline these tests compare against keeps it in the
+    kernel's FP32 accumulator the whole way. With a BF16 cache that round trip
+    rounds the state and the two runs can genuinely diverge in their last
+    generated tokens -- the same reason batch-invariant mode forces FP32 (see
+    MambaInferenceStateConfig.from_model). Pinning FP32 keeps these tests
+    measuring the caching logic rather than cache precision.
+
+    Serving still defaults to the model dtype; this is a test-side choice.
+    """
+    return MambaInferenceStateConfig.from_model(model, ssm_states_dtype=torch.float32)
 
 
 def set_rounder(value):
@@ -73,10 +136,11 @@ class TestPrefixCachingCudaGraphs:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _create_model(self, model_type, num_cuda_graphs=None):
+    def _create_model(self, model_type, num_cuda_graphs=None, ssm_mixer="mamba"):
         """Create a model with optional CUDA graph support.
 
-        Returns (model, mamba_config_or_none).
+        `ssm_mixer` selects the hybrid stack's mixer ("mamba" or "gdp"); it is
+        ignored for the transformer model. Returns (model, mamba_config_or_none).
         """
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
 
@@ -109,7 +173,7 @@ class TestPrefixCachingCudaGraphs:
                 params_dtype=torch.bfloat16,
                 num_layers=3,
                 hidden_size=256,
-                mamba_num_heads=16,
+                **hybrid_mixer_kwargs(ssm_mixer),
                 num_attention_heads=16,
                 use_cpu_initialization=True,
                 cuda_graph_impl=cuda_graph_impl,
@@ -122,7 +186,7 @@ class TestPrefixCachingCudaGraphs:
             )
             model = HybridModel(
                 config=config,
-                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec_for(ssm_mixer),
                 vocab_size=VOCAB_SIZE,
                 max_sequence_length=MAX_SEQ_LEN,
                 parallel_output=True,
@@ -130,7 +194,7 @@ class TestPrefixCachingCudaGraphs:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-            mamba_config = MambaInferenceStateConfig.from_model(model)
+            mamba_config = ssm_state_config(model)
 
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
@@ -264,18 +328,22 @@ class TestPrefixCachingCudaGraphs:
         return finished, step_log
 
     @pytest.mark.flaky_in_dev  # Issue #6130
-    @pytest.mark.parametrize("model_type", ["transformer", "hybrid"])
+    @pytest.mark.parametrize(
+        "model_type,ssm_mixer",
+        [("transformer", None), ("hybrid", "mamba"), ("hybrid", "gdp")],
+        ids=["transformer", "mamba", "gdp"],
+    )
     @pytest.mark.parametrize("batch_structure", ["prefill", "decode", "mixed"])
     @torch.inference_mode()
-    def test_prefix_caching_cuda_graphs(self, model_type, batch_structure):
+    def test_prefix_caching_cuda_graphs(self, model_type, ssm_mixer, batch_structure):
         """Verify correctness and CUDA graph usage for prefix caching."""
         if model_type == "hybrid":
-            sequence_packing_available, reason = _check_mamba_sequence_packing_support()
-            if not sequence_packing_available:
-                pytest.skip(reason)
+            skip_if_sequence_packing_not_available(ssm_mixer)
 
         # Create model with CUDA graph support (cuda_graph_impl="local").
-        model, mamba_config = self._create_model(model_type, num_cuda_graphs=2)
+        model, mamba_config = self._create_model(
+            model_type, num_cuda_graphs=2, ssm_mixer=ssm_mixer or "mamba"
+        )
         prompts = self._create_prompts()
 
         # Baseline: no CUDA graphs.
@@ -334,14 +402,14 @@ class TestHybridChunkedPrefillIntermediateState:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    def _create_hybrid_model(self, num_cuda_graphs=None):
-        """Create a hybrid (Mamba + attention) model."""
+    def _create_hybrid_model(self, num_cuda_graphs=None, ssm_mixer="mamba"):
+        """Create a hybrid (SSM + attention) model with the requested mixer."""
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
         config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=3,
             hidden_size=256,
-            mamba_num_heads=16,
+            **hybrid_mixer_kwargs(ssm_mixer),
             num_attention_heads=16,
             use_cpu_initialization=True,
             cuda_graph_impl=cuda_graph_impl,
@@ -354,7 +422,7 @@ class TestHybridChunkedPrefillIntermediateState:
         )
         model = HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec_for(ssm_mixer),
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
@@ -440,25 +508,24 @@ class TestHybridChunkedPrefillIntermediateState:
         )
 
     @torch.inference_mode()
-    def test_hybrid_chunked_prefill_intermediate_state(self):
-        """Concurrent Mamba state extraction (mid-chunk) and restoration (prefix-cached).
+    @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
+    def test_hybrid_chunked_prefill_intermediate_state(self, ssm_mixer):
+        """Concurrent SSM state extraction (mid-chunk) and restoration (prefix-cached).
 
         req0 (300 tokens): seeds the cache with 1 block of Mamba state.
         req1 (800 tokens): 256 shared prefix, 544 unique. With max_tokens=400 and 1
             Mamba match (skip 256, effective=544), this request is chunked across steps.
         req2 (300 tokens): identical to req0. Full prefix match, 1 Mamba match.
 
-        In the critical step, req2 has Mamba state restored from cache while req1 has
-        Mamba state being computed fresh with intermediate state extraction.
+        In the critical step, req2 has SSM state restored from cache while req1 has
+        SSM state being computed fresh with intermediate state extraction.
         """
-        sequence_packing_available, reason = _check_mamba_sequence_packing_support()
-        if not sequence_packing_available:
-            pytest.skip(reason)
+        skip_if_sequence_packing_not_available(ssm_mixer)
 
         clear_nvte_env_vars()  # conftest's set_env fixture re-sets these per test
 
-        model = self._create_hybrid_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        model = self._create_hybrid_model(ssm_mixer=ssm_mixer)
+        mamba_config = ssm_state_config(model)
 
         device = torch.cuda.current_device()
         prompt0 = torch.arange(0, 300, dtype=torch.int64, device=device)
@@ -539,9 +606,10 @@ class TestHybridChunkedPrefillIntermediateState:
             )
 
     @torch.inference_mode()
-    def test_prefill_shorter_than_conv_window(self):
+    @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
+    def test_prefill_shorter_than_conv_window(self, ssm_mixer):
         """A prefill captured into a CUDA graph whose token bucket is smaller than the
-        Mamba conv window (d_conv) generates correctly.
+        SSM conv window (d_conv) generates correctly.
 
         Conv-state extraction gathers d_conv positions per slot, and unused slots use
         abs_position == d_conv (gather indices up to d_conv-1). The CUDA-graph bucket
@@ -549,14 +617,12 @@ class TestHybridChunkedPrefillIntermediateState:
         is captured at a bucket whose token layout is shorter than the gather window.
         CUDA graphs (num_cuda_graphs) are required to exercise this capture path.
         """
-        sequence_packing_available, reason = _check_mamba_sequence_packing_support()
-        if not sequence_packing_available:
-            pytest.skip(reason)
+        skip_if_sequence_packing_not_available(ssm_mixer)
 
         clear_nvte_env_vars()  # conftest's set_env fixture re-sets these per test
 
-        model = self._create_hybrid_model(num_cuda_graphs=2)
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        model = self._create_hybrid_model(num_cuda_graphs=2, ssm_mixer=ssm_mixer)
+        mamba_config = ssm_state_config(model)
         device = torch.cuda.current_device()
 
         d_conv = mamba_config.conv_states_shape[-1]

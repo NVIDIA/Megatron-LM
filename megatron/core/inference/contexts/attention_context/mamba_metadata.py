@@ -8,6 +8,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
+from megatron.core.ssm.ops.gdp.metadata import CHUNK_SIZE as GDP_CHUNK_SIZE
 from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 
 
@@ -123,6 +124,13 @@ class MambaMetadata:
             self._gdp_chunk_offsets_buffer = torch.zeros(
                 max_requests + 1, dtype=torch.int32, device=self.device
             )
+            # GDP's own offset -> chunk-row mapping for prefix-caching state
+            # extraction. It cannot reuse the Mamba one: the chunk size differs
+            # (64 vs mamba_chunk_size) and GDP's per-chunk states are indexed by
+            # the chunk they enter, not the chunk they leave.
+            self._gdp_intermediate_chunk_indices_buffer = torch.zeros(
+                max_intermediate_count, dtype=torch.int64, device=self.device
+            )
 
         # Conv1d per-token metadata (request ID and request start position)
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
@@ -204,6 +212,7 @@ class MambaMetadata:
         self.gdp_chunk_indices = None
         self.gdp_chunk_indices_dp = None
         self.gdp_chunk_offsets = None
+        self.gdp_intermediate_chunk_indices = None
 
         # Python-side precomputed values
         self.real_prefill_token_count = 0
@@ -510,6 +519,21 @@ class MambaMetadata:
                     torch.int32
                 )
 
+                # Same offsets, GDP's chunking. No -1: GDP's per-chunk states are
+                # the states *entering* each chunk, so the state after `offset`
+                # tokens is row `offset // 64` of the sequence's chunk range,
+                # whereas Mamba's are the states leaving each chunk.
+                if self.gdp_num_householder > 0 and self.gdp_chunk_offsets is not None:
+                    gdp_cu_chunk_offsets = self.gdp_chunk_offsets[:real_prefill_count].to(
+                        torch.int64
+                    )
+                    gdp_indices_2d = gdp_cu_chunk_offsets.unsqueeze(1).expand_as(offsets) + (
+                        offsets // GDP_CHUNK_SIZE
+                    )
+                    self._gdp_intermediate_chunk_indices_buffer[:real_count] = gdp_indices_2d[
+                        valid_mask
+                    ]
+
                 # Pad unused slots with safe defaults for CUDA graph replay:
                 # - chunk_indices=0: reads from chunk 0 (always exists), output ignored
                 # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1].
@@ -520,6 +544,8 @@ class MambaMetadata:
                 if real_count < max_count:
                     self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
                     self._intermediate_abs_positions_buffer[real_count:max_count].fill_(self.d_conv)
+                    if self.gdp_num_householder > 0:
+                        self._gdp_intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
 
                 self.intermediate_count = real_count
                 self.per_request_intermediate_counts = counts_list
@@ -527,11 +553,17 @@ class MambaMetadata:
                 # All counts are 0
                 self._intermediate_chunk_indices_buffer[:max_count] = 0
                 self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
+                if self.gdp_num_householder > 0:
+                    self._gdp_intermediate_chunk_indices_buffer[:max_count] = 0
                 self.intermediate_count = 0
                 self.per_request_intermediate_counts = counts_list
 
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            if self.gdp_num_householder > 0:
+                self.gdp_intermediate_chunk_indices = self._gdp_intermediate_chunk_indices_buffer[
+                    :max_count
+                ]
             # Publish real_count to the fixed-address GPU tensor the scatter
             # kernels consult. fill_ is async (no host sync) and keeps the tensor
             # at the same address captured graphs reference.
@@ -548,6 +580,11 @@ class MambaMetadata:
             self.per_request_intermediate_counts = []
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            if self.gdp_num_householder > 0:
+                self._gdp_intermediate_chunk_indices_buffer[:max_count] = 0
+                self.gdp_intermediate_chunk_indices = self._gdp_intermediate_chunk_indices_buffer[
+                    :max_count
+                ]
             self._intermediate_real_count_buffer.fill_(0)
             self.intermediate_real_count = self._intermediate_real_count_buffer
 

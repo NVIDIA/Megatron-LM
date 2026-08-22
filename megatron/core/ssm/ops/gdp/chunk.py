@@ -53,7 +53,8 @@ def chunk_gated_delta_product_varlen(
     chunk_offsets: torch.Tensor | None = None,
     state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_chunk_states: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """Variable-length chunked Gated Delta Product forward pass.
 
     Args:
@@ -76,8 +77,15 @@ def chunk_gated_delta_product_varlen(
         state: `[S, H, K, V]` per-request state cache for dynamic batching,
             written in place at `state_indices` rather than returned densely.
         state_indices: `[N]` cache slot per sequence; `-1` marks padding.
+        return_chunk_states: Also return the per-chunk states the scan passes
+            through, `[NT, H, K, V]`. Row `chunk_offsets[i] + c` is sequence
+            `i`'s state *entering* its chunk `c`, i.e. after its first `64 * c`
+            tokens -- which is the mid-sequence state prefix caching snapshots.
+            Note this differs from the Mamba2 chunk scan, whose raw states are
+            indexed by the chunk they come *out* of.
 
-    Returns `(o, final_state)` with `o` shaped `[1, T, H, V]`.
+    Returns `(o, final_state)` with `o` shaped `[1, T, H, V]`, or
+    `(o, final_state, chunk_states)` when `return_chunk_states` is set.
 
     Passing the three descriptor arguments is what makes this capturable in a
     CUDA graph: deriving them here reads a device tensor on the host and yields
@@ -209,4 +217,7 @@ def chunk_gated_delta_product_varlen(
         num_householder=num_householder,
         chunk_indices=chunk_indices,
     )
+    if return_chunk_states:
+        # h is [1, NT, H, K, V]; the extraction kernels index by chunk row.
+        return o.to(q.dtype), final_state, h.squeeze(0)
     return o.to(q.dtype), final_state

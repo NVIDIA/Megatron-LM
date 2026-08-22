@@ -97,6 +97,10 @@ from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
     causal_conv1d_varlen_carry_states,
     causal_conv1d_varlen_fn,
 )
+from megatron.core.ssm.ops.common.intermediate_extraction import (
+    scatter_intermediate_conv,
+    scatter_intermediate_ssm,
+)
 from megatron.core.ssm.ops.gdp import (
     chunk_gated_delta_product_varlen,
     fused_recurrent_gated_delta_rule_update,
@@ -1038,8 +1042,23 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         Padding requests are zero-length sequences with a `-1` state slot; they
         produce zero output and touch no state."""
         metadata = context.mamba_metadata
+        slot_allocator = context.mamba_slot_allocator
         cu_seqlens = metadata.cu_seqlens
         batch_indices = metadata.batch_indices_prefill
+
+        # Per-layer intermediate extraction buffers (prefix caching). Present
+        # only when a slot allocator was configured; otherwise extraction is
+        # disabled below and the scan skips returning its per-chunk states.
+        intermediate_ssm_out = None
+        intermediate_conv_out = None
+        if slot_allocator is not None:
+            gdp_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
+            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[gdp_layer_idx]
+            intermediate_conv_out = slot_allocator.intermediate_conv_out[gdp_layer_idx]
+
+        extract_intermediates = (
+            intermediate_ssm_out is not None and metadata.gdp_intermediate_chunk_indices is not None
+        )
 
         z, VKQ, ba = self._preprocess(zVKQba)
 
@@ -1069,6 +1088,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
         tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
+        # The conv snapshot is a window of the pre-convolution inputs, so hold on
+        # to them before the convolution consumes them.
+        VKQ_pre_conv = VKQ if extract_intermediates else None
+
         # The precomputed conv metadata selects the forked varlen conv inside
         # `_prepare_qkv`, which is replayable from a graph.
         query, key, value = self._prepare_qkv(
@@ -1096,7 +1119,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # respecialize the kernel underneath a captured graph.
         initial_ssm_state = ssm_state[batch_indices]
 
-        core_attn_out, _ = chunk_gated_delta_product_varlen(
+        chunk_scan_result = chunk_gated_delta_product_varlen(
             query,
             key,
             value,
@@ -1111,7 +1134,32 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             state_indices=batch_indices,
             initial_state=initial_ssm_state,
             use_qk_l2norm_in_kernel=True,
+            return_chunk_states=extract_intermediates,
         )
+        if extract_intermediates:
+            core_attn_out, _, chunk_states = chunk_scan_result
+        else:
+            core_attn_out, _ = chunk_scan_result
+
+        if extract_intermediates:
+            # Fused gather+conditional-scatter, the same kernels MambaMixer uses:
+            # row `gdp_intermediate_chunk_indices[i]` of the per-chunk states into
+            # `intermediate_ssm_out[i]`, and a length-d_conv window ending at
+            # `intermediate_abs_positions[i]` into `intermediate_conv_out[i]`,
+            # both only for i < real_count.
+            scatter_intermediate_ssm(
+                chunk_states,
+                metadata.gdp_intermediate_chunk_indices,
+                metadata.intermediate_real_count,
+                intermediate_ssm_out,
+            )
+            scatter_intermediate_conv(
+                VKQ_pre_conv,
+                metadata.intermediate_abs_positions,
+                metadata.intermediate_real_count,
+                intermediate_conv_out,
+                d_conv=intermediate_conv_out.shape[-1],
+            )
 
         # post_conv_ssm inside _postprocess is a no-op here: dynamic inference asserts
         # cp_size == 1.

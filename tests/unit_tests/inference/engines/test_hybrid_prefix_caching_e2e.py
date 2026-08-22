@@ -31,6 +31,7 @@ registration, skip counts) and output correctness (generated
 tokens match between pc=off and pc=on).
 """
 
+import math
 import os
 import random
 import types
@@ -55,9 +56,13 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -76,10 +81,62 @@ NUM_GROUPS = 4
 GROUP_TOKEN_STRIDE = 2000
 
 
-def skip_if_mamba_sequence_packing_not_available():
-    sequence_packing_available, reason = _check_mamba_sequence_packing_support()
+try:
+    import einops  # noqa: F401
+    import fla  # noqa: F401
+    import mamba_ssm  # noqa: F401
+
+    HAVE_GDP_DEPS = True
+except ImportError:
+    HAVE_GDP_DEPS = False
+
+
+def skip_if_sequence_packing_not_available(ssm_mixer="mamba"):
+    """Skip unless the packing support the given mixer's kernels need is present."""
+    if ssm_mixer == "gdp":
+        if not HAVE_GDP_DEPS:
+            pytest.skip("GDP requires fla + mamba_ssm + einops")
+        sequence_packing_available, reason = check_fla_sequence_packing_support()
+    else:
+        sequence_packing_available, reason = _check_mamba_sequence_packing_support()
     if not sequence_packing_available:
         pytest.skip(reason)
+
+
+def ssm_state_config(model):
+    """Inference state config with an FP32 recurrent state.
+
+    Prefix caching round trips a request's recurrent state through the cache,
+    where the uncached baseline these tests compare against keeps it in the
+    kernel's FP32 accumulator the whole way. With a BF16 cache that round trip
+    rounds the state and the two runs can genuinely diverge in their last
+    generated tokens -- the same reason batch-invariant mode forces FP32 (see
+    MambaInferenceStateConfig.from_model). Pinning FP32 keeps these tests
+    measuring the caching logic rather than cache precision.
+
+    Serving still defaults to the model dtype; this is a test-side choice.
+    """
+    return MambaInferenceStateConfig.from_model(model, ssm_states_dtype=torch.float32)
+
+
+def buffer_gb_for_kv_blocks(context, num_blocks):
+    """Buffer size that yields exactly `num_blocks` KV blocks for this context.
+
+    Without a `mamba_memory_ratio` the context sizes its block pool as
+    `buffer_bytes // (block_size_bytes + mamba_states_memory_per_request)`, so
+    the block count depends on how large a mixer's recurrent state is. A budget
+    tuned against Mamba2 gives a GDP model, whose state is several times
+    smaller, a correspondingly larger pool. Tests whose scenario depends on an
+    exact pool size therefore have to ask for blocks, not bytes.
+
+    The returned size lands mid-band so floor division cannot tip either way.
+    """
+    mamba_bytes_per_request = (
+        math.prod(context.mamba_conv_states_shape) * context.mamba_conv_states_dtype.itemsize
+        + math.prod(context.mamba_ssm_states_shape) * context.mamba_ssm_states_dtype.itemsize
+    ) * context.num_mamba_layers
+    bytes_per_block = context.block_size_bytes + mamba_bytes_per_request
+    return (bytes_per_block * num_blocks + bytes_per_block // 2) / 1024**3
 
 
 def set_rounder(value):
@@ -116,12 +173,38 @@ class TestMambaPrefixCachingE2E:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    @pytest.fixture(params=["mamba", "gdp"], autouse=True)
+    def ssm_mixer(self, request):
+        """Run every test in this class against both SSM mixers.
+
+        Prefix caching itself is mixer-agnostic -- the durable cache stores and
+        restores whole per-layer state slabs -- but the mid-sequence snapshot it
+        depends on is not: each mixer has to hand back the state at a token
+        offset from its own chunk scan. That is the part these tests cover twice.
+        """
+        skip_if_sequence_packing_not_available(request.param)
+        self._ssm_mixer = request.param
+        return request.param
+
     def _create_model(self, num_cuda_graphs=None):
+        is_gdp = self._ssm_mixer == "gdp"
         transformer_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=3,
             hidden_size=256,
-            mamba_num_heads=16,
+            # GDP needs its head/group/state dims spelled out, plus the
+            # Householder count that sizes its chunk descriptors.
+            **(
+                dict(
+                    gdp_num_householder=2,
+                    mamba_num_heads=8,
+                    mamba_head_dim=32,
+                    mamba_num_groups=8,
+                    mamba_state_dim=64,
+                )
+                if is_gdp
+                else dict(mamba_num_heads=16)
+            ),
             num_attention_heads=16,
             use_cpu_initialization=True,
             cuda_graph_impl="local" if num_cuda_graphs else "none",
@@ -134,7 +217,7 @@ class TestMambaPrefixCachingE2E:
         )
         model = HybridModel(
             config=transformer_config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=(gated_delta_product_stack_spec if is_gdp else hybrid_stack_spec),
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
@@ -427,9 +510,8 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_mamba_prefix_caching_e2e(self):
         """Verify output tokens match between pc=off and pc=on."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        mamba_config = ssm_state_config(model)
         prompts = self._create_prompts()
 
         off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
@@ -444,9 +526,8 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_async_sched_mamba_prefix_caching_with_chunked_prefill_e2e(self):
         """Async combined chunking and Mamba prefix caching matches legacy output."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        mamba_config = ssm_state_config(model)
         prompts = self._create_prompts()[:3]
 
         legacy_outputs, legacy_prefill = self._run_simple(
@@ -470,9 +551,8 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_mamba_prefix_caching_multi_group_e2e(self, num_cuda_graphs):
         """Verify multi-group prefix caching with 4 independent groups."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model(num_cuda_graphs=num_cuda_graphs)
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        mamba_config = ssm_state_config(model)
         all_prompts = [self._create_prompts(g * GROUP_TOKEN_STRIDE) for g in range(NUM_GROUPS)]
 
         _, off_prefill = self._run_simple(
@@ -580,9 +660,8 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_mamba_block_aligned_eos_e2e(self):
         """Verify block-aligned EOS caching and recompute-based back-off."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        mamba_config = ssm_state_config(model)
         prompts = self._create_block_aligned_prompts()
 
         off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
@@ -605,18 +684,25 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_mamba_lru_eviction_e2e(self):
         """Verify KV eviction invalidates mamba state via invalidate_mamba_state_for_block."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
+        # Deliberately on the model dtype: this test asserts eviction behaviour,
+        # not token equality, and an FP32 state would shrink the pool it is tuned to.
         mamba_config = MambaInferenceStateConfig.from_model(model)
         prompts = self._create_eviction_prompts()
 
+        # The scenario below is written against a 3-block pool: E takes two
+        # blocks, leaving exactly one, so F has to evict E's cached block. Ask
+        # for that pool size rather than hardcoding a byte budget, which would
+        # buy a different number of blocks for every mixer.
+        engine_kwargs = dict(
+            enable_prefix_caching=True, prefix_caching_mamba_gb=0.05, request_rounder=1
+        )
+        probe = self._build_engine(model, mamba_config, buffer_size_gb=0.002, **engine_kwargs)
+        buffer_size_gb = buffer_gb_for_kv_blocks(probe.context, 3)
+        del probe
+
         engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=True,
-            buffer_size_gb=0.002,
-            prefix_caching_mamba_gb=0.05,
-            request_rounder=1,
+            model, mamba_config, buffer_size_gb=buffer_size_gb, **engine_kwargs
         )
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
@@ -678,9 +764,8 @@ class TestMambaPrefixCachingE2E:
         token-768 snapshot is extracted and committed. A second request sharing the
         768-token prefix then restores that state and skips those blocks.
         """
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        mamba_config = ssm_state_config(model)
 
         device = torch.cuda.current_device()
         # 800-token prompt -> 3 full blocks (256/512/768) + a 32-token tail.

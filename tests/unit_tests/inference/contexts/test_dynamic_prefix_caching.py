@@ -1436,14 +1436,14 @@ def _make_cpu_mamba_slot_allocator(
         max_mamba_intermediate_states_per_step=1,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         kv_block_allocator=kv_allocator,
-        # A real context always sets these two together (see
-        # DynamicInferenceContext.__init__), and the allocator asserts their
-        # divisibility on construction. Mamba-only values: a model whose SSM
-        # layers all chunk at 128 aligns at 128.
+        # A real context always sets these together (see
+        # DynamicInferenceContext.__init__), and the allocator asserts the
+        # alignment against whichever mixers the model actually has. Mamba-only
+        # values: a model whose SSM layers all chunk at 128 aligns at 128, and
+        # carries no Gated Delta Product layers.
         mamba_chunk_size=128,
         ssm_chunk_alignment=128,
-        # Gated Delta Product prefix caching is unsupported; the allocator
-        # asserts this is 0 on construction (see MambaSlotAllocator.__init__).
+        has_mamba_layers=True,
         gdp_num_householder=0,
     )
     return MambaSlotAllocator(
