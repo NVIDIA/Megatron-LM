@@ -2468,6 +2468,7 @@ def _dsa_sparse_attention_forward_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_K: tl.constexpr,
     VALUE_DTYPE: tl.constexpr,
+    USE_DOT_MMA: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -2557,20 +2558,29 @@ def _dsa_sparse_attention_forward_kernel(
             mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
             other=0.0,
         )
-        if VALUE_DTYPE == 1:
-            probs_for_value = probs.to(tl.float16)
-        elif VALUE_DTYPE == 2:
-            probs_for_value = probs.to(tl.bfloat16)
+        if USE_DOT_MMA:
+            # Fast path (Hopper sm_90 and earlier): pad `probs` into a 16-row
+            # matrix and use tl.dot (tensor-core MMA) for the weighted value sum.
+            if VALUE_DTYPE == 1:
+                probs_for_value = probs.to(tl.float16)
+            elif VALUE_DTYPE == 2:
+                probs_for_value = probs.to(tl.bfloat16)
+            else:
+                probs_for_value = probs
+            dot_rows = tl.arange(0, 16)
+            probs_for_dot = tl.where(dot_rows[:, None] == 0, probs_for_value[None, :], 0.0)
+            if VALUE_DTYPE == 1:
+                probs_for_dot = probs_for_dot.to(tl.float16)
+            elif VALUE_DTYPE == 2:
+                probs_for_dot = probs_for_dot.to(tl.bfloat16)
+            value_acc = tl.dot(probs_for_dot, v, out_dtype=tl.float32)
+            out_acc += tl.sum(value_acc, axis=0)
         else:
-            probs_for_value = probs
-        dot_rows = tl.arange(0, 16)
-        probs_for_dot = tl.where(dot_rows[:, None] == 0, probs_for_value[None, :], 0.0)
-        if VALUE_DTYPE == 1:
-            probs_for_dot = probs_for_dot.to(tl.float16)
-        elif VALUE_DTYPE == 2:
-            probs_for_dot = probs_for_dot.to(tl.bfloat16)
-        value_acc = tl.dot(probs_for_dot, v, out_dtype=tl.float32)
-        out_acc += tl.sum(value_acc, axis=0)
+            # Blackwell (sm_100 / sm_103) workaround: the tl.dot above lowers
+            # through the TMEM/tcgen05 path and hits a Triton 3.7 automatic-
+            # warp-specialization / SSA dominance bug. Express the matvec as an
+            # elementwise reduction (no MMA, no warp-spec); numerically identical.
+            out_acc += tl.sum(probs[:, None] * v.to(tl.float32), axis=0)
 
     tl.store(
         output_ptr
@@ -3219,6 +3229,26 @@ def _dsa_teacher_scores_kernel(
         )
 
 
+_USE_DOT_MMA_CACHE: dict = {}
+
+
+def _use_dot_mma(device: torch.device) -> bool:
+    """Whether the sparse-attn fwd kernel may use the tl.dot (tensor-core MMA) path.
+
+    The padded-matvec tl.dot lowers through the TMEM/tcgen05 path on Blackwell
+    (sm_100 / sm_103) and hits a Triton 3.7 automatic-warp-specialization / SSA
+    dominance bug. Use the fast MMA path on Hopper (sm_90) and earlier; fall back
+    to an elementwise reduction on Blackwell and newer. Cached per device.
+    """
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _USE_DOT_MMA_CACHE.get(idx)
+    if cached is None:
+        major, _ = torch.cuda.get_device_capability(idx)
+        cached = major < 10
+        _USE_DOT_MMA_CACHE[idx] = cached
+    return cached
+
+
 def _triton_sparse_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3256,6 +3286,7 @@ def _triton_sparse_attention_forward(
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
         VALUE_DTYPE=_value_dtype_tag(value.dtype),
+        USE_DOT_MMA=_use_dot_mma(value.device),
     )
     return output
 

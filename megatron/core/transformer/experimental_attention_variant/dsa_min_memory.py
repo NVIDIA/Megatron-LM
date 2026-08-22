@@ -53,6 +53,16 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_simplified_input_norm_stats,
 )
 
+# Optional cuDNN DSA kernels, used to A/B the indexer (scores + top-k) against
+# the Triton min-memory kernels. Gated at runtime by `use_cudnn`.
+try:
+    from cudnn import DSA as _DSA
+except ImportError:
+    try:
+        from cudnn.deepseek_sparse_attention import DSA as _DSA
+    except ImportError:
+        _DSA = None
+
 
 _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE = 64
 
@@ -83,6 +93,12 @@ def _distributed_rank() -> int:
 
 
 class _DSATimingProfiler:
+    _MEDIAN_WINDOW = 5
+    # keyed by label: list of completed (fwd, bwd) pairs, each entry is (totals, counts, order)
+    _paired_history: Dict[str, List[Dict[str, Tuple[Dict[str, float], Dict[str, int], List[str]]]]] = {}
+    # keyed by label: pending forward data waiting to be paired with a backward
+    _pending_fwd: Dict[str, Tuple[Dict[str, float], Dict[str, int], List[str]]] = {}
+
     def __init__(
         self,
         enabled: bool,
@@ -130,6 +146,7 @@ class _DSATimingProfiler:
 
         synchronized_devices = set()
         totals = {}
+        counts = {}
         order = []
         for name, start, end, device in self.records:
             if device is not None:
@@ -142,12 +159,47 @@ class _DSATimingProfiler:
                 elapsed_ms = start
             if name not in totals:
                 totals[name] = 0.0
+                counts[name] = 0
                 order.append(name)
             totals[name] += elapsed_ms
+            counts[name] += 1
 
         label = f" {self.label}" if self.label else ""
-        parts = " ".join(f"{name}={totals[name]:.3f}ms" for name in order)
+        parts = " ".join(
+            f"{name}={totals[name]:.3f}ms(avg={totals[name]/counts[name]:.3f}ms)"
+            for name in order
+        )
         print(f"[rank{self.rank}] DSA min-memory {phase}{label}: {parts}", flush=True)
+
+        _csv_exclude = {"selected_index_scores_fwd_score_fallback"}
+
+        def _csv_values(p: str, t: Dict[str, float], c: Dict[str, int], o: List[str]) -> str:
+            cols = [n for n in o if n not in _csv_exclude]
+            return ",".join([p, self.label] + [f"{t[n]:.3f}" for n in cols] + [f"{t[n]/c[n]:.3f}" for n in cols])
+
+        def _csv_header(o: List[str]) -> str:
+            cols = [n for n in o if n not in _csv_exclude]
+            return ",".join(["phase", "label"] + [f"{n}_total_ms" for n in cols] + [f"{n}_avg_ms" for n in cols])
+
+        if phase == "forward":
+            _DSATimingProfiler._pending_fwd[self.label] = (totals, counts, order)
+        elif phase == "backward" and self.label in _DSATimingProfiler._pending_fwd:
+            fwd_data = _DSATimingProfiler._pending_fwd.pop(self.label)
+            pairs = _DSATimingProfiler._paired_history.setdefault(self.label, [])
+            pairs.append({"forward": fwd_data, "backward": (totals, counts, order)})
+            if len(pairs) >= _DSATimingProfiler._MEDIAN_WINDOW:
+                sorted_pairs = sorted(pairs, key=lambda p: p["forward"][0].get("forward_total", 0.0))
+                med = sorted_pairs[len(sorted_pairs) // 2]
+                ft, fc, fo = med["forward"]
+                bt, bc, bo = med["backward"]
+                print(
+                    f"[rank{self.rank}] CSV (median fwd of {_DSATimingProfiler._MEDIAN_WINDOW}):\n"
+                    f"{_csv_header(fo)}\n"
+                    f"{_csv_values('forward', ft, fc, fo)}\n"
+                    f"{_csv_values('backward', bt, bc, bo)}",
+                    flush=True,
+                )
+                _DSATimingProfiler._paired_history[self.label] = []
 
 
 @contextmanager
@@ -1056,6 +1108,276 @@ def _sort_topk_support_by_position(
     return torch.gather(scores, -1, order), torch.gather(indices, -1, order)
 
 
+def _cudnn_available_for_indexer(use_cudnn: bool, index_n_heads: int) -> bool:
+    # cuDNN indexer_forward_wrapper requires qhead_per_kv_head (= index_n_heads
+    # for MQA indexer K) in {32, 64}.
+    return use_cudnn and _DSA is not None and index_n_heads in (32, 64)
+
+
+def _cudnn_indexer_topk_full_k(
+    q_index: torch.Tensor,
+    weights: torch.Tensor,
+    k_index_full: torch.Tensor,
+    topk: int,
+    q_start: int,
+    q_end: int,
+    profile: Optional[_DSATimingProfiler] = None,
+    profile_suffix: str = "fwd",
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Compute indexer scores + global top-k for a query chunk via cuDNN.
+
+    Unlike the chunked Triton path (which merges top-k across key chunks), cuDNN
+    needs all scores for a query at once, so this scores the chunk against the
+    full causal key range in one shot. Returns (None, topk_indices); scores are
+    discarded by callers. topk_indices are global key positions, sorted ascending.
+    """
+    # q_index: (q_len, B, H, D); weights: (q_len, B, H); k_index_full: (k_total, B, D)
+    q_len, b, _, _ = q_index.shape
+    k_total = k_index_full.size(0)
+    q_bf = q_index.permute(1, 0, 2, 3).contiguous()                 # (B, q_len, H, D)
+    k_bf = k_index_full.permute(1, 0, 2).unsqueeze(2).contiguous()  # (B, k_total, 1, D)
+    w_bf = weights.permute(1, 0, 2).contiguous()                   # (B, q_len, H)
+    # The kernel applies its causal mask relative to the query block (row i attends
+    # keys <= i). Query-chunking means row i is really at absolute position q_start+i,
+    # so tell the kernel each batch's query-block start offset; otherwise every
+    # q_start>0 tile is masked as if it started at position 0.
+    q_causal_offsets = torch.full((b,), q_start, dtype=torch.int32, device=q_bf.device)
+    with _profile_record(profile, f"routing_cudnn_score_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_forward_cudnn"):
+            scores = _DSA.indexer_forward_wrapper(
+                q_bf, k_bf, w_bf, ratio=1, sm_scale=1.0, stream=None,
+                q_causal_offsets=q_causal_offsets,
+            )["scores"]                                            # (B, q_len, k_total) FP32
+    # Causal mask: query position q_start+i may attend to key positions <= q_start+i.
+    # Timed separately because the masked_fill + contiguous reshape of the
+    # (B, q_len, k_total) FP32 score tensor is a material cost the Triton path
+    # (which masks inside its fused kernel) does not pay here.
+    with _profile_record(profile, f"routing_cudnn_mask_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_mask_cudnn"):
+            invalid = _causal_invalid_mask(q_start, q_end, 0, k_total, scores.device)  # (q_len, k_total)
+            scores = scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
+            flat = scores.reshape(b * q_len, k_total).contiguous()
+            # The cuDNN varlen top-k treats seq_lens[r] as the count of valid (in
+            # this layout, contiguous-from-0) keys for row r. Causal masking leaves
+            # each row with only its finite prefix; passing a constant k_total makes
+            # the kernel scan the -inf tail and emit out-of-range indices (which then
+            # fault the downstream gather). Pass each row's true valid-key count.
+            seq_lens = torch.isfinite(flat).sum(dim=1).to(torch.int32)
+    with _profile_record(profile, f"routing_cudnn_topk_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_top_k_cudnn"):
+            topk_indices = _DSA.indexer_top_k_wrapper(
+                flat, seq_lens, top_k=topk, return_val=False, stream=None,
+            )["indices"].reshape(b, q_len, topk)
+            # Rows with fewer valid keys than top_k come back with -1 padding slots.
+            # Match the Triton path (which stores the first causally-invalid key
+            # position, query_pos+1): replace -1 with query_pos+1 clamped in range.
+            # It is in-range (no OOB in downstream gathers, incl. the wgrad kernel)
+            # and > query_pos, so _selected_causal_invalid_mask drops it from attention.
+            q_pos = (q_start + torch.arange(q_len, device=topk_indices.device)).view(1, q_len, 1)
+            pad_idx = torch.clamp(q_pos + 1, max=k_total - 1).to(topk_indices.dtype)
+            topk_indices = torch.where(topk_indices < 0, pad_idx, topk_indices)
+    with _profile_record(profile, f"routing_cudnn_sort_{profile_suffix}", q_index.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_sort_cudnn"):
+            topk_indices, _ = torch.sort(topk_indices.to(torch.long), dim=-1)
+    return None, topk_indices
+
+
+def _cudnn_selected_indexer_scores(
+    q_index: torch.Tensor,
+    weights: torch.Tensor,
+    full_k_index: torch.Tensor,
+    topk_indices: torch.Tensor,
+    q_start: int,
+    index_n_heads: int,
+    profile: Optional[_DSATimingProfiler] = None,
+    profile_suffix: str = "bwd",
+) -> torch.Tensor:
+    """Student top-k softmax p via cuDNN sparse_indexer_score_recompute_wrapper.
+
+    Returns p = softmax_i(sum_h ReLU(q_h . k_topk[i]) * w_h), shape (B, q_len, topk)
+    FP32, with causally-invalid top-k slots zeroed (via topk_length). This is the
+    softmax DISTRIBUTION, not the raw logits. Validated against the masked
+    softmax(selected_scores) reference to ~5e-7
+    (see experiments/validate_cudnn_student.py).
+
+    q_index:      (q_len, B, H, D)
+    weights:      (q_len, B, H)
+    full_k_index: (S_k,   B, D)     single shared indexer-K head
+    topk_indices: (B, q_len, topk)  per-batch-local key positions in [0, S_k)
+    """
+    q_bf = q_index.permute(1, 0, 2, 3).contiguous()          # (B, q_len, H, D)
+    k_bf = full_k_index.permute(1, 0, 2).contiguous()        # (B, S_k, D) 3-D MQA
+    w_bf = weights.permute(1, 0, 2).contiguous()             # (B, q_len, H)
+    topk_i32 = topk_indices.to(torch.int32).contiguous()     # wrapper requires int32
+    # Per-query count of causally-valid top-k slots (invalid slots sort to the tail,
+    # so a length-based mask matches the reference's -inf masking of future keys).
+    valid = ~_selected_causal_invalid_mask(topk_indices, q_start)  # (B, q_len, topk)
+    topk_length = valid.sum(dim=-1).to(torch.int32).contiguous()  # (B, q_len)
+    with _profile_record(
+        profile, f"selected_index_scores_cudnn_{profile_suffix}", q_index.device
+    ):
+        with torch.cuda.nvtx.range("dsa_mm_sparse_indexer_score_recompute_cudnn"):
+            out = _DSA.sparse_indexer_score_recompute_wrapper(
+                q_bf,
+                k_bf,
+                w_bf,
+                topk_i32,
+                qhead_per_kv_head=index_n_heads,
+                topk_length=topk_length,
+                topk_indices_global=False,
+                stream=None,
+            )
+    return out["predict"]                                     # (B, q_len, topk) FP32
+
+
+def _cudnn_indexer_backward_wgrad(
+    hidden_states: torch.Tensor,
+    q_start: int,
+    q_end: int,
+    topk_indices: torch.Tensor,
+    q_index: torch.Tensor,
+    weights: torch.Tensor,
+    full_k_index: torch.Tensor,
+    teacher: torch.Tensor,
+    student_p: torch.Tensor,
+    linear_k_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    has_k_norm_bias: bool,
+    k_norm_eps: float,
+    index_n_heads: int,
+    index_head_dim: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+    use_indexer_rope: bool,
+    use_hadamard: bool,
+    grad_linear_q_weight: Optional[torch.Tensor],
+    grad_linear_k_weight: Optional[torch.Tensor],
+    grad_k_norm_weight: Optional[torch.Tensor],
+    grad_k_norm_bias: Optional[torch.Tensor],
+    grad_linear_weights_weight: Optional[torch.Tensor],
+    loss_coeff: float,
+    grad_loss,
+    profile: Optional[_DSATimingProfiler] = None,
+) -> bool:
+    """Fused indexer WGRAD via cuDNN indexer_backward_wrapper + the transform tails.
+
+    Replaces the KL-grad step + triton_selected_index_scores_backward + the selected
+    K tail. The wrapper takes teacher/student DISTRIBUTIONS (t, p) and returns
+    activation grads d_index_q (B,q,H,D), d_weights (B,q,H), d_index_k (B,S_k,D full
+    scattered). Those feed the shared Q/weights tails and a full-sequence K tail.
+
+    Only the standard indexer (indexer_input_norm=None) is supported here; returns
+    False to fall back if the cuDNN kernel or the k-norm triton path is unavailable.
+
+    Validated:
+      - wrapper outputs: experiments/validate_cudnn_indexer_backward.py
+      - K-tail equivalence: experiments/validate_cudnn_ktail.py
+    """
+    if not hasattr(_DSA, "indexer_backward_wrapper"):
+        return False
+    seq_k = hidden_states.size(0)
+    batch = hidden_states.size(1)
+
+    q_bf = q_index.permute(1, 0, 2, 3).contiguous()          # (B, q, H, D)
+    k_bf = full_k_index.permute(1, 0, 2).contiguous()        # (B, S_k, D)
+    w_bf = weights.permute(1, 0, 2).contiguous()             # (B, q, H)
+    topk_i32 = topk_indices.to(torch.int32).contiguous()
+    attn_score = teacher.contiguous().clone()                # consumed in-place -> clone
+    index_score = student_p.contiguous().clone()             # consumed in-place -> clone
+
+    with _profile_record(profile, "indexer_loss_bwd_cudnn_wgrad", hidden_states.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_backward_cudnn"):
+            out = _DSA.indexer_backward_wrapper(
+                q_bf,
+                w_bf,
+                k_bf,
+                attn_score,
+                index_score,
+                topk_i32,
+                sm_scale=1.0,
+                loss_coeff=loss_coeff,
+                grad_loss=grad_loss,
+                topk_indices_global=False,
+            )
+    d_index_q = out["d_index_q"]                             # (B, q, H, D)
+    d_weights = out["d_weights"]                             # (B, q, H)
+    d_index_k = out["d_index_k"]                             # (B, S_k, D) full-scattered
+
+    hidden_tile = hidden_states[q_start:q_end]
+
+    # ---- Q tail (shared with the selected path) ----
+    with _profile_record(profile, "indexer_loss_bwd_native_q_wgrad", hidden_states.device):
+        if grad_linear_q_weight is not None:
+            grad_q_index = d_index_q.permute(1, 0, 2, 3).contiguous()   # (q, B, H, D)
+            query_positions = torch.arange(
+                q_start, q_end, device=hidden_states.device, dtype=torch.long
+            )
+            grad_q_linear = _backward_indexer_transform(
+                grad_q_index, query_positions, index_head_dim, index_rotary_dim,
+                rotary_pos_emb, rotary_interleaved, use_indexer_rope, use_hadamard,
+            )
+            grad_q_linear = grad_q_linear.reshape(q_end - q_start, batch, -1)
+            _accumulate_linear_weight_grad(grad_linear_q_weight, grad_q_linear, hidden_tile)
+
+        # ---- weights tail ----
+        if grad_linear_weights_weight is not None:
+            grad_weights = d_weights.permute(1, 0, 2)                   # (q, B, H)
+            weights_scale = (index_n_heads ** -0.5) * (index_head_dim ** -0.5)
+            _accumulate_linear_weight_grad(
+                grad_linear_weights_weight, grad_weights * weights_scale, hidden_tile
+            )
+
+    # ---- full-sequence K tail (d_index_k already scattered to S_k) ----
+    if (
+        grad_linear_k_weight is not None
+        or grad_k_norm_weight is not None
+        or (has_k_norm_bias and grad_k_norm_bias is not None)
+    ):
+        with _profile_record(
+            profile, "indexer_loss_bwd_native_k_ln_wgrad", hidden_states.device
+        ):
+            grad_k_index = d_index_k.permute(1, 0, 2).contiguous()     # (S_k, B, D)
+            key_positions = torch.arange(
+                0, seq_k, device=hidden_states.device, dtype=torch.long
+            )
+            grad_k_norm = _backward_indexer_transform(
+                grad_k_index, key_positions, index_head_dim, index_rotary_dim,
+                rotary_pos_emb, rotary_interleaved, use_indexer_rope, use_hadamard,
+            )
+            k_linear_full = _linear(hidden_states, linear_k_weight)     # (S_k, B, D)
+            # triton_k_ln_backward_prepare needs 4-D (batch, query, topk, D); treat
+            # the full sequence as topk=1 -> (S_k, B, 1, D).
+            grad_k_norm_4d = grad_k_norm.reshape(seq_k, batch, 1, index_head_dim)
+            k_linear_4d = k_linear_full.reshape(seq_k, batch, 1, index_head_dim)
+            grad_k_linear_dtype = (
+                torch.float32 if hidden_states.dtype == torch.float32 else hidden_states.dtype
+            )
+            prepared = triton_k_ln_backward_prepare(
+                grad_k_norm_4d, k_linear_4d, k_norm_weight, k_norm_eps,
+                grad_k_norm_weight, grad_k_norm_bias if has_k_norm_bias else None,
+                grad_k_linear_dtype,
+            )
+            if prepared is None:
+                return False
+            grad_k_linear, partial_norm_weight, partial_norm_bias = prepared
+            grad_k_linear = grad_k_linear.reshape(seq_k, batch, index_head_dim)
+            if grad_linear_k_weight is not None:
+                _accumulate_linear_weight_grad(
+                    grad_linear_k_weight, grad_k_linear, hidden_states
+                )
+            # triton_k_ln_backward_prepare returns PARTIAL norm-weight/bias sums;
+            # reduce them into the final k-norm grads (mirrors :2197).
+            triton_k_ln_param_reduce(
+                partial_norm_weight,
+                partial_norm_bias,
+                grad_k_norm_weight,
+                grad_k_norm_bias if has_k_norm_bias else None,
+            )
+    return True
+
+
 def _topk_index_tile(
     hidden_states: torch.Tensor,
     q_start: int,
@@ -1081,26 +1403,121 @@ def _topk_index_tile(
     profile: Optional[_DSATimingProfiler] = None,
     profile_suffix: str = "fwd",
     full_k_index: Optional[torch.Tensor] = None,
+    use_cudnn: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    with _profile_record(profile, f"routing_q_project_{profile_suffix}", hidden_states.device):
-        q_index, weights = _project_q_index_tile(
+    # NVTX range over the whole indexer tile — the point where the Triton and
+    # cuDNN codepaths diverge — so nsys shows one comparable "whole indexer"
+    # range on both sides; the per-op ranges (score/topk/mask/merge/sort) nest
+    # inside it.
+    with torch.cuda.nvtx.range("dsa_mm_topk_index_tile"):
+        return _topk_index_tile_impl(
             hidden_states,
             q_start,
             q_end,
             linear_q_weight,
+            linear_k_weight,
+            k_norm_weight,
+            k_norm_bias,
+            has_k_norm_bias,
             linear_weights_weight,
+            k_norm_eps,
             index_n_heads,
             index_head_dim,
+            index_topk,
             index_rotary_dim,
             rotary_pos_emb,
             rotary_interleaved,
             use_indexer_rope,
             use_hadamard,
-            indexer_input_norm,
-            input_norm_stats,
+            key_chunk_size,
+            profile=profile,
+            profile_suffix=profile_suffix,
+            full_k_index=full_k_index,
+            use_cudnn=use_cudnn,
+            indexer_input_norm=indexer_input_norm,
+            input_norm_stats=input_norm_stats,
         )
+
+
+def _topk_index_tile_impl(
+    hidden_states: torch.Tensor,
+    q_start: int,
+    q_end: int,
+    linear_q_weight: torch.Tensor,
+    linear_k_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    has_k_norm_bias: bool,
+    linear_weights_weight: torch.Tensor,
+    k_norm_eps: float,
+    index_n_heads: int,
+    index_head_dim: int,
+    index_topk: int,
+    index_rotary_dim: int,
+    rotary_pos_emb,
+    rotary_interleaved: bool,
+    use_indexer_rope: bool,
+    use_hadamard: bool,
+    key_chunk_size: int,
+    profile: Optional[_DSATimingProfiler] = None,
+    profile_suffix: str = "fwd",
+    full_k_index: Optional[torch.Tensor] = None,
+    use_cudnn: bool = False,
+    indexer_input_norm=None,
+    input_norm_stats: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    with _profile_record(profile, f"routing_q_project_{profile_suffix}", hidden_states.device):
+        with torch.cuda.nvtx.range("dsa_mm_indexer_q_project"):
+            q_index, weights = _project_q_index_tile(
+                hidden_states,
+                q_start,
+                q_end,
+                linear_q_weight,
+                linear_weights_weight,
+                index_n_heads,
+                index_head_dim,
+                index_rotary_dim,
+                rotary_pos_emb,
+                rotary_interleaved,
+                use_indexer_rope,
+                use_hadamard,
+            )
     causal_key_limit = min(q_end, hidden_states.size(0))
     topk = min(index_topk, causal_key_limit)
+
+    # cuDNN indexer path: score the query chunk against the full causal key
+    # range and pick global top-k in one shot (cuDNN can't do the incremental
+    # per-key-chunk merge the Triton path uses). Used to A/B against Triton.
+    if _cudnn_available_for_indexer(use_cudnn, index_n_heads):
+        if full_k_index is None:
+            with _profile_record(
+                profile, f"routing_k_project_{profile_suffix}", hidden_states.device
+            ):
+                with torch.cuda.nvtx.range("dsa_mm_indexer_k_project"):
+                    k_index_full = _project_k_index_block(
+                        hidden_states,
+                        0,
+                        causal_key_limit,
+                        linear_k_weight,
+                        k_norm_weight,
+                        k_norm_bias,
+                        has_k_norm_bias,
+                        k_norm_eps,
+                        index_head_dim,
+                        index_rotary_dim,
+                        rotary_pos_emb,
+                        rotary_interleaved,
+                        use_indexer_rope,
+                        use_hadamard,
+                    )
+        else:
+            k_index_full = full_k_index[:causal_key_limit]
+        running_scores, running_indices = _cudnn_indexer_topk_full_k(
+            q_index, weights, k_index_full, topk, q_start, q_end,
+            profile=profile, profile_suffix=profile_suffix,
+        )
+        return running_scores, running_indices, q_index, weights
+
     running_scores = None
     running_indices = None
     for k_start in range(0, causal_key_limit, key_chunk_size):
@@ -1109,52 +1526,64 @@ def _topk_index_tile(
             with _profile_record(
                 profile, f"routing_k_project_{profile_suffix}", hidden_states.device
             ):
-                k_index = _project_k_index_block(
-                    hidden_states,
-                    k_start,
-                    k_end,
-                    linear_k_weight,
-                    k_norm_weight,
-                    k_norm_bias,
-                    has_k_norm_bias,
-                    k_norm_eps,
-                    index_head_dim,
-                    index_rotary_dim,
-                    rotary_pos_emb,
-                    rotary_interleaved,
-                    use_indexer_rope,
-                    use_hadamard,
-                    indexer_input_norm,
-                    input_norm_stats,
-                )
+                with torch.cuda.nvtx.range("dsa_mm_indexer_k_project"):
+                    k_index = _project_k_index_block(
+                        hidden_states,
+                        k_start,
+                        k_end,
+                        linear_k_weight,
+                        k_norm_weight,
+                        k_norm_bias,
+                        has_k_norm_bias,
+                        k_norm_eps,
+                        index_head_dim,
+                        index_rotary_dim,
+                        rotary_pos_emb,
+                        rotary_interleaved,
+                        use_indexer_rope,
+                        use_hadamard,
+                        indexer_input_norm,
+                        input_norm_stats,
+                    )
+
         else:
             with _profile_record(
                 profile, f"routing_k_cache_{profile_suffix}", hidden_states.device
             ):
-                k_index = full_k_index[k_start:k_end]
+                with torch.cuda.nvtx.range("dsa_mm_indexer_k_cache"):
+                    k_index = full_k_index[k_start:k_end]
         block_topk = min(topk, k_end - k_start)
         with _profile_record(
             profile, f"routing_block_score_topk_{profile_suffix}", hidden_states.device
         ):
-            triton_topk = triton_topk_index_block(
-                q_index, weights, k_index, block_topk, q_start, k_start
-            )
+            # Triton fuses indexer scores + top-k into one kernel; this single
+            # NVTX range is the counterpart to the cuDNN path's separate
+            # dsa_mm_indexer_forward_cudnn + dsa_mm_indexer_top_k_cudnn ranges.
+            with torch.cuda.nvtx.range("dsa_mm_indexer_topk_triton"):
+                triton_topk = triton_topk_index_block(
+                    q_index, weights, k_index, block_topk, q_start, k_start
+                )
             if triton_topk is None:
-                block_scores = _index_scores_for_block(q_index, weights, k_index)
-                invalid = _causal_invalid_mask(q_start, q_end, k_start, k_end, block_scores.device)
-                block_scores = block_scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
-                block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
-                block_indices = block_indices + k_start
+                with torch.cuda.nvtx.range("dsa_mm_indexer_topk_torch"):
+                    block_scores = _index_scores_for_block(q_index, weights, k_index)
+                    invalid = _causal_invalid_mask(
+                        q_start, q_end, k_start, k_end, block_scores.device
+                    )
+                    block_scores = block_scores.masked_fill(invalid.unsqueeze(0), float("-inf"))
+                    block_scores, block_indices = block_scores.topk(block_topk, dim=-1)
+                    block_indices = block_indices + k_start
             else:
                 block_scores, block_indices = triton_topk
         with _profile_record(profile, f"routing_merge_topk_{profile_suffix}", hidden_states.device):
-            running_scores, running_indices = _merge_topk(
-                running_scores, running_indices, block_scores, block_indices, topk
-            )
+            with torch.cuda.nvtx.range("dsa_mm_indexer_merge"):
+                running_scores, running_indices = _merge_topk(
+                    running_scores, running_indices, block_scores, block_indices, topk
+                )
     with _profile_record(profile, f"routing_final_sort_{profile_suffix}", hidden_states.device):
-        running_scores, running_indices = _sort_topk_support_by_position(
-            running_scores, running_indices
-        )
+        with torch.cuda.nvtx.range("dsa_mm_indexer_sort"):
+            running_scores, running_indices = _sort_topk_support_by_position(
+                running_scores, running_indices
+            )
     return running_scores, running_indices, q_index, weights
 
 
@@ -2381,6 +2810,7 @@ def _forward_min_memory_impl(
     routing_topk_cache: Optional[list] = None,
     selected_scores_cache: Optional[list] = None,
     full_k_index: Optional[torch.Tensor] = None,
+    use_cudnn: bool = False,
     indexer_input_norm=None,
     input_norm_stats: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2419,6 +2849,7 @@ def _forward_min_memory_impl(
                 profile=profile,
                 profile_suffix="fwd",
                 full_k_index=full_k_index,
+                use_cudnn=use_cudnn,
             )
         if routing_topk_cache is not None:
             routing_topk_cache.append(topk_indices)
@@ -3009,6 +3440,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
         cache_indexer_k: bool = False,
         cache_selected_scores: bool = False,
         use_triton: bool = True,
+        use_cudnn: bool = False,
         indexer_input_norm=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
@@ -3075,6 +3507,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                         routing_topk_cache=routing_topk_cache,
                         selected_scores_cache=selected_scores_cache,
                         full_k_index=full_k_index,
+                        use_cudnn=use_cudnn,
                         indexer_input_norm=indexer_input_norm,
                         input_norm_stats=input_norm_stats,
                     )
@@ -3122,6 +3555,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
             tuple(selected_scores_cache) if selected_scores_cache is not None else None
         )
         ctx.use_triton = use_triton
+        ctx.use_cudnn = use_cudnn
         ctx.indexer_input_norm = indexer_input_norm
         return output, indexer_loss
 
@@ -3219,6 +3653,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                 profile=profile,
                                 profile_suffix="bwd",
                                 full_k_index=full_k_index,
+                                use_cudnn=ctx.use_cudnn,
                             )
 
                 triton_attention_done = False
@@ -3333,6 +3768,25 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                         if cached_selected_scores is not None
                         else None
                     )
+                    # cuDNN student score-recompute: gated on dsa_use_cudnn (via
+                    # _cudnn_available_for_indexer) and the cached full indexer-K.
+                    # When on, the student softmax p is computed by cuDNN and the
+                    # Triton selected_scores logits are skipped (the WGRAD uses the
+                    # precomputed grad, not the logits, when grad is non-None).
+                    use_cudnn_student = (
+                        _cudnn_available_for_indexer(ctx.use_cudnn, ctx.index_n_heads)
+                        and full_k_index is not None
+                        and hasattr(_DSA, "sparse_indexer_score_recompute_wrapper")
+                    )
+                    # cuDNN fused indexer backward: computes the KL grad AND the
+                    # score-backward on-device, producing the indexer WGRAD directly.
+                    # Supersedes the student grad_selected_scores + Triton WGRAD path.
+                    use_cudnn_indexer_backward = (
+                        use_cudnn_student
+                        and hasattr(_DSA, "indexer_backward_wrapper")
+                        and ctx.indexer_input_norm is None
+                    )
+                    indexer_backward_done = False
 
                     with _profile_record(profile, "indexer_loss_bwd_prepare", query.device):
                         with torch.no_grad():
@@ -3396,6 +3850,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                 if (
                                     selected_scores is None
                                     and selected_k_index_for_native is not None
+                                    and not use_cudnn_student
                                 ):
                                     selected_scores = _selected_index_scores_from_projected(
                                         q_index,
@@ -3407,7 +3862,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                         profile_prefix="indexer_loss_bwd_prepare",
                                     )
                             else:
-                                if selected_scores is None:
+                                if selected_scores is None and not use_cudnn_student:
                                     selected_scores = _selected_index_scores_tile_chunked(
                                         hidden_states.detach(),
                                         q_start,
@@ -3447,18 +3902,85 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                             with _profile_record(
                                 profile, "indexer_loss_bwd_score_kl_grad", query.device
                             ):
-                                grad_selected_scores = triton_indexer_loss_grad(
-                                    selected_scores, teacher, scale
-                                )
-                                if grad_selected_scores is None:
-                                    student = torch.nn.functional.softmax(
-                                        selected_scores, dim=-1, dtype=torch.float32
+                                if use_cudnn_indexer_backward:
+                                    # cuDNN fuses the KL grad + score-backward, writing
+                                    # the indexer WGRAD directly (no grad_selected_scores).
+                                    student = _cudnn_selected_indexer_scores(
+                                        q_index,
+                                        weights,
+                                        full_k_index,
+                                        topk_indices,
+                                        q_start,
+                                        ctx.index_n_heads,
+                                        profile=profile,
                                     )
-                                    teacher_over_student = teacher * student / (student + 1e-10)
-                                    grad_selected_scores = (
-                                        student * teacher_over_student.sum(dim=-1, keepdim=True)
-                                    ) - teacher_over_student
-                                    grad_selected_scores = grad_selected_scores * scale
+                                    indexer_backward_done = _cudnn_indexer_backward_wgrad(
+                                        hidden_states,
+                                        q_start,
+                                        q_end,
+                                        topk_indices,
+                                        q_index,
+                                        weights,
+                                        full_k_index,
+                                        teacher,
+                                        student,
+                                        linear_k_weight,
+                                        k_norm_weight,
+                                        k_norm_bias,
+                                        ctx.has_k_norm_bias,
+                                        ctx.k_norm_eps,
+                                        ctx.index_n_heads,
+                                        ctx.index_head_dim,
+                                        ctx.index_rotary_dim,
+                                        ctx.rotary_pos_emb,
+                                        ctx.rotary_interleaved,
+                                        ctx.use_indexer_rope,
+                                        ctx.use_hadamard,
+                                        grad_linear_q_weight,
+                                        grad_linear_k_weight,
+                                        grad_k_norm_weight,
+                                        grad_k_norm_bias,
+                                        grad_linear_weights_weight,
+                                        ctx.loss_coeff,
+                                        grad_indexer_loss,
+                                        profile=profile,
+                                    )
+                                if indexer_backward_done:
+                                    pass  # WGRAD written by the fused helper below
+                                elif use_cudnn_student:
+                                    # cuDNN returns the student softmax p directly, so the
+                                    # KL gradient is (p - teacher) * scale (see p - t).
+                                    student = _cudnn_selected_indexer_scores(
+                                        q_index,
+                                        weights,
+                                        full_k_index,
+                                        topk_indices,
+                                        q_start,
+                                        ctx.index_n_heads,
+                                        profile=profile,
+                                    )
+                                    grad_selected_scores = (student - teacher) * scale
+                                else:
+                                    grad_selected_scores = triton_indexer_loss_grad(
+                                        selected_scores, teacher, scale
+                                    )
+                                    if grad_selected_scores is None:
+                                        student = torch.nn.functional.softmax(
+                                            selected_scores, dim=-1, dtype=torch.float32
+                                        )
+                                        teacher_over_student = (
+                                            teacher * student / (student + 1e-10)
+                                        )
+                                        grad_selected_scores = (
+                                            student
+                                            * teacher_over_student.sum(dim=-1, keepdim=True)
+                                        ) - teacher_over_student
+                                        grad_selected_scores = grad_selected_scores * scale
+
+                    if indexer_backward_done:
+                        # The cuDNN fused indexer backward already accumulated the
+                        # indexer WGRAD for this tile; skip the Triton WGRAD loop.
+                        continue
 
                     q_index_for_grads = None
                     weights_for_grads = None
@@ -3521,7 +4043,10 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
                                 ),
                                 (
                                     selected_scores[..., topk_start:topk_end]
-                                    if grad_selected_scores is not None
+                                    if (
+                                        grad_selected_scores is not None
+                                        and selected_scores is not None
+                                    )
                                     else selected_scores
                                 ),
                                 (
@@ -3698,6 +4223,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # indexer_input_norm
         )
 
 
@@ -4767,6 +5293,7 @@ def dsa_min_memory_gqa_forward_only(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
+    use_cudnn: bool = False,
     simplified_input_norm=None,
 ) -> torch.Tensor:
     """Run min-memory DSA-GQA for no-grad validation/eval forward passes."""
@@ -4892,6 +5419,7 @@ def dsa_min_memory_gqa_forward_only(
                 rotary_interleaved=rotary_interleaved,
                 profile=profile,
                 full_k_index=full_k_index,
+                use_cudnn=use_cudnn,
                 indexer_input_norm=simplified_input_norm,
                 input_norm_stats=input_norm_stats,
             )
@@ -5915,6 +6443,7 @@ def dsa_min_memory_gqa(
     profile_rank: int = 0,
     profile_label: str = "",
     use_triton: bool = True,
+    use_cudnn: bool = False,
     simplified_input_norm=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the minimum-activation DSA-GQA training backend."""
@@ -5991,5 +6520,6 @@ def dsa_min_memory_gqa(
         cache_indexer_k,
         cache_selected_scores,
         use_triton,
+        use_cudnn,
         simplified_input_norm,
     )

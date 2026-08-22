@@ -4135,6 +4135,11 @@ def _add_experimental_attention_variant_args(parser):
         action='store_true',
         help='Apply Hadamard rotation to DSA indexer queries and keys.',
     )
+    _maybe_add_argument(
+        '--dsa-use-cudnn',
+        action='store_true',
+        help='Use cuDNN DSA kernels where available (requires nvidia-cudnn-frontend with DSA support).',
+    )
     # Linear attention
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'

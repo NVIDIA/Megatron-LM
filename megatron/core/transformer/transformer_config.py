@@ -508,6 +508,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_hadamard: bool = False
     """Whether to apply Hadamard rotation to DSA indexer queries and keys."""
 
+    dsa_use_cudnn: bool = False
+    """Whether to use cuDNN DSA kernels where available (requires nvidia-cudnn-frontend with DSA support)."""
+
     ####################
     # linear attention
     ####################
