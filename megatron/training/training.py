@@ -90,6 +90,7 @@ from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
+    get_indexer_lr_for_logging,
 )
 from megatron.core.parallel_state import (
     create_all_gather_groups,
@@ -119,7 +120,10 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossLoggingHelper,
+    DSAMainAttentionAuxLossLoggingHelper,
+)
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -183,6 +187,7 @@ from .utils import (
     append_to_progress_log,
     calc_dsa_split_grad_norms,
     calc_dsa_split_grad_num_zeros,
+    get_model_to_optimizer_param_map,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
     is_last_rank,

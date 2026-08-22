@@ -286,11 +286,14 @@ class DSAIndexerLossLoggingHelper:
     @staticmethod
     def save_loss_to_tracker(
         loss: torch.Tensor,
-        raw_loss: Optional[torch.Tensor],
         layer_number: int,
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        # This branch adds raw (pre-coefficient) KL tracking. Upstream call sites --
+        # e.g. the fused-kernel path -- do not supply it, and the body already guards
+        # on None, so it is optional and appended to keep upstream's positional order.
+        raw_loss: Optional[torch.Tensor] = None,
     ):
         """Save the indexer loss for logging.
 
@@ -891,6 +894,7 @@ def fwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    use_cudnn: bool = False,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(
@@ -903,6 +907,7 @@ def fwd_fused_indexer_loss_naive(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
         use_relu=use_relu,
+        use_cudnn=use_cudnn,
     )
 
     indexer_loss = compute_dsa_indexer_loss(
@@ -1154,6 +1159,10 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "query_valid_rows",
     "calculate_per_token_loss",
     "use_relu",
+    # Added by this branch alongside the cuDNN indexer dispatch. It is a plain bool
+    # input to forward(), so backward must still return a (None) gradient slot for it
+    # or autograd raises "returned an incorrect number of gradients".
+    "use_cudnn",
 )
 
 
