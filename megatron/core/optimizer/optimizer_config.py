@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -429,6 +430,11 @@ class OptimizerConfig:
                 "overlap_param_gather_with_optimizer_step is not supported with "
                 "reuse_grad_buf_for_mxfp8_param_ag."
             )
+
+        if self.optimizer_cuda_graph:
+            assert (
+                not math.isfinite(self.grad_norm_skip_threshold)
+            ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
 
         if self.use_precision_aware_optimizer:
             assert (
