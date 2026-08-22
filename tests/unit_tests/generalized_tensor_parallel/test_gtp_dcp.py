@@ -55,7 +55,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
 from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint  # noqa: E402
-from megatron.core.utils import get_pg_size, make_tp_sharded_tensor_for_checkpoint  # noqa: E402
+from megatron.core.utils import (  # noqa: E402
+    get_pg_rank,
+    get_pg_size,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
     _requires_mxfp8,
     _torchrun_dist_init,
@@ -553,7 +557,14 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
     num_global_experts = ep_size * num_gemms  # 2
     global_expert_idx = ep_rank * num_gemms  # + gemm_idx (0)
 
-    weight = _make_gtp_shard(per_expert_out, in_features, egtp_remat_group)
+    # A routed-expert weight replicates over EXPERT DP, not dense dp_cp: with EP=2 the expert
+    # replicas of rank 0's shard are its expt_dp peers ([0,2] here), so the writer election must
+    # run over that group. Non-grouped expert linears stamp it from pg_collection.expt_dp.
+    expt_dp_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    weight = _make_gtp_shard(
+        per_expert_out, in_features, egtp_remat_group, replica_group=expt_dp_group
+    )
+    weight.allreduce = False  # routed-expert tag, as set by _set_expert_parameter_attributes
     assert weight.shape == (
         per_shard_out,
         in_features,
@@ -583,6 +594,12 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
     assert (
         st.global_offset[1] == egtp_rank * per_shard_out
     ), f"rank={rank} EGTP_remat axis-1 offset {st.global_offset[1]} != {egtp_rank * per_shard_out}"
+    # Writer elected over EXPERT DP: rank 0 of [0,2] / [1,3], i.e. ranks 0 and 1 win. Electing
+    # over dense dp_cp instead would misalign the election with the real replica sets.
+    assert st.replica_id[2] == get_pg_rank(expt_dp_group), (
+        f"rank={rank} expert replica coord {st.replica_id[2]} != "
+        f"{get_pg_rank(expt_dp_group)} (elected over the dense group instead of expt_dp?)"
+    )
 
 
 def _worker_helper_embedding_offsets(rank, world_size, port):

@@ -1680,7 +1680,7 @@ class TEColumnParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "dp_cp", None),
+            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
         )
 
         # Set proper partition_stride
@@ -1945,7 +1945,7 @@ class TERowParallelLinear(TELinear):
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
-            gtp_replica_group=getattr(pg_collection, "dp_cp", None),
+            gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -2491,7 +2491,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 is_expert=True,
                 is_grouped=True,
                 out_split_size=tp_size if parallel_mode == "column" else 1,
-                replica_group=getattr(pg_collection, "dp_cp", None),
+                replica_group=getattr(pg_collection, "expt_dp", None),
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:

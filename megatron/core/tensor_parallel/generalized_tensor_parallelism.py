@@ -2560,16 +2560,19 @@ def reset_gtp_state():
 def gtp_replica_rank(param, explicit_group=None):
     """Rank of this process among the true replicas of ``param``'s GTP shard.
 
-    The replicas of a GTP shard are the DP x CP peers EXCLUDING the gtp_remat axis (gtp_remat
-    peers hold *different* shards). Electing over the gtp_remat-inclusive group would leave every
-    shard but one without a writer, so the group must be known to exclude it. Resolution order:
+    The replicas of a GTP shard are the data-parallel peers EXCLUDING the gtp_remat axis
+    (gtp_remat peers hold *different* shards). Electing over a gtp_remat-inclusive group would
+    leave every shard but one without a writer, so the group must be known to exclude it. Which
+    data-parallel axis applies depends on the param: a routed-expert weight (``allreduce=False``)
+    is replicated over EXPERT DP (``expt_dp``), a dense weight over ``dp_cp``. Resolution order:
 
     1. ``explicit_group`` passed by the caller,
-    2. ``param.gtp_replica_group``, stamped at wrap time from the caller's ``pg_collection.dp_cp``,
-    3. the MPU globals (pre-existing behavior for callers that pass no collection).
+    2. ``param.gtp_replica_group``, stamped at wrap time from the caller's collection
+       (``expt_dp`` for expert modules, ``dp_cp`` otherwise),
+    3. the MPU globals, picking the expert or dense axis by the param's ``allreduce`` tag.
 
     A caller on an explicit process-group grid that never initializes ``parallel_state`` must
-    supply ``dp_cp`` in its collection; step 3 cannot serve it and raises instead of guessing.
+    supply that group in its collection; step 3 cannot serve it and raises instead of guessing.
     """
     from megatron.core.utils import get_pg_rank  # noqa: E402
 
@@ -2582,6 +2585,8 @@ def gtp_replica_rank(param, explicit_group=None):
     from megatron.core import parallel_state  # noqa: E402
 
     if parallel_state.is_initialized():
+        if not getattr(param, 'allreduce', True):  # routed-expert weight
+            return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
         return parallel_state.get_data_parallel_rank(
             with_context_parallel=True, with_gtp_remat=False
         )

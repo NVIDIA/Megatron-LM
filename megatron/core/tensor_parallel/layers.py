@@ -1094,7 +1094,10 @@ class ColumnParallelLinear(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                replica_group=getattr(pg_collection, "dp_cp", None),
+                # Expert weights replicate over EXPERT dp; dense over dp_cp.
+                replica_group=getattr(
+                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                ),
             )
             self.gtp_remat_size = gtp_remat_group.size()
 
@@ -1463,7 +1466,10 @@ class RowParallelLinear(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                replica_group=getattr(pg_collection, "dp_cp", None),
+                # Expert weights replicate over EXPERT dp; dense over dp_cp.
+                replica_group=getattr(
+                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                ),
             )
             self.gtp_remat_size = gtp_remat_group.size()
 
