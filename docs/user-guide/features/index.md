@@ -24,4 +24,5 @@ paged_stash
 tokenizers
 megatron_energon
 megatron_rl
+megatron_inference
 ```
