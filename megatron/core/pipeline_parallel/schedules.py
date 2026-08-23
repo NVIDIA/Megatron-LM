@@ -709,6 +709,17 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     return pg_collection
 
 
+def _reset_activation_offload(
+    pg_collection: Union[ProcessGroupCollection, MultiModuleProcessGroupCollection],
+) -> None:
+    """Reset activation offload state for single-model and MIMO language ranks."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        if not pg_collection.has_language_model():
+            return
+        pg_collection = pg_collection.get_language_model_collection()
+    off_interface.reset(process_group=pg_collection.tp_dp_cp)
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -860,7 +871,7 @@ def forward_backward_no_pipelining(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Reset all_gather_pipeline bucket status before next validation iteration
     if forward_only:
         for model_chunk in [model]:
@@ -2086,7 +2097,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2255,6 +2266,13 @@ def forward_backward_pipelining_without_interleaving(
 
     disable_grad_sync()
 
+    grad_sync_first_stage = p2p_communicator.is_pp_first_stage
+    if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+        grad_sync_first_stage = all(
+            p2p_communicator.is_module_pp_first_stage(module_name)
+            for module_name in p2p_communicator.rank_module_map
+        )
+
     # Compute number of warmup microbatches.
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
@@ -2412,7 +2430,7 @@ def forward_backward_pipelining_without_interleaving(
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
             if num_warmup_microbatches == 0 and last_iteration:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor_grad = backward_func(
@@ -2439,7 +2457,7 @@ def forward_backward_pipelining_without_interleaving(
             # pipeline stages do grad reduction during pipeline
             # bubble.
             if i == num_warmup_microbatches - 1:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor = input_tensors.pop(0)
@@ -2480,7 +2498,7 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

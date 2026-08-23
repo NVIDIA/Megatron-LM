@@ -3,6 +3,7 @@
 """Caller-owned orchestration of grouped rollout generation over an agent."""
 
 import asyncio
+import logging
 import time
 from collections import deque
 from typing import TYPE_CHECKING, AsyncIterator, NamedTuple
@@ -13,15 +14,14 @@ from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..inference import ReturnsRaw
-from ..rollout_granularity import (
-    GRANULARITY_RANK,
-    ConsumptionGranularity,
-    SubmissionGranularity,
-)
+from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
 from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
 
 if TYPE_CHECKING:
-    from .api import GroupedRolloutGenerator
+    from ..rollout_bank import RolloutBank
+    from .api import GroupedRolloutGenerator, Rollout, TokenRollout
+
+logger = logging.getLogger(__name__)
 
 
 class _GranularityConfig(NamedTuple):
@@ -89,7 +89,7 @@ class _GranularityConfig(NamedTuple):
 
         Args:
             request: Grouped rollout request to check.
-            num_groups_per_env: Proposed per-env group layout.
+            num_groups_per_env: Constant per-env group layout.
         """
         assert (
             GRANULARITY_RANK[request.consumption_granularity]
@@ -203,6 +203,8 @@ class RolloutPipeline:
         agent: "GroupedRolloutGenerator",
         request: GroupedRolloutRequest,
         parallel_generation_tasks: int,
+        bank: "RolloutBank | None" = None,
+        initial_batch_id: int = 0,
     ) -> None:
         """Validate the request and size the gate, queues, and worker pool.
 
@@ -210,12 +212,16 @@ class RolloutPipeline:
             agent: Agent supplying the env layout, preparation, and inference.
             request: Grouped rollout request to serve; one pipeline per request.
             parallel_generation_tasks: Submission gate depth in trainer batches.
+            bank: Optional durable store for freshly completed rollout groups.
+            initial_batch_id: Batch ID assigned to the first batch in this pipeline.
         """
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
         self.agent = agent
         self.request = request
+        self.bank = bank
+        self.initial_batch_id = initial_batch_id
         self.allocations = agent.rollout_allocations(request.num_groups)
         self.gran_policy = _GranularityConfig.from_request(
             request, [allocation.num_groups for allocation in self.allocations]
@@ -231,10 +237,6 @@ class RolloutPipeline:
         self.num_infer_workers = self.gate.capacity * (
             rollouts_per_batch // self.gran_policy.units_per_batch()
         )
-        if not request.streaming:
-            self.num_infer_workers = min(
-                self.num_infer_workers, request.num_groups * request.rollouts_per_group
-            )
 
         # Core queues.
         self.infer_queue = asyncio_Queue()
@@ -260,11 +262,17 @@ class RolloutPipeline:
         self.prepared_count = 0
         self.inferred_count = 0
         self.assembled_count = 0
+        # All drops, any reason; the two counters below attribute them for metrics.
+        self.dropped_count = 0
         self.filtered_count = 0
+        self.refilled_placeholder_groups = 0
+        self.restored_count = 0
         self.yielded_count = 0
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.assembled_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.yielded_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
+        self.refill_failure_reasons: dict[str, int] = {}
+        self._lifetime_refilled_groups = 0
 
     async def run(self) -> AsyncIterator[RolloutGroup]:
         """Run the pipeline stages; cancels them when the iterator is closed.
@@ -292,15 +300,10 @@ class RolloutPipeline:
                 ),
                 None,
             )
-            expected_end = (
-                not self.request.streaming
-                and self.yielded_count == self.request.num_groups
-            )
-            if failure is not None or not expected_end:
-                raise RuntimeError(
-                    "RolloutPipeline output stream ended: a pipeline stage died"
-                    + ("" if failure is not None else " (no stage exception was recovered)")
-                ) from failure
+            raise RuntimeError(
+                "RolloutPipeline output stream ended: a pipeline stage died"
+                + ("" if failure is not None else " (no stage exception was recovered)")
+            ) from failure
         finally:
             regen_tasks = tuple(self._regen_tasks)
             for task in (*tasks, *regen_tasks):
@@ -335,25 +338,68 @@ class RolloutPipeline:
         if self._prepare_done and self._groups_in_flight <= 0:
             self.infer_queue.shutdown()
 
+    def assert_no_inflight_rollouts(self) -> None:
+        """Verify no rollouts are buffered or in-flight at an iteration boundary for lag=0."""
+        buffered = {
+            "infer_queue": self.infer_queue.qsize(),
+            "assemble_queue": self.assemble_queue.qsize(),
+            "output_queue": self.output_queue.qsize(),
+            "assemble_pending": sum(len(items) for items in self._assemble_pending.values()),
+            "consume_pending": sum(len(groups) for groups in self._consume_pending.values()),
+            "regen_pending": sum(1 for task in self._regen_tasks if not task.done()),
+        }
+        assert not any(buffered.values()), (
+            f"The rollout pipeline has buffered rollouts at iteration boundary: {buffered}. "
+            "The generator has run ahead under a stale policy."
+        )
+        # Dropped groups consume prepared rollouts without ever being yielded;
+        # restored groups are yielded without being freshly prepared.
+        fresh_yielded_count = self.yielded_count - self.restored_count
+        in_flight = self.prepared_count - (
+            (fresh_yielded_count + self.dropped_count) * self.request.rollouts_per_group
+        )
+        assert in_flight == 0, (
+            f"The rollout pipeline prepared {self.prepared_count} rollout(s) but yielded "
+            f"{self.yielded_count} ({self.restored_count} restored) and dropped "
+            f"{self.dropped_count} group(s) of {self.request.rollouts_per_group} "
+            f"({self.filtered_count} same-reward-filtered, "
+            f"{self.refilled_placeholder_groups} placeholder-refilled); "
+            f"{in_flight} rollout(s) in flight at iteration boundary."
+        )
+
     async def stage_prepare(self) -> None:
         """Generate gated inference work items."""
-        assert (
-            self.request.streaming
-            or self.request.num_groups % self.gran_policy.num_groups_per_batch == 0
-        ), "non-streaming requires num_groups to be a multiple of num_groups_per_batch"
         group_id = 0
+        batch_id = self.initial_batch_id
         try:
-            while self.request.streaming or group_id < self.request.num_groups:
+            while True:
                 await self.gate.acquire_for("B")
-                batch_id = group_id // self.gran_policy.num_groups_per_batch
 
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
                     self._groups_in_flight += 1
+                    env_index = self.gran_policy.env_of_index(index_in_batch)
+                    allocation = self.allocations[env_index]
+                    restored = self.agent.take_restored_group(allocation.env_id)
+                    if restored is not None:
+                        assert all(rollout.env_id == allocation.env_id for rollout in restored), (
+                            f"Restored rollout group routed to env {allocation.env_id!r} contains "
+                            f"members for {[rollout.env_id for rollout in restored]}"
+                        )
+                        restored.batch_id = batch_id
+                        restored.index_in_batch = index_in_batch
+                        self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
+                        await self.output_queue.put(restored)
+                        self.restored_count += 1
+                        self._groups_in_flight -= 1
+                        self._maybe_close_intake()
+                        group_id += 1
+                        continue
                     await self._submit_group_to_infer_queue(
                         group_id=group_id, batch_id=batch_id, index_in_batch=index_in_batch
                     )
                     group_id += 1
+                batch_id += 1
         except BaseException:
             self.infer_queue.shutdown()
             raise
@@ -402,7 +448,7 @@ class RolloutPipeline:
         )
 
     async def stage_assemble(self) -> None:
-        """Build complete rollout groups, and regenerate filtered groups."""
+        """Build complete rollout groups, and regenerate dropped groups."""
         pending = self._assemble_pending
         try:
             while True:
@@ -430,12 +476,16 @@ class RolloutPipeline:
                     batch_id=first.item.batch_id,
                     index_in_batch=first.item.index_in_batch,
                 )
-                if self._should_drop(group):
-                    self.filtered_count += 1
-                    task = asyncio.create_task(self._regenerate_group(group))
+                if self._decide_drop(group):
+                    self.dropped_count += 1
+                    task = asyncio.create_task(
+                        self._regenerate_group(group.batch_id, group.index_in_batch)
+                    )
                     self._regen_tasks.add(task)
                     task.add_done_callback(self._regen_tasks.discard)
                     continue
+                if self.bank is not None:
+                    group.uid = self.bank.append(group)
                 self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
                     time.monotonic()
                 )
@@ -445,28 +495,60 @@ class RolloutPipeline:
         finally:
             self.output_queue.shutdown()
 
-    def _should_drop(self, group: RolloutGroup) -> bool:
-        """A group with zero reward variance carries no learning signal."""
-        if not self.request.filter_groups_with_same_reward:
-            return False
-        return np.std([rollout.reward for rollout in group.rollouts]) <= 1e-6
+    @staticmethod
+    def _is_refillable_placeholder(rollout: "Rollout | TokenRollout") -> bool:
+        """A failed episode's placeholder, eligible for a refill."""
+        return rollout.is_placeholder and rollout.rollout_status in ('ok', 'placeholder')
+
+    def _decide_drop(self, group: RolloutGroup) -> bool:
+        """Decide whether to drop this group instead of delivering it."""
+        if all(self._is_refillable_placeholder(rollout) for rollout in group.rollouts):
+            self.refilled_placeholder_groups += 1
+            self._lifetime_refilled_groups += 1
+            reasons: dict[str, int] = {}
+            for rollout in group.rollouts:
+                if rollout.failure_reason:
+                    reasons[rollout.failure_reason] = reasons.get(rollout.failure_reason, 0) + 1
+                    self.refill_failure_reasons[rollout.failure_reason] = (
+                        self.refill_failure_reasons.get(rollout.failure_reason, 0) + 1
+                    )
+            if self._lifetime_refilled_groups == 1 or self._lifetime_refilled_groups % 32 == 0:
+                logger.warning(
+                    "Refilling all-placeholder group (batch %s slot %s): %d refilled over this "
+                    "pipeline's lifetime%s. Groups whose episodes all failed are regenerated; "
+                    "a climbing count means a likely failure upstream of the pipeline.",
+                    group.batch_id,
+                    group.index_in_batch,
+                    self._lifetime_refilled_groups,
+                    f" (member failure reasons: {sorted(reasons.items())})" if reasons else "",
+                )
+            return True
+        if self.request.filter_groups_with_same_reward:
+            real_rewards = [
+                rollout.reward for rollout in group.rollouts if not rollout.is_placeholder
+            ]
+            if real_rewards and np.std(real_rewards) <= 1e-6:
+                self.filtered_count += 1
+                return True
+        return False
 
     @trace_async_exceptions(verbose=True)
-    async def _regenerate_group(self, dropped: RolloutGroup) -> None:
+    async def _regenerate_group(self, batch_id: int, index_in_batch: int) -> None:
         """Resubmit a replacement group for a dropped group's batch slot."""
         group_id = self._next_regen_group_id
         self._next_regen_group_id -= 1
         try:
             await self._submit_group_to_infer_queue(
-                group_id=group_id,
-                batch_id=dropped.batch_id,
-                index_in_batch=dropped.index_in_batch,
+                group_id=group_id, batch_id=batch_id, index_in_batch=index_in_batch
             )
         except asyncio_QueueShutDown:
             # Intake closed mid-regeneration (teardown or other failure).
             self.gate.release_for("G")
             self._groups_in_flight -= 1
             self._maybe_close_intake()
+        except BaseException:
+            self.infer_queue.shutdown()
+            raise
 
     def _record_output_dwell(self, group: RolloutGroup) -> None:
         """Record how long a group sat in output_queue before being yielded."""
@@ -527,7 +609,7 @@ class RolloutPipeline:
 
     async def _consume_batch_order(self) -> AsyncIterator[RolloutGroup]:
         """B consumption: deliver whole batches in dataset order."""
-        next_batch_id = 0
+        next_batch_id = self.initial_batch_id
         pending = self._consume_pending
         while (group := await self._next_complete_group()) is not None:
             pending.setdefault(group.batch_id, []).append(group)
