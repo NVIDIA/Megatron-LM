@@ -99,42 +99,17 @@ def _vllm_silu_mul_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
         fused_silu_mul_per_token_group_quant_fp8,
-        silu_mul_per_token_group_quant_fp8_colmajor,
-        silu_mul_quant_fp8_packed_triton,
     )
     from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 
     scale_format = DeepGemmQuantScaleFMT.from_oracle()
-    if swiglu_limit > 0:
-        if scale_format == DeepGemmQuantScaleFMT.UE8M0:
-            return silu_mul_quant_fp8_packed_triton(
-                gate_up,
-                output_q=output,
-                group_size=128,
-                clamp_limit=swiglu_limit,
-            )
-        if scale_format not in (
-            DeepGemmQuantScaleFMT.FLOAT32,
-            DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0,
-        ):
-            raise RuntimeError(
-                "clamped contiguous DS4 activation requires FLOAT32 or "
-                f"packed UE8M0 scales, got {scale_format}"
-            )
-        return silu_mul_per_token_group_quant_fp8_colmajor(
-            gate_up,
-            output=output,
-            use_ue8m0=(
-                scale_format == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
-            ),
-            clamp_limit=swiglu_limit,
-            group_size=128,
-        )
+    # The alignment kernel is mandatory; never substitute another quantizer.
     return fused_silu_mul_per_token_group_quant_fp8(
         gate_up,
         output_q=output,
         use_ue8m0=(scale_format == DeepGemmQuantScaleFMT.UE8M0),
         round_scale=(scale_format != DeepGemmQuantScaleFMT.FLOAT32),
+        clamp_limit=swiglu_limit,
         masked_m=None,
         group_size=128,
     )

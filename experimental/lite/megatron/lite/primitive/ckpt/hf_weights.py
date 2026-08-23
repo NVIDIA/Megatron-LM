@@ -1447,6 +1447,9 @@ def export_hf_weights(
         """Yield parameters plus persistent buffers present in the HF load plan."""
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
+            logical_dtypes = getattr(
+                chunk, "_fsdp2_model_param_dtypes_by_name", {}
+            )
             state = base_chunk.state_dict()
             layer_map = (
                 {
@@ -1458,7 +1461,12 @@ def export_hf_weights(
             )
             for name, param in base_chunk.named_parameters():
                 logical_name = canonical_state_key(name)
-                yield to_global_layer_name(logical_name, layer_map), param.data.detach()
+                global_name = to_global_layer_name(logical_name, layer_map)
+                tensor = param.data.detach()
+                logical_dtype = logical_dtypes.get(name)
+                if isinstance(logical_dtype, torch.dtype):
+                    tensor = tensor.to(logical_dtype)
+                yield global_name, tensor
             persistent_buffers = [
                 (name, buffer)
                 for name, buffer in base_chunk.named_buffers()

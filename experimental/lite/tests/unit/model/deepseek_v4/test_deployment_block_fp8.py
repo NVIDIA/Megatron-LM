@@ -157,21 +157,40 @@ def test_module_owned_source_scale_applies_to_plain_visible_weight() -> None:
     assert reconstructed.scales is scale
 
 
-def test_native_ue8m0_source_scale_skips_float32_requantization(fake_vllm) -> None:
+def test_cleared_module_source_scale_requantizes_same_visible_weight(fake_vllm) -> None:
+    owner = nn.Module()
+    visible_weight = _weight()
+    scale = torch.tensor([[0.125, 0.25]], dtype=torch.float32)
+    owner._fp8_source_scales_by_parameter = {"weight": scale}
+
+    bind_source_scale_to_visible_weight(owner, "weight", visible_weight)
+    owner._fp8_source_scales_by_parameter.clear()
+    rebound = bind_source_scale_to_visible_weight(owner, "weight", visible_weight)
+    packed = pack_block_fp8_weight(rebound)
+
+    assert rebound is visible_weight
+    assert not hasattr(visible_weight, "_fp8_source_scales")
+    assert not hasattr(visible_weight, "_fp8_source_scale_version")
+    assert [call[0] for call in fake_vllm] == [
+        "weight_quant",
+        "weight_postprocess",
+    ]
+
+
+def test_native_fp8_source_scale_uses_official_float32_requantization(fake_vllm) -> None:
     owner = nn.Module()
     qweight = torch.randn(128, 256).clamp(-4, 4).to(torch.float8_e4m3fn)
     scale = torch.tensor([[2.0**-12, 2.0**-11]], dtype=torch.float32)
     expanded = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
     visible_weight = nn.Parameter((qweight.float() * expanded).to(torch.bfloat16))
     owner._fp8_source_scales_by_parameter = {"weight": scale}
-    owner._fp8_source_scale_fmts_by_parameter = {"weight": "ue8m0"}
-
     bind_source_scale_to_visible_weight(owner, "weight", visible_weight)
     packed = pack_block_fp8_weight(visible_weight)
 
     assert [call[0] for call in fake_vllm] == ["weight_postprocess"]
     post_call = fake_vllm[0]
-    assert post_call[2].dtype == torch.float8_e8m0fnu
+    assert post_call[2].dtype == torch.float32
+    assert post_call[2] is scale
     assert torch.equal(post_call[1], qweight)
     assert torch.equal(packed.qweight, qweight)
 

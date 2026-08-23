@@ -27,6 +27,55 @@ def _reference(
     return torch.cat(outputs)
 
 
+@pytest.mark.parametrize(
+    ("scale_format_name", "expected_quantizer", "expected_use_ue8m0"),
+    [
+        ("FLOAT32", "float32", False),
+        ("FLOAT32_CEIL_UE8M0", "float32", True),
+        ("UE8M0", "packed", True),
+    ],
+)
+def test_contiguous_input_quant_matches_vllm_scale_format(
+    monkeypatch,
+    scale_format_name: str,
+    expected_quantizer: str,
+    expected_use_ue8m0: bool,
+) -> None:
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+    calls = []
+
+    def float32_quant(value, group_size, **kwargs):
+        calls.append(("float32", group_size, kwargs))
+        return value, torch.ones(1)
+
+    def packed_quant(value, group_size, **kwargs):
+        calls.append(("packed", group_size, kwargs))
+        return value, torch.ones(1)
+
+    monkeypatch.setattr(
+        DeepGemmQuantScaleFMT,
+        "from_oracle",
+        staticmethod(lambda: getattr(DeepGemmQuantScaleFMT, scale_format_name)),
+    )
+    monkeypatch.setattr(fp8_utils, "per_token_group_quant_fp8", float32_quant)
+    monkeypatch.setattr(
+        fp8_utils,
+        "per_token_group_quant_fp8_packed_for_deepgemm",
+        packed_quant,
+    )
+
+    value = torch.randn(2, 128, dtype=torch.bfloat16)
+    vllm_grouped_moe._vllm_quantize_contiguous_input(value)
+
+    assert len(calls) == 1
+    quantizer, group_size, kwargs = calls[0]
+    assert quantizer == expected_quantizer
+    assert group_size == 128
+    assert kwargs["use_ue8m0"] is expected_use_ue8m0
+
+
 def test_vllm_visible_silu_quant_has_no_layout_dependent_fallback(monkeypatch):
     from vllm.model_executor.layers.quantization.utils import fp8_utils
     from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
@@ -62,7 +111,7 @@ def test_vllm_visible_silu_quant_preserves_ds4_clamp(monkeypatch):
 
     calls = []
 
-    def packed(value, **kwargs):
+    def fused(value, **kwargs):
         calls.append((value, kwargs))
         return kwargs["output_q"], torch.ones(1)
 
@@ -71,7 +120,7 @@ def test_vllm_visible_silu_quant_preserves_ds4_clamp(monkeypatch):
         "from_oracle",
         staticmethod(lambda: DeepGemmQuantScaleFMT.UE8M0),
     )
-    monkeypatch.setattr(fp8_utils, "silu_mul_quant_fp8_packed_triton", packed)
+    monkeypatch.setattr(fp8_utils, "fused_silu_mul_per_token_group_quant_fp8", fused)
     value = torch.randn(2, 256, dtype=torch.bfloat16)
     output = torch.empty(2, 128, dtype=torch.float8_e4m3fn)
 
@@ -82,6 +131,7 @@ def test_vllm_visible_silu_quant_preserves_ds4_clamp(monkeypatch):
     assert quantized is output
     assert len(calls) == 1
     assert calls[0][1]["clamp_limit"] == 10.0
+    assert calls[0][1]["masked_m"] is None
 
 
 def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(

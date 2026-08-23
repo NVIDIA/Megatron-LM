@@ -86,6 +86,16 @@ class ToyMoEBlock(nn.Module):
         return self.experts(self.dense(x))
 
 
+class ToyMixedDtypeBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16))
+        self.control = nn.Parameter(torch.ones(4, dtype=torch.float32))
+
+    def forward(self, x):
+        return x
+
+
 def test_fsdp2_config_validates_empty_wrap_surface():
     with pytest.raises(ValueError, match="wrap_root=True"):
         FSDP2Config(wrap_root=False)
@@ -162,6 +172,58 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     assert dense_config.reshard_after_forward is True
     assert dense_config.last_unit_reshard_after_forward is True
     assert dense_kwargs["ignored_params"] == set(model.experts.parameters())
+
+
+def test_fsdp2_replicates_parameters_that_must_keep_their_compute_dtype(monkeypatch):
+    model = ToyMixedDtypeBlock()
+    wrap_calls = []
+    optimizer_calls = []
+    optimizer = object()
+    sync_group = object()
+    ps = ParallelState(dp_cp_group=sync_group, dp_group=object(), dp_cp_size=2)
+
+    monkeypatch.setattr(
+        fsdp2_optimizer,
+        "wrap_fsdp2",
+        lambda module, _ps, config, **kwargs: wrap_calls.append(
+            (module, config, kwargs)
+        ),
+    )
+
+    def fake_build(*args, **kwargs):
+        optimizer_calls.append((args, kwargs))
+        return optimizer
+
+    monkeypatch.setattr(fsdp2_optimizer, "build_fsdp2_adamw", fake_build)
+
+    result = fsdp2_optimizer.build_fsdp2_training_optimizer(
+        [model],
+        None,
+        ps,
+        unit_modules=(),
+        replicated_param_classifier=(
+            lambda _name, parameter: parameter.dtype == torch.float32
+        ),
+        use_fp32_shards=False,
+        use_fp32_master=False,
+    )
+
+    assert result is optimizer
+    assert wrap_calls[0][2]["ignored_params"] == {model.control}
+    assert optimizer_calls[0][1]["replicated_grad_params"] == [model.control]
+    assert optimizer_calls[0][1]["replicated_grad_sync_group"] is sync_group
+
+
+def test_fsdp2_replicated_gradient_collectives_preserve_named_parameter_order():
+    model = nn.Module()
+    model.second = nn.Parameter(torch.ones(2, dtype=torch.float32))
+    model.first = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+
+    params = fsdp2_optimizer._collect_replicated_params(
+        [model], lambda _name, parameter: parameter.dtype == torch.float32
+    )
+
+    assert params == [model.second, model.first]
 
 
 @pytest.mark.parametrize("depth", [0, 1, 2])

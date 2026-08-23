@@ -54,6 +54,20 @@ class _NativeFP8Block(nn.Module):
         return x + self.weight[0, 0] * 0
 
 
+class _FP32ControlBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16))
+        self.control = nn.Parameter(
+            torch.tensor([1.0001, -0.5003, 0.2507, -0.1259], dtype=torch.float32)
+        )
+        self.observed_control = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.observed_control = self.control.detach().clone()
+        return x + self.control.sum()
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and fsdp2_available(), "CUDA FSDP2 required"
 )
@@ -114,6 +128,49 @@ class NativeFP8FSDP2Test(unittest.TestCase):
         self.assertEqual(model.observed_source_version, model.observed_weight_version)
         self.assertTrue(torch.equal(model.observed_qweight, qweight))
         self.assertTrue(torch.equal(model.observed_scale, scale))
+        self.assertEqual(
+            model._fsdp2_model_param_dtypes_by_name["weight"], torch.bfloat16
+        )
+
+    def test_fp32_controls_are_not_cast_by_the_bf16_fsdp_policy(self):
+        device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        model = _FP32ControlBlock().to(device)
+        expected = model.control.detach().clone()
+        ps = ParallelState(
+            dp_group=dist.group.WORLD,
+            dp_cp_group=dist.group.WORLD,
+            dp_size=dist.get_world_size(),
+            dp_cp_size=dist.get_world_size(),
+            dp_rank=dist.get_rank(),
+            dp_cp_rank=dist.get_rank(),
+        )
+        build_fsdp2_training_optimizer(
+            [model],
+            SimpleNamespace(
+                optimizer="adam",
+                lr=1.0e-6,
+                weight_decay=0.0,
+                adam_beta1=0.9,
+                adam_beta2=0.95,
+                adam_eps=1.0e-8,
+                clip_grad=1.0,
+                offload_fraction=0.0,
+            ),
+            ps,
+            unit_modules=(),
+            replicated_param_classifier=(
+                lambda _name, parameter: parameter.dtype == torch.float32
+            ),
+            use_fp32_shards=True,
+            cast_forward_inputs=False,
+        )
+
+        model(torch.zeros(1, device=device, dtype=torch.bfloat16))
+
+        self.assertEqual(model.observed_control.dtype, torch.float32)
+        self.assertTrue(torch.equal(model.observed_control, expected))
+        self.assertFalse(torch.equal(model.observed_control, expected.to(torch.bfloat16).float()))
+        self.assertNotIn("control", model._fsdp2_model_param_dtypes_by_name)
 
 
 if __name__ == "__main__":

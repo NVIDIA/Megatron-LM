@@ -52,6 +52,34 @@ class _LayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
 
+def test_ds4_default_export_preserves_fp32_coefficient_bits() -> None:
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.norm = _LayerNorm(2)
+    model.norm.weight.data.copy_(torch.tensor([1.0001, -0.9999]))
+    config = DeepseekV4Config(vocab_size=2, num_hidden_layers=0)
+    parallel_state = SimpleNamespace(
+        tp_size=1,
+        tp_group=None,
+        ep_size=1,
+        ep_group=None,
+        pp_size=1,
+        pp_rank=0,
+        pp_group=None,
+        pp_global_ranks=[0],
+    )
+
+    exported = dict(
+        ckpt._export_unquantized_weights(model, config, parallel_state)
+    )["norm.weight"]
+
+    assert exported.dtype == torch.float32
+    assert torch.equal(exported, model.norm.weight)
+    assert not torch.equal(exported, exported.bfloat16().float())
+
+
 class _Block(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -209,6 +237,52 @@ def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
     )
 
 
+def test_ds4_optimizer_invalidation_removes_parameter_source_scale_state():
+    ckpt = _checkpoint_module()
+    model = nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    model.weight._fp8_source_scales = scale
+    model.weight._fp8_source_scale_version = model.weight._version
+    model._fp8_source_scales_by_parameter = {"weight": scale}
+    model._fp8_source_scales_by_name = {"weight": scale}
+    model._fp8_source_scales_valid = True
+
+    ckpt.invalidate_bound_source_scales(model)
+
+    assert not hasattr(model.weight, "_fp8_source_scales")
+    assert not hasattr(model.weight, "_fp8_source_scale_version")
+    assert model._fp8_source_scales_by_parameter == {}
+    assert model._fp8_source_scales_by_name == {}
+    assert model._fp8_source_scales_valid is False
+
+
+def test_ds4_fused_expert_preserves_w1_w3_bytes_and_scale_order():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
+    native_name = "layers.0.mlp.experts.fc1.weight0"
+    qweights = [
+        torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    ]
+    scales = [
+        torch.tensor([[0.125]], dtype=torch.float32),
+        torch.tensor([[0.5]], dtype=torch.float32),
+    ]
+
+    master = spec.hf_to_native(
+        native_name,
+        [qweights[0], scales[0], qweights[1], scales[1]],
+    )
+    fused_scale = spec.source_block_scales[native_name]
+    restored = ckpt.requantize_block_fp8_weight(master, fused_scale)
+
+    assert torch.equal(restored.qweight, torch.cat(qweights, dim=0))
+    assert torch.equal(fused_scale, torch.cat(scales, dim=0))
+
+
 def _mock_dense_replica_receiver(monkeypatch, master, source_scale):
     from megatron.lite.primitive.ckpt import hf_weights
 
@@ -279,7 +353,6 @@ def test_ds4_native_fp8_dense_replica_receives_source_scale(tmp_path, monkeypatc
     assert torch.equal(parameter, master)
     assert torch.equal(parameter._fp8_source_scales, scale)
     assert parameter._fp8_source_scale_version == parameter._version
-    assert parameter._fp8_source_scale_fmt == "ue8m0"
     restored = ckpt.requantize_block_fp8_weight(
         parameter.detach().to(torch.bfloat16), scale
     )

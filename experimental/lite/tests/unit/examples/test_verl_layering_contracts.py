@@ -15,6 +15,7 @@ pytestmark = pytest.mark.optional
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 VERL_MLITE_ROOT = LITE_ROOT / "examples" / "verl" / "verl_mlite"
+DS4_DAPO_SCRIPT = LITE_ROOT / "examples" / "verl" / "scripts" / "run_deepseek_v4_dapo.sh"
 
 MODEL_PACKAGE_PREFIXES = (
     "megatron.lite.model.deepseek_v4",
@@ -101,3 +102,9 @@ def test_verl_mlite_layer_does_not_see_model_internal_batch_fields() -> None:
         _python_files(VERL_MLITE_ROOT), {"packed_seq_params", "position_ids", "to_bridge_dict"}
     )
     assert violations == []
+
+
+def test_deepseek_v4_rollout_preserves_ue8m0_scale_contract() -> None:
+    script = DS4_DAPO_SCRIPT.read_text(encoding="utf-8")
+    assert '"+${VLLM_QUANT_CONFIG}.fmt=e4m3"' in script
+    assert '"+${VLLM_QUANT_CONFIG}.scale_fmt=ue8m0"' in script

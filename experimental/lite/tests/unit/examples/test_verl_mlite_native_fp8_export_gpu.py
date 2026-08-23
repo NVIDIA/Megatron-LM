@@ -28,8 +28,6 @@ if str(VERL_EXAMPLE_ROOT) not in sys.path:
 def _tensor_equal(actual: torch.Tensor, expected: torch.Tensor) -> bool:
     actual = actual.detach().cpu().contiguous()
     expected = expected.detach().cpu().contiguous()
-    if actual.dtype == torch.bfloat16 and expected.dtype == torch.float32:
-        expected = expected.to(torch.bfloat16)
     if actual.dtype != expected.dtype or actual.shape != expected.shape:
         return False
     if actual.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:

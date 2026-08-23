@@ -18,7 +18,6 @@ class CanonicalBlockFP8Weight:
     qweight: torch.Tensor
     scales: torch.Tensor
     block_shape: tuple[int, int] = BLOCK_SHAPE
-    scale_fmt: str | None = None
 
 
 def _validate_weight(weight: torch.Tensor) -> None:
@@ -83,9 +82,23 @@ def is_release_unquantized_weight(name: str) -> bool:
     )
 
 
+def is_release_fp32_control(name: str) -> bool:
+    """Return whether the official V4 release stores ``name`` in FP32."""
+
+    return (
+        name.startswith("hc_head_")
+        or ".hc_attn_" in name
+        or ".hc_ffn_" in name
+        or name.endswith(".attn.attn_sink")
+        or name.endswith(".ape")
+        or name.endswith(".ffn.gate.bias")
+    )
+
+
 __all__ = [
     "BLOCK_SHAPE",
     "CanonicalBlockFP8Weight",
+    "is_release_fp32_control",
     "is_release_unquantized_weight",
     "requantize_block_fp8_weight",
 ]

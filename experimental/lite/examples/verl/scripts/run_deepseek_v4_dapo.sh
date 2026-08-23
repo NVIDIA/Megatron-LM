@@ -100,14 +100,11 @@ case "${ROLLOUT_WEIGHT_BITS}" in
     ROLLOUT_RESYNC_FORMAT=mxfp4
     ROLLOUT_EXPERT_DTYPE=fp4
     ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-marlin}"
-    ROLLOUT_SCALE_FMT=ue8m0
     ;;
   8)
     ROLLOUT_RESYNC_FORMAT=block_fp8
     ROLLOUT_EXPERT_DTYPE=fp8
     ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-flashinfer_cutlass}"
-    ROLLOUT_SCALE_FMT="$(python3 "${VALIDATOR}" scale-format \
-      --model-config "${MODEL_PATH}/config.json" --weight-bits 8)"
     ;;
   *)
     echo "ROLLOUT_WEIGHT_BITS must be 4 or 8, got ${ROLLOUT_WEIGHT_BITS}" >&2
@@ -318,7 +315,7 @@ ROLLOUT=(
   "+${VLLM_QUANT_CONFIG}.activation_scheme=dynamic"
   "+${VLLM_QUANT_CONFIG}.fmt=e4m3"
   "+${VLLM_QUANT_CONFIG}.quant_method=fp8"
-  "+${VLLM_QUANT_CONFIG}.scale_fmt=${ROLLOUT_SCALE_FMT}"
+  "+${VLLM_QUANT_CONFIG}.scale_fmt=ue8m0"
   "+${VLLM_QUANT_CONFIG}.weight_block_size=[128,128]"
 )
 

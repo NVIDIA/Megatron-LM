@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from megatron.lite.model.deepseek_v4.quantization import (
+    is_release_fp32_control,
     is_release_unquantized_weight,
     requantize_block_fp8_weight,
 )
@@ -79,6 +80,10 @@ def export_resync_weights(
     fp8_scale_format = "e8m0" if expert_dtype == "fp4" else "float32"
 
     for name, tensor in weights:
+        if is_release_fp32_control(name) and tensor.dtype != torch.float32:
+            raise TypeError(
+                f"DeepSeek-V4 FP32 control {name} was exported as {tensor.dtype}"
+            )
         if (
             not name.endswith(".weight")
             or tensor.ndim < 2
@@ -89,6 +94,11 @@ def export_resync_weights(
             yield name, tensor
             continue
 
+        # Quantized deployment weights are computed from the BF16 value used by
+        # the actor forward. FSDP2 may expose an FP32 storage shard here, while
+        # dist-opt ordinarily already exposes BF16.
+        tensor = tensor.to(torch.bfloat16)
+
         fixed_scale = None if source_scales is None else source_scales.get(name)
         if (
             fixed_scale is not None
@@ -98,7 +108,7 @@ def export_resync_weights(
             raise RuntimeError("routed MXFP4 weights cannot carry block-FP8 source scales")
         if fixed_scale is not None:
             canonical = requantize_block_fp8_weight(
-                tensor.to(torch.bfloat16),
+                tensor,
                 fixed_scale.to(tensor.device, dtype=torch.float32).contiguous(),
             )
             quantized, scale = canonical.qweight, canonical.scales

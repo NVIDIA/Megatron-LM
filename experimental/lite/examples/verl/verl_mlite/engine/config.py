@@ -30,7 +30,10 @@ class MegatronLiteEngineConfig(EngineConfig):
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
     cross_entropy_fusion: bool | None = None
-    export_dtype: str | None = "bfloat16"
+    # Preserve each model parameter's declared dtype by default.  A blanket
+    # BF16 cast corrupts FP32 coefficients when the receiver restores them
+    # into FP32 parameter containers.
+    export_dtype: str | None = None
     qat: dict[str, Any] = field(default_factory=dict)
     resync_format: str | None = None
     resync_config: dict[str, Any] = field(default_factory=dict)

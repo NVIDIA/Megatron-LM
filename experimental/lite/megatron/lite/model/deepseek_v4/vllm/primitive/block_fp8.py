@@ -55,12 +55,7 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
         scales is not None
         and getattr(weight, "_fp8_source_scale_version", None) == weight._version
     ):
-        canonical = requantize_block_fp8_weight(weight, scales)
-        return CanonicalBlockFP8Weight(
-            canonical.qweight,
-            canonical.scales,
-            scale_fmt=getattr(weight, "_fp8_source_scale_fmt", None),
-        )
+        return requantize_block_fp8_weight(weight, scales)
     with torch.no_grad():
         from vllm.utils.deep_gemm import per_block_cast_to_fp8
 
@@ -76,24 +71,22 @@ def bind_source_scale_to_visible_weight(
     """Apply model-owned checkpoint scale metadata to the visible weight."""
 
     scales = getattr(module, "_fp8_source_scales_by_parameter", {}).get(parameter_name)
-    if scales is not None:
-        weight._fp8_source_scales = scales
-        weight._fp8_source_scale_version = weight._version
-        scale_fmt = getattr(
-            module, "_fp8_source_scale_fmts_by_parameter", {}
-        ).get(parameter_name)
-        weight._fp8_source_scale_fmt = scale_fmt
+    if scales is None:
+        for attribute in ("_fp8_source_scales", "_fp8_source_scale_version"):
+            if hasattr(weight, attribute):
+                delattr(weight, attribute)
+        return weight
+    weight._fp8_source_scales = scales
+    weight._fp8_source_scale_version = weight._version
     return weight
 
 
-def _post_process(qweight, scales, *, scale_fmt: str | None = None):
+def _post_process(qweight, scales):
     with torch.no_grad():
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             deepgemm_post_process_fp8_weight_block,
         )
 
-        if scale_fmt == "ue8m0":
-            scales = scales.to(torch.float8_e8m0fnu)
         return deepgemm_post_process_fp8_weight_block(
             wq=qweight, ws=scales, quant_block_shape=BLOCK_SHAPE, use_e8m0=True
         )
@@ -101,11 +94,7 @@ def _post_process(qweight, scales, *, scale_fmt: str | None = None):
 
 def pack_block_fp8_weight(weight: nn.Parameter):
     canonical = quantize_block_fp8_weight(weight)
-    qweight, scales = _post_process(
-        canonical.qweight,
-        canonical.scales,
-        scale_fmt=canonical.scale_fmt,
-    )
+    qweight, scales = _post_process(canonical.qweight, canonical.scales)
     return PackedBlockFP8Weight(qweight, scales, _key(weight))
 
 
@@ -114,13 +103,9 @@ def pack_grouped_block_fp8_weight(weights: Iterable[nn.Parameter]):
     if not weights:
         raise ValueError("grouped block-FP8 packing requires at least one expert")
     canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
-    scale_fmts = {item.scale_fmt for item in canonical}
-    if len(scale_fmts) != 1:
-        raise ValueError("grouped block-FP8 weights must use one scale format")
     qweight, scales = _post_process(
         torch.stack([item.qweight for item in canonical]),
         torch.stack([item.scales for item in canonical]),
-        scale_fmt=canonical[0].scale_fmt,
     )
     return PackedBlockFP8Weight(
         qweight, scales, tuple(_key(weight) for weight in weights)
@@ -218,13 +203,9 @@ class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
         ):
             return self._cached_weight
         canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
-        scale_fmts = {item.scale_fmt for item in canonical}
-        if len(scale_fmts) != 1:
-            raise ValueError("fused block-FP8 weights must use one scale format")
         qweight, scales = _post_process(
             torch.cat([item.qweight for item in canonical]),
             torch.cat([item.scales for item in canonical]),
-            scale_fmt=canonical[0].scale_fmt,
         )
         packed = PackedBlockFP8Weight(qweight, scales, key)
         if self.cache_weight:

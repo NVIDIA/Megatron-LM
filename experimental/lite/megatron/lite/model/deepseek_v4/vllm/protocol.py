@@ -295,6 +295,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             unit_modules=(DeepseekV4Layer,),
             use_fp32_shards=True,
             cast_forward_inputs=False,
+            fsdp2_replicated_param_classifier=(
+                lambda _name, parameter: parameter.dtype == torch.float32
+            ),
         )
     )
 

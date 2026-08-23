@@ -383,6 +383,7 @@ def build_training_backend(
     unit_modules: tuple[type[nn.Module], ...],
     use_fp32_shards: bool,
     cast_forward_inputs: bool = True,
+    fsdp2_replicated_param_classifier=None,
 ):
     """Build the shared DS4 runtime-owned optimizer backend."""
 
@@ -423,6 +424,7 @@ def build_training_backend(
                     ps,
                     unit_modules=unit_modules,
                     expert_classifier=is_expert_param,
+                    replicated_param_classifier=fsdp2_replicated_param_classifier,
                     deterministic=impl_cfg.deterministic,
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),

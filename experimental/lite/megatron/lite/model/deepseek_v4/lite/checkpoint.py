@@ -272,11 +272,6 @@ class DeepseekV4WeightSpec:
     def __init__(self, config: DeepseekV4Config, *, source_block_fp8: bool = False):
         self.config = config
         self.source_block_fp8 = source_block_fp8
-        self.source_scale_fmt = (
-            config.quantization_config.get("scale_fmt")
-            if source_block_fp8
-            else None
-        )
         self.source_block_scales: dict[str, torch.Tensor] = {}
 
     def _source_is_quantized(self, native_name: str) -> bool:
@@ -428,7 +423,6 @@ class DeepseekV4WeightSpec:
             value = scale.to(parameter.device, dtype=torch.float32).contiguous()
             parameter._fp8_source_scales = value
             parameter._fp8_source_scale_version = parameter._version
-            parameter._fp8_source_scale_fmt = self.source_scale_fmt
             module_name, _, parameter_name = name.rpartition(".")
             owner = model.get_submodule(module_name) if module_name else model
             owner_scales = getattr(owner, "_fp8_source_scales_by_parameter", None)
@@ -436,13 +430,6 @@ class DeepseekV4WeightSpec:
                 owner_scales = {}
                 owner._fp8_source_scales_by_parameter = owner_scales
             owner_scales[parameter_name] = value
-            owner_scale_fmts = getattr(
-                owner, "_fp8_source_scale_fmts_by_parameter", None
-            )
-            if owner_scale_fmts is None:
-                owner_scale_fmts = {}
-                owner._fp8_source_scale_fmts_by_parameter = owner_scale_fmts
-            owner_scale_fmts[parameter_name] = self.source_scale_fmt
             registry[global_name] = scale.detach().cpu().float().contiguous()
         model._fp8_source_scales_by_name = registry
         model._fp8_source_scales_valid = True
@@ -576,13 +563,14 @@ def invalidate_bound_source_scales(model: nn.Module) -> None:
 
     model._fp8_source_scales_valid = False
     model._fp8_source_scales_by_name = {}
+    for parameter in model.parameters():
+        for attribute in ("_fp8_source_scales", "_fp8_source_scale_version"):
+            if hasattr(parameter, attribute):
+                delattr(parameter, attribute)
     for module in model.modules():
         scales = getattr(module, "_fp8_source_scales_by_parameter", None)
         if scales is not None:
             scales.clear()
-        scale_fmts = getattr(module, "_fp8_source_scale_fmts_by_parameter", None)
-        if scale_fmts is not None:
-            scale_fmts.clear()
 
 
 def _export_source_scales(
