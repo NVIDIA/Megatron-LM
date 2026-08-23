@@ -122,6 +122,17 @@ class MXFP8Tensor:
     data: torch.Tensor  # [M, K] fp8_e4m3fn
     scale: torch.Tensor  # 1D swizzled or [M, K // 32] unswizzled scales
     backend: Optional[MXFP8Backend] = None  # quantization and GEMM backend
+    dtype: torch.dtype = torch.bfloat16  # logical, unquantized dtype
+
+    @property
+    def shape(self) -> torch.Size:
+        """Logical tensor shape."""
+        return self.data.shape
+
+    @property
+    def device(self) -> torch.device:
+        """Device holding the quantized tensor."""
+        return self.data.device
 
     def size(self, idx: Optional[int] = None):
         """Wrapper for calling self.data.size()"""
@@ -140,6 +151,24 @@ class MXFP8Tensor:
         n_col_blocks = _ceil_div(K // MXFP8_BLOCK_SIZE, MXFP8_SCALE_COL_BLOCK)
         padded_cols = n_col_blocks * MXFP8_SCALE_COL_BLOCK
         return self.scale.reshape(-1, padded_cols)
+
+    def quantize_(self, value: torch.Tensor) -> "MXFP8Tensor":
+        """Quantize a logical tensor into the existing storage."""
+        if value.shape != self.shape:
+            raise ValueError(
+                f"MXFP8 shape mismatch: expected {tuple(self.shape)}, got {tuple(value.shape)}."
+            )
+        if self.backend is None:
+            raise ValueError("Cannot update an MXFP8Tensor without a quantization backend.")
+        value = value.to(device=self.device, dtype=self.dtype).contiguous()
+        quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
+        self.data.copy_(quantized.data)
+        self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+        return self
+
+    def copy_(self, value: torch.Tensor) -> "MXFP8Tensor":
+        """Copy a logical tensor while retaining CUDA-graph-visible storage."""
+        return self.quantize_(value)
 
     @classmethod
     def from_bf16(cls, x: torch.Tensor, group_size: int = 32, backend: MXFP8Backend = "flashinfer"):
@@ -168,4 +197,4 @@ class MXFP8Tensor:
                 f"Unknown MXFP8 quantization backend: '{backend}'. "
                 "Must be 'triton' or 'flashinfer'."
             )
-        return cls(data=data, scale=scale, backend=backend)
+        return cls(data=data, scale=scale, backend=backend, dtype=x.dtype)

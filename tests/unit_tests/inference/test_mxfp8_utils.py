@@ -269,6 +269,31 @@ class TestMXFP8Tensor:
         assert scale.dtype == torch.float8_e8m0fnu
         torch.testing.assert_close(scale.view(torch.uint8), scale_bytes)
 
+    @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+    def test_copy_preserves_storage_and_logical_metadata(self, backend):
+        from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
+
+        if backend == "flashinfer" and not HAVE_FLASHINFER:
+            pytest.skip("FlashInfer not available")
+
+        source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+        tensor = MXFP8Tensor.from_bf16(source, backend=backend)
+        data_ptr = tensor.data.data_ptr()
+        scale_ptr = tensor.scale.data_ptr()
+
+        assert tensor.shape == source.shape
+        assert tensor.dtype == source.dtype
+        assert tensor.device == source.device
+
+        updated = torch.randn_like(source)
+        assert tensor.copy_(updated) is tensor
+        expected = MXFP8Tensor.from_bf16(updated, backend=backend)
+
+        assert tensor.data.data_ptr() == data_ptr
+        assert tensor.scale.data_ptr() == scale_ptr
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+
     def test_reject_invalid_scale_dtype(self):
         from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype
 
