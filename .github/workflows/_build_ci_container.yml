@@ -124,7 +124,7 @@ jobs:
         run: |
           echo "::group::Download test data"
           for attempt in 1 2 3; do
-            if pip install --no-cache-dir click requests \
+            if pip install --no-cache-dir click==8.3.2 requests==2.33.1 \
               && python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets; then
               break
             fi
