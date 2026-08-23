@@ -525,6 +525,13 @@ class DataIterator:
         )
         loss_mask[input_ids == self.image_token_id] = 0.0
 
+        flat_input_ids = input_ids.reshape(-1)
+        image_mask = flat_input_ids == self.image_token_id
+        modality_token_indices = {
+            self.encoder_name: image_mask.nonzero(as_tuple=False).flatten(),
+            "text": (~image_mask).nonzero(as_tuple=False).flatten(),
+        }
+
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -538,6 +545,7 @@ class DataIterator:
                     "clip_encoder": {'hidden_states': encoder_hidden_states, 'attention_mask': None}
                 }
             },
+            "modality_token_indices": modality_token_indices,
         }
 
 

@@ -9,15 +9,12 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.profiler import ProfilerActivity, profile
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
-    Partial,
     Placements,
-    Replicate,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -132,31 +129,49 @@ class NonLeafViewModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def _no_shard_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
+    )
+
+
+def _zero1_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
+    )
+
+
+def _zero2_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
 
 
 def _hsdp_placements() -> Placements:
     """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
-    DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
-    all-reduced to [Replicate, Flat] on the last microbatch."""
+    DP-inner (axis 1). main_grad rests [Partial, Shard(0)] between microbatches and is
+    all-reduced to [Replicate, Shard(0)] on the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
-        parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
-        optimizer=[Replicate(), Flat()],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Replicate(), Shard(0)],
     )
 
 
 def _hfsdp_placements() -> Placements:
     """HFSDP: params replicated across DP-outer (axis 0) for compute but the
     optimizer sharded across it, all sharded within DP-inner (axis 1). main_grad
-    rests [Partial, Flat] between microbatches and is reduce-scattered to
-    [Flat, Flat] (the optimizer placement) on the last microbatch."""
+    rests [Partial, Shard(0)] between microbatches and is reduce-scattered to
+    [Shard(0), Shard(0)] (the optimizer placement) on the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
-        parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
-        optimizer=[Flat(), Flat()],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Shard(0), Shard(0)],
     )
 
 
@@ -166,9 +181,16 @@ _REDUCE_SCATTER_OP_NAME_SUBSTRING = "reduce_scatter"
 _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
 
 
+@pytest.mark.parametrize(
+    "placements_factory",
+    [_no_shard_placements, _zero1_placements, _zero2_placements, _flat_placements],
+    ids=["no_shard", "zero1", "zero2", "zero3"],
+)
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatches):
-    """Minimal per-module FSDP training should match single-rank SGD."""
+def test_fully_shard_sgd_losses_match_baseline(
+    distributed_setup, num_microbatches, placements_factory
+):
+    """Every supported sharding strategy should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -176,16 +198,18 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
+    placements = placements_factory()
     torch.manual_seed(1234)
     baseline = TinyModel().to(device)
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
-    with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.fc1, mesh=mesh, placements=placements)
+        fully_shard(model.fc2, mesh=mesh, placements=placements)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
 
     micro_batch_size = 2
     x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
@@ -197,19 +221,19 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
         for step in range(5):
             optimizer.zero_grad()
 
-            for microbatch, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                losses.append(loss.detach())
-                logger.debug(
-                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
-                    log_prefix,
-                    rank,
-                    step,
-                    microbatch,
-                    loss,
-                )
-
-                (loss / num_microbatches).backward()
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    losses.append(loss.detach())
+                    logger.debug(
+                        "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
+                        log_prefix,
+                        rank,
+                        step,
+                        microbatch_index,
+                        loss,
+                    )
+                    (loss / num_microbatches).backward()
 
             optimizer.step()
         return losses
@@ -348,8 +372,8 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     Like HSDP, gradients reduce-scatter within DP-inner every backward and
     accumulate into main_grad. Unlike HSDP, the last-microbatch DP-outer reduction
     is a reduce-scatter (not an all-reduce) that finalizes main_grad to the
-    optimizer's [Flat, Flat] placement, shrinking the buffer; the next step's reset
-    therefore allocates a fresh [Partial, Flat] accumulation buffer. Every rank
+    optimizer's [Shard(0), Shard(0)] placement, shrinking the buffer; the next step's reset
+    therefore allocates a fresh [Partial, Shard(0)] accumulation buffer. Every rank
     sees identical data, so the averaged gradient equals the single-rank gradient
     and losses must match. Both ``zero_grad`` modes are covered.
     """
@@ -380,8 +404,8 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
         fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    # HFSDP's optimizer placement [Flat, Flat] differs from the parameter placement
-    # [Replicate, Flat], so main_weight and model_weight are distinct buffers and the
+    # HFSDP's optimizer placement [Shard(0), Shard(0)] differs from the parameter placement
+    # [Replicate, Shard(0)], so main_weight and model_weight are distinct buffers and the
     # compute weight is stale until the step post-hook registered here refreshes it.
     # HSDP needs no wrapper: its two placements match, so the buffers alias.
     fully_shard_optimizer(optimizer)
@@ -643,12 +667,13 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     model = nn.Linear(1, world_size, bias=False).to(device)
     nn.init.constant_(model.weight, 1.0)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
-    model(x).sum().backward()
-    model(x).sum().backward()
+    with microbatch(context, is_last=False):
+        model(x).sum().backward()
+        model(x).sum().backward()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()

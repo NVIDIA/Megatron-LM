@@ -6,16 +6,18 @@ import logging
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
@@ -50,7 +52,19 @@ class ElementwiseModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def _zero1_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
+    )
+
+
+def _zero2_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
 
 
 def _mb(num_bytes: int) -> str:
@@ -162,6 +176,97 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     )
 
 
+def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distributed_setup):
+    """First-step peak memory should match the expected ZeRO-1 training allocations."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    dim = 4096
+    num_tokens = 256
+    dtype = torch.bfloat16
+    x = torch.ones(num_tokens, dim, device=device, dtype=dtype)
+    model = ElementwiseModel(dim).to(device=device, dtype=dtype)
+    mesh = init_device_mesh(device.type, (world_size,))
+    placements = _zero1_placements()
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=placements)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
+    fully_shard_optimizer(optimizer)
+    (parameter_group,) = model.parameter_groups
+
+    allocated_before_training = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
+    loss = model(x).sum()
+    loss.backward()
+    optimizer.step()
+    assert parameter_group.model_weight.placements == (Flat(),)
+
+    actual_optimizer_size = sum(
+        state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
+        for state in optimizer.state.values()
+    )
+    actual_training_growth = torch.cuda.max_memory_allocated(device) - allocated_before_training
+
+    # Theoretical sharded Adam size.
+    shard_numel = dim * dim // world_size
+    fp32_size = torch.empty((), dtype=torch.float32).element_size()
+    bf16_size = torch.empty((), dtype=dtype).element_size()
+    theoretical_optimizer_size = 2 * shard_numel * fp32_size
+
+    # ElementwiseModel itself is the only layer in this test model.
+    num_layers = 1
+    full_bf16_weight_size = dim * dim * bf16_size
+    sharded_bf16_weight_size = full_bf16_weight_size // world_size
+    sharded_fp32_weight_size = shard_numel * fp32_size
+    activation_size = num_tokens * dim * bf16_size
+    # Backward peak growth:
+    # - Unsharded model weight: dim * dim * bf16_size.
+    backward_model_weight_size = full_bf16_weight_size
+    # - Full parameter gradient: dim * dim * bf16_size.
+    backward_parameter_gradient_size = full_bf16_weight_size
+    # - Unreduced partial-gradient buffer: dim * dim * bf16_size.
+    backward_partial_gradient_size = full_bf16_weight_size
+    # - Earlier-layer activations: (num_layers - 1) * num_tokens * dim * bf16_size.
+    #   This one-layer model has no stacked activation at its backward peak.
+    backward_stacked_activation_size = (num_layers - 1) * activation_size
+    # - Released baseline model-weight shard: -(dim * dim * bf16_size / world_size).
+    released_sharded_model_weight_size = sharded_bf16_weight_size
+    theoretical_backward_growth = (
+        backward_model_weight_size
+        + backward_parameter_gradient_size
+        + backward_partial_gradient_size
+        + backward_stacked_activation_size
+        - released_sharded_model_weight_size
+    )
+
+    # First-Adam-step peak growth:
+    # - Model weight grows from sharded to full BF16: full - sharded BF16 weight.
+    optimizer_model_weight_growth = full_bf16_weight_size - sharded_bf16_weight_size
+    # - BF16 main gradient shrinks from full to sharded: -(full - sharded BF16 weight).
+    optimizer_main_gradient_reduction = full_bf16_weight_size - sharded_bf16_weight_size
+    # - Casted gradient: shard_numel * fp32_size.
+    optimizer_casted_gradient_size = sharded_fp32_weight_size
+    # - Optimizer states exp_avg and exp_avg_sq: 2 * shard_numel * fp32_size.
+    optimizer_state_size = 2 * sharded_fp32_weight_size
+    # - Two FP32 buffers that briefly coexist while Adam computes the
+    #   bias-corrected denominator: 2 * shard_numel * fp32_size.
+    optimizer_temporary_size = 2 * sharded_fp32_weight_size
+    theoretical_optimizer_growth = (
+        optimizer_model_weight_growth
+        - optimizer_main_gradient_reduction
+        + optimizer_casted_gradient_size
+        + optimizer_state_size
+        + optimizer_temporary_size
+    )
+    theoretical_training_growth = max(theoretical_backward_growth, theoretical_optimizer_growth)
+
+    assert actual_optimizer_size == theoretical_optimizer_size
+    assert abs(actual_training_growth - theoretical_training_growth) < 1024**2
+
+
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
     """Deleting an FSDP model should release its persistent storage."""
     world_size = distributed_setup.world_size
@@ -231,8 +336,16 @@ def test_fully_shard_returns_to_resting_memory(distributed_setup):
     assert_returns_to_resting_memory("backward")
 
 
-def test_fully_shard_reduces_peak_training_memory(distributed_setup):
-    """Per-layer FSDP should reduce peak CUDA memory during training."""
+@pytest.mark.parametrize(
+    "placements_factory",
+    [
+        pytest.param(_zero1_placements, id="zero1"),
+        pytest.param(_zero2_placements, id="zero2"),
+        pytest.param(_flat_placements, id="zero3"),
+    ],
+)
+def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_factory):
+    """Per-layer FSDP should reduce peak CUDA memory for each sharding strategy."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -270,7 +383,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
             fully_shard(
                 layer,
                 mesh=mesh,
-                placements=_flat_placements(),
+                placements=placements_factory(),
                 mixed_precision_policy=MixedPrecisionPolicy(
                     main_params_dtype=dtype, main_grads_dtype=dtype
                 ),
@@ -288,4 +401,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
         _mb(sharded_peak),
     )
 
-    assert sharded_peak < baseline_peak
+    assert sharded_peak < baseline_peak, (
+        f"Expected FSDP to reduce peak training memory on rank {rank}: "
+        f"baseline={_mb(baseline_peak)}, sharded={_mb(sharded_peak)}"
+    )

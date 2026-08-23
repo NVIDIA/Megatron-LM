@@ -6,10 +6,10 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 from transformer_engine.pytorch.optimizers import FusedAdam
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -33,7 +33,7 @@ class TinyModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 def test_adam_without_adapter_raises_precision_error(distributed_setup):
