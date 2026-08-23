@@ -131,12 +131,26 @@ def visible_functional_vjp(
 
 def visible_clamped_swiglu(value: torch.Tensor, limit: float) -> torch.Tensor:
     """Use vLLM's activation bytes with the Lite functional graph as its VJP."""
-    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.fused_moe.activation import (
+        silu_and_mul_with_clamp,
+    )
 
     from megatron.lite.primitive.modules.experts import swiglu_with_probs
 
+    def visible_op(value_: torch.Tensor) -> torch.Tensor:
+        if not value_.is_cuda:
+            return swiglu_with_probs(value_, None, float(limit))
+        # The training process does not construct a vLLM worker, so register
+        # the stable-libtorch operators explicitly before calling the official
+        # activation entry.
+        import vllm._C_stable_libtorch  # noqa: F401
+
+        output = value_.new_empty((*value_.shape[:-1], value_.shape[-1] // 2))
+        silu_and_mul_with_clamp(output, value_, float(limit))
+        return output
+
     return visible_functional_vjp(
-        SiluAndMulWithClamp(float(limit)),
+        visible_op,
         lambda value_: swiglu_with_probs(value_, None, float(limit)),
         (value,),
     )

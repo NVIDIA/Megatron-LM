@@ -24,8 +24,9 @@ class _VisibleLinear(nn.Module):
     reason="requires CUDA and vLLM activation kernels",
 )
 def test_shared_swiglu_matches_vllm_clamp_bitwise() -> None:
-    from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.fused_moe.activation import (
+        silu_and_mul_with_clamp,
+    )
 
     torch.manual_seed(17)
     swiglu_limit = 10.0
@@ -35,10 +36,9 @@ def test_shared_swiglu_matches_vllm_clamp_bitwise() -> None:
         device="cuda",
         dtype=torch.bfloat16,
     ) * 20
-    with set_current_vllm_config(VllmConfig()):
-        expected = SiluAndMulWithClamp(swiglu_limit)(gate_up)
-    with set_current_vllm_config(VllmConfig()):
-        actual = visible_clamped_swiglu(gate_up, swiglu_limit)
+    actual = visible_clamped_swiglu(gate_up, swiglu_limit)
+    expected = gate_up.new_empty((gate_up.shape[0], gate_up.shape[1] // 2))
+    silu_and_mul_with_clamp(expected, gate_up, swiglu_limit)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -63,16 +63,17 @@ def test_shared_experts_preserve_clamp_and_bf16_master_gradients() -> None:
     )
     grad_output = torch.randn_like(hidden)
 
-    from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
-
-    with set_current_vllm_config(VllmConfig()):
-        output = moe._shared_expert_forward(hidden)
-        gate_up_visible = F.linear(hidden, moe.shared_experts.gate_up.weight)
-        expected_visible = F.linear(
-            SiluAndMulWithClamp(swiglu_limit)(gate_up_visible),
-            moe.shared_experts.down.weight,
-        )
+    output = moe._shared_expert_forward(hidden)
+    gate_up_visible = F.linear(hidden, moe.shared_experts.gate_up.weight)
+    expected_activated = swiglu_with_probs(
+        gate_up_visible,
+        None,
+        swiglu_limit,
+    )
+    expected_visible = F.linear(
+        expected_activated,
+        moe.shared_experts.down.weight,
+    )
     unclamped_gate, unclamped_up = gate_up_visible.chunk(2, dim=-1)
     unclamped_visible = F.linear(
         F.silu(unclamped_gate) * unclamped_up,
