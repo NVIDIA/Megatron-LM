@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
