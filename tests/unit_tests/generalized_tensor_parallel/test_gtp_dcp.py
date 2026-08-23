@@ -108,7 +108,7 @@ def _precreate_subgroups(_torchrun_dist_init):
     the call-order tag and hangs NCCL. Pre-creating makes every later ``_cached_new_group`` a hit.
     """
     if dist.is_initialized() and dist.get_world_size() == 4:
-        for ranks in ([0, 1], [2, 3], [0, 2], [1, 3], [0, 1, 2, 3]):
+        for ranks in ([0], [1], [2], [3], [0, 1], [2, 3], [0, 2], [1, 3], [0, 1, 2, 3]):
             _cached_new_group(ranks)
     yield
 
@@ -790,6 +790,69 @@ def _worker_save_without_mpu_uses_stamped_replica_group(rank, world_size, port):
             )
     finally:
         ps.initialize_model_parallel()
+
+
+def _worker_gtp_sharded_tp_replicated_roundtrip(rank, world_size, ckpt_base):
+    """A GTP-sharded duplicated weight uses TP only as a checkpoint replica coordinate.
+
+    world=4 -> TP2 x GTP2: GTP peers hold different axis-0 shards, while TP peers hold
+    identical copies of each shard. The checkpoint must therefore describe GTP2, not TP2 x GTP2,
+    and elect exactly one TP replica to write each GTP shard without reading MPU globals.
+    """
+    from megatron.core.dist_checkpointing import load, save
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    gtp_remat_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    tp_replica_group = _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    dp_replica_group = _cached_new_group([rank])
+    world_group = _cached_new_group(list(range(world_size)))
+    logical_out, in_features = 8, 4
+    gtp_size = 2
+    local_out = logical_out // gtp_size
+    tp_rank = rank // gtp_size
+    gtp_rank = rank % gtp_size
+
+    ps.destroy_model_parallel()
+    try:
+        weight = _make_gtp_shard(
+            logical_out, in_features, gtp_remat_group, replica_group=dp_replica_group
+        )
+        assert not ps.is_initialized(), "MPU must be down so all groups come from the caller"
+
+        sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {"weight": weight},
+            prefix="duplicated.",
+            tensor_parallel_layers_axis_map={},
+            tp_group=tp_replica_group,
+            dp_cp_group=world_group,
+        )
+        entry = sharded["duplicated.weight"]
+        assert isinstance(entry, ShardedTensor), type(entry)
+        assert entry.global_shape == (logical_out, in_features), entry.global_shape
+        assert entry.global_offset == (gtp_rank * local_out, 0), entry.global_offset
+        assert entry.axis_fragmentations == (gtp_size, 1), entry.axis_fragmentations
+        assert entry.replica_id == (0, tp_rank, 0), entry.replica_id
+
+        gathered = [None] * world_size
+        dist.all_gather_object(
+            gathered,
+            (gtp_rank, entry.global_offset, entry.replica_id, is_main_replica(entry.replica_id)),
+        )
+        for shard_rank in range(gtp_size):
+            shard_records = [record for record in gathered if record[0] == shard_rank]
+            assert len(shard_records) == 2, shard_records
+            assert len({record[1] for record in shard_records}) == 1, shard_records
+            assert sum(record[3] for record in shard_records) == 1, shard_records
+
+        with TempNamedDir(ckpt_base / 'gtp_tp_replicated_roundtrip', sync=True) as ckpt_dir:
+            save(sharded, ckpt_dir)
+            loaded = load(sharded, ckpt_dir)
+        torch.testing.assert_close(
+            loaded["duplicated.weight"].cpu(), weight.detach().cpu(), rtol=0, atol=0
+        )
+    finally:
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
 
 
 def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
@@ -1477,6 +1540,10 @@ class TestGtpDcpHelper:
     def test_save_without_mpu_uses_stamped_replica_group(self):
         _require_world_size(4)
         _worker_save_without_mpu_uses_stamped_replica_group(dist.get_rank(), 4, None)
+
+    def test_gtp_sharded_tp_replicated_roundtrip(self, tmp_path_dist_ckpt):
+        _require_world_size(4)
+        _worker_gtp_sharded_tp_replicated_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
 
     def test_replicated_sink_rejects_gtp(self):
         _require_world_size(4)
