@@ -276,9 +276,12 @@ class MoELayer(BaseMoELayer):
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
                 else None
             )
-            linear_gtp_kwargs = {"gtp_remat_group": gtp_remat_group}
+            linear_gtp_kwargs = {}
             if linear_cls is TELinear:
-                linear_gtp_kwargs["gtp_replica_group"] = pg_collection.dp_cp
+                linear_gtp_kwargs = {
+                    "gtp_remat_group": gtp_remat_group,
+                    "gtp_replica_group": pg_collection.dp_cp,
+                }
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,

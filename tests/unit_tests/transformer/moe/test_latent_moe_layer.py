@@ -34,6 +34,14 @@ class _RecordingLinear(torch.nn.Module):
         )
 
 
+class _RecordingInferenceLinear(torch.nn.Module):
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.calls.append((args, kwargs))
+
+
 class _DummyDispatcher(torch.nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -120,6 +128,19 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
         AssertionError, match="TELinear sharded_state_dict can only be used with duplicated"
     ):
         layer.sharded_state_dict(prefix="moe.", metadata={"dp_cp_group": checkpoint_dp_cp_group})
+
+    from megatron.core.tensor_parallel import inference_layers as inference_layers_module
+
+    _RecordingInferenceLinear.calls.clear()
+    monkeypatch.setattr(inference_layers_module, "InferenceLinear", _RecordingInferenceLinear)
+    config.transformer_impl = "inference_optimized"
+    MoELayer(config, submodules, pg_collection=pg_collection)
+
+    assert len(_RecordingInferenceLinear.calls) == 2
+    assert all(
+        "gtp_remat_group" not in kwargs and "gtp_replica_group" not in kwargs
+        for _, kwargs in _RecordingInferenceLinear.calls
+    )
 
 
 class TestLatentMoELayer:
