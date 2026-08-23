@@ -484,7 +484,7 @@ def test_partial_reduce_scatter_to_flat_average_without_symm_mem_detector(
     """Ordinary AVG remains available when PyTorch lacks the symmetric-memory detector."""
     device, world_size = distributed_setup.device, distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
-    monkeypatch.delattr(symm_mem, "is_symm_mem_tensor")
+    monkeypatch.delattr(symm_mem, "is_symm_mem_tensor", raising=False)
     rank_scale = float(distributed_setup.rank + 1)
     partial_buffer = DBuffer.distribute_tensors(
         [torch.full((5, 3), rank_scale, dtype=torch.float32, device=device)],
@@ -500,6 +500,8 @@ def test_partial_reduce_scatter_to_flat_average_without_symm_mem_detector(
 
 def test_symmetric_memory_partial_reduce_scatter_to_flat_average(distributed_setup):
     """Symmetric-memory reduce-scatter preserves AVG semantics."""
+    if not hasattr(symm_mem, "is_symm_mem_tensor"):
+        pytest.skip("PyTorch does not expose the symmetric-memory tensor detector.")
     device, world_size = distributed_setup.device, distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
     dist.barrier(device_ids=[device.index])
@@ -528,6 +530,8 @@ def test_symmetric_memory_partial_reduce_scatter_to_flat_average(distributed_set
 
 def test_symmetric_memory_partial_reduce_scatter_to_flat_sum(distributed_setup):
     """Symmetric-memory reduce-scatter preserves explicit SUM semantics."""
+    if not hasattr(symm_mem, "is_symm_mem_tensor"):
+        pytest.skip("PyTorch does not expose the symmetric-memory tensor detector.")
     device, world_size = distributed_setup.device, distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
     dist.barrier(device_ids=[device.index])

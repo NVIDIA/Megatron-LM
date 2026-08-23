@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
@@ -145,6 +146,128 @@ class SinkhornKnopp(torch.autograd.Function):
 
         return grad_input, None
 
+
+def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
+    """Native Sinkhorn-Knopp implementation used by fused-kernel fallbacks."""
+    M = input_logits.softmax(dim=-1) + eps
+    M = M / (M.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(num_iterations - 1):
+        M = M / (M.sum(dim=-1, keepdim=True) + eps)
+        M = M / (M.sum(dim=-2, keepdim=True) + eps)
+    return M
+
+
+@torch.compile
+def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
+    """Native n-stream weighted aggregation."""
+    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+
+
+class NativeHAggregateInto(torch.autograd.Function):
+    """Native H-aggregate whose result is produced in caller-owned storage."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+        """Aggregate into caller-owned ``out`` after validating its contract."""
+        if out.shape != x.shape[:2] + x.shape[3:]:
+            raise ValueError(
+                f"H-aggregate output shape {tuple(out.shape)} does not match "
+                f"{tuple(x.shape[:2] + x.shape[3:])}"
+            )
+        if out.dtype != x.dtype or out.device != x.device:
+            raise ValueError("H-aggregate output dtype/device must match x")
+        if not out.is_contiguous():
+            raise ValueError("H-aggregate caller-owned output must be contiguous")
+        if out.requires_grad:
+            raise ValueError("H-aggregate caller-owned output must be a detached tensor")
+
+        ctx.mark_dirty(out)
+        torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        ctx.save_for_backward(x, h_pre)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        """Back-propagate the aggregation, accumulating grad_h in fp32."""
+        x, h_pre = ctx.saved_tensors
+        grad_output_expanded = grad_output.unsqueeze(2)
+        grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
+        grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
+        return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype), None
+
+
+def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+    """Native weighted aggregation that writes directly to ``out``."""
+    return NativeHAggregateInto.apply(x, h_pre, out)
+
+
+@torch.compile
+def native_h_post_bda(
+    h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+) -> Tensor:
+    """Native H_res.T @ residual + H_post * (x [+ bias])."""
+    s, b, n, C = original_residual.shape
+    h_res_batched = h_res.view(s * b, n, n)
+    residual_batched = original_residual.view(s * b, n, C)
+    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
+    x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
+    if bias is not None:
+        return x_expanded + h_post.unsqueeze(-1) * bias.view(1, 1, 1, C) + mixed
+    return x_expanded + mixed
+
+
+@torch.compile
+def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+    """Native fused projection and RMS normalization."""
+    proj = torch.matmul(x, weight.t())
+    norm = x.norm(dim=-1, keepdim=True)
+    return proj, 1.0 / (norm / math.sqrt(x.shape[-1]) + eps)
+
+
+@torch.compile
+def native_fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
+    """Native three-way elementwise add."""
+    return a + b + c
+
+
+
+class BroadcastTensorFused(torch.autograd.Function):
+    """Split one tensor into three graph children backed by shared storage."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, fused_add_3_fn):
+        """Return three view aliases and remember the gradient combiner."""
+        ctx.fused_add_3_fn = fused_add_3_fn
+        return x.view_as(x), x.view_as(x), x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad1: Optional[Tensor], grad2: Optional[Tensor], grad3: Optional[Tensor]):
+        """Combine the gradients of all broadcast aliases."""
+        grads = [grad for grad in (grad1, grad2, grad3) if grad is not None]
+        if not grads:
+            return None, None
+        if len(grads) == 1:
+            return grads[0], None
+        if len(grads) == 2:
+            return grads[0] + grads[1], None
+        return ctx.fused_add_3_fn(grad1, grad2, grad3), None
+
+
+@torch.compile
+def learned_output_contract(
+    hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
+) -> Tensor:
+    """Learned output contraction: n-stream to 1-stream via sigmoid-gated weighted sum."""
+    dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    head_fn = head_fn.to(torch.float32)
+    base = base.to(torch.float32)
+    scale = scale.to(torch.float32)
+    rsqrt = torch.rsqrt(hidden_states.square().mean(-1, keepdim=True) + eps)
+    mixes = F.linear(hidden_states, head_fn) * rsqrt
+    pre = torch.sigmoid(mixes * scale + base) + eps
+    y = torch.sum(pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2)
+    return y.to(dtype)
 
 # TODO: keep hyper connection in fp32 computation
 class HyperConnectionModule(MegatronModule):

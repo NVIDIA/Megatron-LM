@@ -1009,10 +1009,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1248,10 +1250,12 @@ class TEColumnParallelLinear(TELinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1491,10 +1495,12 @@ class TERowParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
         """
         if not HAVE_TE:
             raise ImportError(
