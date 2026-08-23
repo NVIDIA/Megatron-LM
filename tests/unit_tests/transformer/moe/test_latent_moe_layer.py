@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.extensions import transformer_engine as transformer_engine_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -22,8 +23,15 @@ class _RecordingLinear(torch.nn.Module):
 
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.parallel_mode = None
+        self._tp_group = None
         self.register_parameter("weight", torch.nn.Parameter(torch.empty(1, 1)))
         self.calls.append((args, kwargs))
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return transformer_engine_module.TELinear.sharded_state_dict(
+            self, prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+        )
 
 
 class _DummyDispatcher(torch.nn.Module):
@@ -52,8 +60,12 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     """Latent projections use the owning TP group only for checkpoint metadata."""
     tp_group = _FakeProcessGroup()
     ep_group = _FakeProcessGroup()
-    dp_cp_group = _FakeProcessGroup()
-    pg_collection = ProcessGroupCollection(tp=tp_group, ep=ep_group)
+    gtp_remat_group = _FakeProcessGroup()
+    gtp_replica_group = _FakeProcessGroup()
+    checkpoint_dp_cp_group = _FakeProcessGroup()
+    pg_collection = ProcessGroupCollection(
+        tp=tp_group, ep=ep_group, dp_cp=gtp_replica_group, gtp_remat=gtp_remat_group
+    )
     checkpoint_calls = {}
     config = TransformerConfig(
         num_layers=1,
@@ -67,6 +79,7 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
         moe_latent_size=4,
         use_cpu_initialization=True,
         add_bias_linear=False,
+        gtp_remat_opt_in_modules=["moe_latent_proj"],
     )
     submodules = MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module)
 
@@ -75,7 +88,7 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     monkeypatch.setattr(moe_layer_module, "TELinear", _RecordingLinear)
     monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
     monkeypatch.setattr(
-        moe_layer_module,
+        transformer_engine_module,
         "make_sharded_tensors_for_checkpoint",
         lambda state_dict, prefix, *args, **kwargs: _record_checkpoint_call(
             checkpoint_calls, state_dict, prefix, *args, **kwargs
@@ -87,14 +100,26 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
     assert len(_RecordingLinear.calls) == 2
     assert all(kwargs["parallel_mode"] == "duplicated" for _, kwargs in _RecordingLinear.calls)
     assert all("tp_group" not in kwargs for _, kwargs in _RecordingLinear.calls)
+    assert all(kwargs["gtp_remat_group"] is gtp_remat_group for _, kwargs in _RecordingLinear.calls)
+    assert all(
+        kwargs["gtp_replica_group"] is gtp_replica_group for _, kwargs in _RecordingLinear.calls
+    )
+    assert layer.fc1_latent_proj._tp_group is tp_group
+    assert layer.fc2_latent_proj._tp_group is tp_group
 
-    layer.sharded_state_dict(prefix="moe.", metadata={"dp_cp_group": dp_cp_group})
+    layer.sharded_state_dict(prefix="moe.", metadata={"dp_cp_group": checkpoint_dp_cp_group})
 
     for name in ("fc1_latent_proj", "fc2_latent_proj"):
         state_dict, checkpoint_kwargs = checkpoint_calls[f"moe.{name}."]
         assert set(state_dict) == {"weight"}
         assert checkpoint_kwargs["tp_group"] is tp_group
-        assert checkpoint_kwargs["dp_cp_group"] is dp_cp_group
+        assert checkpoint_kwargs["dp_cp_group"] is checkpoint_dp_cp_group
+
+    layer.fc1_latent_proj.parallel_mode = "column"
+    with pytest.raises(
+        AssertionError, match="TELinear sharded_state_dict can only be used with duplicated"
+    ):
+        layer.sharded_state_dict(prefix="moe.", metadata={"dp_cp_group": checkpoint_dp_cp_group})
 
 
 class TestLatentMoELayer:

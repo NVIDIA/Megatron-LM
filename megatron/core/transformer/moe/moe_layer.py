@@ -9,7 +9,6 @@ from typing import Optional, Protocol
 import torch
 
 from megatron.core import tensor_parallel, utils
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.utils import InferenceMode
@@ -34,11 +33,6 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import (
-    ensure_metadata_has_dp_cp_group,
-    make_sharded_tensors_for_checkpoint,
-    sharded_state_dict_default,
-)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
@@ -282,6 +276,9 @@ class MoELayer(BaseMoELayer):
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
                 else None
             )
+            linear_gtp_kwargs = {"gtp_remat_group": gtp_remat_group}
+            if linear_cls is TELinear:
+                linear_gtp_kwargs["gtp_replica_group"] = pg_collection.dp_cp
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -293,7 +290,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
-                gtp_remat_group=gtp_remat_group,
+                **linear_gtp_kwargs,
             )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
@@ -306,8 +303,13 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
-                gtp_remat_group=gtp_remat_group,
+                **linear_gtp_kwargs,
             )
+            if linear_cls is TELinear:
+                # The duplicated operation has no TP execution group. TELinear uses
+                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
+                self.fc1_latent_proj._tp_group = pg_collection.tp
+                self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -394,48 +396,6 @@ class MoELayer(BaseMoELayer):
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
-
-    def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: tuple[tuple[int, int, int], ...] = (),
-        metadata: Optional[dict] = None,
-    ) -> ShardedStateDict:
-        """Build a sharded state dict with explicit groups for latent projections."""
-        if not self.config.moe_latent_size:
-            return super().sharded_state_dict(prefix, sharded_offsets, metadata)
-
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
-        dp_cp_group = metadata['dp_cp_group']
-
-        sharded_state_dict = {}
-        self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
-        sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            sharded_state_dict,
-            prefix,
-            sharded_offsets=sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=dp_cp_group,
-        )
-
-        for name, module in self.named_children():
-            module_prefix = f'{prefix}{name}.'
-            if name in ('fc1_latent_proj', 'fc2_latent_proj'):
-                module_sharded_state_dict = make_sharded_tensors_for_checkpoint(
-                    module.state_dict(prefix='', keep_vars=True),
-                    module_prefix,
-                    None,
-                    sharded_offsets,
-                    tp_group=self.tp_group,
-                    dp_cp_group=dp_cp_group,
-                )
-            else:
-                module_sharded_state_dict = sharded_state_dict_default(
-                    module, module_prefix, sharded_offsets, metadata, tp_group=self.tp_group
-                )
-            sharded_state_dict.update(module_sharded_state_dict)
-
-        return sharded_state_dict
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.
