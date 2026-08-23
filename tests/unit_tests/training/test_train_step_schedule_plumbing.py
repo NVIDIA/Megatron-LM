@@ -106,3 +106,29 @@ def test_train_step_uses_optimizer_ddp_config_for_mxfp8_staging():
 
     overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
     nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
+
+
+def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
+    class _DistributedOptimizer:
+        def __init__(self):
+            self.ddp_config = SimpleNamespace(
+                reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
+            )
+            self._copy_main_params_to_param_buffer = mock.Mock()
+
+        def zero_grad(self):
+            pass
+
+    optimizer = _DistributedOptimizer()
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False,
+            zero_grad_buffer=lambda: None,
+            remove_forward_pre_hook_handles={object(): object()},
+        )
+    ]
+
+    with mock.patch.object(training_mod, "DistributedOptimizer", _DistributedOptimizer):
+        _run(model=model, optimizer=optimizer)
+
+    optimizer._copy_main_params_to_param_buffer.assert_called_once_with()

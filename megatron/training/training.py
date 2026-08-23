@@ -3055,9 +3055,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # A model component's DDP config may differ from the global args. Check the
         # DistributedOptimizer config that owns the buffers and hooks; non-overlapped
         # optimizers stage during optimizer.step().
+        optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
         mxfp8_overlap_optimizers = [
             optim_instance
-            for optim_instance in optimizer.chained_optimizers
+            for optim_instance in optimizer_instances
             if (
                 isinstance(optim_instance, DistributedOptimizer)
                 and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag

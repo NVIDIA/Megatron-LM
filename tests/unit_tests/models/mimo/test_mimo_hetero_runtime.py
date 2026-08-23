@@ -297,7 +297,7 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
     mocker.patch.object(builder, "build_model", return_value=original_model)
     mocker.patch(
         "examples.mimo.training.builder.wrap_active_modules_with_ddp",
-        side_effect=lambda *_: events.append("wrap"),
+        side_effect=lambda *_, **__: events.append("wrap"),
     )
     mocker.patch(
         "examples.mimo.training.builder.configure_grad_sync",
