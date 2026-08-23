@@ -311,6 +311,12 @@ class MoELayer(BaseMoELayer):
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
                 else None
             )
+            linear_gtp_kwargs = {}
+            if linear_cls is TELinear:
+                linear_gtp_kwargs = {
+                    "gtp_remat_group": gtp_remat_group,
+                    "gtp_replica_group": pg_collection.dp_cp,
+                }
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -322,7 +328,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
-                gtp_remat_group=gtp_remat_group,
+                **linear_gtp_kwargs,
             )
             fc2_linear_cls = (
                 TERMSNormDuplicatedLinear
@@ -348,8 +354,13 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
                 **fc2_extra_kwargs,
-                gtp_remat_group=gtp_remat_group,
+                **linear_gtp_kwargs,
             )
+            if linear_cls is TELinear:
+                # The duplicated operation has no TP execution group. TELinear uses
+                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
+                self.fc1_latent_proj._tp_group = pg_collection.tp
+                self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Megakernel backends replace native dispatch, expert compute, and combine,
         # so only construct a token dispatcher for the native MoE path.
