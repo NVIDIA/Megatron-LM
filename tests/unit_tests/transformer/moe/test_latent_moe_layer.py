@@ -22,6 +22,7 @@ class _RecordingLinear(torch.nn.Module):
 
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.register_parameter("weight", torch.nn.Parameter(torch.empty(1, 1)))
         self.calls.append((args, kwargs))
 
 
@@ -42,11 +43,18 @@ def _build_dummy_module(*args, **kwargs):
     return torch.nn.Module()
 
 
-def test_latent_projections_receive_owning_tp_group(monkeypatch):
-    """Latent-MoE checkpoint metadata must use the layer's custom TP group."""
+def _record_checkpoint_call(checkpoint_calls, state_dict, prefix, *args, **kwargs):
+    checkpoint_calls[prefix] = (state_dict, kwargs)
+    return {}
+
+
+def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch):
+    """Latent projections use the owning TP group only for checkpoint metadata."""
     tp_group = _FakeProcessGroup()
     ep_group = _FakeProcessGroup()
+    dp_cp_group = _FakeProcessGroup()
     pg_collection = ProcessGroupCollection(tp=tp_group, ep=ep_group)
+    checkpoint_calls = {}
     config = TransformerConfig(
         num_layers=1,
         hidden_size=8,
@@ -66,12 +74,27 @@ def test_latent_projections_receive_owning_tp_group(monkeypatch):
     monkeypatch.setattr(moe_layer_module, "HAVE_TE", True)
     monkeypatch.setattr(moe_layer_module, "TELinear", _RecordingLinear)
     monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
+    monkeypatch.setattr(
+        moe_layer_module,
+        "make_sharded_tensors_for_checkpoint",
+        lambda state_dict, prefix, *args, **kwargs: _record_checkpoint_call(
+            checkpoint_calls, state_dict, prefix, *args, **kwargs
+        ),
+    )
 
-    MoELayer(config, submodules, pg_collection=pg_collection)
+    layer = MoELayer(config, submodules, pg_collection=pg_collection)
 
     assert len(_RecordingLinear.calls) == 2
     assert all(kwargs["parallel_mode"] == "duplicated" for _, kwargs in _RecordingLinear.calls)
-    assert all(kwargs["tp_group"] is tp_group for _, kwargs in _RecordingLinear.calls)
+    assert all("tp_group" not in kwargs for _, kwargs in _RecordingLinear.calls)
+
+    layer.sharded_state_dict(prefix="moe.", metadata={"dp_cp_group": dp_cp_group})
+
+    for name in ("fc1_latent_proj", "fc2_latent_proj"):
+        state_dict, checkpoint_kwargs = checkpoint_calls[f"moe.{name}."]
+        assert set(state_dict) == {"weight"}
+        assert checkpoint_kwargs["tp_group"] is tp_group
+        assert checkpoint_kwargs["dp_cp_group"] is dp_cp_group
 
 
 class TestLatentMoELayer:
