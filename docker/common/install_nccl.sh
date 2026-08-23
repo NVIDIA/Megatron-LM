@@ -30,7 +30,16 @@ ARCH=$(uname -m)
 if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
 if [ "$ARCH" = "aarch64" ];then ARCH="sbsa";fi
 
+CUDA_KEYRING_SHA256_X86_64="d2a6b11c096396d868758b86dab1823b25e14d70333f1dfa74da5ddaf6a06dba"
+CUDA_KEYRING_SHA256_SBSA="6ea7d2737648936820e85677177957a0f6521b840d98eb0bbae0a4f003fa7249"
+case "$ARCH" in
+    x86_64) CUDA_KEYRING_SHA256="$CUDA_KEYRING_SHA256_X86_64";;
+    sbsa) CUDA_KEYRING_SHA256="$CUDA_KEYRING_SHA256_SBSA";;
+    *) echo "Unsupported architecture: $ARCH" >&2; exit 1;;
+esac
+
 curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH}/cuda-keyring_1.1-1_all.deb
+echo "${CUDA_KEYRING_SHA256}  cuda-keyring_1.1-1_all.deb" | sha256sum --check --strict
 dpkg -i cuda-keyring_1.1-1_all.deb
 rm cuda-keyring_1.1-1_all.deb
 
