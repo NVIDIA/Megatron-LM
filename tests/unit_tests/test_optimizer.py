@@ -646,6 +646,7 @@ def test_mtp_grad_clipping_uses_separate_norms():
     class MockOptimizer:
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+        get_grad_norm = MegatronOptimizer.get_grad_norm
         get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
         has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
         _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
