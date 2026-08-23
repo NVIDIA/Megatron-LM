@@ -67,7 +67,7 @@ def _parse_and_validate() -> argparse.Namespace:
         args.use_distributed_optimizer
         or getattr(args, "use_layer_wise_distributed_optimizer", False)
     ):
-        raise ValueError("heterogeneous MIMO training requires a distributed optimizer")
+        raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
     validate_encoder_prefetch_args(args)
 
     if getattr(args, "padded_vocab_size", None) is None:
