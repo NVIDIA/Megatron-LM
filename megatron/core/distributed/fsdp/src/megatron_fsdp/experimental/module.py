@@ -15,6 +15,7 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
+from collections.abc import Sequence
 from typing import Literal, cast
 from weakref import ref
 
@@ -178,8 +179,16 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        parent_mesh: DeviceMesh | None = None,
+        dp_axes: Sequence[int] | None = None,
     ) -> None:
-        """Initialize FSDP runtime state on an already-constructed module."""
+        """Initialize FSDP runtime state on an already-constructed module.
+
+        ``mesh`` is the data-parallel submesh MFSDP shards over. ``parent_mesh`` is the
+        mesh the caller passed to ``fully_shard`` and ``dp_axes`` names which of its axes
+        ``mesh`` was selected from, so the sharded DTensors can be expressed on the parent
+        mesh and any sharding a parameter already carried on the other axes survives.
+        """
         self._context = context
         self._is_root = False
         self._name = None
@@ -196,6 +205,8 @@ class FsdpModule:
                     owning_module=self,
                     parameters=group_parameters,
                     mesh=mesh,
+                    parent_mesh=parent_mesh if parent_mesh is not None else mesh,
+                    dp_axes=dp_axes,
                     model_weight_placements=_specialize_placements(
                         model_weight_placements, group_dtype
                     ),

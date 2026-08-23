@@ -14,7 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from weakref import ReferenceType, ref
@@ -23,7 +23,7 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
@@ -57,6 +57,18 @@ def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> 
             continue
         seen_parameter_groups.add(parameter_group)
         parameter_group.sync_model_weight_from_main_weight()
+
+
+@dataclass(frozen=True)
+class _ExpertSpec:
+    """The expert-parallel sharding an input parameter already carried.
+
+    Captured before ``DBuffer`` reduces the parameter to its local shard, so the sharded
+    parameter MFSDP installs can be re-expressed on the parent mesh.
+    """
+
+    global_shape: torch.Size
+    placement: Shard
 
 
 @dataclass(frozen=True, eq=False)
@@ -100,6 +112,8 @@ class FsdpParameterGroup:
         reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        parent_mesh: DeviceMesh | None = None,
+        dp_axes: Sequence[int] | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -117,6 +131,9 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            parent_mesh: Mesh the caller passed to ``fully_shard``. Defaults to ``mesh``.
+            dp_axes: Indices of ``parent_mesh``'s data-parallel axes, in mesh-axis order.
+                Defaults to every axis of ``mesh``.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -127,6 +144,22 @@ class FsdpParameterGroup:
         for fqn, parameter in parameters.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
 
+        # The group owns the parent mesh because it builds the optimizer- and
+        # checkpoint-facing DTensors; the DBuffers below own only the data-parallel submesh.
+        self.parent_mesh = parent_mesh if parent_mesh is not None else mesh
+        self._dp_axes = tuple(dp_axes) if dp_axes is not None else tuple(range(mesh.ndim))
+        # Axes of the parent mesh that MFSDP does not shard over. A parameter may already
+        # be sharded on one of them; today only expert parallelism is supported, and
+        # _expert_spec is where that restriction lives.
+        self._non_dp_axes = tuple(
+            axis for axis in range(self.parent_mesh.ndim) if axis not in set(self._dp_axes)
+        )
+        # Captured before DBuffer reduces each parameter to its local shard. None for
+        # parameters that are not expert-parallel DTensors, which keep the existing path;
+        # dense and expert parameters can share a (dtype, requires_grad) group.
+        self._expert_specs: tuple[_ExpertSpec | None, ...] = tuple(
+            self._expert_spec(fqns, parameter) for parameter, fqns in parameter_to_fqns.items()
+        )
         self._model_weight_placements = model_weight_placements
         # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
         # is finalized to main_weight's placements after the last microbatch.
@@ -152,7 +185,12 @@ class FsdpParameterGroup:
                     f"got {parameter.requires_grad}."
                 )
 
-        tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
+        # Local shapes: an expert-parallel DTensor's .shape is the global extent, while the
+        # DBuffer layout is expressed in this rank's local elements.
+        tensor_shapes = tuple(
+            (parameter.to_local() if isinstance(parameter.data, DTensor) else parameter).shape
+            for parameter in parameter_to_fqns
+        )
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
@@ -216,7 +254,16 @@ class FsdpParameterGroup:
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
             unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
-            if parameter.is_meta:
+            if isinstance(parameter.data, DTensor):
+                # An expert-parallel DTensor Parameter can neither take a plain .data --
+                # the wrapper survives and autograd then demands gradients shaped like the
+                # *global* tensor instead of this rank's shard -- nor be swapped with a
+                # plain Parameter, because DTensor carries extra slots. Replace it with a
+                # plain Parameter over the same storage; the module entry is rewritten by
+                # _switch_to_sharded_parameters() either way, and the expert sharding was
+                # already captured in self._expert_specs.
+                parameter = nn.Parameter(unsharded_tensor, requires_grad=parameter.requires_grad)
+            elif parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
                 # This may be problematic if attributes from the original Parameter need
@@ -232,7 +279,7 @@ class FsdpParameterGroup:
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
-                self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
+                self.get_dtensor(self.main_weight, index), requires_grad=parameter.requires_grad
             )
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
@@ -244,6 +291,96 @@ class FsdpParameterGroup:
 
         self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
+
+    def _expert_spec(self, fqns: list[str], parameter: nn.Parameter) -> "_ExpertSpec | None":
+        """Validate and capture a parameter's pre-existing expert-parallel sharding.
+
+        Returns None for ordinary parameters, which keep the data-parallel-only path.
+        Rejects unsupported inputs before any buffer is allocated.
+        """
+        data = parameter.data
+        if not isinstance(data, DTensor):
+            return None
+        if not self._non_dp_axes:
+            raise ValueError(
+                f"Parameter {fqns!r} is an expert-parallel DTensor, but the mesh passed to "
+                "fully_shard has no non-data-parallel axis to place it on. Pass an (ep, dp) "
+                "mesh and name the data-parallel axis via Placements.dp_axes."
+            )
+        if len(self._non_dp_axes) != 1:
+            raise NotImplementedError(
+                f"MFSDP supports at most one non-data-parallel mesh axis alongside an "
+                f"expert-parallel parameter, got {len(self._non_dp_axes)}: axes "
+                f"{list(self._non_dp_axes)} of mesh dim names {self.parent_mesh.mesh_dim_names}."
+            )
+        (expert_axis,) = self._non_dp_axes
+        if expert_axis > min(self._dp_axes):
+            # DTensor applies placements outer-to-inner in mesh-axis order, so the expert
+            # axis must precede the data-parallel axes to describe the physical nesting:
+            # expert parallelism partitions the experts, and MFSDP shards the local ones
+            # underneath. A (dp, ep) mesh would need a strided placement to describe the
+            # same bytes, so reject it rather than emit placements that tile perfectly
+            # over the wrong rows.
+            raise NotImplementedError(
+                "The non-data-parallel mesh axis must precede the data-parallel axes, i.e. "
+                f"an (ep, dp) mesh. Got dim names {self.parent_mesh.mesh_dim_names} with "
+                f"data-parallel axes {list(self._dp_axes)}."
+            )
+        if data.device_mesh.ndim != 1:
+            raise NotImplementedError(
+                f"Only a 1-D expert-parallel mesh is supported, but parameter {fqns!r} has a "
+                f"{data.device_mesh.ndim}-D mesh {data.device_mesh.mesh_dim_names}."
+            )
+        (placement,) = data.placements
+        if not isinstance(placement, Shard) or placement.dim != 0:
+            raise NotImplementedError(
+                f"Only Shard(0) expert-parallel placement is supported, but parameter "
+                f"{fqns!r} has placement {placement!r}."
+            )
+        expert_mesh_size = self.parent_mesh.size(expert_axis)
+        if data.device_mesh.size() != expert_mesh_size:
+            raise ValueError(
+                f"Parameter {fqns!r} is sharded over an expert-parallel mesh of size "
+                f"{data.device_mesh.size()}, but axis {expert_axis} of the mesh passed "
+                f"to fully_shard has size {expert_mesh_size}."
+            )
+        return _ExpertSpec(global_shape=torch.Size(data.shape), placement=placement)
+
+    def get_dtensor(self, buffer: DBuffer, index: int) -> DTensor:
+        """Lift a DBuffer's data-parallel DTensor onto this group's parent mesh.
+
+        ``buffer.get_dtensor`` returns a DTensor on the data-parallel submesh. When the
+        parameter arrived already expert-parallel sharded, this re-wraps it on
+        ``self.parent_mesh``, putting the captured expert placement on the expert axis and
+        restoring the global dim-0 extent, so the global expert index survives into the
+        optimizer and checkpoints. Everything else is returned unchanged.
+
+        Mesh-axis order is the nesting order -- expert parallelism partitions the experts
+        and MFSDP shards the local ones underneath -- so both axes carry a plain
+        ``Shard(0)`` and no strided placement is needed. ``fully_shard`` rejects the
+        reverse (dp, ep) order for exactly that reason.
+        """
+        dp_dtensor = buffer.get_dtensor(index)
+        expert_spec = self._expert_specs[index]
+        if expert_spec is None:
+            return dp_dtensor
+
+        parent_mesh = self.parent_mesh
+        # Data-parallel placements go back on the parent axes they were selected from;
+        # the remaining axis carries the sharding the parameter already had.
+        placements: list[Placement] = [expert_spec.placement] * parent_mesh.ndim
+        for dp_index, parent_axis in enumerate(self._dp_axes):
+            placements[parent_axis] = dp_dtensor.placements[dp_index]
+
+        local_tensor = dp_dtensor.to_local()
+        return DTensor.from_local(
+            local_tensor=local_tensor,
+            device_mesh=parent_mesh,
+            placements=tuple(placements),
+            run_check=False,
+            shape=expert_spec.global_shape,
+            stride=local_tensor.stride(),
+        )
 
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
@@ -443,7 +580,7 @@ class FsdpParameterGroup:
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+            fsdp_parameter.sharded.grad = self.get_dtensor(self.main_grad, index)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
