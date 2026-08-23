@@ -246,7 +246,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 
 | Knob | Default | Purpose |
 |---|---|---|
-| `pad_for_alignment` | auto (16 NVFP4, 32 MXFP8, 16 BF16) | Shard alignment; auto-set by `training.py` based on quantization recipe. |
+| `pad_for_alignment` | auto (16 NVFP4, 32 MXFP8, 1 BF16) | Shard alignment; auto-set by `training.py` based on quantization recipe. BF16 has no tile-size requirement, so it pads only to `gtp_remat_size` — the minimum needed for equal-sized AG/RS shards. |
 | `weight_prefetch` | `True` | Disable only to debug the synchronous cold-start path. |
 | `async_reduction` | `True` | Async wgrad reduce-scatter; disable for easier debugging. |
 | `calculate_per_token_loss` | `False` | Must mirror `config.calculate_per_token_loss` (SUM vs MEAN RS). |
@@ -317,10 +317,13 @@ torchrun --nproc-per-node 4 pretrain_gpt.py \
 At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
-GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False,
+GTP_remat enabled. GTPRematConfig(pad_for_alignment=1, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
   reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2)
 ```
+
+(`pad_for_alignment=1` here because this example is BF16 with no quantization-tile
+requirement — see the table above.)
 
 ### 2.5 Tuning knobs
 
@@ -328,7 +331,7 @@ Set via `from megatron.core.tensor_parallel.generalized_tensor_parallelism impor
 
 ```python
 update_gtp_config(
-    pad_for_alignment=16,         # NVFP4: 16, MXFP8: 32, BF16: any; auto-set in training.py
+    pad_for_alignment=1,          # NVFP4: 16, MXFP8: 32, BF16: 1 (min for AG/RS); auto-set in training.py
     weight_prefetch=True,         # Disable to debug the cold-start path
     async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
@@ -337,7 +340,7 @@ update_gtp_config(
 )
 ```
 
-`training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
+`training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction, defaulting to `1` (the minimum needed for equal-sized AG/RS shards) when no low-precision tile size applies. The other knobs are usually left at defaults.
 
 GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enabled automatically. The ownership and ordering protocol is described in [§3.6](#cross-graph-backward-reduce-scatter-overlap).
 
@@ -787,7 +790,7 @@ The feature applies only to **local/partial CUDA graphs** and is enabled automat
 
 ### 3.7 Per-parameter alignment padding
 
-Low-precision tiling formats need each rank's local shard aligned to their tile size (MXFP8: 32, NVFP4: 16) — plain equal-sized AG/RS shards only need `dim0` divisible by `gtp_remat_size`, which padding is not required for (`_gtp_slice_one_param` skips it and just asserts that divisibility when `pad_for_alignment == 0`). A weight's real `dim0` is rarely already a multiple of `pad_for_alignment × gtp_remat_size`, so `_gtp_slice_one_param` pads the *logical* tensor up to the next multiple before slicing it evenly across `gtp_remat_group` (§1.3) — the padding lands as a contiguous suffix of that padded buffer. It is real, allocated storage, but the wgrad GEMM only ever writes the logical prefix (§3.6), so it stays exact `0.0` for the life of the run: a permanent structural zero, not a value that merely happens to be zero.
+Low-precision tiling formats need each rank's local shard aligned to their tile size (MXFP8: 32, NVFP4: 16) — plain equal-sized AG/RS shards only need `dim0` divisible by `gtp_remat_size`, which padding is not required for (`_gtp_slice_one_param` skips it and just asserts that divisibility when `pad_for_alignment == 0`). BF16 has no tile-size requirement, so `training.py` sets `pad_for_alignment=1` for it — `dim0` still isn't guaranteed divisible by `gtp_remat_size` on its own, so padding stays on, just bounded to `gtp_remat_size - 1` rows instead of a 16/32-row tile margin. A weight's real `dim0` is rarely already a multiple of `pad_for_alignment × gtp_remat_size`, so `_gtp_slice_one_param` pads the *logical* tensor up to the next multiple before slicing it evenly across `gtp_remat_group` (§1.3) — the padding lands as a contiguous suffix of that padded buffer. It is real, allocated storage, but the wgrad GEMM only ever writes the logical prefix (§3.6), so it stays exact `0.0` for the life of the run: a permanent structural zero, not a value that merely happens to be zero.
 
 #### Where padding lands
 
@@ -832,7 +835,7 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 #### Why pad this way
 
 - **Uniform shard sizes without runtime coordination.** `pad_length` is a pure function of `dim0`, `pad_for_alignment`, and `gtp_remat_size` — computed once, locally, at shard-construction time. No cross-rank negotiation is needed to agree on a shard size before the first AG/RS.
-- **Equal-sized AG/RS shards fall out for free.** `pad_for_alignment` is set to the precision format's tile size (MXFP8/NVFP4); the same pass that satisfies tiling also leaves every rank with an equal-sized shard, so AG/RS needs no separate padding step of its own.
+- **Equal-sized AG/RS shards fall out for free.** For MXFP8/NVFP4, `pad_for_alignment` is set to the precision format's tile size, so the same pass that satisfies tiling also leaves every rank with an equal-sized shard. For BF16, `pad_for_alignment=1` rounds `dim0` up to the next multiple of `gtp_remat_size` directly — no tile size to satisfy, so padding is only the minimum AG/RS itself requires.
 - **A contiguous tail keeps stripping (and resharding) cheap.** Padding is always appended as a suffix *before* slicing, never interleaved with real data, so recovering the logical tensor is a single trailing slice (`tensor[:-pad_length]`) — simple enough to stay correct even when a checkpoint reload changes `gtp_remat_size` and thus the padded size (§3.3's `allow_shape_mismatch`).
 - **A predictable invariant other systems can build on.** "Padding is always an exact structural zero, never written" is safe for any consumer that needs to distinguish real elements from padding — DCP's cross-topology reshard tolerance (§3.3) and the wgrad-ring's fixed-address buffers (§3.6) both lean on it, and it's what lets `count_zeros_fp32` exclude these permanent zeros from `num_zeros` instead of miscounting them as converged-to-zero gradients.
 
