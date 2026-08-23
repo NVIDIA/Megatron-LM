@@ -958,7 +958,20 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
 class VLLMAlignedHybridEPDispatcher(TokenDispatcher):
     """Preserve vLLM route slots over the dedicated HybridEP transport."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        hybridep_max_tokens_per_rank: int | None = None,
+        **kwargs,
+    ):
+        if (
+            not isinstance(hybridep_max_tokens_per_rank, int)
+            or isinstance(hybridep_max_tokens_per_rank, bool)
+            or hybridep_max_tokens_per_rank <= 0
+        ):
+            raise ValueError(
+                "hybridep_max_tokens_per_rank must be a positive integer"
+            )
         kwargs["use_deepep"] = False
         super().__init__(*args, **kwargs)
         if self.ep_size <= 1:
@@ -968,6 +981,7 @@ class VLLMAlignedHybridEPDispatcher(TokenDispatcher):
         hybridep.require_available()
         hybridep.validate_topology(self.ps.ep_group)
         self._hybridep_group = self.ps.ep_group
+        self._hybridep_max_tokens_per_rank = hybridep_max_tokens_per_rank
         self._hybridep_state = None
 
     def dispatch(
@@ -985,6 +999,7 @@ class VLLMAlignedHybridEPDispatcher(TokenDispatcher):
             num_experts=self.num_experts,
             num_local_experts=self.num_local_experts,
             group=self._hybridep_group,
+            hybridep_max_tokens_per_rank=self._hybridep_max_tokens_per_rank,
         )
         self._hybridep_state = result.state
         self._local_tpe_list = result.tokens_per_expert.tolist()

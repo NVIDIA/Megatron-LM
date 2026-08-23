@@ -86,6 +86,9 @@ def _build_moe(
         ),
         layer_idx=0,
         moe_token_dispatcher_type=backend,
+        hybridep_max_tokens_per_rank=(
+            _TOKENS * _TOPK if backend == "hybridep" else None
+        ),
     ).cuda()
     # Standalone construction does not run the training framework's weight
     # initialization callback. Fill BF16 masters explicitly so the FP8 scale

@@ -3,7 +3,6 @@
 Run with an explicit NVLink-domain size, for example:
 
     NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4 \
-    MLITE_HYBRIDEP_MAX_ROUTE_TOKENS_PER_RANK=128 \
       torchrun --standalone --nproc-per-node=4 hybridep_route_gate.py
 """
 
@@ -40,6 +39,7 @@ def main() -> None:
             ep_group=group,
             tp_ep_group=group,
         ),
+        hybridep_max_tokens_per_rank=128,
     )
     hidden = (
         torch.arange(

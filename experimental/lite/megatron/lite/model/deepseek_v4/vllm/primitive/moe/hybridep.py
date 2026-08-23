@@ -93,24 +93,17 @@ def _get_buffer(
     hidden_size: int,
     num_local_experts: int,
     required_route_capacity: int,
+    hybridep_max_tokens_per_rank: int,
 ):
     require_available()
     domain_size = validate_topology(group)
-    capacity_value = os.environ.get(
-        "MLITE_HYBRIDEP_MAX_ROUTE_TOKENS_PER_RANK"
-    )
-    if capacity_value is None:
-        raise RuntimeError(
-            "hybridep requires explicit "
-            "MLITE_HYBRIDEP_MAX_ROUTE_TOKENS_PER_RANK so every rank "
-            "uses the same static buffer capacity"
-        )
-    try:
-        capacity = int(capacity_value)
-    except ValueError as exc:
-        raise RuntimeError(
-            "MLITE_HYBRIDEP_MAX_ROUTE_TOKENS_PER_RANK must be an integer"
-        ) from exc
+    capacity = hybridep_max_tokens_per_rank
+    if (
+        not isinstance(capacity, int)
+        or isinstance(capacity, bool)
+        or capacity <= 0
+    ):
+        raise ValueError("HybridEP max_tokens_per_rank must be a positive integer")
     if capacity < required_route_capacity:
         raise RuntimeError(
             f"HybridEP route capacity {capacity} is below required "
@@ -222,6 +215,7 @@ def dispatch_routes(
     num_experts: int,
     num_local_experts: int,
     group: dist.ProcessGroup,
+    hybridep_max_tokens_per_rank: int,
 ) -> HybridEPDispatchResult:
     if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
         raise TypeError("hybridep requires BF16 [tokens, hidden]")
@@ -249,6 +243,7 @@ def dispatch_routes(
         hidden_states.shape[1],
         num_local_experts,
         positions.shape[0],
+        hybridep_max_tokens_per_rank,
     )
     expert_hidden, padded_counts, handle = _DispatchRoutes.apply(
         buffer,

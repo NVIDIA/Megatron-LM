@@ -54,6 +54,11 @@ def main() -> None:
         world_size * args.local_experts,
         args.hidden,
         parallel_state,
+        **(
+            {"hybridep_max_tokens_per_rank": args.tokens * args.topk}
+            if args.backend == "hybridep"
+            else {}
+        ),
     )
     generator = torch.Generator(device="cuda")
     generator.manual_seed(20260823 + rank)

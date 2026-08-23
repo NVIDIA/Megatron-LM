@@ -151,7 +151,17 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         layer_idx: int,
         cache_deployment_weights: bool = False,
         moe_token_dispatcher_type: str = "deepep",
+        hybridep_max_tokens_per_rank: int | None = None,
     ):
+        if moe_token_dispatcher_type == "hybridep" and (
+            not isinstance(hybridep_max_tokens_per_rank, int)
+            or isinstance(hybridep_max_tokens_per_rank, bool)
+            or hybridep_max_tokens_per_rank <= 0
+        ):
+            raise ValueError(
+                "hybridep_max_tokens_per_rank must be a positive integer "
+                "when moe_token_dispatcher_type='hybridep'"
+            )
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             is_batch_invariant_quant_kernel_enabled,
         )
@@ -175,6 +185,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
                 "moe_token_dispatcher_type must be 'deepep' or 'hybridep'"
             ) from exc
         object.__setattr__(self, "dispatcher_cls", dispatcher_cls)
+        self._hybridep_max_tokens_per_rank = hybridep_max_tokens_per_rank
         ps = ps or ParallelState()
         super().__init__(
             config,
@@ -189,6 +200,27 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         )
         self.shared_down_fp8 = DeploymentBlockFP8Adapter(
             cache_weight=cache_deployment_weights
+        )
+
+    def _build_dispatcher(
+        self,
+        config: DeepseekV4Config,
+        ps: ParallelState,
+        *,
+        use_deepep: bool,
+    ):
+        if self.dispatcher_cls is VLLMAlignedHybridEPDispatcher:
+            return self.dispatcher_cls(
+                config.n_routed_experts,
+                config.hidden_size,
+                ps,
+                hybridep_max_tokens_per_rank=self._hybridep_max_tokens_per_rank,
+            )
+        return self.dispatcher_cls(
+            config.n_routed_experts,
+            config.hidden_size,
+            ps,
+            use_deepep=use_deepep,
         )
 
     def clear_deployment_weight_cache(self) -> None:

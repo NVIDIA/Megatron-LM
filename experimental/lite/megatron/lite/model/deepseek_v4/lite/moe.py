@@ -52,7 +52,20 @@ class DeepseekV4MoE(nn.Module):
             if config.n_shared_experts > 0
             else None
         )
-        self.dispatcher = self.dispatcher_cls(
+        self.dispatcher = self._build_dispatcher(
+            config,
+            ps,
+            use_deepep=use_deepep,
+        )
+
+    def _build_dispatcher(
+        self,
+        config: DeepseekV4Config,
+        ps: ParallelState,
+        *,
+        use_deepep: bool,
+    ) -> TokenDispatcher:
+        return self.dispatcher_cls(
             config.n_routed_experts,
             config.hidden_size,
             ps,

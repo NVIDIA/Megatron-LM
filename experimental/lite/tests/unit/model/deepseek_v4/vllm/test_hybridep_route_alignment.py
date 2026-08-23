@@ -81,12 +81,29 @@ def test_impl_config_accepts_only_clean_dispatchers() -> None:
 
     assert protocol.ImplConfig().moe_token_dispatcher_type == "deepep"
     assert (
-        protocol.ImplConfig(moe_token_dispatcher_type="hybridep")
+        protocol.ImplConfig(
+            moe_token_dispatcher_type="hybridep",
+            hybridep_max_tokens_per_rank=128,
+        )
         .moe_token_dispatcher_type
         == "hybridep"
     )
+    assert (
+        protocol.ImplConfig(
+            moe_token_dispatcher_type="deepep",
+            hybridep_max_tokens_per_rank=None,
+        )
+        .hybridep_max_tokens_per_rank
+        is None
+    )
     with pytest.raises(ValueError, match="deepep.*hybridep"):
         protocol.ImplConfig(moe_token_dispatcher_type="alltoall")
+    for capacity in (None, 0, -1, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            protocol.ImplConfig(
+                moe_token_dispatcher_type="hybridep",
+                hybridep_max_tokens_per_rank=capacity,
+            )
 
 
 def test_hybridep_fails_closed_without_runtime(monkeypatch) -> None:
@@ -96,7 +113,19 @@ def test_hybridep_fails_closed_without_runtime(monkeypatch) -> None:
             4,
             16,
             SimpleNamespace(ep_size=2, ep_group=object()),
+            hybridep_max_tokens_per_rank=128,
         )
+
+
+def test_hybridep_dispatcher_requires_positive_capacity() -> None:
+    for capacity in (None, 0, -1, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            VLLMAlignedHybridEPDispatcher(
+                4,
+                16,
+                SimpleNamespace(ep_size=2, ep_group=object()),
+                hybridep_max_tokens_per_rank=capacity,
+            )
 
 
 def test_hybridep_rejects_invalid_topology(monkeypatch) -> None:
@@ -112,15 +141,26 @@ def test_hybridep_rejects_invalid_topology(monkeypatch) -> None:
             4,
             16,
             SimpleNamespace(ep_size=2, ep_group=object()),
+            hybridep_max_tokens_per_rank=128,
         )
 
 
 def test_hybridep_preserves_duplicate_slots_and_compacts_invalid_routes(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        hybridep, "_get_buffer", lambda *_args: _FakeHybridBuffer()
-    )
+    observed = {}
+
+    def fake_get_buffer(
+        _group,
+        _hidden_size,
+        _num_local_experts,
+        _required_route_capacity,
+        capacity,
+    ):
+        observed["capacity"] = capacity
+        return _FakeHybridBuffer()
+
+    monkeypatch.setattr(hybridep, "_get_buffer", fake_get_buffer)
     hidden, weights, indices = _inputs()
     result = hybridep.dispatch_routes(
         hidden,
@@ -129,9 +169,11 @@ def test_hybridep_preserves_duplicate_slots_and_compacts_invalid_routes(
         num_experts=4,
         num_local_experts=2,
         group=object(),
+        hybridep_max_tokens_per_rank=128,
     )
 
     assert result.tokens_per_expert.tolist() == [128, 128]
+    assert observed["capacity"] == 128
     assert result.hidden.shape == (256, 16)
     assert result.state.source_output_index.tolist() == [[0, 1], [2, -1]]
     source = hybridep.combine_routes(result.hidden, result.state)
@@ -143,9 +185,12 @@ def test_hybridep_preserves_duplicate_slots_and_compacts_invalid_routes(
 def test_hybridep_keeps_zero_route_rank_in_collective(monkeypatch) -> None:
     hidden, weights, indices = _inputs()
     indices.fill_(-1)
-    monkeypatch.setattr(
-        hybridep, "_get_buffer", lambda *_args: _FakeHybridBuffer()
-    )
+
+    def fake_get_buffer(*args):
+        assert args[-1] == 128
+        return _FakeHybridBuffer()
+
+    monkeypatch.setattr(hybridep, "_get_buffer", fake_get_buffer)
     result = hybridep.dispatch_routes(
         hidden,
         weights,
@@ -153,6 +198,7 @@ def test_hybridep_keeps_zero_route_rank_in_collective(monkeypatch) -> None:
         num_experts=4,
         num_local_experts=2,
         group=object(),
+        hybridep_max_tokens_per_rank=128,
     )
     assert result.hidden.shape == (0, hidden.shape[1])
     assert result.tokens_per_expert.tolist() == [0, 0]
@@ -173,13 +219,16 @@ def test_hybridep_combine_lifecycle_and_autograd(monkeypatch) -> None:
     monkeypatch.setattr(
         hybridep.dist, "get_world_size", lambda *, group: 2
     )
-    monkeypatch.setattr(
-        hybridep, "_get_buffer", lambda *_args: _FakeHybridBuffer()
-    )
+    def fake_get_buffer(*args):
+        assert args[-1] == 128
+        return _FakeHybridBuffer()
+
+    monkeypatch.setattr(hybridep, "_get_buffer", fake_get_buffer)
     dispatcher = VLLMAlignedHybridEPDispatcher(
         4,
         16,
         SimpleNamespace(ep_size=2, ep_group=object()),
+        hybridep_max_tokens_per_rank=128,
     )
     hidden, weights, indices = _inputs()
     hidden.requires_grad_(True)
