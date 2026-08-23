@@ -129,6 +129,19 @@ def visible_functional_vjp(
     )
 
 
+def visible_clamped_swiglu(value: torch.Tensor, limit: float) -> torch.Tensor:
+    """Use vLLM's activation bytes with the Lite functional graph as its VJP."""
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+
+    from megatron.lite.primitive.modules.experts import swiglu_with_probs
+
+    return visible_functional_vjp(
+        SiluAndMulWithClamp(float(limit)),
+        lambda value_: swiglu_with_probs(value_, None, float(limit)),
+        (value,),
+    )
+
+
 class _VisibleLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, visible_op: Callable, value: torch.Tensor, *weights):

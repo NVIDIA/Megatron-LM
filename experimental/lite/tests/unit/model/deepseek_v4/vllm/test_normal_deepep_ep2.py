@@ -81,6 +81,64 @@ def _run_microbatch(
     )
 
 
+def _run_duplicate_destination_route_gate(
+    dispatcher: VLLMAlignedNormalDeepEPDispatcher,
+    *,
+    rank: int,
+) -> None:
+    """Compare normal DeepEP route-slot semantics with a direct reference."""
+    tokens = 3 + rank
+    rows = torch.arange(tokens, device="cuda", dtype=torch.int64)
+    hidden = (
+        torch.arange(tokens * 256, device="cuda", dtype=torch.float32)
+        .reshape(tokens, 256)
+        .add_(rank * 17)
+        .remainder_(127)
+        .sub_(63)
+        .to(torch.bfloat16)
+    )
+    # Experts [0, 1] live on rank 0 and [2, 3] on rank 1.  Every token has
+    # multiple distinct top-k slots for the same destination rank, which is
+    # exactly the route identity lost by rank-deduplicating normal dispatch.
+    topk_ids = torch.stack(
+        (
+            rows.remainder(2),
+            1 - rows.remainder(2),
+            2 + rows.remainder(2),
+            3 - rows.remainder(2),
+        ),
+        dim=1,
+    )
+    topk_weights = torch.tensor(
+        [0.125, 0.25, 0.275, 0.35], device="cuda", dtype=torch.float32
+    ).expand(tokens, -1).contiguous()
+
+    expert_input, actual_counts, _ = dispatcher.dispatch(
+        hidden, topk_weights, topk_ids
+    )
+    assert int(actual_counts.sum()) == expert_input.shape[0]
+
+    expert_output = expert_input.clone()
+    offset = 0
+    local_experts = actual_counts.numel()
+    for local_expert, count_tensor in enumerate(actual_counts):
+        count = int(count_tensor)
+        global_expert = rank * local_experts + local_expert
+        expert_output[offset : offset + count].mul_(global_expert + 1)
+        offset += count
+
+    actual = dispatcher.combine(expert_output)
+    expected_fp32 = torch.zeros_like(hidden, dtype=torch.float32)
+    for slot in range(topk_ids.shape[1]):
+        expected_fp32.add_(
+            hidden.float()
+            * topk_weights[:, slot : slot + 1]
+            * (topk_ids[:, slot : slot + 1].to(torch.float32) + 1)
+        )
+    expected = expected_fp32.to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.gpus(2)
 def test_normal_deepep_contiguous_moe_is_shape_invariant_across_microbatches() -> None:
     reason = _skip_reason()
@@ -142,6 +200,38 @@ def test_normal_deepep_contiguous_moe_is_shape_invariant_across_microbatches() -
         )
         for actual, expected in zip(repeated, first, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        dist.barrier(group=group)
+    finally:
+        if created_group:
+            dist.destroy_process_group()
+
+
+@pytest.mark.gpus(2)
+def test_normal_deepep_preserves_multiple_route_slots_to_same_rank() -> None:
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    created_group = not dist.is_initialized()
+    if created_group:
+        dist.init_process_group("nccl")
+    group = dist.group.WORLD
+    rank = dist.get_rank(group)
+    dispatcher = VLLMAlignedNormalDeepEPDispatcher(
+        num_experts=4,
+        hidden_size=256,
+        ps=ParallelState(
+            ep_size=2,
+            ep_rank=rank,
+            ep_group=group,
+            tp_ep_group=group,
+        ),
+        use_deepep=True,
+    )
+    try:
+        _run_duplicate_destination_route_gate(dispatcher, rank=rank)
         dist.barrier(group=group)
     finally:
         if created_group:

@@ -683,58 +683,21 @@ def _validate_and_order_route_preserving_outputs(
             f"{tuple(route_fingerprints.shape)} != {tuple(expected_fingerprints.shape)}"
         )
 
-    def stable_key_order(
-        fingerprints: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        order = torch.arange(indices.numel(), device=indices.device, dtype=torch.long)
-        fingerprint_bits = fingerprints.contiguous().view(torch.int16)
-        columns = [
-            *(
-                fingerprint_bits[:, column]
-                for column in range(fingerprint_bits.shape[1])
-            ),
-            indices.to(dtype=torch.long),
-        ]
-        for column in reversed(columns):
-            permutation = torch.argsort(column.index_select(0, order), stable=True)
-            order = order.index_select(0, permutation)
-        return order
-
-    primary_order = stable_key_order(expected_fingerprints, expected_indices)
-    metadata_order = stable_key_order(
-        route_fingerprints,
-        route_indices.to(dtype=expected_indices.dtype),
+    expected_weights = received_topk_weights[token_rows, topk_slots].reshape(-1)
+    torch._assert_async(
+        torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
+        "Route-preserving DeepEP metadata changed local expert order",
     )
     torch._assert_async(
-        torch.all(
-            expected_indices.index_select(0, primary_order)
-            == route_indices.to(dtype=expected_indices.dtype).index_select(
-                0, metadata_order
-            )
-        ),
-        "Route-preserving DeepEP metadata changed expert identities",
+        torch.all(expected_weights == route_weights.to(dtype=expected_weights.dtype)),
+        "Route-preserving DeepEP metadata changed route probability order",
     )
     torch._assert_async(
-        torch.all(torch.isfinite(route_weights)),
-        "Route-preserving DeepEP metadata contains nonfinite route probabilities",
+        torch.all(expected_fingerprints == route_fingerprints),
+        "Route-preserving DeepEP metadata changed source-token order",
     )
-    torch._assert_async(
-        torch.all(
-            expected_fingerprints.contiguous()
-            .view(torch.int16)
-            .index_select(0, primary_order)
-            == route_fingerprints.contiguous()
-            .view(torch.int16)
-            .index_select(0, metadata_order)
-        ),
-        "Route-preserving DeepEP metadata changed source fingerprints",
-    )
-
-    metadata_to_primary = torch.empty_like(metadata_order)
-    metadata_to_primary.scatter_(0, metadata_order, primary_order)
     primary_route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
-    route_rows = primary_route_rows.index_select(0, metadata_to_primary)
+    route_rows = primary_route_rows
     if return_route_rows:
         return route_rows
     if not order_outputs:

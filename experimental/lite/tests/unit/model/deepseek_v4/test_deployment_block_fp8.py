@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
 import megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 as deployment_fp8
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     BLOCK_SHAPE,
@@ -106,6 +107,55 @@ def fake_vllm(monkeypatch):
 
 def _weight() -> nn.Parameter:
     return nn.Parameter(torch.randn(128, 256, dtype=torch.bfloat16))
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("export_storage_dtype", [torch.bfloat16, torch.float32])
+def test_post_update_actor_pack_matches_export_reload_bitwise(
+    export_storage_dtype: torch.dtype,
+) -> None:
+    """Close the actor-forward versus rollout-reload FP8 lifecycle boundary."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires one CUDA GPU")
+
+    # Post-optimizer values no longer carry checkpoint source scales.  Include
+    # values close to block extrema so this compares the real quantizers, not
+    # merely their nominal scale formula.
+    values = torch.linspace(
+        -1.00390625,
+        1.00390625,
+        128 * 256,
+        device="cuda",
+        dtype=torch.float32,
+    ).reshape(128, 256)
+    visible = nn.Parameter(values.to(torch.bfloat16))
+    actor = pack_block_fp8_weight(visible)
+
+    config = SimpleNamespace(
+        expert_dtype="fp8",
+        quantization_config={"weight_block_size": [128, 128]},
+    )
+    name = "layers.0.ffn.experts.0.w1.weight"
+    exported = dict(
+        export_resync_weights(
+            [(name, visible.detach().to(export_storage_dtype))],
+            config,
+            resync_config={"expert_dtype": "fp8"},
+        )
+    )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+
+    rollout_qweight, rollout_scales = deepgemm_post_process_fp8_weight_block(
+        wq=exported[name],
+        ws=exported["layers.0.ffn.experts.0.w1.scale"],
+        quant_block_shape=BLOCK_SHAPE,
+        use_e8m0=True,
+    )
+
+    assert torch.equal(actor.qweight, rollout_qweight)
+    assert torch.equal(actor.scales, rollout_scales)
 
 
 def test_weight_path_calls_vllm_and_packs_official_layout(fake_vllm) -> None:

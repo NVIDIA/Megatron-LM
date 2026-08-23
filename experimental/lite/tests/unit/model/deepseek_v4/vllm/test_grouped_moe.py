@@ -174,6 +174,47 @@ def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
         torch.testing.assert_close(actual, expected_grad)
 
 
+def test_visible_experts_forward_preserves_model_clamp(monkeypatch) -> None:
+    from torch import nn
+
+    from megatron.lite.model.deepseek_v4.vllm.primitive.moe import module as moe_module
+
+    calls = []
+
+    class _Grouped:
+        @staticmethod
+        def apply(hidden_states, tokens_per_expert, swiglu_limit, *weights):
+            calls.append((tokens_per_expert, swiglu_limit, weights))
+            return hidden_states
+
+    class _Weights(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight0 = nn.Parameter(torch.ones(4, 4))
+
+    experts = moe_module._VLLMVisibleExperts.__new__(
+        moe_module._VLLMVisibleExperts
+    )
+    nn.Module.__init__(experts)
+    experts.num_local_experts = 1
+    experts.swiglu_limit = 10.0
+    experts.fc1 = _Weights()
+    experts.fc2 = _Weights()
+    monkeypatch.setattr(moe_module, "VLLMGroupedMoEWithBF16Backward", _Grouped)
+    monkeypatch.setattr(
+        moe_module,
+        "bind_source_scale_to_visible_weight",
+        lambda _owner, _name, weight: weight,
+    )
+
+    hidden = torch.randn(2, 4)
+    counts = torch.tensor([2], dtype=torch.int32)
+    assert experts(hidden, counts) is hidden
+    assert len(calls) == 1
+    assert calls[0][0] is counts
+    assert calls[0][1] == 10.0
+
+
 @pytest.mark.gpus(1)
 @pytest.mark.skipif(
     not torch.cuda.is_available() or importlib.util.find_spec("vllm") is None,
