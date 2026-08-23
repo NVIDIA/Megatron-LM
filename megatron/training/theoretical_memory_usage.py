@@ -9,11 +9,15 @@ from .utils import is_hybrid_model, print_rank_0
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
-def _get_moe_layer_counts(args):
+def _get_moe_layer_counts(args) -> tuple[int, int, int, list[int]]:
     """Split the transformer block into dense and MoE layers.
 
-    Returns ``(num_dense_layers, num_moe_layers, moe_ffn_hidden_size, moe_layer_pattern)``.
-    A model without experts is reported as all-dense with a zero-sized expert FFN.
+    Args:
+        args: Parsed training arguments.
+
+    Returns:
+        A tuple of (num_dense_layers, num_moe_layers, moe_ffn_hidden_size, moe_layer_pattern).
+        A model without experts is reported as all-dense with a zero-sized expert FFN.
     """
     if args.num_experts is None:
         return args.num_layers, 0, 0, [0] * args.num_layers
@@ -34,7 +38,6 @@ def _get_moe_layer_counts(args):
 
     num_moe_layers = sum(moe_layer_pattern)
     num_dense_layers = args.num_layers - num_moe_layers
-    assert num_dense_layers + num_moe_layers == args.num_layers
     return num_dense_layers, num_moe_layers, args.moe_ffn_hidden_size, moe_layer_pattern
 
 
