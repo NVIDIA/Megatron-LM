@@ -359,6 +359,14 @@ class MimoModel(MegatronModule):
             if isinstance(module, DistributedDataParallel):
                 yield module
 
+    @property
+    def remove_forward_pre_hook_handles(self) -> Dict[torch.nn.Module, Any]:
+        """Expose the active inner DDP parameter-gather hooks to the stock train loop."""
+        handles = {}
+        for module in self._active_ddp_modules():
+            handles.update(module.remove_forward_pre_hook_handles)
+        return handles
+
     @contextmanager
     def no_sync(self):
         """Disable grad-ready registration on overlapped inner DDP modules."""
