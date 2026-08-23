@@ -4,6 +4,7 @@ import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.tensor_parallel.layers import (
+    copy_gtp_attributes,
     gtp_local_pad_zero_count,
     linear_with_frozen_weight,
     linear_with_grad_accumulation_and_async_allreduce,
@@ -90,6 +91,25 @@ class TestGtpLocalPadZeroCount:
         shard = torch.zeros(8, 4)
         shard.pad_length = 3
         assert gtp_local_pad_zero_count(shard, 0, shard.numel()) == 0
+
+
+class TestCopyGtpAttributes:
+    """copy_gtp_attributes(destination, source) must carry pad_length/group onto any param
+    view/copy (e.g. an optimizer's master param) -- regression coverage for a real bug where
+    a prior version dropped one of the two, which silently disabled GTP padding exclusion for
+    optimizers relying on this fallback (e.g. LayerWiseDistributedOptimizer/Muon)."""
+
+    def test_padding_exclusion_survives_the_copy(self):
+        """End-to-end: gtp_local_pad_zero_count on a copy must match the original -- this is
+        exactly the check that would have caught the pad_length/group-dropping bug directly."""
+        source = TestGtpLocalPadZeroCount._shard(8, 4, pad_length=3, group=_FakeGroup(size=4, rank=3))
+
+        destination = torch.zeros(8, 4)
+        copy_gtp_attributes(destination, source)
+
+        expected = gtp_local_pad_zero_count(source, 0, source.numel())
+        assert expected > 0, "test setup must exercise real padding"
+        assert gtp_local_pad_zero_count(destination, 0, destination.numel()) == expected
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
