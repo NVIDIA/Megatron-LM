@@ -107,32 +107,7 @@ if [[ "${DRY_RUN:-0}" == "1" || "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-# Gate directly on VERL's file logger; no diagnostic dump or custom stage
-# print is involved.
-python3 - "${JSONL_FILE}" "${TOTAL_TRAINING_STEPS}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-expected = int(sys.argv[2])
-steps = {}
-for line in path.read_text().splitlines():
-    record = json.loads(line)
-    data = record.get("data", {})
-    if "training/rollout_logprob_bitwise_equal_fraction" in data:
-        steps[int(record["step"])] = data
-if len(steps) != expected:
-    raise SystemExit(f"expected {expected} alignment steps, found {sorted(steps)} in {path}")
-bad = [
-    (step, data["training/rollout_logprob_bitwise_equal_fraction"],
-     data["training/rollout_logprob_abs_diff_max"], data["rollout_corr/k3_kl"])
-    for step, data in sorted(steps.items())
-    if data["training/rollout_logprob_bitwise_equal_fraction"] != 1.0
-    or data["training/rollout_logprob_abs_diff_max"] > 1e-6
-    or data["rollout_corr/k3_kl"] != 0.0
-]
-if bad:
-    raise SystemExit(f"DS4 train/infer alignment gate failed: {bad}")
-print(f"DS4_4L_ALIGNMENT_EXACT steps={len(steps)} bitwise_fraction=1.0 k3_kl=0.0")
-PY
+# Gate directly on VERL's file logger; no diagnostic dump or custom metric is
+# required from VERL.
+python3 "$(dirname "$0")/validate_alignment_metrics.py" \
+  "${JSONL_FILE}" "${TOTAL_TRAINING_STEPS}"
