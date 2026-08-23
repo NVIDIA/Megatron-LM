@@ -1789,6 +1789,7 @@ class TestGTPCaptureParamReadiness:
         assert ag_streams == [graphed_ag_stream]
         assert rs_streams == [graphed_rs_stream]
 
+
 # ---------------------------------------------------------------------------
 # count_zeros_fp32 must exclude GTP alignment padding, end-to-end through the
 # real distributed optimizer (build_model_and_main_param_groups stamps

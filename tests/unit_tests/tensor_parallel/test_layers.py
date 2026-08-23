@@ -102,7 +102,9 @@ class TestCopyGtpAttributes:
     def test_padding_exclusion_survives_the_copy(self):
         """End-to-end: gtp_local_pad_zero_count on a copy must match the original -- this is
         exactly the check that would have caught the pad_length/group-dropping bug directly."""
-        source = TestGtpLocalPadZeroCount._shard(8, 4, pad_length=3, group=_FakeGroup(size=4, rank=3))
+        source = TestGtpLocalPadZeroCount._shard(
+            8, 4, pad_length=3, group=_FakeGroup(size=4, rank=3)
+        )
 
         destination = torch.zeros(8, 4)
         copy_gtp_attributes(destination, source)
