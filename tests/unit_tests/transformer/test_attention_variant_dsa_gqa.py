@@ -2692,7 +2692,6 @@ def test_transformer_config_accepts_dsa_train_main_only(backend):
         ({"dsa_reset_indexer_on_load": True}, "incompatible"),
         ({"dsa_indexer_activation_start_samples": 100}, "activation_start_samples"),
         ({"dsa_indexer_activation_warmup_samples": 100}, "warmup_samples"),
-        ({"dsa_indexer_topk_recompute": True}, "nondifferentiable frozen routing"),
     ],
 )
 def test_transformer_config_rejects_incompatible_dsa_train_main_only_modes(
@@ -3006,11 +3005,6 @@ def test_reference_train_main_only_routes_without_constructing_indexer_loss(monk
             dsa_indexer_loss_coeff=0.0,
             dsa_indexer_use_sparse_loss=False,
             dsa_indexer_sparse_loss_use_topk_only=False,
-            dsa_indexer_loss_recompute=False,
-            dsa_indexer_topk_key_chunk_size=None,
-            dsa_indexer_topk_recompute=False,
-            dsa_sparse_attention_recompute=False,
-            dsa_sparse_attention_query_chunk_size=None,
         ),
         indexer=_Indexer(),
         softmax_scale=0.5,
@@ -3100,62 +3094,8 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
     assert calls[0][4]["attn_mask_type"] == AttnMaskType.causal
 
 
-@pytest.mark.parametrize(
-    "legacy_flag",
-    [
-        "dsa_sparse_attention_query_chunk_size",
-        "dsa_indexer_loss_query_chunk_size",
-        "dsa_indexer_topk_key_chunk_size",
-    ],
-)
-def test_transformer_config_min_memory_rejects_legacy_chunk_flags(legacy_flag):
-    with pytest.raises(AssertionError, match="min-memory"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            experimental_attention_variant="dsa",
-            add_bias_linear=False,
-            dsa_indexer_n_heads=2,
-            dsa_indexer_head_dim=8,
-            dsa_indexer_topk=4,
-            dsa_min_memory_backend="triton-min-memory",
-            dsa_indexer_loss_coeff=0.1,
-            dsa_indexer_use_sparse_loss=True,
-            dsa_indexer_use_hadamard=True,
-            **{legacy_flag: 2},
-        )
 
 
-@pytest.mark.parametrize(
-    "legacy_flag",
-    [
-        "dsa_indexer_topk_recompute",
-        "dsa_indexer_loss_recompute",
-        "dsa_sparse_attention_recompute",
-        "dsa_sparse_attention_use_gather",
-    ],
-)
-def test_transformer_config_min_memory_rejects_legacy_backend_flags(legacy_flag):
-    kwargs = {legacy_flag: True}
-    if legacy_flag == "dsa_indexer_topk_recompute":
-        kwargs["dsa_indexer_topk_key_chunk_size"] = 2
-    with pytest.raises(AssertionError, match="min-memory"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=32,
-            num_attention_heads=4,
-            experimental_attention_variant="dsa",
-            add_bias_linear=False,
-            dsa_indexer_n_heads=2,
-            dsa_indexer_head_dim=8,
-            dsa_indexer_topk=4,
-            dsa_min_memory_backend="triton-min-memory",
-            dsa_indexer_loss_coeff=0.1,
-            dsa_indexer_use_sparse_loss=True,
-            dsa_indexer_use_hadamard=True,
-            **kwargs,
-        )
 
 
 def test_transformer_config_cache_routing_requires_min_memory_backend():
@@ -5245,51 +5185,6 @@ def test_fused_qk_topk_chunked_recompute_matches_normal():
     torch.testing.assert_close(weights.grad, normal_grads[2])
 
 
-def test_compute_gqa_dsa_indexer_loss_recompute_matches_normal():
-    torch.manual_seed(123)
-
-    batch_size = 2
-    seqlen = 8
-    num_heads = 8
-    num_query_groups = 2
-    head_dim = 16
-    topk = 4
-
-    index_scores = _causal_index_scores(
-        torch.randn(batch_size, seqlen, seqlen, dtype=torch.float32, requires_grad=True)
-    )
-    topk_indices = index_scores.detach().topk(topk, dim=-1).indices
-    query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
-    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32)
-    pg_collection = _DummyPGCollection()
-
-    def _compute_loss(index_scores_tensor):
-        return compute_gqa_dsa_indexer_loss(
-            index_scores=index_scores_tensor,
-            topk_indices=topk_indices,
-            query=query,
-            key=key,
-            softmax_scale=head_dim**-0.5,
-            loss_coeff=0.7,
-            sparse_loss=True,
-            pg_collection=pg_collection,
-        )
-
-    normal_loss = _compute_loss(index_scores)
-    normal_loss.backward()
-    normal_grad = index_scores.grad.clone()
-
-    index_scores.grad = None
-
-    recompute_loss = torch_checkpoint.checkpoint(
-        _compute_loss,
-        index_scores,
-        use_reentrant=False,
-    )
-    recompute_loss.backward()
-
-    torch.testing.assert_close(recompute_loss, normal_loss)
-    torch.testing.assert_close(index_scores.grad, normal_grad)
 
 
 def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_recompute_matches_normal():
