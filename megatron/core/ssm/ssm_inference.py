@@ -59,6 +59,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_using_quantization_scales
 
 
@@ -75,7 +76,9 @@ class SSMChunking(NamedTuple):
     """Householder copies for Gated Delta Product layers; 0 for other mixers."""
 
 
-def ssm_chunking(layer_config_list: Sequence, layers: Sequence) -> Optional[SSMChunking]:
+def ssm_chunking(
+    layer_config_list: Sequence[TransformerConfig], layers: Sequence
+) -> Optional[SSMChunking]:
     """Returns the chunking every SSM layer in a stack shares, or None.
 
     None means the stack holds no recurrent layer, which happens on a pipeline

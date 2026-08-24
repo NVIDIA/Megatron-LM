@@ -2,15 +2,11 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from megatron.core.models.hybrid.layer_utils import (
-    HybridLayerConfig,
-    Symbols,
-    normalize_tp_comm_overlap,
-)
+from megatron.core.models.hybrid.layer_utils import Symbols, normalize_tp_comm_overlap
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -298,7 +294,7 @@ def _validate_segment_layer_symbols(segment: str) -> None:
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
-def _create_layer_config(config: TransformerConfig, layer_symbol: str) -> HybridLayerConfig:
+def _create_layer_config(config: TransformerConfig, layer_symbol: str) -> TransformerConfig:
     """Create a layer-specific config from a normalized stack-level config."""
     if layer_symbol == Symbols.MAMBA:
         return MambaLayerConfig.from_config(config)
@@ -317,7 +313,7 @@ def _create_layer_config(config: TransformerConfig, layer_symbol: str) -> Hybrid
     raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
 
 
-def validate_segment_layers(segment: str, config: TransformerConfig) -> List[HybridLayerConfig]:
+def validate_segment_layers(segment: str, config: TransformerConfig) -> List[TransformerConfig]:
     """Validate and convert a single pipeline segment pattern to layer configs.
 
     This is used after the main pattern has been split by '|' into segments.
@@ -339,7 +335,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Hyb
     """
     _validate_segment_layer_symbols(segment)
 
-    layer_configs: list[HybridLayerConfig] = []
+    layer_configs: list[TransformerConfig] = []
     for layer_symbol in segment:
         layer_configs.append(_create_layer_config(config, layer_symbol))
 
@@ -355,7 +351,7 @@ def select_pipeline_segment(
     last_stage_layers: Optional[int] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[List[HybridLayerConfig], int]:
+) -> Tuple[List[TransformerConfig], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
     When the main pattern contains '|' pipe separators, splits by '|' into
@@ -530,7 +526,7 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str,
     return layer_maps
 
 
-def _get_layer_symbol_from_config(layer_config: HybridLayerConfig) -> str:
+def _get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     """Return the canonical symbol for a layer config, including subclasses."""
     matching_symbols = []
     if isinstance(layer_config, MambaLayerConfig):
@@ -558,7 +554,7 @@ def _get_layer_symbol_from_config(layer_config: HybridLayerConfig) -> str:
 
 
 def get_layer_maps_from_layer_config_list(
-    layer_config_list: list[HybridLayerConfig],
+    layer_config_list: Sequence[TransformerConfig],
 ) -> dict[str, dict[int, int]]:
     """Return per-type layer maps for a list of layer configs.
 

@@ -8,7 +8,7 @@
 import copy
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -22,7 +22,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
-from megatron.core.models.hybrid.layer_utils import HybridLayerConfig, normalize_tp_comm_overlap
+from megatron.core.models.hybrid.layer_utils import normalize_tp_comm_overlap
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -72,9 +72,9 @@ class HybridStack(MegatronModule):
         layer_type_list (list[str], optional): backward-compatible list of layer
             type symbols for this pipeline segment. It is immediately converted to
             independent per-layer configs.
-        layer_config_list (list, optional): per-layer configs for this pipeline segment. When
-            provided by HybridModel, pipeline stage selection has already been done
-            via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
+        layer_config_list (Sequence[TransformerConfig], optional): per-layer configs for this
+            pipeline segment. When provided by HybridModel, pipeline stage selection has already
+            been done via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
             ``layer_config_list`` must be provided.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
@@ -103,7 +103,7 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         name: str | None = None,
-        layer_config_list: list[HybridLayerConfig] | None = None,
+        layer_config_list: Sequence[TransformerConfig] | None = None,
     ) -> None:
         """
         Args:

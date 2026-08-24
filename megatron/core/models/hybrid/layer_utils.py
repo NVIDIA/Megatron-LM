@@ -2,13 +2,6 @@
 
 import warnings
 
-from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
-from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
-from megatron.core.transformer.mla_layer_config import MLALayerConfig
-from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -35,17 +28,6 @@ class Symbols:
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
-
-
-HybridLayerConfig = (
-    MambaLayerConfig
-    | GDNLayerConfig
-    | AttentionLayerConfig
-    | DSALayerConfig
-    | MLALayerConfig
-    | MLPLayerConfig
-    | MoELayerConfig
-)
 
 
 def normalize_tp_comm_overlap(
