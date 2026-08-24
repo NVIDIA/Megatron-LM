@@ -251,13 +251,13 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         from unittest.mock import patch
 
         from megatron.core.inference.config import MambaInferenceStateConfig
-        from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         model = SimpleNamespace(
             config=SimpleNamespace(batch_invariant_mode=True, params_dtype=torch.bfloat16)
         )
         decoder = SimpleNamespace(
-            layer_config_list=[object.__new__(MambaLayerConfig)],
+            layer_type_list=[Symbols.MAMBA],
             layers=[SimpleNamespace(mixer=SimpleNamespace(chunk_size=self.chunk_size))],
             mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
         )

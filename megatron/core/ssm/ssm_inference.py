@@ -48,7 +48,7 @@ it does not pollute the dynamic decode/prefill hooks defined here.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Sequence, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -57,9 +57,6 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_merge,
 )
-from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_using_quantization_scales
 
 
@@ -76,9 +73,7 @@ class SSMChunking(NamedTuple):
     """Householder copies for Gated Delta Product layers; 0 for other mixers."""
 
 
-def ssm_chunking(
-    layer_config_list: Sequence[TransformerConfig], layers: Sequence
-) -> Optional[SSMChunking]:
+def ssm_chunking(layer_type_list: List[str], layers: Sequence) -> Optional[SSMChunking]:
     """Returns the chunking every SSM layer in a stack shares, or None.
 
     None means the stack holds no recurrent layer, which happens on a pipeline
@@ -90,20 +85,23 @@ def ssm_chunking(
     rather than silently taking the first layer's answer for every layer.
 
     Args:
-        layer_config_list: Per-layer configs, positionally matching `layers`.
+        layer_type_list: Per-layer symbols, positionally matching `layers`. See
+            `megatron/core/models/hybrid/hybrid_layer_allocation.py`.
         layers: The stack's layers.
 
     Returns:
         The shared `SSMChunking`, or None if no layer is recurrent.
     """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
     chunking = None
     first_layer_idx = None
-    for layer_idx, (layer_config, layer) in enumerate(zip(layer_config_list, layers, strict=True)):
+    for layer_idx, (layer_type, layer) in enumerate(zip(layer_type_list, layers)):
         # Mamba-family mixers (including Gated Delta Product) hang off `.mixer`;
         # Gated Delta Net registers its recurrent mixer in the attention slot.
-        if isinstance(layer_config, MambaLayerConfig):
+        if layer_type == Symbols.MAMBA:
             mixer = getattr(layer, 'mixer', None)
-        elif isinstance(layer_config, GDNLayerConfig):
+        elif layer_type == Symbols.GDN:
             mixer = getattr(layer, 'self_attention', None)
         else:
             continue

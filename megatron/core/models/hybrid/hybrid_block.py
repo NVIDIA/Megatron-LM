@@ -21,7 +21,10 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    get_layer_type_list_from_layer_config_list,
+    validate_segment_layers,
+)
 from megatron.core.models.hybrid.layer_utils import normalize_tp_comm_overlap
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -256,6 +259,11 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+    @property
+    def layer_type_list(self) -> list[str]:
+        """Return layer symbols derived from the per-layer configs for compatibility."""
+        return get_layer_type_list_from_layer_config_list(self.layer_config_list)
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`

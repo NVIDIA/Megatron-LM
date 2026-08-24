@@ -553,21 +553,18 @@ def _get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     return matching_symbols[0]
 
 
-def get_layer_maps_from_layer_config_list(
+def get_layer_type_list_from_layer_config_list(
     layer_config_list: Sequence[TransformerConfig],
-) -> dict[str, dict[int, int]]:
-    """Return per-type layer maps for a list of layer configs.
+) -> list[str]:
+    """Return the layer symbols corresponding to a sequence of layer configs.
 
-    Config subclasses are normalized to their canonical layer symbol before delegating
-    to ``get_layer_maps_from_layer_type_list`` so both APIs share one indexing implementation.
+    This compatibility projection keeps ``layer_config_list`` as the source of truth while
+    supporting callers that still read ``HybridStack.layer_type_list``.
 
     Args:
-        layer_config_list: Per-layer configs in global layer order.
+        layer_config_list: Per-layer configs in layer order.
 
     Returns:
-        Maps from global layer index to type-local layer index, keyed by layer symbol.
+        The canonical layer symbol for each config.
     """
-    layer_type_list = [
-        _get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list
-    ]
-    return get_layer_maps_from_layer_type_list(layer_type_list)
+    return [_get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list]

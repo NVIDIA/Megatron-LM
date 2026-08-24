@@ -21,6 +21,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -238,7 +239,8 @@ class TestHybridModel:
         assert self.model.max_sequence_length == 4
 
         decoder = self.model.decoder
-        assert not hasattr(decoder, "layer_type_list")
+        assert "layer_type_list" not in decoder.__dict__
+        assert decoder.layer_type_list == [Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP]
         assert [type(config) for config in decoder.layer_config_list] == [
             MambaLayerConfig,
             AttentionLayerConfig,

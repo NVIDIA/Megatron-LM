@@ -82,7 +82,8 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
         name="decoder",
     )
 
-    assert not hasattr(block, "layer_type_list")
+    assert "layer_type_list" not in block.__dict__
+    assert block.layer_type_list == list(layer_pattern)
     assert [module_spec for module_spec, _ in build_calls] == expected_specs
     assert all(
         kwargs["config"] is layer_config
@@ -162,7 +163,8 @@ def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatc
         )
     layer_config_list = block.layer_config_list
 
-    assert not hasattr(block, "layer_type_list")
+    assert "layer_type_list" not in block.__dict__
+    assert block.layer_type_list == [Symbols.MAMBA, Symbols.MLA, Symbols.MLP]
     assert type(layer_config_list) is list
     assert [type(layer_config) for layer_config in layer_config_list] == [
         MambaLayerConfig,
