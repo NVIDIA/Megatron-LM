@@ -505,7 +505,9 @@ class TestMultimoduleSchedules:
 
     @classmethod
     def setup_class(cls):
-        Utils.initialize_distributed()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         cls.world_size = dist.get_world_size()
 
     @classmethod
