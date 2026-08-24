@@ -708,10 +708,20 @@ def _validate_and_order_route_preserving_outputs(
 _deepep_buffer = None
 
 
+def _configure_deepep_deterministic_allocator() -> None:
+    """Prevent deterministic debug-fill from racing normal DeepEP writes."""
+    if (
+        torch.are_deterministic_algorithms_enabled()
+        and torch.utils.deterministic.fill_uninitialized_memory
+    ):
+        torch.utils.deterministic.fill_uninitialized_memory = False
+
+
 def _get_deepep_buffer(group: dist.ProcessGroup, hidden_bytes: int):
     """Reuse the process-wide normal-DeepEP buffer used by MCore and Slime."""
     if deep_ep is None:
         raise RuntimeError("DeepEP is required for vLLM-aligned EP>1")
+    _configure_deepep_deterministic_allocator()
     global _deepep_buffer
     group_size = dist.get_world_size(group=group)
     num_nvl_bytes = 0

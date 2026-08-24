@@ -31,6 +31,21 @@ def _skip_reason() -> str | None:
     return None
 
 
+def _ep8_skip_reason() -> str | None:
+    missing = [
+        package
+        for package in ("deep_ep", "vllm")
+        if importlib.util.find_spec(package) is None
+    ]
+    if missing:
+        return f"requires compiled packages: {', '.join(missing)}"
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
+        return "requires eight visible CUDA GPUs"
+    if int(os.environ.get("WORLD_SIZE", "1")) != 8:
+        return "requires torchrun --standalone --nproc-per-node=8"
+    return None
+
+
 def _run_microbatch(
     dispatcher: VLLMAlignedNormalDeepEPDispatcher,
     weights: tuple[torch.nn.Parameter, ...],
@@ -232,6 +247,70 @@ def test_normal_deepep_preserves_multiple_route_slots_to_same_rank() -> None:
     )
     try:
         _run_duplicate_destination_route_gate(dispatcher, rank=rank)
+        dist.barrier(group=group)
+    finally:
+        if created_group:
+            dist.destroy_process_group()
+
+
+@pytest.mark.gpus(8)
+def test_normal_deepep_ep8_full_model_dispatch_geometry() -> None:
+    """Cover the EP8/hidden-7168/topk-8 geometry used by full-model RL."""
+    reason = _ep8_skip_reason()
+    if reason:
+        pytest.skip(reason)
+
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    created_group = not dist.is_initialized()
+    if created_group:
+        dist.init_process_group("nccl")
+    group = dist.group.WORLD
+    rank = dist.get_rank(group)
+    torch.use_deterministic_algorithms(True)
+    torch.utils.deterministic.fill_uninitialized_memory = True
+    num_experts = 256
+    hidden_size = 7168
+    topk = 8
+    tokens = 4096 - 128 * rank
+    dispatcher = VLLMAlignedNormalDeepEPDispatcher(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        ps=ParallelState(
+            ep_size=8,
+            ep_rank=rank,
+            ep_group=group,
+            tp_ep_group=group,
+        ),
+        use_deepep=True,
+    )
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(2903 + rank)
+        hidden = torch.randn(
+            tokens,
+            hidden_size,
+            generator=generator,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        rows = torch.arange(tokens, device="cuda", dtype=torch.int64).unsqueeze(1)
+        slots = torch.arange(topk, device="cuda", dtype=torch.int64).unsqueeze(0)
+        topk_ids = (rows * 17 + slots * 31 + rank * 13).remainder(num_experts)
+        topk_weights = torch.full(
+            (tokens, topk),
+            1.0 / topk,
+            device="cuda",
+            dtype=torch.float32,
+        )
+
+        expert_input, actual_counts, _ = dispatcher.dispatch(
+            hidden, topk_weights, topk_ids
+        )
+        assert not torch.utils.deterministic.fill_uninitialized_memory
+        assert actual_counts.numel() == num_experts // 8
+        assert int(actual_counts.sum()) == expert_input.shape[0]
+        output = dispatcher.combine(expert_input)
+        torch.testing.assert_close(output, hidden, rtol=0, atol=0)
         dist.barrier(group=group)
     finally:
         if created_group:
