@@ -38,6 +38,7 @@ from megatron.core.transformer.multi_token_prediction import (
     _mix_hidden_state_history,
     _mtp_logits_are_vocab_sharded,
     _packed_seq_params_for_local_hsm_roll,
+    get_mtp_layer_offset,
     get_mtp_num_layers_to_build,
     mtp_on_this_rank,
     process_mtp_loss,
@@ -153,10 +154,25 @@ class TestMultiTokenPredictionLayer:
             hidden_size=8,
             num_attention_heads=1,
             pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
             use_cpu_initialization=True,
         )
         assert get_mtp_num_layers_to_build(config, pp_rank=1) == 1
         assert get_mtp_num_layers_to_build(config, pp_rank=0) == 0
+
+        layout_config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=1,
+            pipeline_model_parallel_size=2,
+            pipeline_model_parallel_layout=[['embedding', 'decoder', 'decoder', 'mtp'], ['loss']],
+            pipeline_dtype=torch.float32,
+            use_cpu_initialization=True,
+        )
+        assert get_mtp_layer_offset(layout_config, pp_rank=0) == 0
+        assert get_mtp_layer_offset(layout_config, pp_rank=1) == 1
 
     def test_process_mtp_loss_uses_explicit_metric_group(self, monkeypatch):
         """MTP metric reduction must use the language model's supplied data group."""
@@ -400,6 +416,7 @@ class TestMultiTokenPredictionLayer:
             config=config,
             training=training,
             vp_stage=None,
+            pp_rank=0,
             mtp_use_repeated_layer=False,
             cp_group=None,
             tp_group=None,
@@ -458,6 +475,7 @@ class TestMultiTokenPredictionLayer:
             config=config,
             training=True,
             vp_stage=None,
+            pp_rank=0,
             mtp_use_repeated_layer=False,
             cp_group=None,
             tp_group=None,
@@ -1435,6 +1453,7 @@ class TestMTPHiddenStateRollUnderParallelism:
             config=config,
             training=True,
             vp_stage=None,
+            pp_rank=0,
             mtp_use_repeated_layer=False,
             cp_group=cp_group,
             tp_group=tp_group,

@@ -63,7 +63,10 @@ def build_mtp_layer_callables(layer):
                         inp=hidden_states, requires_grad=True, keep_graph=True
                     )
 
-            offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
+            model = node.chunk_state.model
+            offset = get_mtp_layer_offset(
+                layer.config, model.vp_stage, pp_rank=model.pg_collection.pp.rank()
+            )
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
 

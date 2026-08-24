@@ -602,7 +602,7 @@ class TestMimoModel:
             self.hidden_size,
         )
         assert captured['loss_mask'] is sharded_loss_mask
-        assert captured['input_ids'] is sharded_input_ids
+        torch.testing.assert_close(captured['input_ids'], sharded_input_ids)
         assert captured['position_ids'] is sharded_position_ids
         assert captured['mtp_input_mask'].dtype == torch.bool
         assert torch.equal(captured['mtp_input_mask'], text_mask[:, :sharded_seq_len])

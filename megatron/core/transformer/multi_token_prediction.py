@@ -860,12 +860,28 @@ def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
     return list(mtp_ranks)
 
 
-def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
+def get_mtp_layer_offset(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> int:
     """Get the offset of the MTP layer."""
     if config.pipeline_model_parallel_size > 1:
         if config.pipeline_model_parallel_layout:
-            offset = config.pipeline_model_parallel_layout.get_layer_offset(
-                layer_type=LayerType.mtp, vp_stage=vp_stage
+            if pp_rank is None:
+                # Compatibility fallback for callers without explicit pipeline metadata.
+                pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            layout = config.pipeline_model_parallel_layout
+            if layout.virtual_pipeline_model_parallel_size > 1:
+                assert (
+                    vp_stage is not None
+                ), "vp_stage must be passed if virtual pipeline is enabled"
+            else:
+                vp_stage = 0
+            offset = sum(
+                layout.layout[previous_pp_rank][previous_vp_stage].count(LayerType.mtp)
+                for previous_vp_stage in range(vp_stage + 1)
+                for previous_pp_rank in range(
+                    layout.pipeline_model_parallel_size if previous_vp_stage < vp_stage else pp_rank
+                )
             )
         else:
             offset = 0
@@ -1214,7 +1230,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             hybrid_submodules = mamba_submodules
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
-        self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
+        self.layer_number = layer_number + get_mtp_layer_offset(
+            self.config, vp_stage, pp_rank=pg_collection.pp.rank()
+        )
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
@@ -2015,13 +2033,14 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp'] + (['dp'] if self.config.mtp_hsm else [])
+            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         else:
-            # Ensure the provided process groups include CP
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "MultiTokenPredictionBlock pg_collection must have cp process group"
+            # Ensure the provided process groups include TP, CP, and PP.
+            for group_name in ('tp', 'cp', 'pp'):
+                assert (
+                    getattr(pg_collection, group_name, None) is not None
+                ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
             if self.config.mtp_hsm:
                 assert hasattr(
                     pg_collection, 'dp'
@@ -2031,6 +2050,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
+        self.pp_rank = pg_collection.pp.rank()
         self.dp_group = pg_collection.dp if self.config.mtp_hsm else None
         self.hidden_state_mixing_rng_tracker_name = (
             _initialize_hidden_state_mixing_rng_tracker(self.dp_group)
@@ -2165,7 +2185,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             (Tensor): The mtp loss tensor of shape [b, s].
         """
         # get hidden states from previous mtp stages
-        offset = get_mtp_layer_offset(self.config, self.vp_stage)
+        offset = get_mtp_layer_offset(self.config, self.vp_stage, pp_rank=self.pp_rank)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
 
@@ -2291,7 +2311,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
-            offset = get_mtp_layer_offset(self.config, self.vp_stage)
+            offset = get_mtp_layer_offset(self.config, self.vp_stage, pp_rank=self.pp_rank)
             sharded_prefix = f'{layer_prefix}{layer.layer_number - 1}.'
 
             state_dict_prefix = f'{layer_prefix}{layer.layer_number - 1 - offset}.'
