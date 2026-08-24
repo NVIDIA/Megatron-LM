@@ -543,8 +543,26 @@ def hybrid_context_parallel_forward_backward(
             partner_cp_size = len(
                 [True for sample_ids in sample_id_groups[group_id] if sub_sample_id in sample_ids]
             )
-            sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
-            new_data_iterator = RerunDataIterator(iter([sample]))
+            # Bridge the 1-D sub-sample dict from HybridCPDataLoaderWrapper.unpack_batch
+            # (token-level keys only, no cu_seqlens/max_seqlen) to the 2-D batched
+            # schema get_batch_on_this_tp_rank expects under is_hybrid_cp. The
+            # original bridge helper (get_batch_on_this_hybrid_cp_rank) was removed
+            # in the get_batch consolidation refactor, leaving the two ends
+            # incompatible; this restores the minimal contract.
+            dev = torch.cuda.current_device()
+            seq_len = sample["tokens"].shape[-1]
+            bridged = {
+                key: sample[key].unsqueeze(0)
+                for key in ("tokens", "labels", "loss_mask", "position_ids")
+            }
+            cu = torch.tensor([[0, seq_len]], dtype=torch.int32, device=dev)
+            bridged["cu_seqlens"] = cu
+            bridged["cu_seqlens_padded"] = cu.clone()
+            bridged["max_seqlen"] = torch.tensor([seq_len], dtype=torch.int32, device=dev)
+            bridged["local_cp_size"] = torch.tensor(
+                [partner_cp_size], dtype=torch.int32, device=dev
+            )
+            new_data_iterator = RerunDataIterator(iter([bridged]))
         else:
             partner_cp_size = 0
             new_data_iterator = None
