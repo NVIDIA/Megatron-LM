@@ -23,6 +23,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     HybridLayerConfig,
+    normalize_tp_comm_overlap,
     validate_segment_layers,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -120,7 +121,9 @@ class HybridStack(MegatronModule):
                 for layer_symbol in layer_type_list
             ):
                 raise ValueError("Each entry in layer_type_list must be a single layer symbol")
-            layer_config_list = validate_segment_layers(''.join(layer_type_list), config)
+            segment = ''.join(layer_type_list)
+            normalize_tp_comm_overlap(config, segment)
+            layer_config_list = validate_segment_layers(segment, config)
 
         super().__init__(config=config)
         self.pre_process = pre_process
@@ -147,7 +150,6 @@ class HybridStack(MegatronModule):
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
             layer_number = i + 1 + pp_layer_offset
-            tp_comm_overlap = layer_config.tp_comm_overlap
             if layer_config.fp8:
                 quant_init_context = get_fp8_context(
                     layer_config, i + pp_layer_offset, is_init=True
@@ -242,11 +244,6 @@ class HybridStack(MegatronModule):
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
                     )
 
-            # Some layer builders disable unsupported TP overlap by mutating their config.
-            # Preserve the shared-config behavior for configs that had the same initial value.
-            self.synchronize_shared_config_mutation(
-                "tp_comm_overlap", tp_comm_overlap, layer_config.tp_comm_overlap
-            )
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
@@ -262,24 +259,6 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-
-    def synchronize_shared_config_mutation(
-        self, attribute: str, old_value: object, new_value: object
-    ) -> None:
-        """Propagate a legacy shared-config mutation to configs cloned from it.
-
-        Plain lists are treated as independently supplied configs and are not synchronized.
-        Within a legacy-derived list, configs that have already diverged from the old shared
-        value are also left unchanged.
-        """
-        if old_value == new_value or not getattr(
-            self.layer_config_list, "synchronize_shared_config_mutations", False
-        ):
-            return
-
-        for config_to_update in [self.config, *self.layer_config_list]:
-            if getattr(config_to_update, attribute) == old_value:
-                setattr(config_to_update, attribute, new_value)
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`

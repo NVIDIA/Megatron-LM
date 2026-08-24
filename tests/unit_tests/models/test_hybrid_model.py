@@ -254,16 +254,15 @@ class TestHybridModel:
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
 
-    def test_mtp_shared_config_mutation_reaches_decoder_configs(self, monkeypatch):
-        class MutatingMTPBlock(torch.nn.Module):
+    def test_mtp_tp_overlap_is_normalized_before_decoder_configs(self, monkeypatch):
+        class CheckingMTPBlock(torch.nn.Module):
 
             def __init__(self, config, **kwargs):
                 super().__init__()
-                assert config.tp_comm_overlap is True
-                config.tp_comm_overlap = False
+                assert config.tp_comm_overlap is False
 
         monkeypatch.setattr(
-            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock", MutatingMTPBlock
+            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock", CheckingMTPBlock
         )
 
         model_config = TransformerConfig(
@@ -274,13 +273,14 @@ class TestHybridModel:
             mtp_num_layers=1,
             tp_comm_overlap=True,
         )
-        model = HybridModel(
-            config=model_config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=100,
-            max_sequence_length=4,
-            hybrid_layer_pattern="-/M",
-        )
+        with pytest.warns(UserWarning, match="Disabling tp_comm_overlap"):
+            model = HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-/M",
+            )
 
         assert model.config.tp_comm_overlap is False
         assert all(config.tp_comm_overlap is False for config in model.decoder.layer_config_list)

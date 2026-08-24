@@ -161,6 +161,7 @@ class TestValidateSegmentLayers:
 
         layer_config_list = validate_segment_layers("MMM", self.config)
 
+        assert type(layer_config_list) is list
         assert len({id(config) for config in layer_config_list}) == 3
         assert all(config is not self.config for config in layer_config_list)
         assert all(config.test_mutable_value == {"items": []} for config in layer_config_list)
@@ -602,6 +603,30 @@ class TestSelectPipelineSegment:
         )
         _assert_layer_config_types(layer_configs, "M*M*")
         assert offset == 0
+
+    @pytest.mark.parametrize("layer_symbol", [Symbols.MLA, Symbols.DS_ATTENTION])
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
+    def test_normalizes_tp_overlap_before_copying_selected_segment(self, mock_log, layer_symbol):
+        self.config.tp_comm_overlap = True
+
+        with pytest.warns(UserWarning, match="Disabling tp_comm_overlap"):
+            layer_configs, _ = select_pipeline_segment(
+                layer_symbol, self.config, pp_group=None, vp_stage=None
+            )
+
+        assert self.config.tp_comm_overlap is False
+        assert all(layer_config.tp_comm_overlap is False for layer_config in layer_configs)
+
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
+    def test_does_not_normalize_tp_overlap_for_unselected_mla_segment(self, mock_log):
+        self.config.tp_comm_overlap = True
+
+        layer_configs, _ = select_pipeline_segment(
+            f"{Symbols.MLA}|{Symbols.MAMBA}", self.config, pp_group=None, vp_stage=1
+        )
+
+        assert self.config.tp_comm_overlap is True
+        assert all(layer_config.tp_comm_overlap is True for layer_config in layer_configs)
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_two_segments_vp0(self, mock_log):

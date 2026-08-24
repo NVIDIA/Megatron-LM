@@ -197,6 +197,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            normalize_tp_comm_overlap,
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
@@ -204,18 +205,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
-
-        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
-
-        layer_config_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.config,
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-            **logging_pg_kwargs,
-        )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -231,6 +220,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ignore_virtual=False,
                 vp_stage=self.vp_stage,
             )
+        )
+        normalize_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
+
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+
+        layer_config_list, layer_offset = select_pipeline_segment(
+            parsed.main_pattern or '',
+            self.config,
+            self.pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
 
         # megatron core pipelining currently depends on model type
@@ -300,7 +302,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
 
-            tp_comm_overlap = self.config.tp_comm_overlap
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
                 spec=mtp_block_spec,
@@ -310,9 +311,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
-            )
-            self.decoder.synchronize_shared_config_mutation(
-                "tp_comm_overlap", tp_comm_overlap, self.config.tp_comm_overlap
             )
             self._setup_mtp_cuda_graphs()
 

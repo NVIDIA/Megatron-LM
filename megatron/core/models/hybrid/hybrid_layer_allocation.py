@@ -1,6 +1,7 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -55,16 +56,6 @@ HybridLayerConfig = (
     | MLPLayerConfig
     | MoELayerConfig
 )
-
-
-class _HybridLayerConfigList(list[HybridLayerConfig]):
-    """Configs cloned from one legacy stack config.
-
-    The marker lets HybridStack preserve constructor-time mutations that previously
-    affected a shared config, without coupling independently supplied config lists.
-    """
-
-    synchronize_shared_config_mutations = True
 
 
 @dataclass
@@ -360,15 +351,47 @@ def _create_layer_config(config: TransformerConfig, layer_symbol: str) -> Hybrid
     raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
 
 
+def normalize_tp_comm_overlap(
+    config: TransformerConfig, segment: str, *, has_mtp: bool = False
+) -> None:
+    """Disable TP communication overlap unsupported by built-in hybrid layers.
+
+    This must run before ``validate_segment_layers`` copies the stack-level config so
+    every generated layer config receives the normalized value.
+
+    Args:
+        config: Stack-level config that will be copied for each layer.
+        segment: Selected pipeline segment, containing only layer symbols.
+        has_mtp: Whether this model instance will build an MTP block.
+    """
+    unsupported_features: list[str] = []
+    if Symbols.MLA in segment:
+        unsupported_features.append("MLA")
+    if Symbols.DS_ATTENTION in segment:
+        unsupported_features.append("DSA")
+    if has_mtp:
+        unsupported_features.append("MTP")
+
+    if not config.tp_comm_overlap or not unsupported_features:
+        return
+
+    config.tp_comm_overlap = False
+    warnings.warn(
+        "TP communication overlap is not supported with hybrid "
+        f"{'/'.join(unsupported_features)} layers. Disabling tp_comm_overlap.",
+        stacklevel=2,
+    )
+
+
 def validate_segment_layers(segment: str, config: TransformerConfig) -> List[HybridLayerConfig]:
     """Validate and convert a single pipeline segment pattern to layer configs.
 
     This is used after the main pattern has been split by '|' into segments.
     Each segment should contain only valid layer symbols (no '|').
 
-    The legacy source config has already been normalized by
-    ``TransformerConfig.__post_init__``. Each layer config is created from that normalized
-    state without running ``__post_init__`` a second time.
+    The source config is expected to be normalized before this function is called.
+    Each layer config is created from that state without running ``__post_init__``
+    a second time.
 
     Args:
         segment: A single pipeline segment pattern string (e.g., "M-M*-")
@@ -382,7 +405,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Hyb
     """
     _validate_segment_layer_symbols(segment)
 
-    layer_configs = _HybridLayerConfigList()
+    layer_configs: list[HybridLayerConfig] = []
     for layer_symbol in segment:
         layer_configs.append(_create_layer_config(config, layer_symbol))
 
@@ -507,6 +530,7 @@ def select_pipeline_segment(
             count = layers_per_rank
 
         selected_pattern = full_pattern[offset : offset + count]
+        normalize_tp_comm_overlap(config, selected_pattern)
         selected = validate_segment_layers(selected_pattern, config)
         log_on_each_pipeline_stage(
             logger,
@@ -541,6 +565,7 @@ def select_pipeline_segment(
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
+    normalize_tp_comm_overlap(config, my_segment)
     layer_config_list = validate_segment_layers(my_segment, config)
 
     log_on_each_pipeline_stage(

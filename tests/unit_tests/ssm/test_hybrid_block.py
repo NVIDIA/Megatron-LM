@@ -130,8 +130,8 @@ def test_hybrid_stack_accepts_layer_config_subclasses(monkeypatch):
     assert block.layers[0].config is layer_config
 
 
-def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
-    """The positional layer-type API converts configs and retains shared mutation behavior."""
+def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatch):
+    """The positional layer-type API normalizes the root config before conversion."""
 
     class BuiltLayer(torch.nn.Module):
 
@@ -143,26 +143,27 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
     submodules = hybrid_stack_spec.submodules
 
     def fake_build_module(module_spec, **kwargs):
-        if module_spec is submodules.mla_layer:
-            kwargs["config"].tp_comm_overlap = False
         return BuiltLayer(kwargs["config"], kwargs["layer_number"])
 
     monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
 
-    config = MLATransformerConfig(num_layers=3, hidden_size=64, num_attention_heads=4)
-    config.tp_comm_overlap = True
-    block = HybridStack(
-        config,
-        submodules,
-        False,
-        [Symbols.MAMBA, Symbols.MLA, Symbols.MLP],
-        post_layer_norm=False,
-        post_process=False,
-        pg_collection=SimpleNamespace(pp=None, tp=None),
+    config = MLATransformerConfig(
+        num_layers=3, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
     )
+    with pytest.warns(UserWarning, match="Disabling tp_comm_overlap"):
+        block = HybridStack(
+            config,
+            submodules,
+            False,
+            [Symbols.MAMBA, Symbols.MLA, Symbols.MLP],
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=SimpleNamespace(pp=None, tp=None),
+        )
     layer_config_list = block.layer_config_list
 
     assert not hasattr(block, "layer_type_list")
+    assert type(layer_config_list) is list
     assert [type(layer_config) for layer_config in layer_config_list] == [
         MambaLayerConfig,
         MLALayerConfig,
@@ -187,26 +188,43 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
     assert config.sequence_parallel is False
     assert all(layer_config.sequence_parallel is False for layer_config in layer_config_list)
 
-    independent_root_config = MLATransformerConfig(
-        num_layers=2, hidden_size=64, num_attention_heads=4
+
+def test_explicit_layer_config_mutations_are_isolated(monkeypatch):
+    """Mutating one explicitly supplied layer config does not affect the others."""
+
+    class BuiltLayer(torch.nn.Module):
+
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+
+    submodules = hybrid_stack_spec.submodules
+
+    def fake_build_module(module_spec, **kwargs):
+        if module_spec is submodules.mla_layer:
+            kwargs["config"].tp_comm_overlap = False
+        return BuiltLayer(kwargs["config"], kwargs["layer_number"])
+
+    monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
+
+    root_config = MLATransformerConfig(
+        num_layers=2, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
     )
-    independent_root_config.tp_comm_overlap = True
-    independent_layer_configs = list(
-        validate_segment_layers(Symbols.MLA + Symbols.MLP, independent_root_config)
-    )
+    layer_configs = validate_segment_layers(Symbols.MLA + Symbols.MLP, root_config)
     HybridStack(
-        config=independent_root_config,
+        config=root_config,
         submodules=submodules,
-        layer_config_list=independent_layer_configs,
+        layer_config_list=layer_configs,
         pre_process=False,
         post_layer_norm=False,
         post_process=False,
         pg_collection=SimpleNamespace(pp=None, tp=None),
     )
 
-    assert independent_layer_configs[0].tp_comm_overlap is False
-    assert independent_layer_configs[1].tp_comm_overlap is True
-    assert independent_root_config.tp_comm_overlap is True
+    assert type(layer_configs) is list
+    assert root_config.tp_comm_overlap is True
+    assert [layer_config.tp_comm_overlap for layer_config in layer_configs] == [False, True]
 
 
 @pytest.mark.parametrize(
