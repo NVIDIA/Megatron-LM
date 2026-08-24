@@ -214,16 +214,6 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     _compare('dsa_indexer_n_heads', default=None)
     _compare('dsa_indexer_head_dim', default=None)
     _compare('dsa_indexer_topk', default=None)
-    # _compare('dsa_indexer_topk_key_chunk_size')
-    # _compare('dsa_indexer_topk_recompute', default=False)
-    # _compare('dsa_indexer_loss_coeff', default=None)
-    # _compare('dsa_indexer_loss_recompute', default=False)
-    # _compare('dsa_sparse_attention_recompute', default=False)
-    # _compare('dsa_sparse_attention_use_gather', default=False)
-    # _compare('dsa_sparse_attention_query_chunk_size')
-    # _compare('dsa_indexer_use_sparse_loss', default=False)
-    # _compare('dsa_indexer_sparse_loss_use_topk_only', default=False)
-    # _compare('dsa_indexer_loss_query_chunk_size')
     _compare('dsa_indexer_use_hadamard', default=False)
     if not getattr(args, 'no_load_optim', False) and not getattr(args, 'finetune', False):
         def _dsa_trainability_mode(namespace):
@@ -2306,7 +2296,13 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
             print_rank_0(f'Checkpoint did not provide arguments {arg_name}')
 
     # Model args.
-    # _set_arg('num_layers')
+    # num_layers is derived from hybrid_layer_pattern in validate_args and must not be set
+    # alongside it, so only restore it for non-hybrid checkpoints.
+    if (
+        getattr(args, 'hybrid_layer_pattern', None) is None
+        and getattr(checkpoint_args, 'hybrid_layer_pattern', None) is None
+    ):
+        _set_arg('num_layers')
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
@@ -2321,9 +2317,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('rotary_base', force=True)
     _set_arg('rotary_percent', force=True)
     _set_arg('rotary_interleaved', force=True)
-    _set_arg('rotary_seq_len_interpolation_factor', force=True)
-    _set_arg('use_rope_scaling', force=True)
-    _set_arg('rope_scaling_factor', force=True)
     _set_arg('add_bias_linear', force=True)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
@@ -2364,17 +2357,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         _set_arg('dsa_indexer_head_dim', force=True)
         _set_arg('dsa_indexer_topk', force=True)
         _set_arg('dsa_indexer_use_hadamard', force=True)
-    # _set_arg('dsa_kernel_backend', force=True)
-    # _set_arg('dsa_indexer_topk_key_chunk_size', force=True)
-    # _set_arg('dsa_indexer_topk_recompute', force=True)
-    # _set_arg('dsa_indexer_loss_coeff', force=True)
-    # _set_arg('dsa_indexer_loss_recompute', force=True)
-    # _set_arg('dsa_sparse_attention_recompute', force=True)
-    # _set_arg('dsa_sparse_attention_use_gather', force=True)
-    # _set_arg('dsa_sparse_attention_query_chunk_size', force=True)
-    # _set_arg('dsa_indexer_use_sparse_loss', force=True)
-    # _set_arg('dsa_indexer_sparse_loss_use_topk_only', force=True)
-    # _set_arg('dsa_indexer_loss_query_chunk_size', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
