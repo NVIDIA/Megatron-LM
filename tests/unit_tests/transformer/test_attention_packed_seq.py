@@ -282,7 +282,7 @@ class TestAttentionDynamicContextParallel:
         runtime_group = self._runtime_cp_group()
         packed_seq_params = make_test_packed_seq_params(sequence_length)
         packed_seq_params.cp_group = runtime_group
-        packed_seq_params.local_cp_size = 1
+        packed_seq_params.local_cp_size = 2
         self.parallel_attention(
             hidden_states,
             None,
@@ -341,7 +341,7 @@ class TestAttentionDynamicContextParallel:
         value = torch.zeros_like(query)
         packed_seq_params = make_test_packed_seq_params(32)
         packed_seq_params.cp_group = self._runtime_cp_group()
-        packed_seq_params.local_cp_size = 1
+        packed_seq_params.local_cp_size = 2
 
         core_attention(
             query,
