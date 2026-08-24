@@ -199,3 +199,53 @@ class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPac
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
+
+
+class TestRuntimeCPGroupContract:
+    """Guard the runtime-CP contract: local_cp_size == 1 means CP is off for
+    the sub-sample and cp_group must be None. A producer that starts binding
+    size-1 groups would silently route CP-off microbatches through the CP
+    attention path; this test makes that loud.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            autocast_dtype=torch.bfloat16,
+        )
+        self.parallel_attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_cp_group_with_local_cp_size_one_is_rejected(self):
+        core_attention = self.parallel_attention.core_attention.cuda()
+        query = torch.zeros(32, 4, 16, dtype=torch.bfloat16, device="cuda")
+        packed_seq_params = make_test_packed_seq_params(32)
+        packed_seq_params.cp_group = torch.distributed.new_group(
+            ranks=[torch.distributed.get_rank()]
+        )
+        packed_seq_params.local_cp_size = 1
+
+        with pytest.raises(AssertionError, match="local_cp_size == 1"):
+            core_attention(
+                query,
+                torch.zeros_like(query),
+                torch.zeros_like(query),
+                None,
+                AttnMaskType.padding_causal,
+                packed_seq_params=packed_seq_params,
+            )
