@@ -6,6 +6,9 @@ from typing import Optional
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_collective,
+)
 
 
 def build_inverse_permutation_map(
@@ -60,10 +63,6 @@ def unpermute(
     shapes and adds contributions by EP rank then top-k slot, matching the
     inference NVLS rank-ordered combine.
     """
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-        get_batch_invariant_collective,
-    )
-
     input_dtype = permuted_tokens.dtype
     # Mirror the inference engine's summation tree exactly:
     # - When probs is None the activations were probability-weighted upstream

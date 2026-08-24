@@ -40,6 +40,9 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_collective,
+)
 from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
@@ -641,10 +644,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            get_batch_invariant_collective,
-        )
-
         use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
         # Under batch-invariant mode the "multimem" option keeps the native
         # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
