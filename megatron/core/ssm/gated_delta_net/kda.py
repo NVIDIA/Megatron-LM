@@ -116,9 +116,6 @@ class KimiDeltaAttention(_GDNBase):
         # FP32 through model casting, optimizer construction, and checkpointing.
         mark_keep_in_fp32(self.dt_bias)
         mark_keep_in_fp32(self.A_log)
-        self.dt_bias._no_reinit = True
-        self.dt_bias._no_weight_decay = True
-        self.A_log._no_weight_decay = True
 
         # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
         self.use_gate_in_kernel = True
