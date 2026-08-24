@@ -4273,7 +4273,7 @@ def _add_distributed_args(parser):
         help="Number of persistent buffers in each Megatron FSDP communication pool. "
         "The default of two provides conventional double buffering; combined 1F1B "
         "overlap with forward prefetch requires at least three. A non-default value requires "
-        "--fsdp-double-buffer, --nccl-ub, or --megatron-fsdp-max-pool-double-buffer.",
+        "--fsdp-double-buffer, --use-nccl-ub, or --megatron-fsdp-max-pool-double-buffer.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',
