@@ -962,6 +962,247 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
 
 
+class _ReplicaBF16GradReduceKernel(_ReplicaBulkKernel):
+    """Read BF16 replica gradients and accumulate once in FP32 on the owner."""
+
+    NUM_THREADS = 544
+    BULK_ELEMENTS = _ReplicaGradReduceKernel.BULK_ELEMENTS
+    BULKS_PER_CHUNK = _ReplicaGradReduceKernel.BULKS_PER_CHUNK
+    CHUNK_ELEMENTS = _ReplicaGradReduceKernel.CHUNK_ELEMENTS
+
+    def _smem_bytes(self) -> int:
+        stages = self.STAGES * self.CHUNK_ELEMENTS * 2
+        barriers = self.STAGES * 2 * 8
+        plan = (self.num_local_experts * (self.world_size + 1) + 1) * 4
+        return stages + barriers + plan + 256
+
+    @cute.jit
+    def __call__(
+        self,
+        arena_ptr: cute.Pointer,
+        fc1_main_grad_bases_ptr: cute.Pointer,
+        fc2_main_grad_bases_ptr: cute.Pointer,
+        peer_base_ptr: cute.Pointer,
+        signal_base_ptr: cute.Pointer,
+        experts_ptr: cute.Pointer,
+        grid_barrier_ptr: cute.Pointer,
+        rank: Int32,
+        stream: cuda.CUstream,
+    ):
+        fc1_numel = cutlass.const_expr(self.num_local_experts * self.fc1_member_numel)
+        fc2_numel = cutlass.const_expr(self.num_local_experts * self.fc2_member_numel)
+        arena = _tensor_1d(arena_ptr, fc1_numel + fc2_numel)
+        fc1_main_grad_bases = _tensor_1d(fc1_main_grad_bases_ptr, self.num_local_experts)
+        fc2_main_grad_bases = _tensor_1d(fc2_main_grad_bases_ptr, self.num_local_experts)
+        peer_bases = _tensor_1d(peer_base_ptr, self.world_size)
+        signal_bases = _tensor_1d(signal_base_ptr, self.world_size)
+        experts = _tensor_1d(experts_ptr, self.world_size * self.num_local_experts)
+        self.kernel(
+            arena,
+            fc1_main_grad_bases,
+            fc2_main_grad_bases,
+            peer_bases,
+            signal_bases,
+            experts,
+            grid_barrier_ptr,
+            rank,
+        ).launch(
+            grid=(self.num_sms, 1, 1),
+            block=(self.NUM_THREADS, 1, 1),
+            smem=self._smem_bytes(),
+            stream=stream,
+            cooperative=True,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        arena: cute.Tensor,
+        fc1_main_grad_bases: cute.Tensor,
+        fc2_main_grad_bases: cute.Tensor,
+        peer_bases: cute.Tensor,
+        signal_bases: cute.Tensor,
+        experts: cute.Tensor,
+        grid_barrier,
+        rank: Int32,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        stages = cutlass.const_expr(self.STAGES)
+        chunk_bytes = cutlass.const_expr(self.CHUNK_ELEMENTS * 2)
+        virtual_fc1_numel = cutlass.const_expr(self.num_local_experts * self.fc1_member_numel)
+        fc1_chunks = cutlass.const_expr(self.num_local_experts * self.fc1_member_chunks)
+        fc2_chunks = cutlass.const_expr(self.num_local_experts * self.fc2_member_chunks)
+
+        smem = utils.SmemAllocator()
+        load_mbar = smem.allocate_array(Int64, num_elems=2 * stages)
+        stage_smem = smem.allocate_tensor(
+            BFloat16,
+            cute.make_ordered_layout((self.CHUNK_ELEMENTS, stages), order=(0, 1)),
+            byte_alignment=128,
+        )
+        matches = smem.allocate_tensor(
+            Int32, cute.make_layout((self.num_local_experts * self.world_size,)), byte_alignment=16
+        )
+        active_slots = smem.allocate_tensor(
+            Int32, cute.make_layout((self.num_local_experts,)), byte_alignment=16
+        )
+        active_count = smem.allocate_tensor(Int32, cute.make_layout((1,)), byte_alignment=4)
+
+        for index in cutlass.range(tid, self.num_local_experts * self.world_size, self.NUM_THREADS):
+            matches[index] = Int32(-1)
+        cute.arch.sync_threads()
+        for index in cutlass.range(tid, self.num_local_experts * self.world_size, self.NUM_THREADS):
+            expert = experts[index]
+            owner_expert = expert - rank * self.num_local_experts
+            if owner_expert >= Int32(0) and owner_expert < Int32(self.num_local_experts):
+                destination = index // self.num_local_experts
+                slot = index - destination * self.num_local_experts
+                matches[owner_expert * self.world_size + destination] = slot
+        if tid == 0:
+            count = Int32(0)
+            for slot in cutlass.range_constexpr(self.num_local_experts):
+                if experts[rank * self.num_local_experts + slot] >= Int32(0):
+                    active_slots[count] = Int32(slot)
+                    count += Int32(1)
+            active_count[0] = count
+        cute.arch.sync_threads()
+
+        _cross_rank_barrier(
+            signal_bases,
+            grid_barrier,
+            rank,
+            cutlass.const_expr(self.world_size),
+            Int32(self.num_sms),
+            tid,
+        )
+
+        load_pipe = pipeline.PipelineTmaAsync.create(
+            barrier_storage=load_mbar,
+            num_stages=stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.NUM_THREADS // 32 - 1
+            ),
+            tx_count=chunk_bytes,
+        )
+        load_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), BFloat16)
+        load_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, stages
+        )
+        consume_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, stages
+        )
+        total_work = cutlass.const_expr(fc1_chunks + fc2_chunks)
+        for work in cutlass.range(block, total_work, self.num_sms, unroll=1):
+            is_fc2 = work >= fc1_chunks
+            projection_work = work
+            member_chunks = cutlass.const_expr(self.fc1_member_chunks)
+            member_numel = cutlass.const_expr(self.fc1_member_numel)
+            virtual_projection_base = Int64(0)
+            main_grad_bases = fc1_main_grad_bases
+            if is_fc2:
+                projection_work = work - fc1_chunks
+                member_chunks = cutlass.const_expr(self.fc2_member_chunks)
+                member_numel = cutlass.const_expr(self.fc2_member_numel)
+                virtual_projection_base = Int64(virtual_fc1_numel)
+                main_grad_bases = fc2_main_grad_bases
+            local_expert = projection_work // member_chunks
+            member_chunk = projection_work - local_expert * member_chunks
+            member_offset = Int64(member_chunk * self.CHUNK_ELEMENTS)
+
+            if warp == 0:
+                for destination in cutlass.range_constexpr(self.world_size):
+                    slot = matches[local_expert * self.world_size + destination]
+                    if slot >= Int32(0):
+                        peer = cute.make_ptr(
+                            BFloat16,
+                            peer_bases[destination],
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        peer_offset = (
+                            virtual_projection_base + Int64(slot) * member_numel + member_offset
+                        )
+                        load_pipe.producer_acquire(load_state)
+                        stage = stage_smem[(None, load_state.index)]
+                        _bulk_load_copy(
+                            load_atom,
+                            peer + peer_offset,
+                            stage.iterator,
+                            load_pipe.producer_get_barrier(load_state),
+                            cutlass.const_expr(self.BULK_ELEMENTS),
+                            cutlass.const_expr(self.BULKS_PER_CHUNK),
+                        )
+                        load_pipe.producer_commit(load_state)
+                        load_state.advance()
+            elif warp >= 1:
+                source_count = Int32(0)
+                for destination in cutlass.range_constexpr(self.world_size):
+                    if matches[local_expert * self.world_size + destination] >= Int32(0):
+                        source_count += Int32(1)
+                if source_count > Int32(0):
+                    main_destination = cute.make_ptr(
+                        BFloat16,
+                        main_grad_bases[local_expert],
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    main_destination = _tensor_1d(
+                        main_destination + member_offset, self.CHUNK_ELEMENTS
+                    )
+                    consumer_thread = tid - Int32(32)
+                    consumer_threads = cutlass.const_expr(self.NUM_THREADS - 32)
+                    thread_elements = cutlass.const_expr(
+                        self.CHUNK_ELEMENTS // (self.NUM_THREADS - 32)
+                    )
+                    accumulator = cute.make_rmem_tensor((thread_elements,), Float32)
+                    for register in cutlass.range_constexpr(thread_elements):
+                        element = consumer_thread + register * consumer_threads
+                        accumulator[register] = Float32(main_destination[element])
+                    for _source_index in cutlass.range(source_count, unroll=1):
+                        load_pipe.consumer_wait(consume_state)
+                        stage = stage_smem[(None, consume_state.index)]
+                        for register in cutlass.range_constexpr(thread_elements):
+                            element = consumer_thread + register * consumer_threads
+                            accumulator[register] += Float32(stage[element])
+                        load_pipe.consumer_release(consume_state)
+                        consume_state.advance()
+                    # The only rounding is this final store; peer traffic and persistent
+                    # storage remain BF16 while every local addition above is FP32.
+                    for register in cutlass.range_constexpr(thread_elements):
+                        element = consumer_thread + register * consumer_threads
+                        main_destination[element] = BFloat16(accumulator[register])
+
+        _cross_rank_barrier(
+            signal_bases,
+            grid_barrier,
+            rank,
+            cutlass.const_expr(self.world_size),
+            Int32(self.num_sms),
+            tid,
+        )
+
+        chunks_per_slot = cutlass.const_expr(self.fc1_member_chunks + self.fc2_member_chunks)
+        clear_work = active_count[0] * chunks_per_slot
+        for work in cutlass.range(block, clear_work, self.num_sms, unroll=1):
+            active = work // chunks_per_slot
+            slot_chunk = work - active * chunks_per_slot
+            slot = active_slots[active]
+            destination_offset = Int64(slot) * self.fc1_member_numel + Int64(
+                slot_chunk * self.CHUNK_ELEMENTS
+            )
+            if slot_chunk >= self.fc1_member_chunks:
+                destination_offset = (
+                    Int64(virtual_fc1_numel)
+                    + Int64(slot) * self.fc2_member_numel
+                    + Int64((slot_chunk - self.fc1_member_chunks) * self.CHUNK_ELEMENTS)
+                )
+            for element in cutlass.range(tid, self.CHUNK_ELEMENTS, self.NUM_THREADS):
+                arena[destination_offset + element] = BFloat16(0.0)
+
+
 def _validate_compile_shape(
     world_size: int,
     num_local_experts: int,
@@ -981,7 +1222,9 @@ def _validate_compile_shape(
             f"{MAX_REPLICA_WEIGHT_SMS} SMs, got {num_sms}."
         )
     max_ranks = min(
-        _ReplicaWeightPushKernel.NUM_THREADS, _ReplicaGradReduceKernel.NUM_THREADS
+        _ReplicaWeightPushKernel.NUM_THREADS,
+        _ReplicaGradReduceKernel.NUM_THREADS,
+        _ReplicaBF16GradReduceKernel.NUM_THREADS,
     )
     if world_size > max_ranks:
         raise ValueError(
@@ -1041,21 +1284,33 @@ def _get_compiled_grad_reduce(
     fc2_member_numel: int,
     num_sms: int,
     device_index: int,
+    grad_dtype: torch.dtype = torch.float32,
 ):
     _validate_compile_shape(
         world_size, num_local_experts, fc1_member_numel, fc2_member_numel, num_sms
     )
-    kernel = _ReplicaGradReduceKernel(
+    if grad_dtype == torch.float32:
+        kernel_type = _ReplicaGradReduceKernel
+        pointer_type = Float32
+    elif grad_dtype == torch.bfloat16:
+        kernel_type = _ReplicaBF16GradReduceKernel
+        pointer_type = BFloat16
+    else:
+        raise ValueError(
+            "Replica CuTeDSL gradients must use torch.float32 or torch.bfloat16, "
+            f"got {grad_dtype}."
+        )
+    kernel = kernel_type(
         world_size=world_size,
         num_local_experts=num_local_experts,
         fc1_member_numel=fc1_member_numel,
         fc2_member_numel=fc2_member_numel,
         num_sms=num_sms,
     )
-    f32_ptr = make_ptr(Float32, 0, cute.AddressSpace.gmem, assumed_align=16)
+    grad_ptr = make_ptr(pointer_type, 0, cute.AddressSpace.gmem, assumed_align=16)
     i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
     i64_ptr = make_ptr(Int64, 0, cute.AddressSpace.gmem, assumed_align=8)
-    pointer_args = (f32_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr)
+    pointer_args = (grad_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr)
     stream = cuda.CUstream(0)
     with torch.cuda.device(device_index):
         return cute.compile(kernel, *pointer_args, Int32(0), stream)
@@ -1068,6 +1323,7 @@ def compile_replica_weight_kernels(
     member_numels: tuple[int, int],
     num_sms: int,
     device_index: int,
+    grad_dtype: torch.dtype = torch.float32,
     rowwise_scale_numels: tuple[int, int] | None = None,
     columnwise_scale_numels: tuple[int, int] | None = None,
 ) -> None:
@@ -1079,6 +1335,7 @@ def compile_replica_weight_kernels(
         member_numels[1],
         num_sms,
         device_index,
+        grad_dtype,
     )
     if rowwise_scale_numels is None and columnwise_scale_numels is None:
         _get_compiled_bf16_weight_push(
@@ -1359,6 +1616,15 @@ def launch_replica_grad_reduce(
     device_index = arena.device.index
     if device_index is None:
         raise ValueError("Replica CuTeDSL grad arena must be a CUDA tensor.")
+    if arena.dtype == torch.float32:
+        pointer_type = Float32
+    elif arena.dtype == torch.bfloat16:
+        pointer_type = BFloat16
+    else:
+        raise ValueError(
+            "Replica CuTeDSL grad arena must use torch.float32 or torch.bfloat16, "
+            f"got {arena.dtype}."
+        )
     compiled = _get_compiled_grad_reduce(
         world_size,
         num_local_experts,
@@ -1366,14 +1632,15 @@ def launch_replica_grad_reduce(
         member_numels[1],
         num_sms,
         device_index,
+        arena.dtype,
     )
     stream = cuda.CUstream(torch.cuda.current_stream(arena.device).cuda_stream)
     main_grad_bases = tuple(
-        _as_pointer_table(main_grad, num_local_experts, dtype=torch.float32)
+        _as_pointer_table(main_grad, num_local_experts, dtype=arena.dtype)
         for main_grad in main_grads
     )
     compiled(
-        _runtime_ptr(Float32, arena),
+        _runtime_ptr(pointer_type, arena),
         _runtime_ptr(Int64, main_grad_bases[0], assumed_align=8),
         _runtime_ptr(Int64, main_grad_bases[1], assumed_align=8),
         _runtime_ptr(Int64, peer_bases, assumed_align=8),

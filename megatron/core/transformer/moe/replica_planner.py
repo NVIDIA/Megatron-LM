@@ -473,6 +473,7 @@ class _ReplicaCuTeDSLWorkspace:
         weight_format: str,
         rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
         columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
+        grad_dtype: torch.dtype,
         num_sms: int | None,
     ) -> None:
         try:
@@ -491,6 +492,12 @@ class _ReplicaCuTeDSLWorkspace:
         self.weight_format = weight_format
         self.rowwise_scale_shapes = rowwise_scale_shapes
         self.columnwise_scale_shapes = columnwise_scale_shapes
+        if grad_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                "Replica CuTeDSL gradients must use torch.float32 or torch.bfloat16, "
+                f"got {grad_dtype}."
+            )
+        self.grad_dtype = grad_dtype
         self.rowwise_scale_numels = (
             tuple(math.prod(shape) for shape in rowwise_scale_shapes)
             if rowwise_scale_shapes is not None
@@ -575,7 +582,7 @@ class _ReplicaCuTeDSLWorkspace:
                     f"Unsupported replica weight format {self.weight_format!r}."
                 )
             self.grad_arena = symm_mem.empty(
-                arena_numel, dtype=torch.float32, device=device
+                arena_numel, dtype=self.grad_dtype, device=device
             )
             self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
@@ -624,6 +631,7 @@ class _ReplicaCuTeDSLWorkspace:
             member_numels=self.member_numels,
             num_sms=self.num_sms,
             device_index=device_index,
+            grad_dtype=self.grad_dtype,
             rowwise_scale_numels=self.rowwise_scale_numels,
             columnwise_scale_numels=self.columnwise_scale_numels,
         )
@@ -653,6 +661,7 @@ class _ReplicaCuTeDSLWorkspace:
         weight_format: str,
         rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
         columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
+        grad_dtype: torch.dtype,
         num_sms: int | None,
     ) -> None:
         """Reject heterogeneous layers instead of creating a shape-keyed memory pool."""
@@ -668,6 +677,7 @@ class _ReplicaCuTeDSLWorkspace:
             weight_format,
             rowwise_scale_shapes,
             columnwise_scale_shapes,
+            grad_dtype,
             effective_sms,
         )
         expected = (
@@ -677,6 +687,7 @@ class _ReplicaCuTeDSLWorkspace:
             self.weight_format,
             self.rowwise_scale_shapes,
             self.columnwise_scale_shapes,
+            self.grad_dtype,
             self.num_sms,
         )
         if actual != expected:
@@ -805,7 +816,7 @@ class _ReplicaCuTeDSLWorkspace:
         runtime_shape = (2 * self.num_local_experts, *member_shape)
         cached = (
             torch.empty(runtime_shape, dtype=torch.bfloat16, device=self.device),
-            torch.empty(runtime_shape, dtype=torch.float32, device=self.device),
+            torch.empty(runtime_shape, dtype=self.grad_dtype, device=self.device),
         )
         self._packed_bf16_projection_storage[projection_index] = cached
         return cached
@@ -816,7 +827,7 @@ class _ReplicaCuTeDSLWorkspace:
         if cached is None:
             cached = torch.empty(
                 (self.num_local_experts, *self.member_shapes[projection_index]),
-                dtype=torch.float32,
+                dtype=self.grad_dtype,
                 device=self.device,
             )
             self._gtp_native_projection_grad_storage[projection_index] = cached
@@ -837,6 +848,7 @@ def _get_replica_cutedsl_workspace(
     weight_format: str,
     rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
     columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
+    grad_dtype: torch.dtype,
     num_sms: int | None,
 ) -> _ReplicaCuTeDSLWorkspace:
     """Return the one fixed-shape workspace owned by an EP group and device."""
@@ -852,6 +864,7 @@ def _get_replica_cutedsl_workspace(
             weight_format=weight_format,
             rowwise_scale_shapes=rowwise_scale_shapes,
             columnwise_scale_shapes=columnwise_scale_shapes,
+            grad_dtype=grad_dtype,
             num_sms=num_sms,
         )
         _replica_cutedsl_workspaces[key] = workspace
@@ -863,6 +876,7 @@ def _get_replica_cutedsl_workspace(
             weight_format=weight_format,
             rowwise_scale_shapes=rowwise_scale_shapes,
             columnwise_scale_shapes=columnwise_scale_shapes,
+            grad_dtype=grad_dtype,
             num_sms=num_sms,
         )
     return workspace
@@ -878,6 +892,7 @@ class ReplicaCuTeDSLWeightBridge:
         group: dist.ProcessGroup,
         num_experts: int,
         num_local_experts: int,
+        grad_dtype: torch.dtype = torch.float32,
         num_sms: int | None = None,
         hidden_dim: int | None = None,
         top_k: int | None = None,
@@ -956,6 +971,7 @@ class ReplicaCuTeDSLWeightBridge:
             weight_format=self.weight_format,
             rowwise_scale_shapes=rowwise_scale_shapes,
             columnwise_scale_shapes=columnwise_scale_shapes,
+            grad_dtype=grad_dtype,
             num_sms=num_sms,
         )
         self.prefetch_ready = torch.cuda.Event()
@@ -1315,14 +1331,15 @@ class ReplicaCuTeDSLWeightBridge:
             main_grad_ptrs = []
             for main_grad in main_grad_tensors:
                 if (
-                    main_grad.dtype != torch.float32
+                    main_grad.dtype != self.workspace.grad_dtype
                     or main_grad.device != self.device
                     or main_grad.numel() != projection.member_numel
                     or not main_grad.is_contiguous()
                 ):
                     raise ValueError(
-                        "Replica CuTeDSL requires contiguous FP32 registered main-grad buffers "
-                        "on the weight device with one expert's shape."
+                        "Replica CuTeDSL requires contiguous registered main-grad buffers "
+                        f"with dtype {self.workspace.grad_dtype} on the weight device with one "
+                        "expert's shape."
                     )
                 main_grad_ptrs.append(main_grad.data_ptr())
             main_grad_ptrs = tuple(main_grad_ptrs)
