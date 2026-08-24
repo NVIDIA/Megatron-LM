@@ -106,7 +106,6 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         name: str | None = None,
-        *,
         layer_config_list: list[HybridLayerConfig] | None = None,
     ) -> None:
         """
