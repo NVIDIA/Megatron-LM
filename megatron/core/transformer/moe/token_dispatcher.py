@@ -1357,7 +1357,6 @@ class _ReplicaPlannedManagerMixin:
 
     def _start_replica_weight_prefetch(self, plan) -> None:
         self._bridge.last_plan = plan
-        self._bridge.prepare_source_weights()
         self._bridge.start_prefetch(plan)
 
     def _prepare_replica_plan(self, hidden_states: torch.Tensor):
