@@ -1757,13 +1757,18 @@ def validate_args(args, defaults={}):
                 "--use-layer-sharding-muon does not implement split-QKV Newton-Schulz "
                 "yet; pass --muon-no-split-qkv."
             )
-            if args.muon_tp_mode != 'blockwise':
-                # The kwargs builder matches constructor parameters reflectively, so
-                # an unmatched muon_tp_mode is dropped silently — surface it instead.
+            if args.muon_tp_mode != 'duplicated':
+                # tp_mode reaches the constructor but the layer-sharded exchange
+                # never consults it; it only affects the paths that delegate to
+                # TensorParallelMuon (the empty-homes fallback and degenerate
+                # single-rank domains). Surface that a non-default choice does
+                # not do what it does without layer sharding.
                 warn_rank_0(
-                    f"--muon-tp-mode {args.muon_tp_mode} is ignored under "
-                    "--use-layer-sharding-muon: layer sharding replaces the "
-                    "duplicated/distributed mode selection entirely."
+                    f"--muon-tp-mode {args.muon_tp_mode} does not affect the "
+                    "layer-sharded Newton-Schulz path under "
+                    "--use-layer-sharding-muon (whole matrices are assembled on "
+                    "their NS homes regardless); it only applies to the "
+                    "TensorParallelMuon fallback and degenerate-domain paths."
                 )
 
 
