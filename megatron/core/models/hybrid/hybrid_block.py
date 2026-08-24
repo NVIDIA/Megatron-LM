@@ -66,9 +66,9 @@ class HybridStack(MegatronModule):
         submodules (HybridStackSubmodules): the submodules for the stack
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
-        layer_type_list (list[str], optional): backward-compatible list of layer
-            type symbols for this pipeline segment. It is immediately converted to
-            independent per-layer configs.
+        layer_type_list (list[str], optional): This argument exists for backwards-compatibility
+            reasons, allowing callers to construct ``HybridStack`` directly with layer symbols.
+            It is immediately converted to independent per-layer configs.
         layer_config_list (Sequence[TransformerConfig], optional): per-layer configs for this
             pipeline segment. When provided by HybridModel, pipeline stage selection has already
             been done via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
