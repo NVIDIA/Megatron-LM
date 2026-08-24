@@ -4334,6 +4334,7 @@ def test_min_memory_impl_matches_reference_gradients(input_norm_kind):
         False,
         False,
         True,
+        False,
         input_norm,
     )
     (output.sum() + loss).backward()
