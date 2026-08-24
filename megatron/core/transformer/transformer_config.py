@@ -420,26 +420,16 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_activation_warmup_samples: int = 0
     """Number of samples over which to warm up only DSA indexer optimizer groups."""
 
-    dsa_indexer_topk_key_chunk_size: Optional[int] = None
-    """Optional key chunk size for exact streamed DSA top-k routing. If unset, use dense routing."""
 
-    dsa_indexer_topk_recompute: bool = False
-    """Whether to recompute chunked DSA top-k routing during backward to reduce activation memory."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
-    dsa_indexer_loss_recompute: bool = False
-    """Whether to recompute the DSA indexer KL loss during backward to reduce activation memory."""
 
-    dsa_sparse_attention_recompute: bool = False
-    """Whether to recompute sparse DSA attention during backward to reduce activation memory."""
 
     dsa_sparse_attention_use_gather: bool = False
     """Whether to use the gather-based sparse DSA attention backend instead of the dense-mask reference path."""
 
-    dsa_sparse_attention_query_chunk_size: Optional[int] = None
-    """Optional query chunk size for sparse DSA attention. If unset, process all queries at once."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
@@ -467,8 +457,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_sparse_loss_use_topk_only: bool = False
     """When using sparse DSA indexer loss, compute KL only on the selected top-k support."""
 
-    dsa_indexer_loss_query_chunk_size: Optional[int] = None
-    """Optional query chunk size for the DSA indexer loss top-k-only sparse KL path."""
 
     dsa_indexer_use_hadamard: bool = False
     """Whether to apply Hadamard rotation to DSA indexer queries and keys."""
@@ -3500,26 +3488,10 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_train_main_only disables indexer KL; do not set "
                     "dsa_indexer_sparse_loss_use_topk_only."
                 )
-                assert not self.dsa_indexer_loss_recompute, (
-                    "dsa_train_main_only disables indexer KL; do not set "
-                    "dsa_indexer_loss_recompute."
-                )
-                assert self.dsa_indexer_loss_query_chunk_size is None, (
-                    "dsa_train_main_only disables indexer KL; leave "
-                    "dsa_indexer_loss_query_chunk_size unset."
-                )
-                assert not self.dsa_indexer_topk_recompute, (
-                    "dsa_train_main_only uses nondifferentiable frozen routing; do not set "
-                    "dsa_indexer_topk_recompute."
-                )
                 assert not self.dsa_kernel_cache_selected_scores, (
                     "dsa_train_main_only has no selected-score KL backward; do not set "
                     "dsa_kernel_cache_selected_scores."
                 )
-            assert (
-                self.dsa_indexer_topk_key_chunk_size is None
-                or self.dsa_indexer_topk_key_chunk_size > 0
-            ), "dsa_indexer_topk_key_chunk_size must be a positive integer when set."
             min_memory_dsa_backend = self.dsa_min_memory_backend in (
                 'triton-min-memory',
                 'torch-min-memory',
@@ -3573,39 +3545,6 @@ class TransformerConfig(ModelParallelConfig):
             ), (
                 "dsa_indexer_sparse_loss_use_topk_only requires dsa_indexer_use_sparse_loss."
             )
-            assert (
-                self.dsa_indexer_loss_query_chunk_size is None
-                or self.dsa_indexer_loss_query_chunk_size > 0
-            ), "dsa_indexer_loss_query_chunk_size must be a positive integer when set."
-            assert (
-                self.dsa_sparse_attention_query_chunk_size is None
-                or self.dsa_sparse_attention_query_chunk_size > 0
-            ), "dsa_sparse_attention_query_chunk_size must be a positive integer when set."
-            assert (
-                self.dsa_indexer_loss_query_chunk_size is None
-                or self.dsa_indexer_sparse_loss_use_topk_only
-                or min_memory_dsa_backend
-            ), (
-                "dsa_indexer_loss_query_chunk_size requires "
-                "dsa_indexer_sparse_loss_use_topk_only or a min-memory dsa_min_memory_backend."
-            )
-            assert (
-                not self.dsa_indexer_topk_recompute
-                or (
-                    self.dsa_indexer_topk_key_chunk_size is not None
-                    and self.dsa_indexer_topk_key_chunk_size > 0
-                )
-            ), (
-                "dsa_indexer_topk_recompute requires dsa_indexer_topk_key_chunk_size."
-            )
-            assert (
-                self.dsa_sparse_attention_query_chunk_size is None
-                or self.dsa_sparse_attention_use_gather
-                or min_memory_dsa_backend
-            ), (
-                "dsa_sparse_attention_query_chunk_size requires "
-                "dsa_sparse_attention_use_gather or a min-memory dsa_min_memory_backend."
-            )
             if not self.multi_latent_attention:
                 # DSA over MLA supports both (upstream gates CP on cp_comm_type=allgather
                 # below). The GQA path does not: its min-memory kernels have no
@@ -3618,30 +3557,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
-                assert self.dsa_sparse_attention_query_chunk_size is None, (
-                    "min-memory dsa_min_memory_backend uses dsa_kernel_query_block_size; "
-                    "leave dsa_sparse_attention_query_chunk_size for legacy/reference paths."
-                )
-                assert self.dsa_indexer_loss_query_chunk_size is None, (
-                    "min-memory dsa_min_memory_backend uses dsa_kernel_query_block_size; "
-                    "leave dsa_indexer_loss_query_chunk_size for legacy/reference paths."
-                )
-                assert self.dsa_indexer_topk_key_chunk_size is None, (
-                    "min-memory dsa_min_memory_backend uses dsa_kernel_key_block_size; "
-                    "leave dsa_indexer_topk_key_chunk_size for legacy/reference paths."
-                )
-                assert not self.dsa_indexer_topk_recompute, (
-                    "min-memory dsa_min_memory_backend recomputes or caches routing internally; "
-                    "leave dsa_indexer_topk_recompute for legacy/reference paths."
-                )
-                assert not self.dsa_indexer_loss_recompute, (
-                    "min-memory dsa_min_memory_backend recomputes indexer-loss intermediates "
-                    "internally; leave dsa_indexer_loss_recompute for legacy/reference paths."
-                )
-                assert not self.dsa_sparse_attention_recompute, (
-                    "min-memory dsa_min_memory_backend recomputes sparse attention internally; "
-                    "leave dsa_sparse_attention_recompute for legacy/reference paths."
-                )
                 assert not self.dsa_sparse_attention_use_gather, (
                     "min-memory dsa_min_memory_backend bypasses the reference gather backend; "
                     "leave dsa_sparse_attention_use_gather for legacy/reference paths."

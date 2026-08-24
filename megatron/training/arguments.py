@@ -1057,12 +1057,6 @@ def validate_args(args, defaults={}):
             '--dsa-train-main-only disables indexer KL; do not set --dsa-indexer-use-sparse-loss'
         assert not getattr(args, 'dsa_indexer_sparse_loss_use_topk_only', False), \
             '--dsa-train-main-only disables indexer KL; do not set topk-only sparse loss'
-        assert not getattr(args, 'dsa_indexer_loss_recompute', False), \
-            '--dsa-train-main-only disables indexer KL; do not set indexer-loss recompute'
-        assert getattr(args, 'dsa_indexer_loss_query_chunk_size', None) is None, \
-            '--dsa-train-main-only disables indexer KL; leave its query chunk size unset'
-        assert not getattr(args, 'dsa_indexer_topk_recompute', False), \
-            '--dsa-train-main-only uses frozen routing; do not set topk recompute'
         assert not getattr(args, 'dsa_kernel_cache_selected_scores', False), \
             '--dsa-train-main-only has no selected-score KL backward'
         assert not getattr(args, 'dsa_separate_indexer_grad_clip', False), \
@@ -3921,42 +3915,15 @@ def _add_experimental_attention_variant_args(parser):
         help='Sample count over which only DSA indexer optimizer groups warm up after activation.',
     )
     _maybe_add_argument(
-        '--dsa-indexer-topk-key-chunk-size',
-        type=int,
-        default=None,
-        help='Stream DSA top-k routing over this many keys per chunk. If unset, use dense routing.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-topk-recompute',
-        action='store_true',
-        help='Recompute chunked DSA top-k routing during backward to reduce activation memory.',
-    )
-    _maybe_add_argument(
         '--dsa-indexer-loss-coeff',
         type=float,
         default=None,
         help='KL loss coefficient for training the DSA indexer.',
     )
     _maybe_add_argument(
-        '--dsa-indexer-loss-recompute',
-        action='store_true',
-        help='Recompute the DSA indexer KL loss during backward to reduce activation memory.',
-    )
-    _maybe_add_argument(
-        '--dsa-sparse-attention-recompute',
-        action='store_true',
-        help='Recompute sparse DSA attention during backward to reduce activation memory.',
-    )
-    _maybe_add_argument(
         '--dsa-sparse-attention-use-gather',
         action='store_true',
         help='Use the gather-based sparse DSA attention backend instead of the dense-mask reference path.',
-    )
-    _maybe_add_argument(
-        '--dsa-sparse-attention-query-chunk-size',
-        type=int,
-        default=None,
-        help='Optional query chunk size for sparse DSA attention. Smaller values reduce peak memory.',
     )
     _maybe_add_argument(
         '--dsa-indexer-use-sparse-loss',
@@ -3967,12 +3934,6 @@ def _add_experimental_attention_variant_args(parser):
         '--dsa-indexer-sparse-loss-use-topk-only',
         action='store_true',
         help='When using sparse DSA indexer loss, compute teacher/student KL only on the selected top-k support.',
-    )
-    _maybe_add_argument(
-        '--dsa-indexer-loss-query-chunk-size',
-        type=int,
-        default=None,
-        help='Optional query chunk size for the top-k-only sparse DSA indexer loss path.',
     )
     _maybe_add_argument(
         '--dsa-indexer-use-hadamard',

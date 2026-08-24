@@ -682,7 +682,7 @@ class DSGQAIndexer(MegatronModule):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         q, k, weights = self.forward_before_topk(hidden_states, use_rope, packed_seq_params)
-        key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
+        key_chunk_size = None
         if key_chunk_size is not None and key_chunk_size > 0:
             return fused_qk_topk_chunked(q, k, weights, self.index_topk, mask, key_chunk_size)
         return fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
@@ -1042,7 +1042,7 @@ class DSGQACoreAttention(MegatronModule):
             sparse_indexer_loss_use_topk_only = getattr(
                 self.config, "dsa_indexer_sparse_loss_use_topk_only", False
             )
-            recompute_indexer_loss = getattr(self.config, "dsa_indexer_loss_recompute", False)
+            recompute_indexer_loss = False
             if simplified_indexer:
                 if simplified_learned_k:
                     q_index, k_index = self.indexer.forward_qk(
@@ -1062,8 +1062,8 @@ class DSGQACoreAttention(MegatronModule):
                 q_index, k_index, weights = self.indexer.forward_before_topk(
                     hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
                 )
-            key_chunk_size = getattr(self.config, "dsa_indexer_topk_key_chunk_size", None)
-            recompute_topk = getattr(self.config, "dsa_indexer_topk_recompute", False)
+            key_chunk_size = None
+            recompute_topk = False
             use_chunked_topk = (
                 key_chunk_size is not None
                 and key_chunk_size > 0
@@ -1144,7 +1144,7 @@ class DSGQACoreAttention(MegatronModule):
                             sparse_indexer_loss,
                             self.indexer.pg_collection,
                             sparse_indexer_loss_use_topk_only,
-                            getattr(self.config, "dsa_indexer_loss_query_chunk_size", None),
+                            None,
                             selected_index_scores=selected_scores_tensor,
                         )
 
@@ -1168,7 +1168,7 @@ class DSGQACoreAttention(MegatronModule):
                             sparse_indexer_loss,
                             self.indexer.pg_collection,
                             sparse_indexer_loss_use_topk_only,
-                            getattr(self.config, "dsa_indexer_loss_query_chunk_size", None),
+                            None,
                         )
 
                     if recompute_indexer_loss and index_scores.requires_grad:
@@ -1186,13 +1186,11 @@ class DSGQACoreAttention(MegatronModule):
                     num_layers=self.config.num_layers,
                 )
 
-            recompute_sparse_attention = getattr(self.config, "dsa_sparse_attention_recompute", False)
+            recompute_sparse_attention = False
             sparse_attention_use_gather = getattr(
                 self.config, "dsa_sparse_attention_use_gather", False
             )
-            sparse_attention_query_chunk_size = getattr(
-                self.config, "dsa_sparse_attention_query_chunk_size", None
-            )
+            sparse_attention_query_chunk_size = None
             if recompute_sparse_attention and (
                 query.requires_grad or key.requires_grad or value.requires_grad
             ):
@@ -1269,7 +1267,7 @@ class DSGQACoreAttention(MegatronModule):
             topk_indices,
             self.softmax_scale,
             mask=sparse_attention_mask,
-            query_chunk_size=getattr(self.config, "dsa_sparse_attention_query_chunk_size", None),
+            query_chunk_size=None,
             use_gather=sparse_attention_use_gather,
         )
 
