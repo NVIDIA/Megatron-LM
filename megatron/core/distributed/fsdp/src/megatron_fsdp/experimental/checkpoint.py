@@ -33,14 +33,15 @@ import os
 
 import torch
 import torch.distributed.checkpoint as dcp
-from megatron_fsdp.experimental.parameter_group import sync_model_weights_from_main_weights
-from megatron_fsdp.uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
 )
+
+from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
+from .parameter_group import sync_model_weights_from_main_weights
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
 

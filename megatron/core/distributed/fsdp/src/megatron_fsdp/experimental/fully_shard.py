@@ -20,11 +20,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 import torch
-from megatron_fsdp.experimental.module import FsdpContext, FsdpModule
-from megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
+
+from ..mixed_precision import MixedPrecisionPolicy
+from .module import FsdpContext, FsdpModule
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
