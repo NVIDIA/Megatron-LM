@@ -1362,6 +1362,29 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Controls usage of the memory efficient path for Mamba layers."""
 
+    use_mamba_state_passing_cp: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--use-mamba-state-passing-cp"]}}
+    )
+    """Use experimental sequence-sharded state-passing context parallel for Mamba training."""
+
+    mamba_state_passing_cp_load_balancing: Literal[
+        "none", "permute_p2p", "permute_a2a", "virtual"
+    ] = field(
+        default="permute_p2p",
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--mamba-state-passing-cp-load-balancing"],
+                "choices": ["none", "permute_p2p", "permute_a2a", "virtual"],
+            }
+        },
+    )
+    """How state-passing Mamba CP handles the standard balanced CP sequence layout.
+
+    ``none`` expects contiguous causal shards, ``permute_p2p`` and ``permute_a2a``
+    exchange activation chunks with the selected communication method, and ``virtual``
+    treats each balanced front/back chunk as an independent virtual rank.
+    """
+
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""
