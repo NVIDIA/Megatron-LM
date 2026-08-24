@@ -195,8 +195,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config.num_layers, attn_ratio, mlp_ratio
                 )
 
-        # Parse unified pattern to extract main and MTP components, and
-        # determine the pipeline segment for this model instance.
+        # Parse unified pattern to extract main and MTP components.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             parse_hybrid_pattern,
             select_pipeline_segment,
@@ -221,6 +220,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 vp_stage=self.vp_stage,
             )
         )
+
+        # Pipeline segment selection intentionally follows the MTP decision. It now creates
+        # independent per-layer config copies, so normalize the root config first to ensure
+        # MTP's required tp_comm_overlap disablement is inherited by every decoder-layer config.
+        # Previously, decoder layers shared the root config and observed the mutation directly.
         normalize_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
