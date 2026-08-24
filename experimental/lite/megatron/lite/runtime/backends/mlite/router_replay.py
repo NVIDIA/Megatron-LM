@@ -110,9 +110,8 @@ class RouterReplayDriver:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             RouterReplay.reset_replay_stats()
             try:
-                return forward_step(model, batch)
+                output = forward_step(model, batch)
             finally:
-                self._emit_replay_evidence()
                 # Pipeline schedules may recompute checkpointed router forwards
                 # after one or more newer micro-batches have run.  Those calls
                 # must consume the saved per-microbatch FIFO, not the latest
@@ -120,6 +119,11 @@ class RouterReplayDriver:
                 RouterReplay.set_global_router_replay_action(
                     RouterReplayAction.REPLAY_BACKWARD
                 )
+            # Check liveness only after a successful forward.  Raising from a
+            # finally block would replace the real pre-router failure with a
+            # misleading zero-call replay error.
+            self._emit_replay_evidence()
+            return output
 
         return stepped
 

@@ -532,6 +532,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             ps,
             unit_modules=(DeepseekV4Layer,),
             use_fp32_shards=False,
+            fsdp2_replicated_param_classifier=(
+                lambda name, _parameter: _is_native_fp32_control(name)
+            ),
         )
     )
 
