@@ -124,6 +124,7 @@ class _GDNBase(MegatronModule):
         *,
         name: str | None = None,
         cp_comm_type: str | None = None,
+        pp_layer_offset: int = 0,
     ):
         """
         Args:
@@ -141,6 +142,7 @@ class _GDNBase(MegatronModule):
             cp_comm_type (Optional[str]): Accepted for TransformerLayer compatibility and
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
+            pp_layer_offset: Offset of this pipeline stage's first global layer.
         """
         if not HAVE_FLA:
             raise ImportError(
@@ -152,6 +154,7 @@ class _GDNBase(MegatronModule):
 
         # Attributes from arguments
         self.layer_number = layer_number
+        self.pp_layer_offset = pp_layer_offset
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init

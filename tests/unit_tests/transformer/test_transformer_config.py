@@ -68,3 +68,57 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
             num_attention_heads=4,
             gdp_num_householder=num_householder,
         )
+
+
+def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="ncclep",
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        moe_dispatch_fwd_dtype='mxfp8',
+        moe_combine_bwd_dtype='mxfp8',
+        bf16=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_mxfp8_wire_dtypes_accept_valid_ncclep_config():
+    config = _make_mxfp8_wire_config()
+
+    assert config.moe_dispatch_fwd_dtype == 'mxfp8'
+    assert config.moe_combine_bwd_dtype == 'mxfp8'
+
+
+def test_mxfp8_wire_dtypes_accept_a2a_overlap():
+    # The 1F1B a2a overlap schedule only moves/stages the dispatch output as an opaque block,
+    # which the plain-tensor MXFP8 carrier survives; the combination is deliberately allowed.
+    config = _make_mxfp8_wire_config(overlap_moe_expert_parallel_comm=True)
+
+    assert config.overlap_moe_expert_parallel_comm
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(moe_flex_dispatcher_backend="hybridep"),
+        dict(moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None),
+    ],
+)
+def test_mxfp8_wire_dtypes_reject_non_ncclep_dispatcher(overrides):
+    with pytest.raises(ValueError, match="require the 'ncclep' flex"):
+        _make_mxfp8_wire_config(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides", [dict(use_transformer_engine_op_fuser=False), dict(moe_grouped_gemm=False)]
+)
+def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
+    with pytest.raises(ValueError, match="require BOTH"):
+        _make_mxfp8_wire_config(**overrides)

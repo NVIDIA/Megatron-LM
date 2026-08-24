@@ -11,6 +11,11 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -144,23 +149,36 @@ class MambaLayer(GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
+        # Whole-layer + mixer lens spans, mirroring transformer_layer.py so the hybrid
+        # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
+        # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
+        # group is enabled, so zero cost on normal runs.
+        with _otel_managed_span(
+            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        ):
+            residual = hidden_states
+            if self.config.fp32_residual_connection:
+                residual = residual.float()
 
-        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = apply_module(self.norm)(hidden_states)
+            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+            hidden_states = apply_module(self.norm)(hidden_states)
 
-        mixer_out_with_bias = self.mixer(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
-        )
+            # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
+            # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
+            # lands on the first pass).
+            with _otel_managed_span('layer', 'megatron.layer.mamba'):
+                mixer_out_with_bias = self.mixer(
+                    hidden_states,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                )
 
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mamba_bda(
+                    training=self.training, fused=self.config.bias_dropout_fusion
+                )(mixer_out_with_bias, residual, self.hidden_dropout)
 
-        return hidden_states
+            return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

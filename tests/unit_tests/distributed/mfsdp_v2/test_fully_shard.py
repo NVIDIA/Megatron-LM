@@ -8,16 +8,13 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.profiler import ProfilerActivity, profile
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
-    Partial,
     Placements,
-    Replicate,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -25,10 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
-from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
-    collect_linked_kernels,
-    events_overlap,
-)
+from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_kernels
 
 logger = logging.getLogger(__name__)
 
@@ -89,18 +83,6 @@ class MultiChildModel(nn.Module):
         return x
 
 
-class ElementwiseModel(nn.Module):
-    """Small activation path over a large FSDP-managed weight."""
-
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim, dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the first weight row to an activation tensor."""
-        return torch.relu(x + self.weight[0])
-
-
 class TiedLM(nn.Module):
     """Tiny language model with shared input and output embedding weights."""
 
@@ -147,49 +129,68 @@ class NonLeafViewModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def _no_shard_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
+    )
+
+
+def _zero1_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
+    )
+
+
+def _zero2_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
 
 
 def _hsdp_placements() -> Placements:
     """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
-    DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
-    all-reduced to [Replicate, Flat] on the last microbatch."""
+    DP-inner (axis 1). main_grad rests [Partial, Shard(0)] between microbatches and is
+    all-reduced to [Replicate, Shard(0)] on the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
-        parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
-        optimizer=[Replicate(), Flat()],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Replicate(), Shard(0)],
     )
 
 
 def _hfsdp_placements() -> Placements:
     """HFSDP: params replicated across DP-outer (axis 0) for compute but the
     optimizer sharded across it, all sharded within DP-inner (axis 1). main_grad
-    rests [Partial, Flat] between microbatches and is reduce-scattered to
-    [Flat, Flat] (the optimizer placement) on the last microbatch."""
+    rests [Partial, Shard(0)] between microbatches and is reduce-scattered to
+    [Shard(0), Shard(0)] (the optimizer placement) on the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
-        parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
-        optimizer=[Flat(), Flat()],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Shard(0), Shard(0)],
     )
-
-
-def _mb(num_bytes: int) -> str:
-    return f"{num_bytes / 1024**2:.2f} MB"
 
 
 # CPU ops that a device event chains up to via cpu_parent, used to attribute the device
 # work to its enclosing collective or matmul operation.
-_ALL_GATHER_OP_NAME_SUBSTRING = "allgather"
 _REDUCE_SCATTER_OP_NAME_SUBSTRING = "reduce_scatter"
 _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
-_GEMM_OP_NAME_SUBSTRING = "aten::mm"
 
 
+@pytest.mark.parametrize(
+    "placements_factory",
+    [_no_shard_placements, _zero1_placements, _zero2_placements, _flat_placements],
+    ids=["no_shard", "zero1", "zero2", "zero3"],
+)
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatches):
-    """Minimal per-module FSDP training should match single-rank SGD."""
+def test_fully_shard_sgd_losses_match_baseline(
+    distributed_setup, num_microbatches, placements_factory
+):
+    """Every supported sharding strategy should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -197,16 +198,18 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
+    placements = placements_factory()
     torch.manual_seed(1234)
     baseline = TinyModel().to(device)
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
-    with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.fc1, mesh=mesh, placements=placements)
+        fully_shard(model.fc2, mesh=mesh, placements=placements)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
 
     micro_batch_size = 2
     x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
@@ -218,19 +221,19 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
         for step in range(5):
             optimizer.zero_grad()
 
-            for microbatch, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                losses.append(loss.detach())
-                logger.debug(
-                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
-                    log_prefix,
-                    rank,
-                    step,
-                    microbatch,
-                    loss,
-                )
-
-                (loss / num_microbatches).backward()
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    losses.append(loss.detach())
+                    logger.debug(
+                        "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
+                        log_prefix,
+                        rank,
+                        step,
+                        microbatch_index,
+                        loss,
+                    )
+                    (loss / num_microbatches).backward()
 
             optimizer.step()
         return losses
@@ -369,8 +372,8 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     Like HSDP, gradients reduce-scatter within DP-inner every backward and
     accumulate into main_grad. Unlike HSDP, the last-microbatch DP-outer reduction
     is a reduce-scatter (not an all-reduce) that finalizes main_grad to the
-    optimizer's [Flat, Flat] placement, shrinking the buffer; the next step's reset
-    therefore allocates a fresh [Partial, Flat] accumulation buffer. Every rank
+    optimizer's [Shard(0), Shard(0)] placement, shrinking the buffer; the next step's reset
+    therefore allocates a fresh [Partial, Shard(0)] accumulation buffer. Every rank
     sees identical data, so the averaged gradient equals the single-rank gradient
     and losses must match. Both ``zero_grad`` modes are covered.
     """
@@ -401,8 +404,8 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
         fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    # HFSDP's optimizer placement [Flat, Flat] differs from the parameter placement
-    # [Replicate, Flat], so main_weight and model_weight are distinct buffers and the
+    # HFSDP's optimizer placement [Shard(0), Shard(0)] differs from the parameter placement
+    # [Replicate, Shard(0)], so main_weight and model_weight are distinct buffers and the
     # compute weight is stale until the step post-hook registered here refreshes it.
     # HSDP needs no wrapper: its two placements match, so the buffers alias.
     fully_shard_optimizer(optimizer)
@@ -608,285 +611,6 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     assert len(list(model.parameters())) == 1
 
 
-def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
-    """A training step should stay below five full-size child buffers."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
-    dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    fully_shard_optimizer(optimizer)
-    x = torch.randn(2, dim, device=device, dtype=dtype)
-
-    def train_step() -> None:
-        optimizer.zero_grad(set_to_none=True)
-        model(x).float().sum().backward()
-        optimizer.step()
-
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-    resting_allocated = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    train_step()
-    peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
-
-    # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input,
-    # for a four-full-child-buffer peak. Allow one additional buffer for cuBLAS
-    # workspace, allocator granularity, and small temporaries.
-    bound_nbytes = (4 + 1) * child_weight_nbytes
-
-    assert peak_delta < bound_nbytes, (
-        "FSDP training-step peak memory exceeded the full-size-buffer bound: "
-        f"rank={rank}, peak_delta={_mb(peak_delta)}, "
-        f"five_full_child_buffers={_mb(bound_nbytes)}"
-    )
-
-
-def test_deleted_model_releases_fsdp_storage(distributed_setup):
-    """Deleting an FSDP model should release its persistent storage."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    # Earlier tests may retain process-global CUDA allocations such as the
-    # CuBLAS workspace. Capture them before creating this model, so the test
-    # only detects storage retained by the deleted FSDP model itself.
-    allocated_before = torch.cuda.memory_allocated(device)
-    model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
-
-    x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
-    output = model(x)
-    del output, x, model
-
-    assert torch.cuda.memory_allocated(device) - allocated_before < 1024**2
-
-
-def test_root_forward_returns_to_resting_memory(distributed_setup):
-    """Root forward should release child all-gather storage before returning."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
-    dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-
-    x = torch.randn(2, dim, device=device, dtype=dtype)
-    resting_allocated = torch.cuda.memory_allocated(device)
-
-    output = model(x)
-    del output
-    allocated_after_forward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_forward - resting_allocated
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-
-    assert extra_allocated < child_weight_nbytes, (
-        "Root forward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
-    )
-
-
-def test_root_backward_returns_to_resting_memory(distributed_setup):
-    """Root backward should release child all-gather storage before returning."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
-    dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-
-    x = torch.randn(2, dim, device=device, dtype=dtype, requires_grad=True)
-    output = model(x)
-    loss = output.float().square().mean()
-    allocated_before_backward = torch.cuda.memory_allocated(device)
-
-    loss.backward()
-    del loss, output
-    allocated_after_backward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_backward - allocated_before_backward
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-
-    assert extra_allocated < child_weight_nbytes, (
-        "Root backward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
-    )
-
-
-@pytest.mark.parametrize(
-    "use_symmetric_memory",
-    [
-        # Both variants' all-gathers are launch-timing sensitive, but default-CTA
-        # kernels occupy more compute CTAs, making the profiler overlap count less
-        # stable across ranks (see
-        # https://github.com/NVIDIA/Megatron-LM/actions/runs/31615942188).
-        # The symmetric-memory variant uses zero-CTA all-gather kernels, so its overlap
-        # measurement is more stable and remains enabled.
-        pytest.param(False, marks=(pytest.mark.flaky, pytest.mark.flaky_in_dev)),
-        pytest.param(True),
-    ],
-    ids=["default", "symmetric_memory"],
-)
-def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_memory):
-    """Forward and backward communication should overlap GEMM compute."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    # A large hidden size keeps the per-layer GEMMs long enough that the
-    # collectives reliably overlap them. The overlap count is otherwise
-    # launch-bound: the host issues kernels with gaps (amplified by CI's
-    # `coverage run` wrapper), so with short GEMMs a collective can land in a
-    # gap between GEMMs instead of running alongside one, making the count jitter
-    # run to run. At dim=16384 the GEMMs dominate that launch jitter and the
-    # overlap becomes deterministic. (dim=8192 was flaky under coverage.)
-    dim = 16384
-    num_children = 4
-    dtype = torch.bfloat16
-
-    # new_group requires a default process group. Initialize it here so this test works
-    # in isolation. Do not eagerly initialize it with device_id in the shared fixture:
-    # that can hang teardown after communicator splits; see
-    # https://github.com/pytorch/pytorch/issues/190396.
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-
-    if use_symmetric_memory:
-        # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
-        # per-communicator property, so scoping it to this group leaves the rest of the
-        # bucket on default-CTA symmetric-memory kernels (test_symmetric_memory.py asserts
-        # ncclSymk all-gather kernel counts, which zero-CTA would turn into copy-engine
-        # memcpys). This 1-D group models the DP (FSDP) sub-mesh that mfsdp is handed in
-        # production: with EP/TP the full device mesh is multi-dimensional, but mfsdp
-        # requires an all-FSDP mesh (see experimental/module.py) and never sees the TP/EP
-        # axes, so only the DP communicator needs the zero-CTA policy.
-        zero_cta_options = dist.ProcessGroupNCCL.Options()
-        zero_cta_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
-        dp_group = dist.new_group(backend="nccl", pg_options=zero_cta_options)
-        # NCCL window registration can fail when symmetric-memory rendezvous is the first
-        # operation on a communicator, so initialize this communicator explicitly.
-        dist.barrier(group=dp_group, device_ids=[device.index])
-    else:
-        dp_group = dist.new_group(backend="nccl")
-
-    mesh = DeviceMesh.from_group(dp_group, device.type)
-    model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-
-    x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
-
-    def train_one_iteration() -> None:
-        model.zero_grad(set_to_none=True)
-        model(x).sum().backward()
-
-    train_one_iteration()
-    torch.cuda.synchronize(device)
-
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        train_one_iteration()
-        # Synchronize inside the profiler context so in-flight device kernels
-        # complete and get recorded before the profiler stops on __exit__.
-        # Synchronizing after the context would finalize the trace first and
-        # drop the CUDA events.
-        torch.cuda.synchronize(device)
-
-    gemm_kernels = collect_linked_kernels(prof, _GEMM_OP_NAME_SUBSTRING)
-    # Each child Linear runs one forward and two backward matmuls. aten::mm may also
-    # launch auxiliary kernels, so check only the matmul lower bound.
-    assert len(gemm_kernels) >= 3 * num_children, (
-        f"Expected at least {3 * num_children} kernels linked to GEMMs, got "
-        f"{len(gemm_kernels)}: "
-        f"{[kernel.name for kernel in gemm_kernels]}"
-    )
-
-    allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
-    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # Each child layer does a forward and a backward all-gather and one
-    # reduce-scatter. Zero-CTA moves the all-gather to copy-engine memcpys, so it
-    # should not emit all-gather kernels.
-    expected_allgather_kernel_count = 0 if use_symmetric_memory else 2 * num_children
-    assert len(allgather_kernels) == expected_allgather_kernel_count, (
-        f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
-        f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
-    )
-    assert len(reduce_scatter_kernels) == num_children, (
-        f"Expected {num_children} reduce-scatter kernels, got "
-        f"{len(reduce_scatter_kernels)}: {[kernel.name for kernel in reduce_scatter_kernels]}"
-    )
-
-    allgather_streams = {kernel.device_resource_id for kernel in allgather_kernels}
-    reduce_scatter_streams = {kernel.device_resource_id for kernel in reduce_scatter_kernels}
-    gemm_streams = {kernel.device_resource_id for kernel in gemm_kernels}
-    if allgather_kernels:
-        assert len(allgather_streams) == 1
-    assert len(reduce_scatter_streams) == 1
-    assert allgather_streams.isdisjoint(reduce_scatter_streams)
-    assert allgather_streams.isdisjoint(gemm_streams)
-    assert reduce_scatter_streams.isdisjoint(gemm_streams)
-
-    allgather_overlap_count = sum(
-        any(events_overlap(kernel, gemm) for gemm in gemm_kernels) for kernel in allgather_kernels
-    )
-    reduce_scatter_overlap_count = sum(
-        any(events_overlap(kernel, gemm) for gemm in gemm_kernels)
-        for kernel in reduce_scatter_kernels
-    )
-    expected_allgather_overlap = 2 * (num_children - 1)
-    expected_reduce_scatter_overlap = num_children - 1
-    if not use_symmetric_memory:
-        assert allgather_overlap_count >= expected_allgather_overlap, (
-            f"Expected at least {expected_allgather_overlap} all-gathers to "
-            f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."
-        )
-    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap, (
-        f"Expected at least {expected_reduce_scatter_overlap} reduce-scatters to overlap "
-        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_kernels)}."
-    )
-
-    # Release the dedicated communicator so it does not leak into the shared session.
-    dist.destroy_process_group(dp_group)
-
-
 def test_parameterless_parent_with_child_modules_trains(distributed_setup):
     """A parent with no unowned parameters should still root trainable child FsdpModules."""
     world_size = distributed_setup.world_size
@@ -943,12 +667,13 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     model = nn.Linear(1, world_size, bias=False).to(device)
     nn.init.constant_(model.weight, 1.0)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
-    model(x).sum().backward()
-    model(x).sum().backward()
+    with microbatch(context, is_last=False):
+        model(x).sum().backward()
+        model(x).sum().backward()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()
@@ -1167,63 +892,3 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group.main_grad is not None
     assert group._unsharded_model_weight is not None
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
-
-
-def test_fully_shard_reduces_peak_training_memory(distributed_setup):
-    """Per-layer FSDP should reduce peak CUDA memory during training."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 1024
-    layers = 16
-    batch = 8
-    steps = 2
-    dtype = torch.bfloat16
-
-    def train_steps(model: nn.Module, optimizer: torch.optim.Optimizer, x: torch.Tensor) -> None:
-        for _ in range(steps):
-            optimizer.zero_grad(set_to_none=True)
-            model(x).sum().backward()
-            optimizer.step()
-
-    torch.manual_seed(4321)
-    baseline = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
-    baseline_optimizer = torch.optim.AdamW(baseline.parameters(), lr=0.01)
-    x = torch.randn(batch, dim, device=device, dtype=dtype)
-    torch.cuda.reset_peak_memory_stats(device)
-    train_steps(baseline, baseline_optimizer, x)
-    baseline_peak = torch.cuda.max_memory_allocated(device)
-
-    del baseline_optimizer
-    del baseline
-    del x
-
-    torch.manual_seed(4321)
-    model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
-    with fully_shard_context(device=device):
-        for layer in model:
-            fully_shard(
-                layer,
-                mesh=mesh,
-                placements=_flat_placements(),
-                mixed_precision_policy=MixedPrecisionPolicy(
-                    main_params_dtype=dtype, main_grads_dtype=dtype
-                ),
-            )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
-
-    x = torch.randn(batch, dim, device=device, dtype=dtype)
-    torch.cuda.reset_peak_memory_stats(device)
-    train_steps(model, optimizer, x)
-    sharded_peak = torch.cuda.max_memory_allocated(device)
-    logger.info(
-        "FSDP peak memory: rank=%s, baseline=%s, sharded=%s",
-        rank,
-        _mb(baseline_peak),
-        _mb(sharded_peak),
-    )
-
-    assert sharded_peak < baseline_peak

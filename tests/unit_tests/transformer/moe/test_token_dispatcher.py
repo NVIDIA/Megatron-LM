@@ -102,6 +102,8 @@ class MoEModelTestContainer:
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
+            moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
+            moe_combine_bwd_dtype=kwargs.get("moe_combine_bwd_dtype", 'bf16'),
             use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
             gated_linear_unit=kwargs.get("gated_linear_unit", False),
             activation_func=kwargs.get("activation_func", F.gelu),
@@ -180,13 +182,15 @@ class MoEModelTestContainer:
         ), "Restored hidden states do not match original hidden states"
 
     @pytest.mark.internal
-    def moe_layer_zero_copy_parity_test(self):
-        """Full MoE-layer fwd+bwd with ncclEP zero-copy OFF then ON (identical weights), asserting
-        parity. Runs the real op-fuser experts so fc2-out/fc1-dgrad are written straight into the
-        symm combine/dispatch buffers (verified via is_symm_backed) -- the pure permute/unpermute
-        harness cannot exercise this path."""
-        from transformer_engine.pytorch.ep import is_symm_backed
+    def moe_layer_variant_parity_test(self, variant="zero_copy"):
+        """Full MoE-layer fwd+bwd, reference vs IO-variant (identical weights), asserting parity.
 
+        variant="zero_copy": ncclEP zero-copy OFF then ON. Runs the real op-fuser experts so
+        fc2-out/fc1-dgrad are written straight into the symm combine/dispatch buffers (verified
+        via is_symm_backed) -- the pure permute/unpermute harness cannot exercise this path.
+        variant="mxfp8_wire": bf16 wire then MXFP8 dispatch-fwd/combine-bwd wire. The recv
+        payload is an opaque carrier the op-fuser grouped GEMM rebuilds, so the tolerance is
+        quantization-sized, not exactness-sized."""
         from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
         from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
 
@@ -207,23 +211,41 @@ class MoEModelTestContainer:
             _NCCLEPManager._zc_bwd_token_buf = None
             _NCCLEPManager._zc_recv_topk_weights_buf = None
 
-        ref_layer = self.new_moe_layer(moe_ncclep_zero_copy=False)
+        if variant == "zero_copy":
+            variant_overrides = dict(moe_ncclep_zero_copy=True)
+            rtol = atol = 1e-2
+        else:
+            assert variant == "mxfp8_wire", f"unknown variant {variant!r}"
+            variant_overrides = dict(moe_dispatch_fwd_dtype='mxfp8', moe_combine_bwd_dtype='mxfp8')
+            rtol = atol = 2e-1
+
+        ref_layer = self.new_moe_layer()
         out_ref, grad_ref = run(ref_layer)
 
         reset_ep()
-        zc_layer = self.new_moe_layer(moe_ncclep_zero_copy=True)
-        zc_layer.load_state_dict(ref_layer.state_dict())  # identical weights
-        out_zc, grad_zc = run(zc_layer)
+        var_layer = self.new_moe_layer(**variant_overrides)
+        var_layer.load_state_dict(ref_layer.state_dict())  # identical weights
+        out_var, grad_var = run(var_layer)
 
-        # the combine forward buffer must be an allocated, registered symm window (zero-copy engaged)
-        fwd_buf = _NCCLEPManager._zc_fwd_token_buf
-        assert fwd_buf is not None, "zero-copy forward symm buffer was not allocated"
-        assert is_symm_backed(fwd_buf), "zero-copy forward buffer is not symm-mem-backed"
+        if variant == "zero_copy":
+            from transformer_engine.pytorch.ep import is_symm_backed
+
+            # the combine forward buffer must be an allocated, registered symm window
+            # (zero-copy engaged)
+            fwd_buf = _NCCLEPManager._zc_fwd_token_buf
+            assert fwd_buf is not None, "zero-copy forward symm buffer was not allocated"
+            assert is_symm_backed(fwd_buf), "zero-copy forward buffer is not symm-mem-backed"
+        else:
+            # the quant recipes must have reached the dispatch manager (config -> manager wiring);
+            # manager -> EpBuffer wiring hard-fails inside fused_dispatch when TE lacks support.
+            manager = var_layer.token_dispatcher._comm_manager
+            assert manager.dispatch_fwd_quant_recipe is not None
+            assert manager.combine_bwd_quant_recipe is not None
         reset_ep()
 
-        assert not torch.isnan(out_zc).any() and not torch.isnan(grad_zc).any()
-        torch.testing.assert_close(out_zc, out_ref, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(grad_zc, grad_ref, rtol=1e-2, atol=1e-2)
+        assert not torch.isnan(out_var).any() and not torch.isnan(grad_var).any()
+        torch.testing.assert_close(out_var, out_ref, rtol=rtol, atol=atol)
+        torch.testing.assert_close(grad_var, grad_ref, rtol=rtol, atol=atol)
 
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
@@ -512,6 +534,27 @@ def is_op_fuser_available():
     return is_te_min_version("2.14.0")
 
 
+def is_nccl_ep_fp8_dispatch_available():
+    """MXFP8 wire dtypes need a TE build whose EpBuffer takes the quant recipes AND that returns
+    the plain-tensor MXFP8 carrier (mxfp8_carrier_to_grouped, TE PR #3355 -- older quant-recipe
+    builds return a GroupedTensor payload the op-fuser attrs cannot rebuild), plus MXFP8 hardware
+    support (Blackwell) for the quantize kernels and the grouped GEMM."""
+    if not is_nccl_ep_available():
+        return False
+    import inspect
+
+    try:
+        import transformer_engine.pytorch.ep as te_ep
+        from transformer_engine.pytorch.fp8 import check_mxfp8_support
+    except ImportError:
+        return False
+    if "dispatch_fwd_quant_recipe" not in inspect.signature(te_ep.EpBuffer).parameters:
+        return False
+    if not hasattr(te_ep, "mxfp8_carrier_to_grouped"):
+        return False
+    return check_mxfp8_support()[0]
+
+
 def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     manager = _HybridEPManager.__new__(_HybridEPManager)
     manager.group = object()
@@ -622,19 +665,25 @@ class TestFlexDispatcher:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.skipif(
-        not is_nccl_ep_zero_copy_available(), reason="NCCL EP zero-copy TE API is not available"
-    )
-    @pytest.mark.skipif(
         not is_op_fuser_available(), reason="op-fuser (static-shape/zero-copy) needs TE>=2.14"
     )
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
-    def test_forward_backward_zero_copy(self, tp_size, ep_size):
-        # zero-copy requires a capacity factor, which requires BOTH op-fuser and grouped_gemm; bf16
-        # so no
-        # fp8/Blackwell dependency. The op-fuser needs tp=1 and a SwiGLU activation. Parity: the
-        # zero-copy IO path must match the staged (no-zc) path.
+    @pytest.mark.parametrize(
+        "variant", ["zero_copy", pytest.param("mxfp8_wire", marks=pytest.mark.launch_on_gb200)]
+    )
+    def test_forward_backward_variant_parity(self, tp_size, ep_size, variant):
+        # The op-fuser needs tp=1 and a SwiGLU activation. Parity: the variant IO path must match
+        # the plain staged/eager path.
+        # zero_copy requires a capacity factor (fixed symm buffers), which requires BOTH op-fuser
+        # and grouped_gemm; bf16 so no fp8/Blackwell dependency.
+        # mxfp8_wire runs eager (the validated fp8-wire mode) and needs a TE build with EpBuffer
+        # quant recipes plus MXFP8 hardware.
+        if variant == "zero_copy" and not is_nccl_ep_zero_copy_available():
+            pytest.skip("NCCL EP zero-copy TE API is not available")
+        if variant == "mxfp8_wire" and not is_nccl_ep_fp8_dispatch_available():
+            pytest.skip("NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware")
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -649,11 +698,11 @@ class TestFlexDispatcher:
             gated_linear_unit=True,
             activation_func=F.silu,
             # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS; size generously.
-            moe_expert_rank_capacity_factor=8.0,
+            moe_expert_rank_capacity_factor=8.0 if variant == "zero_copy" else None,
             hidden_size=1024,
             test_dtype=torch.bfloat16,
         )
-        container.moe_layer_zero_copy_parity_test()
+        container.moe_layer_variant_parity_test(variant)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

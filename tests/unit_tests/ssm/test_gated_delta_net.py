@@ -317,6 +317,14 @@ class TestGatedDeltaNet:
             assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
             assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
 
+    def test_inference_state_shapes(self):
+        if self.use_gdn2:
+            pytest.skip("GDN2 inference is not supported.")
+        assert self.gdn.mamba_state_shapes_per_request() == (
+            (self.gdn.conv_dim_local_tp, self.gdn.conv_kernel_dim),
+            (self.gdn.num_v_heads_local_tp, self.gdn.key_head_dim, self.gdn.value_head_dim),
+        )
+
     def test_jit_compiled_helpers(self):
         import torch._dynamo
 

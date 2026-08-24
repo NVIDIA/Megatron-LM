@@ -19,11 +19,11 @@ import pytest
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import CUDAGraphBatchDimensionBuilder
+from megatron.core.inference.moe.batch_invariant import HAVE_TRITON
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     _BATCH_INVARIANT_BACKENDS,
     set_batch_invariant_mode,
 )
-from megatron.core.inference.moe.batch_invariant import HAVE_TRITON
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not HAVE_TRITON,

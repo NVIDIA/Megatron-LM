@@ -18,10 +18,28 @@ are sequence-sharded under sequence-parallel, and the static path does not
 support SP). The end-to-end engine tests sweep TP (`_TP_SIZES`) with SP enabled
 at TP>1, covering dynamic inference under tensor + sequence parallelism; TP>1
 variants skip when the world has too few GPUs.
+
+The second half covers the in-tree kernels the dynamic path runs on:
+`ops/gdp/fused_recurrent.py` (decode recurrence), `ops/gdp/metadata.py` (chunk
+descriptors, replacing FLA's host-synchronizing `prepare_chunk_indices`), and
+`ops/gdp/chunk.py` (chunked prefill).
+
+Keep the two pip-FLA comparisons across FLA version bumps: the CUDA graph tests
+are differential, so only an external reference catches a kernel that is wrong
+with capture on and off alike.
+
+Padding contract, which is what makes CUDA graphs work: a graph is captured for
+a rounded-up batch shape, and steps with fewer real requests mark the leftover
+rows `-1` in `batch_indices` (and, for prefill, as zero-length sequences). Those
+rows must produce zero output and touch no state slot.
+
+Capture and replay itself is covered in
+`tests/unit_tests/inference/engines/test_gdp_cuda_graph_e2e.py`.
 """
 
 from __future__ import annotations
 
+import os
 import random
 import types
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -46,6 +64,9 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
+from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -54,70 +75,83 @@ from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 try:
-    import einops  # noqa: F401
     import fla  # noqa: F401
+
+    HAVE_FLA = True
+except ImportError:
+    HAVE_FLA = False
+
+try:
+    import einops  # noqa: F401
     import mamba_ssm  # noqa: F401
 
-    HAVE_GDP_DEPS = True
+    HAVE_MAMBA_DEPS = True
 except ImportError:
-    HAVE_GDP_DEPS = False
+    HAVE_MAMBA_DEPS = False
+
+HAVE_GDP_DEPS = HAVE_FLA and HAVE_MAMBA_DEPS
 
 # GDP dynamic inference relies on the same packed-sequence conv1d kernel as the
 # training/prefill path (`causal_conv1d_fn(seq_idx=...)`, added in 1.4.0).
 _PACKING_OK, _PACKING_REASON = check_fla_sequence_packing_support()
 
-pytestmark = [
-    pytest.mark.internal,
+pytestmark = [pytest.mark.internal]
+
+# Everything the model-level classes need; the kernel classes below want only a GPU.
+requires_gdp_model = [
     pytest.mark.skipif(not HAVE_GDP_DEPS, reason="GDP requires fla, mamba_ssm, and einops"),
     pytest.mark.skipif(not _PACKING_OK, reason=_PACKING_REASON or "packed-seq support missing"),
+    pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need flash-attn >= 2.7.3 for dynamic batching"
+    ),
 ]
 
+# The chunk-descriptor builder is pure Python; everything else needs a GPU.
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
-# A short single-chunk prompt is enough to exercise the packed-varlen dynamic
-# path; the sizes are kept small to keep the test fast.
+
+@pytest.fixture(scope="module")
+def rank_local_device():
+    """Bind every rank to its own GPU before anything allocates.
+
+    The kernel tests below launch Triton kernels directly, so they never go
+    through `Utils` (whose `initialize_distributed` is the only thing that calls
+    `torch.cuda.set_device`) and would otherwise all allocate on GPU 0.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+    yield
+
+
+# A single-chunk prompt is enough to exercise the packed-varlen dynamic path.
 _VOCAB_SIZE = 128
 _MAX_SEQ_LEN = 512
 _PROMPT_LEN = 64
 
-# bf16 chunk-vs-chunk tolerance. Full-forward and prefill run the same
-# `chunk_gated_delta_product` kernel, so they differ only by the packed var-len
-# layout and floating-point accumulation order.
+# bf16 chunk-vs-chunk tolerance: full-forward and prefill run the same
+# `chunk_gated_delta_product` kernel, differing only in accumulation order.
 _ATOL = 5e-2
 _RTOL = 5e-2
 
-# Looser tolerance for the decode-step check: it compares the recurrent decode
-# kernel against a full-sequence chunk-kernel recompute (different kernels), so
-# it drifts more than the chunk-vs-chunk prefill comparison. Still far tighter
-# than the O(1)+ deviations a genuinely broken decode/state-handoff would show.
+# The decode check compares different kernels (recurrent vs chunk recompute), so
+# it drifts more. Still far tighter than a broken state handoff would show.
 _DECODE_ATOL = 1e-1
 _DECODE_RTOL = 1e-1
 
-# `DynamicInferenceContext` requires at least one attention layer, so the model
-# pattern is GDP mixer + attention + MLP. Dynamic batching needs a recent
-# flash-attention.
+# `DynamicInferenceContext` requires at least one attention layer.
 _LAYER_PATTERN = "M*-"
 _NUM_LAYERS = len(_LAYER_PATTERN)
-requires_dynamic_batching = pytest.mark.skipif(
-    not is_fa_min_version("2.7.3"), reason="need flash-attn >= 2.7.3 for dynamic batching"
-)
 
-# Tensor-parallel sizes swept by the end-to-end engine tests. TP>1 requires
-# sequence-parallel (the inference-optimized linears assert it), which GDP's
-# dynamic path supports; static inference does not, so the single-forward
-# equivalence tests above stay TP=1.
+# Swept by the engine tests only. TP>1 requires sequence-parallel, which static
+# inference does not support, so the single-forward tests above stay at TP=1.
 _TP_SIZES = [1, 2]
 
 
 def _make_config(tp: int = 1) -> TransformerConfig:
-    """A small but shape-valid GDP config, sharded across `tp` tensor-parallel ranks.
+    """A small but shape-valid GDP config, sharded across `tp` ranks.
 
-    The in_proj output width (`zVKQba`) is column-parallel, so each rank sees
-    `proj_dim / tp` channels. The packed-prefill conv slices a channels-last view
-    out of that and `causal_conv1d_fn` requires its stride (the per-rank width) to
-    be a multiple of 8. With mamba_num_heads=16 the full width is
-    `(1+M)*d_inner + (M+1)*ngroups*d_state + (M+1)*nheads = 3*256 + 3*64 + 3*16
-    = 1008`, so per-rank widths are 1008 (tp=1) and 504 (tp=2), both aligned.
-    Production configs satisfy this by having much larger, aligned dimensions.
+    `causal_conv1d_fn` requires the per-rank in_proj width to be a multiple of 8,
+    which constrains how small these dimensions can be.
     """
     return TransformerConfig(
         num_layers=_NUM_LAYERS,
@@ -153,15 +187,15 @@ def _build_model(tp: int = 1) -> HybridModel:
     return model.cuda().eval()
 
 
-@requires_dynamic_batching
 class TestGDPDynamicInference:
     """Static/dynamic GDP inference equivalence against a full-sequence forward.
 
-    These compare raw `model.forward` logits, which are sequence-sharded under
-    sequence-parallel; combined with the static path not supporting SP, they run
-    at TP=1 only. TP>1 dynamic inference is covered end-to-end by the engine
-    tests below, which handle SP through the inference wrapper.
+    TP=1 only: these compare raw `model.forward` logits, which are sequence-
+    sharded under SP, and the static path does not support SP. TP>1 is covered
+    by the engine tests below.
     """
+
+    pytestmark = requires_gdp_model
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -300,10 +334,8 @@ class TestGDPDynamicInference:
     def test_static_and_dynamic_prefill_agree(self):
         """Static and dynamic inference produce equivalent logits.
 
-        This is the central invariant: the two batching strategies must agree.
-        Anchoring each to the full-sequence forward (above) guarantees this
-        transitively, but assert it directly as well so a regression in either
-        path that happens to drift in the same direction is still caught.
+        Implied transitively by the two tests above, but asserted directly so a
+        regression that drifts both paths the same way is still caught.
         """
         input_ids = self._input_ids()
         static = self._static_prefill_last_logits(input_ids)
@@ -312,16 +344,13 @@ class TestGDPDynamicInference:
 
     @torch.inference_mode()
     def test_decode_step_matches_recompute(self):
-        """One decode step matches a full-sequence recompute (decode-path check).
+        """One decode step matches a full-sequence recompute.
 
-        This validates the recurrent decode kernel and the prefill->decode
-        conv/SSM state handoff independently of any golden snapshot: after
-        prefilling the prompt, decoding one more token must produce the same
-        next-token logits as a plain forward over prompt+token. Compared at the
-        logit level with tolerance, so it is robust to the bf16 numerics that
-        make exact greedy token equality across the recurrent/chunk kernels
-        fragile. Uses `StaticInferenceContext`, whose decode calls the same
-        `ssm_decode` recurrent kernel as the dynamic engine.
+        Covers the recurrent decode kernel and the prefill->decode conv/SSM state
+        handoff without a golden snapshot. Compared at the logit level, since
+        bf16 makes exact token equality across the two kernels fragile.
+        `StaticInferenceContext` decode calls the same `ssm_decode` the dynamic
+        engine does.
         """
         prompt = self._input_ids()  # [1, P]
 
@@ -362,22 +391,13 @@ class TestGDPDynamicInference:
 # End-to-end engine tests.
 #
 # The tests above exercise a single forward pass. These drive the full
-# `DynamicInferenceEngine` (add requests -> schedule -> prefill -> decode ->
-# finish) so that GDP is validated through the same runtime path production
-# inference uses: the text-generation controller, the inference-wrapped model,
-# the KV/Mamba-state cache, and the request scheduler.
-#
-# Decoding is greedy (`top_k=1`) so outputs are deterministic. Decode
-# correctness (the recurrent kernel `fused_recurrent_gated_delta_rule` plus the
-# slot-indexed conv/SSM cache, distinct from the prefill chunk kernel) is
-# validated by a byte-for-byte match against committed golden token ids,
-# mirroring the Mamba2 `test_dynamic_engine.py::test_simple` style. The golden
-# constant is captured from a reference GPU run (see `_GOLDEN_*` below); until it
-# is populated the test self-captures and skips with the observed ids.
+# `DynamicInferenceEngine` (add -> schedule -> prefill -> decode -> finish),
+# so GDP runs through the same path production inference uses. Decoding is
+# greedy, and decode correctness is pinned by a match against committed golden
+# token ids, in the style of Mamba2's `test_dynamic_engine.py::test_simple`.
 # ======================================================================
 
-# Fixed prompts for the golden-token test. Deterministic (not random) so the
-# committed golden ids below are reproducible across machines. Varying lengths
+# Fixed rather than random so the golden ids are reproducible; varying lengths
 # exercise the scheduler's mixed-length prefill batching.
 _GOLDEN_PROMPTS: List[List[int]] = [
     [3, 14, 15, 92, 65, 35, 89, 79],
@@ -387,12 +407,10 @@ _GOLDEN_PROMPTS: List[List[int]] = [
 ]
 _GOLDEN_NUM_TOKENS_TO_GENERATE = 12
 
-# Golden generated-token ids per TP size, one list per prompt in `_GOLDEN_PROMPTS`,
-# captured from a reference GPU run. TP shards the weights differently, so each TP
-# size has its own goldens. Environment-sensitive (FLA / causal_conv1d kernel
-# build, GPU arch); re-capture if the kernels or config change. While an entry is
-# None, the test self-captures: it prints the observed ids and skips instead of
-# failing. Paste them in (see the skip message) to turn it into a hard assertion.
+# One list per prompt in `_GOLDEN_PROMPTS`, per TP size (TP shards the weights
+# differently). Sensitive to the FLA / causal_conv1d build and GPU arch, so
+# re-capture if the kernels or config change. A None entry makes the test print
+# the observed ids and skip, so it can be populated from a real run.
 _GOLDEN_GENERATED_TOKENS: Dict[int, Optional[List[List[int]]]] = {
     1: [
         [32, 126, 35, 125, 52, 116, 55, 38, 39, 4, 53, 100],
@@ -410,9 +428,8 @@ _GOLDEN_GENERATED_TOKENS: Dict[int, Optional[List[List[int]]]] = {
 
 
 def _make_engine_config(tp: int = 1) -> TransformerConfig:
-    """GDP config for the engine tests: same shape as `_make_config`, plus the
-    deterministic inference sampling knobs greedy decoding needs. TP>1 turns on
-    sequence-parallel, which the inference-optimized linears require."""
+    """`_make_config` plus deterministic sampling. TP>1 turns on sequence-
+    parallel, which the inference-optimized linears require."""
     config = _make_config(tp)
     config.sequence_parallel = tp > 1
     config.inference_rng_tracker = True
@@ -420,12 +437,10 @@ def _make_engine_config(tp: int = 1) -> TransformerConfig:
     return config
 
 
-@pytest.mark.internal
-@requires_dynamic_batching
-@pytest.mark.skipif(not HAVE_GDP_DEPS, reason="GDP requires fla, mamba_ssm, and einops")
-@pytest.mark.skipif(not _PACKING_OK, reason=_PACKING_REASON or "packed-seq support missing")
 class TestGDPDynamicInferenceEngine:
     """End-to-end GDP decoding through `DynamicInferenceEngine`."""
+
+    pytestmark = requires_gdp_model
 
     SEED = 123
     VOCAB_SIZE = _VOCAB_SIZE
@@ -578,12 +593,10 @@ class TestGDPDynamicInferenceEngine:
 
     @pytest.mark.parametrize("tp", _TP_SIZES)
     def test_engine_greedy_matches_golden(self, tp):
-        """Greedy decode reproduces committed golden token ids (Mamba2-style).
+        """Greedy decode reproduces the committed golden token ids.
 
-        Deterministic fixed prompts + greedy sampling make the output a stable
-        fingerprint of the GDP prefill+decode path. Until the TP entry in
-        `_GOLDEN_GENERATED_TOKENS` is captured from a reference GPU run, the test
-        prints the observed ids and skips instead of failing.
+        Fixed prompts plus greedy sampling make the output a stable fingerprint
+        of the GDP prefill+decode path.
         """
         engine, requests = self._build_engine(
             tp=tp, prompts=_GOLDEN_PROMPTS, num_tokens_to_generate=_GOLDEN_NUM_TOKENS_TO_GENERATE
@@ -627,3 +640,420 @@ class TestGDPDynamicInferenceEngine:
         for request in finished:
             assert request.status == Status.COMPLETED
             assert len(request.generated_tokens) > 0
+
+
+# --------------------------------------------------------------------------- #
+# Reference implementation
+# --------------------------------------------------------------------------- #
+
+
+def _gated_delta_rule_ref(q, k, v, g, beta, state, state_indices, use_qk_l2norm, scale=None):
+    """Naive per-request gated delta rule; updates `state` in place.
+
+    An explicit loop over requests, heads and time steps, so it is independent
+    of the Triton kernel's blocking.
+    """
+    B, T, H, K = k.shape
+    HV = v.shape[2]
+    if scale is None:
+        scale = K**-0.5
+    o = torch.zeros_like(v)
+
+    for b in range(B):
+        slot = b if state_indices is None else int(state_indices[b])
+        if slot < 0:
+            # Padding request: zero output, no state access.
+            continue
+        for i_hv in range(HV):
+            i_h = i_hv // (HV // H)
+            h = state[slot, i_hv].float()
+            for t in range(T):
+                q_t = q[b, t, i_h].float()
+                k_t = k[b, t, i_h].float()
+                v_t = v[b, t, i_hv].float()
+                if use_qk_l2norm:
+                    q_t = q_t / torch.sqrt((q_t * q_t).sum() + 1e-6)
+                    k_t = k_t / torch.sqrt((k_t * k_t).sum() + 1e-6)
+                q_t = q_t * scale
+                h = h * torch.exp(g[b, t, i_hv].float())
+                v_new = beta[b, t, i_hv].float() * (v_t - (h * k_t[:, None]).sum(0))
+                h = h + k_t[:, None] * v_new
+                o[b, t, i_hv] = (h * q_t[:, None]).sum(0).to(o.dtype)
+            state[slot, i_hv] = h.to(state.dtype)
+    return o
+
+
+def _to_dev(values, shape):
+    """Materialize a flat descriptor list as an int32 CUDA tensor."""
+    return torch.tensor(values, device="cuda", dtype=torch.int32).view(*shape)
+
+
+def _random_inputs(B, T, H, HV, K, V, num_slots, device="cuda", dtype=torch.float32, seed=0):
+    torch.manual_seed(seed)
+    q = torch.randn(B, T, H, K, device=device, dtype=dtype)
+    k = torch.randn(B, T, H, K, device=device, dtype=dtype)
+    v = torch.randn(B, T, HV, V, device=device, dtype=dtype)
+    # Decays are log-space and non-positive, as produced by the mixer.
+    g = -torch.rand(B, T, HV, device=device, dtype=torch.float32)
+    beta = torch.rand(B, T, HV, device=device, dtype=dtype).sigmoid()
+    state = torch.randn(num_slots, HV, K, V, device=device, dtype=dtype)
+    return q, k, v, g, beta, state
+
+
+# --------------------------------------------------------------------------- #
+# Kernel-level tests
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("rank_local_device")
+@requires_cuda
+class TestFusedRecurrentGatedDeltaRuleUpdate:
+    """Forked, slot-indexed recurrent kernel used by the GDP decode step."""
+
+    SHAPE = dict(B=6, T=3, H=2, HV=4, K=16, V=32, num_slots=11)
+
+    @pytest.mark.parametrize("use_qk_l2norm", [False, True])
+    def test_matches_reference_with_slot_indices(self, use_qk_l2norm):
+        """Permuted (non-identity) slots read and write the right cache rows."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
+        # Slots deliberately out of order and not covering the whole cache.
+        indices = torch.tensor([7, 0, 3, 10, 1, 5], device="cuda", dtype=torch.int32)
+        state_ref = state.clone()
+
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            state=state,
+            g=g,
+            beta=beta,
+            state_indices=indices,
+            use_qk_l2norm_in_kernel=use_qk_l2norm,
+        )
+        out_ref = _gated_delta_rule_ref(q, k, v, g, beta, state_ref, indices, use_qk_l2norm)
+
+        torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(state, state_ref, atol=1e-4, rtol=1e-4)
+
+    def test_no_state_indices_uses_identity_slots(self):
+        q, k, v, g, beta, state = _random_inputs(**{**self.SHAPE, "num_slots": self.SHAPE["B"]})
+        state_ref = state.clone()
+
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q, k, v, state=state, g=g, beta=beta, state_indices=None
+        )
+        out_ref = _gated_delta_rule_ref(q, k, v, g, beta, state_ref, None, False)
+
+        torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(state, state_ref, atol=1e-4, rtol=1e-4)
+
+    def test_padding_slots_zero_output_and_preserve_state(self):
+        """`-1` rows: zero output, untouched cache, real rows unaffected."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
+        # Rows 1 and 4 are padding; the rest map to real slots.
+        indices = torch.tensor([7, -1, 3, 10, -1, 5], device="cuda", dtype=torch.int32)
+        state_before = state.clone()
+        state_ref = state.clone()
+
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q, k, v, state=state, g=g, beta=beta, state_indices=indices
+        )
+        out_ref = _gated_delta_rule_ref(q, k, v, g, beta, state_ref, indices, False)
+
+        pad_rows = [1, 4]
+        real_rows = [0, 2, 3, 5]
+        assert torch.count_nonzero(out[pad_rows]) == 0, "padding rows must produce zero output"
+        torch.testing.assert_close(out[real_rows], out_ref[real_rows], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(state, state_ref, atol=1e-4, rtol=1e-4)
+
+        # Slots not named by any real row are bit-identical to before the call.
+        untouched = [s for s in range(self.SHAPE["num_slots"]) if s not in {7, 3, 10, 5}]
+        torch.testing.assert_close(
+            state[untouched], state_before[untouched], atol=0, rtol=0, equal_nan=True
+        )
+
+    def test_padding_does_not_change_real_rows(self):
+        """A padded batch gives the real rows exactly what an unpadded one does."""
+        shape = dict(self.SHAPE)
+        q, k, v, g, beta, state = _random_inputs(**shape)
+        real = 4
+        padded_indices = torch.tensor([2, 6, 0, 9, -1, -1], device="cuda", dtype=torch.int32)
+
+        state_padded = state.clone()
+        out_padded, _ = fused_recurrent_gated_delta_rule_update(
+            q, k, v, state=state_padded, g=g, beta=beta, state_indices=padded_indices
+        )
+
+        state_real = state.clone()
+        out_real, _ = fused_recurrent_gated_delta_rule_update(
+            q[:real],
+            k[:real],
+            v[:real],
+            state=state_real,
+            g=g[:real],
+            beta=beta[:real],
+            state_indices=padded_indices[:real],
+        )
+
+        torch.testing.assert_close(out_padded[:real], out_real, atol=0, rtol=0, equal_nan=True)
+        torch.testing.assert_close(state_padded, state_real, atol=0, rtol=0, equal_nan=True)
+
+    @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
+    def test_matches_upstream_fla(self):
+        """Fork parity with the pip FLA kernel the training path still uses."""
+        from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
+        indices = torch.tensor([7, 0, 3, 10, 1, 5], device="cuda", dtype=torch.int32)
+
+        state_fork = state.clone()
+        out_fork, _ = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            state=state_fork,
+            g=g,
+            beta=beta,
+            state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # Upstream needs the initial states gathered in, and returns the final
+        # states to be scattered back out -- exactly what the fork removes.
+        out_fla, final_state = fused_recurrent_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            initial_state=state[indices.long()],
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        state_fla = state.clone()
+        state_fla[indices.long()] = final_state.to(state.dtype)
+
+        torch.testing.assert_close(out_fork, out_fla, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(state_fork, state_fla, atol=1e-4, rtol=1e-4)
+
+
+# --------------------------------------------------------------------------- #
+# Prefill: chunk descriptors
+# --------------------------------------------------------------------------- #
+
+
+class TestGDPChunkDescriptors:
+    """Pure-Python builder for the descriptors the forked chunk kernels read.
+
+    Replaces FLA's `prepare_chunk_indices`, which synchronizes on the device and
+    returns a data-dependent shape.
+    """
+
+    def test_descriptors_match_per_sequence_chunk_counts(self):
+        seq_lens = [130, 64, 7, 0]
+        cu_seqlens = [0]
+        for n in seq_lens:
+            cu_seqlens.append(cu_seqlens[-1] + n)
+        num_householder, padded_tokens = 3, 256
+
+        indices, indices_dp, offsets, num_chunks, num_chunks_dp = build_gdp_chunk_descriptors(
+            cu_seqlens, len(seq_lens), num_householder, padded_tokens
+        )
+        pairs = [tuple(indices[i : i + 2]) for i in range(0, len(indices), 2)]
+        pairs_dp = [tuple(indices_dp[i : i + 2]) for i in range(0, len(indices_dp), 2)]
+
+        # Unexpanded: ceil(L/64) chunks per sequence, in sequence order.
+        expected = []
+        for i, n in enumerate(seq_lens):
+            expected.extend((i, j) for j in range((n + 63) // 64))
+        assert pairs[: len(expected)] == expected
+        assert offsets == [0, 3, 4, 5, 5]
+        assert offsets[-1] == len(expected)
+
+        # Expanded: ceil(L*M/64), which is *not* M * ceil(L/64) in general.
+        expected_dp = []
+        for i, n in enumerate(seq_lens):
+            expected_dp.extend((i, j) for j in range((n * num_householder + 63) // 64))
+        assert pairs_dp[: len(expected_dp)] == expected_dp
+        assert (7 * 3 + 63) // 64 != 3 * ((7 + 63) // 64), "the two chunkings must differ here"
+
+    def test_padding_rows_are_addressed_out_of_range(self):
+        """Padding descriptor rows must land past the end of sequence 0 so their
+        programs load zeros and store nothing."""
+        seq_lens = [96, 32]
+        cu_seqlens = [0, 96, 128]
+        num_householder, padded_tokens = 2, 192
+
+        indices, indices_dp, _, num_chunks, num_chunks_dp = build_gdp_chunk_descriptors(
+            cu_seqlens, len(seq_lens), num_householder, padded_tokens
+        )
+        assert len(indices) // 2 == num_chunks
+        assert len(indices_dp) // 2 == num_chunks_dp
+
+        real = sum((n + 63) // 64 for n in seq_lens)
+        for i in range(real, num_chunks):
+            seq, chunk = indices[2 * i], indices[2 * i + 1]
+            assert chunk * 64 >= seq_lens[seq], "padding chunk overlaps a real chunk"
+
+        real_dp = sum((n * num_householder + 63) // 64 for n in seq_lens)
+        for i in range(real_dp, num_chunks_dp):
+            seq, chunk = indices_dp[2 * i], indices_dp[2 * i + 1]
+            assert chunk * 64 >= seq_lens[seq] * num_householder, "padding overlaps a real chunk"
+
+    def test_buffer_sizing_covers_worst_case(self):
+        max_tokens, max_requests, num_householder = 512, 8, 4
+        max_chunks, max_chunks_dp = max_gdp_chunk_counts(max_tokens, max_requests, num_householder)
+        # Worst case for chunk count: as many short sequences as possible.
+        seq_lens = [1] * (max_requests - 1)
+        seq_lens.append(max_tokens - sum(seq_lens))
+        assert sum((n + 63) // 64 for n in seq_lens) <= max_chunks
+        assert sum((n * num_householder + 63) // 64 for n in seq_lens) <= max_chunks_dp
+
+
+# --------------------------------------------------------------------------- #
+# Prefill: forked chunk kernels
+# --------------------------------------------------------------------------- #
+
+
+def _prefill_inputs(seq_lens, H, K, V, num_householder, num_slots, padded_tokens=None, seed=0):
+    """Random packed prefill activations plus the matching chunk descriptors."""
+    torch.manual_seed(seed)
+    total = sum(seq_lens)
+    padded_tokens = total if padded_tokens is None else padded_tokens
+    M = num_householder
+
+    q = torch.randn(1, padded_tokens, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, padded_tokens * M, H, K, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, padded_tokens * M, H, V, device="cuda", dtype=torch.bfloat16)
+    g = -torch.rand(1, padded_tokens, H, device="cuda", dtype=torch.float32)
+    beta = torch.rand(1, padded_tokens * M, H, device="cuda", dtype=torch.bfloat16).sigmoid()
+
+    cu_list = [0]
+    for n in seq_lens:
+        cu_list.append(cu_list[-1] + n)
+    cu_seqlens = torch.tensor(cu_list, device="cuda", dtype=torch.int32)
+
+    indices, indices_dp, offsets, num_chunks, num_chunks_dp = build_gdp_chunk_descriptors(
+        cu_list, len(seq_lens), M, padded_tokens
+    )
+    descriptors = dict(
+        cu_seqlens=cu_seqlens,
+        chunk_indices=_to_dev(indices, (num_chunks, 2)),
+        chunk_indices_dp=_to_dev(indices_dp, (num_chunks_dp, 2)),
+        chunk_offsets=_to_dev(offsets, (len(offsets),)),
+    )
+    state = torch.randn(num_slots, H, K, V, device="cuda", dtype=torch.bfloat16)
+    return q, k, v, g, beta, state, descriptors
+
+
+@pytest.mark.usefixtures("rank_local_device")
+@requires_cuda
+class TestChunkGatedDeltaProductVarlen:
+    """Forked chunked prefill: parity, padding semantics, graph capture."""
+
+    SHAPE = dict(H=4, K=64, V=64, num_householder=2, num_slots=8)
+
+    @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
+    def test_matches_upstream_fla(self):
+        """The fork must agree with the pip kernels the training path still uses."""
+        from fla.ops.gated_delta_product import chunk_gated_delta_product
+
+        seq_lens = [128, 65, 32]
+        q, k, v, g, beta, state, desc = _prefill_inputs(seq_lens, **self.SHAPE)
+        M = self.SHAPE["num_householder"]
+        slots = torch.tensor([3, 0, 6], device="cuda", dtype=torch.int32)
+
+        state_fork = state.clone()
+        o_fork, _ = chunk_gated_delta_product_varlen(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            num_householder=M,
+            state=state_fork,
+            state_indices=slots,
+            use_qk_l2norm_in_kernel=True,
+            **desc,
+        )
+
+        o_fla, final_state = chunk_gated_delta_product(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            num_householder=M,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=desc["cu_seqlens"].long(),
+        )
+        state_fla = state.clone()
+        state_fla[slots.long()] = final_state.to(state.dtype)
+
+        torch.testing.assert_close(o_fork, o_fla, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(state_fork, state_fla, atol=2e-2, rtol=2e-2)
+
+    def test_padding_requests_are_inert(self):
+        """Zero-length padded requests with -1 slots change nothing."""
+        real_lens = [96, 33]
+        padded_lens = real_lens + [0, 0]
+        padded_tokens = 192
+
+        q, k, v, g, beta, state, desc = _prefill_inputs(
+            padded_lens, padded_tokens=padded_tokens, **self.SHAPE
+        )
+        M = self.SHAPE["num_householder"]
+        slots_padded = torch.tensor([5, 1, -1, -1], device="cuda", dtype=torch.int32)
+
+        state_padded = state.clone()
+        o_padded, _ = chunk_gated_delta_product_varlen(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            num_householder=M,
+            state=state_padded,
+            state_indices=slots_padded,
+            use_qk_l2norm_in_kernel=True,
+            **desc,
+        )
+
+        # Same activations, but only the real requests and no token padding.
+        real_tokens = sum(real_lens)
+        cu_list = [0]
+        for n in real_lens:
+            cu_list.append(cu_list[-1] + n)
+        indices, indices_dp, offsets, n_c, n_c_dp = build_gdp_chunk_descriptors(
+            cu_list, len(real_lens), M, real_tokens
+        )
+        state_real = state.clone()
+        o_real, _ = chunk_gated_delta_product_varlen(
+            q[:, :real_tokens].contiguous(),
+            k[:, : real_tokens * M].contiguous(),
+            v[:, : real_tokens * M].contiguous(),
+            g=g[:, :real_tokens].contiguous(),
+            beta=beta[:, : real_tokens * M].contiguous(),
+            num_householder=M,
+            cu_seqlens=torch.tensor(cu_list, device="cuda", dtype=torch.int32),
+            chunk_indices=_to_dev(indices, (n_c, 2)),
+            chunk_indices_dp=_to_dev(indices_dp, (n_c_dp, 2)),
+            chunk_offsets=_to_dev(offsets, (len(offsets),)),
+            state=state_real,
+            state_indices=slots_padded[: len(real_lens)],
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        torch.testing.assert_close(
+            o_padded[:, :real_tokens], o_real, atol=0, rtol=0, equal_nan=True
+        )
+        assert torch.count_nonzero(o_padded[:, real_tokens:]) == 0, "padded tokens must be zero"
+        torch.testing.assert_close(state_padded, state_real, atol=0, rtol=0, equal_nan=True)
+
+        # Slots owned by no real request are byte-identical to before the call.
+        untouched = [s for s in range(self.SHAPE["num_slots"]) if s not in {5, 1}]
+        torch.testing.assert_close(
+            state_padded[untouched], state[untouched], atol=0, rtol=0, equal_nan=True
+        )
