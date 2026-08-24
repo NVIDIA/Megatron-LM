@@ -15,6 +15,7 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
+from megatron.lite.model.deepseek_v4.quantization import is_release_fp32_control
 from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     nested_from_packed,
@@ -374,6 +375,13 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
+def _cast_training_parameters(model: nn.Module) -> None:
+    """Cast matrix parameters to BF16 without truncating FP32 controls."""
+    for name, parameter in model.named_parameters():
+        if parameter.is_floating_point() and not is_release_fp32_control(name):
+            parameter.data = parameter.data.to(torch.bfloat16)
+
+
 def build_training_backend(
     chunks: list[nn.Module],
     model_cfg: DeepseekV4Config,
@@ -467,23 +475,21 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     )
 
     def _chunk(i: int | None = None):
-        return (
-            DeepseekV4Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                use_deepep=impl_cfg.use_deepep,
-                use_thd=impl_cfg.use_thd,
-                hf_path=impl_cfg.hf_path,
-                attention_backend_override=impl_cfg.attention_backend_override,
-                mtp_enable=mtp_enable,
-                mtp_enable_train=mtp_enable_train,
-                mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-            )
-            .to(torch.bfloat16)
-            .cuda()
+        model = DeepseekV4Model(
+            model_cfg,
+            train_cfg,
+            ps,
+            vpp_chunk_id=i,
+            use_deepep=impl_cfg.use_deepep,
+            use_thd=impl_cfg.use_thd,
+            hf_path=impl_cfg.hf_path,
+            attention_backend_override=impl_cfg.attention_backend_override,
+            mtp_enable=mtp_enable,
+            mtp_enable_train=mtp_enable_train,
+            mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         )
+        _cast_training_parameters(model)
+        return model.cuda()
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
