@@ -636,6 +636,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
+        if config.mtp_detach_heads:
+            # Detached MTP heads are tagged into a separate gradient-norm group, which
+            # the shared helpers reduce with get_grad_norm_fp32. That path derives a
+            # data-parallel group from the gradients' DTensor mesh and reduces over it
+            # in addition to the grad-stats group, double-counting for MFSDP v2 whose
+            # mesh already is the grad-stats group. Reject it rather than report a
+            # silently inflated norm.
+            raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
+
         unsupported_parallelisms = [
             "tensor_model_parallel_size",
             "pipeline_model_parallel_size",

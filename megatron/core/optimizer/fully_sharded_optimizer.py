@@ -13,7 +13,6 @@ from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
 from ..transformer.module import MegatronModule
-from ..utils import to_local_if_dtensor
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -179,20 +178,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             group=self.get_grad_stats_parallel_group(),
         )
         return total_norm_squared.sqrt()
-
-    @override
-    def get_grads_for_grad_norm(self, grad_norm_group: Optional[str] = None):
-        """Return local gradient shards for the shared grad-norm helpers.
-
-        The base implementation only unwraps a DTensor gradient when the parameter
-        carries ``__fsdp_param__``; otherwise the DTensor reaches ``get_grad_norm_fp32``,
-        which feeds every gradient to ``get_data_parallel_group_if_dtensor`` and asserts
-        they all share one device mesh. MFSDP v2 breaks that assumption, so unwrap here
-        instead of marking the parameters.
-        """
-        return [
-            to_local_if_dtensor(grad) for grad in super().get_grads_for_grad_norm(grad_norm_group)
-        ]
 
     @override
     def count_zeros(self) -> float:
