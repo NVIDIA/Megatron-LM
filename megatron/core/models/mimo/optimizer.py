@@ -331,7 +331,7 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    Returns (tp_gtp_rank, pp_rank, dp_cp_rank) so only (0, 0, 0) within each
     module's parallelism group is the main replica; all other ranks
     in the same module are non-main replicas of the same object.
     """
@@ -343,9 +343,13 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
-        hasattr(pg_collection, 'dp') and pg_collection.dp is not None
-    ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
+        hasattr(pg_collection, 'dp_cp') and pg_collection.dp_cp is not None
+    ), "pg_collection.dp_cp must be set for checkpoint deduplication"
+    gtp_group = getattr(pg_collection, 'gtp_remat', None)
+    gtp_rank = gtp_group.rank() if gtp_group is not None else 0
+    gtp_size = gtp_group.size() if gtp_group is not None else 1
+    tp_gtp_rank = pg_collection.tp.rank() * gtp_size + gtp_rank
+    return (tp_gtp_rank, pg_collection.pp.rank(), pg_collection.dp_cp.rank())
 
 
 def _optimizer_config_for_module(
