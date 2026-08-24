@@ -335,6 +335,8 @@ def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
             local_grad[:true_dim0], (0, 0, 0, expected_local_pad_length)
         )
         torch.testing.assert_close(result, expected)
+
+
 def test_muon_optimizer_glu_split(monkeypatch):
     """Muon orthogonalizes the fused gate and up FC1 weights independently."""
     param = torch.nn.Parameter(torch.zeros(8, 4, device='cuda'))
@@ -357,6 +359,8 @@ def test_muon_optimizer_glu_split(monkeypatch):
     torch.testing.assert_close(orthogonalized_grads[0], grad[:4])
     torch.testing.assert_close(orthogonalized_grads[1], grad[4:])
     torch.testing.assert_close(result, torch.cat((grad[:4] + 1, grad[4:] + 2)))
+
+
 def test_muon_optimizer_glu_split_opt_out(monkeypatch):
     """The GLU marker does not change the existing whole-matrix path when splitting is disabled."""
     param = torch.nn.Parameter(torch.zeros(8, 4, device='cuda'))
@@ -467,6 +471,8 @@ def test_muon_optimizer_glu_gtp_gathers_before_split(monkeypatch, gtp_rank, layo
     torch.testing.assert_close(orthogonalized_grads[1], full_grad.new_tensor(up_values).view(-1, 1))
     expected = full_grad.new_tensor(expected_values).view(8, 1)
     torch.testing.assert_close(result, expected[gtp_rank * 4 : (gtp_rank + 1) * 4])
+
+
 def test_muon_optimizer_smoke():
     """Smoke test for TensorParallelMuon optimizer."""
     # Create a simple linear model for testing

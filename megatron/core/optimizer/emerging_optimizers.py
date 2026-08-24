@@ -409,6 +409,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         distributed does not: it stays row-sharded through its own collective, where
         stripping isn't safe (known limitation).
         """
+        is_expert = getattr(p, 'expert_tp', False)
         gtp_remat_group = self._get_gtp_remat_group(p)
 
         # Parameters with is_gtp_weight_remat=False are not sharded along the
