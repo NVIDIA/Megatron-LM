@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 
+from megatron.lite.model.deepseek_v4.lite.checkpoint import _map_block_attr
 from megatron.lite.model.deepseek_v4.lite.protocol import (
     _cast_training_parameters,
     _iter_transformer_units,
@@ -30,19 +31,25 @@ def test_iter_transformer_units_accepts_wrapper_chunk() -> None:
     assert _iter_transformer_units(wrapper) == [*native.layers.values(), *native.mtp]
 
 
-def test_training_cast_preserves_release_fp32_controls() -> None:
+def test_training_cast_preserves_native_fp32_controls() -> None:
     model = nn.Module()
     model.layers = nn.ModuleDict({"0": nn.Module()})
-    model.layers["0"].attn = nn.Module()
-    model.layers["0"].attn.attn_sink = nn.Parameter(
+    layer = model.layers["0"]
+    layer.self_attn = nn.Module()
+    layer.self_attn.self_attn = nn.Module()
+    layer.self_attn.self_attn.sinks = nn.Parameter(
         torch.tensor([1.0001, -0.5003], dtype=torch.float32)
     )
-    model.layers["0"].proj = nn.Linear(2, 2, bias=False)
-    expected_sink = model.layers["0"].attn.attn_sink.detach().clone()
+    layer.attn_hc = nn.Module()
+    layer.attn_hc.hc_fn = nn.Parameter(torch.tensor([1.0001], dtype=torch.float32))
+    layer.proj = nn.Linear(2, 2, bias=False)
+    expected_sink = layer.self_attn.self_attn.sinks.detach().clone()
 
     _cast_training_parameters(model)
 
-    assert model.layers["0"].attn.attn_sink.dtype == torch.float32
-    assert torch.equal(model.layers["0"].attn.attn_sink, expected_sink)
+    assert layer.self_attn.self_attn.sinks.dtype == torch.float32
+    assert torch.equal(layer.self_attn.self_attn.sinks, expected_sink)
+    assert layer.attn_hc.hc_fn.dtype == torch.float32
     assert not torch.equal(expected_sink, expected_sink.bfloat16().float())
-    assert model.layers["0"].proj.weight.dtype == torch.bfloat16
+    assert layer.proj.weight.dtype == torch.bfloat16
+    assert _map_block_attr("self_attn.self_attn.sinks", "layers") == "attn.attn_sink"

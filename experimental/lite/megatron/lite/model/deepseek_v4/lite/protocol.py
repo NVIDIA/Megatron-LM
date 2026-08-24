@@ -15,7 +15,7 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
-from megatron.lite.model.deepseek_v4.quantization import is_release_fp32_control
+from megatron.lite.model.deepseek_v4.quantization import is_native_fp32_control
 from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     nested_from_packed,
@@ -378,7 +378,7 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
 def _cast_training_parameters(model: nn.Module) -> None:
     """Cast matrix parameters to BF16 without truncating FP32 controls."""
     for name, parameter in model.named_parameters():
-        if parameter.is_floating_point() and not is_release_fp32_control(name):
+        if parameter.is_floating_point() and not is_native_fp32_control(name):
             parameter.data = parameter.data.to(torch.bfloat16)
 
 
