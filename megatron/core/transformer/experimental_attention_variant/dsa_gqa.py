@@ -31,10 +31,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_naive,
     rotate_activation,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics import (
-    assert_tp_support_consistent,
-    compute_dsa_attention_diagnostics,
-)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_main_attention_aux_loss,
@@ -1833,7 +1829,6 @@ class DSGQACoreAttention(MegatronModule):
         q_cursor = 0
         block_size_tokens = inference_context.block_size_tokens
         num_requests = inference_context.padded_active_request_count
-        diagnostics = getattr(inference_context, "dsa_diagnostics", None)
         diagnostics_enabled = diagnostics is not None and diagnostics.enabled
         active_request_ids = (
             inference_context.request_ids[
@@ -2016,31 +2011,8 @@ class DSGQACoreAttention(MegatronModule):
 
             if diagnostic_queries:
                 tp_group = self.indexer.pg_collection.tp
-                assert_tp_support_consistent(
-                    topk_indices.index_select(1, diagnostic_rows),
-                    tp_group,
-                    "model",
-                )
-                assert_tp_support_consistent(
-                    diagnostic_topk_indices,
-                    tp_group,
-                    "expanded",
-                )
                 for diagnostic_idx, query_metadata in enumerate(diagnostic_queries):
                     local_idx = query_metadata["local_index"]
-                    metrics = compute_dsa_attention_diagnostics(
-                        query=request_query[local_idx : local_idx + 1],
-                        key=request_key,
-                        value=request_value,
-                        indexer_support=diagnostic_topk_indices[0, diagnostic_idx],
-                        model_support=topk_indices[0, local_idx],
-                        softmax_scale=self.softmax_scale,
-                        topk_values=diagnostics.topk_values,
-                        query_position=query_metadata["position"],
-                        tp_group=tp_group,
-                        model_output=request_output[local_idx],
-                        dump_support_indices=diagnostics.dump_support_indices,
-                    )
                     diagnostics.record(
                         {
                             "request_id": request_id,

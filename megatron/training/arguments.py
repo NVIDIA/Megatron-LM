@@ -24,9 +24,6 @@ from megatron.core.transformer.cuda_graph_config import (
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.transformer.experimental_attention_variant.dsa_diagnostics import (
-    expand_integer_ranges,
-)
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
@@ -115,17 +112,6 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
     set_global_variables(args)
 
     return args
-
-class _ExpandIntegerRangesAction(argparse.Action):
-    """Expand inclusive integer ranges while parsing list-valued CLI options."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        try:
-            expanded = expand_integer_ranges(values)
-        except ValueError as exc:
-            raise argparse.ArgumentError(self, str(exc)) from exc
-        setattr(namespace, self.dest, expanded)
-
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -1123,14 +1109,6 @@ def validate_args(args, defaults={}):
                 '--dsa-attention-aux-topk must be positive'
             assert args.dsa_attention_aux_topk <= args.dsa_indexer_topk, \
                 '--dsa-attention-aux-topk cannot exceed --dsa-indexer-topk'
-
-    if getattr(args, 'dsa_diagnostics', False):
-        assert args.experimental_attention_variant == 'dsa', \
-            '--dsa-diagnostics requires --experimental-attention-variant dsa'
-        assert getattr(args, 'dsa_diagnostics_output_dir', None), \
-            '--dsa-diagnostics requires --dsa-diagnostics-output-dir'
-        assert args.cuda_graph_impl == 'none', \
-            '--dsa-diagnostics requires --cuda-graph-impl none'
 
     if getattr(args, 'dsa_separate_indexer_grad_clip', False):
         assert args.experimental_attention_variant == 'dsa', \
@@ -2560,11 +2538,6 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
-        # These list-valued diagnostics flags use a custom action for range syntax.
-        "dsa_diagnostics_layers",
-        "dsa_diagnostics_topk_values",
-        "dsa_diagnostics_prefill_tail_offsets",
-        "dsa_diagnostics_decode_offsets",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3873,72 +3846,6 @@ def _add_experimental_attention_variant_args(parser):
         type=int,
         default=0,
         help='Global rank that prints DSA min-memory timings. Set to -1 to print on every rank.',
-    )
-    _maybe_add_argument(
-        '--dsa-diagnostics',
-        action='store_true',
-        help=(
-            'Collect sampled dense-vs-sparse DSA diagnostics during dynamic inference. '
-            'Results are written as rank-local JSONL shards.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-diagnostics-output-dir',
-        type=str,
-        default=None,
-        help='Directory for rank-local DSA diagnostic JSONL shards.',
-    )
-    _maybe_add_argument(
-        '--dsa-diagnostics-layers',
-        nargs='+',
-        action=_ExpandIntegerRangesAction,
-        default=None,
-        metavar='LAYER_OR_RANGE',
-        help=(
-            'Optional 1-indexed layers to diagnose. Accepts integers and inclusive ranges, '
-            'for example 7 18...40:11.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-diagnostics-topk-values',
-        nargs='+',
-        action=_ExpandIntegerRangesAction,
-        default=[512, 1024, 2048, 4096, 8192],
-        metavar='K_OR_RANGE',
-        help=(
-            'Support budgets evaluated by DSA diagnostics. Accepts integers and inclusive '
-            'ranges such as 512...8192:512.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-diagnostics-prefill-tail-offsets',
-        nargs='+',
-        action=_ExpandIntegerRangesAction,
-        default=[0],
-        metavar='OFFSET_OR_RANGE',
-        help=(
-            'Prompt query offsets backward from the final prefill token. Offset 0 is the final '
-            'prompt query. Accepts shorthand such as 0...32.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-diagnostics-decode-offsets',
-        nargs='+',
-        action=_ExpandIntegerRangesAction,
-        default=[],
-        metavar='OFFSET_OR_RANGE',
-        help=(
-            'Zero-based decode query offsets. Offset 0 is the first generated token fed back '
-            'through the model. Accepts shorthand such as 0...8.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-diagnostics-dump-support-indices',
-        action='store_true',
-        help=(
-            'Include indexer and oracle support indices in diagnostic JSONL records. This can '
-            'substantially increase output size.'
-        ),
     )
     _maybe_add_argument(
         '--dsa-kernel-query-block-size',

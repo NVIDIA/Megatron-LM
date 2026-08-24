@@ -376,29 +376,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_min_memory_profile_rank: int = 0
     """Global rank that prints DSA min-memory timings. Set to -1 to print on every rank."""
 
-    dsa_diagnostics: bool = False
-    """Whether to collect sampled dense-vs-sparse diagnostics during dynamic DSA inference."""
-
-    dsa_diagnostics_output_dir: Optional[str] = None
-    """Directory for rank-local DSA diagnostic JSONL shards."""
-
-    dsa_diagnostics_layers: Optional[List[int]] = None
-    """Optional 1-indexed DSA layer numbers to diagnose; all DSA layers when unset."""
-
-    dsa_diagnostics_topk_values: List[int] = field(
-        default_factory=lambda: [512, 1024, 2048, 4096, 8192]
-    )
-    """Support budgets evaluated by sampled DSA diagnostics."""
-
-    dsa_diagnostics_prefill_tail_offsets: List[int] = field(default_factory=lambda: [0])
-    """Prompt query offsets measured backward from the final prefill token."""
-
-    dsa_diagnostics_decode_offsets: List[int] = field(default_factory=list)
-    """Zero-based generated-token offsets selected as decode diagnostic queries."""
-
-    dsa_diagnostics_dump_support_indices: bool = False
-    """Whether diagnostic JSONL records include potentially large support-index arrays."""
-
     dsa_kernel_query_block_size: Optional[int] = None
     """Optional query tile size for DSA min-memory kernel backends."""
 
@@ -3376,36 +3353,6 @@ class TransformerConfig(ModelParallelConfig):
         assert (
             not self.dsa_fwd_use_dense_attn or self.experimental_attention_variant == "dsa"
         ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
-        assert not self.dsa_diagnostics or self.experimental_attention_variant == "dsa", (
-            "dsa_diagnostics requires experimental_attention_variant='dsa'."
-        )
-        if self.dsa_diagnostics:
-            assert self.dsa_diagnostics_output_dir, (
-                "dsa_diagnostics_output_dir must be set when DSA diagnostics are enabled."
-            )
-            assert self.cuda_graph_impl == "none", (
-                "dsa_diagnostics requires cuda_graph_impl='none' because CUDA graph replay "
-                "bypasses Python-side diagnostic query selection."
-            )
-            assert self.dsa_diagnostics_topk_values and all(
-                value > 0 for value in self.dsa_diagnostics_topk_values
-            ), "dsa_diagnostics_topk_values must contain positive integers."
-            assert all(value > 0 for value in (self.dsa_diagnostics_layers or [])), (
-                "dsa_diagnostics_layers must contain positive 1-indexed layer numbers."
-            )
-            assert all(value <= self.num_layers for value in (self.dsa_diagnostics_layers or [])), (
-                "dsa_diagnostics_layers cannot exceed num_layers."
-            )
-            assert all(value >= 0 for value in self.dsa_diagnostics_prefill_tail_offsets), (
-                "dsa_diagnostics_prefill_tail_offsets must be non-negative."
-            )
-            assert all(value >= 0 for value in self.dsa_diagnostics_decode_offsets), (
-                "dsa_diagnostics_decode_offsets must be non-negative."
-            )
-            assert (
-                self.dsa_diagnostics_prefill_tail_offsets
-                or self.dsa_diagnostics_decode_offsets
-            ), "DSA diagnostics require at least one prefill-tail or decode offset."
         assert (
             self.dsa_indexer_mode == "standard"
             or self.experimental_attention_variant == "dsa"

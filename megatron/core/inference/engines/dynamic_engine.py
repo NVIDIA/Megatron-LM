@@ -435,7 +435,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self._reset_pending_kv_imports()
         self.context.reset()
-        self.context.dsa_diagnostics.reset_runtime()
 
         # Request state.
         self.request_counter = Counter()
@@ -1343,7 +1342,6 @@ class DynamicInferenceEngine(AbstractEngine):
             request.stop_word_ids = stop_word_ids
 
         if request.status != Status.FAILED:
-            self.context.dsa_diagnostics.register_request(request_id, len(request.prompt_tokens))
             self.waiting_request_ids.append(request_id)
         else:
             self._handle_failed_request(request_id)
@@ -2702,11 +2700,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             )
 
-            # Diagnostic records are buffered by attention modules and written outside forward.
-            self.context.dsa_diagnostics.flush()
-            for finished_request_id in finished_request_ids.tolist():
-                self.context.dsa_diagnostics.unregister_request(finished_request_id)
-
         else:
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
@@ -2719,7 +2712,6 @@ class DynamicInferenceEngine(AbstractEngine):
             assert (
                 failed_entry.future.done()
             ), f"Failed request {failed_request_id} future has not been properly resolved."
-            self.context.dsa_diagnostics.unregister_request(failed_request_id)
         self.failed_request_ids.clear()
 
         nvtx_range_pop("bookkeeping")
