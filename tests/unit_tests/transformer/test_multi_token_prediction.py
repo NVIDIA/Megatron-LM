@@ -1152,6 +1152,50 @@ class TestMultiTokenPredictionLayer:
         assert second_step_grad[0] == 0  # The path that crossed the modality is masked.
         assert second_step_grad[1] != 0  # Its neighboring text-only path remains supervised.
 
+    @pytest.mark.parametrize("with_mtp_input_mask", [False, True])
+    def test_process_mtp_loss_co_rolls_conditioning_mask(self, monkeypatch, with_mtp_input_mask):
+        """Conditioning validity must not add a CP roll at each prediction depth."""
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 5
+        rolled = []
+
+        def capture_roll(tensor, *args, **kwargs):
+            rolled.append((tensor.shape, kwargs.get("return_sum", True)))
+            return roll_tensor(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(mtp_module, "roll_tensor", capture_roll)
+        process_mtp_loss(
+            hidden_states=torch.ones((1 + config.mtp_num_layers) * seq_len, 1, 1),
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            mtp_input_mask=(
+                torch.tensor([[True, False, True, True, True]]) if with_mtp_input_mask else None
+            ),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: torch.ones_like(
+                labels, dtype=logits.dtype
+            ),
+            config=config,
+        )
+
+        assert len(rolled) == 2 * config.mtp_num_layers
+        if with_mtp_input_mask:
+            assert [shape[0] for shape, _ in rolled] == [1, 2, 1, 2]
+            assert all(not return_sum for _, return_sum in rolled)
+        else:
+            assert [shape[0] for shape, _ in rolled] == [1, 1, 1, 1]
+            assert [return_sum for _, return_sum in rolled] == [False, True, False, True]
+
 
 class TestMTPHiddenStateRollUnderParallelism:
     """Token-level checks on the HSM hidden-state roll for every sequence-sharding mode.
