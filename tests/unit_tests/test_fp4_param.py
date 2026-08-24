@@ -487,6 +487,7 @@ class TestFP4Param:
         gc.collect()
         torch.cuda.empty_cache()
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
     )
