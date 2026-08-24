@@ -1375,6 +1375,150 @@ class TELinear(te.pytorch.Linear):
             super().backward_dw()
 
 
+class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
+    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel_mode: Optional[str],
+        config: TransformerConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
+        is_expert: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
+        gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        if not HAVE_TE:
+            raise ImportError(
+                "Transformer Engine is not installed. "
+                "Please install it with `pip install transformer-engine`."
+            )
+        if parallel_mode != "duplicated":
+            raise ValueError("TERMSNormDuplicatedLinear requires parallel_mode='duplicated'.")
+        if is_expert:
+            raise ValueError("TERMSNormDuplicatedLinear does not support expert parameters.")
+        if skip_weight_param_allocation:
+            raise ValueError(
+                "Transformer Engine linear layers do not support skip_weight_param_allocation"
+            )
+
+        self.config = config
+        self.te_return_bias = skip_bias_add and bias
+        self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        self.rng_tracker_name = get_data_parallel_rng_tracker_name()
+
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if self.config.delay_wgrad_compute:
+            if is_te_min_version("2.3.0"):
+                extra_kwargs["delay_wgrad_compute"] = True
+            else:
+                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+
+        self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            rng_via_kwarg=False,
+            replica_group=gtp_replica_group,
+        )
+
+        with init_quant_context, init_gtp_remat_context as output_size:
+            super().__init__(
+                in_features=input_size,
+                out_features=output_size,
+                eps=self.config.layernorm_epsilon,
+                sequence_parallel=False,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                tp_group=None,
+                tp_size=1,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=condition_init_method(config, init_method),
+                bias=bias,
+                normalization="RMSNorm",
+                return_bias=self.te_return_bias,
+                parallel_mode=None,
+                return_layernorm_output=False,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                **extra_kwargs,
+            )
+
+        if bias and gtp_remat_group is not None and gtp_remat_group.size() > 1:
+            # GTP shards only the linear weight. TE sizes bias from the pre-sharded
+            # out_features, so restore its replicated logical width after construction.
+            with torch.no_grad():
+                self.bias.data = self.bias.data.new_zeros(self.out_features)
+
+        self._tp_group = (
+            tp_group
+            if tp_group is not None
+            else get_tensor_model_parallel_group_if_none(tp_group, is_expert=False)
+        )
+        for param in self.parameters():
+            setattr(param, "allreduce", True)
+            setattr(param, "sequence_parallel", self.config.sequence_parallel)
+            setattr(param, "tensor_model_parallel", False)
+
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """Post-init of quantization override."""
+        if quantization_config is None:
+            self.te_quant_params = None
+        else:
+            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+        """Return whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
+            self.te_quant_params, self.training, is_context_quantized
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply RMSNorm followed by the duplicated linear projection."""
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        with quant_context:
+            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        self.is_first_microbatch = False
+        if self.te_return_bias:
+            return out
+        return out, None
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Replicate parameters across TP and DP checkpoint coordinates."""
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
+
+    def backward_dw(self):
+        """Compute weight gradients when delayed wgrad computation is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
+
+
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """Wrapper for the Transformer-Engine's `LayerNormLinear` layer
     that combines layernorm and linear layers."""

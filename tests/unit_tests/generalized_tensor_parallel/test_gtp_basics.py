@@ -48,6 +48,7 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import TERMSNormDuplicatedLinear
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPChain,
@@ -56,6 +57,8 @@ from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     wrap_module_params_gtp,
 )
 from megatron.core.tensor_parallel.gtp_cuda_graphs import preserve_gtp_prefetch_state
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
@@ -308,6 +311,73 @@ class TestLayerNormLinearGTP:
     def test_forward_backward(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_layernorm_linear, 4)
+
+
+def _worker_rmsnorm_duplicated_linear(rank, world_size, port, bias):
+    torch.manual_seed(0)
+    seq, batch, in_f, out_f = 4, 2, 64, 128
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    replica_groups = [dist.new_group([replica_rank]) for replica_rank in range(world_size)]
+    replica_group = replica_groups[rank]
+    model_parallel_cuda_manual_seed(
+        42,
+        gtp_remat_rank=rank,
+        egtp_remat_rank=0,
+        gtp_remat_world_size=world_size,
+        egtp_remat_world_size=1,
+        force_reset_rng=True,
+    )
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=in_f,
+        num_attention_heads=4,
+        params_dtype=dtype,
+        tensor_parallel_num_weight_shards=world_size,
+    )
+    layer = TERMSNormDuplicatedLinear(
+        in_f,
+        out_f,
+        parallel_mode="duplicated",
+        config=config,
+        init_method=config.output_layer_init_method,
+        bias=bias,
+        skip_bias_add=False,
+        skip_weight_param_allocation=False,
+        tp_group=replica_group,
+        gtp_remat_group=gtp_remat_group,
+        gtp_replica_group=replica_group,
+    )
+
+    assert isinstance(layer.weight, GTPShardedParam)
+    assert not isinstance(layer.layer_norm_weight, GTPShardedParam)
+    assert layer.weight.shape == (out_f // world_size, in_f)
+    assert layer.layer_norm_weight.shape == (in_f,)
+    assert layer._tp_group is replica_group
+    assert layer.weight.gtp_replica_group is replica_group
+    if bias:
+        assert layer.bias.shape == (out_f,)
+
+    inp = torch.randn(seq, batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
+    dist.broadcast(inp, src=0)
+    out, output_bias = layer(inp)
+    assert output_bias is None
+    assert out.shape == (seq, batch, out_f)
+
+    layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=dtype, device="cuda")
+    out.sum().backward()
+    assert inp.grad is not None and inp.grad.shape == inp.shape
+    assert layer.layer_norm_weight.grad is not None
+    if bias:
+        assert layer.bias.grad is not None
+
+
+@pytest.mark.launch_on_gb200
+class TestRMSNormDuplicatedLinearGTP:
+    @pytest.mark.parametrize("bias", [False, True])
+    def test_forward_backward(self, bias):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_rmsnorm_duplicated_linear, 4, bias)
 
 
 # ---------------------------------------------------------------------------
