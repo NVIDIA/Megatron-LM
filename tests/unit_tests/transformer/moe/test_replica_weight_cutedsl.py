@@ -105,7 +105,10 @@ def _summarize(samples: list[float]) -> dict[str, float]:
     not torch.cuda.is_available() or not HAVE_CUTEDSL,
     reason="CUDA and CuTeDSL are required",
 )
-def test_replica_weight_kernels_virtual_only_cases():
+@pytest.mark.parametrize(
+    "grad_dtype", [torch.float32, torch.bfloat16], ids=["fp32-grad", "bf16-grad"]
+)
+def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
     """Cover owner-push, sparse clearing, zero work, and unequal FC shapes."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("Replica weight kernel coverage requires a 4-rank torchrun launch")
@@ -123,7 +126,7 @@ def test_replica_weight_kernels_virtual_only_cases():
     weight_storage, weight_handle = _allocate_symmetric(
         arena_numel, torch.bfloat16, group
     )
-    grad_storage, grad_handle = _allocate_symmetric(arena_numel, torch.float32, group)
+    grad_storage, grad_handle = _allocate_symmetric(arena_numel, grad_dtype, group)
     weight_arena = weight_storage
     grad_arena = grad_storage
     sources = tuple(
@@ -138,7 +141,7 @@ def test_replica_weight_kernels_virtual_only_cases():
         )
         source.copy_(values[:, None])
     main_grads = tuple(
-        torch.empty(num_local_experts, member, dtype=torch.float32, device=device)
+        torch.empty(num_local_experts, member, dtype=grad_dtype, device=device)
         for member in member_numels
     )
     weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
@@ -149,6 +152,7 @@ def test_replica_weight_kernels_virtual_only_cases():
         member_numels=member_numels,
         num_sms=4,
         device_index=device.index,
+        grad_dtype=grad_dtype,
     )
 
     def make_plan(placement: str, slots: tuple[int, ...]) -> torch.Tensor:
@@ -181,7 +185,7 @@ def test_replica_weight_kernels_virtual_only_cases():
 
     def check_close(actual: torch.Tensor, expected: torch.Tensor, label: str) -> None:
         try:
-            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         except AssertionError as exc:
             errors.append(f"{label}: {exc}")
 
@@ -236,9 +240,9 @@ def test_replica_weight_kernels_virtual_only_cases():
             torch.cuda.synchronize(device)
             plan_rows = plan.tolist()
             for projection, member in enumerate(member_numels):
-                expected = torch.full(
+                expected_fp32 = torch.full(
                     (num_local_experts,),
-                    projection + 5,
+                    torch.tensor(projection + 5, dtype=grad_dtype).item(),
                     dtype=torch.float32,
                     device=device,
                 )
@@ -247,9 +251,12 @@ def test_replica_weight_kernels_virtual_only_cases():
                     for destination in range(world_size):
                         for slot in range(num_local_experts):
                             if plan_rows[destination][slot] == semantic_expert:
-                                expected[local_expert] += (
-                                    projection * 1000 + destination * 100 + slot + 1
+                                expected_fp32[local_expert] += torch.tensor(
+                                    projection * 1000 + destination * 100 + slot + 1,
+                                    dtype=grad_dtype,
+                                    device=device,
                                 )
+                expected = expected_fp32.to(grad_dtype)
                 check_close(
                     main_grads[projection][:, 0],
                     expected,
@@ -711,6 +718,14 @@ def test_replica_weight_kernels_production_profile():
     )
     warmups = int(os.environ.get("MCORE_REPLICA_WEIGHT_WARMUPS", "3"))
     iterations = int(os.environ.get("MCORE_REPLICA_WEIGHT_ITERATIONS", "10"))
+    grad_dtype_name = os.environ.get("MCORE_REPLICA_WEIGHT_GRAD_DTYPE", "fp32")
+    grad_dtypes = {"fp32": torch.float32, "bf16": torch.bfloat16}
+    if grad_dtype_name not in grad_dtypes:
+        raise ValueError(
+            "MCORE_REPLICA_WEIGHT_GRAD_DTYPE must be 'fp32' or 'bf16', "
+            f"got {grad_dtype_name!r}."
+        )
+    grad_dtype = grad_dtypes[grad_dtype_name]
     if not 0 <= active_slots <= num_local_experts:
         raise ValueError(
             f"active slots must be in [0, {num_local_experts}], got {active_slots}."
@@ -720,7 +735,7 @@ def test_replica_weight_kernels_production_profile():
     weight_arena, weight_handle = _allocate_symmetric(
         arena_numel, torch.bfloat16, group
     )
-    grad_arena, grad_handle = _allocate_symmetric(arena_numel, torch.float32, group)
+    grad_arena, grad_handle = _allocate_symmetric(arena_numel, grad_dtype, group)
     weight_arena.fill_(-123)
     sources = tuple(
         torch.empty(num_local_experts, member, dtype=torch.bfloat16, device=device)
@@ -752,7 +767,7 @@ def test_replica_weight_kernels_production_profile():
     weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     grad_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     main_grads = tuple(
-        torch.zeros(num_local_experts, member, dtype=torch.float32, device=device)
+        torch.zeros(num_local_experts, member, dtype=grad_dtype, device=device)
         for member in member_numels
     )
     compile_replica_weight_kernels(
@@ -761,6 +776,7 @@ def test_replica_weight_kernels_production_profile():
         member_numels=member_numels,
         num_sms=num_sms,
         device_index=device.index,
+        grad_dtype=grad_dtype,
     )
 
     def prefetch() -> None:
@@ -856,7 +872,7 @@ def test_replica_weight_kernels_production_profile():
 
     for projection, main_grad in enumerate(main_grads):
         expected = torch.full(
-            (num_local_experts,), 1 + projection, dtype=torch.float32, device=device
+            (num_local_experts,), 1 + projection, dtype=grad_dtype, device=device
         )
         expected[:active_slots].add_(2 + projection)
         torch.testing.assert_close(main_grad[:, 0], expected)
@@ -872,6 +888,7 @@ def test_replica_weight_kernels_production_profile():
                 "member_numels": member_numels,
                 "active_slots": active_slots,
                 "num_sms": num_sms,
+                "grad_dtype": grad_dtype_name,
             },
             "prefetch_ms": _summarize(prefetch_samples),
             "grad_reduce_ms": _summarize(grad_samples),
