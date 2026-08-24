@@ -16,7 +16,6 @@ from megatron.core.transformer.cuda_graphs import (
     _CudaGraphRunner,
     create_cudagraphs,
 )
-from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -79,12 +78,19 @@ class TestLocalCudagraphPipelineOutput:
             attention_dropout=0.0,
             hidden_dropout=0.0,
             cuda_graph_impl="local",
-            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_modules=[],
             cuda_graph_warmup_steps=1,
             deallocate_pipeline_outputs=True,
             use_cpu_initialization=True,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
         )
-        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
+        block = TransformerBlock(
+            config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            post_process=False,
+            post_layer_norm=False,
+        ).cuda()
         block.train()
         for param in block.parameters():
             param.main_grad = torch.zeros_like(param)
