@@ -330,8 +330,13 @@ class OptimizerConfig:
     over the gtp and tp groups assemble the complete (P, Q) momentum on the home, the exact
     same full-matrix Newton-Schulz as duplicated mode runs there with zero communication and
     zero redundancy, and reverse all_to_all stages scatter the result back to the original
-    shards. Requires the layer-wise distributed optimizer path; muon_tp_mode is ignored
-    (layer sharding replaces the duplicated/distributed mode selection entirely).
+    shards. Requires the layer-wise distributed optimizer path. muon_tp_mode does not
+    affect the layer-sharded exchange itself; it only applies on the paths that delegate
+    to TensorParallelMuon (the empty-homes fallback and degenerate single-rank domains).
+    muon_split_qkv must be False (its default is True): LayerShardedMuon rejects
+    split_qkv at construction because split-QKV Newton-Schulz is not implemented on the
+    layer-sharded path, so a config with only this flag flipped raises at optimizer
+    construction — the training path surfaces it earlier via validate_args.
     Defaults to False."""
 
     muon_concurrent_groups: bool = True

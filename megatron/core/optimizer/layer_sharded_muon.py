@@ -42,6 +42,37 @@ __all__ = ["LayerShardedMuon"]
 logger = logging.getLogger(__name__)
 
 
+def _resolve_use_syrk(use_syrk: bool) -> bool:
+    """Validate SYRK hardware availability, downgrading to False (with an error
+    log) if unmet.
+
+    This guard lives in emerging-optimizers' ``Muon.__init__`` — which this
+    class no longer inherits from — and NOT in ``TensorParallelMuon``, whose
+    constructor only version-gates ``use_syrk``. Without it, Triton < 3.4.0
+    asserts on the first optimizer step instead of downgrading at construction,
+    and unvalidated SM architectures silently run a kernel emerging-optimizers
+    does not vouch for. Resolved *before* the parent constructor so the parent's
+    closure captures the resolved value (fallback and layer-sharded paths agree)
+    and so unfit hardware downgrades before the parent's EO-version raise.
+    """
+    if not use_syrk:
+        return False
+    if torch.cuda.is_available():
+        sm_version = torch.cuda.get_device_capability()
+    else:
+        sm_version = (0, 0)
+    if not triton_kernels.HAS_TRITON_340:  # type: ignore[attr-defined]
+        logger.error("Triton 3.4.0 or higher is required for use_syrk to be True.")
+        return False
+    if sm_version not in ((8, 0), (9, 0), (10, 0), (10, 3)):
+        logger.error(
+            f"Correctness of Triton kernel on SM {sm_version} cannot be guaranteed. "
+            "Setting use_syrk to False."
+        )
+        return False
+    return True
+
+
 def _has_batched_syrk() -> bool:
     """Whether the installed emerging-optimizers has the batched (3-D) SYRK kernel.
 
@@ -181,6 +212,20 @@ class LayerShardedMuon(TensorParallelMuon):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
     ) -> None:
+        if split_qkv:
+            # The layer-sharded exchange routes whole matrices to their NS homes
+            # and never goes through TensorParallelMuon.orthogonalize, where
+            # split-QKV is implemented — only the fallback and degenerate paths
+            # would split. Accepting split_qkv=True would make the update rule
+            # depend on whether param_ns_homes happens to be set; reject it at
+            # the class level rather than relying on validate_args alone.
+            raise ValueError(
+                "LayerShardedMuon does not implement split-QKV Newton-Schulz on the "
+                "layer-sharded path; pass split_qkv=False (--muon-no-split-qkv)."
+            )
+        # Hardware validation first: the parent only version-gates use_syrk, and
+        # unfit hardware should downgrade rather than hit the EO-version raise.
+        use_syrk = _resolve_use_syrk(use_syrk)
         if ns_batch_size > 1 and not is_emerging_optimizers_min_version("0.3.0"):
             # Only the batched (3-D) Newton-Schulz path needs emerging-optimizers
             # >= 0.3.0 (older releases fail inside torch.addmm with "mat1 must be a
@@ -288,12 +333,15 @@ class LayerShardedMuon(TensorParallelMuon):
         ``pre_weight_update_fn_inplace`` / ``post_weight_update_fn_inplace``;
         this helper keeps layer sharding's overridden ``step()`` honouring them
         too, and keeps the four update sites (replicated, fused, two-stage,
-        degenerate domain) from diverging. The update is cast to ``p.dtype``
-        before the scaled add on every path — a no-op for Megatron's fp32 main
-        params. TODO: forward the ``weight_update_hook`` constructor parameter
-        once the emerging-optimizers pin moves past EO #224.
+        degenerate domain) from diverging. No dtype cast on purpose: the base
+        class's ``p.add_(orth_grad, alpha=-lr)`` — the fifth path, taken by the
+        empty-homes fallback — computes the fused multiply-add in the promoted
+        precision and downcasts once on store, so casting here first would give
+        bf16 params different rounding on the layer-sharded paths than on the
+        fallback and than TensorParallelMuon's duplicated mode. TODO: forward
+        the ``weight_update_hook`` constructor parameter once the
+        emerging-optimizers pin moves past EO #224.
         """
-        update = update.to(p.dtype)
         self.pre_weight_update_fn_inplace(p, update)
         p.add_(update, alpha=-lr)
         self.post_weight_update_fn_inplace(p)

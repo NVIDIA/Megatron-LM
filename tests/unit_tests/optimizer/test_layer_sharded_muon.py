@@ -1444,11 +1444,11 @@ def test_degenerate_domain_honours_use_syrk():
     with _prec_ctx("medium"):
         orth = newton_schulz(mom.float(), steps=5, coefficient_type="quintic", use_syrk=True)
     scale = max(full.shape) ** 0.5
-    # Mirror _apply_update's exact op: cast, then a single fused add_(alpha=-lr).
-    # A separate `full - lr * x` rounds the lr multiply first and is NOT bitwise
-    # equal to add_ with alpha.
+    # Mirror _apply_update's exact op: a single fused add_(alpha=-lr), no dtype
+    # cast (matching the base class's fallback-path update). A separate
+    # `full - lr * x` rounds the lr multiply first and is NOT bitwise equal.
     ref = full.clone()
-    ref.add_((orth * scale * 1.0).to(ref.dtype), alpha=-lr)
+    ref.add_(orth * scale * 1.0, alpha=-lr)
     assert torch.equal(p.data, ref), (
         f"Degenerate-domain use_syrk mismatch: max_diff={(p.data - ref).abs().max().item():.2e}"
     )

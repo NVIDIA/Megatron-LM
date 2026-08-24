@@ -59,8 +59,11 @@ class TestInitDerivesBatchedSyrk:
 
     @pytest.mark.parametrize("has_symbol,expected", [(False, False), (True, True)])
     def test_syrk_arms_batched_only_with_symbol(self, monkeypatch, has_symbol, expected):
-        # _make_opt(monkeypatch) bypasses the parent's >= 0.4.0 use_syrk version
-        # gate: this test pins the batched-capability derivation, not the gate.
+        # Bypass the CUDA/Triton/SM hardware gate (this test pins the
+        # batched-capability derivation, not the hardware validation);
+        # _make_opt(monkeypatch) additionally bypasses the parent's >= 0.4.0
+        # use_syrk version gate.
+        monkeypatch.setattr(lsm, "_resolve_use_syrk", lambda flag: flag)
         monkeypatch.setattr(lsm, "_has_batched_syrk", lambda: has_symbol)
         opt = _make_opt(monkeypatch, use_syrk=True, ns_batch_size=4)
         assert opt.use_syrk is True
@@ -117,3 +120,34 @@ class TestRunNsDispatch:
         opt = _make_opt(monkeypatch, use_syrk=False, ns_batch_size=8)
         opt._run_ns({0: torch.randn(4, 4), 1: torch.randn(4, 6)})
         assert calls == [(2, False)] * 2
+
+
+class TestConstructorGuards:
+    def test_hardware_unfit_downgrades_use_syrk(self, monkeypatch):
+        """On unfit hardware (no CUDA here: SM (0,0)) use_syrk must downgrade to
+        False at construction instead of reaching the NS kernels unvalidated."""
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
+        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: True)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        opt = LayerShardedMuon([p], lr=0.1, gtp_group=None, use_syrk=True)
+        assert opt.use_syrk is False
+        assert opt._batched_syrk is False
+
+    def test_hardware_downgrade_precedes_eo_version_gate(self, monkeypatch):
+        """Unfit hardware plus an EO too old for use_syrk must downgrade silently,
+        not raise about the EO version: _resolve_use_syrk runs BEFORE the parent
+        constructor. A refactor moving the resolve below
+        TensorParallelMuon.__init__ would raise ValueError here."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: False)
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        opt = LayerShardedMuon([p], lr=0.1, gtp_group=None, use_syrk=True)
+        assert opt.use_syrk is False
+
+    def test_split_qkv_is_rejected(self):
+        """split_qkv would only apply on the fallback/degenerate paths, making
+        the update rule depend on whether homes are set — reject at the class."""
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="split-QKV"):
+            LayerShardedMuon([p], lr=0.1, gtp_group=None, split_qkv=True)
