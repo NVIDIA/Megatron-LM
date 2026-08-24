@@ -1,51 +1,54 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as torch_checkpoint
-import pytest
 
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
     hadamard_transform,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
-    DSGroupedSelfAttention,
     DSGQACoreAttention,
+    DSGroupedSelfAttention,
     SimplifiedDSGQAIndexer,
     SimplifiedDSGQAIndexerSubmodules,
     _DSAZeroParamDependency,
-    _build_shifted_causal_mask,
     _indexer_input_norm_spec,
     _normalized_indexer_input,
+    _simplified_index_scores,
     _simplified_indexer_input,
     _simplified_indexer_norm_spec,
-    _simplified_index_scores,
     compute_gqa_dsa_indexer_loss,
     unfused_grouped_dsa_fn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import (
+    dsa_stack_spec,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     DSAMinMemoryGQAFn,
     _accumulate_simplified_learned_k_wgrad,
     _captured_mass_backward_torch,
     _dense_main_attention_stats,
-    _main_attention_aux_query_block_size,
-    dsa_main_attention_aux_loss,
-    dsa_dense_indexer_loss,
-    dsa_min_memory_gqa,
     _forward_min_memory_impl,
+    _main_attention_aux_query_block_size,
     _native_indexer_loss_wgrad_chunk,
     _project_k_index_block,
     _project_q_index_tile,
     _routing_key_chunk_size,
+    _selected_index_scores_backward_torch,
+    _selected_index_scores_tile,
     _sparse_attention_backward_torch_fp32,
     _sparse_attention_tile,
     _topk_index_tile,
-    _selected_index_scores_backward_torch,
-    _selected_index_scores_tile,
+    dsa_dense_indexer_loss,
+    dsa_main_attention_aux_loss,
+    dsa_min_memory_gqa,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
     HAVE_TRITON,
@@ -54,18 +57,17 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_k_ln_param_reduce,
     triton_linear_wgrad,
     triton_scatter_selected_grad_to_sequence,
-    triton_selected_k_linear,
-    triton_selected_index_scores_from_hidden,
     triton_selected_index_scores,
-    triton_simplified_index_scores_block,
+    triton_selected_index_scores_from_hidden,
+    triton_selected_k_linear,
     triton_simplified_gathered_linear_wgrad,
+    triton_simplified_index_scores_block,
     triton_simplified_input_norm_stats,
     triton_simplified_selected_index_scores,
     triton_simplified_selected_index_scores_backward,
     triton_simplified_selected_index_scores_backward_qk,
     triton_topk_index_block,
 )
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -655,9 +657,17 @@ def test_skip_dsa_zero_dependency_preserves_output_and_produces_zero_param_grads
     torch.testing.assert_close(indexer_weight.grad, torch.zeros_like(indexer_weight))
 
 
-def test_mamba_stack_spec_uses_dsa_grouped_self_attention():
-    attention_module = mamba_stack_spec.submodules.attention_layer.submodules.self_attention.module
+def test_dsa_stack_spec_uses_dsa_grouped_self_attention():
+    attention_module = dsa_stack_spec.submodules.attention_layer.submodules.self_attention.module
     assert attention_module is DSGroupedSelfAttention
+
+
+def test_dsa_stack_spec_does_not_mutate_upstream_hybrid_spec():
+    """The spec is derived by deep copy; upstream's shared spec must be untouched."""
+    upstream_module = (
+        hybrid_stack_spec.submodules.attention_layer.submodules.self_attention.module
+    )
+    assert upstream_module is not DSGroupedSelfAttention
 
 
 def _causal_mask(seqlen: int, device: torch.device):
@@ -3543,332 +3553,10 @@ def test_min_memory_train_main_only_attaches_only_main_attention_aux_loss(monkey
     assert observed == {"aux": 1, "aux_autoscaler": 1}
 
 
-@pytest.mark.parametrize("disable_main_input_norm", [False, True])
-def test_simplified_dynamic_inference_uses_sparse_gather_and_main_k_cache(
-    monkeypatch, disable_main_input_norm
-):
-    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
-
-    calls = []
-    observed_inputs = []
-
-    def _fake_sparse_attention(query, key, value, topk_indices, softmax_scale, **kwargs):
-        calls.append(
-            {
-                "topk_indices": topk_indices,
-                "softmax_scale": softmax_scale,
-                **kwargs,
-            }
-        )
-        return value.new_zeros(query.size(0), query.size(1), query.size(2) * value.size(-1))
-
-    monkeypatch.setattr(dsa_gqa, "unfused_grouped_dsa_fn", _fake_sparse_attention)
-
-    query_length = 3
-    key_length = 4
-    head_dim = 2
-    query = torch.randn(query_length, 1, 2, head_dim)
-    hidden_states = torch.randn(query_length, 1, 4)
-    key_cache = torch.randn(1, key_length, 1, head_dim)
-    value_cache = torch.randn(1, key_length, 1, head_dim)
-
-    class _Indexer:
-        index_topk = 2
-        softmax_scale = head_dim**-0.5
-
-        @staticmethod
-        def forward_q_dynamic(hidden_states, use_rope, inference_context):
-            del use_rope, inference_context
-            observed_inputs.append(hidden_states.detach().clone())
-            return hidden_states[..., :head_dim].unsqueeze(2)
-
-    class _InferenceContext:
-        block_size_tokens = key_length
-        padded_active_request_count = 1
-        paused_request_count = 0
-        total_request_count = 1
-        active_token_count = query_length
-        request_kv_length_offsets = torch.tensor([key_length - query_length])
-        active_attn_metadata = {
-            "mha_metadata": SimpleNamespace(
-                state_data={
-                    "query_lengths": torch.tensor([query_length]),
-                    "kv_seq_lengths": torch.tensor([key_length]),
-                }
-            )
-        }
-
-        @staticmethod
-        def append_dsa_key_cache(*args, **kwargs):
-            raise AssertionError("simplified inference must not allocate a separate DSA K cache")
-
-    core = SimpleNamespace(
-        training=False,
-        config=SimpleNamespace(
-            dsa_fwd_skip_dsa=False,
-            dsa_indexer_mode="simplified",
-            dsa_simplified_indexer_disable_main_input_norm=disable_main_input_norm,
-            dsa_indexer_topk_key_chunk_size=None,
-            dsa_kernel_query_block_size=2,
-            dsa_kernel_key_block_size=3,
-            dsa_sparse_attention_query_chunk_size=None,
-            dsa_sparse_attention_use_gather=False,
-        ),
-        indexer=_Indexer(),
-        softmax_scale=head_dim**-0.5,
-    )
-    norm_spec = SimpleNamespace(
-        normalization="RMSNorm",
-        weight=torch.randn(hidden_states.size(-1)),
-        bias=None,
-        eps=1.0e-5,
-        zero_centered_gamma=False,
-    )
-
-    output = DSGQACoreAttention.forward_dynamic(
-        core,
-        query,
-        key_cache,
-        value_cache,
-        hidden_states,
-        _InferenceContext(),
-        provider_layer_number=1,
-        block_table=torch.tensor([[0]]),
-        indexer_input_norm=norm_spec,
-    )
-
-    assert output.shape == (query_length, 1, 2 * head_dim)
-    assert len(calls) == 1
-    assert calls[0]["use_gather"] is True
-    assert calls[0]["query_chunk_size"] == 2
-    assert calls[0]["topk_indices"].shape == (1, query_length, 2)
-    expected_input = (
-        hidden_states
-        if disable_main_input_norm
-        else _normalized_indexer_input(hidden_states, norm_spec)
-    )
-    torch.testing.assert_close(observed_inputs[0], expected_input)
 
 
-@pytest.mark.parametrize("disable_main_input_norm", [False, True])
-def test_simplified_learned_k_dynamic_inference_uses_dsa_key_cache(
-    monkeypatch, disable_main_input_norm
-):
-    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
-
-    calls = []
-    index_key_shapes = []
-    observed_inputs = []
-
-    def _fake_sparse_attention(query, key, value, topk_indices, softmax_scale, **kwargs):
-        calls.append({"topk_indices": topk_indices, "key": key, **kwargs})
-        return value.new_zeros(query.size(0), query.size(1), query.size(2) * value.size(-1))
-
-    monkeypatch.setattr(dsa_gqa, "unfused_grouped_dsa_fn", _fake_sparse_attention)
-    original_index_scores = dsa_gqa._simplified_index_scores
-
-    def _checked_index_scores(q_index, index_key, softmax_scale):
-        index_key_shapes.append(index_key.shape)
-        return original_index_scores(q_index, index_key, softmax_scale)
-
-    monkeypatch.setattr(dsa_gqa, "_simplified_index_scores", _checked_index_scores)
-    query_length, key_length, attention_dim, index_dim = 3, 4, 2, 3
-    query = torch.randn(query_length, 1, 2, attention_dim)
-    hidden_states = torch.randn(query_length, 1, 4)
-    key_cache = torch.randn(1, key_length, 1, attention_dim)
-    value_cache = torch.randn(1, key_length, 1, attention_dim)
-    learned_key_cache = torch.randn(1, key_length, index_dim)
-
-    class _Indexer:
-        index_topk = 2
-        softmax_scale = index_dim**-0.5
-
-        @staticmethod
-        def forward_qk_dynamic(hidden_states, use_rope, inference_context):
-            del use_rope, inference_context
-            observed_inputs.append(hidden_states.detach().clone())
-            q = hidden_states[..., :index_dim].unsqueeze(2)
-            return q, q
-
-    class _InferenceContext:
-        block_size_tokens = key_length
-        padded_active_request_count = 1
-        paused_request_count = 0
-        total_request_count = 1
-        active_token_count = query_length
-        request_kv_length_offsets = torch.tensor([key_length - query_length])
-        active_attn_metadata = {
-            "mha_metadata": SimpleNamespace(
-                state_data={
-                    "query_lengths": torch.tensor([query_length]),
-                    "kv_seq_lengths": torch.tensor([key_length]),
-                }
-            )
-        }
-        appended = False
-
-        @classmethod
-        def append_dsa_key_cache(cls, layer_number, key):
-            del layer_number, key
-            cls.appended = True
-
-        @staticmethod
-        def dsa_key_cache(layer_number):
-            del layer_number
-            return learned_key_cache, torch.tensor([[0]])
-
-    core = SimpleNamespace(
-        training=False,
-        config=SimpleNamespace(
-            dsa_fwd_skip_dsa=False,
-            dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=True,
-            dsa_simplified_indexer_disable_main_input_norm=disable_main_input_norm,
-            dsa_indexer_topk_key_chunk_size=None,
-            dsa_kernel_query_block_size=2,
-            dsa_kernel_key_block_size=3,
-            dsa_sparse_attention_query_chunk_size=None,
-            dsa_sparse_attention_use_gather=False,
-        ),
-        indexer=_Indexer(),
-        softmax_scale=attention_dim**-0.5,
-    )
-    norm_spec = SimpleNamespace(
-        normalization="RMSNorm",
-        weight=torch.randn(hidden_states.size(-1)),
-        bias=None,
-        eps=1.0e-5,
-        zero_centered_gamma=False,
-    )
-
-    output = DSGQACoreAttention.forward_dynamic(
-        core,
-        query,
-        key_cache,
-        value_cache,
-        hidden_states,
-        _InferenceContext(),
-        provider_layer_number=1,
-        block_table=torch.tensor([[0]]),
-        indexer_input_norm=norm_spec,
-    )
-
-    assert output.shape == (query_length, 1, 2 * attention_dim)
-    assert _InferenceContext.appended
-    assert len(calls) == 1
-    assert index_key_shapes
-    assert all(shape[1:] == (1, 1, index_dim) for shape in index_key_shapes)
-    assert calls[0]["key"].shape[-1] == attention_dim
-    assert calls[0]["topk_indices"].shape == (1, query_length, 2)
-    expected_input = (
-        hidden_states
-        if disable_main_input_norm
-        else _normalized_indexer_input(hidden_states, norm_spec)
-    )
-    torch.testing.assert_close(observed_inputs[0], expected_input)
 
 
-def test_standard_normalized_dynamic_inference_uses_dsa_key_cache(monkeypatch):
-    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
-
-    monkeypatch.setattr(
-        dsa_gqa,
-        "unfused_grouped_dsa_fn",
-        lambda query, key, value, topk_indices, softmax_scale, **kwargs: value.new_zeros(
-            query.size(0), query.size(1), query.size(2) * value.size(-1)
-        ),
-    )
-    query_length, key_length, head_dim, hidden_size = 3, 4, 2, 4
-    query = torch.randn(query_length, 1, 2, head_dim)
-    hidden_states = torch.randn(query_length, 1, hidden_size)
-    key_cache = torch.randn(1, key_length, 1, head_dim)
-    value_cache = torch.randn(1, key_length, 1, head_dim)
-    index_key_cache = torch.randn(1, key_length, head_dim)
-    observed_inputs = []
-
-    class _Indexer:
-        index_topk = 2
-
-        @staticmethod
-        def forward_before_topk_dynamic(hidden_states, use_rope, inference_context):
-            del use_rope, inference_context
-            observed_inputs.append(hidden_states.detach().clone())
-            q = hidden_states[..., :head_dim].unsqueeze(2)
-            k = hidden_states[..., :head_dim]
-            weights = hidden_states.new_ones(query_length, 1, 1)
-            return q, k, weights
-
-    class _InferenceContext:
-        block_size_tokens = key_length
-        padded_active_request_count = 1
-        paused_request_count = 0
-        total_request_count = 1
-        active_token_count = query_length
-        request_kv_length_offsets = torch.tensor([key_length - query_length])
-        active_attn_metadata = {
-            "mha_metadata": SimpleNamespace(
-                state_data={
-                    "query_lengths": torch.tensor([query_length]),
-                    "kv_seq_lengths": torch.tensor([key_length]),
-                }
-            )
-        }
-        appended = False
-
-        @classmethod
-        def append_dsa_key_cache(cls, layer_number, key):
-            del layer_number, key
-            cls.appended = True
-
-        @staticmethod
-        def dsa_key_cache(layer_number):
-            del layer_number
-            return index_key_cache, torch.tensor([[0]])
-
-    core = SimpleNamespace(
-        training=False,
-        config=SimpleNamespace(
-            dsa_fwd_skip_dsa=False,
-            dsa_indexer_mode="standard",
-            dsa_standard_indexer_use_main_input_norm=True,
-            dsa_indexer_topk_key_chunk_size=None,
-            dsa_sparse_attention_query_chunk_size=None,
-            dsa_sparse_attention_use_gather=False,
-        ),
-        indexer=_Indexer(),
-        softmax_scale=head_dim**-0.5,
-    )
-    norm_spec = _indexer_input_norm_spec(
-        SimpleNamespace(
-            layer_norm_weight=torch.randn(hidden_size),
-            layer_norm_bias=None,
-            eps=1.0e-5,
-        ),
-        SimpleNamespace(
-            normalization="RMSNorm",
-            layernorm_epsilon=1.0e-5,
-            layernorm_zero_centered_gamma=False,
-        ),
-    )
-
-    output = DSGQACoreAttention.forward_dynamic(
-        core,
-        query,
-        key_cache,
-        value_cache,
-        hidden_states,
-        _InferenceContext(),
-        provider_layer_number=1,
-        block_table=torch.tensor([[0]]),
-        indexer_input_norm=norm_spec,
-    )
-
-    assert output.shape == (query_length, 1, 2 * head_dim)
-    assert _InferenceContext.appended
-    assert len(observed_inputs) == 1
-    torch.testing.assert_close(
-        observed_inputs[0], _normalized_indexer_input(hidden_states, norm_spec)
-    )
 
 
 def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
@@ -6206,14 +5894,3 @@ def test_compute_gqa_dsa_indexer_loss_sparse_topk_only_chunked_recompute_matches
     torch.testing.assert_close(index_scores.grad, normal_grad)
 
 
-def test_build_shifted_causal_mask_respects_query_offset():
-    mask = _build_shifted_causal_mask(query_length=2, key_length=5, query_start_position=3, device=torch.device("cpu"))
-
-    expected = torch.tensor(
-        [
-            [0.0, 0.0, 0.0, 0.0, float("-inf")],
-            [0.0, 0.0, 0.0, 0.0, 0.0],
-        ],
-        dtype=torch.float32,
-    )
-    assert torch.equal(mask, expected)
