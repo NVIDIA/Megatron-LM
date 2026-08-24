@@ -270,6 +270,20 @@ def test_fused_mlp_partitions_hooks_across_execution_boundaries():
     ]
 
 
+@pytest.mark.parametrize("invalid_source", ["duplicate", "non-descendant"])
+def test_fused_mlp_pre_hook_sources_are_validated(invalid_source):
+    module = _make_fused_mlp_shell()
+    if invalid_source == "duplicate":
+        source_submodules = (module.linear_fc1, module.linear_fc1)
+        error_match = "must not contain duplicates"
+    else:
+        source_submodules = (torch.nn.Linear(2, 2),)
+        error_match = "must be descendants"
+
+    with pytest.raises(ValueError, match=error_match):
+        module._register_forward_pre_hooks_on_fused_impl(torch.nn.Identity(), source_submodules)
+
+
 @pytest.mark.parametrize("hook_kind", ["pre", "post"])
 def test_fused_mlp_partition_still_rejects_fc1_backward_hooks(hook_kind):
     module = _make_fused_mlp_shell()

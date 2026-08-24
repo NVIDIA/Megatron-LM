@@ -274,6 +274,70 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
             (module._norm_seq[0], tuple(module.linear_fc1.modules()))
         ]
 
+    def test_grouped_forward_runs_fc1_hooks_before_norm(self, monkeypatch):
+        import megatron.core.extensions.transformer_engine as te_ext
+
+        fake_te = _patch_fake_te_ops(monkeypatch)
+        module = _make_fake_grouped_mlp(fake_te)
+        module._fused_impl = None
+        module._norm_seq = None
+        module._recipe = object()
+        module.linear_fc2.te_return_bias = False
+        module.linear_fc2.bias = None
+        events = []
+
+        class RecordingBoundary(torch.nn.Module):
+
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+
+            def forward(self, hidden_states, *args):
+                events.append(self.name)
+                return hidden_states
+
+        def make_fused_impl():
+            module._norm_seq = (RecordingBoundary("norm"),)
+            return RecordingBoundary("fused")
+
+        object.__setattr__(module, "_make_fused_impl", make_fused_impl)
+        monkeypatch.setattr(
+            te_ext.te.pytorch, "autocast", lambda enabled, recipe: nullcontext(), raising=False
+        )
+
+        module._get_fused_impl()
+        module.linear_fc1.register_forward_pre_hook(
+            lambda _module, _inputs: events.append("fc1-pre")
+        )
+        module.linear_fc2.register_forward_pre_hook(
+            lambda _module, _inputs: events.append("fc2-pre")
+        )
+
+        with pytest.warns(UserWarning, match="pre-forward hook"):
+            output, bias = TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 3, 4))
+
+        assert events == ["fc1-pre", "norm", "fc2-pre", "fused"]
+        assert output.shape == (2, 3, 4)
+        assert bias is None
+
+    def test_grouped_hook_registration_rejects_external_phase_selection(self, monkeypatch):
+        fake_te = _patch_fake_te_ops(monkeypatch)
+        module = _make_fake_grouped_mlp(fake_te)
+        module._norm_seq = (torch.nn.Identity(),)
+
+        with pytest.raises(ValueError, match="selected internally"):
+            module._register_hooks_on_fused_impl(
+                torch.nn.Identity(), pre_forward_submodules=(module.linear_fc2,)
+            )
+
+    def test_grouped_hook_registration_requires_norm_sequence(self, monkeypatch):
+        fake_te = _patch_fake_te_ops(monkeypatch)
+        module = _make_fake_grouped_mlp(fake_te)
+        module._norm_seq = None
+
+        with pytest.raises(RuntimeError, match="has not been built"):
+            module._register_hooks_on_fused_impl(torch.nn.Identity())
+
     def test_reset_fused_impl_clears_both_grouped_execution_views(self):
         module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
         torch.nn.Module.__init__(module)
