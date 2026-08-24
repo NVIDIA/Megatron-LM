@@ -31,7 +31,7 @@ class HandoffCompletionTracker:
         self.rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
         self.is_coordinator = self.rank == 0
-        self._reports: dict[int, dict[int, tuple[bool, bool]]] = {}
+        self._reports: dict[int, dict[int, tuple[bool, bool]]] = {}  # req -> rank -> (failed, safe)
         self._failure_notified: set[int] = set()
         self._socket: Any = None
         self.sockets = []

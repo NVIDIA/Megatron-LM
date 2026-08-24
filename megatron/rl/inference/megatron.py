@@ -115,7 +115,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
             model=model,
             engine_class=engine_class,
-            reserve_recurrent_state_dummy_slot=disaggregated,
         )
         if disaggregated:
             configure_disagg_engine(inference_engine)

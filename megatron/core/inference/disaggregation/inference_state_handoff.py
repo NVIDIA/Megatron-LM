@@ -68,6 +68,8 @@ class _PreparedHandoffMetadata:
 class InferenceStateHandoffMixin:
     """Optional KV/SSM handoff behavior composed into the dynamic engine."""
 
+    requires_recurrent_state_dummy_slot = True
+
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
 

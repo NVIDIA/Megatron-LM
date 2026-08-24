@@ -9,6 +9,7 @@ import asyncio
 import torch
 import torch.distributed as dist
 
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.utils import get_pg_size
 from megatron.inference.integrations.dynamo.args import add_engine_service_args
 from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
@@ -30,10 +31,9 @@ def _extra_args(parser):
 async def _serve() -> None:
     args = get_args()
     args.return_log_probs = True
-    engine = get_dynamic_inference_engine(
-        engine_class=DynamoDynamicInferenceEngine,
-        reserve_recurrent_state_dummy_slot=args.role in ("prefill", "decode"),
-    )
+    disaggregated = args.role in ("prefill", "decode")
+    engine_class = DynamoDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
+    engine = get_dynamic_inference_engine(engine_class=engine_class)
 
     replica_group = (
         engine.pg_collection.expt_dp
@@ -49,7 +49,7 @@ async def _serve() -> None:
             f"EP={args.expert_model_parallel_size}"
         )
 
-    if args.role in ("prefill", "decode"):
+    if disaggregated:
         engine.setup_kv_transfer(role=args.role)
 
     reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)

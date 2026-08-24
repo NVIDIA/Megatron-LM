@@ -290,12 +290,13 @@ class _MegatronLLMBase:
                 )
 
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
-        if disaggregated:
-            inference_config.reserve_recurrent_state_dummy_slot = True
+        engine_cls = DisaggDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
+        inference_config.reserve_recurrent_state_dummy_slot = (
+            engine_cls.requires_recurrent_state_dummy_slot
+        )
         context = DynamicInferenceContext(model.config, inference_config)
         wrapper = inference_wrapper_cls(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
-        engine_cls = DisaggDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
         engine = engine_cls(controller=controller, context=context)
         if disaggregated:
             configure_prebuilt_disagg_engine(engine)

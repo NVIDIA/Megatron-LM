@@ -383,15 +383,12 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 def get_dynamic_inference_engine(
     model: Optional[MegatronModule] = None,
     engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
-    reserve_recurrent_state_dummy_slot: bool = False,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 
     Args:
         model: Model to serve. Builds and loads one when omitted.
         engine_class: Engine implementation to construct.
-        reserve_recurrent_state_dummy_slot: Reserve the hybrid EP dummy state entry needed when
-            disaggregated handoff can retain all request-owned state slots.
     """
     args = get_args()
     if model is None:
@@ -399,7 +396,9 @@ def get_dynamic_inference_engine(
     tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)
-    inference_config.reserve_recurrent_state_dummy_slot = reserve_recurrent_state_dummy_slot
+    inference_config.reserve_recurrent_state_dummy_slot = (
+        engine_class.requires_recurrent_state_dummy_slot
+    )
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)

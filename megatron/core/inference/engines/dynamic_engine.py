@@ -244,6 +244,8 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
     """
 
+    requires_recurrent_state_dummy_slot = False
+
     # Map stable states to their corresponding asyncio events.
     _STATE_EVENTS = (
         EngineState.RUNNING,
@@ -2288,7 +2290,14 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
     def _find_cg_chunk_size(self, max_chunk_tokens: int) -> Optional[int]:
-        """Return the largest in-budget chunk covered by a captured graph."""
+        """Return the largest chunk size <= max_chunk_tokens where batch matches a captured graph,
+        or None if no graph covers any chunk in the budget.
+
+        Walks the captured-CG list (sorted descending by token_count) and returns the largest chunk
+        that falls within budget and produces an applicable batch_dim under the engine's matching
+        mode (strict for hybrid models). Callers must explicitly handle the None case rather than
+        scheduling eagerly.
+        """
         active_tok = self.context.active_token_count
         active_p = self.context.num_prefill_requests
         active_d = self.context.num_decode_requests
