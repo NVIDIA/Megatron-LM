@@ -58,6 +58,11 @@ class MambaMetadata:
         # Request-owned slots are [0, max_requests). The optional final entry is reused by
         # EP dummy forwards and never enters the request free-slot pool.
         self.dummy_state_idx = max_requests if reserve_dummy_state_slot else None
+        self.dummy_state_indices = (
+            torch.tensor([self.dummy_state_idx], dtype=torch.int32, device='cpu')
+            if self.dummy_state_idx is not None
+            else None
+        )
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv
@@ -185,9 +190,7 @@ class MambaMetadata:
         """Release request slots while preserving states retained for handoff."""
 
         request_slots = self.request_to_mamba_state_idx
-        owned_request_slots = request_slots[
-            (request_slots >= 0) & (request_slots < self.max_requests)
-        ]
+        owned_request_slots = request_slots[request_slots >= 0]
         self._return_slots(owned_request_slots)
         request_slots.fill_(-1)
         self.reset_varlen_metadata()
@@ -935,10 +938,7 @@ class MambaMetadata:
         # Get the Mamba state indices for finished requests
         mamba_indices_to_free = self.request_to_mamba_state_idx[request_indices]
 
-        # The optional EP dummy slot is outside the request-owned pool.
-        mamba_indices_to_free = mamba_indices_to_free[
-            (mamba_indices_to_free >= 0) & (mamba_indices_to_free < self.max_requests)
-        ]
+        mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free >= 0]
         self._return_slots(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests

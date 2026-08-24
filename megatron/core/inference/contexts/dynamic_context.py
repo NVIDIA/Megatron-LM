@@ -2395,9 +2395,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             # the dedicated slot can be reused without request allocation or handoff retention.
             if self.mamba_metadata.dummy_state_idx is not None:
                 assert N == 1, "The reserved recurrent-state dummy slot supports one request"
-                self.mamba_metadata.request_to_mamba_state_idx[0] = (
-                    self.mamba_metadata.dummy_state_idx
-                )
             else:
                 dummy_slots = self.mamba_metadata.batch_allocate_slots(N)
                 assert (
@@ -2649,8 +2646,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
                     self.mamba_slot_allocator.get_intermediate_cpu_data()
                 )
+            active_mamba_indices = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
+            if (
+                is_expert_parallel_dummy_cuda_graph_step
+                and self.mamba_metadata.dummy_state_indices is not None
+            ):
+                active_mamba_indices = self.mamba_metadata.dummy_state_indices
             self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
-                active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
+                active_mamba_indices=active_mamba_indices,
                 token_to_request_idx=self.token_to_request_idx[: self.active_token_count],
                 cpu_cu_query=self._cpu_mha_cu_query_seq_lengths,
                 batch_dimensions=attn_dimensions,

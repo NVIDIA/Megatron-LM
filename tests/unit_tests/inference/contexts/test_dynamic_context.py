@@ -2418,12 +2418,12 @@ class TestDynamicContext:
         assert retained_slots is not None
         assert metadata.mamba_state_free_slot_count == 0
 
-        dummy_dimensions = InferenceBatchDimensions(
-            token_count=ctx.num_speculative_tokens + 1, prefill_req_count=0, decode_req_count=1
+        ctx.initialize_attention_state(
+            is_expert_parallel_dummy_cuda_graph_step=True, transfer_bookkeeping_to_gpu=False
         )
-        ctx.add_dummy_requests_for_expert_parallel_step(dummy_dimensions)
 
-        assert metadata.request_to_mamba_state_idx[0] == metadata.dummy_state_idx
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+        assert ctx._cpu_mamba_batch_indices_decode[0] == metadata.dummy_state_idx
         ctx.reset()
         assert metadata.mamba_state_free_slot_count == 0
 
