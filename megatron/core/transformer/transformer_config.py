@@ -3606,12 +3606,16 @@ class TransformerConfig(ModelParallelConfig):
                 "dsa_sparse_attention_query_chunk_size requires "
                 "dsa_sparse_attention_use_gather or a min-memory dsa_min_memory_backend."
             )
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
-            assert not self.sequence_parallel, (
-                "Currently sequence parallelism is not supported by DSAttention."
-            )
+            if not self.multi_latent_attention:
+                # DSA over MLA supports both (upstream gates CP on cp_comm_type=allgather
+                # below). The GQA path does not: its min-memory kernels have no
+                # sequence-parallel gather and no CP support yet.
+                assert self.context_parallel_size == 1, (
+                    "Context parallelism is not supported by DSA over GQA."
+                )
+                assert not self.sequence_parallel, (
+                    "Sequence parallelism is not supported by DSA over GQA."
+                )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
                 assert self.dsa_sparse_attention_query_chunk_size is None, (
