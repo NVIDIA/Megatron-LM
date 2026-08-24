@@ -261,7 +261,12 @@ class HybridStack(MegatronModule):
 
     @property
     def layer_type_list(self) -> list[str]:
-        """Return layer symbols derived from the per-layer configs for compatibility."""
+        """Return layer symbols derived from the per-layer configs.
+
+        This property exists for backwards-compatibility reasons so callers that read
+        ``HybridStack.layer_type_list`` continue to work. ``layer_config_list`` remains
+        the source of truth.
+        """
         return get_layer_type_list_from_layer_config_list(self.layer_config_list)
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
