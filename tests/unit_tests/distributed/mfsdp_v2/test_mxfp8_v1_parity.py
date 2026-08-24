@@ -122,6 +122,7 @@ class TestMegatronFSDPE2EMxfp8:
         initial_parameters=None,
         *,
         gradient_accumulation_fusion=False,
+        init_model_with_meta_device=None,
         num_steps=None,
     ):
         if num_steps is None:
@@ -137,12 +138,12 @@ class TestMegatronFSDPE2EMxfp8:
         fp8_args = {"fp8": "e4m3", "fp8_recipe": "mxfp8", "fp8_param_gather": True, "bf16": True}
         fsdp_args = {}
         if use_mfsdp_v2:
+            if init_model_with_meta_device is None:
+                init_model_with_meta_device = False
             fsdp_args = {
                 "use_megatron_fsdp": True,
                 "megatron_fsdp_version": 2,
-                # MXFP8 primary weights under fp8_model_init are materialized
-                # eagerly; meta-device init with fp8 weights needs validation.
-                "init_model_with_meta_device": False,
+                "init_model_with_meta_device": init_model_with_meta_device,
                 "ckpt_format": "fsdp_dtensor",
             }
         else:
@@ -244,6 +245,12 @@ class TestMegatronFSDPE2EMxfp8:
                 "grad_norms": grad_norms,
                 "parameters": parameter_snapshots,
                 "fp8_names": fp8_names,
+                "num_fp8_parameter_groups": sum(
+                    isinstance(group, Fp8ParameterGroup)
+                    for model_chunk in model
+                    for submodule in model_chunk.modules()
+                    for group in getattr(submodule, "parameter_groups", ())
+                ),
             }
         finally:
             Utils.destroy_model_parallel()
@@ -330,6 +337,87 @@ class TestMegatronFSDPE2EMxfp8:
             print(f"[{case['name']}] MFSDP v2 run completed successfully.", flush=True)
 
         self._assert_training_parity(actual, reference, case)
+
+    @pytest.mark.skipif(
+        not HAVE_TE_MXFP8TENSOR or torch.cuda.get_device_capability()[0] < 10,
+        reason="Requires a Blackwell GPU with Transformer Engine MXFP8Tensor support.",
+    )
+    def test_meta_reset_feeds_preserved_initialization_to_main_weight(self, monkeypatch):
+        """Meta reset creates MXFP8 weights before v2 consumes their preserved values."""
+        case = {
+            "name": "optim_grads_params MXFP8 meta init",
+            "model_parallel_config": {},
+            "model_config": {
+                "data_parallel_sharding_strategy": "optim_grads_params",
+                "megatron_fsdp_main_grads_dtype": torch.float32,
+                "moe_token_dispatcher_type": "alltoall",
+            },
+        }
+
+        original_init = Fp8ParameterGroup.__init__
+        captured_parameters = 0
+
+        def capture_preserved_initialization(parameter_group, *args, **kwargs):
+            nonlocal captured_parameters
+            parameters = list(kwargs["parameters"].values())
+            expected_main_weights = []
+            for parameter in parameters:
+                assert is_float8tensor(parameter)
+                get_high_precision_init_val = parameter.get_high_precision_init_val
+                high_precision_init_val = get_high_precision_init_val()
+                assert high_precision_init_val is not None
+                expected_main_weights.append(high_precision_init_val.detach().clone())
+
+            original_init(parameter_group, *args, **kwargs)
+
+            for index, expected_main_weight in enumerate(expected_main_weights):
+                actual_main_weight = uneven_dtensor_to_full_tensor(
+                    parameter_group.main_weight.get_dtensor(index)
+                )
+                assert_close(
+                    actual_main_weight,
+                    expected_main_weight.to(
+                        device=actual_main_weight.device, dtype=actual_main_weight.dtype
+                    ),
+                    atol=0,
+                    rtol=0,
+                )
+            captured_parameters += len(parameters)
+
+        monkeypatch.setattr(Fp8ParameterGroup, "__init__", capture_preserved_initialization)
+        result = self._run_training(
+            use_mfsdp_v2=True,
+            case=case,
+            init_model_with_meta_device=True,
+            num_steps=1,
+        )
+        assert captured_parameters > 0
+        assert torch.isfinite(result["losses"][0])
+
+    @pytest.mark.skipif(
+        not HAVE_TE_MXFP8TENSOR or torch.cuda.get_device_capability()[0] < 10,
+        reason="Requires a Blackwell GPU with Transformer Engine MXFP8Tensor support.",
+    )
+    def test_zero1_mxfp8_multiple_steps(self):
+        """Replicated MXFP8 compute weights survive repeated ZeRO-1 updates."""
+        case = {
+            "name": "DP4 optim MXFP8",
+            "model_parallel_config": {},
+            "model_config": {
+                "data_parallel_sharding_strategy": "optim",
+                "megatron_fsdp_main_grads_dtype": torch.float32,
+                "moe_token_dispatcher_type": "alltoall",
+                "fsdp_trace_pool": True,
+            },
+        }
+        result = self._run_training(use_mfsdp_v2=True, case=case, num_steps=3)
+
+        assert result["num_fp8_parameter_groups"] > 0
+        assert torch.isfinite(torch.stack(result["losses"])).all()
+        assert all(grad_norm is not None for grad_norm in result["grad_norms"])
+        assert torch.isfinite(
+            torch.stack([torch.as_tensor(grad_norm) for grad_norm in result["grad_norms"]])
+        ).all()
 
     @pytest.mark.skipif(
         not HAVE_TE_MXFP8TENSOR or torch.cuda.get_device_capability()[0] < 10,

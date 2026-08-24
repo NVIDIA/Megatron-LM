@@ -8,16 +8,16 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.distributed_c10d import _world
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Flat, Partial
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Replicate as FsdpReplicate
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -76,6 +76,133 @@ class TestMcoreAdapterDense:
     def teardown_method(self):
         _destroy_model_parallel()
 
+    def test_meta_reset_preserves_replaced_parameter_metadata(self):
+        """A reset that swaps Parameter identity must retain MCore metadata."""
+
+        class ReplacingParameterModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.empty(4, 4, device="meta"), requires_grad=False
+                )
+
+            def reset_parameters(self):
+                self.weight = torch.nn.Parameter(torch.ones_like(self.weight))
+
+        module = ReplacingParameterModule()
+        old_parameter = module.weight
+        old_parameter.tensor_model_parallel = True
+        old_parameter.partition_dim = 1
+        old_parameter.partition_stride = 2
+        old_parameter.expert_tp = True
+        old_parameter.is_qkv = True
+        old_parameter.qkv_split_shapes = [1, 2, 1]
+        old_parameter._tensor_parallel_mode = "row"
+        old_parameter.allreduce = False
+        old_parameter.average_gradients_across_tp_domain = True
+        old_parameter.sequence_parallel = True
+        old_parameter.shared = True
+        old_parameter.shared_embedding = True
+        old_parameter.is_embedding_or_output_parameter = True
+        old_parameter.is_embedding_parameter = True
+        old_parameter.is_gtp_weight_remat = True
+        old_parameter.skip_backward_post_hook = True
+
+        mcore_fsdp_adapter.FullyShardedDataParallelV2._reset_meta_parameters_before_fully_shard(
+            module=module,
+            device=torch.device("cuda"),
+            init_param_with_fp8=False,
+        )
+
+        parameter = module.weight
+        assert parameter is not old_parameter
+        assert not parameter.is_meta
+        assert not parameter.requires_grad
+        assert torch.equal(parameter, torch.ones_like(parameter))
+        for attribute in (
+            "tensor_model_parallel",
+            "partition_dim",
+            "partition_stride",
+            "expert_tp",
+            "is_qkv",
+            "qkv_split_shapes",
+            "_tensor_parallel_mode",
+            "allreduce",
+            "average_gradients_across_tp_domain",
+            "sequence_parallel",
+            "shared",
+            "shared_embedding",
+            "is_embedding_or_output_parameter",
+            "is_embedding_parameter",
+            "is_gtp_weight_remat",
+            "skip_backward_post_hook",
+        ):
+            assert getattr(parameter, attribute) == getattr(old_parameter, attribute)
+
+    def test_adapter_preserves_sharded_parameter_metadata(self):
+        """The optimizer-facing Parameter retains topology and grouping metadata."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            ffn_hidden_size=16,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        model = torch.nn.Linear(8, 8, bias=False, device="cuda", dtype=torch.bfloat16)
+        source = model.weight
+        source.tensor_model_parallel = True
+        source.partition_dim = 1
+        source.partition_stride = 2
+        source.expert_tp = True
+        source.is_qkv = True
+        source.qkv_split_shapes = [2, 4, 2]
+        source._tensor_parallel_mode = "row"
+        source.allreduce = False
+        source.average_gradients_across_tp_domain = True
+        source.sequence_parallel = True
+        source.shared = True
+        source.shared_embedding = True
+        source.is_embedding_or_output_parameter = True
+        source.is_embedding_parameter = True
+        source.is_gtp_weight_remat = True
+        source.grad_norm_group = "test"
+
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            fsdp_unit_modules=[],
+            pg_collection=ProcessGroupCollection(dp_cp=self.pg_collection.dp_cp),
+        )
+
+        sharded = wrapped.module.weight
+        assert sharded is not source
+        for attribute in (
+            "tensor_model_parallel",
+            "partition_dim",
+            "partition_stride",
+            "expert_tp",
+            "is_qkv",
+            "qkv_split_shapes",
+            "_tensor_parallel_mode",
+            "allreduce",
+            "average_gradients_across_tp_domain",
+            "sequence_parallel",
+            "shared",
+            "shared_embedding",
+            "is_embedding_or_output_parameter",
+            "is_embedding_parameter",
+            "is_gtp_weight_remat",
+            "grad_norm_group",
+        ):
+            assert getattr(sharded, attribute) == getattr(source, attribute)
+
     def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,
@@ -124,6 +251,77 @@ class TestMcoreAdapterDense:
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
 
+    def test_zero1_trace_pool_placements_and_multiple_steps(self):
+        """ZeRO-1 with trace replay should shard only optimizer state across steps."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim",
+                num_distributed_optimizer_instances=1,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+                fsdp_trace_pool=True,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert tuple(model.mesh.mesh.shape) == (torch.distributed.get_world_size(),)
+        parameter_group = model.module.parameter_groups[0]
+        assert parameter_group._persistent_model_weight
+        assert isinstance(parameter_group.model_weight.placements[0], Replicate)
+        assert isinstance(parameter_group._main_grad_placements[0], Partial)
+        assert isinstance(parameter_group.main_weight.placements[0], Flat)
+
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=self.pg_collection,
+        )
+        optimizer.reload_model_params()
+
+        losses = []
+        for _ in range(3):
+            model.zero_grad_buffer()
+            optimizer.zero_grad(set_to_none=True)
+            batch = torch.randn(4, config.hidden_size, device="cuda", dtype=config.params_dtype)
+            loss = model(batch).float().square().mean()
+            loss.backward()
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(loss.detach())
+
+        assert torch.isfinite(torch.stack(losses)).all()
+
+    @pytest.mark.skipif(
+        not hasattr(symm_mem, "is_symm_mem_tensor"),
+        reason="Requires PyTorch symmetric-memory tensor detection.",
+    )
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,
@@ -358,6 +556,7 @@ class TestMcoreAdapterDense:
             for parameter_group in module.parameter_groups
         ]
         assert parameter_groups
+        assert all(not group._persistent_model_weight for group in parameter_groups)
         sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
         for parameter_group in parameter_groups:
             sync_model_weight = parameter_group.sync_model_weight_from_main_weight
@@ -1082,7 +1281,8 @@ class TestMcoreAdapterHybridInternalPlacements:
         )
 
         parameter_group = model.module.parameter_groups[0]
-        assert isinstance(parameter_group.model_weight.placements[0], FsdpReplicate)
+        assert parameter_group._persistent_model_weight
+        assert isinstance(parameter_group.model_weight.placements[0], Replicate)
         assert isinstance(parameter_group.model_weight.placements[1], Flat)
         assert isinstance(parameter_group._main_grad_placements[0], Partial)
         assert isinstance(parameter_group._main_grad_placements[1], Flat)
@@ -1173,9 +1373,8 @@ class TestMcoreAdapterHybridInternalPlacements:
             for parameter_group in parameter_groups
         }
 
-        # Meta reset populates main_weight by staging through model_weight. Clear
-        # the compute shards and reconstruct them from main_weight to verify that
-        # the staged outer-axis scatter preserved every logical tensor exactly.
+        # Clear the compute shards and reconstruct them from main_weight to verify
+        # that meta initialization preserved every logical tensor exactly.
         for parameter_group in parameter_groups:
             parameter_group.model_weight.local_buffer.zero_()
             parameter_group.sync_model_weight_from_main_weight()

@@ -1033,6 +1033,61 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("enable_trace_pool", [False, True], ids=["allocator", "trace-pool"])
+@pytest.mark.parametrize(
+    "grad_comm_dtype", [torch.float32, None], ids=["explicit", "inherit-main-grad"]
+)
+def test_unfused_partial_grad_uses_grad_comm_dtype(
+    distributed_setup, monkeypatch, enable_trace_pool, grad_comm_dtype
+):
+    """Unfused gradient staging honors the effective communication dtype."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(8, 8, bias=False, device=device, dtype=torch.bfloat16)
+    policy = MixedPrecisionPolicy(
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        grad_comm_dtype=grad_comm_dtype,
+    )
+    with fully_shard_context(device=device, enable_trace_pool=enable_trace_pool):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=policy,
+        )
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, foreach=False)
+    fully_shard_optimizer(optimizer)
+
+    (parameter_group,) = model.parameter_groups
+    observed_dtypes = []
+    original_reduce = parameter_group.reduce_partial_gradients
+
+    def record_partial_grad_dtype(partial_grad, is_last_microbatch=True):
+        observed_dtypes.append(partial_grad.dtype)
+        return original_reduce(partial_grad, is_last_microbatch)
+
+    monkeypatch.setattr(parameter_group, "reduce_partial_gradients", record_partial_grad_dtype)
+    inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
+    weight_before_step = model.weight.to_local().detach().clone()
+    model(inputs).float().sum().backward()
+
+    assert observed_dtypes == [torch.float32]
+    assert model.weight.grad.dtype == torch.float32
+    assert torch.isfinite(model.weight.grad.to_local()).all()
+
+    optimizer.step()
+
+    weight_after_step = model.weight.to_local()
+    assert torch.isfinite(weight_after_step).all()
+    assert not torch.equal(weight_after_step, weight_before_step)
+    assert torch.isfinite(model(inputs).float()).all()
+
+
 def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     """The next forward should observe weights updated by the previous optimizer step."""
     world_size = distributed_setup.world_size
