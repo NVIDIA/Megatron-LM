@@ -13,8 +13,9 @@ Compared to :class:`SFTDataset`, this dataset adds:
 
   * **Multi-source loading** — accepts HuggingFace Hub repo ids
     (``owner/repo``), local ``.parquet`` files, and local ``.jsonl/.json``
-    files; the latter are read via pandas to sidestep pyarrow's per-chunk
-    JSON schema inference which fails when sample fields vary across rows.
+    files; the latter are parsed with the stdlib ``json`` module and built in
+    a single pyarrow pass to sidestep the per-chunk JSON schema inference
+    that fails when sample fields vary across rows.
 
   * **Auto schema detection** — four input layouts are auto-detected by column
     name. The three instruction-tuning layouts are normalized to the messages
@@ -47,6 +48,7 @@ Limitations (raise a clear ``ValueError`` instead of silently mishandling):
   * For HF Hub repos, only ``split="train"`` is loaded.
 """
 
+import json
 import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -250,12 +252,13 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
       * Local ``.parquet`` — loaded via
         ``datasets.load_dataset("parquet", data_files=path, split="all")``;
         parquet's footer schema makes chunked loading safe.
-      * Otherwise local jsonl/json — loaded via pandas
-        ``read_json(lines=True)`` and wrapped in ``Dataset.from_pandas``.
-        We avoid ``datasets.load_dataset("json", ...)`` for local files
-        because its pyarrow-based JSON reader infers schema per parallel
-        chunk and fails with ``CastError`` when the union of fields varies
-        between rows (e.g. LongAlpaca-12k).
+      * Otherwise local jsonl/json — parsed line-by-line with the stdlib
+        ``json`` module and built with ``Dataset.from_list``. We avoid
+        ``datasets.load_dataset("json", ...)`` for local files because its
+        pyarrow-based JSON reader infers schema per parallel chunk and fails
+        with ``CastError`` when the union of fields varies between rows
+        (e.g. LongAlpaca-12k); ``from_list`` unifies the schema over the
+        whole file in one pass.
 
     A per-sample converter is selected once at construction time based on
     column names and applied at access time. The instruction-tuning schemas
@@ -279,15 +282,14 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
                 "parquet", data_files=dataset_path, split="all"
             )
         else:
-            try:
-                import pandas as pd
-            except ImportError as exc:
-                raise ImportError(
-                    "VarlenDataset requires `pandas` to load local jsonl "
-                    "files (pip install pandas)."
-                ) from exc
-            df = pd.read_json(dataset_path, lines=True)
-            self.dataset = Dataset.from_pandas(df, preserve_index=False)
+            # Parse the jsonl with the stdlib and build the table in one
+            # pyarrow pass: datasets.load_dataset("json", ...) infers schema
+            # per parallel chunk and fails with CastError when the union of
+            # fields varies between rows (e.g. LongAlpaca-12k); building from
+            # the full record list sidesteps that without a pandas dependency.
+            with open(dataset_path) as f:
+                records = [json.loads(line) for line in f if line.strip()]
+            self.dataset = Dataset.from_list(records)
 
         self._converter, self._schema_name = _select_converter(
             list(self.dataset.column_names)

@@ -316,7 +316,6 @@ def _write_jsonl(tmp_path: Path, rows):
 
 def test_low_level_loads_jsonl_alpaca(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -335,7 +334,6 @@ def test_low_level_loads_jsonl_alpaca(tmp_path):
 
 def test_low_level_loads_jsonl_sharegpt(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -354,7 +352,6 @@ def test_low_level_loads_jsonl_sharegpt(tmp_path):
 
 def test_low_level_loads_jsonl_messages(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
@@ -374,9 +371,8 @@ def test_low_level_loads_jsonl_messages(tmp_path):
 
 def test_low_level_jsonl_heterogeneous_columns(tmp_path):
     """Real datasets often mix rows that have / lack an optional field. Our
-    pandas-based loader must accept the union schema without ``CastError``."""
+    loader must accept the union schema without ``CastError``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     rows = [{"instruction": "a", "output": "x"}] * 100 + [
         {"instruction": "b", "output": "y", "file": "extra"}
     ] * 100
@@ -390,7 +386,6 @@ def test_low_level_jsonl_heterogeneous_columns(tmp_path):
 
 def test_low_level_rejects_unknown_schema(tmp_path):
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(tmp_path, [{"foo": "bar"}])
     with pytest.raises(ValueError, match="cannot infer schema"):
         VarlenLowLevelDataset(path)
@@ -400,7 +395,6 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     """Pretrain-text corpora (Dolma / OLMo midtraining) typically have
     ``text`` + extra fields like ``id`` / ``url`` / ``metadata``."""
     pytest.importorskip("datasets")
-    pytest.importorskip("pandas")
     path = _write_jsonl(
         tmp_path,
         [
