@@ -12,6 +12,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_layer_counts,
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
+    get_layer_maps_from_layer_config_list,
     get_layer_maps_from_layer_type_list,
     parse_hybrid_pattern,
     pattern_from_ratios,
@@ -1012,3 +1013,54 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mamba_map == {2: 0}
         assert mlp_map == {3: 0}
         assert moe_map == {}
+
+
+@pytest.mark.internal
+class TestGetLayerMapsFromLayerConfigList:
+    """Tests for get_layer_maps_from_layer_config_list."""
+
+    def test_matches_symbol_derived_maps(self):
+        """Config-derived maps match symbol-derived maps for every layer type."""
+        layer_symbols = list(_EXPECTED_LAYER_CONFIG_CLASSES)
+        layer_configs = [
+            _EXPECTED_LAYER_CONFIG_CLASSES[layer_symbol](
+                num_layers=1, hidden_size=64, num_attention_heads=4
+            )
+            for layer_symbol in layer_symbols
+        ]
+
+        assert get_layer_maps_from_layer_config_list(
+            layer_configs
+        ) == get_layer_maps_from_layer_type_list(layer_symbols)
+
+    def test_accepts_config_subclasses(self):
+        """Config subclasses map to their parent's canonical symbol."""
+
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        maps = get_layer_maps_from_layer_config_list(
+            [
+                CustomMambaLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4),
+                AttentionLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4),
+            ]
+        )
+
+        assert maps[Symbols.MAMBA] == {0: 0}
+        assert maps[Symbols.ATTENTION] == {1: 0}
+
+    def test_rejects_unknown_config_types(self):
+        """Unknown config classes fail instead of silently omitting a layer."""
+        with pytest.raises(ValueError, match="Unexpected hybrid layer config type: object"):
+            get_layer_maps_from_layer_config_list([object()])
+
+    def test_rejects_ambiguous_config_types(self):
+        """A config matching multiple registered layer types is ambiguous."""
+
+        class AmbiguousLayerConfig(MambaLayerConfig, AttentionLayerConfig):
+            pass
+
+        with pytest.raises(ValueError, match="Ambiguous hybrid layer config type"):
+            get_layer_maps_from_layer_config_list(
+                [AmbiguousLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)]
+            )

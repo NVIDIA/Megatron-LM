@@ -568,3 +568,22 @@ def get_layer_type_list_from_layer_config_list(
         The canonical layer symbol for each config.
     """
     return [_get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list]
+
+
+def get_layer_maps_from_layer_config_list(
+    layer_config_list: Sequence[TransformerConfig],
+) -> dict[str, dict[int, int]]:
+    """Return per-type layer maps for a list of layer configs.
+
+    Config subclasses are normalized to their canonical layer symbol before delegating
+    to ``get_layer_maps_from_layer_type_list`` so both APIs share one indexing implementation.
+
+    Args:
+        layer_config_list: Per-layer configs in global layer order.
+
+    Returns:
+        Maps from global layer index to type-local layer index, keyed by layer symbol.
+    """
+    return get_layer_maps_from_layer_type_list(
+        get_layer_type_list_from_layer_config_list(layer_config_list)
+    )
