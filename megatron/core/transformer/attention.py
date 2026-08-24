@@ -288,6 +288,14 @@ class Attention(MegatronModule, ABC):
     "cross attn" specializations.
     """
 
+    uses_attention_mask: bool = True
+    """Whether this module consumes the ``attention_mask`` argument and exposes
+    ``attn_mask_type``. Softmax attention does; linear-attention variants that occupy the
+    same ``self_attention`` slot (e.g. ``GatedDeltaNet``) do not, and set this to ``False``
+    so callers can skip building an attention mask they would only discard. Callers should
+    read it with ``getattr(module, "uses_attention_mask", True)`` so third-party attention
+    modules keep the softmax-attention behaviour by default."""
+
     def __init__(
         self,
         config: TransformerConfig,

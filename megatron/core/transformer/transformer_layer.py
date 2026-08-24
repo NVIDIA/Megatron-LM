@@ -1252,6 +1252,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
         )
+        # Linear-attention variants (e.g. GatedDeltaNet) sit in the self_attention slot but
+        # accept `attention_mask` only for signature compatibility and never read it, and
+        # they have no `attn_mask_type`. Building a mask for them costs a persistent
+        # [mbs, 1, slen, seq] buffer that is discarded, and probing attn_mask_type raises
+        # AttributeError. Note this must not fold into attn_in_graph: those layers still
+        # need the THD cu_seqlens static inputs below. Defaults to True so third-party
+        # attention modules keep the softmax-attention behaviour.
+        attn_uses_mask = getattr(self.self_attention, "uses_attention_mask", True)
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
@@ -1276,7 +1284,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             static_inputs["padding_mask"] = torch.zeros(
                 1, slen_for_mask, dtype=torch.bool, device=device
             )
-        elif attn_in_graph:
+        elif attn_in_graph and attn_uses_mask:
             if not self.config.create_attention_mask_in_dataloader:
                 if self.self_attention.attn_mask_type not in (
                     AttnMaskType.causal,
