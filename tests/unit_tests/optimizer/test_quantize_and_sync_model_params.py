@@ -139,6 +139,34 @@ def test_a_nested_chained_optimizer_stages_its_own_members():
     assert log.count(('sync', 'chunk', True)) == 1, log
 
 
+def test_an_empty_chain_refreshes_without_touching_config():
+    """A rank with no trainable parameters gets ChainedOptimizer([]).
+
+    __init__ takes the else branch there and never assigns self.config, so reading
+    self.config.reuse_grad_buf_for_mxfp8_param_ag raises AttributeError rather than
+    returning a default. Loading a quantized checkpoint on such a rank must not crash.
+    """
+    chained = ChainedOptimizer([])
+    assert chained.is_stub_optimizer
+    assert not hasattr(chained, 'config')
+
+    chained.quantize_and_sync_model_params_from_main_params()
+    chained._stage_model_params_from_main_params()
+
+
+def test_a_chain_of_only_stubs_stages_nothing():
+    """Every member being a stub makes the chain itself a stub."""
+    log = []
+    config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=True)
+    stub = _FakeOptimizer(log, 'stub', config, [], is_stub_optimizer=True)
+    chained = ChainedOptimizer([stub])
+    assert chained.is_stub_optimizer
+
+    chained.quantize_and_sync_model_params_from_main_params()
+
+    assert log == []
+
+
 def test_base_optimizer_refresh_is_a_no_op():
     """Optimizers with no main params inherit a no-op rather than failing."""
 
