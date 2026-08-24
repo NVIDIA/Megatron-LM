@@ -10,15 +10,20 @@ field-for-field, except the two fields that
 
 import argparse
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from examples.mimo.model_providers.nemotron_moe_vlm import (
     NEMOTRON_MODEL_PROVIDER,
+    _nemotron_bridge_recv_shape,
     add_model_provider_args,
+    build_nemotron_communicator,
 )
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.args import add_hetero_grid_args
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.transformer.enums import AttnBackend
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
@@ -103,6 +108,61 @@ def test_vision_encoder_attention_backend_arg_uses_full_enum(backend):
     args = _parse(argv)
 
     assert args.mimo_vision_encoder_attention_backend is backend
+
+
+def test_bridge_receive_shape_uses_local_image_token_count():
+    batch = {"input_ids": torch.tensor([[42, 7, 42], [3, 42, 5]])}
+
+    assert _nemotron_bridge_recv_shape(batch, image_token_id=42, hidden_size=2688) == (3, 2688)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "language_rank_input_projection", "expected_hidden_size"),
+    [(False, False, None), (True, False, 2688), (True, True, 5120)],
+    ids=["legacy", "encoder_rank_projection", "language_rank_projection"],
+)
+def test_build_communicator_wires_bridge_receive_shape(
+    monkeypatch, enabled, language_rank_input_projection, expected_hidden_size
+):
+    import examples.mimo.model_providers.nemotron_moe_vlm as provider
+
+    captured = {}
+    communicator = object()
+    language_grid = object()
+    topology = SimpleNamespace(
+        grids={RADIO_ENCODER_MODULE_NAME: object(), MIMO_LANGUAGE_MODULE_KEY: language_grid}
+    )
+    args = SimpleNamespace(
+        mimo_bridge_skip_shape_exchange=enabled,
+        mimo_run_input_projections_on_llm_ranks=language_rank_input_projection,
+        mimo_encoder_tp=4,
+        image_token_id=42,
+        hidden_size=2688,
+    )
+
+    monkeypatch.setattr(
+        provider,
+        "language_model_spec",
+        lambda args, pg_collection, grid: SimpleNamespace(params={"config": object()}),
+    )
+    monkeypatch.setattr(provider, "radio_vision_config", lambda args, tp, pp: object())
+    monkeypatch.setattr(provider, "_vision_projection_input_size", lambda args, config: 5120)
+
+    def capture_communicator(*args, **kwargs):
+        captured.update(kwargs)
+        return communicator
+
+    monkeypatch.setattr(provider, "MultiModulePipelineCommunicator", capture_communicator)
+
+    assert build_nemotron_communicator(args, topology) is communicator
+    shape_fns = captured["bridge_recv_shape_fns"]
+    if enabled:
+        assert shape_fns[RADIO_ENCODER_MODULE_NAME]({"input_ids": torch.tensor([[42, 7, 42]])}) == (
+            2,
+            expected_hidden_size,
+        )
+    else:
+        assert shape_fns is None
 
 
 # --- Config parity gate (requires torch; runs in CI) ----------------------

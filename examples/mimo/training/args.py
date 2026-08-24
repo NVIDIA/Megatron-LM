@@ -85,6 +85,14 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
             "when loading a checkpoint saved with the other placement."
         ),
     )
+    grid.add_argument(
+        "--mimo-bridge-skip-shape-exchange",
+        action="store_true",
+        help=(
+            "Derive MIMO fan-out receive shapes from language-batch metadata and skip "
+            "bridge shape exchange."
+        ),
+    )
     return parser
 
 
