@@ -1047,6 +1047,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_num_dispatch_output_buffers: int = 0
+    """Number of persistent caller-provided buffers for HybridEP permuted token outputs.
+
+    A positive value avoids caching-allocator pending-free accumulation in the combined-1F1B
+    schedule. Two buffers preserve overlap between forward and backward expert computation.
+    Requires static HybridEP output shapes and low-precision expert GEMMs. Zero disables reuse.
+    """
+
     moe_ncclep_static_shape: bool = False
     """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
     instead of narrowing to the (data-dependent) number of received tokens, removing the D2H sync
@@ -2102,6 +2110,37 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
+                )
+
+        if self.moe_hybridep_num_dispatch_output_buffers < 0:
+            raise ValueError("moe_hybridep_num_dispatch_output_buffers must be non-negative")
+        if self.moe_hybridep_num_dispatch_output_buffers > 0:
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires the HybridEP flex "
+                    "dispatcher"
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires "
+                    "overlap_moe_expert_parallel_comm"
+                )
+            if (
+                self.moe_expert_rank_capacity_factor is None
+                and not self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires a static HybridEP "
+                    "output size from moe_expert_rank_capacity_factor or "
+                    "moe_pad_expert_input_to_capacity"
+                )
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires FP8 or FP4 expert "
+                    "GEMMs so the BF16 dispatch input is not saved for backward"
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into

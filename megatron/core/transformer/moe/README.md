@@ -311,6 +311,15 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 
+For combined-1F1B HybridEP training with static dispatch shapes, setting
+`--moe-hybridep-num-dispatch-output-buffers 2` reuses two persistent token-output tensors
+instead of allocating one for every dispatch. The schedule records each expert consumer's CUDA
+completion event before returning a slot to the ring, which avoids caching-allocator pending-free
+accumulation without removing forward/backward overlap. This requires
+`--overlap-moe-expert-parallel-comm`, FP8 or FP4 expert GEMMs, and a static output bound from
+`--moe-expert-rank-capacity-factor` or `--moe-pad-expert-input-to-capacity`. The installed DeepEP
+must expose the caller-provided `output_token` argument; Megatron fails early otherwise.
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
@@ -556,6 +565,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-pad-expert-input-to-capacity | Pad to capacity | False |
 | --moe-token-drop-policy | Drop policy: probs, position | probs |
 | --moe-permute-fusion | Fuse permutation ops | False |
+| --moe-hybridep-num-dispatch-output-buffers | Persistent caller-owned HybridEP token output ring | 0 |
 
 ### Performance Optimization
 | Argument | Description | Default |
