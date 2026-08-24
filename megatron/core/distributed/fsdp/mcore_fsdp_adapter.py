@@ -30,7 +30,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -61,6 +61,19 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _placements_from_sharding_strategy(strategy: str) -> Placements:
+    """Translate an MFSDP sharding strategy into parameter, gradient, and optimizer placements."""
+    if strategy == "no_shard":
+        return Placements([0], [Replicate()], [Partial("avg")], [Replicate()])
+    if strategy == "optim":
+        return Placements([0], [Replicate()], [Partial("avg")], [Shard(0)])
+    if strategy == "optim_grads":
+        return Placements([0], [Replicate()], [Shard(0)], [Shard(0)])
+    if strategy == "optim_grads_params":
+        return Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
+    raise ValueError(f"Unsupported MFSDP sharding strategy: {strategy}")
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -559,8 +572,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             expert_dp_mesh = DeviceMesh.from_group(
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
-        placements = Placements(
-            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        dense_placements = _placements_from_sharding_strategy(
+            ddp_config.data_parallel_sharding_strategy
+        )
+        expert_placements = _placements_from_sharding_strategy(
+            ddp_config.expert_data_parallel_sharding_strategy
+            or ddp_config.data_parallel_sharding_strategy
         )
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -576,7 +593,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
-                            placements=placements,
+                            placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
                         )
@@ -589,11 +606,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
-                        placements=placements,
+                        placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
                     )
             fully_shard(
-                module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                mixed_precision_policy=self.mp_policy,
             )
         super().__init__(config=config, module=module)
 
