@@ -2,14 +2,20 @@
 """Plumbing of ``quantize_and_sync_model_params_from_main_params``.
 
 Chained optimizers (dense + expert, or a LayerWise/DistOpt pair) commonly own the *same*
-DDP model chunk, and under ``--reuse-grad-buf-for-mxfp8-param-ag`` the param buffer aliases
-the grad buffer. So the per-chunk work has to happen exactly once and in a fixed order:
-zero every shared buffer, then let each optimizer stage its own shards into it, then gather
-once. Getting that wrong corrupts weights silently -- a second zero wipes the shards a
-sibling optimizer already staged -- which is why it is worth pinning without a GPU.
+DDP model chunk, so the per-chunk work has to happen exactly once and in a fixed order:
+every optimizer stages its own shards, then the chunk is gathered once.
+
+The refresh must not zero the DDP buffers. Staging writes each rank's own shard and the
+forced gather rewrites every byte that is later read back as a param, so a zero buys
+nothing -- and under ``--reuse-grad-buf-for-mxfp8-param-ag`` the param buffer aliases the
+grad buffer, where clearing a bucket that mixes quantized and non-quantized params would
+wipe the non-quantized weights that alias it. ``_post_param_sync`` skips exactly those
+buckets for that reason. None of this needs a GPU to pin.
 """
 
 from types import SimpleNamespace
+
+import pytest
 
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
 
@@ -59,13 +65,12 @@ def _build(reuse_grad_buf, share_chunk=True, with_stub=False):
     return ChainedOptimizer(members), log
 
 
-def test_shared_model_chunk_is_zeroed_and_gathered_once():
-    """Two optimizers, one shared chunk: one zero and one gather, not two of each."""
+def test_shared_model_chunk_is_gathered_once():
+    """Two optimizers, one shared chunk: one gather, not one per optimizer."""
     optimizer, log = _build(reuse_grad_buf=True)
 
     optimizer.quantize_and_sync_model_params_from_main_params()
 
-    assert log.count(('zero', 'chunk_a')) == 1, log
     assert log.count(('sync', 'chunk_a', True)) == 1, log
     assert [entry for entry in log if entry[0] == 'stage'] == [
         ('stage', 'dense'),
@@ -73,30 +78,34 @@ def test_shared_model_chunk_is_zeroed_and_gathered_once():
     ], log
 
 
-def test_buffer_is_zeroed_before_any_optimizer_stages_into_it():
-    """A zero after a stage would wipe shards the sibling optimizer already wrote."""
+def test_every_optimizer_stages_before_the_gather():
+    """Gathering early would broadcast shards a sibling optimizer has not written yet."""
     optimizer, log = _build(reuse_grad_buf=True)
 
     optimizer.quantize_and_sync_model_params_from_main_params()
 
     order = [entry[0] for entry in log]
-    assert order.index('zero') < order.index('stage'), log
     assert max(i for i, k in enumerate(order) if k == 'stage') < order.index('sync'), log
 
 
-def test_distinct_model_chunks_are_each_zeroed_and_gathered():
+def test_distinct_model_chunks_are_each_gathered():
     optimizer, log = _build(reuse_grad_buf=True, share_chunk=False)
 
     optimizer.quantize_and_sync_model_params_from_main_params()
 
     for name in ('chunk_a', 'chunk_b'):
-        assert log.count(('zero', name)) == 1, log
         assert log.count(('sync', name, True)) == 1, log
 
 
-def test_grad_buffer_is_not_zeroed_when_the_buffer_is_not_reused():
-    """Without the shared param/grad buffer there is nothing to zero, only stage and gather."""
-    optimizer, log = _build(reuse_grad_buf=False)
+@pytest.mark.parametrize("reuse_grad_buf", [True, False])
+def test_the_refresh_never_zeroes_the_grad_buffer(reuse_grad_buf):
+    """Staging plus the forced gather rewrites every param byte, so zeroing buys nothing.
+
+    It is not merely redundant under --reuse-grad-buf-for-mxfp8-param-ag: zeroing a bucket
+    that mixes quantized and non-quantized params would clear the non-quantized weights,
+    which alias that buffer and are not restaged from the masters.
+    """
+    optimizer, log = _build(reuse_grad_buf=reuse_grad_buf)
 
     optimizer.quantize_and_sync_model_params_from_main_params()
 
@@ -135,16 +144,16 @@ def test_a_nested_chained_optimizer_stages_its_own_members():
 
     staged = [entry[1] for entry in log if entry[0] == 'stage']
     assert staged == ['inner_a', 'inner_b', 'outer'], log
-    assert log.count(('zero', 'chunk')) == 1, log
     assert log.count(('sync', 'chunk', True)) == 1, log
 
 
 def test_an_empty_chain_refreshes_without_touching_config():
     """A rank with no trainable parameters gets ChainedOptimizer([]).
 
-    __init__ takes the else branch there and never assigns self.config, so reading
-    self.config.reuse_grad_buf_for_mxfp8_param_ag raises AttributeError rather than
-    returning a default. Loading a quantized checkpoint on such a rank must not crash.
+    __init__ takes the else branch there and never assigns self.config, and it does not
+    call super().__init__(), so the attribute does not exist rather than holding None.
+    Any config read added to the refresh would raise AttributeError on exactly those
+    ranks, which is what the is_stub_optimizer guard and this test exist to prevent.
     """
     chained = ChainedOptimizer([])
     assert chained.is_stub_optimizer

@@ -2907,10 +2907,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Re-derive and all-gather the model params (see MegatronOptimizer)."""
         if self.is_stub_optimizer:
             return
-        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
-            # The param buffer aliases the grad buffer, so zero it before staging into it.
-            for model_chunk in self.model_chunks:
-                model_chunk.zero_grad_buffer()
         self._stage_model_params_from_main_params()
         # Each rank only owns a shard of the main params, so the full params have to be
         # gathered. The caller is outside the training loop, so gather synchronously
