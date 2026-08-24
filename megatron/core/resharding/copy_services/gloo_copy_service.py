@@ -70,6 +70,7 @@ class GlooCopyService(CopyService):
             pairs = match_local_ops_by_task_id(
                 local_sends, local_recv_objs, "GlooCopyService", self.rank
             )
+            self._copy_stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad(), torch.cuda.stream(self._copy_stream):
                 for send_op, recv_op in pairs:
                     src_tensor = send_op.tensor
