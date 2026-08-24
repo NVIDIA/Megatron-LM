@@ -1197,7 +1197,7 @@ class MLASelfAttention(MultiLatentAttention):
         # For the 'dsa' experimental variant core_attention is DSAttention, whose
         # indexer linears defer their wgrads under delay_wgrad_compute and need an
         # explicit flush. For standard MLA the core is TEDotProductAttention, which
-        # owns no linears and defines no backward_dw hence the guard.
+        # owns no linears and defines no backward_dw — hence the guard.
         core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
         if core_attention_backward_dw is not None:
             core_attention_backward_dw()
