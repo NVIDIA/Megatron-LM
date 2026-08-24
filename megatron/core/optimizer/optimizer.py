@@ -1622,6 +1622,8 @@ class ChainedOptimizer(MegatronOptimizer):
         # LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one.
         # Without this the nested chain inherits the base no-op and its params, which are
         # the quantized weights under Muon, are never re-derived.
+        if self.is_stub_optimizer:
+            return
         for optimizer in self.chained_optimizers:
             optimizer._stage_model_params_from_main_params()
 
@@ -1629,6 +1631,10 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def quantize_and_sync_model_params_from_main_params(self) -> None:
         """Re-derive and all-gather the model params (see MegatronOptimizer)."""
+        # A rank with no trainable parameters gets an empty chain, and __init__ leaves
+        # self.config unset in that case, so this has to return before touching it.
+        if self.is_stub_optimizer:
+            return
         model_chunks = self._unique_model_chunks()
         if self.config.reuse_grad_buf_for_mxfp8_param_ag:
             # The param buffer aliases the grad buffer and is shared by every chained
