@@ -140,11 +140,14 @@ class ProcessGroupCollection:
     # _EXPERT_GTP_WEIGHT_REMAT_GROUP
     expt_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
-    # _TP_GTP_WEIGHT_REMAT_GROUP — fused (tp x gtp_remat) domain for layer-sharded
-    # Muon's single all_to_all (None unless both axes are non-trivial).
+    # Fused (tp x gtp_remat) domain for layer-sharded Muon's single-all_to_all
+    # exchange. Never built from parallel_state (which is compatibility-only):
+    # callers that want the fused path supply the communicator here; without it
+    # the optimizer uses the bitwise-identical two-stage exchange. Rank-order
+    # contract: group rank g * tp_size + t, TP innermost (asserted at step time).
     tp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
-    # _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP
+    # Expert variant of tp_gtp_remat: fused (expt_tp x egtp_remat) domain.
     expt_tp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
     # MoE layers need expt_dp group for sharded state dict
@@ -315,12 +318,12 @@ class ProcessGroupCollection:
             'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
             ),
-            'tp_gtp_remat': partial(
-                parallel_state.get_tp_gtp_weight_remat_group, check_initialized=False
-            ),
-            'expt_tp_gtp_remat': partial(
-                parallel_state.get_expert_tp_gtp_weight_remat_group, check_initialized=False
-            ),
+            # Not built from parallel_state: the fused layer-sharded-Muon domain
+            # is opt-in and must be supplied by the caller (the two-stage
+            # exchange is the default). Every field needs an entry here or the
+            # required_pgs assert below fires.
+            'tp_gtp_remat': lambda: None,
+            'expt_tp_gtp_remat': lambda: None,
         }
 
         assert all(
