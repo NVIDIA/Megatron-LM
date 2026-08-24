@@ -306,10 +306,6 @@ def forward_step_calc_loss(
 ):
     """Calculate the loss and number of tokens for forward_step()"""
 
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-        DSAMainAttentionAuxLossAutoScaler,
-    )
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
@@ -399,23 +395,6 @@ def forward_step_calc_loss(
             experimental_attention_variant_loss_scale_func(
                 loss_scale * cp_size_for_scaling / num_microbatches
             )
-
-    if (
-        getattr(config, 'experimental_attention_variant', None) == 'dsa'
-        and (
-            getattr(config, 'dsa_topk_mass_loss_coeff', 0.0) > 0.0
-            or getattr(config, 'dsa_output_consistency_loss_coeff', 0.0) > 0.0
-        )
-    ):
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
-        if config.calculate_per_token_loss:
-            DSAMainAttentionAuxLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            DSAMainAttentionAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     return output_tensor, num_tokens
 
