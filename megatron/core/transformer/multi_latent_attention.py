@@ -77,7 +77,6 @@ if HAVE_TE:
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
-        TENorm,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
     )
@@ -88,7 +87,6 @@ else:
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
-        TENorm,
         Linear,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
@@ -98,7 +96,7 @@ else:
         mxfp8_transpose_swizzle,
         QuantizedTensor,
         MXFP8Quantizer,
-    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
@@ -214,12 +212,17 @@ class MultiLatentAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
-        # Fused MLA Q up-proj+rope+quant via cuDNN gemm_proj_rope_mxfp8
+        # Fused MLA Q up-proj+rope+quant via cuDNN gemm_proj_rope_mxfp8.
+        # The q_layernorm is absorbed into the fusion so that MXFP8 is produced in one step
+        # from the norm's FP32 accumulator, as TELayerNormColumnParallelLinear does; that
+        # requires the norm to exist and to be an RMSNorm (because currently it is only tested with DSv3 which uses RMSNorm)
         self._use_fused_q_uproj = (
             getattr(self.config, "use_fused_mla_q_uproj", False)
             and FusedMLAQUpProjRopeQuant is not None
             and FusedMLAQUpProjRopeQuant.is_supported()
             and get_pg_size(self.tp_group) == 1
+            and self.config.qk_layernorm
+            and self.config.normalization == "RMSNorm"
         )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
@@ -633,13 +636,6 @@ class MLASelfAttention(MultiLatentAttention):
                 tp_group=pg_collection.tp,
                 name=(name + ".linear_q_up_proj") if name is not None else None,
             )
-            if self._use_fused_q_uproj and self.config.qk_layernorm:
-                self._q_up_proj_norm = TENorm(
-                    config=self.config,
-                    hidden_size=self.config.q_lora_rank,
-                    eps=self.config.layernorm_epsilon,
-                )
-                self._q_up_proj_norm.weight = self.linear_q_up_proj.layer_norm_weight
 
         kv_down_proj_kwargs = {}
         if submodules.linear_kv_down_proj in [TELinear]:
@@ -933,18 +929,18 @@ class MLASelfAttention(MultiLatentAttention):
 
             if use_fused_q_uproj:
                 b = q_compressed.shape[1]
-                q_normed = (
-                    self._q_up_proj_norm(q_compressed) if self.config.qk_layernorm else q_compressed
-                )
 
-                # With sequence parallelism q_normed is sequence-split; gather to full sequence
-                # before the fused kernel.
+                # With sequence parallelism the input is sequence-split; gather to full
+                # sequence before the fused kernel, which owns the norm.
                 if self.config.sequence_parallel and get_pg_size(self.tp_group) > 1:
-                    q_normed = gather_from_sequence_parallel_region(q_normed, group=self.tp_group)
-                s = q_normed.shape[0]
+                    q_compressed = gather_from_sequence_parallel_region(
+                        q_compressed, group=self.tp_group
+                    )
+                s = q_compressed.shape[0]
 
                 query = FusedMLAQUpProjFunction.apply(
-                    q_normed,
+                    q_compressed,
+                    self.linear_q_up_proj.layer_norm_weight,
                     self.linear_q_up_proj.weight,
                     rotary_pos_cos,
                     rotary_pos_sin,
@@ -958,6 +954,9 @@ class MLASelfAttention(MultiLatentAttention):
                     b,
                     self.tp_group,
                     self.config.sequence_parallel,
+                    self.config.layernorm_epsilon,
+                    self.config.normalization,
+                    self.config.layernorm_zero_centered_gamma,
                 )
             else:
                 if self.config.q_lora_rank is not None:
@@ -1428,13 +1427,6 @@ class FusedMLASelfAttention(MLASelfAttention):
             tp_group=pg_collection.tp,
             name=(name + ".linear_q_up_proj") if name is not None else None,
         )
-        if self._use_fused_q_uproj and self.config.qk_layernorm:
-            self._q_up_proj_norm = TENorm(
-                config=self.config,
-                hidden_size=self.config.q_lora_rank,
-                eps=self.config.layernorm_epsilon,
-            )
-            self._q_up_proj_norm.weight = self.linear_q_up_proj.layer_norm_weight
 
         self.linear_kv_up_proj = build_module(
             layer_classes["linear_kv_up_proj"],
