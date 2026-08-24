@@ -640,7 +640,7 @@ def test_schedule_enables_grad_sync_on_first_stage(
         def __init__(self):
             self.config = config
             if is_multimodule:
-                self.rank_module_map = {"llm": SimpleNamespace()}
+                self.rank_module_map = {"llm": SimpleNamespace(bridge_comms_as_dest_module=[])}
 
         def is_module_pp_first_stage(self, _module_name):
             return module_first_stage

@@ -57,6 +57,14 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
             "Requires every encoder DP rank to execute encoder backward on every microbatch."
         ),
     )
+    grid.add_argument(
+        "--mimo-bridge-skip-shape-exchange",
+        action="store_true",
+        help=(
+            "Derive MIMO fan-out receive shapes from language-batch metadata and skip "
+            "bridge shape exchange."
+        ),
+    )
     return parser
 
 

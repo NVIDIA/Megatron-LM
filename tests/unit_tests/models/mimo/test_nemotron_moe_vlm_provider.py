@@ -10,14 +10,19 @@ field-for-field, except the two fields that
 
 import argparse
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from examples.mimo.model_providers.nemotron_moe_vlm import (
     NEMOTRON_MODEL_PROVIDER,
+    _nemotron_bridge_recv_shape,
     add_model_provider_args,
+    build_nemotron_communicator,
 )
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
@@ -90,6 +95,49 @@ def test_freeze_flags_drive_tower_freezing():
     assert args.freeze_vit is True
     assert args.freeze_lm is True
     assert args.freeze_projection is False
+
+
+def test_bridge_receive_shape_uses_local_image_token_count():
+    batch = {"input_ids": torch.tensor([[42, 7, 42], [3, 42, 5]])}
+
+    assert _nemotron_bridge_recv_shape(batch, image_token_id=42, hidden_size=2688) == (3, 2688)
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["legacy", "receiver_derived"])
+def test_build_communicator_wires_bridge_receive_shape(monkeypatch, enabled):
+    import examples.mimo.model_providers.nemotron_moe_vlm as provider
+
+    captured = {}
+    communicator = object()
+    language_grid = object()
+    topology = SimpleNamespace(
+        grids={RADIO_ENCODER_MODULE_NAME: object(), MIMO_LANGUAGE_MODULE_KEY: language_grid}
+    )
+    args = SimpleNamespace(
+        mimo_bridge_skip_shape_exchange=enabled, image_token_id=42, hidden_size=2688
+    )
+
+    monkeypatch.setattr(
+        provider,
+        "language_model_spec",
+        lambda args, pg_collection, grid: SimpleNamespace(params={"config": object()}),
+    )
+
+    def capture_communicator(*args, **kwargs):
+        captured.update(kwargs)
+        return communicator
+
+    monkeypatch.setattr(provider, "MultiModulePipelineCommunicator", capture_communicator)
+
+    assert build_nemotron_communicator(args, topology) is communicator
+    shape_fns = captured["bridge_recv_shape_fns"]
+    if enabled:
+        assert shape_fns[RADIO_ENCODER_MODULE_NAME]({"input_ids": torch.tensor([[42, 7, 42]])}) == (
+            2,
+            2688,
+        )
+    else:
+        assert shape_fns is None
 
 
 # --- Config parity gate (requires torch; runs in CI) ----------------------

@@ -124,6 +124,11 @@ def test_parser_does_not_expose_unsupported_grid_knobs():
     assert not hasattr(args, "llm_expt_dp")
 
 
+def test_parser_exposes_bridge_shape_exchange_opt_in():
+    assert not _parse([]).mimo_bridge_skip_shape_exchange
+    assert _parse(["--mimo-bridge-skip-shape-exchange"]).mimo_bridge_skip_shape_exchange
+
+
 def test_llm_cp_must_be_one():
     args = _layout_8gpu_20l(llm_cp=2)
     with pytest.raises(ValueError, match="CP=1 only"):

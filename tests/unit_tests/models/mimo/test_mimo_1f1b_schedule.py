@@ -37,6 +37,7 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.rerun_state_machine import RerunDataIterator, RerunMode, get_rerun_state_machine
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -52,6 +53,142 @@ except ImportError:
     TERowParallelLinear = None
 
 logger = logging.getLogger(__name__)
+
+
+def test_receiver_shape_prepeek_replays_rerun_batch_without_refetching():
+    """A rerun re-derives the receive shape from the buffered logical batch."""
+
+    class CountingIterator:
+        def __init__(self):
+            self.fetches = 0
+
+        def __next__(self):
+            self.fetches += 1
+            return {"batch_id": self.fetches}
+
+    source = CountingIterator()
+    data_iterator = RerunDataIterator(source)
+    prepared_batches = []
+    communicator = SimpleNamespace(
+        has_receiver_derived_bridge_shapes=True, prepare_bridge_recv_shapes=prepared_batches.append
+    )
+    rerun_state_machine = get_rerun_state_machine()
+    previous_mode = rerun_state_machine.get_mode()
+    rerun_state_machine.set_mode(RerunMode.REPORT_DETERMINISM_STATS)
+
+    try:
+        first = schedule._prepare_forward_data_iterator(
+            data_iterator, communicator, is_multimodule=True
+        )
+        assert next(first) == {"batch_id": 1}
+        assert source.fetches == 1
+
+        data_iterator.rewind()
+        replay = schedule._prepare_forward_data_iterator(
+            data_iterator, communicator, is_multimodule=True
+        )
+        assert next(replay) == {"batch_id": 1}
+        assert source.fetches == 1
+        assert prepared_batches == [{"batch_id": 1}, {"batch_id": 1}]
+    finally:
+        data_iterator.advance()
+        rerun_state_machine.set_mode(previous_mode)
+
+
+def test_bridge_receive_shape_preparation_rejects_unconsumed_shape():
+    """Double preparation fails locally before communication can use a stale shape."""
+
+    class Bridge:
+        skip_shape_exchange = True
+        src_module_name = "encoder"
+        tensor_ndim = 2
+
+    bridge = Bridge()
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+    communicator.rank_module_map = {
+        "language": SimpleNamespace(bridge_comms_as_dest_module=[bridge])
+    }
+    communicator.bridge_recv_shape_fns = {"encoder": lambda batch: (batch["rows"], 8)}
+    communicator._next_bridge_recv_shapes = {}
+
+    communicator.prepare_bridge_recv_shapes({"rows": 3})
+    with pytest.raises(RuntimeError, match="prepared more than once"):
+        communicator.prepare_bridge_recv_shapes({"rows": 4})
+
+
+def test_disabled_bridge_rejects_intermediate_module():
+    """Skipping backward on an intermediate module would strand its upstream bridge."""
+    topology = {"source": ["encoder"], "encoder": ["language"], "language": []}
+    with pytest.raises(NotImplementedError, match="graph source module"):
+        MultiModulePipelineCommunicator(
+            {module_name: object() for module_name in topology},
+            topology,
+            object(),
+            bridge_requires_backward={"encoder": False},
+        )
+
+
+def test_disabled_bridge_results_keep_explicit_none_keys():
+    """MultiModule preserves None so detached source backward is skipped by key."""
+
+    class DisabledBridge:
+        src_module_name = "encoder"
+
+        def send_forward_recv_backward(self, output):
+            del output
+            return None
+
+        def recv_backward(self):
+            return None
+
+        def send_backward_recv_forward(self, grad, forward_shape=None):
+            assert grad is None
+            assert forward_shape is None
+            return "activation"
+
+        def send_backward(self, grad):
+            assert grad is None
+
+    bridge = DisabledBridge()
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+    communicator.rank_module_map = {
+        "encoder": SimpleNamespace(
+            pp_rank=0,
+            pp_size=1,
+            bridge_comms_as_src_module=[bridge],
+            bridge_comms_as_dest_module=[],
+        )
+    }
+    assert communicator.send_forward_recv_backward({"encoder": "output"}) == {"encoder": None}
+    assert communicator.recv_backward() == {"encoder": None}
+
+    communicator.rank_module_map = {
+        "language": SimpleNamespace(
+            pp_rank=0,
+            pp_size=1,
+            bridge_comms_as_src_module=[],
+            bridge_comms_as_dest_module=[bridge],
+        )
+    }
+    communicator._next_bridge_recv_shapes = {}
+    assert communicator.send_backward_recv_forward({"encoder": None}) == {"encoder": "activation"}
+    communicator.send_backward({"encoder": None})
+
+
+def test_backward_step_skips_detached_output_with_explicit_none_grad(monkeypatch):
+    """A disabled bridge's explicit None does not seed or invoke source backward."""
+    monkeypatch.setattr(
+        torch.autograd,
+        "backward",
+        lambda *args, **kwargs: pytest.fail("detached source must not run backward"),
+    )
+    config = SimpleNamespace(grad_scale_func=None, deallocate_pipeline_outputs=False, timers=None)
+    assert (
+        schedule.backward_step_multimodule(
+            {}, {"encoder": torch.ones(2)}, {"encoder": None}, config, MIMO_LANGUAGE_MODULE_KEY
+        )
+        == {}
+    )
 
 
 # ============================================================================
@@ -510,6 +647,7 @@ class DataIterator:
         encoder_name,
         image_token_id=50257,
         image_seq_length=None,
+        variable_image_seq_length=False,
     ):
         self.hidden_size = hidden_size
         self.seq_length = seq_length
@@ -518,13 +656,19 @@ class DataIterator:
         self.encoder_name = encoder_name
         self.image_token_id = image_token_id
         self.image_seq_length = image_seq_length or (seq_length // 2)
+        self.variable_image_seq_length = variable_image_seq_length
+        self.num_batches_yielded = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        self.num_batches_yielded += 1
+        image_seq_length = self.image_seq_length
+        if self.variable_image_seq_length:
+            image_seq_length -= (self.num_batches_yielded - 1) % 4
         encoder_hidden_states = torch.randn(
-            self.image_seq_length,
+            image_seq_length,
             self.micro_batch_size,
             self.hidden_size,
             device='cuda',
@@ -532,7 +676,7 @@ class DataIterator:
         )
 
         image_tokens = torch.full(
-            (self.micro_batch_size, self.image_seq_length),
+            (self.micro_batch_size, image_seq_length),
             self.image_token_id,
             dtype=torch.long,
             device='cuda',
@@ -540,7 +684,7 @@ class DataIterator:
         text_tokens = torch.randint(
             1,
             self.vocab_size,
-            (self.micro_batch_size, self.seq_length - self.image_seq_length),
+            (self.micro_batch_size, self.seq_length - image_seq_length),
             device='cuda',
         )
         input_ids = torch.cat([image_tokens, text_tokens], dim=1)
@@ -598,6 +742,7 @@ def run_mimo_1f1b_test(
     micro_batch_size=2,
     num_microbatches=4,
     use_layer_wise_distributed_optimizer=False,
+    skip_bridge_shape_exchange=False,
 ):
     """Run MIMO model through 1F1B schedule and verify.
 
@@ -680,7 +825,17 @@ def run_mimo_1f1b_test(
         mimo_model.config,
         dim_mapping={'s': 0, 'h': 2, 'b': 1},
         module_output_ndim={encoder_name: 2},
+        bridge_recv_shape_fns=(
+            {encoder_name: lambda batch: (int((batch["input_ids"] == 50257).sum()), hidden_size)}
+            if skip_bridge_shape_exchange
+            else None
+        ),
     )
+    if skip_bridge_shape_exchange:
+        for bridge_comm in communicator.bridge_comms:
+            bridge_comm._communicate_shapes = lambda *args, **kwargs: pytest.fail(
+                "shape exchange must not run on the receiver-derived path"
+            )
 
     # Compute per-rank micro-batch size for asymmetric DP.
     # The LLM's MBS is the schedule-level MBS. The encoder's MBS is adjusted
@@ -698,15 +853,37 @@ def run_mimo_1f1b_test(
         is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))
     )
     if encoder_needs_data and not llm_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, encoder_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            hidden_size,
+            seq_length,
+            encoder_mbs,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
+        )
     elif llm_needs_data and not encoder_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, llm_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            hidden_size,
+            seq_length,
+            llm_mbs,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
+        )
     elif encoder_needs_data and llm_needs_data:
         # Colocated: both encoder and LLM on same rank. Use LLM's MBS since
         # the LLM drives the schedule. (encoder_dp == llm_dp when colocated)
         data_iterator = DataIterator(
-            hidden_size, seq_length, micro_batch_size, vocab_size, encoder_name
+            hidden_size,
+            seq_length,
+            micro_batch_size,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
         )
+    raw_data_iterator = data_iterator
+    if skip_bridge_shape_exchange and data_iterator is not None:
+        data_iterator = RerunDataIterator(data_iterator)
 
     # Build MultiModuleProcessGroupCollection (reuse pre-created pg_collections)
     module_pgs = {}
@@ -776,6 +953,23 @@ def run_mimo_1f1b_test(
         assert (
             grad_norm is not None and grad_norm > 0
         ), f"Expected positive grad norm, got {grad_norm}"
+        if skip_bridge_shape_exchange:
+            schedule.forward_backward_pipelining_without_interleaving(
+                forward_step_func=step_func,
+                data_iterator=data_iterator,
+                model=[mimo_model],
+                num_microbatches=num_microbatches,
+                seq_length=seq_length,
+                micro_batch_size=micro_batch_size,
+                forward_only=True,
+                p2p_communicator=communicator,
+                pg_collection=pg_collection,
+            )
+            if raw_data_iterator is not None:
+                assert raw_data_iterator.num_batches_yielded == 2 * num_microbatches
+            assert all(
+                not bridge_comm._sent_forward_shapes for bridge_comm in communicator.bridge_comms
+            ), "Expected every remembered forward shape to be consumed by backward"
 
         # Verify results on last LLM stage
         if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
@@ -927,11 +1121,34 @@ class TestMimo1F1BSchedule:
         )
 
     def test_fan_out_dp1_to_dp4_enc_tp2_pp2_8gpu(self):
-        """Fan-out 1→4: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.
+        """Receiver-derived fan-out: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.
 
         Encoder has PP and TP. Bridge fan-out splits encoder output into
         4 parts for 4 LLM DP ranks each with MBS=1.
         """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=2,
+            encoder_pp=2,
+            encoder_dp=1,
+            encoder_offset=0,
+            llm_tp=1,
+            llm_pp=1,
+            llm_dp=4,
+            llm_offset=4,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=1,
+            num_microbatches=4,
+            skip_bridge_shape_exchange=True,
+        )
+
+    def test_fan_out_dp1_to_dp4_enc_tp2_pp2_legacy_8gpu(self):
+        """Legacy shape-exchange fan-out on the same 8-GPU topology."""
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
 
