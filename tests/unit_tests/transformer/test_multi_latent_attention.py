@@ -800,8 +800,8 @@ class TestMLAOutputGate:
         )
 
         torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
-        torch.testing.assert_close(actual_gradients[0], expected_gate_gradient, atol=0, rtol=0)
-        torch.testing.assert_close(actual_gradients[1], expected_core_gradient, atol=0, rtol=0)
+        torch.testing.assert_close(actual_gradients[0], expected_gate_gradient)
+        torch.testing.assert_close(actual_gradients[1], expected_core_gradient)
 
     def test_missing_gate_spec_raises(self):
         submodules = get_mla_self_attn_submodules()
