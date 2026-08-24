@@ -8,7 +8,7 @@ from typing import Any
 
 import torch.distributed as dist
 
-from megatron.core.inference.shards_spec import InferenceShardSpec
+from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
 from megatron.core.utils import get_pg_rank
 
 PREFILL = "prefill"
@@ -28,10 +28,12 @@ def _validate_disagg_specs(specs: list[InferenceShardSpec]) -> None:
         raise ValueError("disaggregation needs at least one prefill and one decode shard")
 
 
-def configure_prebuilt_disagg_engine(
-    engine: Any, specs: list[InferenceShardSpec], kv_transport_backend: str = "nixl"
-) -> None:
+def configure_prebuilt_disagg_engine(engine: Any) -> None:
     """Configure an engine for coordinator-native disaggregation."""
+    shards = engine.context.config.disaggregation_shards
+    if shards is None:
+        raise ValueError("disaggregation_shards must be configured")
+    specs = normalize_shard_specs(shards, dist.get_world_size())
     _validate_disagg_specs(specs)
     ctx = engine.context
     # Decode admits imported KV through the prefix cache.
@@ -56,6 +58,5 @@ def configure_prebuilt_disagg_engine(
         role=my_spec.role,
         identity=f"{my_spec.role}_s{my_index}_dp{dp_rank}",
         spawn_coordinator=(rank == 0),
-        kv_transport_backend=kv_transport_backend,
         coordinator_group=dist.group.WORLD,
     )

@@ -3,13 +3,16 @@
 import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+if TYPE_CHECKING:
+    from megatron.core.inference.shards_spec import InferenceShardSpec
 
 
 @dataclass
@@ -423,6 +426,14 @@ class InferenceConfig:
     (and at most 3 per request). The scratch is reserved from this budget first, so a
     smaller ``max_tokens`` (or ``max_requests``) shrinks the scratch and leaves more
     durable cache slots."""
+
+    disaggregation_shards: Optional[Union[str, Sequence["InferenceShardSpec"], Sequence[dict]]] = (
+        None
+    )
+    """Prefill and decode shard topology for native disaggregated inference."""
+
+    kv_transport_backend: Literal["nixl", "nccl"] = "nixl"
+    """Backend for disaggregated KV and recurrent-state transfers."""
 
     # =================================
     # Logging config

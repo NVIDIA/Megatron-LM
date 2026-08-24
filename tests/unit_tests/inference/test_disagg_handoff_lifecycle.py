@@ -367,6 +367,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
     )
     engine.context = SimpleNamespace(
+        config=SimpleNamespace(kv_transport_backend="nccl"),
         kv_block_allocator=allocator,
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
         is_hybrid_model=False,
@@ -389,7 +390,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
     pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
     pg_rank = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_rank"
     with (
-        mock.patch(backend_factory, return_value=_Backend),
+        mock.patch(backend_factory, return_value=_Backend) as backend_factory_mock,
         mock.patch(pg_size, return_value=1),
         mock.patch(pg_rank, return_value=0),
     ):
@@ -399,6 +400,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         assert allocator.enable_handoff_pinning
         engine.setup_kv_transfer("prefill")
 
+    backend_factory_mock.assert_called_with("nccl")
     assert _Backend.names[-2] != _Backend.names[-1]
 
 
@@ -419,6 +421,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(
+        config=SimpleNamespace(kv_transport_backend="nixl"),
         kv_block_allocator=SimpleNamespace(
             enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
         ),

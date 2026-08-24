@@ -72,14 +72,14 @@ def _build_model_and_inference_config(args):
         )
         inference_config = get_inference_config_from_model_and_args(model, args)
         inference_config.pg_collection = local_shard.pg_collection
-        return model, inference_config, specs
+        return model, inference_config
 
     model = get_model_for_inference()
     inference_config = get_inference_config_from_model_and_args(model, args)
-    return model, inference_config, None
+    return model, inference_config
 
 
-async def _serve(args, model, tokenizer, inference_config, inference_shards):
+async def _serve(args, model, tokenizer, inference_config):
     async with MegatronAsyncLLM(
         model=model,
         tokenizer=tokenizer,
@@ -87,8 +87,6 @@ async def _serve(args, model, tokenizer, inference_config, inference_shards):
         use_coordinator=True,
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
-        inference_shards=inference_shards,
-        kv_transport_backend=args.disagg_kv_transport_backend,
     ) as llm:
         serve_config = ServeConfig(
             host=args.host,
@@ -114,10 +112,10 @@ def main():
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)
-    model, inference_config, inference_shards = _build_model_and_inference_config(args)
+    model, inference_config = _build_model_and_inference_config(args)
 
     try:
-        asyncio.run(_serve(args, model, tokenizer, inference_config, inference_shards))
+        asyncio.run(_serve(args, model, tokenizer, inference_config))
     except KeyboardInterrupt:
         print("Server process interrupted by user.")
     finally:

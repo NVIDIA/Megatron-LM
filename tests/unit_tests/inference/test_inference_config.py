@@ -106,15 +106,20 @@ class TestInferenceConfig:
         with pytest.raises(SystemExit):
             parser.parse_args(["--inference-dynamic-batching-async-sched-mode", invalid_mode])
 
-    def test_inference_setup_config_maps_async_sched_mode(self):
-        """Ensure declarative inference config maps async scheduling mode to runtime config."""
+    def test_inference_setup_config_maps_engine_settings(self):
+        """Ensure declarative inference settings map to the runtime config."""
         model = SimpleNamespace(
             position_embedding_type="rope",
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="async")
+        shards = "tp=1,role=prefill+tp=1,role=decode"
+        setup_config = InferenceSetupConfig(
+            inference_dynamic_batching_async_sched_mode="async",
+            inference_shards=shards,
+            disagg_kv_transport_backend="nccl",
+        )
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -125,6 +130,8 @@ class TestInferenceConfig:
         )
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
+        assert inference_config.disaggregation_shards == shards
+        assert inference_config.kv_transport_backend == "nccl"
 
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""

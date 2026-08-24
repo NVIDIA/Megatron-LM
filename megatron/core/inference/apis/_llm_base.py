@@ -13,7 +13,7 @@ helpers, the public sync bridge (``submit``/``run_sync``), and the private
 import asyncio
 import concurrent.futures
 import threading
-from typing import Any, Coroutine, List, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Coroutine, List, Optional, Tuple, Type, Union
 
 import torch.distributed as dist
 
@@ -32,7 +32,6 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -269,14 +268,16 @@ class _MegatronLLMBase:
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
-        inference_shards: Optional[Union[str, Sequence[InferenceShardSpec], Sequence[dict]]] = None,
-        kv_transport_backend: str = "nixl",
         inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
     ) -> None:
+        if inference_config is None:
+            inference_config = InferenceConfig()
+        disaggregated = inference_config.disaggregation_shards is not None
+
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
-        if inference_shards is not None and not use_coordinator:
-            raise ValueError("inference_shards (disaggregation) requires use_coordinator=True")
+        if disaggregated and not use_coordinator:
+            raise ValueError("disaggregated inference requires use_coordinator=True")
 
         if not use_coordinator:
             from megatron.core import parallel_state
@@ -288,24 +289,16 @@ class _MegatronLLMBase:
                     f"(got EP={ep_size}). Use coordinator mode to handle EP routing."
                 )
 
-        if inference_config is None:
-            inference_config = InferenceConfig()
-
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
-        if inference_shards is not None:
+        if disaggregated:
             inference_config.reserve_recurrent_state_dummy_slot = True
         context = DynamicInferenceContext(model.config, inference_config)
         wrapper = inference_wrapper_cls(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
-        engine_cls = (
-            DisaggDynamicInferenceEngine if inference_shards is not None else DynamicInferenceEngine
-        )
+        engine_cls = DisaggDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
         engine = engine_cls(controller=controller, context=context)
-        if inference_shards is not None:
-            specs = normalize_shard_specs(inference_shards, dist.get_world_size())
-            configure_prebuilt_disagg_engine(
-                engine, specs, kv_transport_backend=kv_transport_backend
-            )
+        if disaggregated:
+            configure_prebuilt_disagg_engine(engine)
 
         if use_coordinator:
             is_primary_rank = dist.get_rank() == 0

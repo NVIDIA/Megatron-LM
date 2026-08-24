@@ -241,7 +241,7 @@ class InferenceStateHandoffMixin:
                 )
         super().schedule_waiting_requests()
 
-    def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
+    def setup_kv_transfer(self, role: str) -> None:
         """Bring up the KV transfer agents for this engine.
 
         This method must be called collectively by every model-parallel rank in
@@ -249,8 +249,6 @@ class InferenceStateHandoffMixin:
 
         Args:
             role: "prefill" or "decode"; used to name the local transfer agent.
-            backend: transfer backend name, resolved through the explicit
-                registry ("nixl"; "nccl" selects the two-sided push family).
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
@@ -261,7 +259,7 @@ class InferenceStateHandoffMixin:
                     "do not configure prefix_caching_mamba_gb on the decode engine"
                 )
         self._kv_transfer_role = role
-        backend_cls = construct_kv_transfer_backend_class(backend)
+        backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
 
         # Prefill output blocks stay pinned until the peer finishes reading
         # them. Decode requests consume imports but do not produce another
@@ -685,10 +683,7 @@ class InferenceStateHandoffMixin:
             kv_meta["resume_log_probs"] = prepared.resume_log_probs
         if ssm_meta is not None:
             kv_meta["ssm"] = ssm_meta
-        if (
-            self._disagg_config is not None
-            and self._disagg_config["kv_transport_backend"] == "nixl"
-        ):
+        if self._disagg_config is not None and self.context.config.kv_transport_backend == "nixl":
             # Native engines register static NIXL agent blobs once. Keep each
             # request payload limited to addresses, layouts, and block mappings.
             kv_meta = strip_registered_nixl_agent_metadata(kv_meta)

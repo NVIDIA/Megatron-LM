@@ -15,7 +15,6 @@ from megatron.core.inference.shards_spec import (
     parse_inference_shards_spec,
     spec_declares_disaggregation,
 )
-from megatron.training.global_vars import get_args
 
 
 def is_disagg_rollout(args) -> bool:
@@ -111,8 +110,4 @@ def build_disagg_inference_model(
 
 def configure_disagg_engine(engine):
     """Set the disagg role on `engine` and spawn the shared coordinator."""
-    args = get_args()
-    configure_prebuilt_disagg_engine(
-        engine, _specs(args),
-        kv_transport_backend=args.disagg_kv_transport_backend,
-    )
+    configure_prebuilt_disagg_engine(engine)

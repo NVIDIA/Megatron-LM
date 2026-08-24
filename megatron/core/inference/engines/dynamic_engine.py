@@ -436,7 +436,7 @@ class DynamicInferenceEngine(AbstractEngine):
     def _release_pinned_handoff_ssm_slot(self, ssm_slot: int | None) -> None:
         return None
 
-    def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
+    def setup_kv_transfer(self, role: str) -> None:
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("KV transfer setup")
 
@@ -901,7 +901,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         [
                             Headers.REGISTER_ROLE.value,
                             disagg_config["role"],
-                            disagg_config["kv_transport_backend"],
+                            self.context.config.kv_transport_backend,
                             self._instance_transfer_meta,
                         ],
                         use_bin_type=True,
