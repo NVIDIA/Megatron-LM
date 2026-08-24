@@ -20,6 +20,11 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
+    # Runtime (hybrid/dynamic) context parallelism, set per microbatch by
+    # get_batch_on_this_cp_rank. Invariant: local_cp_size == 1 means CP is off
+    # for this sub-sample and cp_group MUST be None (consumers fall back to
+    # their build-time group); cp_group is only bound when local_cp_size > 1.
+    # TEDotProductAttention asserts both directions of this contract.
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
