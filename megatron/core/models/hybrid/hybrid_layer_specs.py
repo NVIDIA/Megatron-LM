@@ -1,4 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+from dataclasses import replace
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -238,6 +239,30 @@ hybrid_stack_spec = ModuleSpec(
 )
 
 
+def get_te_hybrid_stack_spec(moe_grouped_gemm: bool = False) -> ModuleSpec:
+    """Build the Transformer Engine hybrid-stack spec.
+
+    Args:
+        moe_grouped_gemm: Whether MoE experts use Transformer Engine grouped GEMM.
+
+    Returns:
+        A hybrid-stack module spec configured for the requested MoE implementation.
+    """
+    moe_spec = get_moe_module_spec(
+        use_te=True,
+        num_experts=8,  # Can be any positive integer (must not be None).
+        moe_grouped_gemm=moe_grouped_gemm,
+    )
+    moe_layer = replace(
+        hybrid_stack_spec.submodules.moe_layer,
+        submodules=replace(hybrid_stack_spec.submodules.moe_layer.submodules, mlp=moe_spec),
+    )
+    return ModuleSpec(
+        module=hybrid_stack_spec.module,
+        submodules=replace(hybrid_stack_spec.submodules, moe_layer=moe_layer),
+    )
+
+
 gated_delta_product_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
@@ -423,6 +448,7 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
 
 
 # Backward-compatible aliases
+get_te_mamba_stack_spec = get_te_hybrid_stack_spec
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
 gdp_stack_spec = gated_delta_product_stack_spec
