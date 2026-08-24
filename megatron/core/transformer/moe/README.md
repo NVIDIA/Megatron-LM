@@ -319,7 +319,11 @@ backend. It retains the standard HybridEP activation semantics while using a det
 planner to map routes to native or replica expert slots; replica slots are populated
 asynchronously from the optimizer-owned weights and reduced back into their owners after expert
 backward. Both TE's single grouped parameter (`moe_single_grouped_weight=True`) and its normal
-per-expert `weight0..weightN` parameters are supported.
+per-expert `weight0..weightN` parameters are supported. With `--grad-reduce-in-bf16`, replica
+gradients remain BF16 in their symmetric-memory transport arena, are summed with the owner's BF16
+gradient locally in FP32, and are downcast to BF16 once. This composes with both
+`--ddp-reduce-scatter-with-fp32-accumulation` and
+`--gtp-remat-reduce-scatter-with-fp32-accumulation` for the subsequent DDP and GTP reductions.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.

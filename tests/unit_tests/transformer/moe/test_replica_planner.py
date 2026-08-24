@@ -65,6 +65,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(monkeypatch):
         moe_hybridep_num_blocks_permute=7,
         moe_hybridep_num_blocks_unpermute=5,
         moe_hybridep_num_sms_preprocessing=9,
+        replica_hybridep_grad_dtype=torch.bfloat16,
     )
     experts = FakeExperts()
     manager.bind_experts(experts)
@@ -217,15 +218,15 @@ def test_replica_async_collectives_span_transport_backward():
     assert all(parameter.grad is None for parameter in bridge.source_parameters)
 
 
-def _set_main_grad(parameter):
+def _set_main_grad(parameter, dtype=torch.float32):
     parameter.main_grad = torch.zeros(
-        parameter.shape, dtype=torch.float32, device=parameter.device
+        parameter.shape, dtype=dtype, device=parameter.device
     )
     parameter.grad_added_to_main_grad = False
     parameter.overwrite_main_grad = True
 
 
-def _set_main_grads(layer):
+def _set_main_grads(layer, dtype=torch.float32):
     for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
         if getattr(linear, "single_grouped_weight", False):
             parameters = (linear.get_parameter("weight"),)
@@ -234,10 +235,10 @@ def _set_main_grads(layer):
                 linear.get_parameter(f"weight{i}") for i in range(linear.num_gemms)
             )
         for parameter in parameters:
-            _set_main_grad(parameter)
+            _set_main_grad(parameter, dtype)
     if layer.config.moe_latent_size is not None:
-        _set_main_grad(layer.fc1_latent_proj.weight)
-        _set_main_grad(layer.fc2_latent_proj.weight)
+        _set_main_grad(layer.fc1_latent_proj.weight, dtype)
+        _set_main_grad(layer.fc2_latent_proj.weight, dtype)
 
 
 def _stack_linear_main_grad(linear):
@@ -323,6 +324,7 @@ def _run_replica_hybridep_full_layer_parity(
     single_grouped_weight=True,
     mxfp8=False,
     gtp=False,
+    grad_dtype=torch.float32,
     reference_dispatcher="alltoall",
     verify_hybridep_contract=False,
 ):
@@ -357,7 +359,11 @@ def _run_replica_hybridep_full_layer_parity(
 
         # This test isolates the bridge's explicit materialize-before-exchange
         # dependency. The production-script test covers linked async GTP chains.
-        update_gtp_config(weight_prefetch=False, async_reduction=False)
+        update_gtp_config(
+            weight_prefetch=False,
+            async_reduction=False,
+            reduce_scatter_with_fp32_accumulation=(grad_dtype == torch.bfloat16),
+        )
     torch.manual_seed(1234)
 
     common = {
@@ -409,6 +415,7 @@ def _run_replica_hybridep_full_layer_parity(
     backend_config = {}
     if backend == "replica_hybridep":
         backend_config["moe_expert_rank_capacity_factor"] = 2.0
+        backend_config["replica_hybridep_grad_dtype"] = grad_dtype
     replica_config = TransformerConfig(
         **common,
         **backend_config,
@@ -443,10 +450,15 @@ def _run_replica_hybridep_full_layer_parity(
                 layer.fc2_latent_proj.fuse_wgrad_accumulation = False
         replica_layer.load_state_dict(ref_layer.state_dict())
         assert replica_layer.state_dict().keys() == ref_layer.state_dict().keys()
-        _set_main_grads(ref_layer)
-        _set_main_grads(replica_layer)
+        _set_main_grads(ref_layer, grad_dtype)
+        _set_main_grads(replica_layer, grad_dtype)
         if backend.startswith("replica_"):
             bridge = replica_layer.token_dispatcher._comm_manager._bridge
+            assert bridge.workspace.grad_arena.dtype == grad_dtype
+            assert all(
+                projection.virtual_grad.dtype == grad_dtype
+                for projection in bridge.projections
+            )
             bridge.prepare_runtime_parameters()
             if mxfp8:
                 reference_specs, _ = _collect_replica_projection_specs(
@@ -777,7 +789,11 @@ def _run_replica_hybridep_full_layer_parity(
         fused_a2a.reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
         if gtp:
-            update_gtp_config(weight_prefetch=True, async_reduction=True)
+            update_gtp_config(
+                weight_prefetch=True,
+                async_reduction=True,
+                reduce_scatter_with_fp32_accumulation=False,
+            )
 
 
 @pytest.mark.internal
@@ -819,6 +835,28 @@ def test_replica_hybridep_gtp_gradients_match_alltoall(monkeypatch):
         None,
         single_grouped_weight=False,
         gtp=True,
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fused_a2a.HAVE_HYBRIDEP,
+    reason="CUDA and HybridEP are required",
+)
+@pytest.mark.parametrize("gtp", [False, True], ids=["ep4", "ep2-gtp2"])
+def test_replica_hybridep_bf16_gradients_match_alltoall(monkeypatch, gtp):
+    """Reduce replica gradients over BF16 transport with one local FP32 sum."""
+    _run_replica_hybridep_full_layer_parity(
+        monkeypatch,
+        "replica_hybridep",
+        F.silu,
+        True,
+        False,
+        None,
+        None,
+        single_grouped_weight=not gtp,
+        gtp=gtp,
+        grad_dtype=torch.bfloat16,
     )
 
 
