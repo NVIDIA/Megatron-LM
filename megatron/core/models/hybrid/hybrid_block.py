@@ -323,6 +323,10 @@ class HybridStack(MegatronModule):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
             if layer_type == LayerSymbols.GDN:
+                if hasattr(layer, 'mamba_state_shapes_per_request'):
+                    state_shapes = layer.mamba_state_shapes_per_request()
+                    if state_shapes is not None:
+                        return state_shapes
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
 

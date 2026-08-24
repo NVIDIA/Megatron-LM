@@ -40,6 +40,21 @@ class _DummyHybridLayer(MegatronModule):
         return hidden_states + 0.125 * self.proj(hidden_states)
 
 
+class _DummyRecurrentMixer(torch.nn.Module):
+    """Minimal GDN-like mixer exposing the dynamic-inference state contract."""
+
+    def mamba_state_shapes_per_request(self):
+        return (4, 8), (2, 16, 32)
+
+
+class _DummyGDNLayer(_DummyHybridLayer):
+    """TransformerLayer-shaped GDN stub used to verify mHC delegation."""
+
+    def __init__(self, config: TransformerConfig, layer_number: int, **kwargs):
+        super().__init__(config=config, layer_number=layer_number, **kwargs)
+        self.self_attention = _DummyRecurrentMixer()
+
+
 def _get_pg_collection() -> ProcessGroupCollection:
     return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
@@ -126,6 +141,21 @@ class TestHybridStackMHC:
         state = stack.sharded_state_dict(prefix="decoder.", metadata={})
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             assert f"decoder.{name}" in state
+
+    def test_wrapped_gdn_preserves_dynamic_inference_state_shapes(self):
+        config = _get_config(num_layers=1)
+        submodules = _get_dummy_submodules()
+        submodules.gdn_layer = ModuleSpec(module=_DummyGDNLayer)
+        stack = HybridStack(
+            config=config,
+            submodules=submodules,
+            post_layer_norm=False,
+            layer_type_list=[Symbols.GDN],
+            pg_collection=_get_pg_collection(),
+        )
+
+        assert isinstance(stack.layers[0], HyperConnectionHybridLayer)
+        assert stack.mamba_state_shapes_per_request() == ((4, 8), (2, 16, 32))
 
     @pytest.mark.parametrize(
         "recompute_kwargs",

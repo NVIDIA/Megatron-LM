@@ -40,9 +40,12 @@ class HyperConnectionHybridLayer(MegatronModule):
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""
-        if not hasattr(self.inner_layer, 'mamba_state_shapes_per_request'):
-            return None
-        return self.inner_layer.mamba_state_shapes_per_request()
+        if hasattr(self.inner_layer, 'mamba_state_shapes_per_request'):
+            return self.inner_layer.mamba_state_shapes_per_request()
+        mixer = getattr(self.inner_layer, 'self_attention', None)
+        if mixer is not None and hasattr(mixer, 'mamba_state_shapes_per_request'):
+            return mixer.mamba_state_shapes_per_request()
+        return None
 
     def _call_inner_layer(
         self,
