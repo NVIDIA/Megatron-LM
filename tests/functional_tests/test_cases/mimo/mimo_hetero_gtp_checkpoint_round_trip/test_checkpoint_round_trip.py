@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
@@ -26,6 +27,7 @@ from torch.distributed.checkpoint import (
 )
 
 from megatron.core.dist_checkpointing import load_common_state_dict
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 _REPO_ROOT = Path(__file__).parents[5]
 _LAUNCHER = _REPO_ROOT / "examples/mimo/scripts/run_hetero_nemotron_20l_mock_train.sh"
@@ -53,6 +55,7 @@ def _run_launcher(
 ) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "MIMO_CHECKPOINT_PADDING_MANIFEST_DIR": str(scratch / "padding-manifest"),
         "MIMO_CHECKPOINT_TEST_PRETRAIN": "1",
         "MIMO_PRETRAIN_MODULE": _MODULE,
@@ -407,6 +410,7 @@ def _run_comparator(
     return subprocess.run(command, cwd=_REPO_ROOT, capture_output=True, text=True, timeout=1800)
 
 
+@pytest.mark.skipif(not HAVE_GTP, reason="GTP requires a supported Transformer Engine version")
 def test_hetero_mimo_20l_checkpoint_round_trip_is_exact():
     assert torch.cuda.device_count() >= 8, "requires 8 GPUs"
 
