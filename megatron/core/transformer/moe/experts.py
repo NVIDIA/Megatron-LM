@@ -464,7 +464,6 @@ class TEGroupedMLP(MegatronModule):
     def _make_fused_ops(
         self,
         ep_buffer=None,
-        num_local_tokens: Optional[int] = None,
     ) -> torch.nn.Module:
         """Construct the TE operation-fuser module.
 
@@ -509,8 +508,6 @@ class TEGroupedMLP(MegatronModule):
         op_list = []
         dispatch_op = None
         if ep_buffer is not None:
-            if num_local_tokens is None:
-                raise ValueError("num_local_tokens is required for a full MoE Sequential.")
             dispatch_op = te.pytorch.ops.Dispatch(ep_buffer)
             op_list.append(dispatch_op)
 
@@ -662,11 +659,8 @@ class TEGroupedMLP(MegatronModule):
         op_list.append(op)
         fc2_op = op
 
-        if dispatch_op is not None:
-            combine_op = te.pytorch.ops.Combine(
-                ep_buffer,
-                num_local_tokens=num_local_tokens,
-            )
+        if ep_buffer is not None:
+            combine_op = te.pytorch.ops.Combine()
             op_list.append(combine_op)
             dispatch_op.set_extra_output_channel(
                 0, "tokens_per_expert", output_to_caller=False
@@ -674,9 +668,16 @@ class TEGroupedMLP(MegatronModule):
             dispatch_op.set_extra_output_channel(
                 1, "routing_weights", output_to_caller=False
             )
+            dispatch_op.set_extra_output_channel(2, "ep_handle", output_to_caller=False)
+            dispatch_op.set_extra_output_channel(
+                3, "routing_indices", output_to_caller=False
+            )
             fc1_op.set_extra_input_channel(0, "tokens_per_expert")
             activation_op.set_extra_input_channel(0, "routing_weights")
             fc2_op.set_extra_input_channel(0, "tokens_per_expert")
+            combine_op.set_extra_input_channel(0, "ep_handle")
+            combine_op.set_extra_input_channel(1, "tokens_per_expert")
+            combine_op.set_extra_input_channel(2, "routing_indices")
 
         ops = te.pytorch.ops.Sequential(*op_list)
 
@@ -705,7 +706,6 @@ class TEGroupedMLP(MegatronModule):
 
         ops = self._make_fused_ops(
             ep_buffer=ep_buffer,
-            num_local_tokens=hidden_states.shape[0],
         )
         # Keep the most recent sequence available for diagnostics without
         # registering duplicate parameter aliases as child modules.

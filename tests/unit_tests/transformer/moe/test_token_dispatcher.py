@@ -259,7 +259,8 @@ class MoEModelTestContainer:
 
         fused = self.new_moe_layer(
             moe_use_transformer_engine_fused_moe=True,
-            fp8="hybrid",
+            # NCCL-EP transports MXFP8 gradients as E4M3; HYBRID would select E5M2 in backward.
+            fp8="e4m3",
             fp8_recipe="mxfp8",
         )
         fused.load_state_dict(reference.state_dict())
@@ -287,15 +288,16 @@ class MoEModelTestContainer:
             is_megamoe = any(
                 type(op).__name__ == "FusedMoeEp" for group in forward_ops for op in group
             )
-            if torch.cuda.get_device_capability() == (10, 7):
-                try:
-                    from cudnn.moe_ep import MoeEp  # noqa: F401
-                except ImportError:
-                    pass
-                else:
-                    assert is_megamoe
+            try:
+                from transformer_engine.pytorch.ops.fused.moe_ep import _cudnn_megamoe_supported
+            except ImportError:
+                megamoe_supported = False
             else:
-                assert not is_megamoe
+                megamoe_supported = (
+                    torch.cuda.get_device_capability() == (10, 7)
+                    and _cudnn_megamoe_supported()
+                )
+            assert is_megamoe == megamoe_supported
         finally:
             nccl_ep_finalize()
 
