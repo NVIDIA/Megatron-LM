@@ -214,6 +214,8 @@ def _gtp_pad_zero_count(param: torch.Tensor, grad: torch.Tensor) -> int:
     """
     pad_zeros = getattr(param, "gtp_pad_zeros", None)
     if pad_zeros is None and grad.numel() == param.numel():
+        # Not stamped yet (DistributedOptimizer does this explicitly) -- compute and cache it
+        # here so later calls for this param skip straight to the getattr above.
         pad_zeros = param.gtp_pad_zeros = gtp_local_pad_zero_count(param, 0, grad.numel())
     return pad_zeros or 0
 

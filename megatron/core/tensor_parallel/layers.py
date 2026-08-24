@@ -145,19 +145,46 @@ def gtp_local_pad_zero_count(gtp_shard, range_start, range_end):
     relative to ``pad_for_alignment * gtp_remat_size``) it spills backward from the tail into
     lower-numbered ranks' shards too. Computed via each rank's row offset in the unsharded
     buffer -- not special-cased to the last rank -- so both cases come out correct.
+
+    Args:
+        gtp_shard: This rank's local GTP shard (carries ``pad_length``/``group``).
+        range_start: Start offset, in ``gtp_shard.view(-1)`` flat-index units, of the
+            fragment being queried.
+        range_end: End offset (exclusive) of that fragment. Pass ``0, gtp_shard.numel()``
+            for the whole shard (e.g. ``LayerWiseDistributedOptimizer``, which never
+            byte-slices); ``DistributedOptimizer`` passes the DP-optimizer-state
+            fragment's own ``[param_range.start, param_range.end)`` instead, since a
+            fragment only covers part of the shard.
     """
+    # No padding on this weight at all -> nothing to exclude.
     pad_length = getattr(gtp_shard, "pad_length", 0)
     if not pad_length:
         return 0
+    # Not a GTP shard (or GTP off) -> no group to compute a row offset against.
     group = getattr(gtp_shard, "group", None)
     if group is None:
         return 0
+
+    # Reconstruct the *unsharded* padded buffer this shard came from, and where in it
+    # the real (non-padding) data ends. Padding is always a contiguous suffix of this
+    # buffer (see _gtp_slice_one_param), so everything from unsharded_real_dim0 onward
+    # is padding.
     shard_dim0 = gtp_shard.shape[0]
     unsharded_padded_dim0 = shard_dim0 * group.size()
     unsharded_real_dim0 = unsharded_padded_dim0 - pad_length
-    trailing_numel = gtp_shard.numel() // shard_dim0
+
+    # Locate this rank's shard within that unsharded buffer, and convert the row-based
+    # padding boundary into flat-index units (one row = elems_per_row elements) so it's
+    # comparable against range_start/range_end.
+    elems_per_row = gtp_shard.numel() // shard_dim0
     shard_row_start = group.rank() * shard_dim0
-    pad_start_in_shard = max(0, unsharded_real_dim0 - shard_row_start) * trailing_numel
+    pad_start_in_shard = max(0, unsharded_real_dim0 - shard_row_start) * elems_per_row
+
+    # Overlap of the queried [range_start, range_end) fragment with [pad_start_in_shard, end).
+    # A whole-shard query only needs "does this shard have padding", but DistributedOptimizer's
+    # DP-wide bucket split doesn't respect shard boundaries, so a fragment can start/end
+    # anywhere -- entirely before the padding, straddling it, or entirely inside it.
+    # max(0, ...) at the end handles a fragment that ends before padding starts.
     overlap_start = max(range_start, pad_start_in_shard)
     return max(0, range_end - overlap_start)
 
