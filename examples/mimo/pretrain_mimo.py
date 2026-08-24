@@ -54,8 +54,11 @@ def _parse_and_validate() -> argparse.Namespace:
         validate_args(args, {"dataloader_type": "external"})
     finally:
         args.world_size = physical_world_size
-    if not args.use_distributed_optimizer:
-        raise ValueError("heterogeneous MIMO training requires --use-distributed-optimizer")
+    if not (
+        args.use_distributed_optimizer
+        or getattr(args, "use_layer_wise_distributed_optimizer", False)
+    ):
+        raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
 
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = calculate_padded_vocab_size(
