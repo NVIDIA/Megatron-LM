@@ -78,7 +78,6 @@ EXAMPLE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -L)"
 LITE_ROOT="$(cd "${EXAMPLE_ROOT}/../.." && pwd -L)"
 REPO_ROOT="$(cd "${LITE_ROOT}/../.." && pwd -L)"
 VALIDATOR="${SCRIPT_DIR}/validate_deepseek_v4_dapo.py"
-CHAT_TEMPLATE_FILE="${SCRIPT_DIR}/deepseek_v4_chat_template.jinja"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${EXAMPLE_ROOT}/outputs/ds4_dapo}"
 
 add_pythonpath() {
@@ -176,8 +175,6 @@ python3 "${VALIDATOR}" geometry \
   --model-config "${MODEL_PATH}/config.json" \
   --rollout-tp "${ROLLOUT_TP}"
 
-DS4_CHAT_TEMPLATE="${DEEPSEEK_V4_FLASH_CHAT_TEMPLATE:-$(<"${CHAT_TEMPLATE_FILE}")}"
-
 # ---------------------------------------------------------------------------
 # Hydra configuration
 # ---------------------------------------------------------------------------
@@ -200,8 +197,10 @@ DATA=(
   "data.return_raw_chat=True"
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
-  "data.filter_overlong_prompts=True"
-  "+data.apply_chat_template_kwargs.chat_template='${DS4_CHAT_TEMPLATE}'"
+  "data.filter_overlong_prompts=False"
+  "data.continuous_token.enable=True"
+  "data.continuous_token.model_family=deepseekv4"
+  "+data.apply_chat_template_kwargs.enable_thinking=True"
   "data.truncation=error"
   "data.dataloader_num_workers=8"
 )
@@ -210,7 +209,7 @@ MODEL=(
   "actor_rollout_ref.model.path=${MODEL_PATH}"
   "actor_rollout_ref.model.trust_remote_code=True"
   "actor_rollout_ref.model.use_fused_kernels=True"
-  "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'"
+  "actor_rollout_ref.model.custom_chat_template=null"
 )
 
 ACTOR=(

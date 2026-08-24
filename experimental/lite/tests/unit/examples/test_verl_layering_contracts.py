@@ -115,6 +115,17 @@ def test_deepseek_v4_rollout_preserves_ue8m0_scale_contract() -> None:
     assert '"+${VLLM_QUANT_CONFIG}.scale_fmt=ue8m0"' in script
 
 
+def test_deepseek_v4_rollout_uses_native_continuous_token_encoder() -> None:
+    script = DS4_DAPO_SCRIPT.read_text(encoding="utf-8")
+    assert '"data.continuous_token.enable=True"' in script
+    assert '"data.continuous_token.model_family=deepseekv4"' in script
+    assert '"data.filter_overlong_prompts=False"' in script
+    assert '"+data.apply_chat_template_kwargs.enable_thinking=True"' in script
+    assert '"actor_rollout_ref.model.custom_chat_template=null"' in script
+    assert "DS4_CHAT_TEMPLATE" not in script
+    assert "DEEPSEEK_V4_FLASH_CHAT_TEMPLATE" not in script
+
+
 def test_alignment_gate_accepts_upstream_verl_metrics(tmp_path: Path) -> None:
     metrics = tmp_path / "metrics.jsonl"
     records = []
