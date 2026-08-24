@@ -26,6 +26,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.ssm.packed_seq_helpers import (
     build_packed_seq_idx,
@@ -52,10 +53,8 @@ else:
 
 try:
     from causal_conv1d import causal_conv1d_fn
-    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_varlen_states = None
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
@@ -94,11 +93,15 @@ except ImportError:
 # forward-only and CUDA-graph safe, so training (which owns the backward pass)
 # keeps calling upstream.
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
-from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+    causal_conv1d_varlen_carry_states,
+    causal_conv1d_varlen_fn,
+)
 from megatron.core.ssm.ops.gdp import (
     chunk_gated_delta_product_varlen,
     fused_recurrent_gated_delta_rule_update,
 )
+from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_INFERENCE_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +127,15 @@ class ExtendedRMSNorm(RMSNormGated):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0}, sharded_offsets
+            state_dict,
+            prefix,
+            {"weight": 0},
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
 
@@ -218,9 +227,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         super().__init__(config)
 
-        # Inference-time contract: ``MambaInferenceStateConfig.from_model`` in
-        # megatron/core/inference/config.py reads ``layer.mixer.chunk_size`` to
-        # size the SSM scan blocks.
+        # Training-path chunk size, handed to the pip FLA kernels. The dynamic
+        # inference path does NOT run at this size: the forked prefill kernels
+        # chunk at a fixed 64, which `ssm_inference_chunk_size` reports.
         self.chunk_size = chunk_size
 
         # Check that the causal_conv1d version is new enough or fail
@@ -355,6 +364,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
+        # _prepare_qkv feeds the conv channel-last; see assert_causal_conv1d_deterministic.
+        assert_causal_conv1d_deterministic(config.deterministic_mode)
+
         self.activation = "silu"
         self.act = nn.SiLU()
 
@@ -406,6 +418,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            self.norm.tp_group = self.pg_collection.tp
             setattr(self.norm.weight, 'tensor_model_parallel', True)
 
         # Assume sequence parallelism: input is partitioned along d_inner and
@@ -696,6 +709,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         cu_seqlens=None,
         precomputed_seq_idx=None,
         precomputed_seq_start=None,
+        conv_initial_states=None,
     ):
         """Run the causal conv on the VKQ slice and split/reshape it into query, key,
         and value.
@@ -717,6 +731,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         conv metadata, which routes to the forked varlen conv instead of
         `causal_conv1d_fn`: it reads the request ids and start offsets rather than
         deriving them, which is what makes the step replayable from a CUDA graph.
+        `conv_initial_states` is the left conv boundary for each request, which
+        under chunked prefill is the tail of the previous chunk rather than zeros.
         """
         assert (precomputed_seq_idx is None) == (
             precomputed_seq_start is None
@@ -744,15 +760,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         elif precomputed_seq_idx is not None:
             # Forked varlen conv. Stays in the (b, l, d) layout like the decode branch
             # above: the kernel takes a packed ``(T, d)`` sequence, so squeeze the
-            # batch dim rather than transposing to [B, D, L]. Fresh prefills have no
-            # conv history, so `initial_states` stays None (zeros); prefix caching
-            # will pass the restored states here.
+            # batch dim rather than transposing to [B, D, L]. `conv_initial_states`
+            # carries the left boundary: zeros for a fresh prefill, the previous
+            # chunk's tail under chunked prefill.
             x = causal_conv1d_varlen_fn(
                 x=x.squeeze(0).contiguous(),
                 weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
                 bias=self.cp.get_conv1d_bias(),
                 cu_seqlens=cu_seqlens,
-                initial_states=None,
+                initial_states=conv_initial_states,
                 activation=self.activation,
                 precomputed_seq_idx=precomputed_seq_idx,
                 precomputed_seq_start=precomputed_seq_start,
@@ -1014,31 +1030,49 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         context: DynamicInferenceContext,
     ) -> torch.Tensor:
         """Variable-length prefill over all prefill requests in one varlen call.
-        ``zVKQba`` is ``[l, 1, proj_dim]``; returns ``[l, 1, d_inner]``. Fresh
-        requests start from a zero recurrent state (no prefix caching in the MVP);
-        the resulting final conv/SSM states are written back into the caches.
+        ``zVKQba`` is ``[l, 1, proj_dim]``; returns ``[l, 1, d_inner]``.
+
+        Each request enters carrying whatever conv/SSM state its cache slot
+        holds and leaves having written the slot back, which is the whole of
+        the chunked-prefill contract: ``cu_seqlens`` describes only the slice of
+        the prompt scheduled this step, and the state cache is the only thing
+        that carries across steps. A fresh request's slot was zeroed at
+        allocation, so the same code path serves first and continuation chunks.
 
         The whole step is CUDA-graph capturable: it runs on the in-tree kernels,
         which take precomputed chunk descriptors and per-token conv metadata and
         so need neither a host synchronization nor a data-dependent shape.
         Padding requests are zero-length sequences with a `-1` state slot; they
         produce zero output and touch no state."""
-        assert (
-            not context.is_chunked_prefill_enabled()
-        ), "GDP dynamic inference does not support chunked prefill yet."
-
         metadata = context.mamba_metadata
         cu_seqlens = metadata.cu_seqlens
         batch_indices = metadata.batch_indices_prefill
 
         z, VKQ, ba = self._preprocess(zVKQba)
 
-        # Capture per-request final conv states (before the conv consumes the
-        # inputs) and write them into the prefill requests' cache rows. Done here
-        # rather than via _prepare_qkv's conv_state argument, which seeds a single
-        # static-batching window with F.pad instead of one row per request.
-        conv_varlen_states = causal_conv1d_varlen_states(
-            VKQ.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+        # Read the incoming conv history BEFORE overwriting the cache rows below.
+        # On a continuation chunk these are the tail tokens of the previous chunk;
+        # on a first chunk the slot is zeroed, which is the correct left boundary.
+        # Reading after the write would feed a request its own freshly-computed
+        # state and corrupt the convolution.
+        #
+        # A `-1` padding row indexes the last cache slot rather than erroring. The
+        # gathered values are never used: a padding request is zero-length, so the
+        # carry below reproduces the state it read, `tensor_masked_update` skips the
+        # `-1` rows on the write back, and the forked kernels emit zeros for them.
+        previous_conv_states = conv_state[batch_indices]
+        initial_conv_states = previous_conv_states[:, :, 1:]
+
+        # Fold this step's slice into each request's conv state, before the conv
+        # consumes the inputs, and write the result into the prefill cache rows.
+        # Done here rather than via _prepare_qkv's conv_state argument, which
+        # seeds a single static-batching window with F.pad instead of one row per
+        # request. `cu_seqlens` describes only the slice scheduled this step, so a
+        # request whose slice is shorter than d_conv keeps the columns it arrived
+        # with; see `causal_conv1d_varlen_carry_states` for the column-by-column
+        # rule.
+        conv_varlen_states = causal_conv1d_varlen_carry_states(
+            VKQ.squeeze(0), cu_seqlens, previous_conv_states
         )
         tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
@@ -1049,6 +1083,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             cu_seqlens=cu_seqlens,
             precomputed_seq_idx=metadata.conv_seq_idx,
             precomputed_seq_start=metadata.conv_seq_start,
+            conv_initial_states=initial_conv_states,
             l2_norm_in_kernel=True,
         )
 
@@ -1060,8 +1095,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # which emits exactly the layout this kernel wants. The query/key L2 norm is left
         # to the kernel (l2_norm_in_kernel above), so it is applied exactly once. This
         # calls the in-tree fork rather than _run_gdp_kernel because dynamic batching is
-        # forward-only, and the fork writes each request's final state straight into the
-        # cache at `batch_indices` (skipping -1 padding slots), so no scatter follows.
+        # forward-only, and the fork resumes each request's recurrence from its cached
+        # state and writes the final state straight back into the cache at
+        # `batch_indices` (skipping -1 padding slots), so no scatter follows.
+        # `initial_state` is passed unconditionally -- it selects a `tl.constexpr`
+        # branch in the state kernel, so making it depend on the batch content would
+        # respecialize the kernel underneath a captured graph.
+        initial_ssm_state = ssm_state[batch_indices]
+
         core_attn_out, _ = chunk_gated_delta_product_varlen(
             query,
             key,
@@ -1075,7 +1116,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             chunk_offsets=metadata.gdp_chunk_offsets,
             state=ssm_state,
             state_indices=batch_indices,
-            initial_state=None,
+            initial_state=initial_ssm_state,
             use_qk_l2norm_in_kernel=True,
         )
 
@@ -1109,6 +1150,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         conv_states_shape = (self.conv1d.weight.shape[0], self.d_conv)
         ssm_states_shape = (self.nheads_local_tp, self.d_state, self.headdim)
         return (conv_states_shape, ssm_states_shape)
+
+    @property
+    def ssm_inference_chunk_size(self) -> int:
+        """Chunk length the dynamic-inference prefill kernels actually run at.
+
+        The forked GDP kernels chunk at a fixed 64, independent of the
+        training-path `chunk_size`. Scheduling decisions that must land on a
+        chunk boundary (batch-invariant chunked prefill, recurrent-state
+        extraction for prefix caching) align to this, not to `chunk_size`.
+        """
+        return GDP_INFERENCE_CHUNK_SIZE
 
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.
@@ -1168,6 +1220,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 "D": 0,
             },  # parameters sharded across TP
             sharded_offsets=sharded_offsets,
+            tp_group=self.pg_collection.tp,
+            dp_cp_group=metadata["dp_cp_group"],
         )
         # Submodules
         for name, module in self.named_children():
@@ -1175,12 +1229,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 # Add TP sharding for Conv1d
                 module_sd = module.state_dict(prefix="", keep_vars=True)
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd, f"{prefix}{name}.", {f"weight": 0, f"bias": 0}, sharded_offsets
+                    module_sd,
+                    f"{prefix}{name}.",
+                    {"weight": 0, "bias": 0},
+                    sharded_offsets,
+                    tp_group=self.pg_collection.tp,
+                    dp_cp_group=metadata["dp_cp_group"],
                 )
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f"{prefix}{name}.", sharded_offsets, metadata
+                    module,
+                    f"{prefix}{name}.",
+                    sharded_offsets,
+                    metadata,
+                    tp_group=self.pg_collection.tp,
                 )
 
             sharded_state_dict.update(module_sharded_sd)
