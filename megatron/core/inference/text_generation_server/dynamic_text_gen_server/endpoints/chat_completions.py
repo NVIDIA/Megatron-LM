@@ -660,10 +660,14 @@ try:
                 getattr(chat_tok, "chat_template", None) is not None
                 or chat_template_kwargs.get('chat_template') is not None
             ):
-                # Template compilation + render + tokenization is synchronous and
-                # CPU-bound. Run it in a worker thread so a large conversation or
-                # an expensive template cannot stall every other in-flight
-                # generation sharing this event loop.
+                # Template render + tokenization is synchronous and CPU-bound, so
+                # run it off the event loop. This is a latency mitigation, not a
+                # DoS defense: Jinja rendering is pure Python and holds the GIL,
+                # so an expensive template still degrades the loop badly (it just
+                # no longer hangs it outright). Request-supplied templates are
+                # rejected in _sanitize_chat_template_kwargs -- that is the actual
+                # fix. The real win here is the tokenizer half, which drops into
+                # Rust and releases the GIL for long conversations.
                 prompt_tokens = _coerce_to_token_id_list(
                     await asyncio.to_thread(
                         functools.partial(
