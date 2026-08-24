@@ -432,7 +432,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
             self.ssm_chunk_alignment = mamba_inference_state_config.ssm_chunk_alignment
-            self.has_mamba_layers = mamba_inference_state_config.has_mamba_layers
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:

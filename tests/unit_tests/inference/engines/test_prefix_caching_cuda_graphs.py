@@ -19,11 +19,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import (
-    InferenceConfig,
-    MambaInferenceStateConfig,
-    PrefixCachingEvictionPolicy,
-)
+from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -36,82 +32,23 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import (
-    gated_delta_product_stack_spec,
-    hybrid_stack_spec,
-)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    hybrid_mixer_kwargs,
+    hybrid_stack_spec_for,
+    skip_if_sequence_packing_not_available,
+    ssm_state_config,
+)
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 BLOCK_SIZE = 256
 VOCAB_SIZE = 10000
 MAX_SEQ_LEN = 2048
 NUM_TOKENS_TO_GENERATE = 8
-
-try:
-    import einops  # noqa: F401
-    import fla  # noqa: F401
-    import mamba_ssm  # noqa: F401
-
-    HAVE_GDP_DEPS = True
-except ImportError:
-    HAVE_GDP_DEPS = False
-
-
-def skip_if_sequence_packing_not_available(ssm_mixer="mamba"):
-    """Skip unless the packing support the given mixer's kernels need is present."""
-    if ssm_mixer == "gdp":
-        if not HAVE_GDP_DEPS:
-            pytest.skip("GDP requires fla + mamba_ssm + einops")
-        available, reason = check_fla_sequence_packing_support()
-    else:
-        available, reason = _check_mamba_sequence_packing_support()
-    if not available:
-        pytest.skip(reason)
-
-
-def hybrid_mixer_kwargs(ssm_mixer):
-    """TransformerConfig kwargs selecting the hybrid stack's linear-attention mixer.
-
-    GDP needs its head/group/state dims spelled out, plus the Householder count
-    that sizes its chunk descriptors.
-    """
-    if ssm_mixer == "gdp":
-        return dict(
-            gdp_num_householder=2,
-            mamba_num_heads=8,
-            mamba_head_dim=32,
-            mamba_num_groups=8,
-            mamba_state_dim=64,
-        )
-    return dict(mamba_num_heads=16)
-
-
-def hybrid_stack_spec_for(ssm_mixer):
-    """The stack spec that builds the requested mixer."""
-    return gated_delta_product_stack_spec if ssm_mixer == "gdp" else hybrid_stack_spec
-
-
-def ssm_state_config(model):
-    """Inference state config with an FP32 recurrent state.
-
-    Prefix caching round trips a request's recurrent state through the cache,
-    where the uncached baseline these tests compare against keeps it in the
-    kernel's FP32 accumulator the whole way. With a BF16 cache that round trip
-    rounds the state and the two runs can genuinely diverge in their last
-    generated tokens -- the same reason batch-invariant mode forces FP32 (see
-    MambaInferenceStateConfig.from_model). Pinning FP32 keeps these tests
-    measuring the caching logic rather than cache precision.
-
-    Serving still defaults to the model dtype; this is a test-side choice.
-    """
-    return MambaInferenceStateConfig.from_model(model, ssm_states_dtype=torch.float32)
 
 
 def set_rounder(value):

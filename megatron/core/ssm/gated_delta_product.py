@@ -487,6 +487,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             assert (
                 not self.config.gdp_cutedsl_kernel
             ), "gdp_cutedsl_kernel is only supported for training, not inference."
+            # This mixer has neither of MambaMixer's batch-invariance mechanisms:
+            # boundary-chunk state retention on prefill and decode tail replay.
+            # Asserted here rather than in DynamicInferenceContext so callers that
+            # only want batch-invariant attention and GEMMs can still run GDP.
+            assert (
+                not self.config.batch_invariant_mode
+            ), "batch_invariant_mode is not supported for Gated Delta Product layers."
             if inference_context.is_dynamic_batching():
                 ok, reason = check_fla_sequence_packing_support()
                 assert ok, reason
@@ -1063,6 +1070,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             intermediate_ssm_out = slot_allocator.intermediate_ssm_out[gdp_layer_idx]
             intermediate_conv_out = slot_allocator.intermediate_conv_out[gdp_layer_idx]
 
+        # No batch-invariant term, unlike MambaMixer's equivalent flag: `forward`
+        # already rejects batch_invariant_mode for this mixer outright.
         extract_intermediates = (
             intermediate_ssm_out is not None and metadata.gdp_intermediate_chunk_indices is not None
         )

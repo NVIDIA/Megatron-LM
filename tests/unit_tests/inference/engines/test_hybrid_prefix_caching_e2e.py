@@ -56,13 +56,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.hybrid.hybrid_layer_specs import (
-    gated_delta_product_stack_spec,
-    hybrid_stack_spec,
-)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
@@ -71,6 +65,12 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    hybrid_mixer_kwargs,
+    hybrid_stack_spec_for,
+    skip_if_sequence_packing_not_available,
+    ssm_state_config,
+)
 from tests.unit_tests.test_utilities import Utils
 
 BLOCK_SIZE = 256
@@ -83,44 +83,6 @@ NUM_TOKENS_TO_GENERATE = 16
 MULTI_GROUP_TOKENS_TO_GENERATE = 8
 NUM_GROUPS = 4
 GROUP_TOKEN_STRIDE = 2000
-
-
-try:
-    import einops  # noqa: F401
-    import fla  # noqa: F401
-    import mamba_ssm  # noqa: F401
-
-    HAVE_GDP_DEPS = True
-except ImportError:
-    HAVE_GDP_DEPS = False
-
-
-def skip_if_sequence_packing_not_available(ssm_mixer="mamba"):
-    """Skip unless the packing support the given mixer's kernels need is present."""
-    if ssm_mixer == "gdp":
-        if not HAVE_GDP_DEPS:
-            pytest.skip("GDP requires fla + mamba_ssm + einops")
-        sequence_packing_available, reason = check_fla_sequence_packing_support()
-    else:
-        sequence_packing_available, reason = _check_mamba_sequence_packing_support()
-    if not sequence_packing_available:
-        pytest.skip(reason)
-
-
-def ssm_state_config(model):
-    """Inference state config with an FP32 recurrent state.
-
-    Prefix caching round trips a request's recurrent state through the cache,
-    where the uncached baseline these tests compare against keeps it in the
-    kernel's FP32 accumulator the whole way. With a BF16 cache that round trip
-    rounds the state and the two runs can genuinely diverge in their last
-    generated tokens -- the same reason batch-invariant mode forces FP32 (see
-    MambaInferenceStateConfig.from_model). Pinning FP32 keeps these tests
-    measuring the caching logic rather than cache precision.
-
-    Serving still defaults to the model dtype; this is a test-side choice.
-    """
-    return MambaInferenceStateConfig.from_model(model, ssm_states_dtype=torch.float32)
 
 
 def buffer_gb_for_kv_blocks(context, num_blocks):
@@ -197,24 +159,11 @@ class TestMambaPrefixCachingE2E:
         return request.param
 
     def _create_model(self, num_cuda_graphs=None):
-        is_gdp = self._ssm_mixer == "gdp"
         transformer_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=3,
             hidden_size=256,
-            # GDP needs its head/group/state dims spelled out, plus the
-            # Householder count that sizes its chunk descriptors.
-            **(
-                dict(
-                    gdp_num_householder=2,
-                    mamba_num_heads=8,
-                    mamba_head_dim=32,
-                    mamba_num_groups=8,
-                    mamba_state_dim=64,
-                )
-                if is_gdp
-                else dict(mamba_num_heads=16)
-            ),
+            **hybrid_mixer_kwargs(self._ssm_mixer),
             num_attention_heads=16,
             use_cpu_initialization=True,
             cuda_graph_impl="local" if num_cuda_graphs else "none",
@@ -227,7 +176,7 @@ class TestMambaPrefixCachingE2E:
         )
         model = HybridModel(
             config=transformer_config,
-            hybrid_stack_spec=(gated_delta_product_stack_spec if is_gdp else hybrid_stack_spec),
+            hybrid_stack_spec=hybrid_stack_spec_for(self._ssm_mixer),
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
@@ -557,20 +506,14 @@ class TestMambaPrefixCachingE2E:
         assert async_outputs == legacy_outputs
         assert async_prefill < legacy_prefill
 
+    # Comparing 20 requests against 5 is a batch-composition change, so this
+    # needs batch invariant mode, which is not implemented for GDP.
+    # TODO(ksanthanam): add GDP coverage once GDP supports batch invariant mode.
+    @pytest.mark.parametrize("ssm_mixer", ["mamba"], indirect=True)
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
-    def test_mamba_prefix_caching_multi_group_e2e(self, num_cuda_graphs, request):
+    def test_mamba_prefix_caching_multi_group_e2e(self, num_cuda_graphs):
         """Verify multi-group prefix caching with 4 independent groups."""
-        # GDP's strict multi-vs-per-group batch-invariance needs batch_invariant_mode,
-        # which is not yet compatible with prefix caching. The CUDA-graph case only
-        # passes because a fixed bucket coalesces the batch sizes, so xfail GDP either way.
-        if self._ssm_mixer == "gdp":
-            request.applymarker(
-                pytest.mark.xfail(
-                    reason="GDP batch-invariance needs batch_invariant_mode, "
-                    "not yet compatible with prefix caching"
-                )
-            )
         model = self._create_model(num_cuda_graphs=num_cuda_graphs)
         # This test only compares pc=on runs against each other (multi-group vs
         # per-group), so the state round-trip precision cancels -- unlike the

@@ -58,12 +58,6 @@ class MambaInferenceStateConfig:
     chunked prefill splits anywhere, because each step re-chunks from its own
     slice start."""
 
-    has_mamba_layers: bool = True
-    """Whether the model has any Mamba2 layers, as opposed to only other SSM
-    variants. Lets consumers tell whether `mamba_chunk_size` describes a
-    chunking the model actually performs: on a GDP-only model it is an unused
-    default, since GDP carries its own descriptors."""
-
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
@@ -132,15 +126,10 @@ class MambaInferenceStateConfig:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size
                 gdp_num_householder = 0
-                has_mamba_layers = False
             else:
                 mamba_chunk_size = chunking.chunk_size
                 ssm_chunk_alignment = chunking.inference_chunk_size
                 gdp_num_householder = chunking.num_householder
-                # ssm_chunking() asserts a homogeneous SSM stack, so the shared
-                # chunking carries a Householder count only when every SSM layer
-                # is Gated Delta Product.
-                has_mamba_layers = chunking.num_householder == 0
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -149,7 +138,6 @@ class MambaInferenceStateConfig:
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
                 ssm_chunk_alignment=ssm_chunk_alignment,
-                has_mamba_layers=has_mamba_layers,
                 gdp_num_householder=gdp_num_householder,
             )
         return None

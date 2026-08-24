@@ -8,7 +8,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
-from megatron.core.ssm.ops.gdp.metadata import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 from megatron.core.ssm.ops.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 
 
@@ -523,7 +523,14 @@ class MambaMetadata:
                 # the states *entering* each chunk, so the state after `offset`
                 # tokens is row `offset // 64` of the sequence's chunk range,
                 # whereas Mamba's are the states leaving each chunk.
-                if self.gdp_num_householder > 0 and self.gdp_chunk_offsets is not None:
+                if self.gdp_num_householder > 0:
+                    # The GDP chunk descriptors must already be built for this step:
+                    # the view published below is what enables extraction, and it
+                    # would otherwise carry the previous step's rows.
+                    assert self.gdp_chunk_offsets is not None, (
+                        "GDP chunk descriptors must be built before intermediate "
+                        "extraction metadata."
+                    )
                     gdp_cu_chunk_offsets = self.gdp_chunk_offsets[:real_prefill_count].to(
                         torch.int64
                     )
