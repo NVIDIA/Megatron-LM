@@ -95,24 +95,9 @@ def is_release_fp32_control(name: str) -> bool:
     )
 
 
-def is_native_fp32_control(name: str) -> bool:
-    """Return whether a native mLite V4 parameter must remain in FP32."""
-
-    leaf = name.rsplit(".", 1)[-1]
-    return (
-        (name.startswith("hc_head.") and leaf in {"hc_fn", "hc_base", "hc_scale"})
-        or (".attn_hc." in name and leaf in {"hc_fn", "hc_base", "hc_scale"})
-        or (".ffn_hc." in name and leaf in {"hc_fn", "hc_base", "hc_scale"})
-        or name.endswith(".sinks")
-        or name.endswith(".ape")
-        or name.endswith(".mlp.gate.expert_bias")
-    )
-
-
 __all__ = [
     "BLOCK_SHAPE",
     "CanonicalBlockFP8Weight",
-    "is_native_fp32_control",
     "is_release_fp32_control",
     "is_release_unquantized_weight",
     "requantize_block_fp8_weight",
