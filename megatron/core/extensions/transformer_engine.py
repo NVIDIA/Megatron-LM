@@ -2256,6 +2256,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
+                # Hybrid/dynamic CP can enable CP at runtime on a model built
+                # with context_parallel_size == 1, where the constructor never
+                # allocated the auxiliary CP stream. Create it lazily; TE's
+                # AttnFuncWithCPAndKVP2P dereferences it unconditionally.
+                if TEDotProductAttention.cp_stream is None:
+                    TEDotProductAttention.cp_stream = torch.cuda.Stream()
                 self.cp_group = packed_seq_params.cp_group
                 super().set_context_parallel_group(
                     self.cp_group,

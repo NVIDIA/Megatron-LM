@@ -1527,6 +1527,15 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_freqs_max_seqlen = None
 
+            # Hybrid/dynamic CP: RoPE position math must use the sub-sample's
+            # runtime CP group (packed_seq_params.cp_group), not the static
+            # group the model was built with. The fused THD RoPE kernel takes
+            # the full cu_seqlens plus (cp_size, cp_rank) to locate this rank's
+            # zigzag slice, and the static group reports cp_size=1.
+            rope_cp_group = self.pg_collection.cp
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+                rope_cp_group = packed_seq_params.cp_group
+
             if split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
@@ -1537,7 +1546,7 @@ class Attention(MegatronModule, ABC):
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
-                            cp_group=self.pg_collection.cp,
+                            cp_group=rope_cp_group,
                             max_seqlen=rope_freqs_max_seqlen,
                         )
                     else:
@@ -1556,7 +1565,7 @@ class Attention(MegatronModule, ABC):
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
-                        cp_group=self.pg_collection.cp,
+                        cp_group=rope_cp_group,
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
