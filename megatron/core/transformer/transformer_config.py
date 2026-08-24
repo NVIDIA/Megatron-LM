@@ -3219,10 +3219,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             # TODO(tailaim): add support for other dispatcher types
-            assert self.moe_token_dispatcher_type == "alltoall", (
-                f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
-                f"got '{self.moe_token_dispatcher_type}'"
-            )
+            # Only relevant for MoE models; dense models never dispatch tokens,
+            # so the (unused) dispatcher default must not fail validation.
+            if self.num_moe_experts is not None:
+                assert self.moe_token_dispatcher_type == "alltoall", (
+                    f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
+                    f"got '{self.moe_token_dispatcher_type}'"
+                )
 
 
 @dataclass
