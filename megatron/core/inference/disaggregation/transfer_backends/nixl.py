@@ -171,8 +171,6 @@ class NixlPullHandle:
                 raise RuntimeError(self.error)
             return True
         if time.perf_counter() - self.submitted_at > self.timeout_s:
-            # Timeout does not prove that the remote read stopped. Keep
-            # ``done`` false so callers continue to quarantine the buffers.
             raise TimeoutError(
                 f"NIXL transfer timed out after {self.timeout_s}s; pending={pending}"
             )
