@@ -275,6 +275,10 @@ class TestAttentionDynamicContextParallel:
         )
         rotary_pos_emb = RotaryEmbedding(kv_channels=16, rotary_percent=1.0)(sequence_length)
 
+        build_time_group = self.parallel_attention.pg_collection.cp
+
+        # Microbatch with a runtime CP group: RoPE (and the collection) must
+        # use it.
         runtime_group = self._runtime_cp_group()
         packed_seq_params = make_test_packed_seq_params(sequence_length)
         packed_seq_params.cp_group = runtime_group
@@ -286,7 +290,10 @@ class TestAttentionDynamicContextParallel:
             packed_seq_params=packed_seq_params,
         )
         assert captured and all(group is runtime_group for group in captured)
+        assert self.parallel_attention.pg_collection.cp is runtime_group
 
+        # Next microbatch without a runtime group (e.g. local_cp_size == 1):
+        # the build-time group must be restored, not the previous microbatch's.
         captured.clear()
         packed_seq_params = make_test_packed_seq_params(sequence_length)
         self.parallel_attention(
@@ -295,8 +302,8 @@ class TestAttentionDynamicContextParallel:
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
         )
-        static_group = self.parallel_attention.pg_collection.cp
-        assert captured and all(group is static_group for group in captured)
+        assert captured and all(group is build_time_group for group in captured)
+        assert self.parallel_attention.pg_collection.cp is build_time_group
 
     def test_te_cp_stream_lazily_created_for_runtime_cp_group(self, monkeypatch):
         import transformer_engine.pytorch as te_pytorch
