@@ -967,6 +967,13 @@ class _CudagraphReplayNode(torch.autograd.Function):
                         hook = getattr(param, '_grad_accum_hook', None)
                         if hook is not None:
                             hook()
+        for param in runner._replica_finalize_hook_params:
+            param.grad = None
+            if hasattr(param, 'grad_added_to_main_grad'):
+                param.grad_added_to_main_grad = True
+            hook = getattr(param, '_replica_grad_accum_hook', None)
+            if hook is not None:
+                hook()
 
         return None, None, *runner.static_grad_inputs, *(None,) * len(runner.params_to_backprop)
 
@@ -1025,6 +1032,13 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
+        # Non-GTP replica params finalized inside this graph. Their real wgrads
+        # already live in main_grad, so replay manually fires DDP hooks rather
+        # than returning full-sized dummy gradients to AccumulateGrad.
+        self._replica_finalize_hook_params = []
+        # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
+        # reader before launching the graph.
+        self._gtp_wgrad_ring_slots = []
         # GTP weights read by this forward graph before their owning module pre-hooks execute.
         self._gtp_fwd_params_to_ensure_ready = ()
 
@@ -1456,6 +1470,12 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.params_to_backprop = self.get_connected_params(warmup_outputs)
             else:
                 self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
+            self._replica_finalize_hook_params = [
+                param
+                for param in self.params_to_backprop
+                if getattr(param, '_replica_managed_grad', False)
+                and not getattr(param, 'is_gtp_weight_remat', False)
+            ]
             self.num_dgrads = len(self.fwd_graph_input_surface)
             self.fwd_graph_input_surface = self.fwd_graph_input_surface + self.params_to_backprop
 

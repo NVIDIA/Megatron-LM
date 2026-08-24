@@ -1140,7 +1140,14 @@ class GTPShardedParam(torch.nn.Parameter):
     @property
     def _weights(self):
         """Individual weight shards (self for non-routed, weight_list for routed)."""
-        weights = self.weight_list if self.is_routed_expert else [self]
+        # Only the first routed-expert shard owns ``weight_list``. Replica
+        # autograd intentionally connects every discrete optimizer parameter so
+        # CUDA-graph/DDP bookkeeping can visit a non-leader shard directly.
+        weights = (
+            self.weight_list
+            if self.is_routed_expert and self.weight_list is not None
+            else [self]
+        )
         # Only meaningful when _set_state is actively tracking transitions.
         if GTP_CONFIG.check_param_states:
             assert all(w.state == weights[0].state for w in weights)

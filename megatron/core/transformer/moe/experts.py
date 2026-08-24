@@ -509,16 +509,26 @@ class TEGroupedMLP(MegatronModule):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
         def register_replica_weights(
-            op: torch.nn.Module, runtime_weights: tuple[torch.nn.Parameter, ...]
+            op: torch.nn.Module,
+            runtime_weights: tuple[torch.nn.Parameter, ...],
+            *,
+            single_grouped_weight: bool,
         ) -> None:
             """Attach unregistered native-plus-replica weights to a TE op shell."""
-            if len(runtime_weights) != op.num_groups:
+            expected_weights = 1 if single_grouped_weight else op.num_groups
+            if len(runtime_weights) != expected_weights:
                 raise ValueError(
-                    f"Expected {op.num_groups} replica runtime weights, got {len(runtime_weights)}."
+                    f"Expected {expected_weights} replica runtime weights, got "
+                    f"{len(runtime_weights)}."
                 )
-            op.register_parameter("weight", None)
-            for idx, runtime_weight in enumerate(runtime_weights):
-                op.register_parameter(f"weight{idx}", runtime_weight)
+            if single_grouped_weight:
+                op.register_parameter("weight", runtime_weights[0])
+                for idx in range(op.num_groups):
+                    op.register_parameter(f"weight{idx}", None)
+            else:
+                op.register_parameter("weight", None)
+                for idx, runtime_weight in enumerate(runtime_weights):
+                    op.register_parameter(f"weight{idx}", runtime_weight)
 
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
@@ -569,7 +579,17 @@ class TEGroupedMLP(MegatronModule):
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         if replica_bridge is not None:
-            register_replica_weights(op, replica_bridge.runtime_fc1_weights)
+            # The source model intentionally keeps discrete optimizer parameters, so
+            # Megatron sets TE's process-wide single-param gate to false. Large replica
+            # runtimes still need a packed execution-only parameter to avoid TE's
+            # 64-member discrete GEMM limit. Switch just this meta op shell after its
+            # construction instead of changing the process-wide source-weight policy.
+            op.single_grouped_weight = replica_bridge.uses_packed_runtime_weights
+            register_replica_weights(
+                op,
+                replica_bridge.runtime_fc1_weights,
+                single_grouped_weight=replica_bridge.uses_packed_runtime_weights,
+            )
             self._install_fused_fc1_prefetch_wait(op, replica_bridge)
         else:
             register_grouped_linear_params(
@@ -683,7 +703,12 @@ class TEGroupedMLP(MegatronModule):
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
         # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         if replica_bridge is not None:
-            register_replica_weights(op, replica_bridge.runtime_fc2_weights)
+            op.single_grouped_weight = replica_bridge.uses_packed_runtime_weights
+            register_replica_weights(
+                op,
+                replica_bridge.runtime_fc2_weights,
+                single_grouped_weight=replica_bridge.uses_packed_runtime_weights,
+            )
         else:
             register_grouped_linear_params(
                 op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
