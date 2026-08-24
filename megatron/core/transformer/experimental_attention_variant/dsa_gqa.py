@@ -131,6 +131,16 @@ def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
     )
 
 
+def _split_topk_padding(topk_indices):
+    """Split the indexer's -1 padding out of top-k indices.
+
+    Rows with fewer valid keys than top_k are padded with -1 (see
+    fused_qk_topk_naive). Returns indices safe to gather with, plus the mask of
+    padded slots whose scores must be driven to -inf.
+    """
+    return topk_indices.clamp(min=0), topk_indices < 0
+
+
 def _build_selected_causal_mask(
     topk_indices: torch.Tensor, query_start_position: int = 0
 ) -> torch.Tensor:
@@ -233,7 +243,9 @@ def compute_gqa_dsa_indexer_loss(
             if selected_index_scores is not None:
                 student_logits = selected_index_scores[:, q_start:q_end, :]
             else:
-                student_logits = index_scores[:, q_start:q_end, :].gather(-1, topk_indices_chunk)
+                safe_chunk, padded_chunk = _split_topk_padding(topk_indices_chunk)
+                student_logits = index_scores[:, q_start:q_end, :].gather(-1, safe_chunk)
+                student_logits = student_logits.masked_fill(padded_chunk, float("-inf"))
             student_scores = torch.nn.functional.softmax(student_logits, dim=-1, dtype=torch.float32)
             kl_per_element = teacher_scores * (
                 torch.log(teacher_scores + 1e-10) - torch.log(student_scores + 1e-10)
@@ -246,13 +258,16 @@ def compute_gqa_dsa_indexer_loss(
         query = query.permute(1, 2, 0, 3)
         key = key.permute(1, 2, 0, 3)
         topk = topk_indices.size(-1)
-        gather_index = topk_indices[:, None, :, :, None].expand(b, np, sq, topk, hn)
+        safe_topk, padded_topk = _split_topk_padding(topk_indices)
+        gather_index = safe_topk[:, None, :, :, None].expand(b, np, sq, topk, hn)
         selected_key = torch.gather(
             key[:, :, None, :, :].expand(b, np, sq, sk, hn),
             3,
             gather_index,
         )
-        selected_causal_mask = _build_selected_causal_mask(topk_indices).unsqueeze(1)
+        selected_causal_mask = _build_selected_causal_mask(safe_topk).masked_fill(
+            padded_topk, float("-inf")
+        ).unsqueeze(1)
         attention_scores = (
             torch.einsum("bnsh,bnskh->bnsk", query.float(), selected_key.float()) * softmax_scale
         )
@@ -266,7 +281,9 @@ def compute_gqa_dsa_indexer_loss(
             )
         else:
             index_scores = torch.nn.functional.softmax(
-                index_scores.gather(-1, topk_indices), dim=-1, dtype=torch.float32
+                index_scores.gather(-1, safe_topk).masked_fill(padded_topk, float("-inf")),
+                dim=-1,
+                dtype=torch.float32,
             )
         attention_scores = attention_scores.sum(dim=1)
     else:
@@ -279,9 +296,14 @@ def compute_gqa_dsa_indexer_loss(
             torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
             diagonal=1,
         )
+        # Route the indexer's -1 padding into a sink column that is dropped, so
+        # padded slots cannot unmask key 0 via a clamped index.
+        sink_indices = torch.where(
+            topk_indices < 0, torch.full_like(topk_indices, sk), topk_indices
+        )
         index_mask = torch.full(
-            (b, sq, sk), float("-inf"), dtype=torch.float32, device=attention_scores.device
-        ).scatter_(-1, topk_indices, 0)
+            (b, sq, sk + 1), float("-inf"), dtype=torch.float32, device=attention_scores.device
+        ).scatter_(-1, sink_indices, 0)[..., :sk]
 
         attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
         if sparse_loss:
@@ -322,8 +344,11 @@ def _dense_grouped_dsa_fn(
     attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
     attention_scores = attention_scores.reshape(b, np, sq, skv)
 
-    index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
-    index_mask.scatter_(-1, topk_indices, 0)
+    sink_indices = torch.where(
+        topk_indices < 0, torch.full_like(topk_indices, skv), topk_indices
+    )
+    index_mask = torch.full((b, sq, skv + 1), float("-inf"), device=attention_scores.device)
+    index_mask = index_mask.scatter_(-1, sink_indices, 0)[..., :skv]
     if mask is None:
         mask = torch.triu(
             torch.full((sq, skv), float("-inf"), dtype=torch.float32, device=index_mask.device),
@@ -386,6 +411,11 @@ def _sparse_grouped_dsa_fn(
         q_end = min(q_start + query_chunk_size, sq)
         chunk_len = q_end - q_start
         topk_indices_chunk = topk_indices[:, q_start:q_end, :]
+        # Rows with fewer valid keys than top_k are padded with -1 by the indexer
+        # (see fused_qk_topk_naive). Gather from a clamped copy and mask the
+        # corresponding scores, so the padding never selects a real key.
+        padded_slots = topk_indices_chunk < 0
+        topk_indices_chunk = topk_indices_chunk.clamp(min=0)
         if mask is None:
             selected_mask = _build_selected_causal_mask(
                 topk_indices_chunk, query_start_position=q_start
@@ -394,6 +424,8 @@ def _sparse_grouped_dsa_fn(
             selected_mask = mask[q_start:q_end].unsqueeze(0).expand(b, chunk_len, skv).gather(2, topk_indices_chunk)
         else:
             selected_mask = mask[:, q_start:q_end, :].gather(2, topk_indices_chunk)
+        if padded_slots.any():
+            selected_mask = selected_mask.masked_fill(padded_slots, float("-inf"))
         if selected_mask.dtype == torch.bool:
             selected_mask = torch.zeros(
                 selected_mask.shape,
