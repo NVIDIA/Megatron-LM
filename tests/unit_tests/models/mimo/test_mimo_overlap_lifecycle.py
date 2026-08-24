@@ -6,8 +6,17 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
-from megatron.core.models.mimo.optimizer import MimoOptimizer
+from megatron.core.models.mimo.optimizer import (
+    MimoOptimizer,
+    _optimizer_config_for_module,
+    get_mimo_optimizer,
+)
+from megatron.core.optimizer.optimizer import MixedPrecisionOptimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 
 def _overlap_stub(modules):
@@ -72,6 +81,85 @@ def test_nested_overlap_lifecycle_routes_only_to_enabled_modules():
     encoder.start_param_sync.assert_not_called()
     encoder.start_grad_sync.assert_called_once_with()
     inactive.start_grad_sync.assert_not_called()
+
+
+def test_nested_forward_pre_hook_handles_are_visible_to_stock_train_loop():
+    language = MagicMock()
+    encoder = MagicMock()
+    language.remove_forward_pre_hook_handles = {object(): object()}
+    encoder.remove_forward_pre_hook_handles = {}
+    model = _overlap_stub([language, encoder])
+
+    handles = MimoModel.remove_forward_pre_hook_handles.fget(model)
+
+    assert handles == language.remove_forward_pre_hook_handles
+
+
+def test_mimo_optimizer_exposes_inner_optimizers_to_stock_train_loop():
+    dense = object()
+    expert = object()
+    module_optimizer = SimpleNamespace(chained_optimizers=[dense, expert])
+    standalone_optimizer = object()
+    optimizer = SimpleNamespace(_active_optimizers=[module_optimizer, standalone_optimizer])
+
+    optimizers = MimoOptimizer.chained_optimizers.fget(optimizer)
+
+    assert optimizers == [dense, expert, standalone_optimizer]
+
+
+def test_encoder_optimizer_uses_nonoverlapped_mxfp8_param_copy():
+    global_config = OptimizerConfig(
+        fp8_recipe='mxfp8', reuse_grad_buf_for_mxfp8_param_ag=True, overlap_param_gather=True
+    )
+    module = SimpleNamespace(ddp_config=SimpleNamespace(overlap_param_gather=False))
+    module_config = _optimizer_config_for_module(global_config, module)
+    assert module_config is not global_config
+    assert global_config.reuse_grad_buf_for_mxfp8_param_ag
+    assert global_config.overlap_param_gather
+    assert module_config.reuse_grad_buf_for_mxfp8_param_ag
+    assert not module_config.overlap_param_gather
+    optimizer = SimpleNamespace(
+        config=module_config,
+        timers=None,
+        is_stub_optimizer=False,
+        optimizer=MagicMock(),
+        _copy_main_params_to_model_params=MagicMock(),
+        _copy_main_params_to_param_buffer=MagicMock(),
+    )
+
+    assert MixedPrecisionOptimizer.step_with_ready_grads(optimizer)
+    optimizer._copy_main_params_to_model_params.assert_not_called()
+    optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
+
+
+def test_optimizer_config_rejects_module_without_ddp_config():
+    with pytest.raises(ValueError, match="must be DDP-wrapped"):
+        _optimizer_config_for_module(OptimizerConfig(), SimpleNamespace())
+
+
+def test_mimo_optimizer_scopes_param_group_alignment_to_module(mocker):
+    intra_dist_opt = object()
+    pg_collection = SimpleNamespace(intra_dist_opt=intra_dist_opt)
+    module = SimpleNamespace(
+        pg_collection=pg_collection,
+        ddp_config=SimpleNamespace(
+            overlap_param_gather=True, num_distributed_optimizer_instances=1
+        ),
+    )
+    grid = SimpleNamespace(is_current_rank_in_grid=lambda: True)
+    mimo_model = SimpleNamespace(
+        mimo_config=SimpleNamespace(module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: grid}),
+        language_model=module,
+        modality_submodules={},
+    )
+    optimizer_factory = mocker.patch(
+        "megatron.core.optimizer.get_megatron_optimizer", return_value=MagicMock()
+    )
+
+    get_mimo_optimizer(mimo_model, OptimizerConfig())
+
+    assert optimizer_factory.call_args.kwargs['param_group_process_group'] is intra_dist_opt
+    assert optimizer_factory.call_args.kwargs['pg_collection'] is pg_collection
 
 
 def test_mimo_optimizer_stages_each_active_optimizer_before_param_sync():

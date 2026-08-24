@@ -26,7 +26,13 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
-from megatron.core.utils import get_pg_rank, get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    get_te_version,
+    is_te_min_version,
+    is_torch_min_version,
+)
 from megatron.training import (
     get_adlr_autoresume,
     get_args,
@@ -94,8 +100,9 @@ def initialize_megatron(
     )
 
     if args.batch_invariant_mode:
-        print_rank_0("Enabling batch invariant mode globally")
-        enable_batch_invariant_mode()
+        backend = args.batch_invariant_backend
+        print_rank_0(f"Enabling batch invariant mode globally (backend={backend})")
+        enable_batch_invariant_mode(backend)
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -426,10 +433,12 @@ def _set_random_seed(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ep_group: Optional[torch.distributed.ProcessGroup] = None,
     etp_group: Optional[torch.distributed.ProcessGroup] = None,
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+    egtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Set random seed for reproducability.
 
-    The optional pp/dp/tp/ep/etp groups let a caller without an initialized mpu
+    The optional parallel groups let a caller without an initialized mpu
     (e.g. a disjoint-grid run) supply the parallel ranks explicitly; each falls
     back to the mpu group when None.
     """
@@ -448,6 +457,16 @@ def _set_random_seed(
             tp_rank = get_pg_rank(tp_group) if tp_group is not None else None
             ep_rank = get_pg_rank(ep_group) if ep_group is not None else None
             etp_rank = get_pg_rank(etp_group) if etp_group is not None else None
+            gtp_remat_rank = get_pg_rank(gtp_remat_group) if gtp_remat_group is not None else None
+            egtp_remat_rank = (
+                get_pg_rank(egtp_remat_group) if egtp_remat_group is not None else None
+            )
+            gtp_remat_world_size = (
+                get_pg_size(gtp_remat_group) if gtp_remat_group is not None else None
+            )
+            egtp_remat_world_size = (
+                get_pg_size(egtp_remat_group) if egtp_remat_group is not None else None
+            )
             tensor_parallel.model_parallel_cuda_manual_seed(
                 seed,
                 te_rng_tracker,
@@ -456,6 +475,10 @@ def _set_random_seed(
                 tp_rank=tp_rank,
                 ep_rank=ep_rank,
                 etp_rank=etp_rank,
+                gtp_remat_rank=gtp_remat_rank,
+                egtp_remat_rank=egtp_remat_rank,
+                gtp_remat_world_size=gtp_remat_world_size,
+                egtp_remat_world_size=egtp_remat_world_size,
             )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
