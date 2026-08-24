@@ -166,7 +166,6 @@ def test_replica_async_collectives_span_transport_backward():
             torch.nn.Parameter(torch.ones(())),
             torch.nn.Parameter(torch.ones(())),
         )
-        dummy_grads = (torch.zeros(()), torch.zeros(()))
 
         def start_prefetch(self, current_plan, *, retain_for_grad=False):
             assert current_plan is plan and retain_for_grad
@@ -215,6 +214,7 @@ def test_replica_async_collectives_span_transport_backward():
         "dispatch_backward",
         "wait_grad_reduce",
     ]
+    assert all(parameter.grad is None for parameter in bridge.source_parameters)
 
 
 def _set_main_grad(parameter):
@@ -322,6 +322,7 @@ def _run_replica_hybridep_full_layer_parity(
     moe_latent_size,
     single_grouped_weight=True,
     mxfp8=False,
+    gtp=False,
     reference_dispatcher="alltoall",
     verify_hybridep_contract=False,
 ):
@@ -344,11 +345,19 @@ def _run_replica_hybridep_full_layer_parity(
     monkeypatch.setenv(
         "NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1" if single_grouped_weight else "0"
     )
+    expert_model_parallel_size = 2 if gtp else 4
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
-        expert_model_parallel_size=4,
+        expert_model_parallel_size=expert_model_parallel_size,
         expert_tensor_parallel_size=1,
+        expert_gtp_remat_size=2 if gtp else 1,
     )
+    if gtp:
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
+
+        # This test isolates the bridge's explicit materialize-before-exchange
+        # dependency. The production-script test covers linked async GTP chains.
+        update_gtp_config(weight_prefetch=False, async_reduction=False)
     torch.manual_seed(1234)
 
     common = {
@@ -358,8 +367,9 @@ def _run_replica_hybridep_full_layer_parity(
         "moe_ffn_hidden_size": 1024,
         "num_attention_heads": 8,
         "num_moe_experts": 4,
-        "expert_model_parallel_size": 4,
+        "expert_model_parallel_size": expert_model_parallel_size,
         "expert_tensor_parallel_size": 1,
+        "expert_tensor_parallel_num_weight_shards": 2 if gtp else 1,
         "moe_router_topk": 2,
         "moe_router_load_balancing_type": "none",
         "moe_router_dtype": "fp32",
@@ -478,7 +488,17 @@ def _run_replica_hybridep_full_layer_parity(
             ):
                 assert len(runtime_weights) == bridge.num_runtime_experts
                 native_weights = projection.source_tensors
-                if len(projection.parameters) == 1:
+                if projection.packed_runtime_grad is not None:
+                    native_grads = tuple(
+                        projection.packed_runtime_grad[: bridge.num_local_experts]
+                    )
+                elif projection.gtp_leader is not None:
+                    native_grads = (
+                        tuple(projection.gtp_native_grad)
+                        if projection.gtp_native_grad is not None
+                        else projection.gtp_wgrad_tensors
+                    )
+                elif len(projection.parameters) == 1:
                     native_grads = tuple(
                         projection.parameters[0].main_grad.view(
                             bridge.num_local_experts, *projection.member_shape
@@ -512,6 +532,16 @@ def _run_replica_hybridep_full_layer_parity(
             if replica_bridge is not None and mxfp8:
                 _assert_replica_mxfp8_prefetch_exact(replica_bridge, "rowwise")
             output.float().sum().backward()
+            if replica_bridge is not None:
+                assert all(
+                    parameter.grad is None
+                    for parameter in replica_bridge.source_parameters
+                )
+                assert all(
+                    runtime_parameter.grad is None
+                    for projection in replica_bridge.projections
+                    for runtime_parameter in projection.runtime_parameters
+                )
             if replica_bridge is not None and mxfp8:
                 _assert_replica_mxfp8_prefetch_exact(replica_bridge, "columnwise")
             values = [
@@ -635,6 +665,7 @@ def _run_replica_hybridep_full_layer_parity(
         if (
             backend.startswith("replica_")
             and not mxfp8
+            and not gtp
             and not verify_hybridep_contract
         ):
             # Weight transfer runs at the eager prefetch boundary outside the
@@ -745,6 +776,8 @@ def _run_replica_hybridep_full_layer_parity(
     finally:
         fused_a2a.reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
+        if gtp:
+            update_gtp_config(weight_prefetch=True, async_reduction=True)
 
 
 @pytest.mark.internal
@@ -766,6 +799,26 @@ def test_replica_hybridep_full_layer_gradients_match_alltoall(
         None,
         None,
         single_grouped_weight,
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fused_a2a.HAVE_HYBRIDEP,
+    reason="CUDA and HybridEP are required",
+)
+def test_replica_hybridep_gtp_gradients_match_alltoall(monkeypatch):
+    """Check discrete GTP-sharded experts through replica weight and grad exchange."""
+    _run_replica_hybridep_full_layer_parity(
+        monkeypatch,
+        "replica_hybridep",
+        F.silu,
+        True,
+        False,
+        None,
+        None,
+        single_grouped_weight=False,
+        gtp=True,
     )
 
 

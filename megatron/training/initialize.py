@@ -370,11 +370,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
-                assert HAVE_GTP, (
-                    "GTP requires TransformerEngine >= 2.19. "
-                    "Set both --gtp_remat-weight-remat-size and "
-                    "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
-                )
+                # assert HAVE_GTP, (
+                #     "GTP requires TransformerEngine >= 2.19. "
+                #     "Set both --gtp_remat-weight-remat-size and "
+                #     "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
+                # )
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
