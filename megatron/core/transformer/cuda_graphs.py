@@ -1656,6 +1656,8 @@ class _CudaGraphRunner(torch.nn.Module):
     def _make_pipeline_output_viewless(self, output):
         """Make a last-stage record or replay output safe for pipeline deallocation."""
 
+        # A cross-module pipeline stage may have module-local PP size 1 while its output is still
+        # sent and pseudo-deallocated, so deallocation—not local PP size—is the required signal.
         if not (self.is_last_layer and self.deallocate_pipeline_outputs):
             return output
 
