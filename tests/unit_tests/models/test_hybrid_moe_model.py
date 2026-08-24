@@ -49,6 +49,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "attention_softmax_in_fp32": False,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
+    "batch_invariant_backend": "te_native",
     "batch_invariant_mode": False,
     "batch_p2p_comm": True,
     "batch_p2p_sync": True,
@@ -227,6 +228,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_pre_softmax": False,
     "moe_router_quantile_balancing_ema": 0.0,
     "moe_router_score_function": "sigmoid",
+    "moe_router_skip_muon": True,
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
@@ -248,6 +250,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mup_output_mult": 1.0,
     "mup_width_mult": 1.0,
     "mtp_detach_heads": False,
+    "mtp_hsm": False,
     "mtp_hybrid_override_pattern": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
@@ -500,6 +503,7 @@ class TestHybridMoEModel:
         args.moe_grouped_gemm = True
         args.moe_shared_expert_intermediate_size = 3712
         args.moe_router_score_function = "sigmoid"
+        args.moe_router_skip_muon = True
         args.moe_router_enable_expert_bias = True
         args.moe_router_topk_scaling_factor = 2.5
         args.mamba_state_dim = 128

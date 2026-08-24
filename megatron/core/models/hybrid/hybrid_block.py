@@ -217,6 +217,7 @@ class HybridStack(MegatronModule):
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )

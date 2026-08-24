@@ -11,6 +11,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -314,7 +315,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     """
 
     DEFAULT_MAX_TOKENS = 16384
-    TOKEN_ROUNDER = 64
+    TOKEN_ROUNDER = _TOKEN_ROUNDER
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
 
@@ -429,9 +430,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+            self.ssm_chunk_alignment = mamba_inference_state_config.ssm_chunk_alignment
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
+                # Gated Delta Product does not implement batch-invariant mode yet.
+                assert self.gdp_num_householder == 0, (
+                    "batch_invariant_mode does not support Gated Delta Product layers; "
+                    "set batch_invariant_mode=False."
+                )
                 assert not self.enable_prefix_caching, (
                     "batch_invariant_mode does not support Mamba prefix caching; "
                     "set enable_prefix_caching=False."
@@ -823,9 +830,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
             # A chunk plus its final token must fit in one step; otherwise a prompt
             # of that length can never advance without an invalid one-token tail.
-            assert self.max_tokens > self.mamba_chunk_size, (
-                "batch-invariant Mamba chunked prefill requires max_tokens > "
-                f"mamba_chunk_size ({self.mamba_chunk_size})."
+            assert self.max_tokens > self.ssm_chunk_alignment, (
+                "batch-invariant SSM chunked prefill requires max_tokens > "
+                f"ssm_chunk_alignment ({self.ssm_chunk_alignment})."
             )
 
         # FlashInfer.

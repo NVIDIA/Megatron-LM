@@ -9,15 +9,12 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.profiler import ProfilerActivity, profile
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
-    Partial,
     Placements,
-    Replicate,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -132,53 +129,49 @@ class NonLeafViewModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 def _no_shard_placements() -> Placements:
     return Placements(
-        dp_axes=[0],
-        parameter=[Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG)],
-        optimizer=[Replicate()],
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
     )
 
 
 def _zero1_placements() -> Placements:
     return Placements(
-        dp_axes=[0],
-        parameter=[Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG)],
-        optimizer=[Flat()],
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
     )
 
 
 def _zero2_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
 
 
 def _hsdp_placements() -> Placements:
     """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
-    DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
-    all-reduced to [Replicate, Flat] on the last microbatch."""
+    DP-inner (axis 1). main_grad rests [Partial, Shard(0)] between microbatches and is
+    all-reduced to [Replicate, Shard(0)] on the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
-        parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
-        optimizer=[Replicate(), Flat()],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Replicate(), Shard(0)],
     )
 
 
 def _hfsdp_placements() -> Placements:
     """HFSDP: params replicated across DP-outer (axis 0) for compute but the
     optimizer sharded across it, all sharded within DP-inner (axis 1). main_grad
-    rests [Partial, Flat] between microbatches and is reduce-scattered to
-    [Flat, Flat] (the optimizer placement) on the last microbatch."""
+    rests [Partial, Shard(0)] between microbatches and is reduce-scattered to
+    [Shard(0), Shard(0)] (the optimizer placement) on the last microbatch."""
     return Placements(
         dp_axes=[0, 1],
-        parameter=[Replicate(), Flat()],
-        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
-        optimizer=[Flat(), Flat()],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Shard(0), Shard(0)],
     )
 
 
@@ -379,8 +372,8 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     Like HSDP, gradients reduce-scatter within DP-inner every backward and
     accumulate into main_grad. Unlike HSDP, the last-microbatch DP-outer reduction
     is a reduce-scatter (not an all-reduce) that finalizes main_grad to the
-    optimizer's [Flat, Flat] placement, shrinking the buffer; the next step's reset
-    therefore allocates a fresh [Partial, Flat] accumulation buffer. Every rank
+    optimizer's [Shard(0), Shard(0)] placement, shrinking the buffer; the next step's reset
+    therefore allocates a fresh [Partial, Shard(0)] accumulation buffer. Every rank
     sees identical data, so the averaged gradient equals the single-rank gradient
     and losses must match. Both ``zero_grad`` modes are covered.
     """
@@ -411,8 +404,8 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
         fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    # HFSDP's optimizer placement [Flat, Flat] differs from the parameter placement
-    # [Replicate, Flat], so main_weight and model_weight are distinct buffers and the
+    # HFSDP's optimizer placement [Shard(0), Shard(0)] differs from the parameter placement
+    # [Replicate, Shard(0)], so main_weight and model_weight are distinct buffers and the
     # compute weight is stale until the step post-hook registered here refreshes it.
     # HSDP needs no wrapper: its two placements match, so the buffers alias.
     fully_shard_optimizer(optimizer)

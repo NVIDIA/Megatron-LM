@@ -45,10 +45,29 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    ssm_chunk_alignment: Optional[int] = None
+    """Token quantum that a prefill chunk boundary must land on for the model's
+    SSM mixers to see a clean chunk boundary. Defaults to `mamba_chunk_size`,
+    which is correct for any Mamba-only model.
+
+    This is the mixers' shared `ssm_inference_chunk_size`, which is not always
+    their `chunk_size`: the forked Gated Delta Product prefill kernels run at a
+    fixed 64 whatever `chunk_size` says. `from_model` asserts every SSM layer
+    agrees rather than reconciling a mixed stack. Only the paths that genuinely
+    require an aligned boundary consult it -- batch-invariant chunked prefill,
+    which replays the partial tail at decode, and recurrent-state extraction for
+    prefix caching, which can only snapshot at a chunk boundary. Ordinary
+    chunked prefill splits anywhere, because each step re-chunks from its own
+    slice start."""
+
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
+
+    def __post_init__(self):
+        if self.ssm_chunk_alignment is None:
+            self.ssm_chunk_alignment = self.mamba_chunk_size
 
     @classmethod
     def from_model(
@@ -58,6 +77,8 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
+        from megatron.core.ssm.ssm_inference import ssm_chunking
+
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_config_list = getattr(decoder, "layer_config_list", None)
         if layer_config_list is not None:
@@ -95,28 +116,22 @@ class MambaInferenceStateConfig:
                 ssm_states_dtype = torch.float32
             elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
-            mamba_chunk_size = 128
-            for layer_config, layer in zip(layer_config_list, decoder.layers, strict=True):
-                if isinstance(layer_config, MambaLayerConfig) and hasattr(layer, 'mixer'):
-                    mamba_chunk_size = layer.mixer.chunk_size
-                    break
-                if isinstance(layer_config, GDNLayerConfig) and hasattr(layer, 'self_attention'):
-                    mamba_chunk_size = layer.self_attention.chunk_size
-                    break
-            # Gated Delta Product layers register as Mamba layers but carry a
-            # Householder count, which sizes their (separate) chunk descriptors.
-            gdp_num_householder = 0
-            for layer_config, layer in zip(layer_config_list, decoder.layers, strict=True):
-                if isinstance(layer_config, MambaLayerConfig) and hasattr(layer, 'mixer'):
-                    num_householder = getattr(layer.mixer, 'num_householder', None)
-                    if num_householder is not None:
-                        # The descriptors are shared across layers, so one count
-                        # has to cover every GDP layer.
-                        assert gdp_num_householder in (0, num_householder), (
-                            "every GDP layer must use the same num_householder; got "
-                            f"{gdp_num_householder} and {num_householder}"
-                        )
-                        gdp_num_householder = num_householder
+            # `decoder.layers` is pipeline-local, so a stage holding no SSM
+            # layer falls back to the Mamba defaults while a stage holding GDP
+            # layers reports 64. Safe today because every consumer of a
+            # disagreeing value is stage-local (bookkeeping-buffer sizing) or
+            # gated off for GDP (batch-invariant chunk lengths, prefix-cache
+            # extraction offsets). A future cross-rank consumer must reconcile
+            # these across the PP group.
+            chunking = ssm_chunking(layer_config_list, decoder.layers)
+            if chunking is None:
+                mamba_chunk_size = 128
+                ssm_chunk_alignment = mamba_chunk_size
+                gdp_num_householder = 0
+            else:
+                mamba_chunk_size = chunking.chunk_size
+                ssm_chunk_alignment = chunking.inference_chunk_size
+                gdp_num_householder = chunking.num_householder
             return cls(
                 layer_config_list=list(layer_config_list),
                 conv_states_shape=mamba_conv_states_shape,
@@ -124,6 +139,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                ssm_chunk_alignment=ssm_chunk_alignment,
                 gdp_num_householder=gdp_num_householder,
             )
         return None

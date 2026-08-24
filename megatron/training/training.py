@@ -2137,6 +2137,13 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
+    if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+        # Deregister the GTP symmetric-memory pools: windows left registered when the
+        # process groups are destroyed make NCCL abort.
+        deregister_and_clear_gtp_symm_pools()
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -2713,7 +2720,11 @@ def setup_model_and_optimizer(
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
     # also covers the config-container builder path, which does not call get_model.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp_api import configure_gtp_remat_from_recipe
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+        from megatron.core.tensor_parallel.gtp_api import (
+            configure_gtp_remat_from_recipe,
+            register_gtp_symm_pool,
+        )
 
         configure_gtp_remat_from_recipe(
             fp4=getattr(args, 'fp4', None) is not None,
@@ -2724,6 +2735,11 @@ def setup_model_and_optimizer(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
         )
+
+        if getattr(args, 'gtp_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+        if getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -3052,14 +3068,26 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # and subsequent param_data zero are baked into the graph and replay
         # unconditionally. We must populate param_data so the replayed AG gathers
         # correct weights, even when forward pre-hooks are disabled.
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+        # A model component's DDP config may differ from the global args. Check the
+        # DistributedOptimizer config that owns the buffers and hooks; non-overlapped
+        # optimizers stage during optimizer.step().
+        optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
+        mxfp8_overlap_optimizers = [
+            optim_instance
+            for optim_instance in optimizer_instances
+            if (
+                isinstance(optim_instance, DistributedOptimizer)
+                and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and optim_instance.ddp_config.overlap_param_gather
+            )
+        ]
+        if mxfp8_overlap_optimizers:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
+                for optim_instance in mxfp8_overlap_optimizers:
+                    optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -3450,12 +3478,41 @@ def training_log(
         if is_hybrid_model(args):
             from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                parse_hybrid_pattern,
             )
 
-            layers = get_hybrid_layer_counts(args.hybrid_layer_pattern)[Symbols.MOE]
+            parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            main_pattern = parsed_pattern.main_pattern or ""
+            mtp_pattern = parsed_pattern.mtp_pattern or ""
+            main_moe_layers = main_pattern.count(Symbols.MOE)
+            mtp_moe_layers_per_depth = mtp_pattern.count(Symbols.MOE)
+            if parsed_pattern.mtp_num_depths > 0 and mtp_moe_layers_per_depth > 0:
+                mtp_moe_layers = (
+                    mtp_moe_layers_per_depth
+                    if args.mtp_use_repeated_layer
+                    else mtp_moe_layers_per_depth * parsed_pattern.mtp_num_depths
+                )
+            else:
+                mtp_moe_layers = 0
+            num_moe_layers = main_moe_layers + mtp_moe_layers
         else:
-            layers = args.num_layers
+            if args.moe_layer_freq is None:
+                moe_layer_pattern = [1] * args.num_layers
+            elif isinstance(args.moe_layer_freq, int):
+                moe_layer_pattern = [
+                    1 if (i % args.moe_layer_freq == 0) else 0 for i in range(args.num_layers)
+                ]
+            elif isinstance(args.moe_layer_freq, list):
+                moe_layer_pattern = args.moe_layer_freq
+            else:
+                raise ValueError(f"Invalid moe_layer_freq: {args.moe_layer_freq}")
+            main_moe_layers = sum(moe_layer_pattern)
+            mtp_moe_layers = 0
+            if args.mtp_num_layers and moe_layer_pattern[-1]:
+                mtp_moe_layers = 1 if args.mtp_use_repeated_layer else args.mtp_num_layers
+            num_moe_layers = main_moe_layers + mtp_moe_layers
+
+        layers = args.num_layers + (args.mtp_num_layers or 0)
 
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
@@ -3466,8 +3523,8 @@ def training_log(
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
+            num_moe_layers=num_moe_layers,
             moe_layer_freq=args.moe_layer_freq,
-            mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
@@ -5006,6 +5063,13 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+            # Deregister the GTP symmetric-memory pools: windows left registered when the
+            # process groups are destroyed make NCCL abort.
+            deregister_and_clear_gtp_symm_pools()
+
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
