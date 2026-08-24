@@ -23,7 +23,10 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.tensor_parallel.random import initialize_rng_tracker, model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -173,9 +176,7 @@ def create_transformer_block(
     return block
 
 
-def create_module_with_grid(
-    tp, pp, dp, grid_offset, hidden_size, use_local_cudagraphs=False
-):
+def create_module_with_grid(tp, pp, dp, grid_offset, hidden_size, use_local_cudagraphs=False):
     """Create a module (transformer block) with its grid."""
     rank = dist.get_rank()
     grid = create_hypercomm_grid(offset=grid_offset, tp=tp, pp=pp, dp=dp)
@@ -557,8 +558,7 @@ class TestMultimoduleSchedules:
             records = list(_CudagraphGlobalRecord.cudagraph_record)
             assert {record[1] for record in records} == {'fwd', 'bwd'}
             assert all(
-                record[0].base_module.config.pipeline_model_parallel_size == 1
-                for record in records
+                record[0].base_module.config.pipeline_model_parallel_size == 1 for record in records
             )
         finally:
             delete_cuda_graphs()
