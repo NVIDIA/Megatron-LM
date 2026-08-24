@@ -502,6 +502,10 @@ def configure_gtp_remat_from_recipe(
         update_gtp_config(pad_for_alignment=32)
     elif fp8:
         update_gtp_config(pad_for_alignment=16)
+    else:
+        # No MXFP8/NVFP4 tile-size requirement in this recipe -- pad only to the minimum
+        # gtp_remat_size needed for even AG/RS sharding, not a fixed quantization tile size.
+        update_gtp_config(pad_for_alignment=1)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
