@@ -1608,6 +1608,13 @@ def validate_args(args, defaults={}):
     # max_seqlen_per_dp_cp_rank is rejected by the config check.
     if args.sequence_packing_scheduler is not None:
         args.variable_seq_lengths = True
+        # Packed microbatches carry different numbers of valid tokens, so the
+        # default per-microbatch loss averaging would weight tokens unevenly
+        # depending on how samples happened to be packed (same reasoning as
+        # the hybrid-context-parallel check above).
+        assert args.calculate_per_token_loss, (
+            'Sequence packing must be used with --calculate-per-token-loss'
+        )
         if args.max_seqlen_per_dp_cp_rank is not None:
             total_cp_ranks = args.context_parallel_size
             assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
