@@ -26,6 +26,13 @@ class AsyncZMQCommunicator:
     on the CPU.
     """
 
+    _READINESS_TOPIC_PREFIX = b"\x00megatron-ready:"
+
+    @classmethod
+    def _readiness_topic(cls, rank: int) -> bytes:
+        """Return the exact XPUB subscription topic identifying one group rank."""
+        return cls._READINESS_TOPIC_PREFIX + struct.pack("!I", rank)
+
     def __init__(
         self,
         zmq_context: zmq.Context,
@@ -51,13 +58,7 @@ class AsyncZMQCommunicator:
         self.world_size = dist.get_world_size(process_group)
         self.is_leader = self.rank == 0
         # Get the global rank of the leader (first rank in the process group).
-        # `process_group=None` is torch's idiom for the default world group;
-        # its leader is always global rank 0, and dist.get_process_group_ranks
-        # does not accept None.
-        if process_group is None:
-            src_rank = 0
-        else:
-            src_rank = dist.get_process_group_ranks(process_group)[0]
+        src_rank = dist.get_process_group_ranks(process_group)[0]
 
         if self.is_leader:
             local_ip = hostname or socket.gethostname()
@@ -65,10 +66,8 @@ class AsyncZMQCommunicator:
             self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
             gather_socket_addr = self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            # XPUB exposes subscription notifications. Needed to ensure that all
-            # inference engine ranks have (asynchronously) subscribed to the ZMQ
-            # leader rank. Helps prevent deadlock when the leader rank begins
-            # publishing before all ranks have subscribed.
+            # XPUB exposes rank-specific subscription notifications so startup
+            # readiness can be tracked by peer identity rather than frame count.
             self.bcast_sock = zmq_context.socket(zmq.XPUB)
             self.bcast_sock.setsockopt(zmq.XPUB_VERBOSE, 1)
             self.bcast_sock.bind_to_random_port(f"tcp://{local_ip}")
@@ -87,25 +86,36 @@ class AsyncZMQCommunicator:
             self.gather_sock.connect(gather_socket_addr)
             self.bcast_sock = zmq_context.socket(zmq.SUB)
             self.bcast_sock.connect(bcast_socket_addr)
+            # Subscribe to the rank-specific readiness topic before the empty
+            # collective topic so XPUB receives an explicit identity command.
+            self.bcast_sock.setsockopt(zmq.SUBSCRIBE, self._readiness_topic(self.rank))
             self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        # Wait until all ProcessGroup peers have subscribed to the ZMQ leader.
-        # Otherwise, ranks that fail to subscribe in time will deadlock.
+        # Wait until every ProcessGroup peer has subscribed to the leader.
+        # Rank-specific topics make duplicate reconnect notifications idempotent.
         if self.is_leader:
-            # XPUB subscription messages are one byte for an empty-topic
-            # subscription: b"\x01". XPUB_VERBOSE is required so identical
-            # subs from every peer are reported rather than coalesced.
-            subscribed_peers = 0
+            expected_topics = {self._readiness_topic(rank) for rank in range(1, self.world_size)}
+            subscribed_topics = set()
             self.bcast_sock.setsockopt(zmq.RCVTIMEO, 60_000)
             try:
-                while subscribed_peers < self.world_size - 1:
-                    subscription = self.bcast_sock.recv()
-                    if subscription == b"\x01":
-                        subscribed_peers += 1
+                while subscribed_topics != expected_topics:
+                    notification = self.bcast_sock.recv()
+                    event, topic = notification[:1], notification[1:]
+                    if topic not in expected_topics:
+                        continue
+                    if event == b"\x01":
+                        subscribed_topics.add(topic)
+                    elif event == b"\x00":
+                        subscribed_topics.discard(topic)
             except zmq.Again as exc:
+                missing_ranks = [
+                    rank
+                    for rank in range(1, self.world_size)
+                    if self._readiness_topic(rank) not in subscribed_topics
+                ]
                 raise RuntimeError(
-                    "[AsyncZMQCommunicator] Timed out waiting for ZMQ subscribers: "
-                    f"{subscribed_peers}/{self.world_size - 1} connected"
+                    "[AsyncZMQCommunicator] Timed out waiting for ZMQ subscribers; "
+                    f"missing process-group ranks: {missing_ranks}"
                 ) from exc
             finally:
                 self.bcast_sock.setsockopt(zmq.RCVTIMEO, -1)
