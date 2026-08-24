@@ -1516,6 +1516,17 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
+    """Wrap the training data iterator for hybrid context parallelism.
+
+    The rerun state machine asserts that every training data iterator is a
+    RerunDataIterator; a raw iter() around HybridCPDataLoaderWrapper would
+    strip the wrapping applied at dataloader build time and fail that assert
+    on the first train step.
+    """
+    return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -4342,7 +4353,7 @@ def train(
     one_logger = get_one_logger()
 
     if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+        train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
     if args.run_workload_inspector_server:
         try:
