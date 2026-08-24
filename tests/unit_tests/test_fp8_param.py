@@ -717,6 +717,7 @@ class TestFP8Param:
         gc.collect()
         torch.cuda.empty_cache()
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
