@@ -907,6 +907,13 @@ class TransformerConfig(ModelParallelConfig):
     uses deterministic route placement and asynchronous runtime weight replication on top of
     HybridEP."""
 
+    replica_hybridep_grad_dtype: torch.dtype = torch.float32
+    """Gradient transport and storage dtype used by ``replica_hybridep``.
+
+    This follows the effective DDP main-gradient dtype. BF16 transport still accumulates all
+    virtual-expert contributions locally in FP32 before one final BF16 downcast.
+    """
+
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
@@ -1802,6 +1809,10 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
             replica_errors = []
+            if self.replica_hybridep_grad_dtype not in (torch.float32, torch.bfloat16):
+                replica_errors.append(
+                    "replica_hybridep_grad_dtype in {torch.float32, torch.bfloat16}"
+                )
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
