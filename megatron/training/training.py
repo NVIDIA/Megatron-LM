@@ -79,6 +79,7 @@ from megatron.core.optimizer import (
     get_mup_config_overrides,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
