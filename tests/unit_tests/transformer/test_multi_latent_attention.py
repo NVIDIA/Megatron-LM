@@ -2105,6 +2105,9 @@ class TestFusedMLAQUpProjIntegration:
         w_mxfp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(
             w_bf16
         )
+        x_fused_mxfp8 = MXFP8Quantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
+        )(x)
 
         # cos/sin in (tokens, QK_ROPE_DIM) — the format both paths expect.
         # Asymmetric halves (left ≠ right) to expose any half-swapping bugs.
@@ -2118,7 +2121,9 @@ class TestFusedMLAQUpProjIntegration:
         sin_flat = freqs.sin().to(torch.bfloat16)  # (S, 64)
 
         # ── Fused path ──────────────────────────────────────────────────────────────
-        query_fused, _ = FusedMLAQUpProjRopeQuant.run(x, w_mxfp8, cos_flat, sin_flat, S, B)
+        query_fused, _ = FusedMLAQUpProjRopeQuant.run(
+            x_fused_mxfp8, w_mxfp8, cos_flat, sin_flat, S, B
+        )
 
         # ── Unfused path ─────────────────────────────────────────────────────────────
         # Step 1: MXFP8 GEMM.  Same as TE Linear's forward under fp8_autocast.
@@ -2157,8 +2162,8 @@ class TestFusedMLAQUpProjIntegration:
         # Compare MXFP8 Q from both paths directly.  Each path applies E4M3 quantization
         # (≤6.25% relative error) on top of a GEMM that may differ by ~2% between the
         # cuDNN and cuBLAS accumulators, giving a worst-case combined rtol of ~0.14.
-        # We use rtol=0.1 as a tighter bar; flaky failures here would indicate a
-        # systematic bias beyond normal FP8 quantization noise.
+        # Use the combined rtol=0.14 bound; exceeding it would indicate a systematic
+        # bias beyond normal FP8 quantization noise.
         def _deq_row(t: MXFP8Tensor) -> torch.Tensor:
             tokens = S * B
             q_2d = MXFP8Tensor(
@@ -2194,10 +2199,10 @@ class TestFusedMLAQUpProjIntegration:
             )
 
         torch.testing.assert_close(
-            _deq_row(query_fused), _deq_row(query_unfused), atol=1.0, rtol=0.1
+            _deq_row(query_fused), _deq_row(query_unfused), atol=1.0, rtol=0.14
         )
         torch.testing.assert_close(
-            _deq_col(query_fused), _deq_col(query_unfused), atol=1.0, rtol=0.1
+            _deq_col(query_fused), _deq_col(query_unfused), atol=1.0, rtol=0.14
         )
 
     def test_end_to_end_backward_uses_te_autograd(self):
@@ -2216,6 +2221,7 @@ class TestFusedMLAQUpProjIntegration:
                 num_attention_heads=128,
                 attention_dropout=0.0,
                 use_cpu_initialization=True,
+                qk_layernorm=True,
                 fp8="hybrid",
                 fp8_recipe="mxfp8",
                 fp8_dot_product_attention=True,
@@ -2243,7 +2249,7 @@ class TestFusedMLAQUpProjIntegration:
 
             assert attention._use_fused_q_uproj
             assert (
-                mla_module._FusedMLAQUpProjFunction.__module__
+                mla_module.FusedMLAQUpProjFunction.__module__
                 == "transformer_engine.pytorch.attention.fused_mla_q_uproj"
             )
 
@@ -2254,7 +2260,11 @@ class TestFusedMLAQUpProjIntegration:
                 output, _ = attention(hidden_states, None)
             output.float().square().mean().backward()
 
-            for grad in (hidden_states.grad, attention.linear_q_up_proj.weight.grad):
+            for grad in (
+                hidden_states.grad,
+                attention.linear_q_up_proj.weight.grad,
+                attention.linear_q_up_proj.layer_norm_weight.grad,
+            ):
                 assert grad is not None
                 assert torch.isfinite(grad).all()
                 assert torch.count_nonzero(grad) > 0
