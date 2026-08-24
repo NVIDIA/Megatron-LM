@@ -6,14 +6,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from megatron.core.models.hybrid.layer_utils import Symbols, normalize_tp_comm_overlap
-from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
-from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
-from megatron.core.transformer.mla_layer_config import MLALayerConfig
-from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.models.hybrid.layer_utils import (
+    Symbols,
+    create_layer_config,
+    get_layer_symbol_from_config,
+    normalize_tp_comm_overlap,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 
@@ -294,25 +292,6 @@ def _validate_segment_layer_symbols(segment: str) -> None:
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
-def _create_layer_config(config: TransformerConfig, layer_symbol: str) -> TransformerConfig:
-    """Create a layer-specific config from a normalized stack-level config."""
-    if layer_symbol == Symbols.MAMBA:
-        return MambaLayerConfig.from_config(config)
-    if layer_symbol == Symbols.GDN:
-        return GDNLayerConfig.from_config(config)
-    if layer_symbol == Symbols.ATTENTION:
-        return AttentionLayerConfig.from_config(config)
-    if layer_symbol == Symbols.DS_ATTENTION:
-        return DSALayerConfig.from_config(config)
-    if layer_symbol == Symbols.MLA:
-        return MLALayerConfig.from_config(config)
-    if layer_symbol == Symbols.MLP:
-        return MLPLayerConfig.from_config(config)
-    if layer_symbol == Symbols.MOE:
-        return MoELayerConfig.from_config(config)
-    raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
-
-
 def validate_segment_layers(segment: str, config: TransformerConfig) -> List[TransformerConfig]:
     """Validate and convert a single pipeline segment pattern to layer configs.
 
@@ -337,7 +316,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Tra
 
     layer_configs: list[TransformerConfig] = []
     for layer_symbol in segment:
-        layer_configs.append(_create_layer_config(config, layer_symbol))
+        layer_configs.append(create_layer_config(config, layer_symbol))
 
     return layer_configs
 
@@ -526,33 +505,6 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str,
     return layer_maps
 
 
-def _get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
-    """Return the canonical symbol for a layer config, including subclasses."""
-    matching_symbols = []
-    if isinstance(layer_config, MambaLayerConfig):
-        matching_symbols.append(Symbols.MAMBA)
-    if isinstance(layer_config, GDNLayerConfig):
-        matching_symbols.append(Symbols.GDN)
-    if isinstance(layer_config, AttentionLayerConfig):
-        matching_symbols.append(Symbols.ATTENTION)
-    if isinstance(layer_config, DSALayerConfig):
-        matching_symbols.append(Symbols.DS_ATTENTION)
-    if isinstance(layer_config, MLALayerConfig):
-        matching_symbols.append(Symbols.MLA)
-    if isinstance(layer_config, MLPLayerConfig):
-        matching_symbols.append(Symbols.MLP)
-    if isinstance(layer_config, MoELayerConfig):
-        matching_symbols.append(Symbols.MOE)
-    if not matching_symbols:
-        raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
-    if len(matching_symbols) > 1:
-        raise ValueError(
-            f"Ambiguous hybrid layer config type: {type(layer_config).__name__} "
-            f"matches symbols {matching_symbols}"
-        )
-    return matching_symbols[0]
-
-
 def get_layer_type_list_from_layer_config_list(
     layer_config_list: Sequence[TransformerConfig],
 ) -> list[str]:
@@ -567,7 +519,7 @@ def get_layer_type_list_from_layer_config_list(
     Returns:
         The canonical layer symbol for each config.
     """
-    return [_get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list]
+    return [get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list]
 
 
 def get_layer_maps_from_layer_config_list(

@@ -151,7 +151,7 @@ def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatc
     config = MLATransformerConfig(
         num_layers=3, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
     )
-    with pytest.warns(UserWarning, match="Disabling tp_comm_overlap"):
+    with pytest.warns((DeprecationWarning, UserWarning)) as warning_records:
         block = HybridStack(
             config,
             submodules,
@@ -161,6 +161,15 @@ def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatc
             post_process=False,
             pg_collection=SimpleNamespace(pp=None, tp=None),
         )
+    emitted_warnings = {(warning.category, str(warning.message)) for warning in warning_records}
+    assert (
+        DeprecationWarning,
+        "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
+    ) in emitted_warnings
+    assert any(
+        category is UserWarning and "Disabling tp_comm_overlap" in message
+        for category, message in emitted_warnings
+    )
     layer_config_list = block.layer_config_list
 
     assert "layer_type_list" not in block.__dict__
@@ -263,16 +272,20 @@ def test_hybrid_stack_rejects_multi_character_layer_type():
     """The legacy list treats each entry as one layer symbol."""
     config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
 
-    with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
-        HybridStack(
-            config=config,
-            submodules=hybrid_stack_spec.submodules,
-            layer_type_list=[Symbols.MAMBA + Symbols.ATTENTION],
-            pre_process=False,
-            post_layer_norm=False,
-            post_process=False,
-            pg_collection=SimpleNamespace(pp=None, tp=None),
-        )
+    with pytest.warns(
+        DeprecationWarning,
+        match=r"DEPRECATED\(layer_type_list\): please use `layer_config_list` instead",
+    ):
+        with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
+            HybridStack(
+                config=config,
+                submodules=hybrid_stack_spec.submodules,
+                layer_type_list=[Symbols.MAMBA + Symbols.ATTENTION],
+                pre_process=False,
+                post_layer_norm=False,
+                post_process=False,
+                pg_collection=SimpleNamespace(pp=None, tp=None),
+            )
 
 
 def test_mamba_state_shapes_are_selected_by_layer_config_type():
