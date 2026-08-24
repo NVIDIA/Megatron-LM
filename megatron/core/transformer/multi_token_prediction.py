@@ -1013,7 +1013,12 @@ def process_mtp_loss(
         if input_ids is None:
             return hidden_states
         labels, _ = roll_tensor(
-            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            input_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=False,
         )
         derived_labels_from_input_ids = True
 
@@ -1031,7 +1036,12 @@ def process_mtp_loss(
         # label is fabricated (zeroed). Roll loss_mask in lockstep with the
         # input_ids -> labels shift so that boundary position is masked.
         loss_mask, _ = roll_tensor(
-            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            loss_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=False,
         )
 
     # Store the original number of tokens before rolling for proper normalization
@@ -1057,23 +1067,28 @@ def process_mtp_loss(
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
-            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
-        )
-        loss_mask, rolled_num_tokens = roll_tensor(
-            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            mtp_labels,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=False,
         )
 
-        layer_loss_mask = loss_mask
         if mtp_input_mask is not None:
             # Each MTP step consumes one additional token. Accumulate validity so
             # one invalid conditioning token also masks every later step on that path.
-            mtp_input_mask, _ = roll_tensor(
-                mtp_input_mask,
+            mask_metadata = torch.cat((loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0)
+            mask_metadata, _ = roll_tensor(
+                mask_metadata,
                 shifts=-1,
                 dims=-1,
                 cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
+                return_sum=False,
             )
+            loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
+            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
             if cumulative_mtp_input_mask is None:
                 cumulative_mtp_input_mask = mtp_input_mask
             else:
@@ -1081,6 +1096,14 @@ def process_mtp_loss(
             layer_loss_mask = loss_mask * cumulative_mtp_input_mask
             num_tokens = layer_loss_mask.sum()
         else:
+            loss_mask, rolled_num_tokens = roll_tensor(
+                loss_mask,
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            layer_loss_mask = loss_mask
             # roll_tensor already computed this reduction. Preserve the legacy
             # no-mask fast path for all non-multimodal MTP callers.
             num_tokens = rolled_num_tokens
@@ -1357,6 +1380,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
+                return_sum=False,
             )
         else:
             assert mtp_input_mask.shape == input_ids.shape, (
@@ -1371,6 +1395,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
+                return_sum=False,
             )
             input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
             mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
@@ -1380,6 +1405,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             dims=-1,
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
+            return_sum=False,
         )
         if padding_mask is not None:
             padding_mask, _ = roll_tensor(
@@ -1388,6 +1414,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
+                return_sum=False,
             )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
