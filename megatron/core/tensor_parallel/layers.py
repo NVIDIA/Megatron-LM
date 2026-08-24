@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -64,6 +64,8 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
     "qkv_split_shapes": None,
+    "is_glu": False,
+    "glu_interleave_size": None,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -114,8 +116,15 @@ def copy_gtp_attributes(destination, source):
     """Copy GTP metadata onto a param view/copy, so the optimizer's master shards stay
     classifiable by param_is_not_gtp_duplicate (is_gtp_weight_remat, allreduce), keep
     electing their checkpoint writer off the caller's own groups (gtp_replica_group), and
-    stay reconstructable by GTP_remat-aware orthogonalization (pad_length)."""
-    for attr in ("is_gtp_weight_remat", "allreduce", "gtp_replica_group", "pad_length"):
+    stay reconstructable by GTP_remat-aware orthogonalization (gtp_remat_size,
+    pad_length)."""
+    for attr in (
+        "is_gtp_weight_remat",
+        "allreduce",
+        "gtp_replica_group",
+        "gtp_remat_size",
+        "pad_length",
+    ):
         if hasattr(source, attr):
             setattr(destination, attr, getattr(source, attr))
 

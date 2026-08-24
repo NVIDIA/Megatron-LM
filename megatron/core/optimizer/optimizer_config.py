@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 from dataclasses import dataclass, field
@@ -262,6 +262,9 @@ class OptimizerConfig:
 
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
+
+    muon_split_glu: bool = True
+    """Whether to split fused gate and up projections for Muon optimizer."""
 
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
