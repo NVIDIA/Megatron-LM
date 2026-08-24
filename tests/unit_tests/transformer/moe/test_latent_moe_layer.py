@@ -176,6 +176,7 @@ class TestLatentMoELayer:
             gated_linear_unit=True,
             add_bias_linear=False,
             moe_latent_size=moe_latent_size,
+            moe_use_norm_before_up_proj=True,
         )
         if use_te:
             transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
@@ -190,6 +191,8 @@ class TestLatentMoELayer:
         moe_layer = MoELayer(self.transformer_config, submodules)
         moe_layer.cuda()
         config = moe_layer.config
+
+        assert hasattr(moe_layer, "fc2_norm")
 
         assert (
             moe_layer.shared_experts.linear_fc1.weight.shape[1] == config.hidden_size
