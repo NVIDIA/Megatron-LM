@@ -590,7 +590,9 @@ class TestGatedDeltaNet:
 
         assert g.dtype == torch.float32
         assert g.shape == (batch, seq_len, num_v_heads_local)
+        assert beta_out.dtype == torch.float32
         assert beta_out.shape == (batch, seq_len, num_v_heads_local)
+        torch.testing.assert_close(beta_out, gate_feats[0].float().sigmoid())
 
     def test_fused_pre_gated_delta_rule_headwise_cp_uses_cp_local_parameters(self):
         if not HAVE_FUSED_PRE_GDR:
