@@ -14,6 +14,8 @@ from typing import Any, Iterable
 import torch
 from torch import nn
 
+from megatron.core.fusions.fused_indices_converter import fused_routing_map_to_indices
+
 _MOK_MODULE_INDICES = itertools.count()
 _MOK_HIGH_PRECISION_INIT_ATTR = "_mok_high_precision_init_val"
 _MOK_MXFP8_COMPAT_WARNING_EMITTED = False
@@ -940,6 +942,11 @@ class MoKMegakernel(nn.Module):
             raise ValueError("MoK weight import requires non-interleaved MCore routed FC1 weights")
         if config.moe_shared_expert_glu_interleave_size is not None:
             raise ValueError("MoK weight import requires non-interleaved shared FC1 weights")
+        if config.moe_pad_expert_input_to_capacity:
+            raise ValueError(
+                "MOK supports at most moe_router_topk logical routes per token; "
+                "use MOK internal expert padding instead of moe_pad_expert_input_to_capacity"
+            )
         if config.moe_shared_expert_gate:
             raise ValueError("MoK does not support MCore's optional shared-expert output gate")
 
@@ -1335,14 +1342,16 @@ class MoKMegakernel(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
-        del routing_map  # Router side effects/losses are already attached to probs.
         original_shape = hidden_states.shape
         x = hidden_states.reshape(-1, original_shape[-1]).contiguous()
-        router_weights, top_experts = torch.topk(
-            probs.reshape(x.shape[0], -1), self.topk, dim=-1, sorted=False
+        probs = probs.reshape(x.shape[0], -1)
+        routing_map = routing_map.reshape(x.shape[0], -1)
+
+        # Compact the authoritative route set directly into MOK's fixed [tokens, K]
+        # representation. Missing routes are encoded as expert -1 with zero weight.
+        router_weights, top_experts = fused_routing_map_to_indices(
+            probs, routing_map, self.topk
         )
-        router_weights = router_weights.to(dtype=torch.float32).contiguous()
-        top_experts = top_experts.to(dtype=torch.int64).contiguous()
 
         output = _MoKAutograd.apply(
             self,
