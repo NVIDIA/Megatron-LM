@@ -342,6 +342,9 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
+        # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
+        # it on microbatches that carry no per-microbatch CP group.
+        self._build_time_cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
@@ -1527,14 +1530,19 @@ class Attention(MegatronModule, ABC):
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_freqs_max_seqlen = None
 
-            # Hybrid/dynamic CP: RoPE position math must use the sub-sample's
-            # runtime CP group (packed_seq_params.cp_group), not the static
-            # group the model was built with. The fused THD RoPE kernel takes
-            # the full cu_seqlens plus (cp_size, cp_rank) to locate this rank's
-            # zigzag slice, and the static group reports cp_size=1.
-            rope_cp_group = self.pg_collection.cp
+            # Hybrid/dynamic CP: bind the sub-sample's runtime CP group
+            # (packed_seq_params.cp_group) on the process-group collection so
+            # RoPE below — and any other CP consumer in this forward — uses
+            # the group this microbatch was actually sharded with. The fused
+            # THD RoPE kernel takes the full cu_seqlens plus (cp_size,
+            # cp_rank) to locate this rank's zigzag slice, and the build-time
+            # group reports cp_size=1. Restore the build-time group when no
+            # runtime group is bound (e.g. local_cp_size == 1 sub-samples):
+            # the previous microbatch may have left a larger group behind.
             if packed_seq_params is not None and packed_seq_params.cp_group is not None:
-                rope_cp_group = packed_seq_params.cp_group
+                self.pg_collection.cp = packed_seq_params.cp_group
+            elif self.pg_collection.cp is not self._build_time_cp_group:
+                self.pg_collection.cp = self._build_time_cp_group
 
             if split_qkv:
                 if q_pos_emb is not None:
@@ -1546,7 +1554,7 @@ class Attention(MegatronModule, ABC):
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
-                            cp_group=rope_cp_group,
+                            cp_group=self.pg_collection.cp,
                             max_seqlen=rope_freqs_max_seqlen,
                         )
                     else:
@@ -1565,7 +1573,7 @@ class Attention(MegatronModule, ABC):
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
-                        cp_group=rope_cp_group,
+                        cp_group=self.pg_collection.cp,
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
