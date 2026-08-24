@@ -1327,6 +1327,7 @@ class _ReplicaPlannedManagerMixin:
             group=self.group,
             num_experts=self.semantic_num_experts,
             num_local_experts=self.num_owned_experts,
+            grad_dtype=self.config.replica_hybridep_grad_dtype,
             num_sms=self.config.moe_flex_dispatcher_num_sms,
             num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
             num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
