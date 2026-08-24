@@ -429,18 +429,6 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
-    dsa_attention_aux_topk: Optional[int] = None
-    """Direct router top-k used by optional main-attention auxiliary losses."""
-
-    dsa_topk_mass_loss_coeff: float = 0.0
-    """Coefficient for the main-attention top-k captured-mass hinge loss."""
-
-    dsa_topk_mass_target: float = 0.95
-    """Target dense-attention probability mass inside dsa_attention_aux_topk."""
-
-    dsa_output_consistency_loss_coeff: float = 0.0
-    """Coefficient for sparse output consistency against a stop-gradient dense output."""
-
     dsa_indexer_loss_recompute: bool = False
     """Whether to recompute the DSA indexer KL loss during backward to reduce activation memory."""
 
@@ -3496,16 +3484,6 @@ class TransformerConfig(ModelParallelConfig):
             assert self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0, (
                 "dsa_indexer_topk must be set to a positive integer when using DSA."
             )
-            attention_aux_enabled = (
-                self.dsa_topk_mass_loss_coeff > 0.0
-                or self.dsa_output_consistency_loss_coeff > 0.0
-            )
-            assert self.dsa_topk_mass_loss_coeff >= 0.0, (
-                "dsa_topk_mass_loss_coeff must be non-negative."
-            )
-            assert self.dsa_output_consistency_loss_coeff >= 0.0, (
-                "dsa_output_consistency_loss_coeff must be non-negative."
-            )
             assert (
                 not self.dsa_train_indexer_only or (self.dsa_indexer_loss_coeff or 0.0) > 0.0
             ), "dsa_train_indexer_only requires dsa_indexer_loss_coeff > 0."
@@ -3555,32 +3533,6 @@ class TransformerConfig(ModelParallelConfig):
                 and not dense_dsa_warmup
                 and not self.dsa_indexer_use_sparse_loss
             )
-            if attention_aux_enabled:
-                if self.dsa_topk_mass_loss_coeff > 0.0:
-                    assert 0.0 < self.dsa_topk_mass_target <= 1.0, (
-                        "dsa_topk_mass_target must be in (0, 1]."
-                    )
-                if self.dsa_attention_aux_topk is None:
-                    self.dsa_attention_aux_topk = self.dsa_indexer_topk
-                assert self.dsa_attention_aux_topk > 0, (
-                    "dsa_attention_aux_topk must be positive."
-                )
-                assert self.dsa_attention_aux_topk <= self.dsa_indexer_topk, (
-                    "dsa_attention_aux_topk cannot exceed dsa_indexer_topk."
-                )
-                assert min_memory_dsa_backend, (
-                    "DSA main-attention auxiliary losses require a min-memory backend."
-                )
-                assert not skip_dsa and not dense_dsa_warmup, (
-                    "DSA main-attention auxiliary losses require sparse forward attention."
-                )
-                assert not self.dsa_train_indexer_only, (
-                    "DSA main-attention auxiliary losses update the backbone and are incompatible "
-                    "with dsa_train_indexer_only."
-                )
-                assert self.attention_dropout == 0.0, (
-                    "DSA main-attention auxiliary losses initially require attention_dropout=0."
-                )
             assert self.dsa_min_memory_backend in (
                 'reference',
                 'triton-min-memory',

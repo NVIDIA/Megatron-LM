@@ -1077,39 +1077,6 @@ def validate_args(args, defaults={}):
             args, 'use_megatron_fsdp', False
         ), '--dsa-train-main-only currently supports DDP/distributed-optimizer models only'
 
-    dsa_attention_aux_enabled = (
-        getattr(args, 'dsa_topk_mass_loss_coeff', 0.0) > 0.0
-        or getattr(args, 'dsa_output_consistency_loss_coeff', 0.0) > 0.0
-    )
-    assert getattr(args, 'dsa_topk_mass_loss_coeff', 0.0) >= 0.0, \
-        '--dsa-topk-mass-loss-coeff must be non-negative'
-    assert getattr(args, 'dsa_output_consistency_loss_coeff', 0.0) >= 0.0, \
-        '--dsa-output-consistency-loss-coeff must be non-negative'
-    if dsa_attention_aux_enabled:
-        if getattr(args, 'dsa_topk_mass_loss_coeff', 0.0) > 0.0:
-            assert 0.0 < getattr(args, 'dsa_topk_mass_target', 0.95) <= 1.0, \
-                '--dsa-topk-mass-target must be in (0, 1]'
-        assert args.experimental_attention_variant == 'dsa', \
-            'DSA main-attention auxiliary losses require --experimental-attention-variant dsa'
-        assert getattr(args, 'dsa_min_memory_backend', 'reference') in (
-            'triton-min-memory', 'torch-min-memory'
-        ), 'DSA main-attention auxiliary losses require a min-memory backend'
-        assert not getattr(args, 'dsa_fwd_skip_dsa', False), \
-            'DSA main-attention auxiliary losses require sparse forward attention'
-        assert not getattr(args, 'dsa_fwd_use_dense_attn', False), \
-            'DSA main-attention auxiliary losses require sparse forward attention'
-        assert not getattr(args, 'dsa_train_indexer_only', False), \
-            'DSA main-attention auxiliary losses are incompatible with indexer-only training'
-        assert args.attention_dropout == 0.0, \
-            'DSA main-attention auxiliary losses require --attention-dropout 0'
-        assert getattr(args, 'dsa_indexer_topk', None) is not None, \
-            'DSA main-attention auxiliary losses require --dsa-indexer-topk'
-        if getattr(args, 'dsa_attention_aux_topk', None) is not None:
-            assert args.dsa_attention_aux_topk > 0, \
-                '--dsa-attention-aux-topk must be positive'
-            assert args.dsa_attention_aux_topk <= args.dsa_indexer_topk, \
-                '--dsa-attention-aux-topk cannot exceed --dsa-indexer-topk'
-
     if getattr(args, 'dsa_separate_indexer_grad_clip', False):
         assert args.experimental_attention_variant == 'dsa', \
             '--dsa-separate-indexer-grad-clip requires --experimental-attention-variant dsa'
@@ -3969,36 +3936,6 @@ def _add_experimental_attention_variant_args(parser):
         type=float,
         default=None,
         help='KL loss coefficient for training the DSA indexer.',
-    )
-    _maybe_add_argument(
-        '--dsa-attention-aux-topk',
-        type=int,
-        default=None,
-        help=(
-            'Direct router top-k used by optional main-attention auxiliary losses. '
-            'Defaults to --dsa-indexer-topk.'
-        ),
-    )
-    _maybe_add_argument(
-        '--dsa-topk-mass-loss-coeff',
-        type=float,
-        default=0.0,
-        help='Coefficient for the main-attention top-k captured-mass hinge loss.',
-    )
-    _maybe_add_argument(
-        '--dsa-topk-mass-target',
-        type=float,
-        default=0.95,
-        help='Target dense-attention probability mass inside --dsa-attention-aux-topk.',
-    )
-    _maybe_add_argument(
-        '--dsa-output-consistency-loss-coeff',
-        type=float,
-        default=0.0,
-        help=(
-            'Coefficient for sparse main-attention output consistency against a '
-            'stop-gradient dense output.'
-        ),
     )
     _maybe_add_argument(
         '--dsa-indexer-loss-recompute',
