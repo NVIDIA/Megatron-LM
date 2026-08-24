@@ -2,7 +2,11 @@
 
 import pytest
 
-from megatron.core.inference.disaggregation.coordinator_flow_control import DisaggStateFlowControl
+from megatron.core.inference.disaggregation.coordinator_scheduler import (
+    DECODE,
+    PREFILL,
+    DisaggCoordinatorScheduler,
+)
 
 
 def _meta(*, request_capacity=32, **values):
@@ -10,7 +14,7 @@ def _meta(*, request_capacity=32, **values):
 
 
 def test_registration_uses_conservative_model_parallel_limits():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
 
     capacity = flow.register_engine(
         b"decode",
@@ -23,7 +27,7 @@ def test_registration_uses_conservative_model_parallel_limits():
 
 
 def test_weighted_decode_reservations_are_fifo_and_held_until_release():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=5)])
 
     assert flow.try_reserve(b"decode", 1, 4)
@@ -41,7 +45,7 @@ def test_weighted_decode_reservations_are_fifo_and_held_until_release():
 
 
 def test_request_capacity_limits_attention_only_engines():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(b"prefill", "prefill", [_meta(request_capacity=1)])
     flow.register_engine(b"decode", "decode", [_meta(request_capacity=1)])
 
@@ -52,7 +56,7 @@ def test_request_capacity_limits_attention_only_engines():
 
 
 def test_duplicate_registration_requires_explicit_removal():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=5)])
 
     with pytest.raises(ValueError, match="already registered"):
@@ -62,7 +66,7 @@ def test_duplicate_registration_requires_explicit_removal():
 
 
 def test_queue_admission_reserves_only_one_handoff_at_a_time():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=5)])
     flow.enqueue(b"decode", 1, b"first", 2)
     flow.enqueue(b"decode", 2, b"second", 2)
@@ -75,7 +79,7 @@ def test_queue_admission_reserves_only_one_handoff_at_a_time():
 
 
 def test_oversized_handoff_is_rejected_without_mutating_usage():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=4)])
 
     assert not flow.can_ever_fit(b"decode", 5)
@@ -83,7 +87,7 @@ def test_oversized_handoff_is_rejected_without_mutating_usage():
 
 
 def test_invalid_advertised_capacity_is_rejected():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
 
     with pytest.raises(ValueError, match="must be positive"):
         flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=0)])
@@ -91,14 +95,14 @@ def test_invalid_advertised_capacity_is_rejected():
 
 @pytest.mark.parametrize("metadata", [None, [None]])
 def test_malformed_engine_metadata_is_rejected(metadata):
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
 
     with pytest.raises(ValueError, match="transfer metadata"):
         flow.register_engine(b"decode", "decode", metadata)
 
 
 def test_removed_engine_cannot_acquire_new_reservations():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(b"prefill", "prefill", [_meta()])
     flow.register_engine(b"decode", "decode", [_meta()])
     flow.remove_engine(b"prefill")
@@ -111,7 +115,7 @@ def test_removed_engine_cannot_acquire_new_reservations():
 
 
 def test_partially_advertised_model_parallel_capacity_is_rejected():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
 
     with pytest.raises(ValueError, match="missing from part"):
         flow.register_engine(
@@ -120,7 +124,7 @@ def test_partially_advertised_model_parallel_capacity_is_rejected():
 
 
 def test_prefill_reservations_use_advertised_handoff_bound_and_fifo_queue():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(
         b"prefill",
         "prefill",
@@ -142,9 +146,41 @@ def test_prefill_reservations_use_advertised_handoff_bound_and_fifo_queue():
 
 
 def test_available_fraction_uses_binding_request_or_state_capacity():
-    flow = DisaggStateFlowControl()
+    flow = DisaggCoordinatorScheduler()
     flow.register_engine(b"decode", "decode", [_meta(request_capacity=4, ssm_slot_capacity=8)])
 
     assert flow.try_reserve(b"decode", 1, 6)
 
     assert flow.available_fraction(b"decode", "decode") == 0.25
+
+
+def test_engine_selection_is_role_aware_and_round_robins():
+    scheduler = DisaggCoordinatorScheduler()
+    scheduler.register_engine("p0", PREFILL, [_meta()])
+    scheduler.register_engine("p1", PREFILL, [_meta()])
+    scheduler.register_engine("d0", DECODE, [_meta()])
+    scheduler.register_engine("d1", DECODE, [_meta()])
+
+    assert [scheduler.select_engine(PREFILL, request_id) for request_id in range(3)] == [
+        "p0",
+        "p1",
+        "p0",
+    ]
+    assert [scheduler.select_engine(DECODE, request_id) for request_id in range(3)] == [
+        "d0",
+        "d1",
+        "d0",
+    ]
+
+
+def test_engine_selection_uses_score_and_ignores_removed_engines():
+    scheduler = DisaggCoordinatorScheduler()
+    scheduler.register_engine("p0", PREFILL, [_meta()])
+    scheduler.register_engine("p1", PREFILL, [_meta()])
+
+    assert scheduler.select_engine(PREFILL, 0, {"p0": (2,), "p1": (1,)}.get) == "p1"
+    scheduler.remove_engine("p1")
+    assert scheduler.select_engine(PREFILL, 1) == "p0"
+    scheduler.remove_engine("p0")
+    with pytest.raises(RuntimeError, match="no prefill engines"):
+        scheduler.select_engine(PREFILL, 2)

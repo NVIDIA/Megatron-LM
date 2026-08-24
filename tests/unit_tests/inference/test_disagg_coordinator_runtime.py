@@ -165,12 +165,12 @@ def test_registration_rejects_incompatible_transfer_geometry():
 
 def test_reconnection_replaces_stale_engine_accounting():
     runtime, _ = _runtime(request_capacity=1)
-    assert runtime.flow.try_reserve(b"decode", 99, 0)
+    assert runtime.scheduler.try_reserve(b"decode", 99, 0)
 
     runtime.register_engine(b"decode", "decode", "nixl", runtime.engine_metadata[b"decode"])
 
-    assert runtime.flow.decode_load(b"decode") == (0, 0, 0)
-    assert runtime.flow.try_reserve(b"decode", 100, 0)
+    assert runtime.scheduler.decode_load(b"decode") == (0, 0, 0)
+    assert runtime.scheduler.try_reserve(b"decode", 100, 0)
 
 
 def test_read_done_releases_prefill_and_admits_queued_request():
@@ -280,15 +280,15 @@ def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
     runtime.handle_engine_aborted(5, source_safe=False)
 
     assert runtime.prefill_by_request[5] == b"prefill"
-    assert runtime.flow.prefill_usage(b"prefill") == 1
+    assert runtime.scheduler.prefill_usage(b"prefill") == 1
     assert 5 in runtime.terminating_request_ids
 
     runtime.handle_kv_read_done(b"decode", 5)
     assert 5 not in runtime.prefill_by_request
-    assert runtime.flow.prefill_usage(b"prefill") == 0
+    assert runtime.scheduler.prefill_usage(b"prefill") == 0
 
     runtime.handle_engine_aborted(5, source_safe=True)
-    assert runtime.router.decode_for_request(5) is None
+    assert runtime.scheduler.assigned_engine("decode", 5) is None
     assert 5 not in runtime.terminating_request_ids
 
 
@@ -307,7 +307,7 @@ def test_decode_removal_does_not_release_inflight_source():
     runtime.remove_engine(b"decode")
 
     assert runtime.prefill_by_request[5] == b"prefill"
-    assert runtime.flow.prefill_usage(b"prefill") == 1
+    assert runtime.scheduler.prefill_usage(b"prefill") == 1
     assert not any(
         identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
         for identity, message in sent
@@ -335,8 +335,8 @@ def test_undelivered_decode_handoff_releases_prefill_source():
     )
 
     assert 5 not in runtime.prefill_by_request
-    assert runtime.flow.prefill_usage(b"prefill") == 0
-    assert runtime.router.decode_for_request(5) is None
+    assert runtime.scheduler.prefill_usage(b"prefill") == 0
+    assert runtime.scheduler.assigned_engine("decode", 5) is None
     assert 5 not in runtime.terminating_request_ids
     assert 5 not in runtime.coordinator.request_id_to_client_id
     response = msgpack.unpackb(sent[-1][1][1], raw=False)
@@ -369,7 +369,7 @@ def test_engine_removal_after_kv_read_preserves_source_safety():
     runtime.handle_kv_read_done(b"decode", 5)
 
     assert 5 in runtime.requests
-    assert runtime.router.decode_for_request(5) == b"decode"
+    assert runtime.scheduler.assigned_engine("decode", 5) == b"decode"
     assert 5 in runtime.coordinator.request_id_to_client_id
     assert 5 not in runtime.terminating_request_ids
     assert sent == []
@@ -399,12 +399,15 @@ def test_late_source_safety_releases_prefill_after_request_failure():
     runtime.handle_engine_failure(5, "transfer failed", source_safe=False)
 
     assert runtime.prefill_by_request[5] == b"prefill"
-    assert runtime.flow.prefill_usage(b"prefill") == 1
+    assert runtime.scheduler.prefill_usage(b"prefill") == 1
+
+    runtime.handle_kv_read_done(b"decode", 5)
+
+    assert 5 not in runtime.prefill_by_request
+    assert runtime.scheduler.prefill_usage(b"prefill") == 0
 
     runtime.handle_engine_aborted(5, source_safe=True)
 
-    assert 5 not in runtime.prefill_by_request
-    assert runtime.flow.prefill_usage(b"prefill") == 0
     assert 5 not in runtime.coordinator.request_id_to_client_id
     assert any(
         identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
@@ -441,7 +444,7 @@ def test_load_balanced_routing_uses_free_capacity_independent_of_prefix_alpha():
         PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     )
     runtime.coordinator.prefix_caching_routing_alpha = 1.0
-    assert runtime.flow.try_reserve_prefill(b"prefill", 99, 0)
+    assert runtime.scheduler.try_reserve_prefill(b"prefill", 99, 0)
 
     runtime.route_submit(5, [1], {})
 

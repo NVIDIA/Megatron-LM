@@ -11,8 +11,11 @@ from typing import Any
 import msgpack
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
-from megatron.core.inference.disaggregation.coordinator_flow_control import DisaggStateFlowControl
-from megatron.core.inference.disaggregation.coordinator_routing import DisaggRouting
+from megatron.core.inference.disaggregation.coordinator_scheduler import (
+    DECODE,
+    PREFILL,
+    DisaggCoordinatorScheduler,
+)
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     make_submit_request_with_kv_message,
     restore_registered_nixl_agent_metadata,
@@ -80,8 +83,7 @@ class DisaggCoordinatorRuntime:
 
     def __init__(self, coordinator: Any) -> None:
         self.coordinator = coordinator
-        self.router = DisaggRouting()
-        self.flow = DisaggStateFlowControl()
+        self.scheduler = DisaggCoordinatorScheduler()
         self.hop1_request_ids: set[int] = set()
         self.requests: dict[int, _RequestState] = {}
         self.prefill_by_request: dict[int, Any] = {}
@@ -109,14 +111,13 @@ class DisaggCoordinatorRuntime:
         if self._transfer_signature is not None and signature != self._transfer_signature:
             raise ValueError("prefill and decode engines have incompatible transfer geometry")
 
-        capacity = self.flow.register_engine(identity, role, instance_meta)
+        capacity = self.scheduler.register_engine(identity, role, instance_meta)
         if self._transfer_signature is None:
             self._transfer_signature = signature
         coordinator = self.coordinator
         if identity not in coordinator.identities_of_data_parallel_ranks:
             coordinator.identities_of_data_parallel_ranks.append(identity)
             coordinator._register_rank_identity(identity)
-        self.router.register(identity, role)
         self.engine_role[identity] = role
         self.engine_transport[identity] = transport
         self.engine_metadata[identity] = instance_meta
@@ -130,26 +131,25 @@ class DisaggCoordinatorRuntime:
     def remove_engine(self, identity) -> None:
         """Remove an engine and discard work that can no longer complete."""
 
-        for request_id in self.flow.pop_queued_for_engine(identity):
+        for request_id in self.scheduler.pop_queued_for_engine(identity):
             self.drop_request(
                 request_id, f"queued on removed engine {identity!r}", source_safe=True
             )
-        affected = set(self.router.requests_involving(identity))
-        affected.update(self.flow.reservations_for_engine(identity))
+        affected = set(self.scheduler.requests_involving(identity))
+        affected.update(self.scheduler.reservations_for_engine(identity))
         for request_id in affected:
             self.drop_request(
                 request_id,
                 f"engine {identity!r} removed",
                 source_safe=(
                     request_id not in self.prefill_by_request
-                    or self.router.decode_for_request(request_id) != identity
+                    or self.scheduler.assigned_engine(DECODE, request_id) != identity
                 ),
             )
-        self.router.remove(identity)
         self.engine_role.pop(identity, None)
         self.engine_transport.pop(identity, None)
         self.engine_metadata.pop(identity, None)
-        self.flow.remove_engine(identity)
+        self.scheduler.remove_engine(identity)
         if not self.engine_role:
             self._transfer_signature = None
 
@@ -176,7 +176,7 @@ class DisaggCoordinatorRuntime:
             matches = recencies = None
 
         def score(identity) -> tuple:
-            free_capacity = self.flow.available_fraction(identity, role)
+            free_capacity = self.scheduler.available_fraction(identity, role)
             recency = 0.0
             if matches is None:
                 combined = free_capacity
@@ -187,9 +187,9 @@ class DisaggCoordinatorRuntime:
                 alpha = self.coordinator.prefix_caching_routing_alpha
                 combined = alpha * match + (1.0 - alpha) * free_capacity
             load = (
-                self.flow.prefill_load(identity)
-                if role == "prefill"
-                else self.flow.decode_load(identity)
+                self.scheduler.prefill_load(identity)
+                if role == PREFILL
+                else self.scheduler.decode_load(identity)
             )
             return (-combined, -recency, *load)
 
@@ -214,16 +214,16 @@ class DisaggCoordinatorRuntime:
             )
             return
         try:
-            prefill_id = self.router.route_submit(
-                request_id, self._make_routing_score(block_hashes, "prefill")
+            prefill_id = self.scheduler.select_engine(
+                PREFILL, request_id, self._make_routing_score(block_hashes, PREFILL)
             )
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to prefill: {error}", source_safe=True)
             return
 
-        capacity = self.flow.capacity(prefill_id)
-        slot_cost = self.flow.prefill_slot_cost(prefill_id)
-        if not self.flow.can_ever_fit(prefill_id, slot_cost):
+        capacity = self.scheduler.capacity(prefill_id)
+        slot_cost = self.scheduler.prefill_slot_cost(prefill_id)
+        if not self.scheduler.can_ever_fit(prefill_id, slot_cost):
             self.drop_request(
                 request_id,
                 f"request requires {slot_cost} live SSM slots, but prefill "
@@ -231,10 +231,10 @@ class DisaggCoordinatorRuntime:
                 source_safe=True,
             )
             return
-        if self.flow.has_queued_prefill(prefill_id) or not self.flow.try_reserve_prefill(
+        if self.scheduler.has_queued_prefill(prefill_id) or not self.scheduler.try_reserve_prefill(
             prefill_id, request_id, slot_cost
         ):
-            self.flow.enqueue_prefill(prefill_id, request_id, slot_cost)
+            self.scheduler.enqueue_prefill(prefill_id, request_id, slot_cost)
             return
         self._submit_prefill(prefill_id, request_id, prompt, sampling_params)
 
@@ -256,7 +256,7 @@ class DisaggCoordinatorRuntime:
 
     def _drain_prefill_queue(self, prefill_id) -> None:
         while True:
-            request = self.flow.pop_next_prefill(prefill_id)
+            request = self.scheduler.pop_next_prefill(prefill_id)
             if request is None:
                 return
             state = self.requests[request.request_id]
@@ -291,8 +291,8 @@ class DisaggCoordinatorRuntime:
             )
             return
         try:
-            decode_id = self.router.route_prefill_done(
-                request_id, self._make_routing_score(request_state.block_hashes, "decode")
+            decode_id = self.scheduler.select_engine(
+                DECODE, request_id, self._make_routing_score(request_state.block_hashes, DECODE)
             )
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to decode: {error}", source_safe=True)
@@ -324,9 +324,9 @@ class DisaggCoordinatorRuntime:
         # The serialized handoff owns these values until decode receives it.
         request_state.prompt = None
         request_state.sampling_params = {}
-        slot_cost = self.flow.slot_cost_from_handoff(handoff)
-        capacity = self.flow.capacity(decode_id)
-        if not self.flow.can_ever_fit(decode_id, slot_cost):
+        slot_cost = self.scheduler.slot_cost_from_handoff(handoff)
+        capacity = self.scheduler.capacity(decode_id)
+        if not self.scheduler.can_ever_fit(decode_id, slot_cost):
             self.drop_request(
                 request_id,
                 f"SSM handoff requires {slot_cost} live slots, but decode "
@@ -334,10 +334,10 @@ class DisaggCoordinatorRuntime:
                 source_safe=True,
             )
             return
-        if self.flow.has_queued(decode_id) or not self.flow.try_reserve(
+        if self.scheduler.has_queued(decode_id) or not self.scheduler.try_reserve(
             decode_id, request_id, slot_cost
         ):
-            self.flow.enqueue(decode_id, request_id, payload, slot_cost)
+            self.scheduler.enqueue(decode_id, request_id, payload, slot_cost)
             return
         self._send_decode_handoff(decode_id, request_id, payload)
 
@@ -360,7 +360,7 @@ class DisaggCoordinatorRuntime:
     ) -> None:
         """Start a two-sided send after the assigned decode commits destinations."""
 
-        if self.router.decode_for_request(request_id) != sender_identity:
+        if self.scheduler.assigned_engine(DECODE, request_id) != sender_identity:
             logging.warning(
                 "Coordinator: ignoring KV_TRANSFER_READY for request %d from %r",
                 request_id,
@@ -383,7 +383,7 @@ class DisaggCoordinatorRuntime:
 
     def _drain_decode_queue(self, decode_id) -> None:
         while True:
-            handoff = self.flow.pop_next_admissible(decode_id)
+            handoff = self.scheduler.pop_next_admissible(decode_id)
             if handoff is None:
                 return
             if not self._send_decode_handoff(decode_id, handoff.request_id, handoff.payload):
@@ -395,8 +395,8 @@ class DisaggCoordinatorRuntime:
         prefill_id = self.prefill_by_request.pop(request_id, None)
         if prefill_id is None:
             return
-        released_prefill = self.flow.release_prefill(request_id)
-        self.router.forget_prefill(request_id)
+        released_prefill = self.scheduler.release_prefill(request_id)
+        self.scheduler.forget_assignment(PREFILL, request_id)
         sent = self._send(prefill_id, Headers.RELEASE_KV, request_id)
         if released_prefill is not None and sent:
             self._drain_prefill_queue(released_prefill)
@@ -406,7 +406,7 @@ class DisaggCoordinatorRuntime:
 
         if request_id not in self.prefill_by_request:
             return
-        assigned_decode = self.router.decode_for_request(request_id)
+        assigned_decode = self.scheduler.assigned_engine(DECODE, request_id)
         if assigned_decode != sender_identity:
             logging.warning(
                 "Coordinator: ignoring KV_READ_DONE for request %d from %r; assigned decode is %r",
@@ -417,16 +417,16 @@ class DisaggCoordinatorRuntime:
             return
         self._release_prefill(request_id)
         if request_id not in self.requests:
-            self.router.forget(request_id)
+            self.scheduler.forget_request(request_id)
 
     def handle_decode_done(self, request_id: int) -> None:
         """Release all coordinator state after the decode reply is returned."""
 
-        decode_id = self.flow.release_decode(request_id)
+        decode_id = self.scheduler.release_decode(request_id)
         if decode_id is not None:
             self._drain_decode_queue(decode_id)
         self._release_prefill(request_id)
-        self.router.forget(request_id)
+        self.scheduler.forget_request(request_id)
         self.requests.pop(request_id, None)
 
     def drop_request(self, request_id: int, reason: str, *, source_safe: bool) -> None:
@@ -446,8 +446,8 @@ class DisaggCoordinatorRuntime:
                     ),
                 ]
             )
-        self.flow.remove_queued(request_id)
-        decode_id = self.flow.release_decode(request_id)
+        self.scheduler.remove_queued(request_id)
+        decode_id = self.scheduler.release_decode(request_id)
         if decode_id is not None:
             self._drain_decode_queue(decode_id)
         self.requests.pop(request_id, None)
@@ -455,8 +455,7 @@ class DisaggCoordinatorRuntime:
         if source_safe:
             self.terminating_request_ids.discard(request_id)
             self._release_prefill(request_id)
-            self.router.forget(request_id)
-
+            self.scheduler.forget_request(request_id)
             coordinator.request_id_to_client_id.pop(request_id, None)
             client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
             if client_identity is not None and client_request_id is not None:
@@ -477,10 +476,10 @@ class DisaggCoordinatorRuntime:
         """Cancel queued work or forward cancellation to its active engine."""
 
         self.terminating_request_ids.add(request_id)
-        if self.flow.remove_queued(request_id):
+        if self.scheduler.remove_queued(request_id):
             self._finish_abort(request_id)
             return
-        decode_id = self.router.decode_for_request(request_id)
+        decode_id = self.scheduler.assigned_engine(DECODE, request_id)
         if decode_id is not None:
             self._send(decode_id, Headers.ABORT_REQUEST, request_id)
             return
@@ -501,10 +500,10 @@ class DisaggCoordinatorRuntime:
         client_identity = coordinator.request_id_to_client_id.get(request_id)
         client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
         self._release_prefill(request_id)
-        decode_id = self.flow.release_decode(request_id)
+        decode_id = self.scheduler.release_decode(request_id)
         if decode_id is not None:
             self._drain_decode_queue(decode_id)
-        self.router.forget(request_id)
+        self.scheduler.forget_request(request_id)
         self.requests.pop(request_id, None)
         self.hop1_request_ids.discard(request_id)
         self.terminating_request_ids.discard(request_id)

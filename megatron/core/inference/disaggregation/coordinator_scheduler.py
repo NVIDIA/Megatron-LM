@@ -1,12 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Recurrent-state flow control for coordinator-native disaggregation."""
+"""Coordinator scheduling for native prefill/decode disaggregation."""
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+
+PREFILL = "prefill"
+DECODE = "decode"
 
 
 @dataclass(frozen=True)
@@ -29,21 +32,33 @@ class QueuedDecodeHandoff:
 @dataclass
 class _RoleState:
     role: str
+    engines: List[Any] = field(default_factory=list)
+    round_robin_offset: int = 0
+    assignments: Dict[int, Any] = field(default_factory=dict)  # request_id -> selected engine
     usage: Dict[Any, int] = field(default_factory=dict)
     counts: Dict[Any, int] = field(default_factory=dict)
-    reservations: Dict[int, Tuple[Any, int]] = field(default_factory=dict)
+    reservations: Dict[int, Tuple[Any, int]] = field(
+        default_factory=dict
+    )  # request_id -> (engine, cost)
     queues: Dict[Any, Deque] = field(default_factory=dict)
 
 
-class DisaggStateFlowControl:
-    """Reserve recurrent-state slots for prefill and decode handoffs."""
+class DisaggCoordinatorScheduler:
+    """Select engines and reserve capacity for prefill and decode work."""
 
     def __init__(self) -> None:
         self._capacity: Dict[Any, int] = {}
         self._request_capacity: Dict[Any, int] = {}
         self._prefill_slot_cost: Dict[Any, int] = {}
-        self._prefill = _RoleState("prefill")
-        self._decode = _RoleState("decode")
+        self._prefill = _RoleState(PREFILL)
+        self._decode = _RoleState(DECODE)
+
+    def _state(self, role: str) -> _RoleState:
+        if role == PREFILL:
+            return self._prefill
+        if role == DECODE:
+            return self._decode
+        raise ValueError(f"unknown disaggregated role {role!r}")
 
     @staticmethod
     def _metadata_entries(instance_meta) -> list[dict]:
@@ -117,19 +132,14 @@ class DisaggStateFlowControl:
     def register_engine(self, identity, role: str, instance_meta) -> Optional[int]:
         """Register an engine's capacity and return the parsed limit."""
 
-        if role == "prefill":
-            state = self._prefill
-        elif role == "decode":
-            state = self._decode
-        else:
-            raise ValueError(f"unknown disaggregated role {role!r}")
+        state = self._state(role)
         if identity in state.counts:
             raise ValueError(f"engine {identity!r} is already registered")
         entries = self._metadata_entries(instance_meta)
         capacity = self._capacity_from_entries(entries)
         request_capacity = self._request_capacity_from_entries(entries)
         prefill_slot_cost = (
-            self._prefill_slot_cost_from_entries(entries) if role == "prefill" else None
+            self._prefill_slot_cost_from_entries(entries) if role == PREFILL else None
         )
 
         self._request_capacity[identity] = request_capacity
@@ -137,6 +147,7 @@ class DisaggStateFlowControl:
             self._capacity[identity] = capacity
         if prefill_slot_cost is not None:
             self._prefill_slot_cost[identity] = prefill_slot_cost
+        state.engines.append(identity)
         state.usage[identity] = 0
         state.counts[identity] = 0
         return capacity
@@ -148,12 +159,63 @@ class DisaggStateFlowControl:
         self._request_capacity.pop(identity, None)
         self._prefill_slot_cost.pop(identity, None)
         for state in (self._prefill, self._decode):
+            if identity in state.engines:
+                state.engines.remove(identity)
             state.usage.pop(identity, None)
             state.counts.pop(identity, None)
             state.queues.pop(identity, None)
             for request_id, (reserved_identity, _) in list(state.reservations.items()):
                 if reserved_identity == identity:
                     state.reservations.pop(request_id)
+
+    def select_engine(
+        self, role: str, request_id: int, score: Callable[[Any], tuple] | None = None
+    ) -> Any:
+        """Select an engine using load-aware routing and round-robin tie breaking."""
+
+        state = self._state(role)
+        if not state.engines:
+            raise RuntimeError(f"no {role} engines registered")
+        offset = state.round_robin_offset
+        state.round_robin_offset += 1
+        if score is None:
+            identity = state.engines[offset % len(state.engines)]
+        else:
+            # Rotate the pool so min() breaks equal-score ties round-robin.
+            candidates = (
+                state.engines[(offset + index) % len(state.engines)]
+                for index in range(len(state.engines))
+            )
+            identity = min(candidates, key=score)
+        state.assignments[request_id] = identity
+        return identity
+
+    def assigned_engine(self, role: str, request_id: int) -> Any | None:
+        """Return the engine assigned to a request, if any."""
+
+        return self._state(role).assignments.get(request_id)
+
+    def forget_assignment(self, role: str, request_id: int) -> None:
+        """Drop one role's assignment for a request."""
+
+        self._state(role).assignments.pop(request_id, None)
+
+    def forget_request(self, request_id: int) -> None:
+        """Drop all engine assignments for a request."""
+
+        self._prefill.assignments.pop(request_id, None)
+        self._decode.assignments.pop(request_id, None)
+
+    def requests_involving(self, identity) -> List[int]:
+        """Return requests assigned to an engine on either hop."""
+
+        request_ids = {
+            request_id
+            for state in (self._prefill, self._decode)
+            for request_id, assigned_identity in state.assignments.items()
+            if assigned_identity == identity
+        }
+        return list(request_ids)
 
     def capacity(self, identity) -> Optional[int]:
         """Return an engine's advertised live recurrent-state capacity, if any."""
@@ -191,12 +253,7 @@ class DisaggStateFlowControl:
     def available_fraction(self, identity, role: str) -> float:
         """Return the binding free-capacity fraction for routing."""
 
-        if role == "prefill":
-            state = self._prefill
-        elif role == "decode":
-            state = self._decode
-        else:
-            raise ValueError(f"unknown disaggregated role {role!r}")
+        state = self._state(role)
 
         request_capacity = self._request_capacity.get(identity)
         if request_capacity is None:
