@@ -23,7 +23,11 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    KVCacheManagementMode,
+    MediaCacheCoordinatorPolicy,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
@@ -43,6 +47,7 @@ from megatron.core.inference.inference_request import (
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     Status,
+    compute_media_cache_key,
     resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -824,6 +829,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     "enable_prefix_caching": self.context.enable_prefix_caching,
                     "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "media_cache_coordinator_policy": getattr(
+                        self.context,
+                        "media_cache_coordinator_policy",
+                        MediaCacheCoordinatorPolicy.AFFINITY,
+                    ),
+                    "media_cache_routing_weight": getattr(
+                        self.context, "media_cache_routing_weight", 1.0
+                    ),
+                    "vision_embedding_cache_enabled": (self.vision_embedding_cache_max_bytes > 0),
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                 },
@@ -1408,7 +1422,6 @@ class DynamicInferenceEngine(AbstractEngine):
         num_img_embeddings_per_tile: int = 0,
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
-        media_cache_key: Optional[str] = None,
         media_tokens_preexpanded: bool = False,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
@@ -1440,8 +1453,6 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs_sizes (Optional[Tensor]): Per-image sizes [N, 2] with [H, W].
                 Dynamic resolution.
             num_frames (Optional[Tensor]): Number of frames per image/video item.
-            media_cache_key (Optional[str]): Stable identity for the exact
-                preprocessed media. Equal keys reuse projected vision embeddings.
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
 
@@ -1495,7 +1506,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 imgs_sizes=imgs_sizes,
                 precomputed_block_hashes=precomputed_block_hashes,
                 num_frames=num_frames,
-                media_cache_key=media_cache_key,
                 media_tokens_preexpanded=media_tokens_preexpanded,
             )
             # _build_vlm_request has already registered the image embeddings
@@ -1550,7 +1560,6 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor],
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
-        media_cache_key: Optional[str] = None,
         media_tokens_preexpanded: bool = False,
     ) -> DynamicVLMInferenceRequest:
         """Prepare media tokens, run the vision encoder, register per-request
@@ -1569,6 +1578,25 @@ class DynamicInferenceEngine(AbstractEngine):
                     "PP>1 requires the non-first-stage embedding recv path "
                     "which is not yet available upstream."
                 )
+
+        # Compute multimodal media cache key, which is used by generators to
+        # skip re-computing multimodal embeddings if the cache is hit.
+        media_cache_key = None
+        needs_media_identity = self.context.enable_prefix_caching or (
+            getattr(self, "vision_embedding_cache_max_bytes", 0) > 0
+        )
+        if imgs is not None and needs_media_identity:
+            modality = "video" if num_frames is not None else "image"
+            media_inputs = {"imgs": imgs}
+            if num_tiles is not None:
+                media_inputs["num_tiles"] = num_tiles
+            if imgs_sizes is not None:
+                media_inputs["imgs_sizes"] = imgs_sizes
+            if num_frames is not None:
+                media_inputs["num_frames"] = num_frames
+            if num_img_embeddings_per_tile:
+                media_inputs["num_img_embeddings_per_tile"] = num_img_embeddings_per_tile
+            media_cache_key = compute_media_cache_key(modality, media_inputs)
 
         device = torch.cuda.current_device()
         if num_tiles is not None:
@@ -1607,10 +1635,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 compact_prompt_tokens = tokens.clone()
                 token_list: List[List[int]] = [tokens.tolist()]
-                expansion_kwargs = {
-                    "num_tiles": num_tiles,
-                    "imgs_sizes": imgs_sizes,
-                }
+                expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
                 if num_frames is not None:
                     expansion_kwargs["num_frames"] = num_frames
                 expanded_tokens_list, mask_list = (
@@ -1651,10 +1676,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if has_images and imgs is not None:
             if image_embeddings is None:
                 with torch.inference_mode():
-                    encoder_kwargs = {
-                        "num_image_tiles": num_tiles,
-                        "imgs_sizes": imgs_sizes,
-                    }
+                    encoder_kwargs = {"num_image_tiles": num_tiles, "imgs_sizes": imgs_sizes}
                     if num_frames is not None:
                         encoder_kwargs["num_frames"] = num_frames
                     image_embeddings = (
@@ -1683,16 +1705,15 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor
         )
 
-        # Image-bearing requests: skip prefix caching. After image expansion,
-        # two requests with the same text but different images produce
-        # identical token sequences (runs of -1 pads), so KV block hashes
-        # collide and the second request would serve completions conditioned
-        # on the first request's image. Disabling caching at the request
-        # level is a correctness fix; a follow-up could mix an image digest
-        # into the block hash for cross-request reuse of identical (text,
-        # image) pairs.
+        # Image-bearing requests can share KV only when their block-hash chain
+        # is salted by the media identity computed from resolved media tensors.
+        # Requests without enough media data to derive an identity remain
+        # uncached rather than risk cross-media KV reuse for identical
+        # placeholder token sequences.
         request_has_images = has_images
-        enable_prefix_caching = self.context.enable_prefix_caching and not request_has_images
+        enable_prefix_caching = self.context.enable_prefix_caching and (
+            not request_has_images or bool(media_cache_key)
+        )
         return DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
@@ -1701,7 +1722,10 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
-            precomputed_block_hashes=precomputed_block_hashes or [],
+            # Recompute the block hashes for multimodal embeddings,
+            # which are injected dynamically into the sequence.
+            precomputed_block_hashes=[] if request_has_images else (precomputed_block_hashes or []),
+            block_hash_salt=media_cache_key if request_has_images else None,
             num_img_embeddings_per_tile=num_img_embeddings_per_tile,
             imgs=imgs,
             num_tiles=num_tiles,

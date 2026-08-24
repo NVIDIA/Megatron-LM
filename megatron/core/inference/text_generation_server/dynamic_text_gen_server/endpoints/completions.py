@@ -103,14 +103,10 @@ try:
             request_multi_modal_data = req.get("multi_modal_data") or {}
             if not isinstance(request_multi_modal_data, dict):
                 raise ValueError("multi_modal_data must be a dictionary.")
-            unsupported_modalities = set(request_multi_modal_data) - {
-                "image",
-                "video",
-            }
+            unsupported_modalities = set(request_multi_modal_data) - {"image", "video"}
             if unsupported_modalities:
                 raise ValueError(
-                    "Unsupported multimodal modalities: "
-                    f"{sorted(unsupported_modalities)}."
+                    "Unsupported multimodal modalities: " f"{sorted(unsupported_modalities)}."
                 )
             populated_modalities = [
                 modality
@@ -118,9 +114,7 @@ try:
                 if request_multi_modal_data.get(modality)
             ]
             if len(populated_modalities) > 1:
-                raise ValueError(
-                    "A completions request cannot mix image and video inputs."
-                )
+                raise ValueError("A completions request cannot mix image and video inputs.")
             multi_modal_data = None
             if populated_modalities:
                 modality = populated_modalities[0]
@@ -130,14 +124,10 @@ try:
                 if not isinstance(encoded_media, list) or any(
                     not isinstance(item, str) for item in encoded_media
                 ):
-                    raise ValueError(
-                        f"multi_modal_data.{modality} must be a string or list[str]."
-                    )
+                    raise ValueError(f"multi_modal_data.{modality} must be a string or list[str].")
                 media_bytes = [
                     base64.b64decode(
-                        item.split(",", 1)[1]
-                        if item.startswith("data:") and "," in item
-                        else item
+                        item.split(",", 1)[1] if item.startswith("data:") and "," in item else item
                     )
                     for item in encoded_media
                 ]

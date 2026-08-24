@@ -17,8 +17,8 @@ from megatron.core.inference.inference_request import (
     deserialize_ndarray,
     deserialize_tensor,
     resolve_multimodal_data_for_engine,
-    serialize_ndarray,
     serialize_multimodal_data,
+    serialize_ndarray,
     serialize_tensor,
     unwrap_serialized_tensors,
 )
@@ -61,10 +61,7 @@ def test_serialization_helpers_round_trip():
 
 def test_preexpanded_multimodal_request_round_trip():
     media = {
-        "image": {
-            "imgs": torch.ones(1, 2, 4),
-            "imgs_sizes": torch.tensor([[2, 2]]),
-        },
+        "image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])},
         "media_tokens_preexpanded": True,
     }
 
@@ -79,15 +76,51 @@ def test_preexpanded_multimodal_request_round_trip():
 
 def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
     wire = serialize_multimodal_data(
+        {"image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}}
+    )
+    assert "media_tokens_preexpanded" not in wire
+    assert "media_tokens_preexpanded" not in resolve_multimodal_data_for_engine(wire)
+
+
+def test_multimodal_serialization_generates_stable_content_keys():
+    raw_a = serialize_multimodal_data({"image": [b"same-image"]})
+    raw_b = serialize_multimodal_data({"image": [b"same-image"]})
+    raw_c = serialize_multimodal_data({"image": [b"different-image"]})
+    assert raw_a["media_cache_key"] == raw_b["media_cache_key"]
+    assert raw_a["media_cache_key"] != raw_c["media_cache_key"]
+
+    tensor_a = serialize_multimodal_data(
         {
             "image": {
-                "imgs": torch.ones(1, 2, 4),
+                "imgs": torch.arange(8, dtype=torch.float32).reshape(1, 2, 4),
                 "imgs_sizes": torch.tensor([[2, 2]]),
             }
         }
     )
-    assert "media_tokens_preexpanded" not in wire
-    assert "media_tokens_preexpanded" not in resolve_multimodal_data_for_engine(wire)
+    tensor_b = serialize_multimodal_data(
+        {
+            "image": {
+                "imgs": torch.arange(8, dtype=torch.float32).reshape(1, 2, 4),
+                "imgs_sizes": torch.tensor([[2, 2]]),
+            }
+        }
+    )
+    tensor_c = serialize_multimodal_data(
+        {
+            "image": {
+                "imgs": torch.arange(8, dtype=torch.float32).reshape(2, 1, 4),
+                "imgs_sizes": torch.tensor([[2, 2]]),
+            }
+        }
+    )
+    assert tensor_a["media_cache_key"] == tensor_b["media_cache_key"]
+    # Shape participates in identity even when the flattened bytes are equal.
+    assert tensor_a["media_cache_key"] != tensor_c["media_cache_key"]
+
+
+def test_multimodal_serialization_rejects_user_media_cache_key():
+    with pytest.raises(ValueError, match="computed automatically"):
+        serialize_multimodal_data({"image": [b"image"], "media_cache_key": "user-provided"})
 
 
 def test_compute_block_hashes_batched():
@@ -107,6 +140,11 @@ def test_compute_block_hashes_batched():
     assert (
         compute_block_hashes_batched(torch.arange(8, dtype=torch.int64), block_size=4)[1] != h_b[1]
     )
+    tokens = torch.arange(8, dtype=torch.int64)
+    media_a = compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-a")
+    media_b = compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-b")
+    assert media_a != media_b
+    assert media_a == compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-a")
 
 
 def test_inference_parameters_alias_warns_and_copies():

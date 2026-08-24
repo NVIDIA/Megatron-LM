@@ -198,6 +198,17 @@ class InferenceSetupConfig:
     """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
     Higher alpha favors prefix cache hits; lower alpha favors load balance."""
 
+    inference_dynamic_batching_media_cache_coordinator_policy: Literal[
+        "affinity", "load_balanced"
+    ] = "affinity"
+    """Coordinator routing policy for media caching."""
+
+    inference_dynamic_batching_media_cache_routing_weight: float = 1.0
+    """Media-cache hit weight in equivalent compact-prompt blocks."""
+
+    inference_dynamic_batching_vision_embedding_cache_max_bytes: int = 0
+    """Maximum GPU bytes retained per engine for reusable vision embeddings."""
+
     inference_dynamic_batching_prefix_caching_mamba_gb: float | None = None
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching on hybrid models.
     When set, Mamba states at block boundaries are cached for reuse."""
@@ -296,6 +307,7 @@ class InferenceSetupConfig:
             InferenceConfig,
             KVCacheManagementMode,
             MambaInferenceStateConfig,
+            MediaCacheCoordinatorPolicy,
             PrefixCachingCoordinatorPolicy,
             PrefixCachingEvictionPolicy,
         )
@@ -371,6 +383,13 @@ class InferenceSetupConfig:
                 self.inference_dynamic_batching_prefix_caching_coordinator_policy
             ),
             prefix_caching_routing_alpha=self.inference_dynamic_batching_prefix_caching_routing_alpha,
+            media_cache_coordinator_policy=MediaCacheCoordinatorPolicy(
+                self.inference_dynamic_batching_media_cache_coordinator_policy
+            ),
+            media_cache_routing_weight=self.inference_dynamic_batching_media_cache_routing_weight,
+            vision_embedding_cache_max_bytes=(
+                self.inference_dynamic_batching_vision_embedding_cache_max_bytes
+            ),
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,

@@ -337,25 +337,19 @@ class TestPixelShuffleNonSquare:
         # helper must also continue accepting packed 3D image chunks.
         video_chunks = [torch.randn(1008, 8) for _ in range(8)]
         shuffled_video = _pixel_shuffle_dynamic_resolution_chunks(
-            video_chunks,
-            [(448, 576)] * 8,
-            patch_dim=16,
+            video_chunks, [(448, 576)] * 8, patch_dim=16
         )
         assert all(chunk.shape == (252, 32) for chunk in shuffled_video)
 
         packed_image_chunks = [torch.randn(1, 1008, 8)]
         shuffled_images = _pixel_shuffle_dynamic_resolution_chunks(
-            packed_image_chunks,
-            [(448, 576)],
-            patch_dim=16,
+            packed_image_chunks, [(448, 576)], patch_dim=16
         )
         assert shuffled_images[0].shape == (1, 252, 32)
 
     @pytest.mark.internal
     def test_temporal_token_counts_support_media_or_tubelet_placeholders(self):
-        from megatron.core.models.multimodal.llava_model import (
-            _group_temporal_token_counts,
-        )
+        from megatron.core.models.multimodal.llava_model import _group_temporal_token_counts
 
         tubelet_counts = [252, 252, 128]
         media_tubelet_counts = [2, 1]
@@ -367,9 +361,7 @@ class TestPixelShuffleNonSquare:
         ) == [504, 128]
 
         with pytest.raises(ValueError, match="must match either"):
-            _group_temporal_token_counts(
-                tubelet_counts, media_tubelet_counts, placeholder_count=1
-            )
+            _group_temporal_token_counts(tubelet_counts, media_tubelet_counts, placeholder_count=1)
 
 
 class TestRADIODynamicResAndTemporal:

@@ -302,9 +302,7 @@ def _extract_image_url_bytes(url: str) -> bytes:
     raise ValueError(f"Unsupported image_url scheme: {url[:40]!r}")
 
 
-def _extract_multimodal_from_messages(
-    messages, prompt_config: MultimodalPromptConfig
-):
+def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptConfig):
     """Extract media bytes and replace structured blocks with internal slots.
 
     Remote image fetching is blocking, so callers must run this function off
@@ -355,20 +353,11 @@ def _extract_multimodal_from_messages(
                     raise ValueError(f"Failed to load image_url: {e}") from e
                 new_chunks.append(add_slot("image"))
                 found_modalities.add("image")
-            elif isinstance(chunk, dict) and chunk.get("type") in {
-                "video_url",
-                "input_video",
-            }:
+            elif isinstance(chunk, dict) and chunk.get("type") in {"video_url", "input_video"}:
                 video_value = chunk.get("video_url") or chunk.get("video")
-                url = (
-                    video_value.get("url", "")
-                    if isinstance(video_value, dict)
-                    else video_value
-                )
+                url = video_value.get("url", "") if isinstance(video_value, dict) else video_value
                 if not isinstance(url, str) or not url.startswith("data:"):
-                    raise ValueError(
-                        "Megatron chat video inputs must be base64 data URLs."
-                    )
+                    raise ValueError("Megatron chat video inputs must be base64 data URLs.")
                 try:
                     video_bytes_list.append(_extract_image_url_bytes(url))
                 except Exception as e:
@@ -380,16 +369,13 @@ def _extract_multimodal_from_messages(
 
         if found_modalities:
             input_markers = {
-                prompt_config.get_spec(modality).input_marker
-                for modality in found_modalities
+                prompt_config.get_spec(modality).input_marker for modality in found_modalities
             } - {None}
             for index, chunk in enumerate(new_chunks):
                 if isinstance(chunk, dict) and chunk.get("type") == "text":
                     chunk = dict(chunk)
                     for marker in input_markers:
-                        chunk["text"] = str(chunk.get("text", "")).replace(
-                            marker, ""
-                        )
+                        chunk["text"] = str(chunk.get("text", "")).replace(marker, "")
                     new_chunks[index] = chunk
             msg_copy = dict(message)
             msg_copy["content"] = new_chunks
@@ -398,9 +384,7 @@ def _extract_multimodal_from_messages(
             rewritten.append(message)
 
     if image_bytes_list and video_bytes_list:
-        raise ValueError(
-            "Mixing image and video blocks in one request is not supported."
-        )
+        raise ValueError("Mixing image and video blocks in one request is not supported.")
     return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
@@ -596,9 +580,7 @@ def _media_model_token_ids(chat_tok, prompt_config):
         token_id = spec.model_token_id
         if token_id is None and hasattr(chat_tok, "convert_tokens_to_ids"):
             resolved_id = chat_tok.convert_tokens_to_ids(spec.model_token)
-            if resolved_id is not None and resolved_id != getattr(
-                chat_tok, "unk_token_id", None
-            ):
+            if resolved_id is not None and resolved_id != getattr(chat_tok, "unk_token_id", None):
                 token_id = resolved_id
         if token_id is not None:
             token_ids.add(int(token_id))
@@ -659,9 +641,7 @@ async def _tokenize_with_media_slots(
     cursor = 0
     for position, sentinel, modality in sorted(positioned_slots):
         prompt_tokens.extend(
-            _coerce_to_token_id_list(
-                chat_tok(rendered[cursor:position], add_special_tokens=False)
-            )
+            _coerce_to_token_id_list(chat_tok(rendered[cursor:position], add_special_tokens=False))
         )
         spec = prompt_config.get_spec(modality)
         token_id = spec.model_token_id
@@ -674,9 +654,7 @@ async def _tokenize_with_media_slots(
             resolved_id = None
         if token_id is None:
             if resolved_id is None:
-                raise ValueError(
-                    f"Tokenizer does not define media token {spec.model_token!r}."
-                )
+                raise ValueError(f"Tokenizer does not define media token {spec.model_token!r}.")
             token_id = resolved_id
         elif resolved_id is not None and token_id != resolved_id:
             raise ValueError(
@@ -684,22 +662,16 @@ async def _tokenize_with_media_slots(
                 f"{spec.model_token!r} id {resolved_id}."
             )
         prompt_tokens.extend(
-            _coerce_to_token_id_list(
-                chat_tok(spec.prefix, add_special_tokens=False)
-            )
+            _coerce_to_token_id_list(chat_tok(spec.prefix, add_special_tokens=False))
         )
         prompt_tokens.append(int(token_id))
         prompt_tokens.extend(
-            _coerce_to_token_id_list(
-                chat_tok(spec.suffix, add_special_tokens=False)
-            )
+            _coerce_to_token_id_list(chat_tok(spec.suffix, add_special_tokens=False))
         )
         cursor = position + len(sentinel)
 
     prompt_tokens.extend(
-        _coerce_to_token_id_list(
-            chat_tok(rendered[cursor:], add_special_tokens=False)
-        )
+        _coerce_to_token_id_list(chat_tok(rendered[cursor:], add_special_tokens=False))
     )
     return prompt_tokens
 
@@ -942,9 +914,7 @@ try:
 
             else:
                 if media_slots:
-                    raise ValueError(
-                        "Multimodal chat requests require a chat template."
-                    )
+                    raise ValueError("Multimodal chat requests require a chat template.")
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
                 )
@@ -1044,9 +1014,7 @@ try:
 
             streams = [
                 client.add_request_streaming(
-                    prompt_tokens,
-                    sampling_params,
-                    multi_modal_data=multi_modal_data,
+                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
                 )
                 for _ in range(n)
             ]
@@ -1101,11 +1069,7 @@ try:
             return response
 
         tasks = [
-            client.add_request(
-                prompt_tokens,
-                sampling_params,
-                multi_modal_data=multi_modal_data,
-            )
+            client.add_request(prompt_tokens, sampling_params, multi_modal_data=multi_modal_data)
             for _ in range(n)
         ]
 

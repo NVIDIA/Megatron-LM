@@ -169,6 +169,16 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
+class MediaCacheCoordinatorPolicy(str, Enum):
+    """Routing policy for the DP inference coordinator with media caching."""
+
+    AFFINITY = "affinity"
+    """Prefer ranks assigned the same media key when vision embeddings are cached."""
+
+    LOAD_BALANCED = "load_balanced"
+    """Ignore media affinity and route using prefix affinity and load."""
+
+
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
 
@@ -268,6 +278,7 @@ class MultimodalPromptConfig:
 
     @classmethod
     def from_dict(cls, value):
+        """Build from image and video specs."""
         if not value:
             return cls()
         return cls(
@@ -443,8 +454,9 @@ class InferenceConfig:
     vision_embedding_cache_max_bytes: int = 0
     """Maximum GPU bytes retained for reusable vision embeddings.
 
-    A value of zero disables the cache. Cache entries are keyed explicitly by
-    callers and are discarded whenever the inference engine is suspended.
+    A value of zero disables the cache. Cache entries use an automatically
+    generated media-content key and are discarded whenever the inference engine
+    is suspended.
     """
 
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
@@ -468,6 +480,25 @@ class InferenceConfig:
     """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
     Higher alpha favors prefix cache hits; lower alpha favors load balance.
     Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
+        MediaCacheCoordinatorPolicy.AFFINITY
+    )
+    """Media-cache routing policy for the DP inference coordinator.
+
+    Media affinity is active only when ``vision_embedding_cache_max_bytes`` is
+    greater than zero. Media-salted prefix affinity is controlled separately by
+    ``prefix_caching_coordinator_policy``.
+    """
+
+    media_cache_routing_weight: float = 1.0
+    """Estimated vision-encoder reuse cost in compact-prompt block units.
+
+    Multimodal coordinator routing combines this media-hit value with the number
+    of matching routing-prefix blocks before blending cache affinity with load
+    using ``prefix_caching_routing_alpha``. The engine independently uses
+    post-expansion hashes for authoritative KV lookup. Must be non-negative.
     """
 
     prefix_caching_mamba_gb: Optional[float] = None
@@ -572,6 +603,11 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+        if self.media_cache_routing_weight < 0:
+            raise ValueError(
+                "media_cache_routing_weight must be non-negative, "
+                f"got {self.media_cache_routing_weight}"
             )
 
         if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):

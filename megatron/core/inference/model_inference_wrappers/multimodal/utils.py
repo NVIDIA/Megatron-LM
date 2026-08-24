@@ -43,17 +43,13 @@ def dynamic_media_embedding_counts(
         if pixel_shuffle and (
             patch_height % pixel_shuffle_size or patch_width % pixel_shuffle_size
         ):
-            raise ValueError(
-                "Media patch grids must be divisible by pixel_shuffle_size."
-            )
+            raise ValueError("Media patch grids must be divisible by pixel_shuffle_size.")
         count = patch_height * patch_width
         if pixel_shuffle:
             count //= pixel_shuffle_size**2
         merge_factor = spatial_merge_size**2
         if count % merge_factor:
-            raise ValueError(
-                "Media token count must be divisible by the spatial merge factor."
-            )
+            raise ValueError("Media token count must be divisible by the spatial merge factor.")
         counts.append(count // merge_factor)
     return counts
 
@@ -79,9 +75,7 @@ def dynamic_media_replacement_counts(
     elif hasattr(num_frames, "tolist"):
         values = num_frames.tolist()
         frame_groups = (
-            [int(values)]
-            if not isinstance(values, list)
-            else [int(value) for value in values]
+            [int(values)] if not isinstance(values, list) else [int(value) for value in values]
         )
     else:
         frame_groups = [int(value) for value in num_frames]
@@ -100,9 +94,7 @@ def dynamic_media_replacement_counts(
     per_video_counts = []
     frame_offset = 0
     for frame_count in frame_groups:
-        video_frame_counts = frame_embedding_counts[
-            frame_offset : frame_offset + frame_count
-        ]
+        video_frame_counts = frame_embedding_counts[frame_offset : frame_offset + frame_count]
         tubelet_counts = video_frame_counts[::temporal_patch_size]
         per_tubelet_counts.extend(tubelet_counts)
         per_video_counts.append(sum(tubelet_counts))

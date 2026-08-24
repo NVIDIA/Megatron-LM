@@ -100,23 +100,18 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """Map pre-expanded media-token positions to sequential embedding indices."""
         prompt_config = self.get_multimodal_prompt_config()
         if prompt_config is None:
-            raise ValueError(
-                f"{type(self).__name__} does not define a multimodal prompt contract."
-            )
+            raise ValueError(f"{type(self).__name__} does not define a multimodal prompt contract.")
         media_token_id = prompt_config.get_spec(modality).model_token_id
         if media_token_id is None:
             raise ValueError(
-                f"{type(self).__name__} does not define a model token id for "
-                f"{modality} inputs."
+                f"{type(self).__name__} does not define a model token id for " f"{modality} inputs."
             )
 
         media_positions = prompt_tokens == int(media_token_id)
         media_indices = torch.nonzero(media_positions, as_tuple=False).flatten()
         mask = torch.full_like(prompt_tokens, -1, dtype=torch.int64)
         mask[media_indices] = torch.arange(
-            media_indices.numel(),
-            dtype=torch.int64,
-            device=prompt_tokens.device,
+            media_indices.numel(), dtype=torch.int64, device=prompt_tokens.device
         )
         return mask
 

@@ -29,12 +29,8 @@ def _video_target_resolution(image, config: ImageProcessingConfig) -> tuple[int,
     if required_divisor > 1:
         height_remainder = patch_height % required_divisor
         width_remainder = patch_width % required_divisor
-        height_up = patch_height + (
-            required_divisor - height_remainder if height_remainder else 0
-        )
-        width_up = patch_width + (
-            required_divisor - width_remainder if width_remainder else 0
-        )
+        height_up = patch_height + (required_divisor - height_remainder if height_remainder else 0)
+        width_up = patch_width + (required_divisor - width_remainder if width_remainder else 0)
         if height_up * width_up <= target_patches:
             patch_height, patch_width = height_up, width_up
         else:
@@ -62,10 +58,7 @@ def _resolve_pixel_stats(vision_model_type: str):
     return list(fields["pixel_mean"].default), list(fields["pixel_std"].default)
 
 
-def _load_frame_sequence_manifest(
-    payload: bytes,
-    frame_manifest_magic: Optional[bytes],
-):
+def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional[bytes]):
     """Load PIL images from a configured frame-sequence manifest."""
     if not frame_manifest_magic or not payload.startswith(frame_manifest_magic):
         return None
@@ -85,9 +78,7 @@ def _load_frame_sequence_manifest(
         or not frame_paths
         or not all(isinstance(path, str) and path for path in frame_paths)
     ):
-        raise ValueError(
-            "Frame-sequence manifest requires non-empty string frame_paths."
-        )
+        raise ValueError("Frame-sequence manifest requires non-empty string frame_paths.")
 
     frames = []
     for frame_path in frame_paths:
@@ -161,10 +152,7 @@ def dynamic_res_preprocess(
 
 
 def preprocess_image(
-    image,
-    config: ImageProcessingConfig,
-    target_hw=None,
-    device: Optional[torch.device] = None,
+    image, config: ImageProcessingConfig, target_hw=None, device: Optional[torch.device] = None
 ) -> tuple:
     """Convert one PIL image into packed vision patches and its resized shape."""
     try:
@@ -227,12 +215,7 @@ def preprocess_image_bytes(
     from PIL import Image
 
     with Image.open(io.BytesIO(image_bytes)) as image:
-        return preprocess_image(
-            image,
-            config,
-            target_hw=target_hw,
-            device=device,
-        )
+        return preprocess_image(image, config, target_hw=target_hw, device=device)
 
 
 def preprocess_image_bytes_list(
@@ -294,9 +277,7 @@ def preprocess_image_bytes_list(
 
 
 def preprocess_video_bytes_list(
-    video_bytes_list,
-    config: VideoProcessingConfig,
-    device: Optional[torch.device] = None,
+    video_bytes_list, config: VideoProcessingConfig, device: Optional[torch.device] = None
 ) -> dict:
     """Decode videos and return packed dynamic-resolution engine inputs.
 
@@ -308,13 +289,8 @@ def preprocess_video_bytes_list(
     if config.num_frames <= 0:
         raise ValueError("VideoProcessingConfig.num_frames must be positive.")
     if config.temporal_patch_size <= 0:
-        raise ValueError(
-            "VideoProcessingConfig.temporal_patch_size must be positive."
-        )
-    if (
-        not config.image_config.dynamic_resolution
-        or config.image_config.use_tiling
-    ):
+        raise ValueError("VideoProcessingConfig.temporal_patch_size must be positive.")
+    if not config.image_config.dynamic_resolution or config.image_config.use_tiling:
         raise NotImplementedError(
             "Raw video preprocessing currently requires dynamic-resolution, "
             "non-tiled vision inputs."
@@ -323,23 +299,14 @@ def preprocess_video_bytes_list(
     import numpy as np
 
     def decode_frames(encoded_video):
-        frames = _load_frame_sequence_manifest(
-            encoded_video,
-            config.frame_manifest_magic,
-        )
+        frames = _load_frame_sequence_manifest(encoded_video, config.frame_manifest_magic)
         if frames is not None:
             return frames, True
 
         import av
 
         with av.open(io.BytesIO(encoded_video)) as container:
-            return (
-                [
-                    frame.to_image().convert("RGB")
-                    for frame in container.decode(video=0)
-                ],
-                False,
-            )
+            return ([frame.to_image().convert("RGB") for frame in container.decode(video=0)], False)
 
     packed_videos = []
     packed_sizes = []
@@ -362,10 +329,7 @@ def preprocess_video_bytes_list(
             sampled_frames = frames
         else:
             sample_count = min(config.num_frames, len(frames))
-            if (
-                config.temporal_patch_size > 1
-                and sample_count % config.temporal_patch_size
-            ):
+            if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
                 rounded_down = (
                     sample_count // config.temporal_patch_size
                 ) * config.temporal_patch_size
@@ -375,9 +339,7 @@ def preprocess_video_bytes_list(
                     else min(config.temporal_patch_size, len(frames))
                 )
             sample_indices = (
-                np.rint(np.linspace(0, len(frames) - 1, num=sample_count))
-                .astype(np.int64)
-                .tolist()
+                np.rint(np.linspace(0, len(frames) - 1, num=sample_count)).astype(np.int64).tolist()
             )
             sampled_frames = [frames[index] for index in sample_indices]
         sample_count = len(sampled_frames)
@@ -385,15 +347,10 @@ def preprocess_video_bytes_list(
         frame_tensors = []
         frame_sizes = []
         if reference_hw is None:
-            reference_hw = _video_target_resolution(
-                sampled_frames[0], config.image_config
-            )
+            reference_hw = _video_target_resolution(sampled_frames[0], config.image_config)
         for frame in sampled_frames:
             imgs, imgs_sizes = preprocess_image(
-                frame,
-                config.image_config,
-                target_hw=reference_hw,
-                device=device,
+                frame, config.image_config, target_hw=reference_hw, device=device
             )
             frame_tensors.append(imgs)
             frame_sizes.append(imgs_sizes)
@@ -405,7 +362,5 @@ def preprocess_video_bytes_list(
     return {
         "imgs": torch.cat(packed_videos, dim=1),
         "imgs_sizes": torch.cat(packed_sizes, dim=0),
-        "num_frames": torch.tensor(
-            frame_counts, dtype=torch.int32, device=packed_videos[0].device
-        ),
+        "num_frames": torch.tensor(frame_counts, dtype=torch.int32, device=packed_videos[0].device),
     }

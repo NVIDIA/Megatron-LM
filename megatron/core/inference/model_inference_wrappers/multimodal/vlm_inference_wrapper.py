@@ -36,8 +36,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         module = resolve_wrapped_model(self.model)
         token_id = getattr(module, "image_token_index", None)
         spec = MediaPromptSpec(
-            model_token="<image>",
-            model_token_id=int(token_id) if token_id is not None else None,
+            model_token="<image>", model_token_id=int(token_id) if token_id is not None else None
         )
         return MultimodalPromptConfig(image_spec=spec, video_spec=spec)
 
@@ -148,9 +147,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     # ---- Dynamic inference methods ----
 
-    def expand_image_tokens(
-        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None
-    ):
+    def expand_image_tokens(self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None):
         """Expand image tokens to multiple pad tokens.
 
         Supports two modes:
@@ -200,16 +197,13 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 class_token_len = int(getattr(module, "_class_token_len", 0))
                 if module._pixel_shuffle and class_token_len > 0:
                     raise ValueError(
-                        "Dynamic-resolution pixel shuffle requires dropping "
-                        "vision class tokens."
+                        "Dynamic-resolution pixel shuffle requires dropping " "vision class tokens."
                     )
                 frame_embedding_counts = [
                     count + class_token_len for count in frame_embedding_counts
                 ]
             placeholder_count = sum(
-                token == image_token_index
-                for sample_tokens in tokens
-                for token in sample_tokens
+                token == image_token_index for sample_tokens in tokens for token in sample_tokens
             )
             per_image_embeddings = dynamic_media_replacement_counts(
                 frame_embedding_counts,
@@ -306,11 +300,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         return expanded_tokens_list, mask_list
 
     def _forward_vision_encoder(
-        self,
-        images,
-        num_image_tiles=None,
-        imgs_sizes=None,
-        num_frames=None,
+        self, images, num_image_tiles=None, imgs_sizes=None, num_frames=None
     ) -> torch.Tensor:
         """Run the vision encoder only, returning image embeddings.
 
@@ -584,8 +574,8 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         # Static VLM path
         num_image_tokens = (
-            tokens == resolve_wrapped_model(self.model).image_token_index
-        ).sum().item()
+            (tokens == resolve_wrapped_model(self.model).image_token_index).sum().item()
+        )
         num_img_embeddings = inference_input["num_img_embeddings"]
         decoder_seq_length = inference_input["decoder_seq_length"]
         num_tokens = tokens.size(1)

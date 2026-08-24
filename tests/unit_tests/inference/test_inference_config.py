@@ -11,6 +11,7 @@ from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
     MambaInferenceStateConfig,
+    MediaCacheCoordinatorPolicy,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
@@ -96,11 +97,34 @@ class TestInferenceConfig:
         with pytest.raises(ValueError):
             InferenceConfig(async_sched_mode=invalid_mode)
 
+    def test_media_cache_routing_weight_must_be_non_negative(self):
+        with pytest.raises(ValueError, match="media_cache_routing_weight"):
+            InferenceConfig(media_cache_routing_weight=-1.0)
+
+    def test_media_cache_coordinator_policy_defaults_to_affinity(self):
+        assert (
+            InferenceConfig().media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
+        )
+
     def test_async_sched_argparse_plumbing(self):
         """Ensure the CLI exposes async scheduling mode."""
         parser = _add_inference_args(ArgumentParser())
-        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "async"])
+        args = parser.parse_args(
+            [
+                "--inference-dynamic-batching-async-sched-mode",
+                "async",
+                "--inference-dynamic-batching-media-cache-coordinator-policy",
+                "load_balanced",
+                "--inference-dynamic-batching-media-cache-routing-weight",
+                "2.5",
+                "--inference-dynamic-batching-vision-embedding-cache-max-bytes",
+                "1048576",
+            ]
+        )
         assert args.inference_dynamic_batching_async_sched_mode == "async"
+        assert args.inference_dynamic_batching_media_cache_coordinator_policy == "load_balanced"
+        assert args.inference_dynamic_batching_media_cache_routing_weight == 2.5
+        assert args.inference_dynamic_batching_vision_embedding_cache_max_bytes == 1048576
 
     @pytest.mark.parametrize("invalid_mode", ["serial", "overlap"])
     def test_async_sched_argparse_rejects_removed_modes(self, invalid_mode):
@@ -117,7 +141,12 @@ class TestInferenceConfig:
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="async")
+        setup_config = InferenceSetupConfig(
+            inference_dynamic_batching_async_sched_mode="async",
+            inference_dynamic_batching_media_cache_coordinator_policy="load_balanced",
+            inference_dynamic_batching_media_cache_routing_weight=2.5,
+            inference_dynamic_batching_vision_embedding_cache_max_bytes=1048576,
+        )
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -128,6 +157,12 @@ class TestInferenceConfig:
         )
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
+        assert (
+            inference_config.media_cache_coordinator_policy
+            == MediaCacheCoordinatorPolicy.LOAD_BALANCED
+        )
+        assert inference_config.media_cache_routing_weight == 2.5
+        assert inference_config.vision_embedding_cache_max_bytes == 1048576
 
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""

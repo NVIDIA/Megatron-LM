@@ -13,7 +13,10 @@ from multiprocessing.connection import Connection
 import numpy as np
 import torch
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import (
+    MediaCacheCoordinatorPolicy,
+    PrefixCachingCoordinatorPolicy,
+)
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -99,6 +102,11 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
+            MediaCacheCoordinatorPolicy.AFFINITY
+        ),
+        media_cache_routing_weight: float = 1.0,
+        vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
     ):
@@ -117,6 +125,12 @@ class DataParallelInferenceCoordinator:
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
             prefix_caching_routing_alpha (float): Weight for prefix-aware routing score:
                 score = alpha * match + (1 - alpha) * normalized_load.
+            media_cache_coordinator_policy (MediaCacheCoordinatorPolicy):
+                Routing policy for media-cache affinity.
+            media_cache_routing_weight (float): Estimated vision-encoder cost in
+                units of one cached prompt block, used for multimodal routing.
+            vision_embedding_cache_enabled (bool): Whether engines retain
+                reusable projected media embeddings.
             max_requests (int): Max concurrent requests per rank, used to
                 compute normalized_load for prefix-aware scoring.
         """
@@ -200,6 +214,11 @@ class DataParallelInferenceCoordinator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
+        self.media_cache_coordinator_policy = media_cache_coordinator_policy
+        self.media_cache_routing_weight = media_cache_routing_weight
+        self.vision_embedding_cache_enabled = vision_embedding_cache_enabled
+        if self.media_cache_routing_weight < 0:
+            raise ValueError("media_cache_routing_weight must be non-negative.")
         self.max_requests = max_requests
         assert self.max_requests is not None and self.max_requests > 0
 
@@ -246,20 +265,12 @@ class DataParallelInferenceCoordinator:
         best_idx = int(np.argmin(self._pending_counts))
         return self._identities_list[best_idx]
 
-    def get_media_affine_data_parallel_rank(self, media_cache_key: str):
-        """Keep equal media keys on one DP rank while balancing new media."""
-        identity = self._media_cache_affinity.pop(media_cache_key, None)
-        if identity in self.identities_of_data_parallel_ranks:
-            rank_idx = self.identity_to_rank_index[identity]
-            if self._pending_counts[rank_idx] < self.max_requests:
-                self._media_cache_affinity[media_cache_key] = identity
-                return identity
-
-        identity = self.get_least_loaded_data_parallel_rank()
+    def _update_media_affinity(self, media_cache_key: str, identity: bytes) -> None:
+        """Record the rank most recently assigned a generated media key."""
+        self._media_cache_affinity.pop(media_cache_key, None)
         self._media_cache_affinity[media_cache_key] = identity
         if len(self._media_cache_affinity) > self._media_cache_affinity_max_entries:
             self._media_cache_affinity.popitem(last=False)
-        return identity
 
     def _register_rank_identity(self, identity):
         """Register a new rank identity in the scoring data structures.
@@ -341,14 +352,23 @@ class DataParallelInferenceCoordinator:
         for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
             self._send_to_engine(data_parallel_rank_id, serialized)
 
-    def compute_request_hashes(self, prompt):
-        """Compute block hashes for a prompt on CPU.
+    def compute_request_hashes(self, prompt, cache_salt: str | None = None):
+        """Compute compact-prompt affinity hashes on CPU.
+
+        For text requests these equal the engine's KV block hashes. For
+        multimodal requests they are routing proxies: the coordinator does not
+        preprocess media or expand placeholders, so the engine independently
+        computes authoritative KV hashes from its post-expansion tokens. With a
+        common media salt, compact-prefix matches remain a useful affinity
+        signal because equal media have equal expansion behavior.
 
         Args:
             prompt: Either a string (to be tokenized) or a list of token IDs.
+            cache_salt: Optional media identity mixed into the prompt hash
+                chain for multimodal affinity.
 
         Returns:
-            List of integer block hashes, or empty list if prefix caching is disabled.
+            List of integer routing hashes, or empty list if prefix caching is disabled.
         """
         if not self.enable_prefix_caching or self.block_size_tokens is None:
             return []
@@ -357,41 +377,81 @@ class DataParallelInferenceCoordinator:
         else:
             tokens = list(prompt)
         token_tensor = torch.tensor(tokens, dtype=torch.int64)
-        return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
+        return compute_block_hashes_batched(
+            token_tensor, self.block_size_tokens, cache_salt=cache_salt
+        )
 
-    def get_best_data_parallel_rank(self, request_hashes):
-        """Select the best DP rank based on prefix cache affinity and load.
+    def get_best_data_parallel_rank(self, request_hashes, media_cache_key: str | None = None):
+        """Select the best DP rank based on media affinity, prefix affinity, and load.
 
-        Uses a scoring function: score = alpha * match + (1 - alpha) * normalized_load
-        where *match* is a policy-dependent affinity score in [0, 1] (binary for
-        ``first_prefix_block``, normalized prefix depth for ``longest_prefix``)
-        and normalized_load = free_slots / max_requests (higher means more free
-        capacity).
+        Uses ``score = alpha * cache_score + (1 - alpha) * normalized_load``,
+        where ``cache_score`` combines matching prefix blocks with a weighted
+        media-cache hit, and ``normalized_load`` is the rank's free capacity.
 
         Args:
             request_hashes: List of block hashes for the request.
+            media_cache_key: Internally generated content key for request media.
 
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
-        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
+        # Use load-balancing if text or multimodal coordination affinity is deactivated.
+        has_media = isinstance(media_cache_key, str) and bool(media_cache_key)
+        use_prefix_affinity = (
+            self.enable_prefix_caching
+            and bool(request_hashes)
+            and self.prefix_caching_coordinator_policy
+            != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        )
+        use_media_affinity = (
+            has_media
+            and self.vision_embedding_cache_enabled
+            and self.media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
+        )
+        if not use_prefix_affinity and not use_media_affinity:
             return self.get_least_loaded_data_parallel_rank()
 
-        # Without prefix caching (or when the request has no hashes to match on)
-        # fall back to load-balanced routing.
-        if not self.enable_prefix_caching or not request_hashes:
+        # Compute text affinity.
+        n_ranks = len(self._identities_list)
+        prefix_match = np.zeros(n_ranks, dtype=np.float64)
+        recency = np.zeros(n_ranks, dtype=np.float64)
+        if use_prefix_affinity:
+            prefix_match, recency = self._match_vector(request_hashes)
+
+        # Compute multimodal affinity.
+        media_hit = np.zeros(n_ranks, dtype=np.float64)
+        if use_media_affinity:
+            media_identity = self._media_cache_affinity.get(media_cache_key)
+            media_rank_idx = self.identity_to_rank_index.get(media_identity)
+            if (
+                media_rank_idx is not None
+                and self._pending_counts[media_rank_idx] < self.max_requests
+            ):
+                media_hit[media_rank_idx] = 1.0
+
+        # If there are no hits anywhere, just fall-back to load balancing.
+        if not prefix_match.any() and not media_hit.any():
             return self.get_least_loaded_data_parallel_rank()
 
-        match, recency = self._match_vector(request_hashes)
+        # Compute the affinity / cache score based on matched prefix blocks
+        # and a hit on the multimodal media cache per DP rank.
+        prefix_block_count = len(request_hashes) if use_prefix_affinity else 0
+        matched_prefix_blocks = prefix_match * prefix_block_count
+        reusable_work = matched_prefix_blocks + media_hit * self.media_cache_routing_weight
+        maximum_reusable_work = prefix_block_count + (
+            self.media_cache_routing_weight if use_media_affinity else 0.0
+        )
+        cache_score = (
+            reusable_work / maximum_reusable_work if maximum_reusable_work > 0 else reusable_work
+        )
 
+        # Compute a coordinator score for every DP rank, weighting the cache score
+        # against the number of free request slots for each DP rank.
         alpha = self.prefix_caching_routing_alpha
-
-        # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
         free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
-        scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
+        scores = alpha * cache_score + (1.0 - alpha) * (free_slots / self.max_requests)
 
         # Tiebreak: highest score, then highest recency, then lowest rank index.
-        n_ranks = len(self._identities_list)
         order = np.lexsort((np.arange(n_ranks), -recency, -scores))
         best_idx = int(order[0])
         return self._identities_list[best_idx]
@@ -506,6 +566,11 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
+            MediaCacheCoordinatorPolicy.AFFINITY
+        ),
+        media_cache_routing_weight: float = 1.0,
+        vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
     ):
@@ -527,6 +592,12 @@ class DataParallelInferenceCoordinator:
             prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
             schedule_output_path (Optional[str]): Path to write scheduling decisions JSON.
             prefix_caching_routing_alpha (float): Weight for prefix-aware routing score.
+            media_cache_coordinator_policy (MediaCacheCoordinatorPolicy):
+                Routing policy for media-cache affinity.
+            media_cache_routing_weight (float): Vision reuse cost in equivalent
+                cached prompt blocks.
+            vision_embedding_cache_enabled (bool): Whether engines retain
+                reusable projected media embeddings.
             max_requests (int): Max concurrent requests per rank.
         """
         coordinator = cls(
@@ -540,6 +611,9 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+            media_cache_coordinator_policy=media_cache_coordinator_policy,
+            media_cache_routing_weight=media_cache_routing_weight,
+            vision_embedding_cache_enabled=vision_embedding_cache_enabled,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
         )

@@ -64,9 +64,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             )
         return super().run_one_forward_step(inference_input, recv_buffer_seq_len)
 
-    def expand_image_tokens(
-        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None
-    ):
+    def expand_image_tokens(self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None):
         """Expand compact image/video placeholders and build embedding masks."""
         if imgs_sizes is None:
             raise NotImplementedError(
@@ -79,22 +77,16 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             raise ValueError("NemotronOmniModel must have dynamic_resolution enabled.")
 
         frame_embedding_counts = dynamic_media_embedding_counts(
-            imgs_sizes,
-            patch_dim=model.patch_dim,
-            pixel_shuffle=True,
+            imgs_sizes, patch_dim=model.patch_dim, pixel_shuffle=True
         )
         placeholder_count = sum(
-            token == model.image_token_index
-            for sample_tokens in tokens
-            for token in sample_tokens
+            token == model.image_token_index for sample_tokens in tokens for token in sample_tokens
         )
 
         replacement_counts = dynamic_media_replacement_counts(
             frame_embedding_counts,
             num_frames=num_frames,
-            temporal_patch_size=int(
-                getattr(model.vision_model, "temporal_patch_dim", 1)
-            ),
+            temporal_patch_size=int(getattr(model.vision_model, "temporal_patch_dim", 1)),
             placeholder_count=placeholder_count,
         )
 
@@ -138,18 +130,13 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         media_kind = "video" if num_frames is not None else "image"
         if num_frames is None:
             num_frames = torch.ones(
-                imgs_sizes.shape[0],
-                dtype=torch.int32,
-                device=imgs_sizes.device,
+                imgs_sizes.shape[0], dtype=torch.int32, device=imgs_sizes.device
             )
 
         model = resolve_wrapped_model(self.model)
         with torch.cuda.nvtx.range(f"megatron.multimodal.{media_kind}_encoder"):
             embeddings = model._encode_images(
-                images,
-                imgs_sizes,
-                vision_packed_seq_params=None,
-                num_frames=num_frames,
+                images, imgs_sizes, vision_packed_seq_params=None, num_frames=num_frames
             )
         return embeddings.unsqueeze(1)
 

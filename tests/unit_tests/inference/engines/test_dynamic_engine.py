@@ -41,6 +41,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
     compute_block_hashes_batched,
+    compute_media_cache_key,
 )
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -97,10 +98,7 @@ def _build_mock_vlm_engine(image_embeddings):
     controller.pp_group = None
     controller.inference_wrapped_model = wrapper
     engine.controller = controller
-    engine.context = mock.Mock(
-        block_size_tokens=256,
-        enable_prefix_caching=False,
-    )
+    engine.context = mock.Mock(block_size_tokens=256, enable_prefix_caching=False)
     engine._get_cached_vision_embedding = mock.Mock(return_value=None)
     engine._cache_vision_embedding = mock.Mock()
     engine._resolve_image_token_id = mock.Mock(return_value=99)
@@ -108,16 +106,12 @@ def _build_mock_vlm_engine(image_embeddings):
 
 
 def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded):
-    with mock.patch.object(
-        torch.cuda, "current_device", return_value=torch.device("cpu")
-    ):
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
         return engine._build_vlm_request(
             request_id=1,
             prompt_str=None,
             tokens=tokens,
-            sampling_params=SamplingParams(
-                num_tokens_to_generate=1, termination_id=0
-            ),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
             imgs=torch.ones(1, 2, 4),
             num_tiles=None,
             num_img_embeddings_per_tile=0,
@@ -133,9 +127,7 @@ def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
         [-1, 0, 1, -1], dtype=torch.int64
     )
 
-    request = _call_build_vlm_request(
-        engine, tokens, media_tokens_preexpanded=True
-    )
+    request = _call_build_vlm_request(engine, tokens, media_tokens_preexpanded=True)
 
     assert torch.equal(request.prompt_tokens, tokens)
     assert request.compact_prompt_tokens is None
@@ -152,28 +144,41 @@ def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
 
     with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
         _call_build_vlm_request(
-            engine,
-            torch.tensor([10, 99, 99, 20], dtype=torch.int64),
-            media_tokens_preexpanded=True,
+            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
         )
 
 
 def test_build_vlm_request_keeps_compact_expansion_path():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     compact_tokens = torch.tensor([10, 42, 20], dtype=torch.int64)
-    wrapper.expand_image_tokens.return_value = (
-        [[10, -1, -1, 20]],
-        [[None, 0, 1, None]],
-    )
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
-    request = _call_build_vlm_request(
-        engine, compact_tokens, media_tokens_preexpanded=False
-    )
+    request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
 
     wrapper.expand_image_tokens.assert_called_once()
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
     assert torch.equal(request.compact_prompt_tokens, compact_tokens)
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+
+def test_build_vlm_request_enables_media_salted_prefix_caching():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine.context.enable_prefix_caching = True
+    engine.context.block_size_tokens = 2
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
+    )
+
+    media_cache_key = compute_media_cache_key(
+        "image", {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}
+    )
+    assert request.enable_prefix_caching
+    assert request.block_hash_salt == media_cache_key
+    assert request.precomputed_block_hashes == compute_block_hashes_batched(
+        request.prompt_tokens, block_size=2, cache_salt=media_cache_key
+    )
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str, ssm_mixer: str = "mamba"):

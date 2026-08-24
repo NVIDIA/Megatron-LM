@@ -1234,10 +1234,11 @@ class LLaVAModel(MegatronModule):
                         f"sum(num_frames)={sum(num_frames)}, imgs_sizes={len(imgs_sizes)}."
                     )
                 media_tubelet_counts = [
-                    1
-                    if frame_count == 1
-                    else (frame_count + self.temporal_patch_dim - 1)
-                    // self.temporal_patch_dim
+                    (
+                        1
+                        if frame_count == 1
+                        else (frame_count + self.temporal_patch_dim - 1) // self.temporal_patch_dim
+                    )
                     for frame_count in num_frames
                 ]
                 if self._tile_tags is not None:
@@ -1289,13 +1290,10 @@ class LLaVAModel(MegatronModule):
                     else 0
                 )
                 sequence_lengths = [
-                    (int(height) // patch_dim) * (int(width) // patch_dim)
-                    + class_token_len
+                    (int(height) // patch_dim) * (int(width) // patch_dim) + class_token_len
                     for height, width in sizes
                 ]
-                chunks = list(
-                    torch.split(image_embeddings.squeeze(0), sequence_lengths, dim=0)
-                )
+                chunks = list(torch.split(image_embeddings.squeeze(0), sequence_lengths, dim=0))
                 if self._drop_vision_class_token and class_token_len > 0:
                     chunks = [chunk[class_token_len:] for chunk in chunks]
                 if self._pixel_shuffle:
@@ -1303,9 +1301,7 @@ class LLaVAModel(MegatronModule):
                         raise ValueError(
                             "Temporal pixel shuffle requires dropping vision class tokens."
                         )
-                    chunks = _pixel_shuffle_dynamic_resolution_chunks(
-                        chunks, sizes, patch_dim
-                    )
+                    chunks = _pixel_shuffle_dynamic_resolution_chunks(chunks, sizes, patch_dim)
                 tubelet_token_counts_tensor = torch.tensor(
                     [chunk.shape[0] for chunk in chunks],
                     dtype=torch.int,
@@ -1317,10 +1313,8 @@ class LLaVAModel(MegatronModule):
                     image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
                         image_embeddings, num_padded_imgs
                     )
-                    tubelet_token_counts_tensor = (
-                        gather_from_context_parallel_ranks_dynamic_res(
-                            tubelet_token_counts_tensor, num_padded_imgs
-                        )
+                    tubelet_token_counts_tensor = gather_from_context_parallel_ranks_dynamic_res(
+                        tubelet_token_counts_tensor, num_padded_imgs
                     )
 
                 is_packed_dynamic_res = True
@@ -1345,14 +1339,10 @@ class LLaVAModel(MegatronModule):
                     else len(tubelet_token_counts)
                 )
                 placeholder_token_counts = _group_temporal_token_counts(
-                    tubelet_token_counts,
-                    media_tubelet_counts,
-                    placeholder_count,
+                    tubelet_token_counts, media_tubelet_counts, placeholder_count
                 )
                 num_image_tiles = torch.tensor(
-                    placeholder_token_counts,
-                    dtype=torch.int,
-                    device=image_embeddings.device,
+                    placeholder_token_counts, dtype=torch.int, device=image_embeddings.device
                 )
             else:
                 # Stock CLIPViTModel does not accept VLM-specific kwargs.
@@ -1394,9 +1384,7 @@ class LLaVAModel(MegatronModule):
                             torch.cat([seq_lens.new_zeros(1), seq_lens + class_token_len]), dim=0
                         )[:-1]
                         class_offsets = segment_starts.unsqueeze(1) + torch.arange(
-                            class_token_len,
-                            device=image_embeddings.device,
-                            dtype=seq_lens.dtype,
+                            class_token_len, device=image_embeddings.device, dtype=seq_lens.dtype
                         ).unsqueeze(0)
                         remove_mask[class_offsets.reshape(-1)] = False
                         image_embeddings = image_embeddings[:, remove_mask, :]
@@ -1468,9 +1456,7 @@ class LLaVAModel(MegatronModule):
                 if imgs_sizes is not None and self._dynamic_resolution
                 else images.shape[0]
             )
-            num_image_tiles = torch.ones(
-                num_images, dtype=torch.int, device=input_ids.device
-            )
+            num_image_tiles = torch.ones(num_images, dtype=torch.int, device=input_ids.device)
 
         # if context_parallel_lm == 1:
         #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
@@ -1683,9 +1669,7 @@ def _pixel_shuffle_dynamic_resolution_chunks(
     chunks, image_sizes, patch_dim, scale_factor=0.5, version=2
 ):
     """Pixel-shuffle dynamic-resolution chunks using their real patch grids."""
-    assert len(chunks) == len(image_sizes), (
-        "each image chunk requires a matching image size"
-    )
+    assert len(chunks) == len(image_sizes), "each image chunk requires a matching image size"
     shuffled_chunks = []
     for chunk, (height, width) in zip(chunks, image_sizes):
         restore_2d = chunk.ndim == 2
@@ -1703,15 +1687,11 @@ def _pixel_shuffle_dynamic_resolution_chunks(
 
 
 def _group_temporal_token_counts(
-    tubelet_token_counts: list[int],
-    media_tubelet_counts: list[int],
-    placeholder_count: int,
+    tubelet_token_counts: list[int], media_tubelet_counts: list[int], placeholder_count: int
 ) -> list[int]:
     """Return token counts for either per-tubelet or per-media placeholders."""
     if sum(media_tubelet_counts) != len(tubelet_token_counts):
-        raise ValueError(
-            "media_tubelet_counts must partition tubelet_token_counts exactly."
-        )
+        raise ValueError("media_tubelet_counts must partition tubelet_token_counts exactly.")
     if placeholder_count == len(tubelet_token_counts):
         return tubelet_token_counts
     if placeholder_count == len(media_tubelet_counts):
@@ -1719,11 +1699,7 @@ def _group_temporal_token_counts(
         tubelet_offset = 0
         for tubelet_count in media_tubelet_counts:
             media_token_counts.append(
-                sum(
-                    tubelet_token_counts[
-                        tubelet_offset : tubelet_offset + tubelet_count
-                    ]
-                )
+                sum(tubelet_token_counts[tubelet_offset : tubelet_offset + tubelet_count])
             )
             tubelet_offset += tubelet_count
         return media_token_counts
@@ -1748,13 +1724,11 @@ def pixel_shuffle(x, scale_factor=0.5, version=2, h=None, w=None):
     """
     if h is not None or w is not None:
         assert h is not None and w is not None, "h and w must both be provided"
-        assert h * w == x.shape[1], (
-            f"h*w ({h}*{w}={h * w}) must equal patches ({x.shape[1]})"
-        )
+        assert h * w == x.shape[1], f"h*w ({h}*{w}={h * w}) must equal patches ({x.shape[1]})"
         reduction = int(1 / scale_factor)
-        assert h % reduction == 0 and w % reduction == 0, (
-            f"h and w ({h}, {w}) must both be divisible by {reduction}"
-        )
+        assert (
+            h % reduction == 0 and w % reduction == 0
+        ), f"h and w ({h}, {w}) must both be divisible by {reduction}"
     else:
         h = w = int(x.shape[1] ** 0.5)
     x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
@@ -1796,15 +1770,9 @@ def pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, versio
     seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
     splits = torch.split(x, seq_lens.tolist(), dim=-2)
 
-    sizes = (
-        imgs_sizes.tolist() if torch.is_tensor(imgs_sizes) else list(imgs_sizes)
-    )
+    sizes = imgs_sizes.tolist() if torch.is_tensor(imgs_sizes) else list(imgs_sizes)
     out = _pixel_shuffle_dynamic_resolution_chunks(
-        splits,
-        sizes,
-        patch_dim,
-        scale_factor=scale_factor,
-        version=version,
+        splits, sizes, patch_dim, scale_factor=scale_factor, version=version
     )
     x = torch.cat(out, dim=-2)
     return x

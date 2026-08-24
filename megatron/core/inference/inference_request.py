@@ -7,7 +7,7 @@ import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -49,23 +49,67 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
-def _with_multimodal_metadata(
-    payload: Dict[str, Any],
-    *,
-    media_cache_key: Optional[str],
-    media_tokens_preexpanded: bool,
-) -> Dict[str, Any]:
-    """Attach optional request-level metadata to a multimodal payload."""
-    if media_cache_key is not None:
-        payload["media_cache_key"] = media_cache_key
-    if media_tokens_preexpanded:
-        payload["media_tokens_preexpanded"] = True
-    return payload
+def compute_media_cache_key(modality: str, modality_data: Any) -> str:
+    """Return a stable content key for raw or preprocessed media.
+
+    The key is generated inside the inference stack so callers do not need to
+    understand vision-embedding cache identity. Tensor metadata is included to
+    prevent equal byte streams with different shapes or dtypes from colliding.
+    """
+    digest = hashlib.sha256()
+    digest.update(b"megatron-media-v2\0")
+    digest.update(modality.encode())
+    digest.update(b"\0")
+
+    if isinstance(modality_data, (bytes, bytearray)):
+        items = [bytes(modality_data)]
+    elif isinstance(modality_data, list):
+        items = [bytes(item) for item in modality_data]
+    else:
+        items = None
+
+    if items is not None:
+        digest.update(b"raw\0")
+        for item in items:
+            digest.update(len(item).to_bytes(8, "big"))
+            digest.update(item)
+        return digest.hexdigest()
+
+    if not isinstance(modality_data, dict):
+        raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
+
+    digest.update(b"preprocessed\0")
+    tensor_fields = (
+        {"imgs", "imgs_sizes", "num_frames"}
+        if modality == "video"
+        else {"imgs", "imgs_sizes", "num_tiles"}
+    )
+    cache_fields = tensor_fields | {"num_img_embeddings_per_tile"}
+    for name in sorted(set(modality_data) & cache_fields):
+        value = modality_data[name]
+        digest.update(name.encode())
+        digest.update(b"\0")
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().contiguous().cpu()
+            digest.update(str(tensor.dtype).encode())
+            digest.update(b"\0")
+            digest.update(repr(tuple(tensor.shape)).encode())
+            digest.update(b"\0")
+            # Viewing a flattened tensor as uint8 works for dtypes such as
+            # bfloat16 that NumPy cannot represent directly.
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        elif name == "num_img_embeddings_per_tile":
+            digest.update(str(int(value)).encode())
+        else:
+            raise TypeError(
+                f"Cannot compute a media cache key from field {name!r} "
+                f"of type {type(value).__name__}."
+            )
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
-def serialize_multimodal_data(
-    multi_modal_data: Any,
-) -> Optional[Dict[str, Any]]:
+def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]:
     """Serialize one request's vLLM-style multimodal dictionary.
 
     Supported modalities:
@@ -87,12 +131,12 @@ def serialize_multimodal_data(
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
-    unsupported = set(multi_modal_data) - {
-        "image",
-        "video",
-        "media_cache_key",
-        "media_tokens_preexpanded",
-    }
+    unsupported = set(multi_modal_data) - {"image", "video", "media_tokens_preexpanded"}
+    if "media_cache_key" in unsupported:
+        raise ValueError(
+            "multi_modal_data['media_cache_key'] is internal and must not be "
+            "provided; media identity is computed automatically."
+        )
     if unsupported:
         raise NotImplementedError(
             f"Unsupported multimodal modalities: {sorted(unsupported)}; "
@@ -112,55 +156,29 @@ def serialize_multimodal_data(
             "multi_modal_data['media_tokens_preexpanded'] must be a bool, "
             f"got {type(media_tokens_preexpanded)}."
         )
-    media_cache_key = multi_modal_data.get("media_cache_key")
-    if media_cache_key is not None and not isinstance(media_cache_key, str):
-        raise TypeError(
-            "multi_modal_data['media_cache_key'] must be a string or None, "
-            f"got {type(media_cache_key)}."
-        )
-
-    def key_for_bytes(items: List[bytes]) -> str:
-        digest = hashlib.sha256()
-        digest.update(b"megatron-media-v1\0")
-        digest.update(modality.encode())
-        for item in items:
-            digest.update(len(item).to_bytes(8, "big"))
-            digest.update(item)
-        return digest.hexdigest()
-
+    metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
     if isinstance(modality_data, (bytes, bytearray)):
         items = [bytes(modality_data)]
-        if media_cache_key is None:
-            media_cache_key = key_for_bytes(items)
-        return _with_multimodal_metadata(
-            {modality: items},
-            media_cache_key=media_cache_key,
-            media_tokens_preexpanded=media_tokens_preexpanded,
-        )
+        media_cache_key = compute_media_cache_key(modality, items)
+        return {modality: items, "media_cache_key": media_cache_key, **metadata}
     if isinstance(modality_data, list):
         if any(not isinstance(item, (bytes, bytearray)) for item in modality_data):
-            raise TypeError(
-                f"multi_modal_data[{modality!r}] list must contain only bytes."
-            )
+            raise TypeError(f"multi_modal_data[{modality!r}] list must contain only bytes.")
         items = [bytes(item) for item in modality_data]
-        if media_cache_key is None:
-            media_cache_key = key_for_bytes(items)
-        return _with_multimodal_metadata(
-            {modality: items},
-            media_cache_key=media_cache_key,
-            media_tokens_preexpanded=media_tokens_preexpanded,
-        )
+        media_cache_key = compute_media_cache_key(modality, items)
+        return {modality: items, "media_cache_key": media_cache_key, **metadata}
     if not isinstance(modality_data, dict):
         raise TypeError(
             f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
             f"preprocessed tensor dict; got {type(modality_data)}."
         )
+    media_cache_key = compute_media_cache_key(modality, modality_data)
 
     wire: Dict[str, Any] = {}
-    tensor_keys = ("imgs", "imgs_sizes", "num_frames") if modality == "video" else (
-        "imgs",
-        "imgs_sizes",
-        "num_tiles",
+    tensor_keys = (
+        ("imgs", "imgs_sizes", "num_frames")
+        if modality == "video"
+        else ("imgs", "imgs_sizes", "num_tiles")
     )
     for key in tensor_keys:
         value = modality_data.get(key)
@@ -168,23 +186,12 @@ def serialize_multimodal_data(
             continue
         if not isinstance(value, torch.Tensor):
             raise TypeError(
-                f"multi_modal_data[{modality!r}][{key!r}] must be a Tensor, "
-                f"got {type(value)}."
+                f"multi_modal_data[{modality!r}][{key!r}] must be a Tensor, " f"got {type(value)}."
             )
         wire[key] = serialize_tensor(value)
     if "num_img_embeddings_per_tile" in modality_data:
-        wire["num_img_embeddings_per_tile"] = int(
-            modality_data["num_img_embeddings_per_tile"]
-        )
-    return (
-        _with_multimodal_metadata(
-            {modality: wire},
-            media_cache_key=media_cache_key,
-            media_tokens_preexpanded=media_tokens_preexpanded,
-        )
-        if wire
-        else None
-    )
+        wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
+    return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
 
 
 def resolve_multimodal_data_for_engine(
@@ -238,19 +245,13 @@ def resolve_multimodal_data_for_engine(
             "multi_modal_data['media_tokens_preexpanded'] must be a bool, "
             f"got {type(media_tokens_preexpanded)}."
         )
-    media_cache_key = multi_modal_data.get("media_cache_key")
-    if media_cache_key is not None and not isinstance(media_cache_key, str):
-        raise TypeError(
-            "multi_modal_data['media_cache_key'] must be a string or None, "
-            f"got {type(media_cache_key)}."
+    metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
+    if isinstance(modality_data, list):
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+            image_preprocessing,
         )
 
-    if isinstance(modality_data, list):
         if modality == "video":
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
-                preprocess_video_bytes_list,
-            )
-
             if video_preprocessing_config is None:
                 raise RuntimeError(
                     "Raw video data require InferenceConfig.video_preprocessing_config."
@@ -260,30 +261,24 @@ def resolve_multimodal_data_for_engine(
                 if torch.cuda.is_available()
                 else None
             )
-            return _with_multimodal_metadata(
-                preprocess_video_bytes_list(
+            return {
+                **image_preprocessing.preprocess_video_bytes_list(
                     modality_data, video_preprocessing_config, device=device
                 ),
-                media_cache_key=media_cache_key,
-                media_tokens_preexpanded=media_tokens_preexpanded,
-            )
-
-        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
-            preprocess_image_bytes_list,
-        )
+                **metadata,
+            }
 
         if image_preprocessing_config is None:
             raise RuntimeError("Raw image data require InferenceConfig.image_preprocessing_config.")
         device = (
             torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
         )
-        return _with_multimodal_metadata(
-            preprocess_image_bytes_list(
+        return {
+            **image_preprocessing.preprocess_image_bytes_list(
                 modality_data, image_preprocessing_config, device=device
             ),
-            media_cache_key=media_cache_key,
-            media_tokens_preexpanded=media_tokens_preexpanded,
-        )
+            **metadata,
+        }
     if not isinstance(modality_data, dict):
         raise TypeError(
             f"Wire multi_modal_data[{modality!r}] must be list[bytes] or a "
@@ -291,21 +286,17 @@ def resolve_multimodal_data_for_engine(
         )
 
     kwargs: Dict[str, Any] = {}
-    tensor_keys = ("imgs", "imgs_sizes", "num_frames") if modality == "video" else (
-        "imgs",
-        "imgs_sizes",
-        "num_tiles",
+    tensor_keys = (
+        ("imgs", "imgs_sizes", "num_frames")
+        if modality == "video"
+        else ("imgs", "imgs_sizes", "num_tiles")
     )
     for key in tensor_keys:
         if key in modality_data:
             value = modality_data[key]
-            kwargs[key] = (
-                value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
-            )
+            kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
     if "num_img_embeddings_per_tile" in modality_data:
-        kwargs["num_img_embeddings_per_tile"] = int(
-            modality_data["num_img_embeddings_per_tile"]
-        )
+        kwargs["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
 
     if modality == "image":
         # Reject incomplete static-tiling payloads. Static tiling (imgs +
@@ -327,11 +318,7 @@ def resolve_multimodal_data_for_engine(
                 "Preprocessed video payload requires imgs, imgs_sizes, and num_frames; "
                 f"missing {sorted(missing)}."
             )
-    return _with_multimodal_metadata(
-        kwargs,
-        media_cache_key=media_cache_key,
-        media_tokens_preexpanded=media_tokens_preexpanded,
-    )
+    return {**kwargs, **metadata}
 
 
 def serialize_ndarray(arr: np.ndarray) -> dict:
@@ -375,7 +362,9 @@ class Status(Enum):
 # =========================================================================
 
 
-def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
+def compute_block_hashes_batched(
+    prompt_tokens: torch.Tensor, block_size: int, cache_salt: Optional[str] = None
+) -> List[int]:
     """Compute SHA-256 based hashes for all complete blocks in a prompt.
 
     Each block hash is computed as SHA-256(parent_digest || block_bytes), where
@@ -386,6 +375,9 @@ def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -
     Args:
         prompt_tokens: All prompt token IDs, shape [seq_len].
         block_size: Number of tokens per block.
+        cache_salt: Optional request-input identity mixed into every chained
+            block hash. Multimodal requests use their generated media key so
+            equal token placeholders backed by different media cannot share KV.
 
     Returns:
         List of positive integer hash values in [1, 2^63-1], one per complete block.
@@ -400,7 +392,12 @@ def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -
     block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
 
     hashes = []
-    parent_digest = b'\x00' * 32  # SHA-256 digest size
+    if cache_salt is None:
+        parent_digest = b'\x00' * 32  # Preserve text-only hash compatibility.
+    else:
+        parent_digest = hashlib.sha256(
+            b"megatron-prefix-cache-salt-v1\0" + cache_salt.encode()
+        ).digest()
 
     for i in range(num_complete_blocks):
         block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
@@ -680,6 +677,7 @@ class DynamicInferenceRequest(InferenceRequest):
     # match rather than computed. Accumulated across prefill chunks by the context,
     # which uses it to avoid rewriting KV into blocks that already hold it.
     num_matched_prefix_blocks: int = 0
+    block_hash_salt: Optional[str] = None  # Media identity for multimodal KV safety.
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
@@ -712,7 +710,7 @@ class DynamicInferenceRequest(InferenceRequest):
         - precomputed_block_hashes is [hash1, ...] for N complete blocks
         """
         self.precomputed_block_hashes = compute_block_hashes_batched(
-            self.prompt_tokens, self.block_size_tokens
+            self.prompt_tokens, self.block_size_tokens, cache_salt=self.block_hash_salt
         )
 
     @property
@@ -1006,6 +1004,7 @@ class DynamicInferenceRequestRecord:
             kv_cache_epoch=kv_cache_epoch,
             block_size_tokens=old_request.block_size_tokens,
             enable_prefix_caching=old_request.enable_prefix_caching,
+            block_hash_salt=old_request.block_hash_salt,
         )
         # Preserve the VLM subtype and multimodal fields so a suspend/resume
         # cycle doesn't downcast the request to text-only and lose its imgs /
@@ -1089,6 +1088,7 @@ class DynamicInferenceRequestRecord:
             routing_indices=routing_indices,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            block_hash_salt=self.requests[0].block_hash_salt,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
             num_cached_tokens=self.requests[0].num_cached_tokens,
             disaggregated_params=disaggregated_params,
