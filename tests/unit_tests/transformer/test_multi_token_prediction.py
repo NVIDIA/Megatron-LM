@@ -38,6 +38,8 @@ from megatron.core.transformer.multi_token_prediction import (
     _mix_hidden_state_history,
     _mtp_logits_are_vocab_sharded,
     _packed_seq_params_for_local_hsm_roll,
+    get_mtp_num_layers_to_build,
+    mtp_on_this_rank,
     process_mtp_loss,
     roll_tensor,
 )
@@ -116,6 +118,89 @@ class TestMultiTokenPredictionLayer:
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
         return config, mtp_block_spec
+
+    def test_mtp_placement_uses_explicit_pipeline_rank(self, monkeypatch):
+        """Explicit PP metadata must avoid global MPU reads during model construction."""
+
+        def unexpected_global_read(*args, **kwargs):
+            raise AssertionError("global pipeline state must not be read")
+
+        monkeypatch.setattr(
+            mtp_module.parallel_state, "get_pipeline_model_parallel_rank", unexpected_global_read
+        )
+        monkeypatch.setattr(
+            mtp_module.parallel_state,
+            "get_pipeline_model_parallel_world_size",
+            unexpected_global_read,
+        )
+        monkeypatch.setattr(
+            mtp_module.parallel_state,
+            "get_virtual_pipeline_model_parallel_world_size",
+            unexpected_global_read,
+        )
+
+        assert mtp_on_this_rank(
+            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_rank=1, pp_size=2, vp_size=1
+        )
+        assert not mtp_on_this_rank(
+            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_rank=0, pp_size=2, vp_size=1
+        )
+
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=1,
+            pipeline_model_parallel_size=2,
+            use_cpu_initialization=True,
+        )
+        assert get_mtp_num_layers_to_build(config, pp_rank=1) == 1
+        assert get_mtp_num_layers_to_build(config, pp_rank=0) == 0
+
+    def test_process_mtp_loss_uses_explicit_metric_group(self, monkeypatch):
+        """MTP metric reduction must use the language model's supplied data group."""
+        metric_avg_group = object()
+        captured = {}
+
+        def unexpected_global_read(*args, **kwargs):
+            raise AssertionError("global data-parallel state must not be read")
+
+        def capture_metrics(*args, **kwargs):
+            captured["avg_group"] = kwargs["avg_group"]
+
+        monkeypatch.setattr(
+            mtp_module.parallel_state, "get_data_parallel_group", unexpected_global_read
+        )
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        hidden_states = torch.ones(2 * seq_len, 1, 1)
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.zeros(1, seq_len, dtype=torch.long),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=True,
+            compute_language_model_loss=lambda labels, logits: torch.ones_like(
+                labels, dtype=logits.dtype
+            ),
+            config=config,
+            metric_avg_group=metric_avg_group,
+        )
+
+        assert captured["avg_group"] is metric_avg_group
 
     def test_hsm_mix_preserves_dtype_and_gradients(self, monkeypatch):
         """HSM selects per-element history entries without changing dtype or gradients."""
@@ -3009,6 +3094,7 @@ class TestMultiTokenPredictionHybrid:
     def _make_forward_stub():
         hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
         call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0, "mtp_input_mask": None}
+        metric_avg_group = object()
 
         def decoder(**kwargs):
             decoder_hidden_states = kwargs["hidden_states"]
@@ -3051,11 +3137,11 @@ class TestMultiTokenPredictionHybrid:
             output_layer=output_layer,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
-            pg_collection=types.SimpleNamespace(cp=None),
+            pg_collection=types.SimpleNamespace(cp=None, dp_cp=metric_avg_group),
             tp_group=None,
             _scale_logits=lambda logits: logits,
         )
-        return model, hidden_states, call_counts
+        return model, hidden_states, call_counts, metric_avg_group
 
     @pytest.mark.parametrize(
         (
@@ -3082,7 +3168,7 @@ class TestMultiTokenPredictionHybrid:
         expected_main_loss_calls,
     ):
         """Test that MTP execution and the main output contract are independent."""
-        model, hidden_states, call_counts = self._make_forward_stub()
+        model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
         labels = torch.tensor([[3, 4]]) if provide_labels else None
         input_ids = torch.zeros(1, 2, dtype=torch.long)
         loss_mask = torch.ones(1, 2)
@@ -3094,6 +3180,7 @@ class TestMultiTokenPredictionHybrid:
             assert kwargs["input_ids"] is input_ids
             assert kwargs["loss_mask"] is loss_mask
             assert kwargs["mtp_input_mask"] is mtp_input_mask
+            assert kwargs["metric_avg_group"] is metric_avg_group
             return torch.chunk(kwargs["hidden_states"], 1 + kwargs["config"].mtp_num_layers, dim=0)[
                 0
             ]
@@ -3131,7 +3218,7 @@ class TestMultiTokenPredictionHybrid:
         self, monkeypatch, compute_mtp_loss
     ):
         """Test the auxiliary MTP switch does not disable speculative-decoding state capture."""
-        model, hidden_states, call_counts = self._make_forward_stub()
+        model, hidden_states, call_counts, _ = self._make_forward_stub()
         inference_context = types.SimpleNamespace(
             is_dynamic_batching=lambda: True,
             num_speculative_tokens=1,

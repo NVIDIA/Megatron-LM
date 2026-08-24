@@ -790,6 +790,9 @@ def mtp_on_this_rank(
     mtp_num_layers: Optional[int] = None,
     ignore_virtual: Optional[bool] = True,
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
+    vp_size: Optional[int] = None,
 ) -> bool:
     """
     Check if there is MTP on the current rank.
@@ -804,13 +807,17 @@ def mtp_on_this_rank(
           pipeline stage. The function returns True only on the last pipeline stage.
     """
     mtp_on_this_rank = False
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if pp_rank is None:
+        # Compatibility fallback for callers that have not migrated to explicit PP metadata.
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if vp_size is None and layout is not None:
+        vp_size = layout.virtual_pipeline_model_parallel_size
+    elif vp_size is None and not ignore_virtual:
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
     if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
-        if (
-            not ignore_virtual
-            and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
-        ):
+        if not ignore_virtual and vp_size not in (None, 1):
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
             num_layers_to_build = layout.layout[pp_rank][vp_stage].count(LayerType.mtp)
             mtp_on_this_rank = num_layers_to_build > 0
@@ -823,9 +830,15 @@ def mtp_on_this_rank(
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
-            mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
-                ignore_virtual=ignore_virtual, vp_stage=vp_stage
-            )
+            if pp_size is None:
+                # Compatibility fallback for callers without explicit pipeline metadata.
+                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+            mtp_on_this_rank = pp_rank == pp_size - 1
+            if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
+                assert (
+                    vp_stage is not None
+                ), "vp_stage must be passed if virtual pipeline is enabled"
+                mtp_on_this_rank = vp_stage == vp_size - 1
         else:
             mtp_on_this_rank = False
     return mtp_on_this_rank
@@ -865,21 +878,32 @@ def get_mtp_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
     """Get the number of MTP layers to build."""
+    if pp_rank is None:
+        # Compatibility fallback for callers that have not migrated to explicit PP ranks.
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
     if config.pipeline_model_parallel_layout is not None:
         # If we have a custom PP layout, get the number of mtp layers in the layout array.
-        num_layers_to_build = config.pipeline_model_parallel_layout.get_num_layers_to_build(
-            layer_type=LayerType.mtp, vp_stage=vp_stage
-        )
+        layout = config.pipeline_model_parallel_layout
+        if layout.virtual_pipeline_model_parallel_size > 1:
+            assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
+        else:
+            vp_stage = 0
+        num_layers_to_build = layout.layout[pp_rank][vp_stage].count(LayerType.mtp)
         assert num_layers_to_build == config.mtp_num_layers or num_layers_to_build == 0, (
             f"Currently, we only support put all of MTP layers on the last pipeline stage, "
             f"so the number of MTP layers to build ({num_layers_to_build}) must match "
             f"mtp_num_layers ({config.mtp_num_layers}) or be 0."
         )
     else:
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
-            num_layers_to_build = config.mtp_num_layers if config.mtp_num_layers else 0
-        else:
-            num_layers_to_build = 0
+        vp_size = config.virtual_pipeline_model_parallel_size
+        if vp_size not in (None, 1):
+            assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
+        is_last_vp_stage = vp_size in (None, 1) or vp_stage == vp_size - 1
+        is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
+        num_layers_to_build = (
+            config.mtp_num_layers if is_last_pp_stage and is_last_vp_stage else 0
+        ) or 0
     return num_layers_to_build
 
 
@@ -945,6 +969,7 @@ def process_mtp_loss(
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
     mtp_input_mask: Optional[Tensor] = None,
+    metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -973,6 +998,7 @@ def process_mtp_loss(
         mtp_input_mask (Optional[Tensor]): Boolean mask over tokens that are valid as
             additional MTP conditioning inputs. The mask accumulates across prediction
             steps so a path stays masked after it reaches an invalid token.
+        metric_avg_group (Optional[ProcessGroup]): Group used to average MTP logging metrics.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -1076,13 +1102,18 @@ def process_mtp_loss(
                 tp_group,
             )
 
+            if metric_avg_group is None:
+                # Compatibility fallback for callers that have not migrated to explicit groups.
+                metric_avg_group = parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
+                )
             MTPLossLoggingHelper.save_metrics_to_tracker(
                 mtp_loss_for_log,
                 correct,
                 total,
                 mtp_layer_number,
                 config.mtp_num_layers,
-                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                avg_group=metric_avg_group,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
