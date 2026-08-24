@@ -7,7 +7,7 @@ from typing import List, Literal, Optional, Tuple
 
 import torch
 
-from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
+from megatron.core.models.hybrid.layer_utils import HybridLayerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig

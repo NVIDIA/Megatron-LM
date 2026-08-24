@@ -1,12 +1,16 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from megatron.core.models.hybrid.layer_utils import (
+    HybridLayerConfig,
+    Symbols,
+    normalize_tp_comm_overlap,
+)
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -18,44 +22,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 
 logger = logging.getLogger(__name__)
-
-
-class Symbols:
-    """Symbols for different layer types and pattern separators."""
-
-    MAMBA = "M"
-    GDN = 'G'
-    ATTENTION = "*"
-    DS_ATTENTION = "D"
-    MLA = "+"
-    MLP = "-"
-    MOE = 'E'
-    PIPE = '|'
-    MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
-
-    @classmethod
-    def name_sorted_valid_layer_symbols(cls) -> list[str]:
-        """Return the valid layer symbols sorted lexicographically by their public attribute
-        name.
-        """
-        valid_layer_attrs = []
-        for name, value in vars(cls).items():
-            if not name.startswith('_') and value in cls.VALID_LAYERS:
-                valid_layer_attrs.append((name, value))
-        valid_layer_attrs.sort()
-        return [value for (_, value) in valid_layer_attrs]
-
-
-HybridLayerConfig = (
-    MambaLayerConfig
-    | GDNLayerConfig
-    | AttentionLayerConfig
-    | DSALayerConfig
-    | MLALayerConfig
-    | MLPLayerConfig
-    | MoELayerConfig
-)
 
 
 @dataclass
@@ -349,38 +315,6 @@ def _create_layer_config(config: TransformerConfig, layer_symbol: str) -> Hybrid
     if layer_symbol == Symbols.MOE:
         return MoELayerConfig.from_config(config)
     raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
-
-
-def normalize_tp_comm_overlap(
-    config: TransformerConfig, segment: str, *, has_mtp: bool = False
-) -> None:
-    """Disable TP communication overlap unsupported by built-in hybrid layers.
-
-    This must run before ``validate_segment_layers`` copies the stack-level config so
-    every generated layer config receives the normalized value.
-
-    Args:
-        config: Stack-level config that will be copied for each layer.
-        segment: Selected pipeline segment, containing only layer symbols.
-        has_mtp: Whether this model instance will build an MTP block.
-    """
-    unsupported_features: list[str] = []
-    if Symbols.MLA in segment:
-        unsupported_features.append("MLA")
-    if Symbols.DS_ATTENTION in segment:
-        unsupported_features.append("DSA")
-    if has_mtp:
-        unsupported_features.append("MTP")
-
-    if not config.tp_comm_overlap or not unsupported_features:
-        return
-
-    config.tp_comm_overlap = False
-    warnings.warn(
-        "TP communication overlap is not supported with hybrid "
-        f"{'/'.join(unsupported_features)} layers. Disabling tp_comm_overlap.",
-        stacklevel=2,
-    )
 
 
 def validate_segment_layers(segment: str, config: TransformerConfig) -> List[HybridLayerConfig]:

@@ -14,6 +14,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.layer_utils import normalize_tp_comm_overlap
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -197,7 +198,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            normalize_tp_comm_overlap,
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
