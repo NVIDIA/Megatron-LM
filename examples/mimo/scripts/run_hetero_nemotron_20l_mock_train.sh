@@ -7,6 +7,7 @@ set -euo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 TRAIN_ITERS=${TRAIN_ITERS:-20}
+PRETRAIN_MODULE=${MIMO_PRETRAIN_MODULE:-examples.mimo.pretrain_mimo}
 NUM_MICROBATCHES=${NUM_MICROBATCHES:-4}
 EVAL_INTERVAL=${EVAL_INTERVAL:-1}
 EVAL_ITERS=${EVAL_ITERS:-0}
@@ -26,7 +27,7 @@ TORCHRUN_ARGS=(
 
 uv run --extra ssm python -m torch.distributed.run \
   "${TORCHRUN_ARGS[@]}" \
-  -m examples.mimo.pretrain_mimo \
+  -m "${PRETRAIN_MODULE}" \
   --model-provider nemotron-moe-vlm \
   --dataset-provider mock \
   --image-token-id 511 \
