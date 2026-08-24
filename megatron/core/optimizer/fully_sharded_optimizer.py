@@ -169,7 +169,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 continue
             replication = count_replication(grad)
             local_grad = grad.to_local()
-            if local_grad.numel():
+            if local_grad.numel() > 0:
                 total_norm_squared += local_grad.float().pow(2).sum() / replication
 
         torch.distributed.all_reduce(
@@ -196,7 +196,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 continue
             replication = count_replication(grad)
             local_grad = grad.to_local()
-            if local_grad.numel():
+            if local_grad.numel() > 0:
                 zeros = local_grad.numel() - torch.count_nonzero(local_grad)
                 total_zeros += zeros.float() / replication
 
