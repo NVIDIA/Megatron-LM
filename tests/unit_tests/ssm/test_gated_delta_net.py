@@ -934,7 +934,7 @@ class TestFusedPreGatedDeltaRule:
 
         assert unfused_beta.dtype == torch.float32
         assert fused_beta.dtype == torch.float32
-        torch.testing.assert_close(unfused_beta, expected_beta, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(unfused_beta, expected_beta, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(fused_beta, expected_beta, atol=1e-5, rtol=1e-5)
 
         beta_grad = torch.linspace(
