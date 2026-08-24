@@ -313,18 +313,19 @@ class DataParallelInferenceCoordinator:
             len(self.identities_of_data_parallel_ranks),
         )
 
-    def _send_to_engine(self, identity, payload):
-        """Send payload to an engine, removing it from the pool if unreachable.
+    def _send_to_engine(self, identity, payload, *, remove_unreachable=True):
+        """Send payload to an engine, optionally removing it if unreachable.
 
         Returns:
-            True if the send succeeded, False if the engine was unreachable and removed.
+            True if the send succeeded, otherwise False.
         """
         try:
             self.router_socket.send_multipart([identity, payload])
             return True
         except zmq.error.ZMQError as e:
             if e.errno == zmq.EHOSTUNREACH:
-                self._remove_engine(identity)
+                if remove_unreachable:
+                    self._remove_engine(identity)
                 return False
             raise
 

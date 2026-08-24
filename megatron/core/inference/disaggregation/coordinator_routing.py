@@ -62,6 +62,11 @@ class DisaggRouting:
         self._req_prefill.pop(request_id, None)
         self._req_decode.pop(request_id, None)
 
+    def forget_prefill(self, request_id: int) -> None:
+        """Drop the prefill assignment once decode owns the transferred state."""
+
+        self._req_prefill.pop(request_id, None)
+
     def requests_involving(self, identity) -> list[int]:
         """Request ids routed through `identity` on either hop (snapshot)."""
         rids = {rid for rid, ident in self._req_prefill.items() if ident == identity}

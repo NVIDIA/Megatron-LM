@@ -140,7 +140,10 @@ class DisaggCoordinatorRuntime:
             self.drop_request(
                 request_id,
                 f"engine {identity!r} removed",
-                source_safe=self.router.decode_for_request(request_id) != identity,
+                source_safe=(
+                    request_id not in self.prefill_by_request
+                    or self.router.decode_for_request(request_id) != identity
+                ),
             )
         self.router.remove(identity)
         self.engine_role.pop(identity, None)
@@ -341,16 +344,15 @@ class DisaggCoordinatorRuntime:
     def _send_decode_handoff(self, decode_id, request_id: int, payload: bytes) -> bool:
         """Send a handoff; an unreachable engine is removed with its assigned work."""
 
-        sent = self.coordinator._send_to_engine(decode_id, payload)
+        sent = self.coordinator._send_to_engine(decode_id, payload, remove_unreachable=False)
         if sent:
             request = self.requests[request_id]
             self._record_hash_assignment(decode_id, request.block_hashes)
             request.block_hashes = []
         else:
-            # EHOSTUNREACH means the ROUTER did not deliver the handoff, so no
-            # transfer can still be reading the prefill source.
+            # The handoff was not delivered, so its prefill source is safe.
             self._release_prefill(request_id)
-            self.router.forget(request_id)
+            self.coordinator._remove_engine(decode_id)
         return sent
 
     def handle_kv_transfer_ready(
@@ -393,9 +395,10 @@ class DisaggCoordinatorRuntime:
         prefill_id = self.prefill_by_request.pop(request_id, None)
         if prefill_id is None:
             return
-        self._send(prefill_id, Headers.RELEASE_KV, request_id)
         released_prefill = self.flow.release_prefill(request_id)
-        if released_prefill is not None:
+        self.router.forget_prefill(request_id)
+        sent = self._send(prefill_id, Headers.RELEASE_KV, request_id)
+        if released_prefill is not None and sent:
             self._drain_prefill_queue(released_prefill)
 
     def handle_kv_read_done(self, sender_identity, request_id: int) -> None:
