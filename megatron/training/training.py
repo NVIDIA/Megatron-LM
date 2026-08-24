@@ -1291,8 +1291,8 @@ def num_floating_point_operations(
         num_mlp_layers = layer_counts[Symbols.MLP]
         num_moe_layers = layer_counts[Symbols.MOE]
 
-        # Ling uses + for dense MLA. DSv4 D/C/H/W layers are MLA variants too,
-        # but their sparse attention FLOPs are handled by the DSv4 branch.
+        # DSv4 D/C/H/W layers are MLA variants, but their
+        # sparse attention FLOPs are handled by the DSv4 branch.
         dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA}
         dsv4_mla_layers = sum(layer_counts[symbol] for symbol in dsv4_mla_symbols)
         num_mla_layers = layer_counts[Symbols.MLA]
