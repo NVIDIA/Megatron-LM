@@ -190,6 +190,22 @@ def chunk_gated_delta_product_varlen(
         chunk_indices=chunk_indices_dp,
     )
 
+    # When the caller snapshots the per-chunk states for prefix caching, keep
+    # `h` in the state-cache precision rather than the kernel's bf16 working
+    # dtype: the recurrence accumulates in fp32 and only rounds on store, so a
+    # bf16 `h` would snapshot a bf16-rounded state even into an fp32 cache and
+    # the restored prefix diverges from an uncached run. MambaMixer passes
+    # `state_dtype` to its scan for the same reason. The output path below still
+    # consumes a bf16 view of `h`, so `o` is bit-for-bit unchanged.
+    chunk_states_dtype = None
+    if return_chunk_states:
+        if state is not None:
+            chunk_states_dtype = state.dtype
+        elif initial_state is not None:
+            chunk_states_dtype = initial_state.dtype
+        else:
+            chunk_states_dtype = torch.float32
+
     h, v_new, final_state = chunk_gated_delta_product_fwd_h(
         k=k,
         w=w,
@@ -204,12 +220,15 @@ def chunk_gated_delta_product_varlen(
         chunk_offsets=chunk_offsets,
         state=state,
         state_indices=state_indices,
+        states_dtype=chunk_states_dtype,
     )
     o = chunk_gated_delta_product_fwd_o(
         q=q,
         k=k,
         v=v_new,
-        h=h,
+        # fp32 -> bf16 round-to-nearest matches the value the scan would have
+        # stored directly in bf16, so the output kernel sees the same input.
+        h=h if h.dtype == q.dtype else h.to(q.dtype),
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,

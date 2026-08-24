@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference import batch_dimensions_utils
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -74,6 +75,15 @@ def set_rounder(value):
     DynamicInferenceContext.ROUNDER = value
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
+    # Batch-invariant CUDA-graph buckets align their token counts to the
+    # module-level TOKEN_ROUNDER (default 64) via _batch_invariant_token_align,
+    # which set_rounder above does not reach. Left at 64 while the eager path
+    # rounds to `value`, a decode-only bucket's token_count rounds up but its
+    # decode_req_count does not, producing an inconsistent (token_count !=
+    # decode_req_count) shape that breaks the decode reshape; it also puts graph
+    # steps in a different norm/GEMM M-alignment class than eager. Keep the two
+    # rounders in lockstep so decode buckets stay square and both paths match.
+    batch_dimensions_utils.TOKEN_ROUNDER = value
 
 
 @pytest.mark.internal
