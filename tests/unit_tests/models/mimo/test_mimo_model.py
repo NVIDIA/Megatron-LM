@@ -223,15 +223,28 @@ class TestMimoModel:
         assert mimo_model.special_token_ids == self.special_token_ids
 
     def test_get_text_embeddings(self):
-        """Test getting text embeddings."""
-        mimo_model = self._make_avlm()
+        """Precomputed text positions must match the mask-based embedding lookup."""
+        mimo_model = self._make_avlm().eval()
         input_ids = self._make_input_ids()
         position_ids = self._make_position_ids()
+        input_ids[0, 3] = self.special_token_ids["images"]
+        input_ids[1, 5] = self.special_token_ids["audio"]
 
-        text_embeddings = mimo_model.get_text_embeddings(
+        text_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in self.special_token_ids.values():
+            text_mask &= input_ids != special_token_id
+        text_token_indices = text_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+
+        mask_embeddings = mimo_model.get_text_embeddings(
             input_ids, position_ids, self.special_token_ids
         )
-        assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
+        indexed_embeddings = mimo_model.get_text_embeddings(
+            input_ids, position_ids, self.special_token_ids, text_token_indices=text_token_indices
+        )
+
+        expected_text_tokens = self.batch_size * self.seq_len - 2
+        assert indexed_embeddings.shape == (expected_text_tokens, self.hidden_size)
+        torch.testing.assert_close(indexed_embeddings, mask_embeddings, rtol=0, atol=0)
 
     def test_get_text_embeddings_handles_3d_position_ids(self):
         """3D mRoPE position_ids ``[rope_dim, B, S]`` must produce the same text
@@ -317,6 +330,35 @@ class TestMimoModel:
         for special_token_id in self.special_token_ids.values():
             expected_mtp_input_mask &= input_ids != special_token_id
         torch.testing.assert_close(captured['mtp_input_mask'], expected_mtp_input_mask)
+
+    def test_prepare_mtp_inputs_uses_optional_text_indices(self):
+        """Precomputed text positions and the fallback scan must produce the same MTP mask."""
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        input_ids[0, 1] = self.special_token_ids['images']
+        input_ids[1, 2] = self.special_token_ids['audio']
+        position_ids = self._make_position_ids()
+
+        expected_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in self.special_token_ids.values():
+            expected_mask &= input_ids != special_token_id
+        text_token_indices = expected_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+
+        indexed_ids, indexed_positions, indexed_mask = mimo_model._prepare_mtp_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packed_seq_params=None,
+            owns_mtp=True,
+            text_token_indices=text_token_indices,
+        )
+        fallback_ids, fallback_positions, fallback_mask = mimo_model._prepare_mtp_inputs(
+            input_ids=input_ids, position_ids=position_ids, packed_seq_params=None, owns_mtp=True
+        )
+
+        assert indexed_ids is fallback_ids is input_ids
+        assert indexed_positions is fallback_positions is position_ids
+        torch.testing.assert_close(indexed_mask, expected_mask)
+        torch.testing.assert_close(indexed_mask, fallback_mask)
 
     def test_forward_with_image_modality(self):
         """Test forward pass with text and image input."""
@@ -487,6 +529,11 @@ class TestMimoModel:
         input_ids[0, 1] = self.special_token_ids['images']
         position_ids = self._make_position_ids()
         loss_mask = torch.ones(self.batch_size, self.seq_len, device=self.device)
+        text_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for special_token_id in self.special_token_ids.values():
+            text_mask &= input_ids != special_token_id
+        text_token_indices = text_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+        modality_token_indices = {"text": text_token_indices}
 
         sharded_seq_len = self.seq_len // 2
         # shard() returns LM-layout [S/cp, B, H] and a (CP-sharded) loss mask.
@@ -496,10 +543,13 @@ class TestMimoModel:
         sharded_loss_mask = torch.ones(self.batch_size, sharded_seq_len, device=self.device)
         sharded_input_ids = input_ids[:, :sharded_seq_len].clone()
         sharded_position_ids = position_ids[:, :sharded_seq_len].clone()
+        sharded_token_metadata = torch.cat(
+            (sharded_input_ids, text_mask[:, :sharded_seq_len].to(dtype=input_ids.dtype)), dim=0
+        )
         mock_adapter = MagicMock()
         mock_adapter.shard.side_effect = [
             (sharded_emb, None, sharded_loss_mask, None),
-            (None, sharded_position_ids, sharded_input_ids, None),
+            (None, sharded_position_ids, sharded_token_metadata, None),
         ]
         mimo_model.partition_adapter = mock_adapter
 
@@ -532,6 +582,7 @@ class TestMimoModel:
                 position_ids=position_ids,
                 loss_mask=loss_mask,
                 modality_inputs=None,
+                modality_token_indices=modality_token_indices,
             )
 
         assert mock_adapter.shard.call_count == 2
@@ -542,7 +593,8 @@ class TestMimoModel:
         mtp_shard_kwargs = mock_adapter.shard.call_args_list[1].kwargs
         assert mtp_shard_kwargs['embeddings'] is None
         assert mtp_shard_kwargs['labels'] is position_ids
-        assert mtp_shard_kwargs['loss_mask'] is input_ids
+        expected_token_metadata = torch.cat((input_ids, text_mask.to(dtype=input_ids.dtype)), dim=0)
+        torch.testing.assert_close(mtp_shard_kwargs['loss_mask'], expected_token_metadata)
         # shard()'s LM-layout output flows straight into the LM (no extra transpose).
         assert captured['decoder_input'].shape == (
             sharded_seq_len,
@@ -553,9 +605,7 @@ class TestMimoModel:
         assert captured['input_ids'] is sharded_input_ids
         assert captured['position_ids'] is sharded_position_ids
         assert captured['mtp_input_mask'].dtype == torch.bool
-        assert torch.equal(
-            captured['mtp_input_mask'], sharded_input_ids != self.special_token_ids['images']
-        )
+        assert torch.equal(captured['mtp_input_mask'], text_mask[:, :sharded_seq_len])
         # forward() returns the (possibly sharded) loss mask from shard().
         assert out_loss_mask is sharded_loss_mask
 

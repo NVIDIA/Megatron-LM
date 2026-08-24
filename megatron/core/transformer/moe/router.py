@@ -70,6 +70,10 @@ class Router(ABC, MegatronModule):
             )
         else:
             self.bias = None
+        if self.config.moe_router_skip_muon:
+            setattr(self.weight, 'use_muon', False)
+            if self.bias is not None:
+                setattr(self.bias, 'use_muon', False)
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
