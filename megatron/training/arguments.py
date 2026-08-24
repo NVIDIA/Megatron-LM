@@ -2817,14 +2817,15 @@ def _add_rl_args(parser):
         '--refit-method',
         type=str,
         default='gloo',
-        choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem'],
+        choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem', 'nixl'],
         help=(
             'Method to refit model weights. '
             'nccl: use NCCLCopyService; '
             'nccl_m2n: use the official NCCL M2N API from a non-RL launcher such as the '
             'ReFIT benchmark; '
             'gloo: use GlooCopyService over CPU; '
-            'nvshmem: use NVSHMEMCopyService.'
+            'nvshmem: use NVSHMEMCopyService; '
+            'nixl: use NixlCopyService.'
         ),
     )
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,

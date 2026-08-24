@@ -35,7 +35,9 @@ from megatron.core.resharding import swap_model_weights
 swap_model_weights(
     src_model=training_model,
     target_model=inference_model,
-    refit_method="nccl",  # or "gloo", "nvshmem", or "nixl"
+    # Other collocated backends: "gloo", "nvshmem", or "nixl".
+    # "nccl_m2n" is supported only for non-collocated refits.
+    refit_method="nccl",
 )
 ```
 
