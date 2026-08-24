@@ -15,33 +15,57 @@ from megatron.core.utils import get_attr_wrapped_model
 @dataclass
 class MambaInferenceStateConfig:
     """
-    Config for initializing Mamba model inference state tensors.
+    Config for initializing recurrent mixer inference state tensors.
 
     Note that we maintain separate metadata for decode, regular prefill, and
-    chunked prefill requests because the Mamba kernels do not yet support mixing
-    these. Once the kernels have been updated we can simplify this code.
+    chunked prefill requests because the recurrent kernels do not yet support
+    mixing these. Once the kernels have been updated we can simplify this code.
     """
 
     layer_type_list: List[str]
     """
-    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
+    A list of strings that indicates the layer type (Mamba / GDN / Attention / MLP) for each layer.
     See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
-    """Mamba conv states shape per request."""
+    """Recurrent mixer's conv state shape per request."""
 
     ssm_states_shape: Tuple[int]
-    """Mamba SSM states shape per request."""
+    """Recurrent mixer state shape per request."""
 
     conv_states_dtype: torch.dtype
     """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
 
     ssm_states_dtype: torch.dtype
-    """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
+    """The dtype to use for Mamba SSM state. Batch-invariant mode requires FP32."""
 
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
+
+    ssm_chunk_alignment: Optional[int] = None
+    """Token quantum that a prefill chunk boundary must land on for the model's
+    SSM mixers to see a clean chunk boundary. Defaults to `mamba_chunk_size`,
+    which is correct for any Mamba-only model.
+
+    This is the mixers' shared `ssm_inference_chunk_size`, which is not always
+    their `chunk_size`: the forked Gated Delta Product prefill kernels run at a
+    fixed 64 whatever `chunk_size` says. `from_model` asserts every SSM layer
+    agrees rather than reconciling a mixed stack. Only the paths that genuinely
+    require an aligned boundary consult it -- batch-invariant chunked prefill,
+    which replays the partial tail at decode, and recurrent-state extraction for
+    prefix caching, which can only snapshot at a chunk boundary. Ordinary
+    chunked prefill splits anywhere, because each step re-chunks from its own
+    slice start."""
+
+    gdp_num_householder: int = 0
+    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
+    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    kernels, whose Householder-expanded token stream is this many times longer."""
+
+    def __post_init__(self):
+        if self.ssm_chunk_alignment is None:
+            self.ssm_chunk_alignment = self.mamba_chunk_size
 
     @classmethod
     def from_model(
@@ -50,24 +74,62 @@ class MambaInferenceStateConfig:
         conv_states_dtype: Optional[torch.dtype] = None,
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
-        """Returns Mamba inference state config from the model if it is a hybrid model."""
+        """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.ssm.ssm_inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+        recurrent_symbols = (Symbols.MAMBA, Symbols.GDN)
+        if layer_type_list is not None and any(
+            symbol in layer_type_list for symbol in recurrent_symbols
+        ):
+            present_recurrent_symbols = {
+                symbol for symbol in recurrent_symbols if symbol in layer_type_list
+            }
+            if len(present_recurrent_symbols) > 1:
+                raise ValueError(
+                    "Dynamic inference does not support mixing Mamba and GDN layers; "
+                    "the recurrent-state cache and prefill metadata use one shared shape "
+                    "and chunk size."
+                )
+            if (
+                Symbols.GDN in present_recurrent_symbols
+                and model.config.experimental_attention_variant == "gdn2"
+            ):
+                raise NotImplementedError("GDN2 does not support dynamic inference.")
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:
                 conv_states_dtype = model.config.params_dtype
-            if ssm_states_dtype is None:
+            if model.config.batch_invariant_mode:
+                if ssm_states_dtype not in (None, torch.float32):
+                    raise ValueError(
+                        "batch_invariant_mode requires FP32 Mamba SSM states; "
+                        f"got {ssm_states_dtype}."
+                    )
+                # State passing carries an unrounded FP32 boundary value across
+                # chunks. Rounding the cache to BF16 changes the next transition.
+                ssm_states_dtype = torch.float32
+            elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
-            mamba_chunk_size = 128
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    mamba_chunk_size = layer.mixer.chunk_size
-                    break
+            # `decoder.layers` is pipeline-local, so a stage holding no SSM
+            # layer falls back to the Mamba defaults while a stage holding GDP
+            # layers reports 64. Safe today because every consumer of a
+            # disagreeing value is stage-local (bookkeeping-buffer sizing) or
+            # gated off for GDP (batch-invariant chunk lengths, prefix-cache
+            # extraction offsets). A future cross-rank consumer must reconcile
+            # these across the PP group.
+            chunking = ssm_chunking(decoder.layer_type_list, decoder.layers)
+            if chunking is None:
+                mamba_chunk_size = 128
+                ssm_chunk_alignment = mamba_chunk_size
+                gdp_num_householder = 0
+            else:
+                mamba_chunk_size = chunking.chunk_size
+                ssm_chunk_alignment = chunking.inference_chunk_size
+                gdp_num_householder = chunking.num_householder
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -75,6 +137,8 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                ssm_chunk_alignment=ssm_chunk_alignment,
+                gdp_num_householder=gdp_num_householder,
             )
         return None
 
@@ -140,11 +204,29 @@ class AsyncScheduleMode(str, Enum):
     LEGACY = "legacy"
     """Resolve requests before preparing the next forward pass."""
 
-    SERIAL = "serial"
-    """Prepare and forward speculatively before resolving the sampled requests."""
+    ASYNC = "async"
+    """Overlap asynchronous scheduling phases by reordering them to prepare-before-resolve."""
 
-    OVERLAP = "overlap"
-    """Overlap async scheduling prepare/sample and forward/resolve phases."""
+
+@dataclass
+class ImageProcessingConfig:
+    """Configuration for converting raw images into model input tensors."""
+
+    patch_dim: int
+    dynamic_resolution: bool = False
+    use_tiling: bool = False
+    pixel_shuffle: bool = False
+    spatial_merge_size: int = 1
+    dynamic_resolution_min_patches: int = 1
+    dynamic_resolution_max_patches: int = 128
+    vision_model_type: str = "radio"
+    pixel_mean: Optional[List[float]] = None
+    pixel_std: Optional[List[float]] = None
+    img_h: Optional[int] = None
+    img_w: Optional[int] = None
+    max_num_tiles: int = 1
+    use_thumbnail: bool = False
+    num_img_embeddings_per_tile: int = 0
 
 
 @dataclass
@@ -163,16 +245,18 @@ class InferenceConfig:
 
     buffer_size_gb: int = 20
     """
-    Buffer size reserved on the GPU for the KV cache.
+    On-GPU portion of the shared KV cache block pool.
     If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
     """
 
     paused_buffer_size_gb: Optional[int] = None
     """
-    Portion of buffer reserved for paused requests. Active requests are paused when there are not
-    enough active blocks available to continue generating a request. The total buffer size
-    (active + paused) depends on `unified_memory_level` (uvm):
+    Memory used to derive the paused-request block retention budget. This does not reserve blocks
+    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    When the pool cannot satisfy new allocations, paused requests retain blocks only within this
+    budget and excess paused requests may be evicted. The total buffer size depends on
+    `unified_memory_level` (uvm):
         - uvm 0: buffer_size_gb (paused buffer is inclusive)
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
@@ -278,6 +362,9 @@ class InferenceConfig:
 
     pg_collection: Optional[ProcessGroupCollection] = None
     """A `ProcessGroupCollection` for distributed execution."""
+
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None
+    """Configuration for preprocessing raw image payloads."""
 
     use_flashinfer_fused_rope: Optional[bool] = False
     """
