@@ -1838,10 +1838,8 @@ def pretrain(
             # model on its shard groups; the per-pool refit keeps it fresh.
             inference_model = build_disagg_inference_model(
                 args,
-                model_provider,
                 model_type,
                 model_cfg,
-                get_model,
                 cfg_container=cfg_container,
                 model_alloc_ctx=rl_utils.inference_model_alloc_context(args),
             )

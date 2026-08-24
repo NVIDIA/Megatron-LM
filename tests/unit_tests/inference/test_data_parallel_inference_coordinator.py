@@ -85,7 +85,7 @@ def test_malformed_client_handoff_does_not_allocate_request_state(fields):
     assert coordinator.next_request_id == 0
 
 
-def test_native_disaggregation_rejects_multimodal_requests():
+def test_native_disaggregation_asserts_on_multimodal_requests():
     coordinator = unittest.mock.MagicMock(
         known_clients={b"client"},
         next_request_id=0,
@@ -94,14 +94,18 @@ def test_native_disaggregation_rejects_multimodal_requests():
         client_request_to_request_id={},
     )
 
-    HANDLERS[Headers.SUBMIT_REQUEST](
-        coordinator, b"client", [Headers.SUBMIT_REQUEST.value, 7, [1], {}, {"image": [b"image"]}]
-    )
+    with pytest.raises(
+        AssertionError, match="native disaggregation does not support multimodal requests"
+    ):
+        HANDLERS[Headers.SUBMIT_REQUEST](
+            coordinator,
+            b"client",
+            [Headers.SUBMIT_REQUEST.value, 7, [1], {}, {"image": [b"image"]}],
+        )
 
     coordinator.disagg.route_submit.assert_not_called()
-    coordinator.disagg.drop_request.assert_called_once_with(
-        0, "multimodal requests are not supported by native disaggregation", source_safe=True
-    )
+    assert coordinator.next_request_id == 0
+    assert not coordinator.request_id_to_client_id
 
 
 class DummyTokenizer:

@@ -323,16 +323,7 @@ class DisaggCoordinatorScheduler:
     def pop_next_prefill(self, identity) -> Optional[QueuedPrefillRequest]:
         """Reserve and return the next queued prefill, if it fits."""
 
-        queue = self._prefill.queues.get(identity)
-        if not queue:
-            return None
-        request = queue[0]
-        if not self.try_reserve_prefill(identity, request.request_id, request.slot_cost):
-            return None
-        queue.popleft()
-        if not queue:
-            self._prefill.queues.pop(identity, None)
-        return request
+        return self._pop_next(self._prefill, identity)
 
     @staticmethod
     def _release(state: _RoleState, request_id: int):
@@ -399,16 +390,20 @@ class DisaggCoordinatorScheduler:
         each handoff before reserving another. If that send discovers a dead
         engine, no later queued request is left with an orphan reservation.
         """
-        queue = self._decode.queues.get(identity)
+
+        return self._pop_next(self._decode, identity)
+
+    def _pop_next(self, state: _RoleState, identity):
+        queue = state.queues.get(identity)
         if not queue:
             return None
-        handoff = queue[0]
-        if not self.try_reserve(identity, handoff.request_id, handoff.slot_cost):
+        request = queue[0]
+        if not self._try_reserve(state, identity, request.request_id, request.slot_cost):
             return None
         queue.popleft()
         if not queue:
-            self._decode.queues.pop(identity, None)
-        return handoff
+            state.queues.pop(identity, None)
+        return request
 
     def release_decode(self, request_id: int):
         """Release a request's reservation and return its decode identity."""

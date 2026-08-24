@@ -15,6 +15,9 @@ except ImportError:
     use_http2 = False
 
 from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.disaggregation.coordinator_setup import (
+    configure_prebuilt_disagg_engine,
+)
 from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
@@ -32,7 +35,7 @@ from ..inference.inference_interface import (
     ReturnsTokens,
 )
 from ..server.api import InferenceServer
-from .disagg import configure_disagg_engine, is_disagg_rollout
+from .disagg import is_disagg_rollout
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -117,7 +120,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             engine_class=engine_class,
         )
         if disaggregated:
-            configure_disagg_engine(inference_engine)
+            configure_prebuilt_disagg_engine(inference_engine)
         inference_engine.local_metadata_ledger_enabled = True
         if args.rl_partial_rollouts:
             # Resolve args.rl_generation_lag against the engine's request capacity:

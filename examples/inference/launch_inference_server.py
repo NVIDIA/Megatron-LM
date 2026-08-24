@@ -23,10 +23,7 @@ sys.path.append(
 
 from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
 from megatron.core.inference.shards import build_inference_pg_collections_for_shards
-from megatron.core.inference.shards_spec import (
-    parse_inference_shards_spec,
-    spec_declares_disaggregation,
-)
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
@@ -61,10 +58,9 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
 def _build_model_and_inference_config(args):
     """Build the model on either global or role-tagged inference process groups."""
 
-    if args.inference_shards and spec_declares_disaggregation(args.inference_shards):
+    if spec_declares_disaggregation(args.inference_shards):
         world_size = dist.get_world_size()
-        specs = parse_inference_shards_spec(args.inference_shards, world_size)
-        shards = build_inference_pg_collections_for_shards(world_size, specs)
+        shards = build_inference_pg_collections_for_shards(world_size, args.inference_shards)
         local_shard = next(shard for shard in shards if shard.pg_collection is not None)
         model = get_model_for_inference(
             pg_collection=local_shard.pg_collection,
