@@ -131,7 +131,7 @@ class MimoModel(MegatronModule):
                         hasattr(pg, 'dp_cp') and pg.dp_cp is not None
                     ), f"pg_collection on '{name}' is missing dp_cp group"
                     mod_metadata = dict(metadata) if metadata else {}
-                    mod_metadata['dp_cp_group'] = pg.dp_cp
+                    mod_metadata['dp_cp_group'] = getattr(pg, 'dp_cp_gtp_remat', None) or pg.dp_cp
                 # Unwrap wrappers so the sharded keys match the raw load_state_dict keys.
                 inner = module
                 child_prefix = f'{prefix}{name}.'
@@ -358,6 +358,14 @@ class MimoModel(MegatronModule):
         for module in self._active_submodules():
             if isinstance(module, DistributedDataParallel):
                 yield module
+
+    @property
+    def remove_forward_pre_hook_handles(self) -> Dict[torch.nn.Module, Any]:
+        """Expose the active inner DDP parameter-gather hooks to the stock train loop."""
+        handles = {}
+        for module in self._active_ddp_modules():
+            handles.update(module.remove_forward_pre_hook_handles)
+        return handles
 
     @contextmanager
     def no_sync(self):
