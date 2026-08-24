@@ -19,9 +19,7 @@ import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
-    make_release_kv_message,
     make_submit_request_with_kv_message,
-    parse_submit_request_with_kv_fields,
 )
 from megatron.core.inference.headers import Headers
 
@@ -383,15 +381,12 @@ def handle_submit_request_with_kv(coordinator, sender_identity, payload):
             "Received SUBMIT_REQUEST_WITH_KV from unknown client %s; ignoring.", sender_identity
         )
         return
-    try:
-        client_request_id, prompt, sampling_params, kv_meta, src_block_ids = (
-            parse_submit_request_with_kv_fields(payload[1:])
-        )
-    except ValueError:
+    if len(payload) != 6:
         logging.error(
             "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload with %d fields", len(payload) - 1
         )
         return
+    client_request_id, prompt, sampling_params, kv_meta, src_block_ids = payload[1:]
 
     if isinstance(prompt, torch.Tensor):
         prompt = prompt.tolist()
@@ -461,9 +456,7 @@ def handle_release_kv(coordinator, sender_identity, payload):
     if sender_identity not in coordinator.known_clients:
         logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
         return
-    coordinator._broadcast_to_engines(
-        make_release_kv_message(Headers.RELEASE_KV.value, int(payload[1]))
-    )
+    coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, int(payload[1])])
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)

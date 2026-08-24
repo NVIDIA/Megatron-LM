@@ -86,7 +86,6 @@ class DisaggCoordinatorRuntime:
         self.scheduler = DisaggCoordinatorScheduler()
         self.hop1_request_ids: set[int] = set()
         self.requests: dict[int, _RequestState] = {}
-        self.prefill_by_request: dict[int, Any] = {}
         self.engine_role: dict[Any, str] = {}
         self.engine_transport: dict[Any, str] = {}
         self.engine_metadata: dict[Any, Any] = {}
@@ -142,7 +141,7 @@ class DisaggCoordinatorRuntime:
                 request_id,
                 f"engine {identity!r} removed",
                 source_safe=(
-                    request_id not in self.prefill_by_request
+                    self.scheduler.reserved_engine(PREFILL, request_id) is None
                     or self.scheduler.assigned_engine(DECODE, request_id) != identity
                 ),
             )
@@ -243,7 +242,6 @@ class DisaggCoordinatorRuntime:
     ) -> None:
         """Submit a request whose prefill capacity has already been reserved."""
 
-        self.prefill_by_request[request_id] = prefill_id
         self.hop1_request_ids.add(request_id)
         prefill_params = dict(sampling_params)
         prefill_params["do_kv_handoff"] = True
@@ -298,7 +296,7 @@ class DisaggCoordinatorRuntime:
             self.drop_request(request_id, f"cannot route to decode: {error}", source_safe=True)
             return
 
-        prefill_id = self.prefill_by_request.get(request_id)
+        prefill_id = self.scheduler.reserved_engine(PREFILL, request_id)
         if prefill_id is not None and self.engine_transport.get(prefill_id) == "nixl":
             try:
                 kv_meta = restore_registered_nixl_agent_metadata(
@@ -367,7 +365,7 @@ class DisaggCoordinatorRuntime:
                 sender_identity,
             )
             return
-        prefill_id = self.prefill_by_request.get(request_id)
+        prefill_id = self.scheduler.reserved_engine(PREFILL, request_id)
         if prefill_id is None or self.engine_transport.get(prefill_id) != "nccl":
             self.drop_request(
                 request_id, "unexpected KV transfer readiness notification", source_safe=False
@@ -392,19 +390,18 @@ class DisaggCoordinatorRuntime:
     def _release_prefill(self, request_id: int) -> None:
         """Release prefill pins after decode has imported the handoff."""
 
-        prefill_id = self.prefill_by_request.pop(request_id, None)
+        prefill_id = self.scheduler.release_prefill(request_id)
         if prefill_id is None:
             return
-        released_prefill = self.scheduler.release_prefill(request_id)
         self.scheduler.forget_assignment(PREFILL, request_id)
         sent = self._send(prefill_id, Headers.RELEASE_KV, request_id)
-        if released_prefill is not None and sent:
-            self._drain_prefill_queue(released_prefill)
+        if sent:
+            self._drain_prefill_queue(prefill_id)
 
     def handle_kv_read_done(self, sender_identity, request_id: int) -> None:
         """Release source state after the assigned decode reports a completed read."""
 
-        if request_id not in self.prefill_by_request:
+        if self.scheduler.reserved_engine(PREFILL, request_id) is None:
             return
         assigned_decode = self.scheduler.assigned_engine(DECODE, request_id)
         if assigned_decode != sender_identity:
@@ -483,7 +480,7 @@ class DisaggCoordinatorRuntime:
         if decode_id is not None:
             self._send(decode_id, Headers.ABORT_REQUEST, request_id)
             return
-        prefill_id = self.prefill_by_request.get(request_id)
+        prefill_id = self.scheduler.reserved_engine(PREFILL, request_id)
         if prefill_id is not None:
             self._send(prefill_id, Headers.ABORT_REQUEST, request_id)
             return

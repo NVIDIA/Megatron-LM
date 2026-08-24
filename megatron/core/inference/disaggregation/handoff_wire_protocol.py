@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict
 
 _NIXL_AGENT_NAME = "agent_name"
 _NIXL_AGENT_METADATA = "agent_metadata_b64"
@@ -91,17 +91,3 @@ def make_submit_request_with_kv_message(
     """Build a ``SUBMIT_REQUEST_WITH_KV`` message."""
 
     return [header_value, int(request_id), prompt, sampling_params, kv_meta, list(src_block_ids)]
-
-
-def parse_submit_request_with_kv_fields(fields: Sequence[Any]) -> Tuple[Any, ...]:
-    """Validate and unpack fields following ``SUBMIT_REQUEST_WITH_KV``."""
-
-    if len(fields) != 5:
-        raise ValueError(f"SUBMIT_REQUEST_WITH_KV payload must have 5 fields, got {len(fields)}")
-    return tuple(fields)
-
-
-def make_release_kv_message(header_value: int, request_id: int) -> list:
-    """Build a ``RELEASE_KV`` message."""
-
-    return [header_value, int(request_id)]

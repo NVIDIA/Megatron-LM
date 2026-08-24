@@ -195,6 +195,12 @@ class DisaggCoordinatorScheduler:
 
         return self._state(role).assignments.get(request_id)
 
+    def reserved_engine(self, role: str, request_id: int) -> Any | None:
+        """Return the engine holding capacity for an active request, if any."""
+
+        reservation = self._state(role).reservations.get(request_id)
+        return reservation[0] if reservation is not None else None
+
     def forget_assignment(self, role: str, request_id: int) -> None:
         """Drop one role's assignment for a request."""
 

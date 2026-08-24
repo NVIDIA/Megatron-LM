@@ -192,7 +192,7 @@ def test_read_done_releases_prefill_and_admits_queued_request():
         (b"prefill", Headers.RELEASE_KV),
         (b"prefill", Headers.SUBMIT_REQUEST),
     ]
-    assert runtime.prefill_by_request[6] == b"prefill"
+    assert runtime.scheduler.reserved_engine("prefill", 6) == b"prefill"
 
 
 def test_read_done_from_wrong_decode_does_not_release_prefill():
@@ -209,7 +209,7 @@ def test_read_done_from_wrong_decode_does_not_release_prefill():
 
     runtime.handle_kv_read_done(b"other-decode", 5)
 
-    assert 5 in runtime.prefill_by_request
+    assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
     assert sent == []
 
 
@@ -261,7 +261,7 @@ def test_active_decode_cancellation_waits_for_engine_safety():
     client_frames = sent[-1][1]
     assert client_frames[0] == b"client"
     assert Headers(msgpack.unpackb(client_frames[1], raw=False)[0]) == Headers.REQUEST_ABORTED
-    assert 5 not in runtime.prefill_by_request
+    assert runtime.scheduler.reserved_engine("prefill", 5) is None
     assert 5 not in runtime.terminating_request_ids
 
 
@@ -279,12 +279,12 @@ def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
     runtime.abort_request(5)
     runtime.handle_engine_aborted(5, source_safe=False)
 
-    assert runtime.prefill_by_request[5] == b"prefill"
+    assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
     assert runtime.scheduler.prefill_usage(b"prefill") == 1
     assert 5 in runtime.terminating_request_ids
 
     runtime.handle_kv_read_done(b"decode", 5)
-    assert 5 not in runtime.prefill_by_request
+    assert runtime.scheduler.reserved_engine("prefill", 5) is None
     assert runtime.scheduler.prefill_usage(b"prefill") == 0
 
     runtime.handle_engine_aborted(5, source_safe=True)
@@ -306,7 +306,7 @@ def test_decode_removal_does_not_release_inflight_source():
 
     runtime.remove_engine(b"decode")
 
-    assert runtime.prefill_by_request[5] == b"prefill"
+    assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
     assert runtime.scheduler.prefill_usage(b"prefill") == 1
     assert not any(
         identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
@@ -334,7 +334,7 @@ def test_undelivered_decode_handoff_releases_prefill_source():
         },
     )
 
-    assert 5 not in runtime.prefill_by_request
+    assert runtime.scheduler.reserved_engine("prefill", 5) is None
     assert runtime.scheduler.prefill_usage(b"prefill") == 0
     assert runtime.scheduler.assigned_engine("decode", 5) is None
     assert 5 not in runtime.terminating_request_ids
@@ -398,12 +398,12 @@ def test_late_source_safety_releases_prefill_after_request_failure():
 
     runtime.handle_engine_failure(5, "transfer failed", source_safe=False)
 
-    assert runtime.prefill_by_request[5] == b"prefill"
+    assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
     assert runtime.scheduler.prefill_usage(b"prefill") == 1
 
     runtime.handle_kv_read_done(b"decode", 5)
 
-    assert 5 not in runtime.prefill_by_request
+    assert runtime.scheduler.reserved_engine("prefill", 5) is None
     assert runtime.scheduler.prefill_usage(b"prefill") == 0
 
     runtime.handle_engine_aborted(5, source_safe=True)
