@@ -16,7 +16,12 @@
 
 from megatron_fsdp.experimental.checkpoint import load_checkpoint, save_checkpoint
 from megatron_fsdp.experimental.dbuffer import DBuffer
-from megatron_fsdp.experimental.fully_shard import Placements, fully_shard, fully_shard_context, microbatch
+from megatron_fsdp.experimental.fully_shard import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+    microbatch,
+)
 from megatron_fsdp.experimental.optimizer import fully_shard_optimizer
 from megatron_fsdp.experimental.placement import Flat
 
