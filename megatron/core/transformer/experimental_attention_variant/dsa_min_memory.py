@@ -1481,6 +1481,8 @@ def _topk_index_tile_impl(
                 rotary_interleaved,
                 use_indexer_rope,
                 use_hadamard,
+                indexer_input_norm,
+                input_norm_stats,
             )
     causal_key_limit = min(q_end, hidden_states.size(0))
     topk = min(index_topk, causal_key_limit)
@@ -1509,6 +1511,8 @@ def _topk_index_tile_impl(
                         rotary_interleaved,
                         use_indexer_rope,
                         use_hadamard,
+                        indexer_input_norm,
+                        input_norm_stats,
                     )
         else:
             k_index_full = full_k_index[:causal_key_limit]
