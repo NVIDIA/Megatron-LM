@@ -19,6 +19,7 @@ tensor_parallel
 pipeline_parallel
 fusions
 distributed
+parallel_state
 datasets
 dist_checkpointing
 dist_checkpointing.strategies
