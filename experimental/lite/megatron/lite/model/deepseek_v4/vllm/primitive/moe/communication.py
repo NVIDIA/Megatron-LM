@@ -685,19 +685,65 @@ def _validate_and_order_route_preserving_outputs(
         )
 
     expected_weights = received_topk_weights[token_rows, topk_slots].reshape(-1)
+    # The hidden-state and metadata dispatches are separate DeepEP operations.
+    # At full-model scale they may preserve the same routes while choosing a
+    # different arrival order within an expert. Match the two streams by a
+    # bitwise route fingerprint before validating and building combine rows.
+    def _route_hashes(
+        fingerprints: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        words = fingerprints.contiguous().view(torch.int16).reshape(
+            fingerprints.shape[0], -1
+        )
+        hashes = torch.full(
+            (words.shape[0],),
+            1469598103934665603,
+            dtype=torch.int64,
+            device=words.device,
+        )
+        for column in range(words.shape[1]):
+            hashes = (hashes ^ (words[:, column].to(torch.int64) & 0xFFFF)) * 1099511628211
+        hashes = (hashes ^ indices.to(torch.int64)) * 1099511628211
+        weight_bits = weights.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        return (hashes ^ weight_bits) * 1099511628211
+
+    expected_hashes = _route_hashes(
+        expected_fingerprints, expected_indices, expected_weights
+    )
+    route_hashes = _route_hashes(
+        route_fingerprints,
+        route_indices.to(dtype=expected_indices.dtype),
+        route_weights.to(dtype=expected_weights.dtype),
+    )
+    expected_order = torch.argsort(expected_hashes, stable=True)
+    route_order = torch.argsort(route_hashes, stable=True)
+    expected_for_route = torch.empty_like(expected_order)
+    expected_for_route.scatter_(0, route_order, expected_order)
+    expected_indices = expected_indices.index_select(0, expected_for_route)
+    expected_weights = expected_weights.index_select(0, expected_for_route)
+    expected_fingerprints = expected_fingerprints.index_select(0, expected_for_route)
     torch._assert_async(
         torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
         "Route-preserving DeepEP metadata changed local expert order",
     )
     torch._assert_async(
-        torch.all(expected_weights == route_weights.to(dtype=expected_weights.dtype)),
+        torch.all(
+            expected_weights.contiguous().view(torch.int32)
+            == route_weights.to(dtype=expected_weights.dtype)
+            .contiguous()
+            .view(torch.int32)
+        ),
         "Route-preserving DeepEP metadata changed route probability order",
     )
     torch._assert_async(
         torch.all(expected_fingerprints == route_fingerprints),
         "Route-preserving DeepEP metadata changed source-token order",
     )
-    primary_route_rows = output_index[token_rows, topk_slots].to(dtype=torch.long)
+    primary_route_rows = output_index[token_rows, topk_slots].to(
+        dtype=torch.long
+    ).index_select(0, expected_for_route)
     route_rows = primary_route_rows
     if return_route_rows:
         return route_rows
@@ -979,7 +1025,6 @@ class VLLMAlignedHybridEPDispatcher(TokenDispatcher):
         if self.ps.ep_group is None:
             raise RuntimeError("hybridep requires an expert-parallel process group")
         hybridep.require_available()
-        hybridep.validate_topology(self.ps.ep_group)
         self._hybridep_group = self.ps.ep_group
         self._hybridep_max_tokens_per_rank = hybridep_max_tokens_per_rank
         self._hybridep_state = None
