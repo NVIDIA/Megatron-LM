@@ -7,7 +7,6 @@ from unittest.mock import patch
 import pytest
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    LAYER_SYMBOL_TO_CONFIG_CLASS,
     ParsedHybridPattern,
     Symbols,
     get_hybrid_layer_counts,
@@ -30,6 +29,16 @@ from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
+_EXPECTED_LAYER_CONFIG_CLASSES = {
+    Symbols.MAMBA: MambaLayerConfig,
+    Symbols.GDN: GDNLayerConfig,
+    Symbols.ATTENTION: AttentionLayerConfig,
+    Symbols.DS_ATTENTION: DSALayerConfig,
+    Symbols.MLA: MLALayerConfig,
+    Symbols.MLP: MLPLayerConfig,
+    Symbols.MOE: MoELayerConfig,
+}
+
 
 def _make_transformer_config() -> TransformerConfig:
     return TransformerConfig(num_layers=7, hidden_size=64, num_attention_heads=4)
@@ -37,7 +46,7 @@ def _make_transformer_config() -> TransformerConfig:
 
 def _assert_layer_config_types(layer_config_list, pattern: str) -> None:
     assert [type(config) for config in layer_config_list] == [
-        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol] for layer_symbol in pattern
+        _EXPECTED_LAYER_CONFIG_CLASSES[layer_symbol] for layer_symbol in pattern
     ]
 
 
@@ -126,19 +135,10 @@ class TestValidateSegmentLayers:
         for pattern in ["M*-M*-M*-", "MMMMMMMMM", "MM*-", "MEME"]:
             layer_config_list = validate_segment_layers(pattern, self.config)
             for layer_config in layer_config_list:
-                assert type(layer_config) in LAYER_SYMBOL_TO_CONFIG_CLASS.values()
+                assert type(layer_config) in _EXPECTED_LAYER_CONFIG_CLASSES.values()
 
     @pytest.mark.parametrize(
-        ("layer_symbol", "config_class"),
-        [
-            (Symbols.MAMBA, MambaLayerConfig),
-            (Symbols.GDN, GDNLayerConfig),
-            (Symbols.ATTENTION, AttentionLayerConfig),
-            (Symbols.DS_ATTENTION, DSALayerConfig),
-            (Symbols.MLA, MLALayerConfig),
-            (Symbols.MLP, MLPLayerConfig),
-            (Symbols.MOE, MoELayerConfig),
-        ],
+        ("layer_symbol", "config_class"), list(_EXPECTED_LAYER_CONFIG_CLASSES.items())
     )
     def test_all_symbols_map_to_layer_configs(self, layer_symbol, config_class):
         layer_config_list = validate_segment_layers(layer_symbol, self.config)
@@ -151,10 +151,10 @@ class TestValidateSegmentLayers:
         assert layer_config_list[0].hidden_size == self.config.hidden_size
         _assert_layer_config_types(layer_config_list, layer_symbol)
 
-    def test_config_mapping_covers_all_layer_symbols(self):
-        assert set(LAYER_SYMBOL_TO_CONFIG_CLASS) == Symbols.VALID_LAYERS
-        assert Symbols.PIPE not in LAYER_SYMBOL_TO_CONFIG_CLASS
-        assert Symbols.MTP_SEPARATOR not in LAYER_SYMBOL_TO_CONFIG_CLASS
+    def test_all_layer_symbols_have_an_expected_config_class(self):
+        assert set(_EXPECTED_LAYER_CONFIG_CLASSES) == Symbols.VALID_LAYERS
+        assert Symbols.PIPE not in _EXPECTED_LAYER_CONFIG_CLASSES
+        assert Symbols.MTP_SEPARATOR not in _EXPECTED_LAYER_CONFIG_CLASSES
 
     def test_repeated_layers_receive_independent_config_copies(self):
         self.config.test_mutable_value = {"items": []}
@@ -996,9 +996,11 @@ class TestGetLayerMapsFromLayerConfigList:
 
     def test_matches_symbol_derived_maps(self):
         """Config-derived maps match symbol-derived maps for every layer type."""
-        layer_symbols = list(LAYER_SYMBOL_TO_CONFIG_CLASS)
+        layer_symbols = list(_EXPECTED_LAYER_CONFIG_CLASSES)
         layer_configs = [
-            object.__new__(LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol])
+            _EXPECTED_LAYER_CONFIG_CLASSES[layer_symbol](
+                num_layers=1, hidden_size=64, num_attention_heads=4
+            )
             for layer_symbol in layer_symbols
         ]
 
@@ -1013,7 +1015,10 @@ class TestGetLayerMapsFromLayerConfigList:
             pass
 
         maps = get_layer_maps_from_layer_config_list(
-            [object.__new__(CustomMambaLayerConfig), object.__new__(AttentionLayerConfig)]
+            [
+                CustomMambaLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4),
+                AttentionLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4),
+            ]
         )
 
         assert maps[Symbols.MAMBA] == {0: 0}
@@ -1031,4 +1036,6 @@ class TestGetLayerMapsFromLayerConfigList:
             pass
 
         with pytest.raises(ValueError, match="Ambiguous hybrid layer config type"):
-            get_layer_maps_from_layer_config_list([object.__new__(AmbiguousLayerConfig)])
+            get_layer_maps_from_layer_config_list(
+                [AmbiguousLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)]
+            )

@@ -9,11 +9,7 @@ import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    LAYER_SYMBOL_TO_CONFIG_CLASS,
-    Symbols,
-    validate_segment_layers,
-)
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
@@ -22,6 +18,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
@@ -30,6 +27,7 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -85,9 +83,6 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
     )
 
     assert not hasattr(block, "layer_type_list")
-    assert [type(layer_config) for layer_config in layer_config_list] == [
-        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol] for layer_symbol in layer_pattern
-    ]
     assert [module_spec for module_spec, _ in build_calls] == expected_specs
     assert all(
         kwargs["config"] is layer_config
@@ -169,8 +164,9 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
 
     assert not hasattr(block, "layer_type_list")
     assert [type(layer_config) for layer_config in layer_config_list] == [
-        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol]
-        for layer_symbol in (Symbols.MAMBA, Symbols.MLA, Symbols.MLP)
+        MambaLayerConfig,
+        MLALayerConfig,
+        MLPLayerConfig,
     ]
     assert len({id(layer_config) for layer_config in layer_config_list}) == len(layer_config_list)
     assert all(layer_config is not config for layer_config in layer_config_list)

@@ -1,7 +1,6 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -56,16 +55,6 @@ HybridLayerConfig = (
     | MLPLayerConfig
     | MoELayerConfig
 )
-
-LAYER_SYMBOL_TO_CONFIG_CLASS: Dict[str, type[HybridLayerConfig]] = {
-    Symbols.ATTENTION: AttentionLayerConfig,
-    Symbols.DS_ATTENTION: DSALayerConfig,
-    Symbols.GDN: GDNLayerConfig,
-    Symbols.MAMBA: MambaLayerConfig,
-    Symbols.MLA: MLALayerConfig,
-    Symbols.MLP: MLPLayerConfig,
-    Symbols.MOE: MoELayerConfig,
-}
 
 
 class _HybridLayerConfigList(list[HybridLayerConfig]):
@@ -352,6 +341,25 @@ def _validate_segment_layer_symbols(segment: str) -> None:
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
+def _create_layer_config(config: TransformerConfig, layer_symbol: str) -> HybridLayerConfig:
+    """Create a layer-specific config from a normalized stack-level config."""
+    if layer_symbol == Symbols.MAMBA:
+        return MambaLayerConfig.from_config(config)
+    if layer_symbol == Symbols.GDN:
+        return GDNLayerConfig.from_config(config)
+    if layer_symbol == Symbols.ATTENTION:
+        return AttentionLayerConfig.from_config(config)
+    if layer_symbol == Symbols.DS_ATTENTION:
+        return DSALayerConfig.from_config(config)
+    if layer_symbol == Symbols.MLA:
+        return MLALayerConfig.from_config(config)
+    if layer_symbol == Symbols.MLP:
+        return MLPLayerConfig.from_config(config)
+    if layer_symbol == Symbols.MOE:
+        return MoELayerConfig.from_config(config)
+    raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
+
+
 def validate_segment_layers(segment: str, config: TransformerConfig) -> List[HybridLayerConfig]:
     """Validate and convert a single pipeline segment pattern to layer configs.
 
@@ -359,9 +367,8 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Hyb
     Each segment should contain only valid layer symbols (no '|').
 
     The legacy source config has already been normalized by
-    ``TransformerConfig.__post_init__``. Deep-copying it and changing only its marker
-    class preserves that normalized state and any dynamically added attributes without
-    running ``__post_init__`` a second time.
+    ``TransformerConfig.__post_init__``. Each layer config is created from that normalized
+    state without running ``__post_init__`` a second time.
 
     Args:
         segment: A single pipeline segment pattern string (e.g., "M-M*-")
@@ -377,9 +384,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Hyb
 
     layer_configs = _HybridLayerConfigList()
     for layer_symbol in segment:
-        layer_config = deepcopy(config)
-        layer_config.__class__ = LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol]
-        layer_configs.append(layer_config)
+        layer_configs.append(_create_layer_config(config, layer_symbol))
 
     return layer_configs
 
@@ -568,11 +573,21 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str,
 
 def _get_layer_symbol_from_config(layer_config: HybridLayerConfig) -> str:
     """Return the canonical symbol for a layer config, including subclasses."""
-    matching_symbols = [
-        layer_symbol
-        for layer_symbol, config_class in LAYER_SYMBOL_TO_CONFIG_CLASS.items()
-        if isinstance(layer_config, config_class)
-    ]
+    matching_symbols = []
+    if isinstance(layer_config, MambaLayerConfig):
+        matching_symbols.append(Symbols.MAMBA)
+    if isinstance(layer_config, GDNLayerConfig):
+        matching_symbols.append(Symbols.GDN)
+    if isinstance(layer_config, AttentionLayerConfig):
+        matching_symbols.append(Symbols.ATTENTION)
+    if isinstance(layer_config, DSALayerConfig):
+        matching_symbols.append(Symbols.DS_ATTENTION)
+    if isinstance(layer_config, MLALayerConfig):
+        matching_symbols.append(Symbols.MLA)
+    if isinstance(layer_config, MLPLayerConfig):
+        matching_symbols.append(Symbols.MLP)
+    if isinstance(layer_config, MoELayerConfig):
+        matching_symbols.append(Symbols.MOE)
     if not matching_symbols:
         raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
     if len(matching_symbols) > 1:
