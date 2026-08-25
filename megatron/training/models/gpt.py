@@ -55,6 +55,14 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
+    latent_cp_enabled = transformer_cfg.mla_latent_cp is True
+    if latent_cp_enabled and config.restore_modelopt_state:
+        raise ValueError("mla_latent_cp cannot be combined with restore_modelopt_state.")
+    if latent_cp_enabled and isinstance(transformer_cfg, HeterogeneousTransformerConfig):
+        raise ValueError(
+            "mla_latent_cp uses the GPT or HybridModel builders, not heterogeneous_block_specs."
+        )
+
     if transformer_cfg.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
             transformer_cfg.qk_layernorm,
@@ -84,7 +92,7 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
         return get_transformer_block_with_experimental_attention_variant_spec(
             config=transformer_cfg, vp_stage=vp_stage
         )
-    elif transformer_cfg.num_moe_experts is not None:
+    elif latent_cp_enabled or transformer_cfg.num_moe_experts is not None:
         return get_gpt_decoder_block_spec(
             transformer_cfg,
             use_transformer_engine=use_te,
@@ -289,6 +297,13 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             The constructed model
         """
         transformer_layer_spec = self._model_config.transformer_layer_spec
+        if (
+            self._model_config.transformer.mla_latent_cp is True
+            and transformer_layer_spec is not None
+        ):
+            raise ValueError(
+                "mla_latent_cp is config-driven and cannot be combined with transformer_layer_spec."
+            )
         if transformer_layer_spec is None:
             transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)
         elif not isinstance(transformer_layer_spec, ModuleSpec) and callable(

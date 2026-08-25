@@ -2,9 +2,10 @@
 
 """Experimental MLA self-attention that exchanges latent KV over a P2P CP ring.
 
-This module intentionally has no registration side effects. Callers opt in with
-make_mla_with_latent_cp_spec. The implementation bypasses MCore and Transformer Engine attention
-wrappers: only the existing MLA projection modules and RoPE implementation are reused.
+This module intentionally has no registration side effects. Model-spec builders opt in through
+``TransformerConfig.mla_latent_cp`` and use ``make_mla_with_latent_cp_spec``. The implementation
+bypasses MCore and Transformer Engine attention wrappers: only the existing MLA projection modules
+and RoPE implementation are reused.
 """
 
 from __future__ import annotations
@@ -1538,6 +1539,7 @@ class MLAWithLatentCP(MLASelfAttention):
         _require(
             config.multi_latent_attention, "multi_latent_attention=True is required"
         )
+        _require(config.mla_latent_cp, "mla_latent_cp=True is required")
         _require(config.qk_layernorm, "standalone Q/KV layer norms must be enabled")
         _require(
             not config.add_bias_linear, "all MLA projection biases must be disabled"

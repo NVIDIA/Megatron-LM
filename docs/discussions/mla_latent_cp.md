@@ -16,9 +16,10 @@ orphan: true
 ## Status
 
 This document proposes a deliberately narrow first implementation. It is not a compatibility plan
-for the existing MLA attention path. The implementation is opt-in, lives entirely in new files, and
-leaves Transformer Engine (TE), `megatron/core/transformer/multi_latent_attention.py`, and all
-existing MLA tests unchanged.
+for the existing MLA attention path. The attention algorithm and all backend code remain isolated
+in the feature-owned module, while narrow config and model-spec plumbing makes the feature directly
+selectable by GPT and HybridModel builders. Transformer Engine (TE),
+`megatron/core/transformer/multi_latent_attention.py`, and all existing MLA tests remain unchanged.
 
 P2P context parallelism (CP) circulates normalized MLA latent KV and the positional key component,
 rather than expanded K and V. Each receiving CP rank reconstructs K/V immediately before its
@@ -625,9 +626,9 @@ This cache records successful deterministic availability/plan preflight, not num
 runtime does not execute random/reference inputs, compare numbers, mutate the allow-list tuple, or
 provide an opt-in numerical probe.
 
-## New-file architecture and opt-in construction
+## Feature-owned architecture and config-driven construction
 
-Implementation adds only:
+The algorithm and its dedicated tests live in:
 
 ```text
 megatron/core/transformer/experimental_attention_variant/mla_with_latent_cp.py
@@ -636,6 +637,8 @@ tests/unit_tests/transformer/experimental_attention_variant/test_mla_with_latent
 
 The production file contains the module, phase planner, FP32 merger, direct adapters,
 differentiable synchronous ring transport, no-op zigzag layout adapter, and spec factory.
+Small integration changes add `TransformerConfig.mla_latent_cp` and route only GPT/HybridModel
+attention slots through that factory; no attention algorithm is moved into an existing MLA file.
 
 `get_gpt_layer_local_spec(...)` returns a whole transformer-layer `ModuleSpec`; the attention
 factory does not accept that outer object. `make_mla_with_latent_cp_spec(base_mla_spec)` accepts
@@ -644,7 +647,7 @@ spec, and returns a new `ModuleSpec` whose module is `MLAWithLatentCP`. It const
 `MLASelfAttentionSubmodules` with `core_attention=IdentityOp` and copies `params`/`metainfo` mappings;
 it never mutates `base_mla_spec`, its submodules, or the outer layer spec.
 
-The complete opt-in pattern is:
+The lower-level manual construction pattern remains available to spec authors:
 
 ```python
 from dataclasses import replace
@@ -672,9 +675,23 @@ latent_layer_spec = replace(
 ```
 
 The factory internally uses the same `dataclasses.replace` pattern for `base_mla_spec` and
-`base_mla_spec.submodules`; it does not assign to either input object. A recipe selects
-`latent_layer_spec` explicitly. No existing GPT layer-spec function, old MLA file, enum, or config
-field changes; `attention_backend` remains the selector.
+`base_mla_spec.submodules`; it does not assign to either input object. Normal model construction
+instead opts in through configuration:
+
+```yaml
+multi_latent_attention: true
+mla_latent_cp: true
+attention_backend: fused
+cp_comm_type: p2p
+cp_partition_mode: zigzag
+```
+
+The argument factory also exposes `--mla-latent-cp`. Ordinary GPT replaces self-attention in both
+dense and MoE layers; gated-delta GPT and `HybridModel` replace only their standard-attention (`*`)
+slots. Mamba/GDN, D, CSA/HCA, window-attention, MLP, and MoE slot selection stays unchanged. Explicit
+layer/stack specs, inference/modelopt, MTP, and other unsupported combinations fail rather than
+silently ignoring the flag. `attention_backend` remains the fused-versus-FA4 selector. The manual
+factory above remains useful to developers building custom specs.
 
 The reused projection state-dict names stay compatible, while unsupported specs fail during factory
 construction rather than halfway through forward.
@@ -683,6 +700,7 @@ construction rather than halfway through forward.
 
 Construction or pre-collective validation requires:
 
+- `mla_latent_cp == multi_latent_attention == True` when selected through model configuration;
 - explicit `ProcessGroupCollection` with usable `cp` and `tp` groups;
 - `cp_comm_type == "p2p"` for CP greater than one;
 - the exact local-MCore projection/norm spec and nonzero Q LoRA described above;
@@ -824,6 +842,12 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    both similarity metrics after explicit CP reduction/TP reconstruction. The H100/SM90 fused and
    SM100 fused/FA4 cases use normal production qualification/preflight, assert the exact tuple
    epsilon for every metric, and require the newly observed candidate epsilon not to exceed it.
+   Separately construct the unchanged `MLASelfAttention + TEDotProductAttention` P2P CP path with
+   identical TP=2 x CP=2 weights and packed zigzag input; compare latent-CP and legacy full-KV-CP
+   forward output for rope and YARN with the exact qualified-backend epsilon. This direct comparison
+   is intentionally forward-only: legacy TE CP backward is not the numerical oracle for latent
+   recomputation. Input and every mapped parameter gradient remain covered by the independent
+   pinned `NaiveMLA` parity above after explicit CP reduction and TP reconstruction.
 6. **Backend dispatch, qualification, and preflight caches.** Assert fused creates only the direct
    shared cuDNN adapter and flash only FA4; TE `DotProductAttention` is neither built nor called.
    The fake public FA4 callable receives the exact planner-owned int32 tensors by identity; invalid

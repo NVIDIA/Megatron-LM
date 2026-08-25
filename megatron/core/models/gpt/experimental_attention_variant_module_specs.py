@@ -600,6 +600,11 @@ def _get_self_attention_module_spec(
 
     Warning: This function may be deprecated in the future."""
 
+    if config.mla_latent_cp is True:
+        from megatron.core.models.gpt.gpt_layer_specs import get_mla_latent_cp_self_attention_spec
+
+        return get_mla_latent_cp_self_attention_spec(config)
+
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 

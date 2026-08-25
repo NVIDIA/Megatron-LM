@@ -32,14 +32,18 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.context_parallel_layout.utils import finalize_packed_seq_params
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+    get_mla_latent_cp_self_attention_spec,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 
@@ -217,6 +221,7 @@ def _make_config(
         num_query_groups=heads,
         kv_channels=128,
         multi_latent_attention=True,
+        mla_latent_cp=True,
         q_lora_rank=q_lora,
         kv_lora_rank=kv_lora,
         qk_head_dim=_QK_CONTENT,
@@ -286,6 +291,28 @@ def _base_mla_spec():
 
 def _build_layer(config: MLATransformerConfig, pg: ProcessGroupCollection):
     spec = latent_cp.make_mla_with_latent_cp_spec(_base_mla_spec())
+    return build_module(
+        spec,
+        config=config,
+        layer_number=1,
+        cp_comm_type="p2p",
+        pg_collection=pg,
+    )
+
+
+def _build_legacy_cp_layer(config: MLATransformerConfig, pg: ProcessGroupCollection):
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+    base = _base_mla_spec()
+    spec = replace(
+        base,
+        params=dict(base.params),
+        metainfo=dict(base.metainfo),
+        submodules=replace(
+            base.submodules,
+            core_attention=TEDotProductAttention,
+        ),
+    )
     return build_module(
         spec,
         config=config,
@@ -1226,6 +1253,123 @@ def test_factory_rejects_unsupported_projection_and_mask_specs():
         latent_cp.make_mla_with_latent_cp_spec(
             replace(base, params={"attn_mask_type": AttnMaskType.no_mask})
         )
+
+
+def test_mla_latent_cp_config_validation_is_fail_closed():
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    assert TransformerConfig.__dataclass_fields__["mla_latent_cp"].default is False
+    config = _make_config()
+    assert config.mla_latent_cp is True
+    with pytest.raises(ValueError, match="multi_latent_attention"):
+        replace(config, multi_latent_attention=False)
+    with pytest.raises(ValueError, match="gated_delta_net"):
+        replace(config, experimental_attention_variant="dsa")
+    with pytest.raises(ValueError, match="zigzag"):
+        replace(config, cp_partition_mode="contiguous")
+    with pytest.raises(ValueError, match="MTP"):
+        replace(config, mtp_num_layers=1)
+    with pytest.raises(ValueError, match="attention_backend"):
+        replace(config, attention_backend=AttnBackend.auto)
+
+
+def test_config_drives_gpt_specs_without_mutation():
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        _get_self_attention_module_spec,
+    )
+
+    config = _make_config()
+    latent_attention = get_mla_latent_cp_self_attention_spec(config)
+    assert latent_attention.module is latent_cp.MLAWithLatentCP
+    assert latent_attention.metainfo == {"fuse_input_layernorm": False}
+
+    decoder_layers = get_gpt_decoder_layer_specs(
+        config,
+        use_transformer_engine=torch.cuda.is_available(),
+        normalization=config.normalization,
+    )
+    assert len(decoder_layers) == config.num_layers
+    assert all(
+        layer.submodules.self_attention.module is latent_cp.MLAWithLatentCP
+        for layer in decoder_layers
+    )
+
+    experimental_standard = _get_self_attention_module_spec(config)
+    assert experimental_standard.module is latent_cp.MLAWithLatentCP
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_config_drives_hybrid_model_spec_without_mutation():
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_mla_latent_cp_stack_spec,
+        hybrid_stack_spec,
+    )
+    from megatron.core.transformer.attention import SelfAttention
+
+    config = _make_config()
+    base_attention = hybrid_stack_spec.submodules.attention_layer
+    assert base_attention.submodules.self_attention.module is SelfAttention
+    latent_stack = hybrid_mla_latent_cp_stack_spec(config)
+    assert latent_stack is not hybrid_stack_spec
+    assert latent_stack.submodules is not hybrid_stack_spec.submodules
+    assert (
+        latent_stack.submodules.attention_layer.submodules.self_attention.module
+        is latent_cp.MLAWithLatentCP
+    )
+    assert hybrid_stack_spec.submodules.attention_layer is base_attention
+    assert base_attention.submodules.self_attention.module is SelfAttention
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_gpt_model_builder_selects_config_driven_latent_cp_spec():
+    from megatron.training.models.gpt import default_layer_spec
+
+    config = _make_config()
+    gpt_block = ModuleSpec(module=object)
+    gpt_config = SimpleNamespace(
+        transformer=config,
+        restore_modelopt_state=False,
+    )
+    with mock.patch(
+        "megatron.training.models.gpt.get_gpt_decoder_block_spec",
+        return_value=gpt_block,
+    ) as get_gpt_block:
+        assert default_layer_spec(gpt_config, vp_stage=3) is gpt_block
+    get_gpt_block.assert_called_once_with(
+        config,
+        use_transformer_engine=config.transformer_impl == "transformer_engine",
+        normalization=config.normalization,
+        qk_l2_norm=config.qk_l2_norm,
+        vp_stage=3,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_hybrid_model_builder_selects_config_driven_latent_cp_spec():
+    from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+
+    config = _make_config()
+    hybrid_config = HybridModelConfig(
+        transformer=config,
+        vocab_size=128,
+        hybrid_layer_pattern="*",
+    )
+    latent_stack = ModuleSpec(module=object)
+    process_groups = SimpleNamespace(pp=object())
+    with (
+        mock.patch(
+            "megatron.training.models.hybrid.hybrid_mla_latent_cp_stack_spec",
+            return_value=latent_stack,
+        ) as get_hybrid_stack,
+        mock.patch("megatron.training.models.hybrid.HybridModel") as hybrid_model,
+    ):
+        HybridModelBuilder(hybrid_config).build_model(
+            process_groups,
+            pre_process=True,
+            post_process=True,
+        )
+    get_hybrid_stack.assert_called_once_with(config)
+    assert hybrid_model.call_args.kwargs["hybrid_stack_spec"] is latent_stack
 
 
 def test_qualification_constants_are_exact_and_fail_closed():
@@ -3240,6 +3384,105 @@ def _run_production_parity(
         _assert_emitted_metrics(metrics, candidate_eps, eps=assertion_eps)
 
 
+def _run_legacy_full_kv_cp_forward_parity(rope_type: str) -> None:
+    runtime = _qualified_real_backend_runtime_or_skip(AttnBackend.fused)
+    assertion_eps = EXPECTED_QUALIFICATION_EPS[runtime]
+    with _model_parallel(2, 2) as pg:
+        torch.manual_seed(_SEED + 30)
+        torch.cuda.manual_seed_all(_SEED + 30)
+        model_parallel_cuda_manual_seed(_SEED + 30)
+        config = _make_config(
+            tp_size=2,
+            cp_size=2,
+            backend=AttnBackend.fused,
+            rope_type=rope_type,
+            production_shape=True,
+        )
+        latent_layer = _build_layer(config, pg).cuda().bfloat16().train()
+        legacy_layer = _build_legacy_cp_layer(config, pg).cuda().bfloat16().train()
+        incompatible = legacy_layer.load_state_dict(
+            latent_layer.state_dict(), strict=True
+        )
+        assert incompatible.missing_keys == []
+        assert incompatible.unexpected_keys == []
+
+        total_tokens = sum(_PRODUCTION_PACKED_LENGTHS)
+        full_hidden = torch.randn(
+            total_tokens,
+            1,
+            config.hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        tp_cp_source = dist.get_process_group_ranks(pg.tp_cp)[0]
+        dist.broadcast(full_hidden, src=tp_cp_source, group=pg.tp_cp)
+        local_indices = _zigzag_global_indices(
+            _PRODUCTION_PACKED_LENGTHS,
+            2,
+            dist.get_rank(pg.cp),
+            "cuda",
+        )
+        local_hidden = full_hidden.index_select(0, local_indices)
+        latent_hidden = local_hidden.detach().clone()
+        legacy_hidden = local_hidden.detach().clone()
+        latent_packed = _make_packed(
+            _PRODUCTION_PACKED_LENGTHS,
+            device="cuda",
+            cp_group=pg.cp,
+        )
+        legacy_packed = _make_packed(
+            _PRODUCTION_PACKED_LENGTHS,
+            device="cuda",
+            cp_group=pg.cp,
+        )
+
+        with _forbid_default_process_group_resolvers():
+            latent_output, latent_bias = latent_layer(
+                latent_hidden,
+                None,
+                packed_seq_params=latent_packed,
+            )
+        legacy_output, legacy_bias = legacy_layer(
+            legacy_hidden,
+            None,
+            packed_seq_params=legacy_packed,
+        )
+        assert latent_bias is None
+        assert legacy_bias is None
+        parity_metrics = {
+            "output": _measure_similarity(
+                latent_output.detach(),
+                legacy_output.detach(),
+                "latent CP vs legacy full-KV CP output",
+            )
+        }
+
+        metrics, candidate_eps = _aggregate_and_emit_metrics(
+            event="mla_latent_cp_legacy_full_kv_cp_forward_parity",
+            metadata={
+                "backend": AttnBackend.fused.name,
+                "legacy_path": "MLASelfAttention+TEDotProductAttention",
+                "rope": rope_type,
+                "qualified_eps": assertion_eps,
+                "runtime_tuple": [
+                    runtime[0].name,
+                    runtime[1],
+                    runtime[2],
+                    list(runtime[3]),
+                ],
+                "seed": _SEED + 30,
+            },
+            local_metrics=parity_metrics,
+            pg=pg,
+            device=latent_hidden.device,
+        )
+        _assert_emitted_metrics(
+            metrics,
+            candidate_eps,
+            eps=assertion_eps,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cudnn_do_only_phase_backward_diagnostic():
     _run_cudnn_do_only_phase_diagnostic()
@@ -3265,3 +3508,11 @@ def test_fused_cudnn_tp2_cp2_production_shape_parity(rope_type: str):
 @pytest.mark.parametrize("rope_type", ["rope", "yarn"])
 def test_fa4_tp2_cp2_production_shape_parity_blackwell(rope_type: str):
     _run_production_parity(AttnBackend.flash, rope_type)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("rope_type", ["rope", "yarn"])
+def test_mla_latent_cp_matches_legacy_full_kv_cp_forward(rope_type: str):
+    """Compare forward accuracy with the legacy TE wrapper that circulates expanded K/V."""
+
+    _run_legacy_full_kv_cp_forward_parity(rope_type)

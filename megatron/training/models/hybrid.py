@@ -6,7 +6,10 @@ from typing import Any, Callable, ClassVar, Literal, override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_inference_stack_spec,
+    hybrid_mla_latent_cp_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
 )
@@ -147,7 +150,21 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
         hybrid_stack_spec = self._model_config.hybrid_stack_spec
-        if hybrid_stack_spec is None:
+        latent_cp_enabled = self._model_config.transformer.mla_latent_cp is True
+        if latent_cp_enabled and hybrid_stack_spec is not None:
+            raise ValueError(
+                "mla_latent_cp is config-driven and cannot be combined with hybrid_stack_spec."
+            )
+        if latent_cp_enabled:
+            if (
+                self._model_config.transformer.transformer_impl == "inference_optimized"
+                or self._model_config.restore_modelopt_state
+            ):
+                raise ValueError("mla_latent_cp is unsupported by inference/modelopt HybridModel.")
+            hybrid_stack_spec = hybrid_mla_latent_cp_stack_spec(
+                self._model_config.transformer
+            )
+        elif hybrid_stack_spec is None:
             if self._model_config.transformer.transformer_impl == "inference_optimized":
                 hybrid_stack_spec = hybrid_inference_stack_spec
             elif self._model_config.restore_modelopt_state:

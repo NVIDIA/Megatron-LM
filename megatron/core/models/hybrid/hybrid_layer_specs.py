@@ -366,6 +366,38 @@ mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
 
 
+def hybrid_mla_latent_cp_stack_spec(config):
+    """Return a non-mutating hybrid stack whose attention slot uses MLA latent CP."""
+    import dataclasses
+
+    from megatron.core.models.gpt.gpt_layer_specs import get_mla_latent_cp_self_attention_spec
+
+    latent_attention = get_mla_latent_cp_self_attention_spec(config)
+    base_attention_layer = hybrid_stack_spec.submodules.attention_layer
+    latent_attention_layer = dataclasses.replace(
+        base_attention_layer,
+        params=dict(base_attention_layer.params),
+        metainfo=dict(base_attention_layer.metainfo),
+        submodules=dataclasses.replace(
+            base_attention_layer.submodules,
+            input_layernorm=TENorm,
+            self_attention=latent_attention,
+            sharded_state_dict_keys_map=dict(
+                base_attention_layer.submodules.sharded_state_dict_keys_map
+            ),
+        ),
+    )
+    return dataclasses.replace(
+        hybrid_stack_spec,
+        params=dict(hybrid_stack_spec.params),
+        metainfo=dict(hybrid_stack_spec.metainfo),
+        submodules=dataclasses.replace(
+            hybrid_stack_spec.submodules,
+            attention_layer=latent_attention_layer,
+        ),
+    )
+
+
 def hybrid_dsv4_stack_spec(config):
     """Config-aware hybrid stack spec whose ``D`` (DS_ATTENTION) layer runs the DSv4
     ``CompressedSparseAttention`` (CSA/HCA + ``CSAIndexer``), identical to the GPT

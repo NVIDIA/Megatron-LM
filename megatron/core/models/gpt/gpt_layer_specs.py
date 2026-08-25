@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import warnings
+from dataclasses import replace
 from functools import partial
 from typing import Optional, Union
 
@@ -501,6 +502,30 @@ def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     )
 
 
+def get_mla_latent_cp_self_attention_spec(config: TransformerConfig) -> ModuleSpec:
+    """Build the supported local MLA self-attention spec and opt it into latent P2P CP."""
+    if config.mla_latent_cp is not True:
+        raise ValueError("get_mla_latent_cp_self_attention_spec requires mla_latent_cp=True.")
+
+    from megatron.core.transformer.experimental_attention_variant.mla_with_latent_cp import (
+        make_mla_with_latent_cp_spec,
+    )
+
+    base_attention = get_gpt_layer_local_spec(
+        num_experts=None,
+        moe_grouped_gemm=False,
+        qk_layernorm=config.qk_layernorm,
+        multi_latent_attention=config.multi_latent_attention,
+        normalization=config.normalization,
+    ).submodules.self_attention
+    latent_attention = make_mla_with_latent_cp_spec(base_attention)
+    return replace(
+        latent_attention,
+        params=dict(latent_attention.params),
+        metainfo={**latent_attention.metainfo, "fuse_input_layernorm": False},
+    )
+
+
 def _get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
@@ -670,6 +695,26 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             enable_hyper_connection=config.enable_hyper_connections,
         )
+
+    if config.mla_latent_cp is True:
+        latent_attention = get_mla_latent_cp_self_attention_spec(config)
+
+        def with_latent_attention(layer_spec: ModuleSpec) -> ModuleSpec:
+            return replace(
+                layer_spec,
+                params=dict(layer_spec.params),
+                metainfo=dict(layer_spec.metainfo),
+                submodules=replace(
+                    layer_spec.submodules,
+                    self_attention=latent_attention,
+                    sharded_state_dict_keys_map=dict(
+                        layer_spec.submodules.sharded_state_dict_keys_map
+                    ),
+                ),
+            )
+
+        dense_layer_spec = with_latent_attention(dense_layer_spec)
+        moe_layer_spec = with_latent_attention(moe_layer_spec)
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
