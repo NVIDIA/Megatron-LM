@@ -5,6 +5,7 @@ import os
 import sys
 from functools import partial
 
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 import torch
 import yaml
@@ -390,6 +391,7 @@ if __name__ == "__main__":
     )
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         train_valid_test_dataloaders_provider,
         ModelType.encoder_or_decoder,
         forward_step,
