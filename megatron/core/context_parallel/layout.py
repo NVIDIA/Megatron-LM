@@ -771,6 +771,7 @@ class ContextParallelLayoutManager:
             total_tokens=None,
             seq_idx=None,
             pad_between_seqs=plan.pad_between_seqs,
+            cp_partition_mode="zigzag",
         )
         return plan, zigzag_packed_seq_params
 

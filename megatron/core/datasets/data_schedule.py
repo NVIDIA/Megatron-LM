@@ -751,6 +751,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    config=None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -758,6 +759,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
+        config: Transformer configuration used to select graph-safe runtime metadata.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -785,10 +787,10 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'zigzag_cp_min_chunk_size']
-    if is_first_stage:
+    if is_first_stage or mtp_on_this_rank:
         batch_keys.append('tokens')
         batch_keys.append('position_ids')
-    if is_last_stage:
+    if is_last_stage or mtp_on_this_rank:
         batch_keys.append('labels')
         batch_keys.append('loss_mask')
 
@@ -831,7 +833,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             ), "Transformer Engine is required to use Context Parallel with THD format data."
             index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             cp_slice_keys = ['padding_mask']
-            if is_first_or_last_stage:
+            if is_first_or_last_stage or mtp_on_this_rank:
                 cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
             for key in cp_slice_keys:
                 batch[key] = batch[key].index_select(0, index)
@@ -861,7 +863,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['position_ids'] = None
 
     # Step2: Prepare "labels", "loss_mask" on all ranks.
-    if is_last_stage:
+    if is_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['labels'].dtype == torch.int64
             assert batch['loss_mask'].dtype == torch.float32
@@ -933,7 +935,9 @@ def get_batch_on_this_rank_for_sequence_packing(
         .cpu()
         .tolist()
     )
-    if zigzag_cp_min_chunk_size < 0:
+    if zigzag_cp_min_chunk_size < 0 or (
+        config is not None and getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration'
+    ):
         zigzag_cp_min_chunk_size = None
 
     # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
