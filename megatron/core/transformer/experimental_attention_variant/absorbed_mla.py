@@ -917,6 +917,9 @@ class AbsorbedMLASelfAttention(Attention):
         """Execute weight gradient computation."""
         self._backward_kv_proj()
         self._backward_q_proj()
+        core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
+        if core_attention_backward_dw is not None:
+            core_attention_backward_dw()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
