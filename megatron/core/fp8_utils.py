@@ -263,7 +263,18 @@ def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torc
     # Equivalent to dst.copy_(src), but entered directly instead of via the aten::copy_ op,
     # QuantizedTensor.__torch_dispatch__ (type and usage checks) and dst.quantize_(src).
     for src, quantizer, dst in zip(srcs_to_cast, quantizers, dsts_to_cast):
-        quantizer.update_quantized(src, dst)
+        # GTP native-FP8 parameters are dynamic subclasses of TE quantized tensors. TE's C++
+        # update path dispatches on the exact Python class, so temporarily present the TE base
+        # class while preserving the GTP class and attributes around the in-place update.
+        dst_cls = type(dst)
+        base_cls = dst_cls.__mro__[1] if dst_cls.__name__.startswith("GTP_") else dst_cls
+        if base_cls is not dst_cls:
+            dst.__class__ = base_cls
+        try:
+            quantizer.update_quantized(src, dst)
+        finally:
+            if base_cls is not dst_cls:
+                dst.__class__ = dst_cls
 
 
 def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:

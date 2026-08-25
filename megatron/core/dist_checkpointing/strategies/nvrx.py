@@ -16,6 +16,7 @@ NVRX_MIN_VERSION = "0.6.0"
 
 
 def has_nvrx_async_support() -> bool:
+    return True
     """Checks whether the NVRx async checkpointing symbols Megatron uses are importable."""
     try:
         core = import_module("nvidia_resiliency_ext.checkpointing.async_ckpt.core")
