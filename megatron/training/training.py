@@ -4278,6 +4278,8 @@ def train(
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
+            if isinstance(forward_backward_func, PagedStashRunner):
+                forward_backward_func.mark_te_graph_captured(num_microbatches)
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:

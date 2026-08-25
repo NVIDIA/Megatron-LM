@@ -752,6 +752,11 @@ class PagedStashManager:
                     f"entry {chunk_id!r} is not supported."
                 )
             vp_stage = abs(chunk_id)
+            if not 1 <= vp_stage <= self.vp_size:
+                raise RuntimeError(
+                    "Paged stash received an invalid VP stage in TE's graph capture order: "
+                    f"chunk ID {chunk_id}, expected magnitude in [1, {self.vp_size}]."
+                )
             template = layer_templates.get(vp_stage)
             if template is None:
                 continue
@@ -796,9 +801,11 @@ class PagedStashManager:
         self._pp_schedule = self._build_te_graph_capture_schedule(order)
         self._te_graph_capture = True
         self.current_schedule_index = 0
-        self.current_layer = [1 for _ in range(self.vp_size)]
-        self.current_microbatch = [0 for _ in range(self.vp_size)]
-        self.current_vp_stage = 0
+        # Install capture-private schedule coordinates. The list cursors must not alias the
+        # saved runtime lists; the VP stage stays unset until decoded from the capture schedule.
+        self.current_layer = None
+        self.current_microbatch = None
+        self.current_vp_stage = None
         return runtime_state
 
     def finish_te_graph_capture(self, runtime_state):
@@ -1177,6 +1184,8 @@ class PagedStashRunner:
         self.model = model
         self.optimizer = optimizer
         self.forward_backward_func = forward_backward_func
+        self._te_graph_capture_finished = False
+        self._te_graph_runtime_num_microbatches: int | None = None
         self.moe_layers = []
         # TransformerConfig objects that must stay in sync for moe_paged_stash: the training
         # loop `config` (schedules / paged_stash_reset) plus each VP chunk's GPT root config
@@ -1235,6 +1244,11 @@ class PagedStashRunner:
         for c in self._configs_to_sync_moe_paged_stash:
             c.moe_paged_stash = value
 
+    def mark_te_graph_captured(self, num_microbatches: int) -> None:
+        """Record rank-consistent TE capture completion and its runtime schedule size."""
+        self._te_graph_capture_finished = True
+        self._te_graph_runtime_num_microbatches = num_microbatches
+
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
         data_iterator_saved = []
@@ -1287,14 +1301,16 @@ class PagedStashRunner:
         return flags[0].item(), flags[1].item(), flags[2].item()
 
     def _raise_if_te_whole_moe_graph_overflow(
-        self, stash_overflow_ranks: int, overbudget_ranks: int
+        self, stash_overflow_ranks: int, overbudget_ranks: int, training: bool
     ) -> None:
         """Fail fast when a captured TE whole-MoE graph exceeds its static buffers."""
-        te_whole_moe_graph = (
-            self.config.cuda_graph_impl == "transformer_engine"
+        te_whole_moe_graph_replay = (
+            training
+            and self.config.cuda_graph_impl == "transformer_engine"
             and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and self._te_graph_capture_finished
         )
-        if not te_whole_moe_graph or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
+        if not te_whole_moe_graph_replay or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
             return
 
         raise RuntimeError(
@@ -1305,6 +1321,25 @@ class PagedStashRunner:
             "Increase --moe-expert-rank-capacity-factor and/or "
             "--moe-paged-stash-buffer-size-factor-cuda, then restart the job."
         )
+
+    def _validate_te_whole_moe_graph_runtime(self, training: bool, num_microbatches: int) -> None:
+        """Require the runtime microbatch count to remain fixed after TE graph capture."""
+        te_whole_moe_paged_stash_replay = (
+            training
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and self.config.moe_paged_stash
+            and self._te_graph_capture_finished
+        )
+        if not te_whole_moe_paged_stash_replay:
+            return
+
+        if num_microbatches != self._te_graph_runtime_num_microbatches:
+            raise RuntimeError(
+                "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
+                "runtime microbatch count after capture: expected "
+                f"{self._te_graph_runtime_num_microbatches}, got {num_microbatches}."
+            )
 
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun"""
@@ -1401,6 +1436,7 @@ class PagedStashRunner:
 
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
+        self._validate_te_whole_moe_graph_runtime(training, num_microbatches)
         saved_moe_paged_stash = self.config.moe_paged_stash
         num_tries = 0
         while True:
@@ -1416,7 +1452,9 @@ class PagedStashRunner:
             result = self.forward_backward_func(*args, **kwargs)
 
             stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
-            self._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks, overbudget_ranks)
+            self._raise_if_te_whole_moe_graph_overflow(
+                stash_overflow_ranks, overbudget_ranks, training
+            )
             # if no overflow, set the expert_rank_capacity_factor to the original value
             if stash_overflow_ranks == 0 and overbudget_ranks == 0:
                 if host_spill_ranks > 0:

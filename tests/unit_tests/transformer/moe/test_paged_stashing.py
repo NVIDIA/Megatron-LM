@@ -58,15 +58,24 @@ def test_te_graph_capture_uses_capture_order_then_restores_runtime_schedule():
         -1_001_001,
     ]
     manager = _make_schedule_manager(runtime_schedule)
+    runtime_current_layer = manager.current_layer
+    runtime_current_microbatch = manager.current_microbatch
+    runtime_current_vp_stage = manager.current_vp_stage
 
     runtime_state = manager.start_te_graph_capture([1, 1, 1, -1, -1, -1])
 
     assert manager._pp_schedule != runtime_schedule
     assert len(manager._pp_schedule) == 12
     assert manager.current_schedule_index == 0
+    assert manager.current_layer is None
+    assert manager.current_microbatch is None
+    assert manager.current_vp_stage is None
     manager.prepare_te_graph_capture_forward()
     assert manager.current_layer == [1]
     assert manager.current_microbatch == [0]
+    assert manager.current_vp_stage == 0
+    assert manager.current_layer is not runtime_current_layer
+    assert manager.current_microbatch is not runtime_current_microbatch
 
     # TE repeats the complete order for warmup and capture. The first forward naturally
     # wraps a fully consumed schedule without any per-callable cursor hook.
@@ -78,8 +87,9 @@ def test_te_graph_capture_uses_capture_order_then_restores_runtime_schedule():
     assert not manager._te_graph_capture
     assert manager._pp_schedule is runtime_schedule
     assert manager.current_schedule_index == len(runtime_schedule)
-    assert manager.current_layer == [99]
-    assert manager.current_microbatch == [99]
+    assert manager.current_layer is runtime_current_layer
+    assert manager.current_microbatch is runtime_current_microbatch
+    assert manager.current_vp_stage == runtime_current_vp_stage
 
 
 def test_paged_stash_schedule_supports_distinct_vp_layer_templates():
@@ -116,6 +126,14 @@ def test_paged_stash_schedule_rejects_invalid_recording_or_order():
         manager._build_te_graph_capture_schedule([1, 1, -1])
     with pytest.raises(RuntimeError, match="chunk-level integer PP order"):
         manager._build_te_graph_capture_schedule([1.0, -1.0])
+    with pytest.raises(RuntimeError, match="invalid VP stage"):
+        manager._build_te_graph_capture_schedule([2, -2])
+
+
+def test_paged_stash_schedule_skips_valid_vp_stage_without_paged_layers():
+    manager = _make_schedule_manager([1_001_000, -1_001_000], vp_size=2)
+
+    assert manager._build_te_graph_capture_schedule([1, 2, -2, -1]) == manager._pp_schedule
 
 
 def test_te_graph_capture_joins_auxiliary_streams_per_layer(monkeypatch):
@@ -151,13 +169,54 @@ def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback():
     runner.config = SimpleNamespace(
         cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.moe]
     )
+    runner._te_graph_capture_finished = False
+
+    # Warmup runs eagerly, so overflow can still use the dynamic fallback.
+    runner._raise_if_te_whole_moe_graph_overflow(
+        stash_overflow_ranks=1, overbudget_ranks=0, training=True
+    )
+
+    runner.mark_te_graph_captured(num_microbatches=2)
+
+    # Evaluation also runs eagerly even after training graphs have been captured.
+    runner._raise_if_te_whole_moe_graph_overflow(
+        stash_overflow_ranks=1, overbudget_ranks=0, training=False
+    )
 
     with pytest.raises(RuntimeError, match="Dynamic fallback is not supported"):
-        runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=1, overbudget_ranks=0)
+        runner._raise_if_te_whole_moe_graph_overflow(
+            stash_overflow_ranks=1, overbudget_ranks=0, training=True
+        )
     with pytest.raises(RuntimeError, match="expert-rank token budget overflow on 2 rank"):
-        runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=0, overbudget_ranks=2)
+        runner._raise_if_te_whole_moe_graph_overflow(
+            stash_overflow_ranks=0, overbudget_ranks=2, training=True
+        )
 
-    runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=0, overbudget_ranks=0)
+    runner._raise_if_te_whole_moe_graph_overflow(
+        stash_overflow_ranks=0, overbudget_ranks=0, training=True
+    )
+
+
+def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count():
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=[CudaGraphModule.moe],
+        moe_paged_stash=True,
+    )
+    runner._te_graph_runtime_num_microbatches = None
+    runner._te_graph_capture_finished = False
+
+    runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=2)
+    assert runner._te_graph_runtime_num_microbatches is None
+
+    runner.mark_te_graph_captured(num_microbatches=2)
+    runner._validate_te_whole_moe_graph_runtime(training=False, num_microbatches=4)
+    assert runner._te_graph_runtime_num_microbatches == 2
+
+    with pytest.raises(RuntimeError, match="expected 2, got 3"):
+        runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=3)
+    runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=2)
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
