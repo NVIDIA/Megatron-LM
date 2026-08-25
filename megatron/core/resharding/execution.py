@@ -98,6 +98,16 @@ def execute_reshard_plan(
     src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
     dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
 
+    if service.execute_plan(plan, src_params, dst_params, transform=transform):
+        logger.info("Executing native reshard plan")
+        torch.cuda.synchronize()
+        if service.requires_process_group_barrier:
+            dist.barrier(group=group)
+        _refresh_module_caches(dst_module)
+        torch.cuda.synchronize()
+        logger.info("Reshard complete")
+        return
+
     # Cache dequantized BF16 views of MXFP8 source params so that multiple
     # send ops for the same param reuse one dequant instead of repeating it.
     # Issue all dequants on a side stream and record per-param events so each

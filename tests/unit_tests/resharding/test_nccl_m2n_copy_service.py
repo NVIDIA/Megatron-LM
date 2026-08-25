@@ -1,24 +1,25 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Tests for the hierarchical NCCL M2N ReFIT copy service."""
+"""Tests for the native NCCL M2N ReFIT copy service."""
 
 import importlib.util
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.resharding.copy_services.base import RecvOp, SendOp
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     NCCLM2NCopyService,
-    _operation_layout,
-    _ops_by_peer,
+    _M2NChannel,
+    _parameter_groups,
+    _stage_pairs,
     _validate_nccl_version,
-    _validate_pair_layouts,
     _validate_role_roster,
 )
+from megatron.core.resharding.transforms import MXFP8ReshardTransform
+from megatron.core.resharding.utils import ReshardPlan, TensorReshardSpec
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -26,6 +27,30 @@ def _nccl_with_version(*release: int):
     version = SimpleNamespace(release=release)
     version_info = SimpleNamespace(libnccl=SimpleNamespace(version=version))
     return SimpleNamespace(get_version=lambda: version_info)
+
+
+def _spec(
+    *,
+    src_ranks=(0, 1),
+    dst_ranks=(2,),
+    src_name=None,
+    dst_name=None,
+    src_shard_dim=1,
+    dst_shard_dim=None,
+):
+    return TensorReshardSpec(
+        resolved_name="decoder.layers.0.weight",
+        src_ranks=src_ranks,
+        dst_ranks=dst_ranks,
+        global_shape=(4, 8),
+        src_local_shape=(4, 4),
+        dst_local_shape=(4, 8),
+        dtype=torch.float32,
+        src_shard_dim=src_shard_dim,
+        dst_shard_dim=dst_shard_dim,
+        src_param_name=src_name,
+        dst_param_name=dst_name,
+    )
 
 
 def test_validate_nccl_version():
@@ -54,61 +79,43 @@ def test_validate_role_roster_rejects_unsupported_topologies(roles, message):
         _validate_role_roster(roles)
 
 
-def test_ops_by_peer_preserves_submission_order():
-    first_duplicate = SendOp(task_id=4, tensor=torch.tensor([1]), dest_rank=3)
-    second_duplicate = SendOp(task_id=4, tensor=torch.tensor([2]), dest_rank=3)
-    lower_id = SendOp(task_id=1, tensor=torch.tensor([3]), dest_rank=3)
-    other_peer = SendOp(task_id=0, tensor=torch.tensor([4]), dest_rank=2)
-
-    grouped = _ops_by_peer([first_duplicate, other_peer, second_duplicate, lower_id], is_send=True)
-
-    assert grouped[2] == [other_peer]
-    assert grouped[3] == [first_duplicate, second_duplicate, lower_id]
-
-
-def test_operation_layout_requires_task_ids():
-    op = RecvOp(task_id=None, tensor=torch.zeros(1), src_rank=0)
-    with pytest.raises(RuntimeError, match="requires a task_id"):
-        _operation_layout([op])
-
-
-def test_operation_layout_detects_ordered_tensor_disagreement():
-    first = SendOp(task_id=1, tensor=torch.zeros(1, dtype=torch.float32), dest_rank=2)
-    second = SendOp(task_id=2, tensor=torch.zeros(4, dtype=torch.uint8), dest_rank=2)
-    matching_layout = [
-        RecvOp(task_id=1, tensor=torch.zeros(1, dtype=torch.float32), src_rank=0),
-        RecvOp(task_id=2, tensor=torch.zeros(4, dtype=torch.uint8), src_rank=0),
-    ]
-    same_bytes_different_layout = [
-        RecvOp(task_id=1, tensor=torch.zeros(4, dtype=torch.uint8), src_rank=0),
-        RecvOp(task_id=2, tensor=torch.zeros(4, dtype=torch.uint8), src_rank=0),
+def test_stage_pairs_are_unique_and_sorted():
+    specs = [
+        _spec(src_ranks=(2, 3), dst_ranks=(5,)),
+        _spec(src_ranks=(0, 1), dst_ranks=(4,)),
+        _spec(src_ranks=(2, 3), dst_ranks=(5,)),
     ]
 
-    send_layout = _operation_layout([first, second])
-    recv_layout = _operation_layout(same_bytes_different_layout)
-
-    assert send_layout == _operation_layout(matching_layout)
-    assert send_layout[:2] == recv_layout[:2] == (8, 2)
-    assert send_layout[2] != recv_layout[2]
+    assert _stage_pairs(specs) == (((0, 1), (4,)), ((2, 3), (5,)))
 
 
-def test_validate_pair_layouts_returns_largest_agreed_pair():
-    topology = _validate_role_roster([(True, False), (True, False), (False, True)])
-    layouts = [[[8, 2, 11], [0, 0, 0]], [[5, 1, 12], [0, 0, 0]], [[8, 2, 11], [5, 1, 12]]]
+def test_parameter_groups_are_bounded_without_splitting_packed_parameters():
+    first = replace(_spec(), resolved_name="first")
+    second_parts = [
+        replace(
+            _spec(),
+            resolved_name="second",
+            dst_local_shape=(2, 8),
+            part_index=part_index,
+            part_count=2,
+        )
+        for part_index in range(2)
+    ]
+    third = replace(_spec(), resolved_name="third")
 
-    assert _validate_pair_layouts(topology, layouts) == 8
+    batches = _parameter_groups([first, *second_parts, third], max_group_bytes=192)
+
+    assert [
+        [[spec.resolved_name for spec in parameter] for parameter in batch] for batch in batches
+    ] == [[['first']], [['second', 'second']], [['third']]]
 
 
-@pytest.mark.parametrize(
-    ("recv_layout", "message"),
-    [([7, 2, 11], "source submitted 8 bytes"), ([8, 2, 99], "ordered task/dtype layouts differ")],
-)
-def test_validate_pair_layouts_rejects_disagreement(recv_layout, message):
-    topology = _validate_role_roster([(True, False), (False, True)])
-    layouts = [[[8, 2, 11]], [recv_layout]]
+def test_parameter_groups_reject_noncontiguous_parameter_specs():
+    first = replace(_spec(), resolved_name="first")
+    second = replace(_spec(), resolved_name="second")
 
-    with pytest.raises(RuntimeError, match=message):
-        _validate_pair_layouts(topology, layouts)
+    with pytest.raises(RuntimeError, match="non-contiguous specs for first"):
+        _parameter_groups([first, second, first], max_group_bytes=1024)
 
 
 def test_model_roles_cannot_change_while_reusing_service():
@@ -129,6 +136,7 @@ def test_topology_is_collected_once(monkeypatch):
     service._is_source = True
     service._is_destination = False
     service._topology = None
+    service._max_group_bytes = 123
     service.world_size = 4
     service.group = None
     calls = 0
@@ -137,7 +145,7 @@ def test_topology_is_collected_once(monkeypatch):
         nonlocal calls
         assert group is None
         calls += 1
-        roles = ((1, 0), (1, 0), (0, 1), (0, 1))
+        roles = ((1, 0, 123), (1, 0, 123), (0, 1, 123), (0, 1, 123))
         for output, role in zip(outputs, roles):
             output.copy_(torch.tensor(role))
 
@@ -152,71 +160,74 @@ def test_topology_is_collected_once(monkeypatch):
     assert calls == 1
 
 
-def test_pair_layout_is_reused_until_plan_changes(monkeypatch):
+def test_dense_submission_interface_is_rejected():
     service = object.__new__(NCCLM2NCopyService)
-    service._active_plan = None
-    service._active_transform = None
-    service._slot_bytes = None
-    topology = _validate_role_roster([(True, False), (False, True)])
-    exchanges = 0
+    tensor = torch.zeros(1)
 
-    def fake_exchange(_topology, _sends, _recvs):
-        nonlocal exchanges
-        exchanges += 1
-        return exchanges * 8
-
-    validate_peers = Mock()
-    monkeypatch.setattr(service, "_exchange_pair_layouts", fake_exchange)
-    monkeypatch.setattr(service, "_validate_peers", validate_peers)
-
-    first_plan = object()
-    service.set_plan(first_plan)
-    assert service._get_slot_bytes(topology, {}, {}) == 8
-    service.set_plan(first_plan)
-    assert service._get_slot_bytes(topology, {}, {}) == 8
-
-    second_plan = object()
-    service.set_plan(second_plan)
-    assert service._get_slot_bytes(topology, {}, {}) == 16
-    service.set_plan(second_plan, transform=object())
-    assert service._get_slot_bytes(topology, {}, {}) == 24
-    assert exchanges == validate_peers.call_count == 3
+    with pytest.raises(RuntimeError, match="whole-tensor ReshardPlan"):
+        service.submit_send(tensor, 1)
+    with pytest.raises(RuntimeError, match="whole-tensor ReshardPlan"):
+        service.submit_recv(tensor, 0)
+    with pytest.raises(RuntimeError, match="whole-tensor ReshardPlan"):
+        service.run()
 
 
-def test_unbound_pair_layout_is_collected_every_run(monkeypatch):
+def test_plan_incompatibility_is_not_lowered_to_dense_path():
     service = object.__new__(NCCLM2NCopyService)
-    service._active_plan = None
-    service._active_transform = None
-    service._slot_bytes = None
-    topology = _validate_role_roster([(True, False), (False, True)])
-    exchanges = 0
+    service._closed = False
+    service._poisoned = False
+    plan = ReshardPlan(
+        send_ops=[], recv_ops=[], tensor_reshard_error="partition_stride=2 is unsupported"
+    )
 
-    def fake_exchange(_topology, _sends, _recvs):
-        nonlocal exchanges
-        exchanges += 1
-        return 8
-
-    validate_peers = Mock()
-    monkeypatch.setattr(service, "_exchange_pair_layouts", fake_exchange)
-    monkeypatch.setattr(service, "_validate_peers", validate_peers)
-
-    assert service._get_slot_bytes(topology, {}, {}) == 8
-    assert service._get_slot_bytes(topology, {}, {}) == 8
-    assert exchanges == validate_peers.call_count == 2
+    with pytest.raises(RuntimeError, match="partition_stride=2"):
+        service.execute_plan(plan, {}, {})
 
 
-def test_pack_leaves_padding_untouched():
+def test_non_mxfp8_transform_is_rejected_before_any_collective():
     service = object.__new__(NCCLM2NCopyService)
-    buffer = torch.full((6,), 7, dtype=torch.uint8)
-    topology = _validate_role_roster([(True, False), (False, True), (False, True)])
-    op = SendOp(task_id=1, tensor=torch.tensor([1, 2], dtype=torch.uint8), dest_rank=1)
+    service._closed = False
+    service._poisoned = False
+    plan = ReshardPlan(send_ops=[], recv_ops=[], tensor_reshard_specs=[_spec()])
 
-    service._pack_sends(buffer, topology, sends={1: [op]}, slot_bytes=3)
+    with pytest.raises(RuntimeError, match="only supports the MXFP8 receiver-side"):
+        service.execute_plan(plan, {}, {}, transform=object())
 
-    assert torch.equal(buffer, torch.tensor([1, 2, 7, 7, 7, 7], dtype=torch.uint8))
+
+def test_sender_side_mxfp8_transform_is_rejected_before_any_collective():
+    service = object.__new__(NCCLM2NCopyService)
+    service._closed = False
+    service._poisoned = False
+    plan = ReshardPlan(send_ops=[], recv_ops=[], tensor_reshard_specs=[_spec()])
+    transform = object.__new__(MXFP8ReshardTransform)
+    transform.convert_on_send = True
+
+    with pytest.raises(RuntimeError, match="does not support MXFP8 sender-side"):
+        service.execute_plan(plan, {}, {}, transform=transform)
 
 
-def test_close_is_local_and_idempotent_after_destroy_failure(monkeypatch):
+def test_local_tensor_validates_whole_shard_metadata():
+    src = torch.zeros(4, 4)
+    spec = _spec(src_name="weight")
+
+    local = NCCLM2NCopyService._local_tensor(spec, 0, {"weight": src}, {})
+
+    assert local.src.data_ptr() == src.data_ptr()
+    assert local.dst is None
+    with pytest.raises(RuntimeError, match="parameter shape changed"):
+        NCCLM2NCopyService._local_tensor(spec, 0, {"weight": torch.zeros(4, 8)}, {})
+
+
+def test_validate_specs_rejects_wrong_side_mesh():
+    service = object.__new__(NCCLM2NCopyService)
+    topology = _validate_role_roster([(True, False), (True, False), (False, True)])
+    spec = _spec(src_ranks=(0, 2), dst_ranks=(2,))
+
+    with pytest.raises(RuntimeError, match="non-source ranks"):
+        service._validate_specs(topology, [spec])
+
+
+def test_close_destroys_every_channel_after_one_failure(monkeypatch):
     calls = []
 
     class Resource:
@@ -233,17 +244,21 @@ def test_close_is_local_and_idempotent_after_destroy_failure(monkeypatch):
     service._closed = False
     service._device = torch.device("cpu")
     service._handle = Resource("handle", raises=True)
-    service._comm = Resource("comm")
+    service._channels = {
+        ((0,), (2,)): _M2NChannel(Resource("first"), None, None, None),
+        ((1,), (3,)): _M2NChannel(Resource("second"), None, None, None),
+        ((0,), (3,)): None,
+    }
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: calls.append("synchronize"))
 
     with pytest.raises(RuntimeError, match="handle destroy failed"):
         service.close()
     service.close()
 
-    assert calls == ["synchronize", "handle", "comm"]
+    assert calls == ["synchronize", "handle", "first", "second"]
     assert service._closed
     assert service._handle is None
-    assert service._comm is None
+    assert service._channels == {}
 
 
 def _has_nccl_m2n_python_package() -> bool:
@@ -260,8 +275,8 @@ def _has_nccl_m2n_python_package() -> bool:
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
-def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
-    """Exercise cross-dimension packing, M2N transfer, and unpacking on GPUs."""
+def test_nccl_m2n_reshards_parameter_between_tensor_dimensions():
+    """Exercise direct TP shard-to-shard M2N transfer on GPUs."""
     Utils.initialize_distributed()
     world_size = dist.get_world_size()
     if world_size < 2 or world_size % 2:
@@ -269,67 +284,62 @@ def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
 
     rank = dist.get_rank()
     src_count = world_size // 2
-    src_ranks = range(src_count)
-    dst_ranks = range(src_count, world_size)
-    is_source = rank < src_count
+    dst_count = world_size - src_count
+    src_ranks = tuple(range(src_count))
+    dst_ranks = tuple(range(src_count, world_size))
+    is_source = rank in src_ranks
+    rows_per_src = 3
+    cols_per_dst = 5
+    global_shape = (src_count * rows_per_src, dst_count * cols_per_dst)
+    src_shape = (rows_per_src, global_shape[1])
+    dst_shape = (global_shape[0], cols_per_dst)
 
+    src_tensor = None
+    dst_tensor = None
+    if is_source:
+        first_row = rank * rows_per_src
+        row_ids = torch.arange(
+            first_row, first_row + rows_per_src, dtype=torch.float32, device="cuda"
+        ).view(-1, 1)
+        col_ids = torch.arange(global_shape[1], dtype=torch.float32, device="cuda").view(1, -1)
+        src_tensor = row_ids * 1000 + col_ids
+    else:
+        dst_tensor = torch.empty(dst_shape, dtype=torch.float32, device="cuda")
+
+    spec = TensorReshardSpec(
+        resolved_name="weight",
+        src_ranks=src_ranks,
+        dst_ranks=dst_ranks,
+        global_shape=global_shape,
+        src_local_shape=src_shape,
+        dst_local_shape=dst_shape,
+        dtype=torch.float32,
+        src_shard_dim=0,
+        dst_shard_dim=1,
+        src_param_name="weight" if is_source else None,
+        dst_param_name="weight" if not is_source else None,
+    )
+    plan = ReshardPlan(send_ops=[], recv_ops=[], tensor_reshard_specs=[spec])
     service = NCCLM2NCopyService()
     service.set_model_roles(is_source=is_source, is_destination=not is_source)
-    service.set_plan(object())
-    exchange_calls = 0
-    exchange_pair_layouts = service._exchange_pair_layouts
 
-    def counted_exchange_pair_layouts(topology, sends, recvs):
-        nonlocal exchange_calls
-        exchange_calls += 1
-        return exchange_pair_layouts(topology, sends, recvs)
+    assert service.execute_plan(
+        plan,
+        {"weight": src_tensor} if src_tensor is not None else {},
+        {"weight": dst_tensor} if dst_tensor is not None else {},
+    )
+    torch.cuda.synchronize()
 
-    service._exchange_pair_layouts = counted_exchange_pair_layouts
     local_ok = True
-    for iteration in range(2):
-        received: list[tuple[int, torch.Tensor, torch.Tensor, int]] = []
-        if is_source:
-            for dst_rank in dst_ranks:
-                task_id = rank * world_size + dst_rank
-                length = 13 + rank * 7 + (dst_rank - src_count) * 5
-                byte_value = (rank * 31 + dst_rank * 17 + iteration) % 251
-                service.submit_send(
-                    torch.full((length,), byte_value, dtype=torch.uint8, device="cuda"),
-                    dst_rank,
-                    task_id=task_id,
-                )
-                # Duplicate task IDs model transforms that emit more than one tensor
-                # for a single logical plan operation.
-                service.submit_send(
-                    torch.tensor(
-                        [rank, dst_rank, length, iteration], dtype=torch.int64, device="cuda"
-                    ),
-                    dst_rank,
-                    task_id=task_id,
-                )
-        else:
-            for src_rank in src_ranks:
-                task_id = src_rank * world_size + rank
-                length = 13 + src_rank * 7 + (rank - src_count) * 5
-                bytes_out = torch.empty(length, dtype=torch.uint8, device="cuda")
-                metadata_out = torch.empty(4, dtype=torch.int64, device="cuda")
-                service.submit_recv(bytes_out, src_rank, task_id=task_id)
-                service.submit_recv(metadata_out, src_rank, task_id=task_id)
-                received.append((src_rank, bytes_out, metadata_out, length))
+    if dst_tensor is not None:
+        dst_index = rank - src_count
+        first_col = dst_index * cols_per_dst
+        row_ids = torch.arange(global_shape[0], dtype=torch.float32, device="cuda").view(-1, 1)
+        col_ids = torch.arange(
+            first_col, first_col + cols_per_dst, dtype=torch.float32, device="cuda"
+        ).view(1, -1)
+        local_ok = torch.equal(dst_tensor, row_ids * 1000 + col_ids)
 
-        service.run()
-        torch.cuda.synchronize()
-
-        for src_rank, bytes_out, metadata_out, length in received:
-            byte_value = (src_rank * 31 + rank * 17 + iteration) % 251
-            expected_bytes = torch.full_like(bytes_out, byte_value)
-            expected_metadata = torch.tensor(
-                [src_rank, rank, length, iteration], dtype=torch.int64, device="cuda"
-            )
-            local_ok &= torch.equal(bytes_out, expected_bytes)
-            local_ok &= torch.equal(metadata_out, expected_metadata)
-
-    local_ok &= exchange_calls == 1
     service.close()
     status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")
     dist.all_reduce(status, op=dist.ReduceOp.MIN)
@@ -340,23 +350,123 @@ def test_nccl_m2n_moves_variable_mixed_dtype_payloads():
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
-def test_nccl_m2n_rejects_pair_layout_mismatch_before_transfer():
-    """A missing or wrong-sized operation must fail on every rank before M2N runs."""
+def test_nccl_m2n_quantizes_packed_parameters_to_mxfp8_one_at_a_time():
+    """Receive packed BF16 shards and immediately quantize each full local parameter."""
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
     Utils.initialize_distributed()
+    if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
+        pytest.skip("MXFP8 integration requires a Blackwell GPU")
+
     world_size = dist.get_world_size()
     if world_size < 2 or world_size % 2:
         pytest.skip("NCCL M2N integration test requires an even distributed world size >= 2")
 
     rank = dist.get_rank()
-    first_dst = world_size // 2
-    is_source = rank < first_dst
-    service = NCCLM2NCopyService()
-    service.set_model_roles(is_source=is_source, is_destination=not is_source)
-    if rank == 0:
-        service.submit_send(torch.zeros(8, dtype=torch.uint8, device="cuda"), first_dst, task_id=1)
-    elif rank == first_dst:
-        service.submit_recv(torch.empty(7, dtype=torch.uint8, device="cuda"), 0, task_id=1)
+    mesh_size = world_size // 2
+    src_ranks = tuple(range(mesh_size))
+    dst_ranks = tuple(range(mesh_size, world_size))
+    is_source = rank in src_ranks
+    local_rows = 32
+    columns = 128
+    component_shape = (mesh_size * local_rows, columns)
+    local_param_shape = (2 * local_rows, columns)
 
-    with pytest.raises(RuntimeError, match="transfer layout mismatch"):
-        service.run()
+    def make_rows(first_row: int, value_offset: int = 0) -> torch.Tensor:
+        rows = torch.arange(
+            first_row, first_row + local_rows, dtype=torch.float32, device="cuda"
+        ).view(-1, 1)
+        cols = torch.arange(columns, dtype=torch.float32, device="cuda").view(1, -1)
+        return (value_offset + rows + cols / columns).to(torch.bfloat16)
+
+    parameter_names = ("first_weight", "second_weight")
+    src_tensors = {}
+    persistent_buffers = {}
+    expected_buffers = {}
+    local_mesh_rank = rank if is_source else rank - mesh_size
+    for parameter_index, name in enumerate(parameter_names):
+        value_offset = parameter_index * 256
+        first_component = make_rows(local_mesh_rank * local_rows, value_offset)
+        second_component = make_rows(
+            component_shape[0] + local_mesh_rank * local_rows, value_offset
+        )
+        local_value = torch.cat((first_component, second_component))
+        if is_source:
+            src_tensors[name] = local_value
+        else:
+            persistent_buffers[name] = MXFP8Tensor.from_bf16(
+                torch.zeros_like(local_value), backend="triton"
+            )
+            expected_buffers[name] = MXFP8Tensor.from_bf16(local_value, backend="triton")
+
+    specs = []
+    for name in parameter_names:
+        for part_index in range(2):
+            part_slice = (
+                slice(part_index * local_rows, (part_index + 1) * local_rows),
+                slice(None),
+            )
+            specs.append(
+                TensorReshardSpec(
+                    resolved_name=name,
+                    src_ranks=src_ranks,
+                    dst_ranks=dst_ranks,
+                    global_shape=component_shape,
+                    src_local_shape=(local_rows, columns),
+                    dst_local_shape=(local_rows, columns),
+                    dtype=torch.bfloat16,
+                    src_shard_dim=0,
+                    dst_shard_dim=0,
+                    src_param_name=name if is_source else None,
+                    dst_param_name=name if not is_source else None,
+                    src_param_shape=local_param_shape,
+                    dst_param_shape=local_param_shape,
+                    src_slice=part_slice,
+                    dst_slice=part_slice,
+                    part_index=part_index,
+                    part_count=2,
+                )
+            )
+
+    class TrackingTransform(MXFP8ReshardTransform):
+        def __init__(self):
+            super().__init__(
+                convertible_params=set(parameter_names),
+                persistent_buffers=persistent_buffers,
+                backend="triton",
+            )
+            self.active_buffers = 0
+            self.max_active_buffers = 0
+
+        def prepare_recv(self, param_name, dst_slice):
+            self.active_buffers += 1
+            self.max_active_buffers = max(self.max_active_buffers, self.active_buffers)
+            return super().prepare_recv(param_name, dst_slice)
+
+        def finalize_recv(self, param_name, dst_slice, recv_buffers):
+            super().finalize_recv(param_name, dst_slice, recv_buffers)
+            self.active_buffers -= 1
+
+    transform = None if is_source else TrackingTransform()
+    plan = ReshardPlan(send_ops=[], recv_ops=[], tensor_reshard_specs=specs)
+    parameter_bytes = 2 * local_rows * columns * torch.bfloat16.itemsize
+    service = NCCLM2NCopyService(max_group_bytes=parameter_bytes)
+    service.set_model_roles(is_source=is_source, is_destination=not is_source)
+
+    assert service.execute_plan(plan, src_tensors, {}, transform=transform)
+    torch.cuda.synchronize()
+
+    local_ok = True
+    if transform is not None:
+        local_ok = transform.active_buffers == 0 and transform.max_active_buffers == 1
+        for name, expected in expected_buffers.items():
+            actual = persistent_buffers[name]
+            local_ok = local_ok and torch.equal(actual.data, expected.data)
+            local_ok = local_ok and torch.equal(
+                actual.scale.view(torch.uint8), expected.scale.view(torch.uint8)
+            )
+
     service.close()
+    status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")
+    dist.all_reduce(status, op=dist.ReduceOp.MIN)
+    assert status.item() == 1

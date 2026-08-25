@@ -1,11 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import hashlib
 import logging
-from collections import defaultdict
+import os
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from itertools import groupby
+from math import prod
+from typing import Any, Mapping
 
 import torch
 import torch.distributed as dist
@@ -18,15 +19,24 @@ try:
 except ImportError:
     HAVE_NCCL_M2N = False
 
-from .base import CopyService, RecvOp, SendOp
+from ..transforms import MXFP8ReshardTransform, _ensure_sendable
+from ..utils import ReshardPlan, TensorReshardSpec
+from .base import CopyService
 
 logger = logging.getLogger(__name__)
-
-_TransferOpT = TypeVar("_TransferOpT", SendOp, RecvOp)
 
 # nccl-extensions' public M2N header requires NCCL 2.30.5 or newer.
 # _validate_nccl_version checks the loaded libnccl before M2N is initialized.
 _MINIMUM_NCCL_VERSION = (2, 30, 5)
+
+# M2N's grouped PACK path amortizes fixed per-call work across tensors. Bound
+# each submission so receiver-side MXFP8 conversion does not stage an entire
+# model in BF16 at once. A single parameter may exceed this soft limit.
+_DEFAULT_MAX_GROUP_BYTES = 256 * 1024 * 1024
+_MAX_GROUP_BYTES_ENV = "MEGATRON_NCCL_M2N_MAX_GROUP_BYTES"
+_MAX_INT64 = (1 << 63) - 1
+
+_StagePair = tuple[tuple[int, ...], tuple[int, ...]]
 
 
 @dataclass(frozen=True)
@@ -35,6 +45,33 @@ class _M2NTopology:
 
     src_ranks: tuple[int, ...]
     dst_ranks: tuple[int, ...]
+
+
+@dataclass
+class _M2NChannel:
+    """NCCL4Py communicator dedicated to one PP-stage pair."""
+
+    comm: Any
+    stream: torch.cuda.Stream
+    src_mesh: Any
+    dst_mesh: Any
+
+
+@dataclass
+class _LocalTransfer:
+    """Local buffers for one M2N call and an optional destination writeback."""
+
+    src: torch.Tensor | None
+    dst: torch.Tensor | None
+    dst_view: torch.Tensor | None = None
+
+
+@dataclass
+class _PendingParameter:
+    """Buffers retained until a grouped M2N submission is enqueued."""
+
+    local_transfers: list[_LocalTransfer]
+    transform_args: tuple[str, tuple[slice, ...], list[torch.Tensor]] | None = None
 
 
 def _validate_role_roster(roles: list[tuple[bool, bool]]) -> _M2NTopology:
@@ -68,74 +105,10 @@ def _validate_role_roster(roles: list[tuple[bool, bool]]) -> _M2NTopology:
     return _M2NTopology(src_ranks=src_ranks, dst_ranks=dst_ranks)
 
 
-def _ops_by_peer(ops: list[_TransferOpT], *, is_send: bool) -> dict[int, list[_TransferOpT]]:
-    """Group operations by peer while preserving planner submission order."""
-    grouped: dict[int, list[_TransferOpT]] = defaultdict(list)
-    peer_attr = "dest_rank" if is_send else "src_rank"
-    for op in ops:
-        grouped[getattr(op, peer_attr)].append(op)
-    return grouped
-
-
-def _tensor_nbytes(tensor: torch.Tensor) -> int:
-    return tensor.numel() * tensor.element_size()
-
-
-def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.detach().view(-1).view(torch.uint8)
-
-
-def _operation_layout(ops: list[_TransferOpT]) -> tuple[int, int, int]:
-    """Return the byte count, op count, and digest for one peer's ordered operations.
-
-    ``_exchange_pair_layouts`` gathers this tuple from every rank, then
-    ``_validate_pair_layouts`` compares each sender with its receiver before
-    any payload is submitted to M2N.
-    """
-    if not ops:
-        return 0, 0, 0
-
-    total_bytes = 0
-    digest = hashlib.blake2b(digest_size=8)
-    for op in ops:
-        if op.task_id is None:
-            raise RuntimeError("NCCL M2N refit requires a task_id for every transfer")
-        size = _tensor_nbytes(op.tensor)
-        total_bytes += size
-        digest.update(
-            f"{op.task_id}:{size}:{op.tensor.element_size()}:{op.tensor.dtype};".encode("ascii")
-        )
-    return total_bytes, len(ops), int.from_bytes(digest.digest(), "little", signed=True)
-
-
-def _validate_pair_layouts(topology: _M2NTopology, layouts: list[list[list[int]]]) -> int:
-    """Validate source/destination pair layouts and return the uniform slot size."""
-    slot_bytes = 0
-    for src_index, src_rank in enumerate(topology.src_ranks):
-        for dst_index, dst_rank in enumerate(topology.dst_ranks):
-            send_layout = tuple(layouts[src_rank][dst_index])
-            recv_layout = tuple(layouts[dst_rank][src_index])
-            if send_layout != recv_layout:
-                if send_layout[:2] == recv_layout[:2]:
-                    mismatch = "ordered task/dtype layouts differ"
-                else:
-                    mismatch = (
-                        f"source submitted {send_layout[0]} bytes across {send_layout[1]} "
-                        f"tensors, but destination expects {recv_layout[0]} bytes across "
-                        f"{recv_layout[1]} tensors"
-                    )
-                raise RuntimeError(
-                    "NCCL M2N transfer layout mismatch for source rank "
-                    f"{src_rank} and destination rank {dst_rank}: {mismatch}"
-                )
-            slot_bytes = max(slot_bytes, send_layout[0])
-    return slot_bytes
-
-
-def _validate_nccl_version(nccl: Any) -> None:
+def _validate_nccl_version(nccl_module: Any) -> None:
     """Ensure the loaded NCCL library supports the current M2N API."""
     try:
-        version = nccl.get_version().libnccl.version
+        version = nccl_module.get_version().libnccl.version
         release = tuple(version.release)
     except AttributeError as exc:
         raise RuntimeError("NCCL M2N requires the current NCCL4Py package") from exc
@@ -145,27 +118,84 @@ def _validate_nccl_version(nccl: Any) -> None:
         raise RuntimeError(f"NCCL M2N requires NCCL >= {required}, found {version}")
 
 
+def _stage_pairs(specs: list[TensorReshardSpec]) -> tuple[_StagePair, ...]:
+    """Return the deterministic communicator roster used by every rank."""
+    return tuple(sorted({(spec.src_ranks, spec.dst_ranks) for spec in specs}))
+
+
+def _parameter_spec_key(spec: TensorReshardSpec) -> str:
+    return spec.resolved_name
+
+
+def _max_group_bytes_from_env() -> int:
+    value = os.environ.get(_MAX_GROUP_BYTES_ENV)
+    if value is None:
+        return _DEFAULT_MAX_GROUP_BYTES
+    try:
+        max_group_bytes = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{_MAX_GROUP_BYTES_ENV} must be a positive integer") from exc
+    if max_group_bytes <= 0:
+        raise RuntimeError(f"{_MAX_GROUP_BYTES_ENV} must be a positive integer")
+    return max_group_bytes
+
+
+def _parameter_groups(
+    specs: list[TensorReshardSpec], max_group_bytes: int
+) -> list[list[list[TensorReshardSpec]]]:
+    """Batch complete parameters without exceeding the soft byte limit."""
+    parameters: list[list[TensorReshardSpec]] = []
+    seen: set[str] = set()
+    for key, grouped_specs in groupby(specs, key=_parameter_spec_key):
+        if key in seen:
+            raise RuntimeError(f"NCCL M2N plan contains non-contiguous specs for {key}")
+        seen.add(key)
+        parameters.append(list(grouped_specs))
+
+    batches: list[list[list[TensorReshardSpec]]] = []
+    batch: list[list[TensorReshardSpec]] = []
+    batch_bytes = 0
+    for parameter_specs in parameters:
+        parameter_bytes = sum(
+            prod(spec.dst_local_shape) * spec.dtype.itemsize for spec in parameter_specs
+        )
+        if batch and batch_bytes + parameter_bytes > max_group_bytes:
+            batches.append(batch)
+            batch = []
+            batch_bytes = 0
+        batch.append(parameter_specs)
+        batch_bytes += parameter_bytes
+    if batch:
+        batches.append(batch)
+    return batches
+
+
 class NCCLM2NCopyService(CopyService):
-    """Hierarchical non-collocated ReFIT transport backed by NCCL M2N.
+    """Non-collocated ReFIT transport backed by native NCCL M2N resharding.
 
-    The generic ReFIT planner emits point-to-point slices. This service packs
-    those slices into a dense ``[source, destination, bytes]`` logical tensor:
-    source ranks shard dimension 0 and destination ranks shard dimension 1.
-    One official ``nccl.m2n.reshard`` call moves the complete batch, after
-    which receive slices are unpacked into their original tensors.
+    M2N consumes TP-local parameter shards together with their source and
+    destination mesh placements. Each pipeline-stage pair uses an exact,
+    source-first communicator so native calls contain no inactive ranks. Stage
+    pairs run on independent streams, matching the native M2N execution model.
 
-    NCCL M2N requires disjoint, contiguous source and destination meshes, so
-    this backend supports non-collocated ReFIT only. The process group must
-    contain source ranks first, destination ranks second, and no idle ranks.
+    Grouped submissions amortize M2N's fixed per-call work. Receiver-side
+    MXFP8 conversion keeps only a bounded batch of full-parameter BF16 buffers
+    on each destination rank, then quantizes that batch on the same stream.
+
+    Packed Mamba projections are split into their independently-sharded
+    components; they are never lowered into a padded point-to-point tensor.
 
     Args:
         group: NCCL process group containing exactly the source and destination ranks.
+        max_group_bytes: Soft limit for the destination bytes in one grouped
+            submission. Defaults to ``MEGATRON_NCCL_M2N_MAX_GROUP_BYTES`` or
+            256 MiB. A single parameter may exceed the limit.
     """
 
     requires_process_group_barrier = False
     supports_idle_ranks = False
 
-    def __init__(self, group=None):
+    def __init__(self, group=None, *, max_group_bytes: int | None = None):
         if not HAVE_NCCL_M2N:
             raise ImportError("NCCL M2N refit requires NVIDIA/nccl-extensions and NCCL4Py")
         if not dist.is_initialized():
@@ -179,18 +209,21 @@ class NCCLM2NCopyService(CopyService):
             raise RuntimeError("NCCLM2NCopyService requires an NCCL process group")
 
         _validate_nccl_version(nccl)
+        if not callable(getattr(m2n, "group", None)):
+            raise RuntimeError("NCCL M2N refit requires the grouped submission API")
+        if max_group_bytes is None:
+            max_group_bytes = _max_group_bytes_from_env()
+        if not isinstance(max_group_bytes, int) or not 0 < max_group_bytes <= _MAX_INT64:
+            raise ValueError("max_group_bytes must be a positive int64 value")
+        self._max_group_bytes = max_group_bytes
         self._handle = m2n.init()
         self._is_source: bool | None = None
         self._is_destination: bool | None = None
         self._topology: _M2NTopology | None = None
-        self._comm: Any | None = None
-        self._active_plan: object | None = None
-        self._active_transform: object | None = None
-        self._slot_bytes: int | None = None
+        self._stage_pair_roster: tuple[_StagePair, ...] | None = None
+        self._channels: dict[_StagePair, _M2NChannel | None] = {}
         self._closed = False
         self._poisoned = False
-        self.send_ops: list[SendOp] = []
-        self.recv_ops: list[RecvOp] = []
         logger.info("NCCLM2NCopyService initialized on rank %d/%d", self.rank, self.world_size)
 
     def set_model_roles(self, *, is_source: bool, is_destination: bool) -> None:
@@ -205,152 +238,280 @@ class NCCLM2NCopyService(CopyService):
         self._is_source = is_source
         self._is_destination = is_destination
 
-    def set_plan(self, plan: object, *, transform: object | None = None) -> None:
-        """Select the immutable plan whose M2N layout should be reused."""
-        if plan is not self._active_plan or transform is not self._active_transform:
-            self._active_plan = plan
-            self._active_transform = transform
-            self._slot_bytes = None
-
     def submit_send(
         self, src_tensor: torch.Tensor, dest_rank: int, task_id: int | None = None
     ) -> None:
-        self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
+        raise RuntimeError(
+            "NCCL M2N requires a whole-tensor ReshardPlan; use execute_reshard_plan()"
+        )
 
     def submit_recv(
         self, dest_tensor: torch.Tensor, src_rank: int, task_id: int | None = None
     ) -> None:
-        self.recv_ops.append(RecvOp(task_id=task_id, tensor=dest_tensor, src_rank=src_rank))
+        raise RuntimeError(
+            "NCCL M2N requires a whole-tensor ReshardPlan; use execute_reshard_plan()"
+        )
+
+    def run(self) -> None:
+        raise RuntimeError(
+            "NCCL M2N requires a whole-tensor ReshardPlan; use execute_reshard_plan()"
+        )
 
     def _get_topology(self) -> _M2NTopology:
         if self._topology is not None:
             return self._topology
         if self._is_source is None or self._is_destination is None:
             raise RuntimeError(
-                "NCCLM2NCopyService model roles were not configured; call set_model_roles() "
+                "NCCL M2N model roles were not configured; call set_model_roles() "
                 "or use swap_model_weights()"
             )
         roles = torch.tensor(
-            [int(self._is_source), int(self._is_destination)],
+            [int(self._is_source), int(self._is_destination), self._max_group_bytes],
             dtype=torch.int64,
             device=self._device,
         )
         gathered = [torch.empty_like(roles) for _ in range(self.world_size)]
         dist.all_gather(gathered, roles, group=self.group)
-        host_roles = [tuple(bool(value) for value in item.cpu().tolist()) for item in gathered]
+        host_values = [item.cpu().tolist() for item in gathered]
+        group_byte_limits = {values[2] for values in host_values}
+        if len(group_byte_limits) != 1:
+            raise RuntimeError(
+                f"NCCL M2N max_group_bytes must match on every rank, got "
+                f"{sorted(group_byte_limits)}"
+            )
+        host_roles = [tuple(bool(value) for value in values[:2]) for values in host_values]
         self._topology = _validate_role_roster(host_roles)
         return self._topology
 
-    def _validate_peers(
-        self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
-    ) -> None:
-        if self.rank in topology.src_ranks:
-            if recvs:
-                raise RuntimeError("NCCL M2N source ranks cannot submit receive operations")
-            invalid = sorted(set(sends) - set(topology.dst_ranks))
-            if invalid:
-                raise RuntimeError(f"NCCL M2N sends target non-destination ranks: {invalid}")
-        else:
-            if sends:
-                raise RuntimeError("NCCL M2N destination ranks cannot submit send operations")
-            invalid = sorted(set(recvs) - set(topology.src_ranks))
-            if invalid:
-                raise RuntimeError(f"NCCL M2N receives name non-source ranks: {invalid}")
+    def _validate_specs(self, topology: _M2NTopology, specs: list[TensorReshardSpec]) -> None:
+        src_roster = set(topology.src_ranks)
+        dst_roster = set(topology.dst_ranks)
+        for spec in specs:
+            if not spec.src_ranks or not spec.dst_ranks:
+                raise RuntimeError(f"NCCL M2N plan for {spec.resolved_name} has an empty mesh")
+            if not set(spec.src_ranks) <= src_roster:
+                raise RuntimeError(
+                    f"NCCL M2N source mesh for {spec.resolved_name} contains non-source ranks"
+                )
+            if not set(spec.dst_ranks) <= dst_roster:
+                raise RuntimeError(
+                    f"NCCL M2N destination mesh for {spec.resolved_name} contains "
+                    "non-destination ranks"
+                )
+            if set(spec.src_ranks) & set(spec.dst_ranks):
+                raise RuntimeError(f"NCCL M2N meshes overlap for {spec.resolved_name}")
 
-    def _exchange_pair_layouts(
-        self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
-    ) -> int:
-        """Agree on every pair's ordered byte layout before a plan's first M2N run."""
-        peer_count = max(len(topology.src_ranks), len(topology.dst_ranks))
-        local_layouts = [[0, 0, 0] for _ in range(peer_count)]
-        if self.rank in topology.src_ranks:
-            peer_start = topology.dst_ranks[0]
-            local_ops = sends
-        else:
-            peer_start = topology.src_ranks[0]
-            local_ops = recvs
-        for peer, ops in local_ops.items():
-            local_layouts[peer - peer_start] = list(_operation_layout(ops))
-
-        local_tensor = torch.tensor(local_layouts, dtype=torch.int64, device=self._device)
-        gathered = torch.empty(
-            (self.world_size * peer_count, 3), dtype=torch.int64, device=self._device
-        )
-        dist.all_gather_into_tensor(gathered, local_tensor, group=self.group)
-        host_layouts = gathered.view(self.world_size, peer_count, 3).cpu().tolist()
-        return _validate_pair_layouts(topology, host_layouts)
-
-    def _get_slot_bytes(
-        self, topology: _M2NTopology, sends: dict[int, list[SendOp]], recvs: dict[int, list[RecvOp]]
-    ) -> int:
-        """Validate and cache the packed layout once per immutable plan."""
-        if self._active_plan is not None and self._slot_bytes is not None:
-            return self._slot_bytes
-
-        self._validate_peers(topology, sends, recvs)
-        slot_bytes = self._exchange_pair_layouts(topology, sends, recvs)
-        if self._active_plan is not None:
-            self._slot_bytes = slot_bytes
-        return slot_bytes
-
-    def _get_comm(self) -> Any:
-        if self._comm is not None:
-            return self._comm
-
-        unique_id = bytes(nccl.get_unique_id(empty=self.rank != 0))
-        if not unique_id:
+    def _broadcast_unique_id(self, root_rank: int) -> Any:
+        unique_id = bytes(nccl.get_unique_id(empty=self.rank != root_rank))
+        if self.rank == root_rank and not unique_id:
             raise RuntimeError("NCCL4Py returned an empty NCCL unique ID")
         unique_id_tensor = torch.tensor(list(unique_id), dtype=torch.uint8, device=self._device)
-        src_rank = 0 if self.group is None else dist.get_global_rank(self.group, 0)
+        if self.rank != root_rank and unique_id_tensor.numel() == 0:
+            unique_id_tensor = torch.empty(128, dtype=torch.uint8, device=self._device)
+        src_rank = root_rank if self.group is None else dist.get_global_rank(self.group, root_rank)
         dist.broadcast(unique_id_tensor, src=src_rank, group=self.group)
-        unique_id = bytes(unique_id_tensor.cpu().tolist())
-        self._comm = nccl.Communicator.init(
-            self.world_size, self.rank, nccl.UniqueId.from_bytes(unique_id)
+        return nccl.UniqueId.from_bytes(bytes(unique_id_tensor.cpu().tolist()))
+
+    def _prepare_channels(self, pairs: tuple[_StagePair, ...]) -> None:
+        """Collectively bootstrap one exact communicator per stage pair."""
+        if self._stage_pair_roster is not None and self._stage_pair_roster != pairs:
+            raise RuntimeError(
+                "NCCL M2N stage-pair topology changed while reusing a service; close the "
+                "service before using a different reshard plan"
+            )
+        self._stage_pair_roster = pairs
+        for pair in pairs:
+            if pair in self._channels:
+                continue
+            src_ranks, dst_ranks = pair
+            members = src_ranks + dst_ranks
+            unique_id = self._broadcast_unique_id(members[0])
+            if self.rank in members:
+                channel_rank = members.index(self.rank)
+                comm = nccl.Communicator.init(len(members), channel_rank, unique_id)
+                stream = torch.cuda.Stream(device=self._device)
+                self._channels[pair] = _M2NChannel(
+                    comm=comm,
+                    stream=stream,
+                    src_mesh=m2n.Mesh((len(src_ranks),), start_rank=0),
+                    dst_mesh=m2n.Mesh((len(dst_ranks),), start_rank=len(src_ranks)),
+                )
+            else:
+                self._channels[pair] = None
+
+    @staticmethod
+    def _local_tensor(
+        spec: TensorReshardSpec,
+        rank: int,
+        src_tensors: Mapping[str, torch.Tensor],
+        dst_tensors: Mapping[str, torch.Tensor],
+        *,
+        src_override: torch.Tensor | None = None,
+        dst_override: torch.Tensor | None = None,
+    ) -> _LocalTransfer:
+        """Select contiguous local component buffers for one native call."""
+        src = None
+        dst = None
+        dst_view = None
+        if rank in spec.src_ranks:
+            if src_override is None:
+                if spec.src_param_name is None or spec.src_param_name not in src_tensors:
+                    raise RuntimeError(
+                        f"NCCL M2N source tensor for {spec.resolved_name} is unavailable on "
+                        f"rank {rank}"
+                    )
+                src_override = _ensure_sendable(src_tensors[spec.src_param_name]).detach()
+            expected_param_shape = spec.src_param_shape or spec.src_local_shape
+            if tuple(src_override.shape) != expected_param_shape:
+                raise RuntimeError(
+                    f"NCCL M2N source parameter shape changed for {spec.resolved_name}: "
+                    f"expected {expected_param_shape}, got {tuple(src_override.shape)}"
+                )
+            src = src_override if spec.src_slice is None else src_override[spec.src_slice]
+            if tuple(src.shape) != spec.src_local_shape or src.dtype != spec.dtype:
+                raise RuntimeError(
+                    f"NCCL M2N source tensor metadata changed for {spec.resolved_name}: "
+                    f"expected {spec.src_local_shape}/{spec.dtype}, got "
+                    f"{tuple(src.shape)}/{src.dtype}"
+                )
+            if not src.is_contiguous():
+                src = src.contiguous()
+        if rank in spec.dst_ranks:
+            if dst_override is None:
+                if spec.dst_param_name is None or spec.dst_param_name not in dst_tensors:
+                    raise RuntimeError(
+                        f"NCCL M2N destination tensor for {spec.resolved_name} is unavailable "
+                        f"on rank {rank}"
+                    )
+                dst_override = dst_tensors[spec.dst_param_name].detach()
+            expected_param_shape = spec.dst_param_shape or spec.dst_local_shape
+            if tuple(dst_override.shape) != expected_param_shape:
+                raise RuntimeError(
+                    f"NCCL M2N destination parameter shape changed for {spec.resolved_name}: "
+                    f"expected {expected_param_shape}, got {tuple(dst_override.shape)}"
+                )
+            dst_view = dst_override if spec.dst_slice is None else dst_override[spec.dst_slice]
+            if tuple(dst_view.shape) != spec.dst_local_shape or dst_view.dtype != spec.dtype:
+                raise RuntimeError(
+                    f"NCCL M2N destination tensor metadata changed for {spec.resolved_name}: "
+                    f"expected {spec.dst_local_shape}/{spec.dtype}, got "
+                    f"{tuple(dst_view.shape)}/{dst_view.dtype}"
+                )
+            if dst_view.is_contiguous():
+                dst = dst_view
+                dst_view = None
+            else:
+                dst = torch.empty(spec.dst_local_shape, dtype=spec.dtype, device=dst_view.device)
+        return _LocalTransfer(src=src, dst=dst, dst_view=dst_view)
+
+    @staticmethod
+    def _placement(shard_dim: int | None) -> tuple[Any]:
+        return (m2n.Replicate() if shard_dim is None else m2n.Shard(shard_dim),)
+
+    def _enqueue_parameter(
+        self,
+        parameter_specs: list[TensorReshardSpec],
+        channel: _M2NChannel,
+        src_tensors: Mapping[str, torch.Tensor],
+        dst_tensors: Mapping[str, torch.Tensor],
+        transform: MXFP8ReshardTransform | None,
+    ) -> _PendingParameter:
+        """Prepare one parameter and record all of its M2N component calls."""
+        first_spec = parameter_specs[0]
+        if [spec.part_index for spec in parameter_specs] != list(
+            range(first_spec.part_count)
+        ) or any(spec.part_count != first_spec.part_count for spec in parameter_specs):
+            raise RuntimeError(
+                f"NCCL M2N plan for {first_spec.resolved_name} has incomplete "
+                "packed component metadata"
+            )
+
+        src_override = None
+        if self.rank in first_spec.src_ranks:
+            if first_spec.src_param_name is None or first_spec.src_param_name not in src_tensors:
+                raise RuntimeError(
+                    f"NCCL M2N source tensor for {first_spec.resolved_name} is unavailable "
+                    f"on rank {self.rank}"
+                )
+            src_override = _ensure_sendable(src_tensors[first_spec.src_param_name]).detach()
+
+        transform_args = None
+        dst_override = None
+        should_transform = (
+            transform is not None
+            and self.rank in first_spec.dst_ranks
+            and first_spec.dst_param_name is not None
+            and transform.should_transform(first_spec.dst_param_name)
         )
-        return self._comm
+        if should_transform:
+            assert transform is not None
+            assert first_spec.dst_param_name is not None
+            dst_param_shape = first_spec.dst_param_shape or first_spec.dst_local_shape
+            full_slice = tuple(slice(None) for _ in dst_param_shape)
+            recv_buffers = transform.prepare_recv(first_spec.dst_param_name, full_slice)
+            if len(recv_buffers) != 1:
+                raise RuntimeError(
+                    "NCCL M2N receiver-side MXFP8 conversion requires exactly "
+                    f"one BF16 buffer for {first_spec.resolved_name}"
+                )
+            dst_override = recv_buffers[0]
+            transform_args = (first_spec.dst_param_name, full_slice, recv_buffers)
 
-    def _pack_sends(
-        self,
-        buffer: torch.Tensor,
-        topology: _M2NTopology,
-        sends: dict[int, list[SendOp]],
-        slot_bytes: int,
+        local_transfers = []
+        for spec in parameter_specs:
+            local = self._local_tensor(
+                spec,
+                self.rank,
+                src_tensors,
+                dst_tensors,
+                src_override=src_override,
+                dst_override=dst_override,
+            )
+            src = m2n.DistTensor(
+                local.src,
+                local_shape=spec.src_local_shape,
+                dtype=spec.dtype,
+                mesh=channel.src_mesh,
+                placements=self._placement(spec.src_shard_dim),
+            )
+            dst = m2n.DistTensor(
+                local.dst,
+                local_shape=spec.dst_local_shape,
+                dtype=spec.dtype,
+                mesh=channel.dst_mesh,
+                placements=self._placement(spec.dst_shard_dim),
+            )
+            self._handle.reshard(channel.comm, src, dst, stream=channel.stream)
+            local_transfers.append(local)
+        return _PendingParameter(local_transfers=local_transfers, transform_args=transform_args)
+
+    @staticmethod
+    def _complete_parameter(
+        pending: _PendingParameter, channel: _M2NChannel, transform: MXFP8ReshardTransform | None
     ) -> None:
-        destinations = []
-        sources = []
-        for peer, ops in sends.items():
-            offset = (peer - topology.dst_ranks[0]) * slot_bytes
-            for op in ops:
-                size = _tensor_nbytes(op.tensor)
-                destinations.append(buffer[offset : offset + size])
-                sources.append(_byte_view(op.tensor))
-                offset += size
-        with torch.no_grad():
-            if destinations:
-                torch._foreach_copy_(destinations, sources)
+        """Schedule writebacks and conversion after a group has been submitted."""
+        for local in pending.local_transfers:
+            if local.src is not None:
+                local.src.record_stream(channel.stream)
+            if local.dst is not None:
+                local.dst.record_stream(channel.stream)
+            if local.dst_view is not None:
+                assert local.dst is not None
+                local.dst_view.copy_(local.dst)
 
-    def _unpack_recvs(
+        if pending.transform_args is not None:
+            assert transform is not None
+            transform.finalize_recv(*pending.transform_args)
+
+    def execute_plan(
         self,
-        buffer: torch.Tensor,
-        topology: _M2NTopology,
-        recvs: dict[int, list[RecvOp]],
-        slot_bytes: int,
-    ) -> None:
-        destinations = []
-        sources = []
-        for peer, ops in recvs.items():
-            offset = (peer - topology.src_ranks[0]) * slot_bytes
-            for op in ops:
-                size = _tensor_nbytes(op.tensor)
-                destinations.append(_byte_view(op.tensor))
-                sources.append(buffer[offset : offset + size])
-                offset += size
-        with torch.no_grad():
-            if destinations:
-                torch._foreach_copy_(destinations, sources)
-
-    def run(self) -> None:
-        """Pack and execute all queued transfers in one hierarchical M2N reshard."""
+        plan: object,
+        src_tensors: Mapping[str, torch.Tensor],
+        dst_tensors: Mapping[str, torch.Tensor],
+        *,
+        transform: object | None = None,
+    ) -> bool:
+        """Execute TP/PP parameter shards directly through ``m2n.reshard``."""
         if self._closed:
             raise RuntimeError("NCCLM2NCopyService is closed")
         if self._poisoned:
@@ -358,76 +519,85 @@ class NCCLM2NCopyService(CopyService):
                 "NCCLM2NCopyService is unusable after an M2N submission failure; "
                 "close it and initialize a new service"
             )
+        if not isinstance(plan, ReshardPlan):
+            raise TypeError("NCCL M2N requires a ReshardPlan")
+        if transform is not None and not isinstance(transform, MXFP8ReshardTransform):
+            raise RuntimeError(
+                "NCCL M2N native resharding only supports the MXFP8 receiver-side transform"
+            )
+        mxfp8_transform = transform
+        if mxfp8_transform is not None and mxfp8_transform.convert_on_send:
+            raise RuntimeError(
+                "NCCL M2N native resharding does not support MXFP8 sender-side conversion"
+            )
+        if plan.tensor_reshard_specs is None:
+            reason = plan.tensor_reshard_error or "whole-tensor metadata is unavailable"
+            raise RuntimeError(f"NCCL M2N cannot execute this reshard plan: {reason}")
 
+        specs = plan.tensor_reshard_specs
+        topology = self._get_topology()
+        self._validate_specs(topology, specs)
+        pairs = _stage_pairs(specs)
+        self._prepare_channels(pairs)
+
+        current_stream = torch.cuda.current_stream(self._device)
+        ready = torch.cuda.Event()
+        ready.record(current_stream)
         try:
-            topology = self._get_topology()
-            sends = _ops_by_peer(self.send_ops, is_send=True)
-            recvs = _ops_by_peer(self.recv_ops, is_send=False)
-            slot_bytes = self._get_slot_bytes(topology, sends, recvs)
-            if slot_bytes == 0:
-                return
-
-            comm = self._get_comm()
-            is_source = self.rank in topology.src_ranks
-            src_count = len(topology.src_ranks)
-            dst_count = len(topology.dst_ranks)
-            peer_count = dst_count if is_source else src_count
-            buffer = torch.empty(peer_count * slot_bytes, dtype=torch.uint8, device=self._device)
-            if is_source:
-                self._pack_sends(buffer, topology, sends, slot_bytes)
-                src = buffer.view(1, dst_count, slot_bytes)
-                dst = None
-            else:
-                src = None
-                dst = buffer.view(src_count, 1, slot_bytes)
-
-            stream = torch.cuda.current_stream(self._device)
-            try:
-                m2n.reshard(
-                    src=src,
-                    dst=dst,
-                    comm=comm,
-                    stream=stream,
-                    src_mesh=m2n.Mesh((src_count,), start_rank=topology.src_ranks[0]),
-                    src_placements=(m2n.Shard(0),),
-                    src_local_shape=(1, dst_count, slot_bytes),
-                    src_dtype=torch.uint8,
-                    dst_mesh=m2n.Mesh((dst_count,), start_rank=topology.dst_ranks[0]),
-                    dst_placements=(m2n.Shard(1),),
-                    dst_local_shape=(src_count, 1, slot_bytes),
-                    dst_dtype=torch.uint8,
-                    handle=self._handle,
-                )
-            except BaseException:
-                self._poisoned = True
-                raise
-            finally:
-                # nccl.m2n enqueues work outside PyTorch's dispatcher. Teach
-                # the caching allocator that the staging tensor is in use.
-                buffer.record_stream(stream)
-
-            if not is_source:
-                self._unpack_recvs(buffer, topology, recvs, slot_bytes)
-        finally:
-            self.send_ops.clear()
-            self.recv_ops.clear()
+            for pair in pairs:
+                channel = self._channels[pair]
+                if channel is None:
+                    continue
+                channel.stream.wait_event(ready)
+                pair_specs = [spec for spec in specs if (spec.src_ranks, spec.dst_ranks) == pair]
+                with torch.cuda.stream(channel.stream):
+                    for batch in _parameter_groups(pair_specs, self._max_group_bytes):
+                        pending_parameters = []
+                        with m2n.group():
+                            for parameter_specs in batch:
+                                pending_parameters.append(
+                                    self._enqueue_parameter(
+                                        parameter_specs,
+                                        channel,
+                                        src_tensors,
+                                        dst_tensors,
+                                        mxfp8_transform,
+                                    )
+                                )
+                        for pending in pending_parameters:
+                            self._complete_parameter(pending, channel, mxfp8_transform)
+            for pair in pairs:
+                channel = self._channels[pair]
+                if channel is not None:
+                    current_stream.wait_stream(channel.stream)
+        except BaseException:
+            self._poisoned = True
+            raise
+        return True
 
     def close(self) -> None:
         """Wait for local work and release M2N resources; this is not collective."""
         if self._closed:
             return
         self._closed = True
-        self._active_plan = None
-        self._active_transform = None
-        self._slot_bytes = None
         handle, self._handle = self._handle, None
-        comm, self._comm = self._comm, None
+        channels, self._channels = self._channels, {}
+        errors: list[BaseException] = []
         try:
             torch.cuda.synchronize(self._device)
-        finally:
+        except BaseException as exc:
+            errors.append(exc)
+        if handle is not None:
             try:
-                if handle is not None:
-                    handle.destroy()
-            finally:
-                if comm is not None:
-                    comm.destroy()
+                handle.destroy()
+            except BaseException as exc:
+                errors.append(exc)
+        for channel in channels.values():
+            if channel is None:
+                continue
+            try:
+                channel.comm.destroy()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]

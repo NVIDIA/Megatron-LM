@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -85,6 +85,23 @@ class CopyService(ABC):
         for the lifetime of the plan and transform. Point-to-point backends do
         not require per-plan setup and keep this default no-op.
         """
+
+    def execute_plan(
+        self,
+        plan: object,
+        src_tensors: Mapping[str, torch.Tensor],
+        dst_tensors: Mapping[str, torch.Tensor],
+        *,
+        transform: object | None = None,
+    ) -> bool:
+        """Execute a plan natively, returning whether it was handled.
+
+        The default keeps the established submit/run path. Backends whose
+        native primitive needs whole tensors and mesh metadata can override
+        this hook without changing the public ReFIT API or the slice-copy
+        contract used by other transports.
+        """
+        return False
 
 
 def match_local_ops_by_task_id(
