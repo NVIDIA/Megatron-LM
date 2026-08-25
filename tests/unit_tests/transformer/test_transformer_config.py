@@ -126,8 +126,7 @@ def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
 
 
 requires_te_2_9 = pytest.mark.skipif(
-    not is_te_min_version("2.9.0"),
-    reason="sequence packing requires Transformer Engine >= 2.9.0",
+    not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
 )
 
 
