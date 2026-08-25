@@ -1979,7 +1979,9 @@ class GTPShardedParam(torch.nn.Parameter):
         copy-into-registered-memory path. Deliberately symm-only so behavior off the
         --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
         _prepare_wgrad_reduce_scatter_inputs."""
-        return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(self.group)
+        return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(
+            self.group, mode="rs"
+        )
 
     def get_wgrad_tensor(self, *, persistent: bool = False):
         """Return writable logical-shape scratch; ``persistent`` keeps eager pointers fixed.
@@ -2008,7 +2010,7 @@ class GTPShardedParam(torch.nn.Parameter):
             return ring_slot.tensor[: self._unsharded_shape[0]]
 
         # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
-        if is_gtp_symm_pool_registered(self.group):
+        if is_gtp_symm_pool_registered(self.group, mode="rs"):
             # Lifecycle invariant: get_wgrad_tensor -> GEMM -> _prepare consumes the slot -> RS.
             if self._wgrad_symm_slot is not None:
                 raise RuntimeError(
@@ -2251,7 +2253,7 @@ class GTPShardedParam(torch.nn.Parameter):
         fp32_accumulation = (
             GTP_CONFIG.reduce_scatter_with_fp32_accumulation
             and self.group.size() > 2
-            and not is_gtp_symm_pool_registered(self.group)
+            and not is_gtp_symm_pool_registered(self.group, mode="rs")
         )
 
         if async_op:
@@ -2359,7 +2361,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
                 # With symmetric memory registration, send the padded parent tensor of the
                 # logical view that get_wgrad_tensor handed the GEMM.
-                if is_gtp_symm_pool_registered(weight.group):
+                if is_gtp_symm_pool_registered(weight.group, mode="rs"):
                     symm_slot = weight._wgrad_symm_slot
                     weight._wgrad_symm_slot = None
                     if symm_slot is None:
