@@ -130,6 +130,7 @@ def get_mock_mla_config(
     qk_layernorm: bool,
     apply_rope_fusion: bool = False,
     rope_type: str = "yarn",
+    rotary_percent: float = 1.0,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -154,6 +155,7 @@ def get_mock_mla_config(
         context_parallel_size=context_parallel_size,
         apply_rope_fusion=apply_rope_fusion,
         rope_type=rope_type,
+        rotary_percent=rotary_percent,
         rotary_scaling_factor=40,
         mscale=1.0,
         mscale_all_dim=1.0,
@@ -568,3 +570,110 @@ def test_standard_rope_fusion_functionality(qkv_format: str):
         rope_type="rope",
         check_hidden_grad=True,
     )
+
+
+@pytest.mark.parametrize("attention_type", ["standard", "absorbed"])
+@pytest.mark.parametrize(("qkv_format", "cp_size"), [("sbhd", 1), ("thd", 1), ("thd", 2)])
+@pytest.mark.parametrize("rotary_percent", [1.0, 0.5], ids=["full", "partial-fallback"])
+def test_standard_rope_fused_unfused_parity(attention_type, qkv_format, cp_size, rotary_percent):
+    """Standard RoPE fusion or fallback must preserve outputs and all gradients."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    model_parallel_cuda_manual_seed(123)
+
+    configs = [
+        get_mock_mla_config(
+            tensor_model_parallel_size=1,
+            context_parallel_size=cp_size,
+            qk_layernorm=True,
+            apply_rope_fusion=apply_rope_fusion,
+            rope_type="rope",
+            rotary_percent=rotary_percent,
+        )
+        for apply_rope_fusion in (False, True)
+    ]
+
+    if attention_type == "absorbed":
+        attention_cls = AbsorbedMLASelfAttention
+        submodules = [
+            get_absorbed_mla_submodules(
+                down_proj_use_column_parallel=False, qk_layernorm=True, rms_norm=True
+            )
+            for _ in configs
+        ]
+    else:
+        attention_cls = MLASelfAttention
+        submodules = [
+            get_mla_submodules(
+                down_proj_use_column_parallel=False, qk_layernorm=True, rms_norm=True
+            )
+            for _ in configs
+        ]
+
+    attentions = [
+        attention_cls(
+            config=config,
+            submodules=module_spec,
+            layer_number=0,
+            attn_mask_type=AttnMaskType.causal,
+            cp_comm_type="all_gather" if cp_size > 1 else None,
+            pg_collection=None,
+        ).cuda()
+        for config, module_spec in zip(configs, submodules)
+    ]
+    attentions[1].load_state_dict(attentions[0].state_dict())
+
+    if qkv_format == "thd":
+        seqlens = [96, 160, 64]
+        cu_seqlens = torch.tensor([0, 96, 256, 320], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_kv=max(seqlens),
+            qkv_format="thd",
+        )
+        hidden_states = torch.randn(
+            (sum(seqlens) // cp_size, 1, configs[0].hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+    else:
+        packed_seq_params = None
+        hidden_states = torch.randn(
+            (320 // cp_size, 2, configs[0].hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+
+    inputs = [hidden_states.detach().clone().requires_grad_(True) for _ in attentions]
+    output_grad = torch.randn_like(hidden_states)
+    outputs = []
+    for attention, input_tensor in zip(attentions, inputs):
+        output, _ = attention(
+            input_tensor, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        output.backward(output_grad)
+        outputs.append(output)
+
+    torch.testing.assert_close(outputs[1], outputs[0], atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(inputs[1].grad, inputs[0].grad, atol=5e-3, rtol=5e-3)
+
+    unfused_parameters = dict(attentions[0].named_parameters())
+    fused_parameters = dict(attentions[1].named_parameters())
+    assert fused_parameters.keys() == unfused_parameters.keys()
+    for name in unfused_parameters:
+        unfused_grad = unfused_parameters[name].grad
+        fused_grad = fused_parameters[name].grad
+        assert unfused_grad is not None, f"unfused parameter {name} has no gradient"
+        assert fused_grad is not None, f"fused parameter {name} has no gradient"
+        fused_grad_fp64 = fused_grad.double()
+        unfused_grad_fp64 = unfused_grad.double()
+        denominator = (fused_grad_fp64.square() + unfused_grad_fp64.square()).sum()
+        similarity = (
+            1.0
+            if denominator == 0
+            else (2 * fused_grad_fp64 * unfused_grad_fp64).sum() / denominator
+        )
+        assert similarity > 0.9999, f"parameter {name} gradient similarity = {similarity}"
+
+    Utils.destroy_model_parallel()

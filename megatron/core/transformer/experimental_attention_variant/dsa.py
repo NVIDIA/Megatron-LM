@@ -12,6 +12,7 @@ from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
+    should_use_fused_mla_rope,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1290,8 +1291,8 @@ class DSAIndexer(MegatronModule):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
-        fused_indexer_rope = (
-            self.config.apply_rope_fusion and self.config.dsa_indexer_rope_interleaved
+        fused_indexer_rope = self.config.dsa_indexer_rope_interleaved and should_use_fused_mla_rope(
+            self.config
         )
         rotary_pos_cos = rotary_pos_sin = None
         if fused_indexer_rope:

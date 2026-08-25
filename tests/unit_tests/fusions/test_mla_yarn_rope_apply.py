@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
+from megatron.core.models.common.embeddings import should_use_fused_mla_rope
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -29,6 +31,53 @@ except Exception:
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
     fused_mla_rope_out_of_place = None
+
+
+@pytest.mark.parametrize(
+    ("apply_rope_fusion", "rope_type", "rotary_percent", "expected"),
+    [
+        (False, "rope", 1.0, False),
+        (True, "rope", 1.0, True),
+        (True, "rope", 0.5, False),
+        (True, "yarn", 0.5, True),
+    ],
+)
+def test_mla_rope_fusion_selection(apply_rope_fusion, rope_type, rotary_percent, expected):
+    """Partial standard RoPE falls back while full RoPE and YaRN retain fusion."""
+    config = SimpleNamespace(
+        apply_rope_fusion=apply_rope_fusion, rope_type=rope_type, rotary_percent=rotary_percent
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert should_use_fused_mla_rope(config) is expected
+
+
+def test_partial_standard_rope_fallback_warns_once(monkeypatch):
+    """Partial standard RoPE preserves its tail and reports each fallback only once."""
+    config = SimpleNamespace(
+        apply_rope_fusion=True,
+        mrope_section=None,
+        multi_latent_attention=True,
+        rope_type="rope",
+        rotary_interleaved=False,
+        rotary_percent=0.5,
+    )
+    monkeypatch.setattr(rope_utils_module, "_ROPE_FUSION_FALLBACK_WARNINGS", set())
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            assert not should_use_fused_mla_rope(config)
+            values = torch.randn(8, 1, 2, 64)
+            freqs = torch.randn(8, 1, 1, 32)
+            output = apply_rotary_pos_emb(
+                values, freqs, config=config, cp_group=FakeCPGroup(), mla_rotary_interleaved=True
+            )
+            torch.testing.assert_close(output[..., 32:], values[..., 32:], rtol=0, atol=0)
+
+    messages = [str(warning.message) for warning in recorded]
+    assert sum("Falling back to the unfused path" in message for message in messages) == 1
+    assert sum("MLA-style interleaving" in message for message in messages) == 1
 
 
 def dtype_tols(dtype):
@@ -701,6 +750,7 @@ class TestApplyRotaryPosEmbMlaFusionConflict:
 
         fused_mock = MagicMock(return_value=t.clone())
         with (
+            patch.object(rope_utils_module, "_ROPE_FUSION_FALLBACK_WARNINGS", set()),
             patch.object(rope_utils_module, "fused_apply_rotary_pos_emb", fused_mock),
             patch.object(
                 rope_utils_module,

@@ -25,6 +25,7 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+    should_use_fused_mla_rope,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -418,7 +419,8 @@ class AbsorbedMLASelfAttention(Attention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.apply_rope_fusion:
+        use_fused_rope = should_use_fused_mla_rope(self.config)
+        if use_fused_rope:
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                 rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
             )
@@ -555,7 +557,7 @@ class AbsorbedMLASelfAttention(Attention):
 
             k_up_weight, _ = self._get_kv_up_weights()
 
-            if self.config.apply_rope_fusion:
+            if use_fused_rope:
                 # q_no_pe: [num_tokens, n, qk_head_dim]
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_no_pe, q_pos_emb = torch.split(

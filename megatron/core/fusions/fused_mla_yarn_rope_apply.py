@@ -99,7 +99,8 @@ def _mla_rope_fwd_inplace_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """
-    Forward pass: apply RoPE inplace to the trailing emb_dim elements.
+    Forward pass: apply RoPE inplace to the leading emb_dim elements when ROPE_FIRST is true,
+    otherwise to the trailing emb_dim elements.
     Reads from interleaved layout, writes back to interleaved layout.
 
     Input:
@@ -199,7 +200,8 @@ def _mla_rope_bwd_inplace_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """
-    Backward pass: inverse RoPE inplace on the trailing emb_dim elements.
+    Backward pass: inverse RoPE inplace on the leading emb_dim elements when ROPE_FIRST is true,
+    otherwise on the trailing emb_dim elements.
     Reads from interleaved layout, writes to interleaved layout.
 
     Input:

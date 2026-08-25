@@ -23,6 +23,7 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+    should_use_fused_mla_rope,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -701,7 +702,8 @@ class MLASelfAttention(MultiLatentAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.apply_rope_fusion:
+        use_fused_rope = should_use_fused_mla_rope(self.config)
+        if use_fused_rope:
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                 rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
             )
@@ -881,7 +883,7 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             # todo add assert about fusions and caching
-            if self.config.apply_rope_fusion:
+            if use_fused_rope:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_apply_mla_rope_for_q(

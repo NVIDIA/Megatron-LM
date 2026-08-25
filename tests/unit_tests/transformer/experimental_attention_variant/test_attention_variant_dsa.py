@@ -2367,14 +2367,16 @@ class TestDSAIndexer:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("packed", [False, True], ids=["sbhd", "thd"])
-    def test_dsa_indexer_fused_rope_matches_unfused(self, seqlen, packed):
-        """Fused leading-channel RoPE must preserve indexer values and all gradients."""
+    @pytest.mark.parametrize("rotary_percent", [1.0, 0.5], ids=["full", "partial-fallback"])
+    def test_dsa_indexer_fused_rope_matches_unfused(self, seqlen, packed, rotary_percent):
+        """Fused leading-channel RoPE or fallback must preserve values and all gradients."""
         from megatron.core.extensions.transformer_engine import TELinear, TENorm
         from megatron.core.transformer.spec_utils import ModuleSpec
 
         def build_indexer(apply_rope_fusion):
             config = copy.deepcopy(self.config)
             config.apply_rope_fusion = apply_rope_fusion
+            config.rotary_percent = rotary_percent
             config.dsa_indexer_rope_interleaved = True
             config.dsa_indexer_k_norm_fp32 = True
             config.dsa_indexer_rotate_activation = False
