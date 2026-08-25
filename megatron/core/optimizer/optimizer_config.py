@@ -300,16 +300,10 @@ class OptimizerConfig:
     kernel (batched_tsyrk_ex, >= 0.5.0a0) and otherwise fall back to baddbmm
     with a one-time warning. Same math,
     different kernel: results differ from the GEMM path by kernel-level rounding.
-
-    MEASURED: on GB300 (SM 10.3, Triton 3.4) SYRK is a steady-state WIN — NS5 on a
-    (12288, 10240) matrix runs 17.5 ms with SYRK vs 23.4 ms without (0.75x, warm
-    median; ratio identical at NS16 and across emerging-optimizers 0.4.0/main).
-    An earlier in-training profile reported SYRK slower (30.8 vs 26.0 ms); that was
-    a measurement artifact of the first-call cost. The operational caveat is that
-    first call: each rank pays a one-time ~30 s Triton autotune+compile per distinct
-    matrix shape (measured 32-34 s on this shape), so the first optimizer step of a
-    run is minutes slower on a cold Triton cache — budget for it in step-time
-    monitoring, or persist TRITON_CACHE_DIR across runs. Defaults to False."""
+    Operational caveat: each rank pays a one-time Triton autotune+compile
+    (tens of seconds) per distinct matrix shape, so the first optimizer step on a
+    cold Triton cache is slow — budget for it in step-time monitoring, or persist
+    TRITON_CACHE_DIR across runs. Defaults to False."""
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
@@ -318,11 +312,13 @@ class OptimizerConfig:
     transient stack of this many matrices for far fewer launches. Batches of more than
     one use baddbmm instead of addmm, so results differ from the per-matrix path by
     kernel-level floating point rounding and bitwise parity with duplicated mode is
-    lost. Only used when use_layer_sharding_muon is set. Defaults to 1 (bit-exact
-    per-matrix path); raise (e.g. to 32) to trade bitwise parity for fewer kernel
-    launches on MoE expert homes. Values > 1 require emerging-optimizers >= 0.3.0
-    (batched 3-D Newton-Schulz); the default runs on any version with the
-    newton_schulz API."""
+    lost. Only used when use_layer_sharding_muon is set. The value is an upper
+    bound per same-shape bucket: a home owning fewer matrices of a shape simply
+    forms a smaller (or single-matrix, bit-exact) batch, so oversizing it is
+    harmless. Defaults to 1 (bit-exact per-matrix path); raise (e.g. to 32) to
+    trade bitwise parity for fewer kernel launches on MoE expert homes. Values
+    > 1 require emerging-optimizers >= 0.3.0 (batched 3-D Newton-Schulz); the
+    default runs on any version with the newton_schulz API."""
 
     use_layer_sharding_muon: bool = False
     """If true, use LayerShardedMuon instead of TensorParallelMuon when optimizer is 'muon'.
