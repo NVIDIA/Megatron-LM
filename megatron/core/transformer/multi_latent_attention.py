@@ -19,6 +19,7 @@ except ImportError:
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -125,6 +126,7 @@ class MLASelfAttentionSubmodules:
     linear_kv_up_proj: Union[ModuleSpec, type] = None
     linear_qkv_down_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    linear_gate: Union[ModuleSpec, type] = None
 
 
 class MultiLatentAttention(Attention):
@@ -163,6 +165,10 @@ class MultiLatentAttention(Attention):
         self.config: MLATransformerConfig
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
+        if self.config.gated_attention_proj_granularity == 'elementwise':
+            self.gate_projection_size = self.query_projection_size
+        else:
+            self.gate_projection_size = self.config.num_attention_heads
 
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
 
@@ -224,6 +230,26 @@ class MultiLatentAttention(Attention):
             pg_collection=self.pg_collection,
             **core_attn_extra_kwargs,
         )
+
+        if self.config.attention_output_gate:
+            if submodules.linear_gate is None:
+                raise ValueError("MLA output gating requires a linear_gate module spec.")
+            self.linear_gate = build_module(
+                submodules.linear_gate,
+                self.config.hidden_size,
+                self.gate_projection_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='mla_gate',
+                tp_group=self.pg_collection.tp,
+                name=(name + ".linear_gate") if name is not None else None,
+            )
+        else:
+            self.linear_gate = None
 
         # Output.
         self.linear_proj = submodules.linear_proj(
@@ -333,6 +359,8 @@ class MultiLatentAttention(Attention):
 
         # hidden_states: [sq, b, h]
 
+        gate_input = hidden_states
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if inference_context and not inference_context.is_static_batching():
             assert (
@@ -349,6 +377,18 @@ class MultiLatentAttention(Attention):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and self.pg_collection.cp is not None
+            and get_pg_size(self.pg_collection.cp) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            raise ValueError(
+                "MultiLatentAttention requires cp_partition_mode='zigzag', but "
+                f"packed_seq_params has {packed_seq_params.cp_partition_mode!r}. CP partition "
+                "conversion must be handled before entering MLA."
+            )
 
         # =====================
         # Query, Key, and Value
@@ -385,6 +425,10 @@ class MultiLatentAttention(Attention):
 
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
+        core_attention_extra_kwargs = {}
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            core_attention_extra_kwargs = {"x": hidden_states, "qr": q_compressed}
+
         # ==================================
         # core attention computation
         # ==================================
@@ -395,16 +439,15 @@ class MultiLatentAttention(Attention):
         )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                extra_kwargs = {}
-                if self.config.experimental_attention_variant == "dsa":
-                    # For dsa we need to pass in the original hidden states and the compressed
-                    # query representation.
-                    extra_kwargs["x"] = hidden_states
-                    extra_kwargs["qr"] = q_compressed
                 with core_attn_manager as query:
                     core_attn_out = self._run_core_attention(
                         query,
@@ -413,7 +456,7 @@ class MultiLatentAttention(Attention):
                         attention_mask,
                         packed_seq_params=packed_seq_params,
                         attn_mask_type=attn_mask_type,
-                        **extra_kwargs,
+                        **core_attention_extra_kwargs,
                     )
             elif self.cache_mla_latents:
                 value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
@@ -469,6 +512,9 @@ class MultiLatentAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
+        if self.linear_gate is not None:
+            core_attn_out = self._project_and_apply_mla_output_gate(core_attn_out, gate_input)
+
         # =================
         # Output. [sq, b, h]
         # =================
@@ -479,6 +525,65 @@ class MultiLatentAttention(Attention):
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
+
+    def _project_and_apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate_input: torch.Tensor
+    ) -> torch.Tensor:
+        """Project the gate after core attention, then apply it to the MLA output."""
+        gate, _ = apply_module(self.linear_gate)(gate_input)
+        return self._apply_mla_output_gate(core_attn_out, gate)
+
+    def _apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply an MLA output gate with the configured projection granularity."""
+        if core_attn_out.shape[:-1] != gate.shape[:-1]:
+            raise ValueError(
+                "MLA output gate and core attention output must have matching token/batch "
+                f"dimensions, got {tuple(gate.shape)} and {tuple(core_attn_out.shape)}."
+            )
+
+        if self.config.gated_attention_proj_granularity == 'elementwise':
+            if core_attn_out.shape != gate.shape:
+                raise ValueError(
+                    "Elementwise MLA output gating requires the gate and core attention output "
+                    f"to have the same shape, got {tuple(gate.shape)} and "
+                    f"{tuple(core_attn_out.shape)}."
+                )
+            return self._apply_mla_elementwise_output_gate(core_attn_out, gate)
+
+        if core_attn_out.size(-1) % gate.size(-1) != 0:
+            raise ValueError(
+                "Headwise MLA output gating requires the core attention output dimension "
+                f"({core_attn_out.size(-1)}) to be divisible by the number of local gates "
+                f"({gate.size(-1)})."
+            )
+        return self._apply_mla_headwise_output_gate(core_attn_out, gate)
+
+    @staticmethod
+    def _apply_mla_elementwise_output_gate(
+        core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply one gate per local MLA output element in the activation dtype."""
+        # Keep the FP32 sigmoid followed by native-dtype multiplication used by the
+        # released model. Do not jit-fuse this helper: nvFuser can move the cast
+        # across the elementwise multiply and silently change the rounding/VJP.
+        gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
+        return core_attn_out * gate
+
+    @staticmethod
+    @jit_fuser
+    def _apply_mla_headwise_output_gate(
+        core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply one gate per local MLA attention head in the activation dtype."""
+        output_shape = core_attn_out.shape
+        core_attn_out = core_attn_out.view(*output_shape[:2], gate.size(-1), -1)
+        # Compute the sigmoid in FP32 for a stable gate VJP, then cast back to the
+        # attention output dtype.
+        gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
+        core_attn_out = core_attn_out * gate.unsqueeze(-1)
+        return core_attn_out.reshape(output_shape)
 
 
 class MLASelfAttention(MultiLatentAttention):
@@ -757,7 +862,7 @@ class MLASelfAttention(MultiLatentAttention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
-        if packed_seq_params is not None:
+        if thd_packed_seq:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
@@ -912,7 +1017,7 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif not thd_packed_seq or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -1087,6 +1192,8 @@ class MLASelfAttention(MultiLatentAttention):
         """Execute weight gradient computation"""
         self._backward_kv_proj()
         self._backward_q_proj()
+        if self.linear_gate is not None:
+            self.linear_gate.backward_dw()
         # For the 'dsa' experimental variant core_attention is DSAttention, whose
         # indexer linears defer their wgrads under delay_wgrad_compute and need an
         # explicit flush. For standard MLA the core is TEDotProductAttention, which

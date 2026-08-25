@@ -34,6 +34,7 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
+    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -262,15 +263,23 @@ class TransformerConfig(ModelParallelConfig):
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
-    """Apply a full head_dim output gate (num_attention_heads * head_dim rows
-    fused inline per-group [q, gate, k, v] into linear_qkv). Mutually
-    exclusive with `head_wise_attn_gate` (per-head scalar gate)."""
+    """Whether to apply output gating to attention layers.
 
+    The gate projection granularity is controlled by
+    ``gated_attention_proj_granularity``. It is mutually exclusive with
+    ``head_wise_attn_gate``.
+    """
+
+    gated_attention_proj_granularity: Literal['elementwise', 'headwise'] = "elementwise"
+    """Projection granularity for ``attention_output_gate``.
+
+    ``elementwise`` projects one gate per attention output element. ``headwise`` projects one
+    scalar gate per attention head and is currently supported only by Multi-Latent Attention.
+    """
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
     the shared model-level rotary_pos_emb is not created."""
-
     head_wise_attn_gate: bool = False
     """Apply a per-head scalar output gate (Step-3.5-Flash g_proj):
     num_attention_heads scalar gates fused as the trailing rows of
@@ -303,13 +312,22 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
-        None
-    )
-    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
+    experimental_attention_variant: Optional[
+        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
+    ] = None
+    """Type of experimental attention variant to use.
+
+    ``gdn`` and ``kda`` select Gated DeltaNet and Kimi Delta Attention, respectively.
+    ``gated_delta_net`` is a deprecated compatibility alias for ``gdn`` and is normalized in
+    ``__post_init__`` with a ``DeprecationWarning``.
+    """
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
-    """How THD sequence rows are partitioned across context-parallel ranks."""
+    """How THD sequence rows are partitioned across context-parallel ranks.
+
+    Contiguous partitioning is defined only for THD inputs; BSHD context parallelism uses the
+    standard zigzag layout.
+    """
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -326,12 +344,37 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_freq: int = 1
+    """Frequency of DSA indexer top-k computation across layers.
+    A value greater than 1 enables cross-layer top-k sharing."""
+
+    dsa_indexer_skip_topk_offset: int = 0
+    """Layer offset for DSA cross-layer top-k sharing."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
+    """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
+
+    dsa_indexer_rope_interleaved: bool = False
+    """Whether DSA indexer RoPE should use MLA-style interleaving."""
+
+    dsa_indexer_rotate_activation: bool = True
+    """Whether DSA indexer should apply Hadamard rotation before scoring."""
+
+    dsa_indexer_scoring_relu: bool = True
+    """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
+
+    dsa_indexer_k_norm_epsilon: Optional[float] = None
+    """Optional epsilon override for the DSA indexer key LayerNorm."""
+
+    dsa_indexer_k_norm_fp32: bool = False
+    """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -350,10 +393,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
 
-    apply_dsa_kernel_fusion: bool = False
-    """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
-    indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``
-    with CuTe-DSL support. When False, falls back to unfused PyTorch implementations."""
+    apply_dsa_kernel_fusion: Optional[bool] = None
+    """Deprecated DSv4 fused-kernel switch. Use ``dsa_kernel_backend`` instead. For
+    ``dsv4_hybrid`` only, True maps to ``cudnn`` and False maps to ``none``."""
 
     ####################
     # linear attention
@@ -382,6 +424,12 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    kda_safe_gate: bool = False
+    """Whether the KDA kernel should use bounded gate values."""
+
+    kda_lower_bound: Optional[float] = None
+    """Optional lower bound for KDA's bounded gate values."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
@@ -569,7 +617,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn".
+             "shared_experts", "mhc", "gdn", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -579,12 +627,15 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "mhc": recompute HyperConnection intermediate activations via
-            CheckpointWithoutOutput + CheckpointManager. Requires
+            CheckpointWithoutOutput + MHCCheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
-    "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
-            gated norm, CP all-to-all and out_proj). Requires
-            experimental_attention_variant="gated_delta_net".
-    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
+    "gdn": recompute the entire GDN-family layer, including GatedDeltaNet and KDA
+            (input projections, conv1d, gated delta rule, gated norm, CP all-to-all, and
+            out_proj). Requires a GDN-family experimental attention variant or a hybrid model.
+    "gdn_norm_out": recompute gated output normalization and layout restoration for
+            Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
@@ -1154,13 +1205,13 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
-    thd_max_packed_sequences: int = field(
-        default=32, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
+    thd_max_packed_sequences: Optional[int] = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
     )
-    """Maximum number of THD packed sequences per microbatch, including any dummy
-    sequence appended for a padding tail. The dp_balanced packing scheduler reserves
-    that dummy slot when THD padding appends one. When CUDA Graph is enabled, cu_seqlens
-    tensors are padded to this size + 1.
+    """Optional maximum number of THD packed sequences per microbatch, including any
+    dummy sequence appended for a padding tail. The dp_balanced packing scheduler reserves
+    that dummy slot when THD padding appends one. When set, cu_seqlens tensors are padded
+    to this size + 1 in both eager and CUDA Graph modes. THD CUDA Graph requires this value.
 
     Sizing guidance: choose a value that comfortably covers the worst-case packing,
     roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
@@ -1207,7 +1258,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers in each mHC recompute group.
 
     Layers are grouped in their local transformer-block order. The last layer in each group leaves
-    its final MLP BDA output uncheckpointed and closes the current ``CheckpointManager``; a new
+    its final MLP BDA output uncheckpointed and closes the current ``MHCCheckpointManager``; a new
     manager is created for the next group.
 
     In the standard forward path, the group-ending layer registers a unified recompute hook on its
@@ -1433,6 +1484,12 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        # Imported lazily because the module-spec module imports TransformerConfig.
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            is_gated_delta_net_variant,
+            normalize_experimental_attention_variant,
+        )
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1469,6 +1526,17 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
+
+        if self.gated_attention_proj_granularity not in ('elementwise', 'headwise'):
+            raise ValueError(
+                "gated_attention_proj_granularity must be either 'elementwise' or 'headwise', "
+                f"got {self.gated_attention_proj_granularity!r}."
+            )
+        if self.gated_attention_proj_granularity == 'headwise' and not self.multi_latent_attention:
+            raise ValueError(
+                "Regular attention does not support headwise "
+                "gated_attention_proj_granularity; use 'elementwise'."
+            )
 
         if (
             self.num_query_groups % self.tensor_model_parallel_size != 0
@@ -1528,73 +1596,159 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
+        if self.experimental_attention_variant is not None:
+            self.experimental_attention_variant = normalize_experimental_attention_variant(
+                self.experimental_attention_variant
+            )
+
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
-        if self.experimental_attention_variant == "dsv4_hybrid" and (
+        if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            assert (
-                self.sequence_packing_scheduler is not None
-            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
-
-        if self.context_parallel_size > 1:
+            if self.sequence_packing_scheduler is None:
+                raise ValueError(
+                    "cp_partition_mode='contiguous' with context parallelism requires THD "
+                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
+                    "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
+                )
             if (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and self.cp_partition_mode != "contiguous"
-            ):
-                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
-            if (
-                self.experimental_attention_variant != "dsv4_hybrid"
-                and self.cp_partition_mode != "zigzag"
+                (self.mtp_num_layers or 0) > 0
+                and self.tensor_model_parallel_size > 1
+                and self.sequence_parallel
             ):
                 raise ValueError(
-                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+                    "MTP with tensor_model_parallel_size > 1, sequence_parallel=True, and "
+                    "cp_partition_mode='contiguous' has a known token-side padding-mask layout "
+                    "bug. This combination is temporarily unsupported and will be fixed in a "
+                    "follow-up change."
                 )
 
-        if self.experimental_attention_variant in ["gated_delta_net"]:
-            assert (
-                self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear attention."
+        if self.context_parallel_size > 1:
+            if self.cp_partition_mode == "contiguous":
+                if (
+                    self.multi_latent_attention
+                    and self.experimental_attention_variant != "dsv4_hybrid"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is not supported with "
+                        "multi_latent_attention outside dsv4_hybrid."
+                    )
+                if self.experimental_attention_variant != "dsv4_hybrid" and not (
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' with context parallelism currently "
+                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'gdn', "
+                        "or 'kda'."
+                    )
+                if (
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
+                    and self.linear_cp_mode == "headwise"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "GDN-family linear_cp_mode='headwise'."
+                    )
+            elif self.cp_partition_mode == "zigzag":
+                if self.experimental_attention_variant == "dsv4_hybrid":
+                    raise ValueError(
+                        "DSv4 Hybrid with context parallelism requires "
+                        "cp_partition_mode='contiguous'."
+                    )
 
-            if self.experimental_attention_variant == "gated_delta_net":
+        # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
+        # selectors have been folded into experimental_attention_variant, and immediately
+        # before the centralized attention-variant validation consumes dsa_kernel_backend.
+        if self.apply_dsa_kernel_fusion is not None:
+            if self.experimental_attention_variant != "dsv4_hybrid":
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and ignored outside "
+                    "experimental_attention_variant='dsv4_hybrid'; use dsa_kernel_backend "
+                    "instead.",
+                )
+            else:
+                legacy_backend = "cudnn" if self.apply_dsa_kernel_fusion else "none"
+                if self.dsa_kernel_backend not in ("none", legacy_backend):
+                    raise ValueError(
+                        "Conflicting DSA kernel controls: "
+                        f"apply_dsa_kernel_fusion={self.apply_dsa_kernel_fusion} maps to "
+                        f"dsa_kernel_backend={legacy_backend!r}, but "
+                        f"dsa_kernel_backend={self.dsa_kernel_backend!r} was also selected. "
+                        "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
+                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and will be removed in a future "
+                    f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
+                )
+                self.dsa_kernel_backend = legacy_backend
+
+        if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if not self.is_hybrid_model:
+                assert (
+                    self.linear_attention_freq is not None
+                ), "linear_attention_freq must be set for linear attention."
                 if self.pad_packed_seq_alignment is not None:
-                    assert self.pad_packed_seq_by_appending_dummy_seq, (
-                        "gated_delta_net with pad_packed_seq_alignment requires "
-                        "pad_packed_seq_by_appending_dummy_seq."
+                    tail_policy = self.thd_tail_padding_policy or 'append_dummy_seq'
+                    assert tail_policy == 'append_dummy_seq', (
+                        "GDN-family attention with pad_packed_seq_alignment requires "
+                        "thd_tail_padding_policy='append_dummy_seq'."
                     )
 
-                # Check required parameters
-                assert (
-                    self.linear_conv_kernel_dim is not None
-                ), "linear_conv_kernel_dim must be set for gated delta net."
-                assert (
-                    self.linear_key_head_dim is not None
-                ), "linear_key_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_value_head_dim is not None
-                ), "linear_value_head_dim must be set for gated delta net."
-                assert (
-                    self.linear_num_key_heads is not None
-                ), "linear_num_key_heads must be set for gated delta net."
-                assert (
-                    self.linear_num_value_heads is not None
-                ), "linear_num_value_heads must be set for gated delta net."
-                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
-                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
-                    f"linear_num_key_heads ({self.linear_num_key_heads})."
-                )
-                if self.gdn_conv_pad_alignment is not None:
-                    assert self.gdn_conv_pad_alignment > 0, (
-                        f"gdn_conv_pad_alignment must be positive when set, "
-                        f"got {self.gdn_conv_pad_alignment}."
-                    )
+            # Required by both standalone GDN and hybrid KDA layers.
+            assert (
+                self.linear_conv_kernel_dim is not None
+            ), "linear_conv_kernel_dim must be set for a GDN-family layer."
+            assert (
+                self.linear_key_head_dim is not None
+            ), "linear_key_head_dim must be set for a GDN-family layer."
+            assert (
+                self.linear_value_head_dim is not None
+            ), "linear_value_head_dim must be set for a GDN-family layer."
+            assert (
+                self.linear_num_key_heads is not None
+            ), "linear_num_key_heads must be set for a GDN-family layer."
+            assert (
+                self.linear_num_value_heads is not None
+            ), "linear_num_value_heads must be set for a GDN-family layer."
 
-            if self.context_parallel_size > 1:
-                assert self.linear_cp_mode in ("headwise", "chunkwise"), (
-                    f"linear_cp_mode must be one of 'headwise' or 'chunkwise', "
+            if self.experimental_attention_variant == "kda":
+                if self.linear_num_key_heads != self.linear_num_value_heads:
+                    raise ValueError("KDA requires equal key and value head counts.")
+                if self.linear_key_head_dim != self.linear_value_head_dim:
+                    raise ValueError("KDA requires equal key and value head dimensions.")
+                if self.kda_safe_gate:
+                    if self.kda_lower_bound is None:
+                        raise ValueError("KDA requires kda_lower_bound when kda_safe_gate=True.")
+                    if not (-5.0 <= self.kda_lower_bound < 0.0):
+                        raise ValueError(
+                            "KDA requires kda_lower_bound to be in [-5, 0) "
+                            "when kda_safe_gate=True."
+                        )
+
+            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                f"linear_num_key_heads ({self.linear_num_key_heads})."
+            )
+            if (
+                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+            ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
+                raise ValueError(
+                    f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
                     f"got {self.linear_cp_mode!r}."
                 )
+            if self.gdn_conv_pad_alignment is not None:
+                assert self.gdn_conv_pad_alignment > 0, (
+                    f"gdn_conv_pad_alignment must be positive when set, "
+                    f"got {self.gdn_conv_pad_alignment}."
+                )
+
+            if self.context_parallel_size > 1:
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
@@ -1615,8 +1769,37 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
-        elif self.experimental_attention_variant == "dsa":
-            pass
+        if self.experimental_attention_variant == "dsa":
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if self.add_bias_linear:
+                raise ValueError(
+                    "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "
+                    "Disable linear bias for DSA configs."
+                )
+            if self.dsa_indexer_topk_freq < 1:
+                raise ValueError(
+                    f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
+                )
+            if self.dsa_indexer_skip_topk_offset < 0:
+                raise ValueError(
+                    "dsa_indexer_skip_topk_offset must be non-negative, got "
+                    f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if self.context_parallel_size > 1:
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                assert all(
+                    cp_comm_type is not None
+                    and cp_comm_type.replace("_", "").lower() == "allgather"
+                    for cp_comm_type in cp_comm_types
+                ), (
+                    "DSAttention context parallelism currently supports "
+                    "cp_comm_type=allgather only."
+                )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -1640,13 +1823,17 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
-            if self.apply_dsa_kernel_fusion:
-                assert (
-                    torch.cuda.is_available()
-                ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
+            if self.dsa_kernel_backend == "tilelang":
+                raise ValueError(
+                    "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
+                    "for fused CSA kernels or 'none' for the PyTorch fallback."
+                )
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+
+            if self.dsa_kernel_backend == "cudnn":
                 sm = torch.cuda.get_device_capability()
                 assert sm[0] >= 9, (
-                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
+                    f"dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
                 uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
@@ -1660,36 +1847,10 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
                         "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
-                        "this path. Use sparse indexer loss or disable DSA kernel fusion."
+                        "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
 
-                _flash_mla_available = True
-                try:
-                    from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-                except ImportError:
-                    _flash_mla_available = False
-
-                _cudnn_dsa_available = True
-                try:
-                    from cudnn import DSA  # noqa: F401
-                except ImportError:
-                    _cudnn_dsa_available = False
-
-                if not _flash_mla_available or not _cudnn_dsa_available:
-                    missing = []
-                    if not _flash_mla_available:
-                        missing.append(
-                            "flash_mla (install from "
-                            "https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
-                        )
-                    if not _cudnn_dsa_available:
-                        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
-                    raise ValueError(
-                        f"apply_dsa_kernel_fusion requires fused DSA kernels, but the "
-                        f"following packages are not available: {', '.join(missing)}. "
-                        f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
-                        f"PyTorch fallback."
-                    )
+                from cudnn import DSA
 
                 if (
                     self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -1713,16 +1874,18 @@ class TransformerConfig(ModelParallelConfig):
                             "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
                             "with q_causal_offsets support; missing from: "
                             f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
-                            "build or disable DSA kernel fusion."
+                            "build or set dsa_kernel_backend='none'."
                         )
 
-        if (
-            self.gdn_pre_gated_delta_rule_fusion
-            and self.experimental_attention_variant != "gated_delta_net"
-        ):
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
+            raise NotImplementedError(
+                "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
+            )
+
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gated_delta_net'."
+                "experimental_attention_variant='gdn'."
             )
 
         if self.fp8:
@@ -2103,6 +2266,7 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn",
+                    "gdn_norm_out",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2122,14 +2286,30 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
-                "gdn" in self.recompute_modules
-                and self.experimental_attention_variant != "gated_delta_net"
+                "gdn_norm_out" in self.recompute_modules
+                and not self.is_hybrid_model
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
-                    "gdn in recompute_modules is only supported with "
-                    "experimental_attention_variant='gated_delta_net'."
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    f"GDN-family layers, but got {self.experimental_attention_variant=}."
                 )
 
+            if (
+                "gdn" in self.recompute_modules
+                and not self.is_hybrid_model
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
+            ):
+                raise ValueError(
+                    "gdn in recompute_modules is only supported with GDN-family layers, but got "
+                    f"{self.experimental_attention_variant=} and {self.is_hybrid_model=}."
+                )
+
+            if "gdn" in self.recompute_modules and "gdn_norm_out" in self.recompute_modules:
+                raise ValueError(
+                    "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
+                    "'gdn' recomputes the full GDN-family layer, including gated norm."
+                )
             if "core_attn" in self.recompute_modules:
                 warnings.warn(
                     "If you are using transformer_engine as the transformer implementation, "
@@ -2201,7 +2381,11 @@ class TransformerConfig(ModelParallelConfig):
                 # the backward chunk, so tensor_pop hits a None chunk for these modules.
                 # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
                 # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
-                # checkpoints, so they are safe to use with mHC recompute.
+                # checkpoints, so they are safe to use with mHC recompute -- except
+                # under the attention-only CUDA Graph split, which narrows the three
+                # attention-scope modules further down in __post_init__ (the split
+                # predicate needs normalized cuda_graph_modules, which are not
+                # available yet here).
                 _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
                 conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
                 if conflicting:
@@ -2214,22 +2398,60 @@ class TransformerConfig(ModelParallelConfig):
                         f"recompute_modules."
                     )
 
+        use_mhc_recompute = (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        )
+        # NOTE: the mHC-recompute/CUDA-graph capability gate lives further down in
+        # __post_init__, after cuda_graph_modules normalization and the deprecated
+        # enable_cuda_graph/external_cuda_graph migration, so that string module
+        # forms and legacy flags reach the same gate.
+
+        # The attention-only Transformer Engine split keeps the mHC producer and
+        # its checkpoint registration eager per microbatch (only input-layernorm
+        # + self-attention are captured), so it composes with EP a2a overlap:
+        # the captured attention backward reads the fixed arena slot that the
+        # group-end recompute node repopulates by direct kernel output.
+        # Full-iteration capture is also valid because it records the explicit
+        # schedule barrier and its fixed-address recompute kernels as part of
+        # the iteration graph. Other per-layer graph forms remain rejected.
+        # Normalize locally: cuda_graph_modules is only normalized in bulk further
+        # down in __post_init__, so a config built directly (rather than through
+        # megatron/training/arguments.py) still holds string forms like ["attn"]
+        # here. Comparing them raw would reject a combination the later gate
+        # accepts, and the string form is part of this field's declared type.
+        normalized_graph_modules, _, _ = normalize_cuda_graph_modules(self.cuda_graph_modules)
+        is_te_attn_split = (
+            self.cuda_graph_impl == "transformer_engine"
+            and not self.enable_cuda_graph
+            and not self.external_cuda_graph
+            and list(normalized_graph_modules or []) == [CudaGraphModule.attn]
+            and list(self.recompute_modules) == ["mhc"]
+        )
+        is_full_iteration = (
+            self.cuda_graph_impl == "full_iteration"
+            and not self.enable_cuda_graph
+            and not self.external_cuda_graph
+        )
         if (
             self.overlap_moe_expert_parallel_comm
-            and self.recompute_granularity == "selective"
-            and "mhc" in self.recompute_modules
+            and use_mhc_recompute
+            and not is_te_attn_split
+            and not is_full_iteration
             and (
                 self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
             )
         ):
             raise ValueError(
                 "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
-                "to be disabled because explicit group replay is eager-only."
+                "to be disabled, except for the attention-only Transformer Engine split "
+                "(cuda_graph_impl='transformer_engine', cuda_graph_modules=[attn], "
+                "recompute_modules=[mhc]) or full-iteration capture "
+                "(cuda_graph_impl='full_iteration', hidden_dropout=0, "
+                "attention_dropout=0), because other graph scopes cannot represent the "
+                "explicit schedule-owned recompute barrier."
             )
 
-        if self.enable_hyper_connections and not (
-            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
-        ):
+        if self.enable_hyper_connections and not use_mhc_recompute:
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
@@ -2578,7 +2800,18 @@ class TransformerConfig(ModelParallelConfig):
                     "It is experimental and may change in future versions."
                 )
             else:
-                if self.rotary_interleaved:
+                fused_mrope_available = False
+                # Triton fused mRoPE supports split-half RoPE only. Keep rotary_interleaved
+                # configs on the TE validation path so the TE >= 2.3 check still applies.
+                if self.mrope_section is not None and not self.rotary_interleaved:
+                    try:
+                        from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                        fused_mrope_available = is_fused_mrope_available()
+                    except ImportError:
+                        fused_mrope_available = False
+
+                if self.rotary_interleaved and not fused_mrope_available:
                     if not is_te_min_version("2.3.0"):
                         raise ValueError(
                             "rotary_interleaved does not work with apply_rope_fusion for "
@@ -2590,9 +2823,14 @@ class TransformerConfig(ModelParallelConfig):
                     fused_apply_rotary_pos_emb_thd,
                 )
 
-                if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
+                if (
+                    fused_apply_rotary_pos_emb is None
+                    and fused_apply_rotary_pos_emb_thd is None
+                    and not fused_mrope_available
+                ):
                     raise ValueError(
-                        "apply_rope_fusion is not available. Please install TE >= 1.4."
+                        "apply_rope_fusion is not available. Please install TE >= 1.4 "
+                        "or Triton for fused mRoPE."
                     )
 
         if self.fused_single_qkv_rope:
@@ -2903,6 +3141,118 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        # mHC selective recompute couples with CUDA graphs only through the guarded
+        # attention-only Transformer Engine split. This gate must stay below the
+        # cuda_graph_modules normalization and the deprecated flag migration above:
+        # earlier placement would compare unnormalized string module forms and let
+        # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
+        if use_mhc_recompute and self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl == "local":
+                # Intentionally fail-closed even for inference-only local-graph
+                # configs that carry leftover training recompute args: mHC
+                # recompute is inert outside training, but silently accepting
+                # the combination would mask misconfigured training runs.
+                raise ValueError(
+                    "mHC recompute is not supported with cuda_graph_impl='local': "
+                    "eager mHC recompute and its per-microbatch checkpoint "
+                    "registration need host execution between captured segments, "
+                    "which the local per-layer implementation does not provide. Use "
+                    "cuda_graph_impl='transformer_engine' with "
+                    "cuda_graph_modules=['attn'], cuda_graph_impl='full_iteration' "
+                    "with dropout disabled, or disable CUDA graphs."
+                )
+            if self.cuda_graph_impl == "full_iteration":
+                # Full-iteration capture records the whole eager iteration —
+                # including mHC checkpoint registration, recompute kernels, and
+                # storage rebinding — into one graph, so replays re-execute the
+                # recompute at fixed addresses by construction (no partial-graph
+                # bridge involved). The one mechanical hazard is RNG-consuming
+                # ops inside a checkpointed region: the recompute-time RNG rewind
+                # cannot run under stream capture, so a captured recompute would
+                # replay a different dropout mask than its captured forward.
+                if self.hidden_dropout != 0.0 or self.attention_dropout != 0.0:
+                    raise ValueError(
+                        "mHC recompute with cuda_graph_impl='full_iteration' requires "
+                        "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
+                        "rewound inside CUDA graph capture, so a captured recompute "
+                        "would replay a different dropout mask than its forward pass."
+                    )
+            elif list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+                self.recompute_modules
+            ) != ["mhc"]:
+                raise ValueError(
+                    "mHC recompute with Transformer Engine CUDA Graphs currently supports "
+                    "only the initial attention-only split: cuda_graph_modules=[attn] and "
+                    "recompute_modules=[mhc]. The eager mHC producer must remain outside "
+                    "the captured consumer."
+                )
+            if (
+                self.cuda_graph_impl == "transformer_engine"
+                and self.fine_grained_activation_offloading
+            ):
+                # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
+                # TransformerLayer's implementation rather than extending it, so it
+                # never plants the offload synchronization edges the full-layer
+                # capture plants -- backward_record() on the graph input and
+                # forward_record() after capture. _set_offload_modules plants those
+                # exactly for the attention-scope modules under an attn-scope graph,
+                # so without them the offload copies race the captured attention.
+                attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
+                    self.offload_modules or []
+                )
+                if attn_scope_offload:
+                    raise ValueError(
+                        f"mHC recompute with attention-only TE CUDA Graphs is incompatible "
+                        f"with offload_modules {sorted(attn_scope_offload)}. The split "
+                        f"capture path omits the offload stream synchronization the "
+                        f"full-layer capture path performs, so the offload copies can race "
+                        f"the captured attention. Remove {sorted(attn_scope_offload)} from "
+                        f"offload_modules, or drop 'attn' from cuda_graph_modules."
+                    )
+                # The replay half of the same gap is fixed, not rejected: see
+                # _replay_mhc_attention_consumer.
+            if self.virtual_pipeline_model_parallel_size is not None:
+                # VPP is admitted only together with EP overlap. Interleaving used
+                # to diverge here (grad norms ~1e8 from the first iteration) on a
+                # caching-allocator use-after-free: mHC post-processing ran inside
+                # the communication-stream combine node, so the recompute subgraph
+                # was allocated on the compute stream and read from another, a
+                # window the allocator cannot track. The fix -- the post node owning
+                # a compute-stream schedule node -- lives in the overlap schedule,
+                # so the non-overlap VPP path has never carried it and stays
+                # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
+                # pre_process chunk carries a data iterator.
+                if not self.overlap_moe_expert_parallel_comm:
+                    raise ValueError(
+                        "mHC recompute supports interleaved pipeline (VPP) "
+                        "schedules only together with "
+                        "overlap_moe_expert_parallel_comm: the non-overlap VPP "
+                        "path is unvalidated."
+                    )
+
+        cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (
+            self.cuda_graph_impl in ("local", "transformer_engine")
+            and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
+        )
+
+        cp_layout_conversion_required = is_gated_delta_net_variant(
+            self.experimental_attention_variant
+        )
+        if (
+            (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+            and self.sequence_packing_scheduler is not None
+            and cuda_graph_captures_attention
+            and cp_layout_conversion_required
+        ):
+            raise ValueError(
+                "THD context parallel layout conversion is required for this model "
+                "configuration, but it is not supported by CUDA graph capture that includes "
+                "attention "
+                f"(experimental_attention_variant={self.experimental_attention_variant!r}, "
+                f"cuda_graph_impl={self.cuda_graph_impl!r}, "
+                f"cuda_graph_modules={self.cuda_graph_modules!r})."
+            )
+
         if self.cuda_graph_impl != "none":
 
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
@@ -3136,15 +3486,60 @@ class TransformerConfig(ModelParallelConfig):
                 'flex',
             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
-            assert (
-                self.recompute_granularity != 'full'
-            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_method is None
-            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_num_layers is None
-            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            if self.recompute_granularity == 'full':
+                # Full recompute runs per layer segment; recompute_method /
+                # recompute_num_layers control the decoder grouping and are validated by
+                # the shared checks above. MTP under 'block' and the FP8/FP4 block window
+                # intentionally differ from the non-overlap checkpoint path. See
+                # megatron/core/models/common/model_chunk_schedule_plan.py.
+                # The replay is hand-rolled rather than a checkpoint primitive, so it
+                # cannot shard the retained segment input across TP ranks.
+                assert not self.distribute_saved_activations, (
+                    'overlap_moe_expert_parallel_comm full recompute does not support '
+                    'distribute_saved_activations: the segment replay does not go through '
+                    'a checkpoint primitive, so the retained input is not sharded.'
+                )
+                # MTP is segmented under both methods here, so unlike
+                # MultiTokenPredictionLayer._checkpointed_forward there is no 'block'
+                # exemption. The 'uniform' restriction below is config parity with that
+                # function's own assert, not a constraint of this schedule - multi-layer
+                # decoder segments hand the mHC bridge over correctly.
+                if self.mtp_num_layers and self.recompute_method == 'uniform':
+                    assert (
+                        self.recompute_num_layers == 1
+                    ), 'recompute_num_layers must be 1 for MTP recompute'
+                # With dropout the forward RNG stream is interleaved across microbatches
+                # in the 1F1B schedule and cannot yet be faithfully replayed.
+                assert self.attention_dropout == 0.0 and self.hidden_dropout == 0.0, (
+                    'overlap_moe_expert_parallel_comm full recompute currently requires '
+                    'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '
+                    'interleaved 1F1B schedule is not yet supported for nonzero dropout)'
+                )
+                # Delayed-scaling FP8 accumulates amax into a persistent
+                # amax_history across microbatches. Both the initial no_grad forward
+                # and the backward-time recompute run under the delayed FP8 autocast,
+                # and this path does not enter TE's activation-recompute
+                # (recompute_phase) machinery that te_checkpoint uses to snapshot and
+                # restore FP8 metadata, so the recompute would update amax_history a
+                # second time and silently diverge. Current-scaling recipes
+                # (tensorwise / mxfp8 / blockwise) derive scales from the current
+                # tensor each pass, so the replayed forward re-derives identical
+                # scales (validated bitwise-identical to recompute-off); only delayed
+                # scaling is rejected here.
+                assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.delayed), (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'with delayed-scaling FP8 (fp8_recipe="delayed"): the backward-time '
+                    'recompute would double-update the persistent amax_history. Use a '
+                    'current-scaling recipe (tensorwise / mxfp8 / blockwise) instead.'
+                )
+            else:
+                assert self.recompute_method is None, (
+                    'disable recomputation method when enabling ' 'overlap_moe_expert_parallel_comm'
+                )
+                assert self.recompute_num_layers is None, (
+                    'recompute_num_layers must be None when enabling '
+                    'overlap_moe_expert_parallel_comm'
+                )
             assert (
                 "moe" not in self.recompute_modules
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
@@ -3336,6 +3731,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
+            if self.thd_max_packed_sequences is None:
+                raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")
             assert (
                 self.pad_packed_seq_alignment is not None
             ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
@@ -3346,6 +3743,21 @@ class TransformerConfig(ModelParallelConfig):
                 "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
+
+        # 'extend_last' THD tail padding with context parallelism requires the
+        # global metadata to be extended before CP slicing, which only the
+        # sequence-packing scheduler path performs. Restrict this combination.
+        if (
+            self.sequence_packing_scheduler is None
+            and self.pad_packed_seq_alignment is not None
+            and (self.thd_tail_padding_policy or 'append_dummy_seq') == 'extend_last'
+            and (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+        ):
+            raise ValueError(
+                "thd_tail_padding_policy='extend_last' with context parallelism is only "
+                "supported together with a sequence_packing_scheduler. Either enable a "
+                "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
             )
 
         if self.sequence_packing_scheduler is not None:
@@ -3468,8 +3880,16 @@ class MLATransformerConfig(TransformerConfig):
         ):
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
-        if self.attention_output_gate:
-            raise NotImplementedError("Output gate is not supported for MLA yet.")
+        if self.attention_output_gate and self.mla_down_proj_fusion:
+            # Fused MLA hides the post-input-LayerNorm activation inside the fused
+            # LayerNorm+linear module. Gated MLA must consume that activation as the
+            # gate input; using raw hidden_states would silently change the model.
+            # Keep this combination fail-fast until the fused API exposes the
+            # normalized activation.
+            raise ValueError(
+                "MLA output gating does not support fused down projections; "
+                "disable mla_down_proj_fusion to use the unfused path."
+            )
 
         # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
         if self.experimental_attention_variant == "dsv4_hybrid":

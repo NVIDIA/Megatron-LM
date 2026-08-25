@@ -18,8 +18,10 @@ from megatron.core.datasets.data_schedule_utils import (
 )
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
+    extend_thd_padding_before_cp_slice,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
 )
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -29,7 +31,11 @@ from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 def _build_thd_padding_mask(
     cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
 ) -> torch.Tensor:
-    """Build a 1D THD padding mask from scheduler sequence metadata."""
+    """Build a 1D THD padding mask from packed-sequence metadata.
+
+    True marks physical slots that carry no valid tokens, covering both
+    inter-sequence gaps and the padding tail of the final sequence.
+    """
     assert cu_seqlens.dim() == 1
     assert cu_seqlens_padded.dim() == 1
     assert cu_seqlens.numel() == cu_seqlens_padded.numel()
@@ -312,12 +318,10 @@ class DpBalancedScheduler(BasePackingScheduler):
                 ), f"Batch missing required key {key}, provided keys: {batch[0].keys()}"
 
             # Step 3: Strip data fields not needed by this PP stage to avoid
-            # unnecessary all-to-all communication. First PP needs tokens/position_ids,
+            # unnecessary rerouting communication. First PP needs tokens/position_ids,
             # last PP needs labels/loss_mask. MTP stages need all four.
-            # NOTE: this assumes _unpack_batch produces only the six keys below
-            # (tokens, position_ids, labels, loss_mask, original_seq_len,
-            # padded_seq_len). Any custom dataset metadata key outside this set
-            # would be silently dropped here; extend keys_to_keep if needed.
+            # DpBalancedScheduler supports the six fields below. Extend keys_to_keep
+            # and the reroute schema together when adding custom dataset metadata.
             keys_to_keep = {'original_seq_len', 'padded_seq_len'}
             if is_first_pp or mtp_on_this_pp:
                 keys_to_keep.update(['tokens', 'position_ids'])
@@ -349,9 +353,7 @@ class DpBalancedScheduler(BasePackingScheduler):
                 sample_id_groups,
                 offsets,
                 dp_group,
-                tp_group,
                 dp_cp_group,
-                total_dcp_gpus,
             )
 
             dcp_rank = dp_cp_group.rank()
@@ -376,7 +378,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             ) = (None, None, None, None)
 
         # Broadcast to TP group (for non-TP-0 ranks)
-        (num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) = (
+        num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
             broadcast_scalars(
                 [
                     num_micro_batches,
@@ -467,8 +469,9 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
     if max_num_seqs < 1:
         raise ValueError(f"thd_max_packed_sequences must be >= 1, got {max_num_seqs}.")
 
-    if getattr(config, 'pad_packed_seq_alignment', None) is not None and getattr(
-        config, 'pad_packed_seq_by_appending_dummy_seq', True
+    if (
+        getattr(config, 'pad_packed_seq_alignment', None) is not None
+        and resolve_thd_tail_padding_policy(config) == 'append_dummy_seq'
     ):
         if max_num_seqs < 2:
             raise ValueError(
@@ -631,7 +634,9 @@ def get_batch_on_this_rank_for_sequence_packing(
         )
 
     cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
+    tail_padding_policy = resolve_thd_tail_padding_policy(config)
     contiguous_cp_local_target_len = None
+    non_dummy_global_target_len = None
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
     )
@@ -666,17 +671,35 @@ def get_batch_on_this_rank_for_sequence_packing(
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
+        # In extend_last mode, the padding tail belongs to the final real
+        # sequence. Extend its global physical endpoint before CP slicing so
+        # both zigzag indices and contiguous rank origins see the padded layout.
+        if pad_alignment is not None and tail_padding_policy == 'extend_last':
+            batch['cu_seqlens_padded'], batch['max_seqlen'], non_dummy_global_target_len = (
+                extend_thd_padding_before_cp_slice(
+                    batch['cu_seqlens_padded'],
+                    batch['max_seqlen'],
+                    alignment=alignment,
+                    target_len=(
+                        target_len if target_len is not None else contiguous_cp_local_target_len
+                    ),
+                    cp_size=cp_group.size(),
+                    cp_partition_mode=cp_partition_mode,
+                )
+            )
+
     # Partition sequence tensors for context parallelism. Padding mask is needed
     # on every PP stage, while data tensors are only needed on first/last/MTP stages.
     if is_tp_rank_0:
         cp_slice_keys = ['padding_mask']
         if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
-        partition_total_tokens = (
-            contiguous_cp_local_target_len * cp_group.size()
-            if contiguous_cp_local_target_len is not None
-            else None
-        )
+        if non_dummy_global_target_len is not None:
+            partition_total_tokens = non_dummy_global_target_len
+        elif contiguous_cp_local_target_len is not None:
+            partition_total_tokens = contiguous_cp_local_target_len * cp_group.size()
+        else:
+            partition_total_tokens = None
         get_cp_slice_for_thd(
             batch,
             cp_group,
@@ -823,12 +846,14 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size=local_cp_size,
         cp_group=cp_group,
         cp_partition_mode=cp_partition_mode,
-        pad_between_seqs=False,
+        pad_between_seqs=True,
     )
 
-    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    if pad_alignment is not None and packed_seq_params is not None:
+    # Dummy metadata is appended after CP slicing as an ordinary sequence.
+    # Non-dummy tensors and their final padded endpoint were extended before
+    # slicing; this call is then a no-op except for fixed-capacity cu_seqlens
+    # entries in eager or graph mode.
+    if pad_alignment is not None:
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,
@@ -839,9 +864,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
-                pad_by_appending_dummy_seq=getattr(
-                    config, 'pad_packed_seq_by_appending_dummy_seq', True
-                ),
+                tail_padding_policy=tail_padding_policy,
                 padding_mask=padding_mask,
                 cp_group=cp_group,
             )

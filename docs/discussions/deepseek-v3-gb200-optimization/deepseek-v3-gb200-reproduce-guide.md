@@ -25,6 +25,7 @@ RUN rm -rf /opt/megatron-lm && \
     apt-get update && \
     apt-get install -y sudo gdb bash-builtins git zsh autojump tmux curl gettext libfabric-dev && \
     wget https://github.com/mikefarah/yq/releases/download/v4.27.5/yq_linux_arm64 -O /usr/bin/yq && \
+    echo "ea360a0ecdff30c8625ccd0b97f8714b8308a429fd839cf8ccc481f311e217c6  /usr/bin/yq" | sha256sum --check - && \
     chmod +x /usr/bin/yq
 
 # =========================

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
 import builtins
@@ -367,6 +367,26 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
             )
 
 
+def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
+    """Resolve an omitted --dsa-kernel-backend flag to its effective backend.
+
+    The CLI flag carries no static default so an omitted flag is distinguishable
+    from an explicit "none". DSv4 hybrid launches historically ran fused kernels
+    by default (the deprecated --no-dsa-kernel-fusion flag defaulted to True), so
+    an omitted flag resolves to "cudnn" for that variant unless the deprecated
+    switch was passed; every other configuration resolves to "none". Runs before
+    TransformerConfig.__post_init__ folds the deprecated switch into
+    dsa_kernel_backend, so explicit legacy values still win.
+    """
+    if 'dsa_kernel_backend' not in kw_args or kw_args['dsa_kernel_backend'] is not None:
+        return
+    variant = kw_args.get('experimental_attention_variant') or kw_args.get('linear_attention_type')
+    if variant == 'dsv4_hybrid' and getattr(args, 'apply_dsa_kernel_fusion', None) is None:
+        kw_args['dsa_kernel_backend'] = 'cudnn'
+    else:
+        kw_args['dsa_kernel_backend'] = 'none'
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -443,6 +463,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         pattern = args.hybrid_layer_pattern
+        has_kda = Symbols.KDA in pattern
         has_dsv4_csa = any(s in pattern for s in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA))
         has_dsa = Symbols.DS_ATTENTION in pattern
         if getattr(args, 'experimental_attention_variant', None) is None:
@@ -450,8 +471,12 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
 
         _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
+
+    _resolve_dsa_kernel_backend_cli_default(args, kw_args)
 
     kw_args['inference_sampling_seed'] = args.seed
 

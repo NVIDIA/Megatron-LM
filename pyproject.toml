@@ -85,7 +85,7 @@ mlm = [
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
-    "nvidia-resiliency-ext",
+    "nvidia-resiliency-ext==0.6.0",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
@@ -94,8 +94,8 @@ dev = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "flash-linear-attention>=0.4.2,<0.5",
-    "megatron-energon[av_decode]~=6.0",
+    "flash-linear-attention[tilelang]==0.5.1",
+    "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
     "nvidia-cudnn-frontend[cutedsl]",
@@ -163,7 +163,7 @@ build = [
 ]
 linting = [
     "ruff~=0.9.0",
-    "black==24.4.2",
+    "black==26.3.0",
     "isort==5.13.2",
     "flake8==7.1.0",
     "pylint==3.2.6",
@@ -190,7 +190,33 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
+    "urllib3>=2.6.3",
 ]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0+b7643bd"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine"
+version = "2.14.0+f031cf87"
+requires-dist = [
+    "einops",
+    "importlib-metadata",
+    "nvdlfw-inspect",
+    "onnx",
+    "onnxscript",
+    "packaging",
+    "pydantic",
+    "torch",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "fast-hadamard-transform"
+version = "1.0.4.post1"
+requires-dist = ["torch", "packaging", "ninja"]
 
 [tool.uv.sources]
 
@@ -202,7 +228,6 @@ transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", 
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
@@ -219,7 +244,7 @@ line_length = 100
 skip_string_normalization = true
 # recognized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
-required_version = "24"
+required_version = "26"
 skip_magic_trailing_comma = true
 include = '\.pyi?$'
 exclude = '''

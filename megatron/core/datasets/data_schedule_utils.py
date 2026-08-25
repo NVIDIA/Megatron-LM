@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import lru_cache
 from math import ceil, log2
@@ -10,6 +10,17 @@ from megatron.core.extensions.transformer_engine import get_thd_partitioned_indi
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 _DYNAMIC_CP_WORKLOAD_CAP_DELTA = 0.05
+
+_REROUTE_KEY_ORDER = (
+    "tokens",
+    "labels",
+    "loss_mask",
+    "position_ids",
+    "original_seq_len",
+    "padded_seq_len",
+)
+_REROUTE_KEY_SET = frozenset(_REROUTE_KEY_ORDER)
+_REROUTE_SCALAR_KEYS = frozenset(("original_seq_len", "padded_seq_len"))
 
 
 def get_cp_slice_for_thd(
@@ -34,7 +45,7 @@ def get_cp_slice_for_thd(
             before slicing. Existing cu_seqlens metadata is left unchanged.
     """
     cp_size = cp_group.size()
-    if cp_size <= 1:
+    if cp_size <= 1 and partition_total_tokens is None:
         return
     cp_rank = cp_group.rank()
     # Partition with padded cumulative lengths so CP slices match the THD
@@ -63,6 +74,8 @@ def get_cp_slice_for_thd(
             if pad_len > 0:
                 pad_value = True if key == 'padding_mask' else 0
                 batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
+    if cp_size <= 1:
+        return
     if cp_partition_mode == "contiguous":
         if total_tokens % cp_size != 0:
             raise RuntimeError(
@@ -80,7 +93,10 @@ def get_cp_slice_for_thd(
     if cp_partition_mode != "zigzag":
         raise ValueError(f"Unsupported CP partition mode: {cp_partition_mode}")
 
-    index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+    cu_seqlens_for_index = (
+        cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(dtype=torch.int32)
+    )
+    index = get_thd_partitioned_indices(cu_seqlens_for_index, total_tokens, cp_size, cp_rank)
     for key in keys:
         if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)
@@ -340,122 +356,120 @@ def create_data_iterator(
 
 
 def reroute_samples_to_dcp_ranks(
-    batch,
-    global_ids_this_rank,
-    global_id_seqlens,
-    sample_id_groups,
-    offsets,
-    dp_group,
-    tp_group,
-    dp_cp_group,
-    total_dcp_gpus,
+    batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets, dp_group, dp_cp_group
 ):
     """
     Reroutes the sub-samples to the correct rank after scheduling.
 
-    For each key in the batch dict, we perform an all-to-all communication
-    to transfer the data to the correct ranks.
+    Each CP lane gathers the samples from its DP group, then keeps only the
+    samples assigned to its DPxCP rank. Gathering within ``dp_group`` avoids
+    collecting the identical input held by every CP sibling and avoids the
+    fully connected P2P transport created by NCCL all-to-all.
+
+    All ranks in ``dp_group`` must provide the same set of data keys. CP siblings
+    that share a non-CP DP rank must additionally provide byte-identical sample
+    contents. This holds for the in-tree samplers, which use the non-CP DP rank
+    to select dataset indices.
+
+    The gather is intentionally issued one data key at a time. This pays the
+    fixed collective latency once per key, but bounds temporary memory to one
+    global field at a time. Selected slices are cloned before advancing to the
+    next key so the full gather buffer can be freed.
     """
 
-    def _gid_to_src_rank(gid: int) -> int:
-        dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
-        dcp_rank = (
-            torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
-        ) % dp_cp_group.size()
-        return dcp_rank
-
-    gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
     dcp_rank = dp_cp_group.rank()
-    dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
-    dp_ranks = [(r // tp_group.size()) % dp_cp_group.size() for r in dp_ranks]
+    dp_rank = dp_group.rank()
+    dp_size = dp_group.size()
 
-    data_keys = batch[0].keys()
-
-    # Create the send plan
-    combined_sample_id_groups: List[List[int]] = [[] for _ in range(total_dcp_gpus)]
-    for d in range(total_dcp_gpus):
-        for sample_id_group in sample_id_groups:
-            combined_sample_id_groups[d].extend(sample_id_group[d])
-    for dest_rank in range(total_dcp_gpus):
-        combined_sample_id_groups[dest_rank].sort()
-
-    send_ids_sorted = [
-        gid for d in dp_ranks for gid in combined_sample_id_groups[d] if gid in global_ids_this_rank
-    ]
-
-    send_num_split = [0] * total_dcp_gpus
-    send_lens_split = [0] * total_dcp_gpus
-    for dest_rank in range(total_dcp_gpus):
-        if dest_rank in dp_ranks:
-            send_seq_lens = [
-                global_id_seqlens[gid][1]
-                for gid in combined_sample_id_groups[dest_rank]
-                if gid in global_ids_this_rank
-            ]
-            send_num_split[dest_rank] = len(send_seq_lens)
-            send_lens_split[dest_rank] = sum(send_seq_lens)
-        else:
-            send_lens_split[dest_rank] = 0
-
-    # Create the recv plan
-    recv_sample_id_groups = [[] for _ in range(total_dcp_gpus)]
-    for gid in combined_sample_id_groups[dcp_rank]:
-        src_rank = _gid_to_src_rank(gid)
-        recv_sample_id_groups[src_rank].append(gid)
-
-    recv_lens_split = [0] * total_dcp_gpus
-    for src_rank in range(total_dcp_gpus):
-        recv_lens_split[src_rank] = sum(
-            [global_id_seqlens[gid][1] for gid in recv_sample_id_groups[src_rank]]
+    # Keep collective ordering independent of dictionary insertion order. Unknown
+    # keys require an explicit layout classification rather than being silently dropped.
+    batch_keys = set(batch[0])
+    unsupported_keys = batch_keys - _REROUTE_KEY_SET
+    assert not unsupported_keys, (
+        f"Cannot reroute unsupported sample keys {sorted(unsupported_keys)}; "
+        "extend _REROUTE_KEY_ORDER and classify their element layout."
+    )
+    for sample_idx, sample in enumerate(batch[1:], start=1):
+        sample_keys = set(sample)
+        assert sample_keys == batch_keys, (
+            f"Sample {sample_idx} keys {sorted(sample_keys)} do not match sample 0 keys "
+            f"{sorted(batch_keys)}."
         )
+    data_keys = [key for key in _REROUTE_KEY_ORDER if key in batch_keys]
 
-    recv_ids_sorted = [gid for d in range(total_dcp_gpus) for gid in recv_sample_id_groups[d]]
-    recv_counts = [len(recv_sample_id_groups[d]) for d in range(total_dcp_gpus)]
+    offset_values = [int(value) for value in offsets.tolist()]
+    assert (
+        len(offset_values) == dp_size + 1
+    ), f"Expected {dp_size + 1} DP offsets, got {len(offset_values)}."
+    local_ids = [int(gid) for gid in global_ids_this_rank.tolist()]
+    expected_local_ids = list(range(offset_values[dp_rank], offset_values[dp_rank + 1]))
+    assert (
+        local_ids == expected_local_ids
+    ), f"Local sample IDs {local_ids} do not match DP-rank range {expected_local_ids}."
+    assert len(batch) == len(
+        local_ids
+    ), f"Local batch size {len(batch)} does not match sample-ID count {len(local_ids)}."
 
-    recv_samples = [{k: None for k in data_keys} for _ in range(sum(recv_counts))]
+    recv_ids = sorted(
+        {gid for sample_id_group in sample_id_groups for gid in sample_id_group[dcp_rank]}
+    )
+    recv_samples = {gid: {key: None for key in data_keys} for gid in recv_ids}
+    seq_len_by_gid = dict(global_id_seqlens)
 
-    def _pack_sample_by_key(key: str) -> torch.Tensor:
-        flattened_tensors = []
-        for gid in send_ids_sorted:
-            t = batch[gid2local_id[gid]][key].to(torch.cuda.current_device(), non_blocking=True)
-            flattened_tensors.append(t.reshape(-1))
-        return (
-            torch.cat(flattened_tensors, dim=0)
-            if flattened_tensors
-            else torch.empty(0, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
-        )
+    def _build_layout(is_scalar):
+        sample_numels = {
+            gid: 1 if is_scalar else int(seq_len_by_gid[gid]) for gid in range(offset_values[-1])
+        }
+        rank_numels = [
+            sum(sample_numels[gid] for gid in range(offset_values[rank], offset_values[rank + 1]))
+            for rank in range(dp_size)
+        ]
+        max_rank_numel = max(rank_numels)
 
-    def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
-        cursor = 0
-        for i, gid in enumerate(recv_ids_sorted):
-            sample_len = (
-                1 if key in ["original_seq_len", "padded_seq_len"] else global_id_seqlens[gid][1]
-            )
-            recv_samples[i][key] = recv_tensor[cursor : cursor + sample_len]
-            cursor += sample_len
+        sample_slices = {}
+        for source_rank in range(dp_size):
+            cursor = source_rank * max_rank_numel
+            for gid in range(offset_values[source_rank], offset_values[source_rank + 1]):
+                sample_numel = sample_numels[gid]
+                sample_slices[gid] = (cursor, sample_numel)
+                cursor += sample_numel
+
+        return rank_numels, max_rank_numel, sample_slices
+
+    layouts = {False: _build_layout(is_scalar=False), True: _build_layout(is_scalar=True)}
 
     for key in data_keys:
-        output_split_sizes, input_split_sizes = (
-            (recv_counts, send_num_split)
-            if key in ["original_seq_len", "padded_seq_len"]
-            else (recv_lens_split, send_lens_split)
-        )
-        send_tensor = _pack_sample_by_key(key)
-        recv_tensor_size = sum(output_split_sizes)
-        recv_tensor = torch.empty(
-            recv_tensor_size, device=torch.cuda.current_device(), dtype=send_tensor.dtype
-        )
-        torch.distributed.all_to_all_single(
-            output=recv_tensor,
-            input=send_tensor,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=dp_cp_group,
-        )
-        _unpack_sample_by_key(key, recv_tensor)
+        rank_numels, max_rank_numel, sample_slices = layouts[key in _REROUTE_SCALAR_KEYS]
 
-    recv_sample_with_id = {recv_id: recv_samples[i] for i, recv_id in enumerate(recv_ids_sorted)}
-    return recv_sample_with_id
+        local_tensor = torch.cat(
+            [
+                sample[key].to(torch.cuda.current_device(), non_blocking=True).reshape(-1)
+                for sample in batch
+            ],
+            dim=0,
+        )
+        assert (
+            local_tensor.numel() == rank_numels[dp_rank]
+        ), f"Packed {key} has {local_tensor.numel()} elements, expected {rank_numels[dp_rank]}."
+
+        if local_tensor.numel() < max_rank_numel:
+            gather_input = local_tensor.new_zeros(max_rank_numel)
+            gather_input[: local_tensor.numel()].copy_(local_tensor)
+        else:
+            gather_input = local_tensor.contiguous()
+
+        if dp_size == 1:
+            gathered_tensor = gather_input
+        else:
+            gathered_tensor = local_tensor.new_empty(dp_size * max_rank_numel)
+            torch.distributed.all_gather_into_tensor(gathered_tensor, gather_input, group=dp_group)
+
+        for gid in recv_ids:
+            start, sample_numel = sample_slices[gid]
+            # Clone so this sample does not retain the full global gather buffer.
+            recv_samples[gid][key] = gathered_tensor[start : start + sample_numel].clone()
+
+    return recv_samples
 
 
 def build_packed_microbatches(

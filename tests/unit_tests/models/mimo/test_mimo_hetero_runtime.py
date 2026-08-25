@@ -102,12 +102,15 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     seed = mocker.patch("examples.mimo.training.builder.configure_module_rng")
 
     assert builder.build_distributed_models(
-        mocker.Mock(), ddp_config=DistributedDataParallelConfig(), data_parallel_random_init=True
+        mocker.Mock(),
+        ddp_config=DistributedDataParallelConfig(),
+        data_parallel_random_init=True,
+        use_layer_wise_distributed_optimizer=True,
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
     seed.assert_called_once_with(args, groups, _LANGUAGE_SEED_OFFSET, True)
-    wrap.assert_called_once_with(args, model, topology, True)
+    wrap.assert_called_once_with(args, model, topology, True, True)
     grad_sync.assert_called_once_with(args, model, topology)
     # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.
     assert model.pg_collection is groups

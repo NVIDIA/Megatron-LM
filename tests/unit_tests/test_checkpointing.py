@@ -123,6 +123,87 @@ def create_args():
     yield args
 
 
+def test_async_save_rejects_reusable_chunked_optimizer_buffers(create_args):
+    """Checkpoint entry must preserve the CLI guard when startup validation was bypassed."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="does not support --async-save"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_rejects_mutated_format_with_chunked_optimizer_offload(create_args):
+    """Checkpoint entry revalidates the format after resume-time argument restoration."""
+
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="requires --ckpt-format torch_dist"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_treats_zero_offload_fraction_as_disabled(create_args):
+    """A zero fraction must not impose async-save or distributed-format restrictions."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(
+            chunked_optimizer_state_offload=True, optimizer_state_offload_fraction=0.0
+        )
+    )
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_skips_offload_guards_without_optimizer_state(create_args):
+    """Model-only saves do not expose reusable optimizer buffers to the async writer."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_allows_legacy_format_without_optimizer_state(create_args):
+    """A model-only save is not forced through optimizer-specific distributed hooks."""
+
+    create_args.ckpt_format = 'torch'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.on_save_checkpoint_start",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
 @pytest.fixture
 def create_ckpt_load_args(create_args):
     """Setup dummy args allowing checkpoint load."""
