@@ -186,6 +186,8 @@ class GraphableMegatronModule(MegatronModule):
             # script with the graphs returned by make_graphed_callables API before the first
             # training step.
             self.cuda_graphs = []
+            # DCP communicators are capture-time constants, so keep one graph list per CP size.
+            self.cuda_graphs_by_dynamic_cp_size = {}
             # Positional hidden-state inputs used as TE's fixed CUDA Graph input
             # surfaces, indexed exactly like ``cuda_graphs``.  Most layers do not
             # need to retain these handles.  They are exposed for eager producers
@@ -193,6 +195,8 @@ class GraphableMegatronModule(MegatronModule):
             # downstream graph (for example, mHC aggregation feeding attention).
             self._te_cuda_graph_static_hidden_inputs = ()
             self._te_cuda_graph_static_hidden_input_ptrs = ()
+            self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size = {}
+            self._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size = {}
             # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
             # graphs. Those hooks and args are collected in this list and should be manually
             # triggered before CUDA Graph running. This is required to ensure the correct param
@@ -204,7 +208,7 @@ class GraphableMegatronModule(MegatronModule):
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
 
-    def set_te_cuda_graph_static_hidden_inputs(self, inputs):
+    def set_te_cuda_graph_static_hidden_inputs(self, inputs, dynamic_cp_size=None):
         """Retain TE's fixed hidden-state input surface for each graph slot.
 
         ``TECudaGraphHelper`` calls this only after ``make_graphed_callables``
@@ -213,16 +217,50 @@ class GraphableMegatronModule(MegatronModule):
         lifetimes do not overlap.
         """
         inputs = tuple(inputs)
-        if len(inputs) != len(self.cuda_graphs):
+        graphs = self.cuda_graphs
+        if dynamic_cp_size is not None:
+            dynamic_cp_size = int(dynamic_cp_size)
+            if dynamic_cp_size not in self.cuda_graphs_by_dynamic_cp_size:
+                raise ValueError(
+                    "Cannot attach TE static inputs for an unknown dynamic CP size: "
+                    f"{dynamic_cp_size}; available sizes are "
+                    f"{sorted(self.cuda_graphs_by_dynamic_cp_size)}"
+                )
+            graphs = self.cuda_graphs_by_dynamic_cp_size[dynamic_cp_size]
+        if len(inputs) != len(graphs):
             raise ValueError(
                 "TE CUDA Graph static-input count must match graph count: "
-                f"got {len(inputs)} inputs and {len(self.cuda_graphs)} graphs"
+                f"got {len(inputs)} inputs and {len(graphs)} graphs"
             )
         if not all(isinstance(tensor, torch.Tensor) and tensor.is_cuda for tensor in inputs):
             raise TypeError("TE CUDA Graph static hidden inputs must be CUDA tensors")
 
+        input_ptrs = tuple(tensor.data_ptr() for tensor in inputs)
+        if dynamic_cp_size is not None:
+            self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size[dynamic_cp_size] = inputs
+            self._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size[dynamic_cp_size] = (
+                input_ptrs
+            )
         self._te_cuda_graph_static_hidden_inputs = inputs
-        self._te_cuda_graph_static_hidden_input_ptrs = tuple(tensor.data_ptr() for tensor in inputs)
+        self._te_cuda_graph_static_hidden_input_ptrs = input_ptrs
+
+    def activate_te_cuda_graph_static_hidden_inputs(self, dynamic_cp_size):
+        """Select the retained static-input surfaces for one dynamic CP graph bank."""
+        if not self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size:
+            return
+        dynamic_cp_size = int(dynamic_cp_size)
+        if dynamic_cp_size not in self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size:
+            raise RuntimeError(
+                "No TE CUDA Graph static inputs for dynamic CP size "
+                f"{dynamic_cp_size}; available sizes are "
+                f"{sorted(self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size)}"
+            )
+        self._te_cuda_graph_static_hidden_inputs = (
+            self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size[dynamic_cp_size]
+        )
+        self._te_cuda_graph_static_hidden_input_ptrs = (
+            self._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size[dynamic_cp_size]
+        )
 
     def get_te_cuda_graph_static_hidden_input(self, microbatch_idx=None):
         """Return the fixed hidden-state input for a TE CUDA Graph slot."""
@@ -245,6 +283,8 @@ class GraphableMegatronModule(MegatronModule):
         """Release retained TE static-input handles when graphs are deleted."""
         self._te_cuda_graph_static_hidden_inputs = ()
         self._te_cuda_graph_static_hidden_input_ptrs = ()
+        self._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size = {}
+        self._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size = {}
 
     def init_backward_dw_wrapper(self):
         """Initialize the backward_dw_wrapper."""
