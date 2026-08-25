@@ -3546,7 +3546,12 @@ class TransformerConfig(ModelParallelConfig):
                 "dsa_indexer_sparse_loss_use_topk_only requires dsa_indexer_use_sparse_loss."
             )
             if not self.multi_latent_attention:
-                # DSA over MLA supports both (upstream gates CP on cp_comm_type=allgather
+                # Only the simplified indexer is implemented for DSA over GQA; the standard
+                # DeepSeek indexer remains available for DSA over MLA.
+                assert self.dsa_indexer_mode == 'simplified', (
+                    "DSA over GQA requires dsa_indexer_mode='simplified'."
+                )
+                # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
                 # below). The GQA path does not: its min-memory kernels have no
                 # sequence-parallel gather and no CP support yet.
                 assert self.context_parallel_size == 1, (

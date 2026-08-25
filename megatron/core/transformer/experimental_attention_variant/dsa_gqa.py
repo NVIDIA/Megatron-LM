@@ -495,12 +495,6 @@ def unfused_grouped_dsa_fn(
     )
 
 
-@dataclass
-class DSGQAIndexerSubmodules:
-    linear_q: Union[ModuleSpec, type] = None
-    linear_k: Union[ModuleSpec, type] = None
-    k_norm: Union[ModuleSpec, type] = None
-    linear_weights_proj: Union[ModuleSpec, type] = None
 
 
 @dataclass
@@ -515,176 +509,6 @@ class DSGQAAttentionSubmodules:
     dense_core_attention: Union[ModuleSpec, type] = None
 
 
-class DSGQAIndexer(MegatronModule):
-    """Token-level DSA indexer for grouped-query attention."""
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-        submodules: DSGQAIndexerSubmodules,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-    ) -> None:
-        super().__init__(config=config)
-        self.hidden_size = config.hidden_size
-        self.index_n_heads = config.dsa_indexer_n_heads
-        self.index_head_dim = config.dsa_indexer_head_dim
-        self.index_topk = config.dsa_indexer_topk
-        self.softmax_scale = self.index_head_dim**-0.5
-        self.index_rotary_dim = int(self.index_head_dim * config.rotary_percent)
-        self.index_rotary_dim -= self.index_rotary_dim % 2
-
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        self.pg_collection = pg_collection
-
-        self.rotary_pos_emb = None
-        if self.index_rotary_dim > 0:
-            if config.rope_type == 'rope':
-                self.rotary_pos_emb = RotaryEmbedding(
-                    self.index_rotary_dim,
-                    rotary_percent=1.0,
-                    rotary_interleaved=config.rotary_interleaved,
-                    seq_len_interpolation_factor=config.rotary_seq_len_interpolation_factor,
-                    rotary_base=config.rotary_base,
-                    rope_scaling=config.use_rope_scaling,
-                    rope_scaling_factor=config.rope_scaling_factor,
-                    use_cpu_initialization=config.use_cpu_initialization,
-                    cp_group=self.pg_collection.cp,
-                )
-            elif config.rope_type == 'yarn':
-                self.rotary_pos_emb = YarnRotaryEmbedding(
-                    self.index_rotary_dim,
-                    rotary_interleaved=config.rotary_interleaved,
-                    seq_len_interpolation_factor=config.rotary_seq_len_interpolation_factor,
-                    rotary_base=config.rotary_base,
-                    scaling_factor=config.rotary_scaling_factor,
-                    original_max_position_embeddings=config.original_max_position_embeddings,
-                    beta_fast=config.beta_fast,
-                    beta_slow=config.beta_slow,
-                    mscale=config.mscale,
-                    mscale_all_dim=config.mscale_all_dim,
-                    use_cpu_initialization=config.use_cpu_initialization,
-                    cp_group=self.pg_collection.cp,
-                )
-
-        self.linear_q = build_module(
-            submodules.linear_q,
-            self.hidden_size,
-            self.index_n_heads * self.index_head_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
-        self.linear_k = build_module(
-            submodules.linear_k,
-            self.hidden_size,
-            self.index_head_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
-
-        k_norm_config = copy.copy(config)
-        k_norm_config.normalization = "LayerNorm"
-        self.k_norm = build_module(
-            submodules.k_norm,
-            config=k_norm_config,
-            hidden_size=self.index_head_dim,
-            eps=config.layernorm_epsilon,
-        )
-        self.linear_weights_proj = build_module(
-            submodules.linear_weights_proj,
-            self.hidden_size,
-            self.index_n_heads,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
-        if self.pg_collection.tp.size() > 1:
-            for param in self.parameters():
-                setattr(param, "average_gradients_across_tp_domain", True)
-
-    def _apply_rope(self, x: torch.Tensor, use_rope: bool, packed_seq_params=None):
-        if not use_rope or self.rotary_pos_emb is None or self.index_rotary_dim == 0:
-            return x
-
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            None, None, x, self.config, packed_seq_params
-        )
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
-            mscale = 1.0
-        else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
-
-        x_nope, x_pe = torch.split(
-            x, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
-        )
-        x_pe = apply_rotary_pos_emb(
-            x_pe,
-            rotary_pos_emb,
-            config=self.config,
-            cu_seqlens=None,
-            mscale=mscale,
-            cp_group=self.pg_collection.cp,
-        )
-        return torch.cat([x_nope, x_pe], dim=-1)
-
-
-
-    def forward_before_topk(
-        self,
-        hidden_states: torch.Tensor,
-        use_rope: bool,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.pg_collection.tp
-            )
-
-        seqlen, batch_size, _ = hidden_states.size()
-
-        q, _ = self.linear_q(hidden_states)
-        q = q.reshape(seqlen, batch_size, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, use_rope=use_rope, packed_seq_params=packed_seq_params)
-
-        k, _ = self.linear_k(hidden_states)
-        k = self.k_norm(k)
-        k = k.reshape(seqlen, batch_size, 1, self.index_head_dim)
-        k = self._apply_rope(k, use_rope=use_rope, packed_seq_params=packed_seq_params)
-        k = k.reshape(seqlen, batch_size, self.index_head_dim)
-
-        if self.config.dsa_indexer_use_hadamard:
-            q = rotate_activation(q)
-            k = rotate_activation(k)
-
-        weights, _ = self.linear_weights_proj(hidden_states)
-        weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
-        return q, k, weights
-
-    def forward_with_scores(
-        self,
-        hidden_states: torch.Tensor,
-        use_rope: bool,
-        mask: Optional[torch.Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
-        q, k, weights = self.forward_before_topk(hidden_states, use_rope, packed_seq_params)
-        key_chunk_size = None
-        if key_chunk_size is not None and key_chunk_size > 0:
-            return fused_qk_topk_chunked(q, k, weights, self.index_topk, mask, key_chunk_size)
-        return fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
 
 
 
@@ -1508,16 +1332,6 @@ class DSGroupedSelfAttention(SelfAttention):
                     submodules=SimplifiedDSGQAIndexerSubmodules(
                         linear_q=ModuleSpec(module=TELinear),
                         linear_k=ModuleSpec(module=TELinear),
-                    ),
-                )
-            else:
-                indexer_spec = ModuleSpec(
-                    module=DSGQAIndexer,
-                    submodules=DSGQAIndexerSubmodules(
-                        linear_q=ModuleSpec(module=TELinear),
-                        linear_k=ModuleSpec(module=TELinear),
-                        k_norm=ModuleSpec(module=TENorm),
-                        linear_weights_proj=ModuleSpec(module=TELinear),
                     ),
                 )
             submodules.core_attention = ModuleSpec(
