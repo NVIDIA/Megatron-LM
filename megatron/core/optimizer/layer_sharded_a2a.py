@@ -67,6 +67,10 @@ def layer_sharded_all_to_all_fwd(
             - my_param_indices: Indices into momentum_list for params assigned
               to this rank.
     """
+    if not momentum_list:
+        # Nothing to exchange; avoid sending an empty buffer into the collective.
+        return [], []
+
     rank, size = _group_rank_and_size(group)
     if size <= 1:
         # Trivial group: every param is homed locally and the shard IS the
@@ -327,6 +331,10 @@ def layer_sharded_fused_fwd(
         ``(full_mats, my_param_indices)`` — complete matrices for params homed
         on this rank, and their indices into ``momentum_list``.
     """
+    if not momentum_list:
+        # Nothing to exchange; avoid sending an empty buffer into the collective.
+        return [], []
+
     G, T = gtp_remat_size, tp_size
     S = G * T
     my_flat = gtp_remat_rank * T + tp_rank
