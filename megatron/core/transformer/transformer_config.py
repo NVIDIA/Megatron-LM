@@ -1426,6 +1426,18 @@ class TransformerConfig(ModelParallelConfig):
     attention_cp_layout: CPLayout = "zigzag"
     """CP layout for softmax-attention layers."""
 
+    #############################
+    # Pipeline Parallel Prewarm
+    #############################
+    pipeline_model_parallel_prewarm: bool = False
+    """Initialize lazy kernels concurrently across pipeline stages before training.
+
+    Each PP rank runs one synthetic eager forward/backward pass for every transformer layer in
+    its local PP/VPP model chunks. The passes do not use pipeline P2P communication, so pipeline
+    stages can initialize their local kernels concurrently. This does not capture or replay CUDA
+    Graphs and can be used independently of ``cuda_graph_impl``.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -4882,6 +4894,11 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.moe_shortcut_connection and self.cuda_graph_impl != "none"
         ), "CUDA graphs are not supported with moe_shortcut_connection."
+
+        if self.pipeline_model_parallel_prewarm:
+            assert self.pipeline_model_parallel_size > 1, (
+                "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
+            )
 
         if self.cuda_graph_impl != "none":
 
