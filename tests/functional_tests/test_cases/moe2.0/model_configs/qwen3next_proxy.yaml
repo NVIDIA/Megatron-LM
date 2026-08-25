@@ -15,44 +15,35 @@ MODEL_ARGS:
   --max-position-embeddings: 4096
   --make-vocab-size-divisible-by: 3232
   --untie-embeddings-and-output-weights: true
-  # Add attention related args
-  --multi-latent-attention: true
-  --num-attention-heads: 32
+  # Add attention related args (GQA)
+  --num-attention-heads: 16
+  --group-query-attention: true
+  --num-query-groups: 4
   --kv-channels: 128
   --qk-layernorm: true
   --position-embedding-type: rope
-  --rotary-base: 10000
-  --q-lora-rank: 1536
-  --kv-lora-rank: 512
-  --qk-head-dim: 128
-  --qk-pos-emb-head-dim: 64
-  --v-head-dim: 128
-  --rotary-scaling-factor: 40
-  --mscale: 1.0
-  --mscale-all-dim: 1.0
+  --rotary-percent: 1.0
+  --rotary-base: 1000000
+  # Gated Delta Net (Linear Attention) args
+  --experimental-attention-variant: gated_delta_net
+  --linear-attention-freq: 3
+  --linear-conv-kernel-dim: 4
+  --linear-key-head-dim: 128
+  --linear-value-head-dim: 128
+  --linear-num-key-heads: 16
+  --linear-num-value-heads: 32
   # Add MLP related args
   --swiglu: true
   --ffn-hidden-size: 4096
   # Add MoE args
   --num-experts: 32
-  --moe-layer-freq: ([0]*2+[1]*14)
   --moe-ffn-hidden-size: 1024
   --moe-shared-expert-intermediate-size: 1024
-  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-router-load-balancing-type: global_aux_loss
   --moe-router-topk: 4
-  --moe-router-pre-softmax: true
-  --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-4
-  --moe-router-group-topk: 2
-  --moe-router-num-groups: 4
-  --moe-router-topk-scaling-factor: 2.0
-  --moe-router-score-function: sigmoid
-  --moe-router-enable-expert-bias: true
-  --moe-router-bias-update-rate: 1e-3
+  --moe-router-score-function: softmax
   --moe-router-dtype: fp32
-  # Comment out the following MTP args to disable MTP
-  --mtp-num-layers: 1
-  --mtp-loss-scaling-factor: 0.1
   # Add regularization args
   --attention-dropout: 0.0
   --hidden-dropout: 0.0
@@ -81,5 +72,5 @@ METRICS:
   - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
-  - "mtp_1 loss"
-  - "seq_load_balancing_loss"
+  - "load_balancing_loss"
+
