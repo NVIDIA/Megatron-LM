@@ -723,6 +723,18 @@ _ASYNC_PAIR_SCENARIOS = (
         parity="reproducible",
     ),
     _pair_scenario(
+        "flashinfer-fused-rope",
+        "kernel:flashinfer-fused-rope",
+        config={
+            "hidden_size": 64,
+            "position_embedding_type": "rope",
+            "inference_config_overrides": {"use_flashinfer_fused_rope": True},
+        },
+        signals=("fused-rope",),
+        prerequisite="flashinfer",
+        parity="reproducible",
+    ),
+    _pair_scenario(
         "swa-off-by-one-sink",
         "attention:swa-all-layers",
         "attention:off-by-one-sink",
