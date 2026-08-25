@@ -88,6 +88,22 @@ def test_paged_stash_allows_non_fused_grouped_tensor_hybridep():
     assert config.use_transformer_engine_op_fuser is False
 
 
+def test_paged_stash_marking_delegates_to_transformer_engine(monkeypatch):
+    marked = []
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=True)
+    tensors = (torch.zeros(2, 4), torch.ones(2, 1))
+
+    monkeypatch.setattr(
+        experts_module, "_te_mark_grouped_tensor", lambda *args: marked.append(args)
+    )
+    module._mark_paged_stash_tensors(*tensors)
+
+    assert len(marked) == 1
+    assert marked[0][0] is tensors[0]
+    assert marked[0][1] is tensors[1]
+
+
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
     interleaved = torch.tensor([[1, 2, 5, 6, 3, 4, 7, 8], [11, 12, 15, 16, 13, 14, 17, 18]])
     expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14, 15, 16, 17, 18]])

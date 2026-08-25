@@ -47,6 +47,13 @@ HybridEP and TE grouped experts are required whenever `moe_expert_rank_capacity_
 Path B removes host-device synchronization from grouped GEMM split metadata, but FC1, activation,
 and FC2 remain separate launches. Without a full-iteration CUDA graph it can therefore retain
 significant CPU launch overhead even though the expert path is host-device sync-free.
+The legacy multi-stream cuBLAS GroupedLinear path is not supported because it materializes split
+metadata on the host; paged stashing would not make that expert path sync-free.
+
+Paged stash identifies dynamic saved activations through Transformer Engine's
+`mark_grouped_tensor` utility. The non-op-fuser integration marks these tensors explicitly rather
+than inferring dynamic shapes from warmup iterations: shape sampling can misclassify a dynamic
+tensor as static and is therefore not a safe correctness contract.
 
 In this context, sync-free refers to the steady-state expert data path. The initial paged-stash
 capture performs host reads, and the runner reads reduced overflow/over-budget state at the end of
