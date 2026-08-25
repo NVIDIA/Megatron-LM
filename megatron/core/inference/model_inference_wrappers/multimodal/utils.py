@@ -2,20 +2,6 @@
 
 import torch
 
-from megatron.core.utils import unwrap_model
-
-
-def resolve_wrapped_model(model):
-    """Return the innermost model across supported and lightweight wrappers."""
-    module = unwrap_model(model)
-    for _ in range(4):
-        inner = getattr(module, "module", None)
-        if inner is None or inner is module:
-            break
-        module = inner
-    return module
-
-
 def dynamic_media_embedding_counts(
     imgs_sizes: torch.Tensor,
     patch_dim: int,
@@ -59,15 +45,9 @@ def dynamic_media_replacement_counts(
     *,
     num_frames,
     temporal_patch_size: int,
-    placeholder_count: int,
 ) -> list[int]:
-    """Map per-frame counts to image, tubelet, or whole-video placeholders."""
+    """Map per-frame counts to one compact placeholder per image or video."""
     if num_frames is None:
-        if placeholder_count != len(frame_embedding_counts):
-            raise ValueError(
-                f"Expected {len(frame_embedding_counts)} image placeholders, "
-                f"got {placeholder_count}."
-            )
         return frame_embedding_counts
 
     if isinstance(num_frames, int):
@@ -90,22 +70,12 @@ def dynamic_media_replacement_counts(
     if temporal_patch_size <= 0:
         raise ValueError("temporal_patch_size must be positive.")
 
-    per_tubelet_counts = []
     per_video_counts = []
     frame_offset = 0
     for frame_count in frame_groups:
         video_frame_counts = frame_embedding_counts[frame_offset : frame_offset + frame_count]
         tubelet_counts = video_frame_counts[::temporal_patch_size]
-        per_tubelet_counts.extend(tubelet_counts)
         per_video_counts.append(sum(tubelet_counts))
         frame_offset += frame_count
 
-    if placeholder_count == len(per_tubelet_counts):
-        return per_tubelet_counts
-    if placeholder_count == len(per_video_counts):
-        return per_video_counts
-    raise ValueError(
-        "Video prompt placeholders must match either the number of "
-        f"videos ({len(per_video_counts)}) or tubelets "
-        f"({len(per_tubelet_counts)}); got {placeholder_count}."
-    )
+    return per_video_counts

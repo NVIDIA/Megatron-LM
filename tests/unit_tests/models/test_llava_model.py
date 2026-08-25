@@ -286,6 +286,51 @@ class TestLLaVAModel:
         assert torch.allclose(loss_mask[4], expected_loss_mask)
 
     @pytest.mark.internal
+    def test_preprocess_data_with_media_token_counts(self):
+        self.model.cuda()
+
+        hidden_size = 8
+        image_token_index = self.model.image_token_index
+        image_embeddings = (
+            torch.arange(5 * hidden_size, dtype=torch.float)
+            .reshape(5, 1, hidden_size)
+            .cuda()
+        )
+        language_embeddings = (
+            -torch.arange(2 * 3 * hidden_size, dtype=torch.float)
+            .reshape(2, 3, hidden_size)
+            .cuda()
+        )
+        input_ids = torch.tensor(
+            [[image_token_index, 1, 2], [3, image_token_index, 4]],
+            dtype=torch.long,
+            device="cuda",
+        )
+        num_image_tiles = torch.ones(2, dtype=torch.int, device="cuda")
+        media_token_counts = torch.tensor([2, 3], dtype=torch.int, device="cuda")
+
+        embeddings, _, _, _, _ = self.model._preprocess_data(
+            image_embeddings,
+            language_embeddings,
+            input_ids,
+            loss_mask=None,
+            labels=None,
+            use_inference_kv_cache=False,
+            inference_context=None,
+            image_token_index=image_token_index,
+            num_image_tiles=num_image_tiles,
+            media_token_counts=media_token_counts,
+        )
+
+        assert embeddings.shape == (5, 2, hidden_size)
+        assert torch.equal(embeddings[:2, 0], image_embeddings[:2, 0])
+        assert torch.equal(embeddings[2:4, 0], language_embeddings[0, 1:])
+        assert torch.count_nonzero(embeddings[4, 0]) == 0
+        assert torch.equal(embeddings[0, 1], language_embeddings[1, 0])
+        assert torch.equal(embeddings[1:4, 1], image_embeddings[2:, 0])
+        assert torch.equal(embeddings[4, 1], language_embeddings[1, 2])
+
+    @pytest.mark.internal
     def test_forward(self):
         self.model.cuda()
 

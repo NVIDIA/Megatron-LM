@@ -40,6 +40,10 @@ try:
 except:
     HAVE_MSGPACK = False
 
+# Bound coordinator routing metadata; engine-side embedding caches are
+# byte-bounded separately, so older affinity entries are only opportunistic.
+_DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES = 65_536
+
 # Register faulthandler to emit stack traces upon process kill.
 faulthandler.enable()
 faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
@@ -243,7 +247,7 @@ class DataParallelInferenceCoordinator:
         self._hash_table: dict[int, dict[int, int]] = {}
         self._hash_assignment_counter = 0
         self._media_cache_affinity: OrderedDict[str, bytes] = OrderedDict()
-        self._media_cache_affinity_max_entries = 65536
+        self._media_cache_affinity_max_entries = _DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES
 
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()
@@ -301,6 +305,11 @@ class DataParallelInferenceCoordinator:
         """
         self.identities_of_data_parallel_ranks.remove(identity)
         self.removed_engine_identities.add(identity)
+        self._media_cache_affinity = OrderedDict(
+            (media_key, assigned_identity)
+            for media_key, assigned_identity in self._media_cache_affinity.items()
+            if assigned_identity != identity
+        )
         idx = self.identity_to_rank_index.pop(identity, None)
         if idx is None:
             return

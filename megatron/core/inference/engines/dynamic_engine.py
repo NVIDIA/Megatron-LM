@@ -1459,6 +1459,13 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        input_modalities = ["text"]
+        if num_frames is not None:
+            input_modalities.append("video")
+        elif imgs is not None:
+            input_modalities.append("image")
+        self.controller.inference_wrapped_model.validate_input_modalities(*input_modalities)
+
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
@@ -1492,6 +1499,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if (
             imgs is not None
             or num_tiles is not None
+            or num_img_embeddings_per_tile != 0
             or imgs_sizes is not None
             or num_frames is not None
         ):
@@ -1531,22 +1539,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return self._add_request(request)
 
-    def _resolve_image_token_id(self) -> Optional[int]:
-        """Return the model's image token id, whichever wrapper level holds it.
-
-        None when the model marks images with a negative sentinel instead of a
-        real vocabulary entry (LLaVA's DEFAULT_IMAGE_TOKEN_INDEX), since such an
-        id is no more decodable than the padding it would replace.
-        """
-        module = getattr(self.controller.inference_wrapped_model, "model", None)
-        while module is not None:
-            image_token_index = getattr(module, "image_token_index", None)
-            if image_token_index is not None:
-                image_token_index = int(image_token_index)
-                return image_token_index if image_token_index >= 0 else None
-            module = getattr(module, "module", None)
-        return None
-
     def _build_vlm_request(
         self,
         *,
@@ -1565,82 +1557,103 @@ class DynamicInferenceEngine(AbstractEngine):
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
         """
+        if num_frames is not None:
+            missing = [
+                name
+                for name, value in (("imgs", imgs), ("imgs_sizes", imgs_sizes))
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "Video input requires imgs, imgs_sizes, and num_frames; "
+                    f"missing {missing}."
+                )
+        elif imgs_sizes is not None:
+            if imgs is None:
+                raise ValueError("Dynamic-resolution image input requires imgs and imgs_sizes.")
+        elif imgs is None or num_tiles is None or num_img_embeddings_per_tile <= 0:
+            raise ValueError(
+                "Static-tiling image input requires imgs, num_tiles, and "
+                "num_img_embeddings_per_tile > 0."
+            )
+
         # PP>1 needs a non-first-stage embedding recv path (the wrapper's
         # _recv_only_vision_embeds TODO). Until that lands, only PP=1 is
         # correct: non-first stages would see None embeddings but a non-None
         # mask and silently skip image splicing.
         pp_group = self.controller.pp_group
-        if pp_group is not None and torch.distributed.is_initialized():
-            pp_world_size = torch.distributed.get_world_size(pp_group)
-            if pp_world_size > 1:
-                raise NotImplementedError(
-                    "Dynamic VLM inference does not support pipeline parallel. "
-                    "PP>1 requires the non-first-stage embedding recv path "
-                    "which is not yet available upstream."
-                )
+        if (
+            pp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(pp_group) > 1
+        ):
+            raise NotImplementedError(
+                "Dynamic VLM inference does not support pipeline parallel. "
+                "PP>1 requires the non-first-stage embedding recv path "
+                "which is not yet available upstream."
+            )
 
         # Compute multimodal media cache key, which is used by generators to
         # skip re-computing multimodal embeddings if the cache is hit.
+        modality = "video" if num_frames is not None else "image"
         media_cache_key = None
         needs_media_identity = self.context.enable_prefix_caching or (
             getattr(self, "vision_embedding_cache_max_bytes", 0) > 0
         )
         if imgs is not None and needs_media_identity:
-            modality = "video" if num_frames is not None else "image"
             media_inputs = {"imgs": imgs}
-            if num_tiles is not None:
-                media_inputs["num_tiles"] = num_tiles
-            if imgs_sizes is not None:
-                media_inputs["imgs_sizes"] = imgs_sizes
-            if num_frames is not None:
-                media_inputs["num_frames"] = num_frames
+            for name, value in (
+                ("num_tiles", num_tiles),
+                ("imgs_sizes", imgs_sizes),
+                ("num_frames", num_frames),
+            ):
+                if value is not None:
+                    media_inputs[name] = value
             if num_img_embeddings_per_tile:
                 media_inputs["num_img_embeddings_per_tile"] = num_img_embeddings_per_tile
             media_cache_key = compute_media_cache_key(modality, media_inputs)
 
         device = torch.cuda.current_device()
-        if num_tiles is not None:
-            num_tiles = num_tiles.to(device=device)
-        if imgs_sizes is not None:
-            imgs_sizes = imgs_sizes.to(device=device)
-        if num_frames is not None:
-            num_frames = num_frames.to(device=device)
+        num_tiles = num_tiles.to(device=device) if num_tiles is not None else None
+        imgs_sizes = imgs_sizes.to(device=device) if imgs_sizes is not None else None
+        num_frames = num_frames.to(device=device) if num_frames is not None else None
 
-        is_dynamic_resolution = imgs_sizes is not None and imgs is not None
         # Dynamic-resolution requests derive their embedding count from
         # imgs_sizes downstream and don't need num_tiles.sum() at admission.
         # Static-tiling requests do; only pay the D2H sync on that path so
         # dynamic-res admissions stay sync-free here.
-        if is_dynamic_resolution:
-            total_num_tiles = 0
-            num_img_embeddings = 0
-            has_images = True
-        else:
+        has_images = imgs_sizes is not None and imgs is not None
+        if not has_images:
             total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
             num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
             has_images = num_img_embeddings > 0
+        if not has_images:
+            raise ValueError("Multimodal input did not contain any processable media.")
 
         mask_tensor: Optional[Tensor] = None
         image_embeddings: Optional[Tensor] = None
         compact_prompt_tokens: Optional[Tensor] = None
+        expected_embedding_count = 0
 
         if has_images:
+            inference_wrapper = self.controller.inference_wrapped_model
             if media_tokens_preexpanded:
-                modality = "video" if num_frames is not None else "image"
-                mask_tensor = (
-                    self.controller.inference_wrapped_model.build_preexpanded_media_token_mask(
-                        tokens, modality
-                    )
+                mask_tensor = inference_wrapper.build_preexpanded_media_token_mask(
+                    tokens, modality
                 )
+                expected_embedding_count = int((mask_tensor >= 0).sum().item())
             else:
+                media_token_id = inference_wrapper.resolve_media_token_id(
+                    self.controller.tokenizer, modality
+                )
                 compact_prompt_tokens = tokens.clone()
                 token_list: List[List[int]] = [tokens.tolist()]
                 expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
                 if num_frames is not None:
                     expansion_kwargs["num_frames"] = num_frames
                 expanded_tokens_list, mask_list = (
-                    self.controller.inference_wrapped_model.expand_image_tokens(
-                        token_list, **expansion_kwargs
+                    inference_wrapper.expand_image_tokens(
+                        token_list, image_token_id=media_token_id, **expansion_kwargs
                     )
                 )
                 # expand_image_tokens pads the embedding slots with -1, but the mask
@@ -1648,33 +1661,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 # prompt_tokens where the model has one: they are echoed to HTTP
                 # clients, detokenized for raw_text and hashed for prefix caching, and
                 # none of those accept a negative id.
-                expanded_tokens = expanded_tokens_list[0]
-                image_token_id = self._resolve_image_token_id()
-                if image_token_id is not None:
-                    expanded_tokens = [
-                        image_token_id if token < 0 else token for token in expanded_tokens
-                    ]
+                expanded_tokens = [
+                    media_token_id if token < 0 else token
+                    for token in expanded_tokens_list[0]
+                ]
                 tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
                 mask_tensor = torch.tensor(
                     [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
                 )
+                expected_embedding_count = sum(value is not None for value in mask_list[0])
+
             image_embeddings = self._get_cached_vision_embedding(media_cache_key)
-            if image_embeddings is not None:
-                expected_embedding_count = int((mask_tensor >= 0).sum().item())
-                cached_embedding_count = (
-                    image_embeddings.numel() // image_embeddings.shape[-1]
-                    if image_embeddings.ndim > 0
-                    else 0
-                )
-                if cached_embedding_count != expected_embedding_count:
-                    image_embeddings = None
             if image_embeddings is None and imgs is not None:
                 imgs = imgs.to(device=device)
-
-        # PP>1 is rejected above, so we're on the (only) stage that owns the
-        # vision encoder — no is_pipeline_first_stage check needed here.
-        if has_images and imgs is not None:
-            if image_embeddings is None:
+                # PP>1 is rejected above, so this is the only stage that owns
+                # the vision encoder.
                 with torch.inference_mode():
                     encoder_kwargs = {"num_image_tiles": num_tiles, "imgs_sizes": imgs_sizes}
                     if num_frames is not None:
@@ -1685,21 +1686,20 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                     )
 
-        if has_images and image_embeddings is not None and mask_tensor is not None:
-            expected_embedding_count = int((mask_tensor >= 0).sum().item())
-            actual_embedding_count = (
-                image_embeddings.numel() // image_embeddings.shape[-1]
-                if image_embeddings.ndim > 0
-                else 0
-            )
-            if actual_embedding_count != expected_embedding_count:
-                prompt_kind = "Pre-expanded" if media_tokens_preexpanded else "Expanded"
-                raise ValueError(
-                    f"{prompt_kind} prompt has {expected_embedding_count} media-token "
-                    f"position(s), but the vision encoder produced "
-                    f"{actual_embedding_count} embedding(s)."
+            if image_embeddings is not None:
+                actual_embedding_count = (
+                    image_embeddings.numel() // image_embeddings.shape[-1]
+                    if image_embeddings.ndim > 0
+                    else 0
                 )
-            self._cache_vision_embedding(media_cache_key, image_embeddings)
+                if actual_embedding_count != expected_embedding_count:
+                    prompt_kind = "Pre-expanded" if media_tokens_preexpanded else "Expanded"
+                    raise ValueError(
+                        f"{prompt_kind} prompt has {expected_embedding_count} media-token "
+                        f"position(s), but the vision encoder produced "
+                        f"{actual_embedding_count} embedding(s)."
+                    )
+                self._cache_vision_embedding(media_cache_key, image_embeddings)
 
         self.context.add_vlm_request_data(
             request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor

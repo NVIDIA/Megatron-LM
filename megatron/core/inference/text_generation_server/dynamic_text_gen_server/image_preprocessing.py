@@ -19,26 +19,6 @@ from megatron.core.inference.config import ImageProcessingConfig, VideoProcessin
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
 
 
-def _video_target_resolution(image, config: ImageProcessingConfig) -> tuple[int, int]:
-    """Return a video frame target as ``(height, width)``."""
-    target_patches = config.dynamic_resolution_max_patches
-    aspect_ratio = image.width / max(image.height, 1)
-    patch_height = max(1, round(math.sqrt(target_patches / aspect_ratio)))
-    patch_width = max(1, round(math.sqrt(target_patches * aspect_ratio)))
-    required_divisor = 2 if config.pixel_shuffle else 1
-    if required_divisor > 1:
-        height_remainder = patch_height % required_divisor
-        width_remainder = patch_width % required_divisor
-        height_up = patch_height + (required_divisor - height_remainder if height_remainder else 0)
-        width_up = patch_width + (required_divisor - width_remainder if width_remainder else 0)
-        if height_up * width_up <= target_patches:
-            patch_height, patch_width = height_up, width_up
-        else:
-            patch_height = max(required_divisor, patch_height - height_remainder)
-            patch_width = max(required_divisor, patch_width - width_remainder)
-    return patch_height * config.patch_dim, patch_width * config.patch_dim
-
-
 def _resolve_pixel_stats(vision_model_type: str):
     """Return (pixel_mean, pixel_std) for a vision encoder.
 
@@ -96,9 +76,13 @@ def dynamic_res_preprocess(
     factor_max=1.0,
     pixel_shuffle=False,
     spatial_merge_size=1,
+    video_maintain_aspect_ratio=None,
 ):
     """Resize image to fit within [min_patches, max_patches] preserving aspect ratio.
 
+    When ``video_maintain_aspect_ratio`` is not None, use a fixed per-frame
+    ``max_patches`` budget. True preserves the source aspect ratio; False uses
+    a square grid. Images leave this as None and use adaptive resizing.
     For pixel_shuffle, patch grid dimensions are rounded to even numbers for
     compatibility.
 
@@ -112,38 +96,69 @@ def dynamic_res_preprocess(
     """
     orig_width, orig_height = image.size
 
-    # Use math.ceil, not round(x + 0.5) — the latter is banker's rounding and
-    # produces off-by-one, non-monotonic patch counts on exactly-aligned sides.
-    closest_patch_height = math.ceil(orig_height / res_step)
-    closest_patch_width = math.ceil(orig_width / res_step)
-    patches = closest_patch_height * closest_patch_width
-
-    factor = min(math.sqrt(max_patches / patches), factor_max)
-    target_patch_height = math.floor(factor * closest_patch_height)
-    target_patch_width = math.floor(factor * closest_patch_width)
-
-    if target_patch_height * target_patch_width < min_patches:
-        up_factor = math.sqrt(min_patches / max(target_patch_height * target_patch_width, 1))
-        target_patch_height = math.ceil(up_factor * target_patch_height)
-        target_patch_width = math.ceil(up_factor * target_patch_width)
-
-    grid_multiple = max(2 if pixel_shuffle else 1, spatial_merge_size)
-    if grid_multiple > 1:
-        if target_patch_height % grid_multiple:
-            increase = grid_multiple - target_patch_height % grid_multiple
-            if (target_patch_height + increase) * target_patch_width <= max_patches:
-                target_patch_height += increase
+    if video_maintain_aspect_ratio is not None:
+        if video_maintain_aspect_ratio:
+            aspect_ratio = orig_width / max(orig_height, 1)
+            target_patch_height = max(1, round(math.sqrt(max_patches / aspect_ratio)))
+            target_patch_width = max(1, round(math.sqrt(max_patches * aspect_ratio)))
+            # Preserve the former _video_target_resolution behavior exactly.
+            grid_multiple = 2 if pixel_shuffle else 1
+        else:
+            target_patch_height = target_patch_width = max(1, math.isqrt(max_patches))
+            grid_multiple = max(2 if pixel_shuffle else 1, spatial_merge_size)
+        if grid_multiple > 1:
+            height_remainder = target_patch_height % grid_multiple
+            width_remainder = target_patch_width % grid_multiple
+            height_up = target_patch_height + (
+                grid_multiple - height_remainder if height_remainder else 0
+            )
+            width_up = target_patch_width + (
+                grid_multiple - width_remainder if width_remainder else 0
+            )
+            if height_up * width_up <= max_patches:
+                target_patch_height, target_patch_width = height_up, width_up
             else:
-                target_patch_height -= target_patch_height % grid_multiple
-        if target_patch_width % grid_multiple:
-            increase = grid_multiple - target_patch_width % grid_multiple
-            if target_patch_height * (target_patch_width + increase) <= max_patches:
-                target_patch_width += increase
-            else:
-                target_patch_width -= target_patch_width % grid_multiple
+                target_patch_height = max(
+                    grid_multiple, target_patch_height - height_remainder
+                )
+                target_patch_width = max(
+                    grid_multiple, target_patch_width - width_remainder
+                )
+    else:
+        grid_multiple = max(2 if pixel_shuffle else 1, spatial_merge_size)
+        # Use math.ceil, not round(x + 0.5) — the latter is banker's rounding and
+        # produces off-by-one, non-monotonic patch counts on exactly-aligned sides.
+        closest_patch_height = math.ceil(orig_height / res_step)
+        closest_patch_width = math.ceil(orig_width / res_step)
+        patches = closest_patch_height * closest_patch_width
 
-        target_patch_height = max(grid_multiple, target_patch_height)
-        target_patch_width = max(grid_multiple, target_patch_width)
+        factor = min(math.sqrt(max_patches / patches), factor_max)
+        target_patch_height = math.floor(factor * closest_patch_height)
+        target_patch_width = math.floor(factor * closest_patch_width)
+
+        if target_patch_height * target_patch_width < min_patches:
+            up_factor = math.sqrt(
+                min_patches / max(target_patch_height * target_patch_width, 1)
+            )
+            target_patch_height = math.ceil(up_factor * target_patch_height)
+            target_patch_width = math.ceil(up_factor * target_patch_width)
+
+        if grid_multiple > 1:
+            if target_patch_height % grid_multiple:
+                increase = grid_multiple - target_patch_height % grid_multiple
+                if (target_patch_height + increase) * target_patch_width <= max_patches:
+                    target_patch_height += increase
+                else:
+                    target_patch_height -= target_patch_height % grid_multiple
+            if target_patch_width % grid_multiple:
+                increase = grid_multiple - target_patch_width % grid_multiple
+                if target_patch_height * (target_patch_width + increase) <= max_patches:
+                    target_patch_width += increase
+                else:
+                    target_patch_width -= target_patch_width % grid_multiple
+
+            target_patch_height = max(grid_multiple, target_patch_height)
+            target_patch_width = max(grid_multiple, target_patch_width)
 
     assert target_patch_height * target_patch_width <= max_patches
 
@@ -276,6 +291,71 @@ def preprocess_image_bytes_list(
     return {"imgs": imgs, "imgs_sizes": imgs_sizes}
 
 
+def _video_sample_indices(total_frames: int, config: VideoProcessingConfig) -> list[int]:
+    """Return the existing uniformly spaced sample indices for a video."""
+    import numpy as np
+
+    sample_count = min(config.num_frames, total_frames)
+    if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
+        rounded_down = (
+            sample_count // config.temporal_patch_size
+        ) * config.temporal_patch_size
+        sample_count = (
+            rounded_down
+            if rounded_down > 0
+            else min(config.temporal_patch_size, total_frames)
+        )
+    return (
+        np.rint(np.linspace(0, total_frames - 1, num=sample_count))
+        .astype(np.int64)
+        .tolist()
+    )
+
+
+def _decode_sampled_video_frames(encoded_video: bytes, config: VideoProcessingConfig):
+    """Decode the stream while converting only uniformly sampled frames to RGB."""
+    import av
+
+    def decode_selected(total_frames: int):
+        sample_indices = _video_sample_indices(total_frames, config)
+        wanted = set(sample_indices)
+        sampled_frames = []
+        decoded_count = 0
+        with av.open(io.BytesIO(encoded_video)) as container:
+            stream = container.streams.video[0]
+            for index, frame in enumerate(container.decode(stream)):
+                decoded_count = index + 1
+                if index in wanted:
+                    sampled_frames.append(frame.to_image().convert("RGB"))
+        return sampled_frames, decoded_count
+
+    # Prefer container metadata so indexed streams need only one decode pass.
+    with av.open(io.BytesIO(encoded_video)) as container:
+        declared_frames = int(container.streams.video[0].frames or 0)
+
+    if declared_frames > 0:
+        sampled_frames, decoded_count = decode_selected(declared_frames)
+        if decoded_count == declared_frames:
+            return sampled_frames
+        # Some containers report an inaccurate frame count. Redecode using the
+        # observed count to preserve the original exact uniform indices.
+        if decoded_count > 0:
+            sampled_frames, _ = decode_selected(decoded_count)
+        return sampled_frames
+
+    # Unindexed streams need a count-only pass before exact uniform indices can
+    # be selected. No AVFrame or RGB image is retained during this pass.
+    total_frames = 0
+    with av.open(io.BytesIO(encoded_video)) as container:
+        stream = container.streams.video[0]
+        for total_frames, _ in enumerate(container.decode(stream), start=1):
+            pass
+    if total_frames == 0:
+        return []
+    sampled_frames, _ = decode_selected(total_frames)
+    return sampled_frames
+
+
 def preprocess_video_bytes_list(
     video_bytes_list, config: VideoProcessingConfig, device: Optional[torch.device] = None
 ) -> dict:
@@ -296,22 +376,16 @@ def preprocess_video_bytes_list(
             "non-tiled vision inputs."
         )
 
-    import numpy as np
-
     def decode_frames(encoded_video):
         frames = _load_frame_sequence_manifest(encoded_video, config.frame_manifest_magic)
         if frames is not None:
             return frames, True
 
-        import av
-
-        with av.open(io.BytesIO(encoded_video)) as container:
-            return ([frame.to_image().convert("RGB") for frame in container.decode(video=0)], False)
+        return _decode_sampled_video_frames(encoded_video, config), False
 
     packed_videos = []
     packed_sizes = []
     frame_counts = []
-    reference_hw = None
 
     for encoded_video in video_bytes_list:
         if not isinstance(encoded_video, (bytes, bytearray)):
@@ -320,34 +394,26 @@ def preprocess_video_bytes_list(
         if not frames:
             raise ValueError("Decoded video contains no frames.")
 
-        if is_frame_sequence:
-            if len(frames) != config.num_frames:
-                raise ValueError(
-                    "Frame-sequence count must match the configured count: "
-                    f"{len(frames)} != {config.num_frames}."
-                )
-            sampled_frames = frames
-        else:
-            sample_count = min(config.num_frames, len(frames))
-            if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
-                rounded_down = (
-                    sample_count // config.temporal_patch_size
-                ) * config.temporal_patch_size
-                sample_count = (
-                    rounded_down
-                    if rounded_down > 0
-                    else min(config.temporal_patch_size, len(frames))
-                )
-            sample_indices = (
-                np.rint(np.linspace(0, len(frames) - 1, num=sample_count)).astype(np.int64).tolist()
+        if is_frame_sequence and len(frames) != config.num_frames:
+            raise ValueError(
+                "Frame-sequence count must match the configured count: "
+                f"{len(frames)} != {config.num_frames}."
             )
-            sampled_frames = [frames[index] for index in sample_indices]
+        sampled_frames = frames
         sample_count = len(sampled_frames)
 
         frame_tensors = []
         frame_sizes = []
-        if reference_hw is None:
-            reference_hw = _video_target_resolution(sampled_frames[0], config.image_config)
+        reference_image = dynamic_res_preprocess(
+            sampled_frames[0],
+            min_patches=config.image_config.dynamic_resolution_min_patches,
+            max_patches=config.image_config.dynamic_resolution_max_patches,
+            res_step=config.image_config.patch_dim,
+            pixel_shuffle=config.image_config.pixel_shuffle,
+            spatial_merge_size=config.image_config.spatial_merge_size,
+            video_maintain_aspect_ratio=config.video_maintain_aspect_ratio,
+        )
+        reference_hw = (reference_image.height, reference_image.width)
         for frame in sampled_frames:
             imgs, imgs_sizes = preprocess_image(
                 frame, config.image_config, target_hw=reference_hw, device=device

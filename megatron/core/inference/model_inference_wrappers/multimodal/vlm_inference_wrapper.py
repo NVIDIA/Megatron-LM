@@ -16,8 +16,8 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
     dynamic_media_embedding_counts,
     dynamic_media_replacement_counts,
-    resolve_wrapped_model,
 )
+from megatron.core.utils import get_attr_wrapped_model
 
 
 # pylint: disable=line-too-long
@@ -33,12 +33,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
         """Use the conventional compact ``<image>`` placeholder."""
-        module = resolve_wrapped_model(self.model)
-        token_id = getattr(module, "image_token_index", None)
-        spec = MediaPromptSpec(
-            model_token="<image>", model_token_id=int(token_id) if token_id is not None else None
-        )
+        spec = MediaPromptSpec(model_token="<image>")
         return MultimodalPromptConfig(image_spec=spec, video_spec=spec)
+
+    def get_preexpanded_media_token_id(self, modality: str) -> int:
+        """Return LLaVA's internal sentinel without exposing it as a vocabulary ID."""
+        del modality
+        module = get_attr_wrapped_model(
+            self.model, "image_token_index", return_model_obj=True
+        )
+        return int(module.image_token_index)
 
     def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
         """A utility function for preparing model for inference
@@ -147,7 +151,15 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     # ---- Dynamic inference methods ----
 
-    def expand_image_tokens(self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None):
+    def expand_image_tokens(
+        self,
+        tokens,
+        num_tiles=None,
+        imgs_sizes=None,
+        num_frames=None,
+        *,
+        image_token_id=None,
+    ):
         """Expand image tokens to multiple pad tokens.
 
         Supports two modes:
@@ -166,8 +178,12 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             mask (List[List[int or None]]): Mask indicating image embedding indices for each
                 position, None for non-image positions.
         """
-        module = resolve_wrapped_model(self.model)
-        image_token_index = module.image_token_index
+        module = get_attr_wrapped_model(
+            self.model, "image_token_index", return_model_obj=True
+        )
+        image_token_index = (
+            module.image_token_index if image_token_id is None else int(image_token_id)
+        )
 
         pad_value = -1
         batch_size = len(tokens)
@@ -209,8 +225,13 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 frame_embedding_counts,
                 num_frames=num_frames,
                 temporal_patch_size=int(getattr(module, "temporal_patch_dim", 1)),
-                placeholder_count=placeholder_count,
             )
+            media_kind = "video" if num_frames is not None else "image"
+            if placeholder_count != len(per_image_embeddings):
+                raise ValueError(
+                    f"Expected one compact placeholder per {media_kind}: "
+                    f"expected {len(per_image_embeddings)}, got {placeholder_count}."
+                )
         else:
             # Static resolution: fixed embeddings per tile
             img_embeddings_per_tile = module.img_seq_len
@@ -300,7 +321,11 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         return expanded_tokens_list, mask_list
 
     def _forward_vision_encoder(
-        self, images, num_image_tiles=None, imgs_sizes=None, num_frames=None
+        self,
+        images,
+        num_image_tiles=None,
+        imgs_sizes=None,
+        num_frames=None,
     ) -> torch.Tensor:
         """Run the vision encoder only, returning image embeddings.
 
@@ -317,7 +342,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         """
         from megatron.core.packed_seq_params import PackedSeqParams
 
-        module = resolve_wrapped_model(self.model)
+        module = get_attr_wrapped_model(
+            self.model, "image_token_index", return_model_obj=True
+        )
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes (see expand_image_tokens for context).
@@ -396,12 +423,19 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         attention_mask = inference_input.get("attention_mask", None)
         image_embeddings = inference_input.get("image_embeddings", None)
 
-        module = resolve_wrapped_model(self.model)
+        module = get_attr_wrapped_model(
+            self.model, "image_token_index", return_model_obj=True
+        )
 
         if is_pipeline_first_stage(self.pp_group) or self._recv_only_vision_embeds:
-            # Replace -1 padding with 0 for embedding lookup
+            # Media positions may contain either compact-path padding or the
+            # model's pre-expanded sentinel (for example, -200). The mask is
+            # authoritative for both representations.
             input_ids_text = tokens.clone()
-            input_ids_text[input_ids_text == -1] = 0
+            if image_token_mask is not None:
+                input_ids_text[image_token_mask >= 0] = 0
+            else:
+                input_ids_text[input_ids_text == -1] = 0
 
             # Get language embeddings: [seq_len, b, h_language]
             language_embeddings = module.language_model.embedding(
@@ -573,9 +607,10 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             return super().run_one_forward_step(inference_input)
 
         # Static VLM path
-        num_image_tokens = (
-            (tokens == resolve_wrapped_model(self.model).image_token_index).sum().item()
+        module = get_attr_wrapped_model(
+            self.model, "image_token_index", return_model_obj=True
         )
+        num_image_tokens = (tokens == module.image_token_index).sum().item()
         num_img_embeddings = inference_input["num_img_embeddings"]
         decoder_seq_length = inference_input["decoder_seq_length"]
         num_tokens = tokens.size(1)

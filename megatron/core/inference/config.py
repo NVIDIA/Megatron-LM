@@ -248,6 +248,7 @@ class VideoProcessingConfig:
     temporal_patch_size: int = 1
     frame_manifest_magic: Optional[bytes] = None
     """Prefix for payloads encoded as ``magic + UTF-8 {"frame_paths": [...]}``."""
+    video_maintain_aspect_ratio: bool = True
 
 
 @dataclass(frozen=True)
@@ -255,7 +256,6 @@ class MediaPromptSpec:
     """Map one API media type to the model's prompt-token contract."""
 
     model_token: str = "<image>"
-    model_token_id: Optional[int] = None
     prefix: str = ""
     suffix: str = ""
     input_marker: Optional[str] = None

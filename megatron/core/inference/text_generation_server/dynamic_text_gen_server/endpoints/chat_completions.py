@@ -15,9 +15,10 @@ import urllib.request
 import uuid
 import warnings
 
-_IMAGE_FETCH_TIMEOUT_S = 5.0
+_MEDIA_FETCH_TIMEOUT_S = 5.0
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
-_IMAGE_FETCH_USER_AGENT = "megatron-inference"
+_MAX_VIDEO_BYTES = 256 * 1024 * 1024  # 256 MiB
+_MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
@@ -265,23 +266,37 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
 
 
-def _extract_image_url_bytes(url: str) -> bytes:
-    """Extract raw bytes from an OpenAI-style image_url value.
+def _extract_media_url_bytes(url: str, *, max_bytes: int) -> bytes:
+    """Extract size-bounded bytes from an OpenAI-style media URL.
 
     Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
     plain ``http(s)://`` URLs.
     """
     if url.startswith("data:"):
-        _, b64_data = url.split(",", 1)
-        return base64.b64decode(b64_data)
+        # Base64 encodes each three input bytes as four characters. Bound the
+        # complete request before splitting or decoding it; 256 characters is
+        # ample for the data-URL metadata preceding the comma.
+        max_encoded_chars = 4 * ((max_bytes + 2) // 3)
+        if len(url) > max_encoded_chars + 256:
+            raise ValueError(f"Media data URL exceeds {max_bytes} byte limit")
+        try:
+            metadata, b64_data = url.split(",", 1)
+        except ValueError as exc:
+            raise ValueError(f"Malformed media data URL: {url[:40]!r}") from exc
+        if len(b64_data) > max_encoded_chars:
+            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
+        data = base64.b64decode(b64_data)
+        if len(data) > max_bytes:
+            raise ValueError(f"{metadata} payload exceeds {max_bytes} byte limit")
+        return data
     if url.startswith(("http://", "https://")):
         parsed = urllib.parse.urlparse(url)
         if not parsed.hostname:
-            raise ValueError(f"Invalid image_url: {url[:40]!r}")
+            raise ValueError(f"Invalid media URL: {url[:40]!r}")
         try:
             ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
         except (socket.gaierror, ValueError) as exc:
-            raise ValueError(f"Cannot resolve image_url host: {parsed.hostname}") from exc
+            raise ValueError(f"Cannot resolve media URL host: {parsed.hostname}") from exc
         # Refuse SSRF-prone destinations (loopback, RFC1918, link-local,
         # multicast, reserved, unspecified). Public addresses only.
         if (
@@ -292,14 +307,16 @@ def _extract_image_url_bytes(url: str) -> bytes:
             or ip.is_reserved
             or ip.is_unspecified
         ):
-            raise ValueError(f"Refusing to fetch image from non-public address: {parsed.hostname}")
-        req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_FETCH_USER_AGENT})
-        with _no_redirect_opener.open(req, timeout=_IMAGE_FETCH_TIMEOUT_S) as response:
-            data = response.read(_MAX_IMAGE_BYTES + 1)
-        if len(data) > _MAX_IMAGE_BYTES:
-            raise ValueError(f"Image at {parsed.hostname} exceeds {_MAX_IMAGE_BYTES} byte limit")
+            raise ValueError(
+                f"Refusing to fetch media from non-public address: {parsed.hostname}"
+            )
+        req = urllib.request.Request(url, headers={"User-Agent": _MEDIA_FETCH_USER_AGENT})
+        with _no_redirect_opener.open(req, timeout=_MEDIA_FETCH_TIMEOUT_S) as response:
+            data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"Media at {parsed.hostname} exceeds {max_bytes} byte limit")
         return data
-    raise ValueError(f"Unsupported image_url scheme: {url[:40]!r}")
+    raise ValueError(f"Unsupported media URL scheme: {url[:40]!r}")
 
 
 def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptConfig):
@@ -316,7 +333,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
     video_bytes_list: list[bytes] = []
     media_slots = []
 
-    def add_slot(modality):
+    def add_slot(modality, message_index):
         """Preserve a media block's position while the chat template renders text.
 
         The actual bytes travel separately. After rendering,
@@ -324,10 +341,10 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
         model-specific MediaPromptSpec tokens.
         """
         sentinel = f"__MCORE_MEDIA_SLOT_{len(media_slots)}__"
-        media_slots.append((sentinel, modality))
+        media_slots.append((sentinel, modality, message_index))
         return {"type": "text", "text": sentinel}
 
-    for message in messages:
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             rewritten.append(message)
             continue
@@ -345,13 +362,15 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
                 if not url:
                     continue
                 try:
-                    image_bytes_list.append(_extract_image_url_bytes(url))
+                    image_bytes_list.append(
+                        _extract_media_url_bytes(url, max_bytes=_MAX_IMAGE_BYTES)
+                    )
                 except Exception as e:
                     # Dropping the image would answer the request as if it were
                     # text-only, handing the client a confident answer about an
                     # image the model never saw. Surface it as a 400 instead.
                     raise ValueError(f"Failed to load image_url: {e}") from e
-                new_chunks.append(add_slot("image"))
+                new_chunks.append(add_slot("image", message_index))
                 found_modalities.add("image")
             elif isinstance(chunk, dict) and chunk.get("type") in {"video_url", "input_video"}:
                 video_value = chunk.get("video_url") or chunk.get("video")
@@ -359,10 +378,12 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
                 if not isinstance(url, str) or not url.startswith("data:"):
                     raise ValueError("Megatron chat video inputs must be base64 data URLs.")
                 try:
-                    video_bytes_list.append(_extract_image_url_bytes(url))
+                    video_bytes_list.append(
+                        _extract_media_url_bytes(url, max_bytes=_MAX_VIDEO_BYTES)
+                    )
                 except Exception as e:
                     raise ValueError(f"Failed to load video_url: {e}") from e
-                new_chunks.append(add_slot("video"))
+                new_chunks.append(add_slot("video", message_index))
                 found_modalities.add("video")
             else:
                 new_chunks.append(chunk)
@@ -572,41 +593,6 @@ def _coerce_to_token_id_list(result):
     return list(result)
 
 
-def _media_model_token_ids(chat_tok, prompt_config):
-    """Resolve the model token ids that stand in for media in a chat template."""
-    token_ids = set()
-    for modality in ("image", "video"):
-        spec = prompt_config.get_spec(modality)
-        token_id = spec.model_token_id
-        if token_id is None and hasattr(chat_tok, "convert_tokens_to_ids"):
-            resolved_id = chat_tok.convert_tokens_to_ids(spec.model_token)
-            if resolved_id is not None and resolved_id != getattr(chat_tok, "unk_token_id", None):
-                token_id = resolved_id
-        if token_id is not None:
-            token_ids.add(int(token_id))
-    return token_ids
-
-
-def _collapse_expanded_media_tokens(token_ids, media_token_ids):
-    """Collapse each consecutive run of a media token ID to one token.
-
-    ``token_ids`` contains the expanded model-input prompt, while
-    ``media_token_ids`` contains the image/video marker IDs from
-    ``MediaPromptSpec``. The result matches the compact chat-template token form.
-    """
-    if not media_token_ids:
-        return list(token_ids)
-
-    collapsed = []
-    previous_token_id = None
-    for token_id in token_ids:
-        if token_id in media_token_ids and token_id == previous_token_id:
-            continue
-        collapsed.append(token_id)
-        previous_token_id = token_id
-    return collapsed
-
-
 async def _tokenize_with_media_slots(
     chat_tok,
     messages,
@@ -632,7 +618,7 @@ async def _tokenize_with_media_slots(
         raise TypeError("Multimodal chat template rendering must return a string.")
 
     positioned_slots = []
-    for sentinel, modality in media_slots:
+    for sentinel, modality, _message_index in media_slots:
         if rendered.count(sentinel) != 1:
             raise ValueError(f"Chat template did not preserve media slot {sentinel}.")
         positioned_slots.append((rendered.index(sentinel), sentinel, modality))
@@ -644,7 +630,6 @@ async def _tokenize_with_media_slots(
             _coerce_to_token_id_list(chat_tok(rendered[cursor:position], add_special_tokens=False))
         )
         spec = prompt_config.get_spec(modality)
-        token_id = spec.model_token_id
         resolved_id = (
             chat_tok.convert_tokens_to_ids(spec.model_token)
             if hasattr(chat_tok, "convert_tokens_to_ids")
@@ -652,19 +637,12 @@ async def _tokenize_with_media_slots(
         )
         if resolved_id == getattr(chat_tok, "unk_token_id", None):
             resolved_id = None
-        if token_id is None:
-            if resolved_id is None:
-                raise ValueError(f"Tokenizer does not define media token {spec.model_token!r}.")
-            token_id = resolved_id
-        elif resolved_id is not None and token_id != resolved_id:
-            raise ValueError(
-                f"Configured token id {token_id} does not match "
-                f"{spec.model_token!r} id {resolved_id}."
-            )
+        if resolved_id is None:
+            raise ValueError(f"Tokenizer does not define media token {spec.model_token!r}.")
         prompt_tokens.extend(
             _coerce_to_token_id_list(chat_tok(spec.prefix, add_special_tokens=False))
         )
-        prompt_tokens.append(int(token_id))
+        prompt_tokens.append(int(resolved_id))
         prompt_tokens.extend(
             _coerce_to_token_id_list(chat_tok(spec.suffix, add_special_tokens=False))
         )
@@ -849,8 +827,26 @@ try:
                         and isinstance(last_assistant_message.get("prompt_token_ids"), list)
                         and isinstance(last_assistant_message.get("generation_token_ids"), list)
                     ):
+                        messages_to_last_assistant_message = template_messages[
+                            : last_assistant_message_idx + 1
+                        ]
+                        previous_media_slots = [
+                            slot
+                            for slot in media_slots
+                            if slot[2] <= last_assistant_message_idx
+                        ]
+                        previous_prompt_token_ids = last_assistant_message.get(
+                            "compact_prompt_token_ids"
+                        )
+                        if not isinstance(previous_prompt_token_ids, list):
+                            raise ValueError(
+                                "Prefix stitching requires compact_prompt_token_ids "
+                                "from the previous Megatron-Inference response."
+                            )
                         eos_token_id = tokenizer.eos_id
-                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+                        assert (
+                            eos_token_id is not None
+                        ), "Your tokenizer must have an EOS token ID!"
 
                         warnings.warn(
                             "Avoiding prefix retokenization."
@@ -858,16 +854,7 @@ try:
                             " This may cause unexpected behavior if messages (including system messages) are altered between generations."
                         )
 
-                        messages_to_last_assistant_message = template_messages[
-                            : last_assistant_message_idx + 1
-                        ]
-
-                        # Get the templated tokenization of just the previous generation
-                        previous_media_slots = [
-                            slot
-                            for slot in media_slots
-                            if slot[0] in str(messages_to_last_assistant_message)
-                        ]
+                        # Get the templated tokenization of just the previous generation.
                         if previous_media_slots:
                             retokenized_previous_turn_token_ids = (
                                 await _tokenize_with_media_slots(
@@ -896,13 +883,8 @@ try:
                                 )
                             )
 
-                        # Responses carry model-input tokens, but prefix stitching happens
-                        # before media expansion, so undo the expansion first.
                         previous_turn_token_ids = (
-                            _collapse_expanded_media_tokens(
-                                last_assistant_message["prompt_token_ids"],
-                                _media_model_token_ids(chat_tok, prompt_config),
-                            )
+                            previous_prompt_token_ids
                             + last_assistant_message["generation_token_ids"]
                         )
                         prompt_tokens = _replace_prefix_tokens(
@@ -921,6 +903,9 @@ try:
                 prompt_tokens = tokenizer.tokenize(
                     "\n".join([message["content"] for message in messages])
                 )
+        except ValueError as e:
+            logger.error(f"{traceback.format_exc()}")
+            return Response(f"Invalid 'messages': {e}", status=400)
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
             return Response(f"Error processing 'messages': {e}", status=500)
@@ -1218,9 +1203,12 @@ try:
 
             if return_tokenized_data:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
-                # (post vision/video expansion). Compact chat-template tokens stay
-                # engine-internal (compact_prompt_tokens) and are never returned.
+                # (post vision/video expansion). Preserve the exact compact form
+                # separately for lossless multi-turn prefix stitching.
                 message["prompt_token_ids"] = result["prompt_tokens"]
+                message["compact_prompt_token_ids"] = (
+                    result.get("compact_prompt_tokens") or result["prompt_tokens"]
+                )
                 message["generation_token_ids"] = result["generated_tokens"]
             if return_raw_text:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])

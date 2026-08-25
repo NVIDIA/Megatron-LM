@@ -397,6 +397,17 @@ class TestMultimodalAffinityRouting:
         coordinator._update_media_affinity("image-a", media_rank)
         assert coordinator.get_best_data_parallel_rank([], media_cache_key="image-a") == media_rank
 
+    def test_removing_engine_prunes_its_media_affinity(self):
+        coordinator = make_coordinator_direct()
+        removed_rank, retained_rank = coordinator._identities_list
+        coordinator._update_media_affinity("removed-image", removed_rank)
+        coordinator._update_media_affinity("retained-image", retained_rank)
+
+        coordinator._remove_engine(removed_rank)
+
+        assert "removed-image" not in coordinator._media_cache_affinity
+        assert coordinator._media_cache_affinity["retained-image"] == retained_rank
+
     def test_cold_media_falls_back_to_least_loaded_rank(self):
         coordinator = make_coordinator_direct(
             enable_prefix_caching=False, prefix_caching_routing_alpha=1.0
