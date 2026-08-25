@@ -332,25 +332,11 @@ def test_non_fused_forward_wraps_compute_in_paged_stash_scope(monkeypatch):
             events.append("exit")
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
-    torch.nn.Module.__init__(module)
     module.config = SimpleNamespace(
-        fp8=False,
-        fp4=False,
-        moe_paged_stash=True,
-        moe_expert_rank_capacity_factor=1.5,
-        moe_apply_probs_on_input=False,
-        delay_offload_until_cuda_graph=False,
-        use_te_activation_func=True,
-        gated_linear_unit=False,
-        moe_mlp_glu_interleave_size=None,
+        fp8=False, fp4=False, moe_paged_stash=True, moe_expert_rank_capacity_factor=1.5
     )
     module._with_fused_impl = False
     module._use_grouped_tensor = True
-    module.offload_expert_fc1 = False
-    module.offload_moe_act = False
-    module.activation_recompute = False
-    module.activation_func = lambda tensor: tensor
-    module._mark_paged_stash_tensors = lambda *tensors: None
 
     monkeypatch.setattr(experts_module, "skip_routed_expert_padding", lambda _config: True)
 
@@ -375,19 +361,12 @@ def test_non_fused_forward_wraps_compute_in_paged_stash_scope(monkeypatch):
     monkeypatch.setattr(experts_module, "get_paged_stash_context", get_context)
     monkeypatch.setattr(experts_module, "paged_stash_group_commit", group_commit)
 
-    class FakeFC1(torch.nn.Module):
-        def forward(self, hidden_states, tokens_per_expert):
-            events.append("compute")
-            assert isinstance(tokens_per_expert, torch.Tensor)
-            return hidden_states + 1, None
+    def unfused_forward(hidden_states, tokens_per_expert, permuted_probs):
+        events.append("compute")
+        assert isinstance(tokens_per_expert, torch.Tensor)
+        return hidden_states + permuted_probs
 
-    class FakeFC2(torch.nn.Module):
-        def forward(self, hidden_states, tokens_per_expert):
-            assert isinstance(tokens_per_expert, torch.Tensor)
-            return hidden_states, None
-
-    module.linear_fc1 = FakeFC1()
-    module.linear_fc2 = FakeFC2()
+    module._unfused_forward = unfused_forward
 
     hidden_states = torch.zeros(2, 4)
     tokens_per_expert = torch.tensor([1, 1])
