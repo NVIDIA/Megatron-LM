@@ -160,15 +160,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 "output arity."
             )
 
-    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+    def get_layer_static_inputs(self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
 
-        CUDA graph capture creates static buffers whose shapes are determined by
-        this method. The base class returns [s, b, C], but mHC layers operate on
-        n-stream hidden states of shape [s, b, n*C].
+        CUDA graph capture and pipeline prewarm create synthetic buffers whose shapes are
+        determined by this method. The base class returns [s, b, C], but mHC layers operate
+        on n-stream hidden states of shape [s, b, n*C].
         """
-        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
-        if self._uses_mhc_recompute_attn_cuda_graph_split():
+        static_inputs = super().get_layer_static_inputs(
+            seq_length, micro_batch_size, for_pipeline_prewarm=for_pipeline_prewarm
+        )
+        if not for_pipeline_prewarm and self._uses_mhc_recompute_attn_cuda_graph_split():
             # The captured callable begins at the attention consumer, after the
             # eager mHC producer has reduced n streams to one hidden-size tensor.
             return static_inputs

@@ -81,6 +81,20 @@ class TestHybridMHCAttentionGraphSplit:
         assert inputs["hidden_states"].shape == (3, 1, 4 if split else 8)
         assert inputs["attention_mask"] is mask
 
+    def test_pipeline_prewarm_input_keeps_n_streams_with_split(self, hybrid_split_wrapper):
+        # Pipeline prewarm runs the whole wrapper, whose forward starts from n streams,
+        # even when graph capture would start at the split attention consumer.
+        wrapper = hybrid_split_wrapper
+        assert wrapper._uses_mhc_recompute_attn_cuda_graph_split()
+        wrapper.inner_layer.get_layer_static_inputs = Mock(
+            return_value={"hidden_states": torch.ones(3, 1, 4)}
+        )
+        inputs = wrapper.get_layer_static_inputs(3, 1, for_pipeline_prewarm=True)
+        assert inputs["hidden_states"].shape == (3, 1, 8)
+        wrapper.inner_layer.get_layer_static_inputs.assert_called_once_with(
+            3, 1, for_pipeline_prewarm=True
+        )
+
     def test_mlp_wrapper_stays_eager(self, hybrid_split_wrapper):
         from megatron.core.transformer.cuda_graphs import _layer_is_graphable
 
