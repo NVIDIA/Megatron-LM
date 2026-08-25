@@ -898,11 +898,9 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = self._remove_glu_interleaving(
                         intermediate_parallel, self.config.moe_mlp_glu_interleave_size
                     )
-                self._mark_paged_stash_tensors(intermediate_parallel)
                 intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
-                    self._mark_paged_stash_tensors(intermediate_parallel, permuted_probs)
                     intermediate_parallel = intermediate_parallel * permuted_probs
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
             elif self.config.bias_activation_fusion and not with_glu_interleaving:
@@ -946,22 +944,17 @@ class TEGroupedMLP(MegatronModule):
                                 x, self.config.moe_mlp_glu_interleave_size
                             )
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        self._mark_paged_stash_tensors(x_glu, x_linear)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
                             x_linear = x_linear.clamp(min=-val, max=val)
-                            self._mark_paged_stash_tensors(x_glu, x_linear)
                         x_glu = self.config.activation_func(x_glu)
                         x_linear = x_linear + self.config.glu_linear_offset
-                        # MulBackward saves both newly-created operands.
-                        self._mark_paged_stash_tensors(x_glu, x_linear)
                         return x_glu * x_linear
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
                     intermediate_parallel = self.activation_func(intermediate_parallel)
                 original_dtype = intermediate_parallel.dtype
-                self._mark_paged_stash_tensors(intermediate_parallel, permuted_probs)
                 intermediate_parallel = intermediate_parallel * permuted_probs
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel

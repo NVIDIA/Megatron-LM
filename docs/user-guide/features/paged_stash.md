@@ -21,7 +21,7 @@ Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-ba
 
 ## Prerequisites
 
-HybridEP and TE grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. The non-op-fuser path requires a Transformer Engine version whose GroupedLinear marks saved GroupedTensor activation buffers for paged stashing. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.
+HybridEP and TE grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. The non-op-fuser path requires a Transformer Engine version whose GroupedLinear marks saved GroupedTensor activation buffers for paged stashing. It currently supports only fused SwiGLU or QuickGeGLU (`bias_activation_fusion=True`) without GLU interleaving; restricting the activation contract keeps dynamic-tensor marking at the fused autograd boundaries. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.
 
 ## Configuration
 
@@ -42,6 +42,7 @@ HybridEP and TE grouped experts are required whenever `moe_expert_rank_capacity_
 # B. Device-initiated GroupedLinear, without the operation fuser
 --moe-grouped-gemm
 --moe-use-grouped-tensor
+# Keep the default fused SwiGLU activation; do not pass --no-bias-swiglu-fusion.
 ```
 
 Path B removes host-device synchronization from grouped GEMM split metadata, but FC1, activation,
