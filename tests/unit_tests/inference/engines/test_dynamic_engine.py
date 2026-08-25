@@ -194,7 +194,7 @@ class DynamicEngineTestConfig:
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
-    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -6189,14 +6189,7 @@ class TestChunkedPrefillCudaGraphs:
         model.eval()
         return model
 
-    def _build_engine(
-        self,
-        model,
-        enable_chunked_prefill,
-        num_cuda_graphs,
-        context_max_tokens,
-        async_sched_mode=None,
-    ):
+    def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
         # FP32 recurrent state. Chunked prefill hands a request's recurrence
@@ -6221,8 +6214,6 @@ class TestChunkedPrefillCudaGraphs:
             max_requests=128,
             sampling_backend='torch',
         )
-        if async_sched_mode is not None:
-            inference_config_kwargs.update(async_sched_mode=async_sched_mode)
         if mamba_config is not None:
             inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
         context = DynamicInferenceContext(
@@ -6400,12 +6391,7 @@ class TestChunkedPrefillCudaGraphs:
 
         baseline_snapshots = []
         baseline_engine = self._build_engine(
-            model,
-            enable_chunked_prefill=False,
-            num_cuda_graphs=None,
-            context_max_tokens=None,
-            # Snapshot counts below intentionally describe the legacy step layout.
-            async_sched_mode=AsyncScheduleMode.LEGACY,
+            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
         )
         baseline_outputs, _ = self._run_to_completion(
             baseline_engine, prompts, num_tokens_to_generate, conv_snapshots=baseline_snapshots
@@ -6417,7 +6403,6 @@ class TestChunkedPrefillCudaGraphs:
             enable_chunked_prefill=True,
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=context_max_tokens,
-            async_sched_mode=AsyncScheduleMode.LEGACY,
         )
         chunked_outputs, _ = self._run_to_completion(
             chunked_engine, prompts, num_tokens_to_generate, conv_snapshots=chunked_snapshots
@@ -6442,13 +6427,14 @@ class TestChunkedPrefillCudaGraphs:
             ("baseline", baseline_snapshots, baseline_prefill_steps),
             ("chunked", chunked_snapshots, chunked_prefill_steps),
         ):
-            # The first generated token comes out of the final prefill step, so
-            # the rest cost one decode step each. Checked rather than assumed: a
-            # different prompt split would otherwise leave the comparison below
-            # on two decode-step snapshots, which match no matter what.
-            assert len(snapshots) == prefill_steps + num_tokens_to_generate - 1, (
+            # Async scheduling launches the first prefill as a primer-only step,
+            # then resolves each generated token in a subsequent step. Checked
+            # rather than assumed: a different prompt split would otherwise leave
+            # the comparison below on two decode-step snapshots, which match no
+            # matter what.
+            assert len(snapshots) == prefill_steps + num_tokens_to_generate, (
                 f"{name}: expected {prefill_steps} prefill steps and "
-                f"{num_tokens_to_generate - 1} decode steps, got {len(snapshots)} steps"
+                f"{num_tokens_to_generate} sampling steps, got {len(snapshots)} steps"
             )
 
         baseline_conv = baseline_snapshots[baseline_prefill_steps - 1]
