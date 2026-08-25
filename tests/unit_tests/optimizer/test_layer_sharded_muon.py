@@ -1683,3 +1683,66 @@ def test_padded_param_2d_fused_raises():
     p.grad = torch.randn_like(p)
     with pytest.raises(NotImplementedError, match="fused"):
         opt.step()
+
+
+def test_tp_replicated_ns_chunking_is_column_invariant():
+    """nsb>1 must not diverge the TP replicas of a non-TP-sharded param.
+
+    A GTP_remat-sharded / non-TP-sharded param is assembled and orthogonalized
+    independently on EVERY TP column of its g_home, and each column scatters its
+    own result back over gtp_remat alone. Its batch chunking therefore must not
+    depend on the column's TP-sharded params — a different set per column. With
+    pooled chunking, the canary below lands in a baddbmm chunk on column t=0
+    (which also homes a same-shape TP-sharded matrix) and runs alone via addmm
+    on t=1; the kernel-level rounding difference makes the TP replicas of its
+    weight drift apart and compound every step (manifests with GPU kernels;
+    CPU GEMMs may round identically). Fixed by running the pdim-None subset
+    through its own _run_ns call, whose set is identical on every column.
+    """
+    _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP_remat=2)")
+    _require_batched_ns(8)
+    T, G = 2, 2
+    r = dist.get_rank()
+    t_rank, g_rank = r % T, r // T
+    tp_group, gtp_remat_group = _get_2d_groups()
+    lr, momentum = 1e-2, 0.95
+    torch.manual_seed(_SEED + 500)
+
+    # Canary A: GTP_remat-sharded, not TP-sharded. B: TP+GTP_remat sharded,
+    # homed at (0, 0) only. Both assemble to (32, 16), sharing a shape bucket.
+    full_a = torch.randn(32, 16)
+    full_b = torch.randn(32, 16)
+    grad_a = torch.randn(32, 16)
+    grad_b = torch.randn(32, 16)
+
+    p_a = _gtp_param(full_a[g_rank * 16 : (g_rank + 1) * 16, :].clone())
+    p_a.grad = grad_a[g_rank * 16 : (g_rank + 1) * 16, :].clone()
+    rows_b = 32 // (T * G)
+    start_b = t_rank * (32 // T) + g_rank * rows_b
+    p_b = _gtp_param(full_b[start_b : start_b + rows_b, :].clone())
+    p_b.partition_dim = 0
+    p_b.grad = grad_b[start_b : start_b + rows_b, :].clone()
+
+    opt = LayerShardedMuon(
+        [p_a, p_b],
+        lr=lr,
+        momentum=momentum,
+        weight_decay=0.0,
+        num_ns_steps=5,
+        fp32_matmul_prec="highest",
+        gtp_remat_group=gtp_remat_group,
+        tp_group=tp_group,
+        ns_batch_size=8,
+    )
+    opt.set_param_ns_homes({id(p_a): (0, 0), id(p_b): (0, 0)})
+    opt.step()
+
+    # A's shard is defined by g alone; the TP peers of each g row must agree
+    # bitwise or the replicas compound apart over training.
+    gathered = [torch.empty_like(p_a.data) for _ in range(T)]
+    dist.all_gather(gathered, p_a.data.contiguous(), group=tp_group)
+    assert torch.equal(gathered[0], gathered[1]), (
+        f"TP replicas of the non-TP-sharded param diverged on rank {r} "
+        f"(t={t_rank}, g={g_rank}): "
+        f"max_diff={(gathered[0] - gathered[1]).abs().max().item():.2e}"
+    )

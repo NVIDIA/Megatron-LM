@@ -1726,6 +1726,15 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
+    # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
+    # sgd/adam that block is skipped entirely, which would silently ignore the
+    # flag — the one case where the loud failure matters most.
+    if getattr(args, 'use_layer_sharding_muon', False):
+        assert args.optimizer == 'muon', (
+            f"--use-layer-sharding-muon is only supported with --optimizer muon "
+            f"(got --optimizer {args.optimizer}). Other optimizers, including "
+            "adaptive_muon, do not implement layer sharding."
+        )
     if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
@@ -1744,11 +1753,7 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
         if getattr(args, 'use_layer_sharding_muon', False):
-            assert args.optimizer == 'muon', (
-                f"--use-layer-sharding-muon is only supported with --optimizer muon "
-                f"(got --optimizer {args.optimizer}). Other Muon variants such as "
-                "adaptive_muon do not implement layer sharding."
-            )
+            # optimizer == 'muon' is already guaranteed by the hoisted assert above.
             assert args.use_layer_wise_distributed_optimizer, (
                 "--use-layer-sharding-muon requires the layer-wise distributed "
                 "optimizer path (--optimizer muon with --use-distributed-optimizer)."
