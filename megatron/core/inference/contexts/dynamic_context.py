@@ -12,6 +12,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -315,7 +316,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     """
 
     DEFAULT_MAX_TOKENS = 16384
-    TOKEN_ROUNDER = 64
+    TOKEN_ROUNDER = _TOKEN_ROUNDER
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
 
@@ -430,9 +431,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+            self.ssm_chunk_alignment = mamba_inference_state_config.ssm_chunk_alignment
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
+                # Gated Delta Product does not implement batch-invariant mode yet.
+                assert self.gdp_num_householder == 0, (
+                    "batch_invariant_mode does not support Gated Delta Product layers; "
+                    "set batch_invariant_mode=False."
+                )
                 assert not self.enable_prefix_caching, (
                     "batch_invariant_mode does not support Mamba prefix caching; "
                     "set enable_prefix_caching=False."
@@ -446,21 +453,22 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "boundaries are not rounded between decode chunks."
                 )
 
-            # For hybrid models, the layer map converts the global layer index to the
-            # corresponding attention layer index or Mamba layer index depending on the
-            # layer type.
-            attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
-                operator.itemgetter(
-                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
-                )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
-            )
-
-            if len(gdn_layer_map) > 0:
-                raise NotImplementedError("GDN layers are not supported for inference.")
+            # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
+            # one map in global layer order; independently generated per-symbol maps both
+            # start at zero and would alias if they were simply unioned.
+            attention_layer_map, dsa_layer_map = operator.itemgetter(
+                Symbols.ATTENTION, Symbols.DS_ATTENTION
+            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+            recurrent_layer_map = {}
+            for global_layer_idx, layer_type in enumerate(
+                mamba_inference_state_config.layer_type_list
+            ):
+                if layer_type in (Symbols.MAMBA, Symbols.GDN):
+                    recurrent_layer_map[global_layer_idx] = len(recurrent_layer_map)
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
-            self.num_mamba_layers = len(mamba_layer_map)
-            self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
+            self.num_mamba_layers = len(recurrent_layer_map)
+            self.layer_map = attention_layer_map | dsa_layer_map | recurrent_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -818,9 +826,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
             # A chunk plus its final token must fit in one step; otherwise a prompt
             # of that length can never advance without an invalid one-token tail.
-            assert self.max_tokens > self.mamba_chunk_size, (
-                "batch-invariant Mamba chunked prefill requires max_tokens > "
-                f"mamba_chunk_size ({self.mamba_chunk_size})."
+            assert self.max_tokens > self.ssm_chunk_alignment, (
+                "batch-invariant SSM chunked prefill requires max_tokens > "
+                f"ssm_chunk_alignment ({self.ssm_chunk_alignment})."
             )
 
         # FlashInfer.

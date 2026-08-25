@@ -71,7 +71,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 
-from .async_zmq_communicator import AsyncZMQCommunicator
+from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
 
 try:
     from tqdm import tqdm
@@ -747,6 +747,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         mp_group = self.pg_collection.mp
         mp_src = get_pg_src_rank(mp_group)
+        mp_size = get_pg_size(mp_group)
+        mp_rank = get_pg_rank(mp_group)
+        dp_replica_mp_request_broadcast = RankedPubSub(
+            b"DynamicInferenceEngine.mp_request_broadcast:"
+        )
         tp_rank = get_pg_rank(self.pg_collection.tp)
         pp_rank = get_pg_rank(self.pg_collection.pp)
 
@@ -799,10 +804,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
-            mp_req_sock = self.zmq_context.socket(zmq.PUB)
+            mp_req_sock = dp_replica_mp_request_broadcast.create_publisher(self.zmq_context)
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
-
         else:
             mp_req_addr = None
 
@@ -834,11 +838,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.model_parallel_publisher_socket,
             ]
         # All MP ranks subscribe to the publisher socket
-        self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_subscriber_socket.connect(mp_req_addr)
-        self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.model_parallel_subscriber_socket = dp_replica_mp_request_broadcast.create_subscriber(
+            self.zmq_context, mp_req_addr, mp_rank
+        )
 
         self.zmq_sockets += [self.model_parallel_subscriber_socket]
+
+        if self.is_mp_coordinator:
+            dp_replica_mp_request_broadcast.wait_for_subscribers(
+                self.model_parallel_publisher_socket, range(mp_size)
+            )
 
         self._setup_handoff_completion_tracking(hostname)
 
@@ -2035,19 +2044,19 @@ class DynamicInferenceEngine(AbstractEngine):
     def _mamba_batch_invariant_prefill_chunk_length(
         self, req: DynamicInferenceRequest, capacity: int
     ) -> int:
-        """Raw prefill length that computes an aligned chunk within ``capacity``.
+        """Raw prefill length that computes an aligned chunk within `capacity`.
 
-        Non-final calls must start and end at Mamba chunk boundaries. The final
+        Non-final calls must start and end at SSM chunk boundaries. The final
         prompt call may be shorter because it seeds the decode replay tail.
         """
         remaining = len(req.remaining_prompt_tokens)
         if capacity >= remaining:
             return remaining
 
-        chunk_size = self.context.mamba_chunk_size
-        computed_tokens = (capacity // chunk_size) * chunk_size
+        alignment = self.context.ssm_chunk_alignment
+        computed_tokens = (capacity // alignment) * alignment
         if remaining - computed_tokens == 1:
-            computed_tokens -= chunk_size
+            computed_tokens -= alignment
         if computed_tokens <= 0:
             return 0
         return computed_tokens
