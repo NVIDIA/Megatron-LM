@@ -990,9 +990,9 @@ class _CudaGraphRunner(torch.nn.Module):
         self.needs_recompute_param_discovery = False
         self.use_stream = False
         self.gtp_remat = False
-        # Populated by create_bwd_graph: GTP params whose main_grad.add_ was captured in THIS
-        # graph.  Used in Graphed.backward's post-replay hook loop to fire DDP hooks only in the
-        # graph whose replay populates main_grad.
+        # Populated by create_bwd_graph: one entry per captured GTP wgrad-finalization occurrence.
+        # Repeated parameters intentionally appear more than once so replay matches eager DDP
+        # grad-ready accounting.
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
@@ -1058,32 +1058,6 @@ class _CudaGraphRunner(torch.nn.Module):
         """
         for s in side_streams:
             torch.cuda.current_stream().wait_stream(s)
-
-    def _compute_finalized_during_bwd_capture(self):
-        """Return GTP params whose DDP grad-ready hook fires post-replay
-        of THIS bwd_graph.
-
-        A param's hook must fire in the graph that physically populates its
-        main_grad. Rules, given the cascade walk in wgrad_reduce_scatter
-        finalizes p.next_w on behalf of p:
-          - p.prev_w is None → p is sync-finalized in p's own graph; add p.
-          - p.next_w is not None → p.next_w's main_grad.add_ is captured here
-            via p's cascade; add p.next_w. (For cross-graph chain tails the
-            wait was captured in the producer's Phase 2, but the add lives
-            here regardless, bridged by external rs_event.)
-        """
-        finalized = {}  # id → param
-        for p in self.params_to_backprop:
-            if not getattr(p, 'is_gtp_weight_remat', False):
-                continue
-            if getattr(p, "prev_w", None) is None:
-                for w in getattr(p, "_weights", [p]):
-                    finalized[id(w)] = w
-            next_w = getattr(p, "next_w", None)
-            if next_w is not None:
-                for w in getattr(next_w, "_weights", [next_w]):
-                    finalized[id(w)] = w
-        return list(finalized.values())
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -1575,9 +1549,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.unfreeze()
 
-        # See _compute_finalized_during_bwd_capture for what's in this set and why.
         self.finalized_during_bwd_capture = (
-            self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
+            list(capture_comms.finalized_params) if self.gtp_remat else []
         )
         self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
 

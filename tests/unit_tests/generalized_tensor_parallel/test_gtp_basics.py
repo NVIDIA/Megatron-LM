@@ -1602,6 +1602,17 @@ class TestActivationRecomputePhaseFlag:
 
 
 class TestGTPCaptureParamReadiness:
+    def test_wgrad_finalization_preserves_repeated_occurrences(self):
+        first = object()
+        second = object()
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture:
+            gtp_cuda_graphs.register_capture_wgrad_finalize(first)
+            gtp_cuda_graphs.register_capture_wgrad_finalize(second)
+            gtp_cuda_graphs.register_capture_wgrad_finalize(first)
+
+        assert capture.finalized_params == [first, second, first]
+
     def test_forward_gather_registers_params_before_ensuring_readiness(self, monkeypatch):
         class StopAfterReadiness(Exception):
             pass

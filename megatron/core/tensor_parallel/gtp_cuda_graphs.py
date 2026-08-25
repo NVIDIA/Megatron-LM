@@ -87,6 +87,7 @@ class GTPCaptureCommState:
     ag_streams: list = field(default_factory=list)
     rs_streams: list = field(default_factory=list)
     wgrad_ring_slots: list = field(default_factory=list)
+    finalized_params: list = field(default_factory=list)
     _param_ids: set = field(default_factory=set)
     _param_ids_to_ensure_ready: set = field(default_factory=set)
     _ag_stream_ids: set = field(default_factory=set)
@@ -155,6 +156,12 @@ class GTPCaptureCommState:
             self._wgrad_ring_slot_params[slot_id] = param_id
             self.wgrad_ring_slots.append(slot)
 
+    def register_wgrad_finalize(self, param) -> None:
+        """Record one DDP grad-ready occurrence produced by captured GTP finalization."""
+        # Repeated uses of one parameter must remain repeated: DDP learns the expected ready
+        # count during eager execution, and CUDA graph replay must reproduce that count.
+        self.finalized_params.append(param)
+
 
 _ACTIVE_CAPTURE_COMM_STATE: Optional[GTPCaptureCommState] = None
 
@@ -163,6 +170,12 @@ def register_capture_comm(param, stream: torch.cuda.Stream, *, reduce_scatter: b
     """Register communication with the active capture, if one exists."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
         _ACTIVE_CAPTURE_COMM_STATE.register_comm(param, stream, reduce_scatter=reduce_scatter)
+
+
+def register_capture_wgrad_finalize(param) -> None:
+    """Record one GTP wgrad-finalization occurrence with the active capture."""
+    if _ACTIVE_CAPTURE_COMM_STATE is not None:
+        _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_finalize(param)
 
 
 def register_capture_params_to_ensure_ready(params: Iterable) -> None:

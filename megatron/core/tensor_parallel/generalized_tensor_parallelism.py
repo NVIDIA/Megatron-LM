@@ -42,6 +42,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     cuda_graph_pool_allocation,
     register_capture_comm,
     register_capture_params_to_ensure_ready,
+    register_capture_wgrad_finalize,
     register_capture_wgrad_ring_slot,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
@@ -1854,8 +1855,10 @@ class GTPShardedParam(torch.nn.Parameter):
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype, zero=True)
         else:
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
-        if getattr(param, "_grad_accum_hook", None) is not None:
-            param._grad_accum_hook()
+        hook = getattr(param, "_grad_accum_hook", None)
+        if hook is not None:
+            register_capture_wgrad_finalize(param)
+            hook()
 
         param._set_rs_state(GTPWeightState.NONE)
         return dummy_grad
