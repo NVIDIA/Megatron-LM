@@ -7,7 +7,9 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Release Notes
+# Release Notes and Roadmaps
+
+## Release Notes
 
 We publish release notes for every [major release](https://github.com/NVIDIA/Megatron-LM/releases).
 
