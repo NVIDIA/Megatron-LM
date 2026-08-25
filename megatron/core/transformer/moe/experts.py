@@ -312,6 +312,12 @@ class TEGroupedMLP(MegatronModule):
         output_dtype = intermediate_parallel.dtype
         flat_output = intermediate_parallel.view(-1, hidden_size).float()
         flat_probs = permuted_probs.reshape(-1, 1).float()
+        paged_stash_marked = hasattr(intermediate_parallel, "grouped_tensor_scale_inv") or hasattr(
+            permuted_probs, "grouped_tensor_scale_inv"
+        )
+        if paged_stash_marked:
+            setattr(flat_output, "grouped_tensor_scale_inv", False)
+            setattr(flat_probs, "grouped_tensor_scale_inv", False)
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -329,6 +335,8 @@ class TEGroupedMLP(MegatronModule):
         bias_per_token = torch.repeat_interleave(
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
+        if paged_stash_marked:
+            setattr(bias_per_token, "grouped_tensor_scale_inv", False)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
     @staticmethod
@@ -689,6 +697,43 @@ class TEGroupedMLP(MegatronModule):
 
         return forward_post_hook
 
+    def _start_paged_stash_group(
+        self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> tuple[torch.Tensor, object]:
+        """Start the grouped-MLP paged-stash scope when it is enabled."""
+        if not self.config.moe_paged_stash:
+            return permuted_local_hidden_states, nullcontext()
+
+        permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+        max_num_tokens = permuted_local_hidden_states.shape[0]
+        # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+        # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+        cap_factor = self.config.moe_expert_rank_capacity_factor
+        avg_num_tokens = (
+            int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+        )
+        stash_context = get_paged_stash_context(
+            name="grouped_mlp",
+            max_num_tokens=max_num_tokens,
+            num_tokens_tensor=tokens_per_expert.sum(),
+            avg_num_tokens=avg_num_tokens,
+        )
+        return permuted_local_hidden_states, stash_context
+
+    def _commit_paged_stash_group(self, output: torch.Tensor) -> torch.Tensor:
+        """Commit the grouped-MLP paged-stash scope when it is enabled."""
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
+        return output
+
+    def _mark_paged_stash_tensors(self, *tensors: Optional[torch.Tensor]) -> None:
+        """Mark dynamic unfused activations for the paged-stash saved-tensor hook."""
+        if not self.config.moe_paged_stash:
+            return
+        for tensor in tensors:
+            if tensor is not None:
+                setattr(tensor, "grouped_tensor_scale_inv", False)
+
     def _fused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -752,25 +797,9 @@ class TEGroupedMLP(MegatronModule):
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
-        if self.config.moe_paged_stash:
-            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-            max_num_tokens = permuted_local_hidden_states.shape[0]
-            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-            cap_factor = self.config.moe_expert_rank_capacity_factor
-            avg_num_tokens = (
-                int(max_num_tokens // cap_factor)
-                if cap_factor is not None and cap_factor > 0
-                else None
-            )
-            stash_context = get_paged_stash_context(
-                name="grouped_mlp",
-                max_num_tokens=max_num_tokens,
-                num_tokens_tensor=tokens_per_expert.sum(),
-                avg_num_tokens=avg_num_tokens,
-            )
-        else:
-            stash_context = nullcontext()
+        permuted_local_hidden_states, stash_context = self._start_paged_stash_group(
+            permuted_local_hidden_states, tokens_per_expert
+        )
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
         fused_group_mlp_manager = off_interface(
@@ -796,9 +825,7 @@ class TEGroupedMLP(MegatronModule):
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
-        if self.config.moe_paged_stash:
-            output = paged_stash_group_commit(output, name="grouped_mlp")
-        return output
+        return self._commit_paged_stash_group(output)
 
     @staticmethod
     def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
@@ -808,6 +835,150 @@ class TEGroupedMLP(MegatronModule):
         x = x.transpose(1, 2).contiguous()
         x = x.view(shape)
         return x
+
+    def _unfused_forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor | list[int],
+        permuted_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run FC1, activation, and FC2 without the TE operation fuser."""
+        self._mark_paged_stash_tensors(permuted_local_hidden_states, permuted_probs)
+
+        if self.config.moe_apply_probs_on_input:
+            assert (
+                self.config.moe_router_topk == 1
+            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            original_dtype = permuted_local_hidden_states.dtype
+            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
+            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
+            # Probs already applied, so reset to 1.
+            permuted_probs = torch.ones_like(permuted_probs)
+            self._mark_paged_stash_tensors(permuted_local_hidden_states, permuted_probs)
+
+        expert_fc1_manager = off_interface(
+            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+        )
+        with expert_fc1_manager as permuted_local_hidden_states:
+            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+        fc1_output = expert_fc1_manager.group_offload(
+            fc1_output,
+            forced_released_tensors=[permuted_local_hidden_states],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
+        self._mark_paged_stash_tensors(fc1_output)
+
+        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
+
+        def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
+            self._mark_paged_stash_tensors(intermediate_parallel, permuted_probs)
+
+            # Whether activation function is interleaved GLU
+            with_glu_interleaving = (
+                self.config.gated_linear_unit
+                and self.config.moe_mlp_glu_interleave_size is not None
+            )
+
+            if self.config.use_te_activation_func:
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                if with_glu_interleaving:
+                    intermediate_parallel = self._remove_glu_interleaving(
+                        intermediate_parallel, self.config.moe_mlp_glu_interleave_size
+                    )
+                self._mark_paged_stash_tensors(intermediate_parallel)
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if permuted_probs is not None:
+                    original_dtype = intermediate_parallel.dtype
+                    self._mark_paged_stash_tensors(intermediate_parallel, permuted_probs)
+                    intermediate_parallel = intermediate_parallel * permuted_probs
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
+            elif self.config.bias_activation_fusion and not with_glu_interleaving:
+                if self.activation_func == F.silu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        permuted_probs,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.activation_func_clamp_value,
+                    )
+                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                    intermediate_parallel = weighted_bias_quick_geglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        permuted_probs,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.glu_linear_offset,
+                        self.config.activation_func_clamp_value,
+                    )
+                else:
+                    raise ValueError(
+                        "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
+                    )
+            elif (
+                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
+            ):
+                assert (
+                    bias_parallel is None
+                ), "Bias is not supported with fused weighted squared relu."
+                intermediate_parallel = weighted_squared_relu_impl(
+                    intermediate_parallel, permuted_probs
+                )
+            else:
+                if self.config.gated_linear_unit:
+
+                    def glu(x):
+                        if with_glu_interleaving:
+                            x = self._remove_glu_interleaving(
+                                x, self.config.moe_mlp_glu_interleave_size
+                            )
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        self._mark_paged_stash_tensors(x_glu, x_linear)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                            self._mark_paged_stash_tensors(x_glu, x_linear)
+                        x_glu = self.config.activation_func(x_glu)
+                        self._mark_paged_stash_tensors(x_glu)
+                        x_linear = x_linear + self.config.glu_linear_offset
+                        self._mark_paged_stash_tensors(x_linear)
+                        return x_glu * x_linear
+
+                    intermediate_parallel = glu(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+                original_dtype = intermediate_parallel.dtype
+                self._mark_paged_stash_tensors(intermediate_parallel, permuted_probs)
+                intermediate_parallel = intermediate_parallel * permuted_probs
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+            return intermediate_parallel
+
+        if self.activation_recompute:
+            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            with moe_act_manager as fc1_output:
+                bias_act_output = self.activation_checkpoint.checkpoint(
+                    bias_act_func, fc1_output, bias_parallel, permuted_probs
+                )
+        else:
+            with moe_act_manager as fc1_output:
+                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
+        self._mark_paged_stash_tensors(bias_act_output)
+        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        if self.activation_recompute:
+            self.activation_checkpoint.discard_output_and_register_recompute(output)
+
+        # Delay the offload of the moe act until after the linear_fc2 has been computed
+        # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
+        output = moe_act_manager.group_offload(
+            output,
+            forced_released_tensors=[fc1_output],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
+        self._mark_paged_stash_tensors(output, permuted_probs)
+        return self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
     def forward(
         self,
@@ -874,135 +1045,18 @@ class TEGroupedMLP(MegatronModule):
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 
-        if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
-            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
-
-        expert_fc1_manager = off_interface(
-            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+        permuted_local_hidden_states, stash_context = self._start_paged_stash_group(
+            permuted_local_hidden_states, tokens_per_expert
         )
-        with expert_fc1_manager as permuted_local_hidden_states:
-            fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                permuted_local_hidden_states, tokens_per_expert
+        with stash_context:
+            output = self._unfused_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )
-        fc1_output = expert_fc1_manager.group_offload(
-            fc1_output,
-            forced_released_tensors=[permuted_local_hidden_states],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
-
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
-
-        def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
-
-            # Whether activation function is interleaved GLU
-            with_glu_interleaving = (
-                self.config.gated_linear_unit
-                and self.config.moe_mlp_glu_interleave_size is not None
-            )
-
-            if self.config.use_te_activation_func:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                if with_glu_interleaving:
-                    intermediate_parallel = self._remove_glu_interleaving(
-                        intermediate_parallel, self.config.moe_mlp_glu_interleave_size
-                    )
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-                if permuted_probs is not None:
-                    original_dtype = intermediate_parallel.dtype
-                    intermediate_parallel = intermediate_parallel * permuted_probs
-                    intermediate_parallel = intermediate_parallel.to(original_dtype)
-            elif self.config.bias_activation_fusion and not with_glu_interleaving:
-                if self.activation_func == F.silu and self.config.gated_linear_unit:
-                    # dtype is handled inside the fused kernel
-                    intermediate_parallel = weighted_bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        permuted_probs,
-                        self.config.activation_func_fp8_input_store,
-                        self.config.activation_func_clamp_value,
-                    )
-                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-                    intermediate_parallel = weighted_bias_quick_geglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        permuted_probs,
-                        self.config.activation_func_fp8_input_store,
-                        self.config.glu_linear_offset,
-                        self.config.activation_func_clamp_value,
-                    )
-                else:
-                    raise ValueError(
-                        "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
-                    )
-            elif (
-                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
-            ):
-                assert (
-                    bias_parallel is None
-                ), "Bias is not supported with fused weighted squared relu."
-                intermediate_parallel = weighted_squared_relu_impl(
-                    intermediate_parallel, permuted_probs
-                )
-            else:
-                if self.config.gated_linear_unit:
-
-                    def glu(x):
-                        if with_glu_interleaving:
-                            x = self._remove_glu_interleaving(
-                                x, self.config.moe_mlp_glu_interleave_size
-                            )
-                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        if (val := self.config.activation_func_clamp_value) is not None:
-                            x_glu = x_glu.clamp(min=None, max=val)
-                            x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
-                        )
-
-                    intermediate_parallel = glu(intermediate_parallel)
-                else:
-                    intermediate_parallel = self.activation_func(intermediate_parallel)
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
-            return intermediate_parallel
-
-        moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
-        if self.activation_recompute:
-            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with moe_act_manager as fc1_output:
-                bias_act_output = self.activation_checkpoint.checkpoint(
-                    bias_act_func, fc1_output, bias_parallel, permuted_probs
-                )
-        else:
-            with moe_act_manager as fc1_output:
-                bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.activation_recompute:
-            self.activation_checkpoint.discard_output_and_register_recompute(output)
-
-        # Delay the offload of the moe act until after the linear_fc2 has been computed
-        # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        output = moe_act_manager.group_offload(
-            output,
-            forced_released_tensors=[fc1_output],
-            delay_offload=self.config.delay_offload_until_cuda_graph,
-        )
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
-
         # upad and concat the output
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
+        output = self._commit_paged_stash_group(output)
         output_bias = None
 
         return output, output_bias

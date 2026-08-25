@@ -1,8 +1,16 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import torch
 
 from megatron.core.jit import jit_fuser
+
+
+def _propagate_paged_stash_marker(source, target):
+    """Preserve Megatron's dynamic-activation marker across view/cast operations."""
+    if hasattr(source, "grouped_tensor_scale_inv"):
+        setattr(target, "grouped_tensor_scale_inv", source.grouped_tensor_scale_inv)
+    return target
+
 
 ###### BIAS GELU FUSION/ NO AUTOGRAD ################
 # 1/sqrt(2*pi)-> 0.3989423
@@ -324,6 +332,7 @@ class WeightedQuickGeGLUFunction(torch.autograd.Function):
             torch.Tensor: Output tensor of shape [N, H] after weighted Quick-GEGLU.
         """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        _propagate_paged_stash_marker(input, input_for_backward)
         ctx.save_for_backward(input_for_backward, weights, linear_offset)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
@@ -374,6 +383,7 @@ class WeightedBiasQuickGeGLUFunction(torch.autograd.Function):
         """
         # Optionally store the input in FP8 for memory savings.
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        _propagate_paged_stash_marker(input, input_for_backward)
 
         # Save tensors for backward.
         ctx.save_for_backward(input_for_backward, bias, weights, linear_offset)
@@ -420,6 +430,7 @@ def weighted_bias_quick_geglu_impl(
         output: [num_selected_experts * seq_len, hidden_size]
     """
     ori_shape = input.shape
+    paged_stash_source = input
     assert len(ori_shape) in [2, 3]
     if clamp_value is not None:
         x_glu, x_linear = input.chunk(2, -1)
@@ -430,7 +441,7 @@ def weighted_bias_quick_geglu_impl(
             ),
             -1,
         )
-    input = input.view(-1, ori_shape[-1])
+    input = _propagate_paged_stash_marker(paged_stash_source, input.view(-1, ori_shape[-1]))
     linear_offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
     if bias is not None:
         output = WeightedBiasQuickGeGLUFunction.apply(

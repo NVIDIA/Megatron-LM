@@ -68,6 +68,26 @@ def test_grouped_tensor_requires_grouped_gemm():
         )
 
 
+def test_paged_stash_allows_non_fused_grouped_tensor_hybridep():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.5,
+        moe_paged_stash=True,
+        use_transformer_engine_op_fuser=False,
+    )
+
+    assert config.moe_paged_stash is True
+    assert config.moe_use_grouped_tensor is True
+    assert config.use_transformer_engine_op_fuser is False
+
+
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
     interleaved = torch.tensor([[1, 2, 5, 6, 3, 4, 7, 8], [11, 12, 15, 16, 13, 14, 17, 18]])
     expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14, 15, 16, 17, 18]])
@@ -222,6 +242,63 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     torch.testing.assert_close(fused_ops.args[1], tokens_per_expert)
     torch.testing.assert_close(fused_ops.args[2], probs)
     torch.testing.assert_close(fused_ops.args[3], tokens_per_expert)
+
+
+def test_non_fused_forward_wraps_compute_in_paged_stash_scope(monkeypatch):
+    events = []
+
+    class FakeStashContext:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append("exit")
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(
+        fp8=False, fp4=False, moe_paged_stash=True, moe_expert_rank_capacity_factor=1.5
+    )
+    module._with_fused_impl = False
+    module._use_grouped_tensor = True
+
+    monkeypatch.setattr(experts_module, "skip_routed_expert_padding", lambda _config: True)
+
+    def group_start(hidden_states):
+        events.append("start")
+        return hidden_states
+
+    def get_context(**kwargs):
+        events.append("context")
+        assert kwargs["name"] == "grouped_mlp"
+        assert kwargs["max_num_tokens"] == 2
+        torch.testing.assert_close(kwargs["num_tokens_tensor"], torch.tensor(2))
+        assert kwargs["avg_num_tokens"] == 1
+        return FakeStashContext()
+
+    def group_commit(output, *, name):
+        events.append("commit")
+        assert name == "grouped_mlp"
+        return output
+
+    monkeypatch.setattr(experts_module, "paged_stash_group_start", group_start)
+    monkeypatch.setattr(experts_module, "get_paged_stash_context", get_context)
+    monkeypatch.setattr(experts_module, "paged_stash_group_commit", group_commit)
+
+    def unfused_forward(hidden_states, tokens_per_expert, permuted_probs):
+        events.append("compute")
+        assert isinstance(tokens_per_expert, torch.Tensor)
+        return hidden_states + permuted_probs
+
+    module._unfused_forward = unfused_forward
+
+    hidden_states = torch.zeros(2, 4)
+    tokens_per_expert = torch.tensor([1, 1])
+    probs = torch.ones(2)
+    output, output_bias = module.forward(hidden_states, tokens_per_expert, probs)
+
+    torch.testing.assert_close(output, torch.ones_like(hidden_states))
+    assert output_bias is None
+    assert events == ["start", "context", "enter", "compute", "exit", "commit"]
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():

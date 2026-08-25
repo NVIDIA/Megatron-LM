@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -6,6 +6,14 @@ import torch.nn.functional as F
 from megatron.core.activations import squared_relu
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
+
+
+def _propagate_paged_stash_marker(source, target):
+    """Preserve Megatron's dynamic-activation marker across view operations."""
+    if hasattr(source, "grouped_tensor_scale_inv"):
+        setattr(target, "grouped_tensor_scale_inv", source.grouped_tensor_scale_inv)
+    return target
+
 
 ######################  WEIGHTED SQUARED ReLU FUSION  ######################
 
@@ -103,7 +111,7 @@ def weighted_squared_relu_impl(input: torch.Tensor, weights: torch.Tensor) -> to
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
-    input = input.view(-1, ori_shape[-1])
+    input = _propagate_paged_stash_marker(input, input.view(-1, ori_shape[-1]))
 
     output = WeightedSquaredReLUFunction.apply(input, weights)
 
