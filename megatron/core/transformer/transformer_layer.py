@@ -2004,37 +2004,43 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         return self.self_attention.linear_qkv.layer_norm_weight.data
 
-    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+    def get_layer_static_inputs(self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False):
         """
-        Get the static inputs for the transformer layer. Besides the hidden_states that is
+        Get synthetic inputs for the transformer layer. Besides the hidden_states that is
         generated in GraphableMegatronModule, we also add the attention_mask.
 
-        For THD + CUDA Graph: generates cu_seqlens and padding_mask static tensors
-        instead of attention_mask.
+        For padded THD execution, generates cu_seqlens and padding_mask tensors instead of an
+        attention_mask.
 
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
-        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        static_inputs = super().get_layer_static_inputs(
+            seq_length, micro_batch_size, for_pipeline_prewarm=for_pipeline_prewarm
+        )
         device = torch.cuda.current_device()
 
-        # Captured forward needs attention-side static input only when this
-        # layer's attention is inside the captured scope.
-        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_modules
+        # Pipeline prewarm executes the full layer. CUDA Graph capture only needs attention-side
+        # inputs when attention belongs to the configured capture scope.
+        attention_is_executed = not isinstance(self.self_attention, IdentityOp) and (
+            for_pipeline_prewarm
+            or not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+        use_padded_thd = self._is_thd_cuda_graph() or (
+            for_pipeline_prewarm and self.config.sequence_packing_scheduler is not None
         )
         # Linear-attention variants (e.g. GatedDeltaNet) sit in the self_attention slot but
         # accept `attention_mask` only for signature compatibility and never read it, and
         # they have no `attn_mask_type`. Building a mask for them costs a persistent
         # [mbs, 1, slen, seq] buffer that is discarded, and probing attn_mask_type raises
-        # AttributeError. Note this must not fold into attn_in_graph: those layers still
+        # AttributeError. Note this must not fold into attention_is_executed: those layers still
         # need the THD cu_seqlens static inputs below. Defaults to True so third-party
         # attention modules keep the softmax-attention behaviour.
         attn_uses_mask = getattr(self.self_attention, "uses_attention_mask", True)
 
-        if self._is_thd_cuda_graph():
-            if attn_in_graph:
+        if use_padded_thd:
+            if attention_is_executed:
                 # Static cu_seqlens shaped [capacity + 1]. The capacity is
                 # thd_max_packed_sequences or cuda_graph_thd_max_packed_sequences; the
                 # config allows only one of them. We seed it as
@@ -2046,6 +2052,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 max_num_seqs = self.config.thd_max_packed_sequences
                 if max_num_seqs is None:
                     max_num_seqs = self.config.cuda_graph_thd_max_packed_sequences
+                # Pipeline prewarm of packed data may run without either capacity set.
+                max_num_seqs = max_num_seqs or 1
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
                 cu_seqlens[1:] = max_T
 
@@ -2068,7 +2076,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             static_inputs["padding_mask"] = torch.zeros(
                 1, slen_for_mask, dtype=torch.bool, device=device
             )
-        elif attn_in_graph and attn_uses_mask:
+        elif attention_is_executed and attn_uses_mask:
             if not self.config.create_attention_mask_in_dataloader:
                 if self.self_attention.attn_mask_type not in (
                     AttnMaskType.causal,
@@ -2078,7 +2086,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     log_single_rank(
                         logger,
                         logging.WARNING,
-                        "TE CUDA graph capture is omitting attention_mask because "
+                        "Synthetic layer execution is omitting attention_mask because "
                         "create_attention_mask_in_dataloader is False, but "
                         f"attn_mask_type={self.self_attention.attn_mask_type.name} may require "
                         "an explicit mask. Ensure this is intended for the current workload.",
@@ -2092,13 +2100,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     .tile(micro_batch_size, 1, 1, 1)
                 )
 
-        # Add input_ids for hash-based MoE routing under CUDA graphs.
+        # Add input_ids for hash-based MoE routing.
         # Only add for layers that actually use hash routing,
         # since other layers (e.g. on later PP stages) receive input_ids=None.
         if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
             input_ids_shape = (
                 (1, self.config.max_seqlen_per_dp_cp_rank)
-                if self._is_thd_cuda_graph()
+                if use_padded_thd
                 else (micro_batch_size, static_inputs["hidden_states"].shape[0])
             )
             static_inputs["input_ids"] = torch.zeros(
