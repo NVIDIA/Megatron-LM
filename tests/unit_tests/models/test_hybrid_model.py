@@ -282,6 +282,7 @@ class TestHybridModel:
         assert kinds.count("residual_contribution") == 3
         assert kinds.count("output_logits") == 1
         assert observed[-1][0] is self.model.output_layer
+        assert observed[-1][4:] == (-1, 0, 1)
         torch.testing.assert_close(observed[-1][3].transpose(0, 1), logits)
 
     def test_forward_packed_sequence(self):

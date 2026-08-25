@@ -34,18 +34,18 @@ def build_router_diagnostics(
 ) -> torch.Tensor:
     """Build compact score, load, and bias summaries for each local sequence.
 
-    The returned tensor has shape ``[batch_size, channels, num_experts]``. Distribution-valued
+    The returned tensor has shape `[batch_size, channels, num_experts]`. Distribution-valued
     channels are normalized over experts. Scalar channels use element zero and leave the
     remaining expert elements as zero.
 
     Args:
-        scores_for_aux_loss: Normalized all-expert scores with shape ``[tokens, num_experts]``.
+        scores_for_aux_loss: Normalized all-expert scores with shape `[tokens, num_experts]`.
         routing_map_for_aux_loss: Unbiased top-k assignments with the same shape.
         actual_routing_map: Assignments used for token dispatch with the same shape.
-        expert_bias: Current expert-selection bias, or ``None`` when bias routing is disabled.
+        expert_bias: Current expert-selection bias, or `None` when bias routing is disabled.
         seq_length: Local sequence length before the token dimension was flattened.
         batch_size: Local micro-batch size.
-        padding_mask: Flattened mask where ``True`` marks padding.
+        padding_mask: Flattened mask where `True` marks padding.
 
     Returns:
         Float32 diagnostic tensor with one compact observation per sequence.

@@ -23,9 +23,9 @@ _SEQUENTIAL_EXPERT_PATTERN = re.compile(r"^((?:.*\.)?mlp\.experts\.local_experts
 class CanonicalParameterNameMap(Mapping[torch.nn.Parameter, str]):
     """Map original model parameters to topology-independent logical names.
 
-    Pipeline-local layer indices are replaced with the global ``layer_number``
+    Pipeline-local layer indices are replaced with the global `layer_number`
     assigned to their owning layer module. This includes MTP layers, whose names
-    retain their distinct ``mtp.layers`` prefix. Expert-local indices are
+    retain their distinct `mtp.layers` prefix. Expert-local indices are
     replaced with global expert indices when an expert-parallel rank and size
     are supplied. Single grouped expert tensors are labeled with their half-open
     global expert range.

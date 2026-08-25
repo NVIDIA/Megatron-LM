@@ -962,14 +962,14 @@ def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) 
 
     Args:
         logits: Router logits with experts in the final dimension.
-        score_function: Score function to use. Must be ``softmax``, ``sigmoid``, or
-            ``sqrtsoftplus``.
+        score_function: Score function to use. Must be `softmax`, `sigmoid`, or
+            `sqrtsoftplus`.
 
     Returns:
-        Float32 normalized router scores with the same shape as ``logits``.
+        Float32 normalized router scores with the same shape as `logits`.
 
     Raises:
-        ValueError: If ``score_function`` is unsupported.
+        ValueError: If `score_function` is unsupported.
     """
     if score_function == "softmax":
         return torch.softmax(logits, dim=-1, dtype=torch.float32)
