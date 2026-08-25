@@ -117,7 +117,12 @@ class LatentCPLayoutAdapter(Protocol):
         local_hidden: Tensor,
         packed_seq_params: PackedSeqParams,
         cp_group: dist.ProcessGroup,
-    ) -> ZigZagLayout: ...
+        *,
+        tp_group: dist.ProcessGroup | None = None,
+        sequence_parallel: bool = False,
+    ) -> ZigZagLayout:
+        """Validate layout metadata and return the per-rank phase plan."""
+        ...
 
 
 class LatentCPTransport(Protocol):
@@ -125,7 +130,9 @@ class LatentCPTransport(Protocol):
 
     def iter_payloads(
         self, local_payload: Tensor, phase_plan: tuple[PhaseSpec, ...]
-    ) -> Iterator[PayloadLease]: ...
+    ) -> Iterator[PayloadLease]:
+        """Yield one ready payload lease for every phase."""
+        ...
 
 
 def _require(condition: bool, message: str) -> None:
@@ -151,9 +158,7 @@ def _packed_half_indices(local_lengths: Tensor) -> tuple[Tensor, Tensor]:
     ]
     back = [
         torch.arange(start + half, start + length, dtype=torch.long, device=device)
-        for start, half, length in zip(
-            starts.unbind(), halves.unbind(), local_lengths.unbind()
-        )
+        for start, half, length in zip(starts.unbind(), halves.unbind(), local_lengths.unbind())
     ]
     if not front:
         empty = torch.empty(0, dtype=torch.long, device=device)
@@ -181,10 +186,7 @@ def build_zigzag_layout(
     _require(int(cu_global[0].item()) == 0, "cu_seqlens must start at zero")
 
     global_lengths = cu_global[1:] - cu_global[:-1]
-    _require(
-        bool(torch.all(global_lengths > 0).item()),
-        "empty packed sequences are unsupported",
-    )
+    _require(bool(torch.all(global_lengths > 0).item()), "empty packed sequences are unsupported")
     _require(
         bool(torch.all(torch.remainder(global_lengths, 2 * cp_size) == 0).item()),
         f"every global packed length must be divisible by 2*CP ({2 * cp_size})",
@@ -194,18 +196,13 @@ def build_zigzag_layout(
     half_lengths = torch.div(global_lengths, 2 * cp_size, rounding_mode="floor")
     cu_full = _cu_from_lengths(local_lengths)
     cu_half = _cu_from_lengths(half_lengths)
-    _require(
-        int(cu_full[-1].item()) == local_tokens,
-        "hidden token count disagrees with metadata",
-    )
+    _require(int(cu_full[-1].item()) == local_tokens, "hidden token count disagrees with metadata")
 
     full_indices = torch.arange(local_tokens, dtype=torch.long, device=cu_global.device)
     front_indices, back_indices = _packed_half_indices(local_lengths)
     derived_max_global = int(global_lengths.max().item())
     if max_global is not None:
-        _require(
-            max_global == derived_max_global, "max_seqlen disagrees with cu_seqlens"
-        )
+        _require(max_global == derived_max_global, "max_seqlen disagrees with cu_seqlens")
     max_global = derived_max_global
     max_full = int(local_lengths.max().item())
     max_half = int(half_lengths.max().item())
@@ -284,26 +281,26 @@ class AlreadyZigZagTHDAdapter:
         local_hidden: Tensor,
         packed_seq_params: PackedSeqParams,
         cp_group: dist.ProcessGroup,
+        *,
+        tp_group: dist.ProcessGroup | None = None,
+        sequence_parallel: bool = False,
     ) -> ZigZagLayout:
+        """Validate already-zigzag THD metadata and build its phase plan."""
         _require(packed_seq_params.qkv_format == "thd", "only THD format is supported")
         _require(
             packed_seq_params.cp_partition_mode == "zigzag",
             "only an already-zigzag CP partition is supported",
         )
         _require(
-            packed_seq_params.local_cp_size is None,
-            "dynamic local_cp_size metadata is unsupported",
+            packed_seq_params.local_cp_size is None, "dynamic local_cp_size metadata is unsupported"
         )
         _require(
-            packed_seq_params.cp_group is None
-            or packed_seq_params.cp_group is cp_group,
+            packed_seq_params.cp_group is None or packed_seq_params.cp_group is cp_group,
             "packed metadata names a different CP process group",
         )
         cu_q = packed_seq_params.cu_seqlens_q
         cu_kv = packed_seq_params.cu_seqlens_kv
-        _require(
-            isinstance(cu_q, Tensor) and isinstance(cu_kv, Tensor), "missing cu_seqlens"
-        )
+        _require(isinstance(cu_q, Tensor) and isinstance(cu_kv, Tensor), "missing cu_seqlens")
         _require(
             cu_q.is_cuda
             and cu_kv.is_cuda
@@ -315,13 +312,8 @@ class AlreadyZigZagTHDAdapter:
             cu_q.dtype == torch.int32 and cu_kv.dtype == torch.int32,
             "both Q and KV cu_seqlens must have dtype torch.int32",
         )
-        _require(
-            cu_q.is_contiguous() and cu_kv.is_contiguous(),
-            "cu_seqlens must be contiguous",
-        )
-        _require(
-            torch.equal(cu_q, cu_kv), "self-attention requires equal Q/KV cu_seqlens"
-        )
+        _require(cu_q.is_contiguous() and cu_kv.is_contiguous(), "cu_seqlens must be contiguous")
+        _require(torch.equal(cu_q, cu_kv), "self-attention requires equal Q/KV cu_seqlens")
         for padded, valid, name in (
             (packed_seq_params.cu_seqlens_q_padded, cu_q, "Q"),
             (packed_seq_params.cu_seqlens_kv_padded, cu_kv, "KV"),
@@ -344,13 +336,11 @@ class AlreadyZigZagTHDAdapter:
         _require(max_q == max_kv, "self-attention requires equal Q/KV max_seqlen")
         cp_size = dist.get_world_size(cp_group)
         cp_rank = dist.get_rank(cp_group)
-        return build_zigzag_layout(
-            cu_q,
-            local_hidden.size(0),
-            cp_size,
-            cp_rank,
-            max_global=max_q,
-        )
+        local_tokens = local_hidden.size(0)
+        if sequence_parallel:
+            _require(tp_group is not None, "sequence parallelism requires a TP group")
+            local_tokens *= dist.get_world_size(tp_group)
+        return build_zigzag_layout(cu_q, local_tokens, cp_size, cp_rank, max_global=max_q)
 
 
 class _LatentRingExchange(torch.autograd.Function):
@@ -358,12 +348,9 @@ class _LatentRingExchange(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx: Any,
-        payload: Tensor,
-        cp_group: dist.ProcessGroup,
-        previous_peer: int,
-        next_peer: int,
+        ctx: Any, payload: Tensor, cp_group: dist.ProcessGroup, previous_peer: int, next_peer: int
     ) -> Tensor:
+        """Send one payload clockwise and receive the preceding owner's payload."""
         receive = torch.empty_like(payload)
         operations = [
             dist.P2POp(dist.isend, payload, next_peer, group=cp_group),
@@ -378,6 +365,7 @@ class _LatentRingExchange(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, grad_receive: Tensor) -> tuple[Tensor, None, None, None]:
+        """Route the received-payload gradient through the reverse ring hop."""
         grad_receive = grad_receive.contiguous()
         grad_payload = torch.empty_like(grad_receive)
         operations = [
@@ -404,15 +392,13 @@ class P2PRingTransport:
     def iter_payloads(
         self, local_payload: Tensor, phase_plan: tuple[PhaseSpec, ...]
     ) -> Iterator[PayloadLease]:
+        """Yield the local payload followed by each synchronous clockwise hop."""
         _require(len(phase_plan) == self.size, "phase-plan length must equal CP size")
         for phase_index, phase in enumerate(phase_plan):
             expected_owner = (self.rank - phase_index) % self.size
+            _require(phase.phase == phase_index, "phase-plan indices must be contiguous")
             _require(
-                phase.phase == phase_index, "phase-plan indices must be contiguous"
-            )
-            _require(
-                phase.owner == expected_owner,
-                "phase-plan owner order disagrees with the P2P ring",
+                phase.owner == expected_owner, "phase-plan owner order disagrees with the P2P ring"
             )
 
         payload = local_payload
@@ -433,10 +419,7 @@ def scatter_upper_phase(
         (local_tokens, *output.shape[1:]), dtype=torch.float32, device=output.device
     ).index_copy(0, back_indices, output.float())
     lse_full = torch.full(
-        (local_tokens, lse.size(1)),
-        -torch.inf,
-        dtype=torch.float32,
-        device=lse.device,
+        (local_tokens, lse.size(1)), -torch.inf, dtype=torch.float32, device=lse.device
     ).index_copy(0, back_indices, lse.float())
     return output_full, lse_full
 
@@ -446,25 +429,16 @@ def merge_attention_partials(
 ) -> tuple[Tensor, Tensor]:
     """Stable FP32 online-softmax merge for two attention partials."""
 
-    _require(
-        output_a.dtype == output_b.dtype == torch.float32,
-        "partial outputs must be FP32",
-    )
+    _require(output_a.dtype == output_b.dtype == torch.float32, "partial outputs must be FP32")
     _require(lse_a.dtype == lse_b.dtype == torch.float32, "partial LSE must be FP32")
     merged_lse = torch.logaddexp(lse_a, lse_b)
     valid_a = torch.isfinite(lse_a) & torch.isfinite(merged_lse)
     valid_b = torch.isfinite(lse_b) & torch.isfinite(merged_lse)
-    delta_a = torch.where(
-        valid_a, lse_a - merged_lse, torch.full_like(lse_a, -torch.inf)
-    )
-    delta_b = torch.where(
-        valid_b, lse_b - merged_lse, torch.full_like(lse_b, -torch.inf)
-    )
+    delta_a = torch.where(valid_a, lse_a - merged_lse, torch.full_like(lse_a, -torch.inf))
+    delta_b = torch.where(valid_b, lse_b - merged_lse, torch.full_like(lse_b, -torch.inf))
     weight_a = torch.exp(delta_a)
     weight_b = torch.exp(delta_b)
-    merged_output = output_a * weight_a.unsqueeze(-1) + output_b * weight_b.unsqueeze(
-        -1
-    )
+    merged_output = output_a * weight_a.unsqueeze(-1) + output_b * weight_b.unsqueeze(-1)
     return merged_output, merged_lse
 
 
@@ -486,9 +460,7 @@ def cudnn_backward_proxy(
     denominator = torch.where(safe, norm2, torch.ones_like(norm2))
     coefficient = torch.where(safe, grad_lse / denominator, torch.zeros_like(grad_lse))
     raw_correction = coefficient.unsqueeze(-1) * grad_output
-    correction = torch.where(
-        safe.unsqueeze(-1), raw_correction, torch.zeros_like(raw_correction)
-    )
+    correction = torch.where(safe.unsqueeze(-1), raw_correction, torch.zeros_like(raw_correction))
     return partial_output - correction, grad_output
 
 
@@ -503,7 +475,9 @@ class DirectAttentionAdapter(Protocol):
         v_dim: int,
         phases: tuple[PhaseSpec, ...],
         scale: float,
-    ) -> None: ...
+    ) -> None:
+        """Validate and prepare every phase before ring communication starts."""
+        ...
 
     def forward_phase(
         self,
@@ -516,7 +490,9 @@ class DirectAttentionAdapter(Protocol):
         max_kv: int,
         causal: bool,
         scale: float,
-    ) -> tuple[Tensor, Tensor]: ...
+    ) -> tuple[Tensor, Tensor]:
+        """Return canonical FP32 output and LSE for one packed phase."""
+        ...
 
 
 class FA4Adapter:
@@ -540,6 +516,7 @@ class FA4Adapter:
         phases: tuple[PhaseSpec, ...],
         scale: float,
     ) -> None:
+        """Accept phase metadata; FA4 requires no persistent plan construction."""
         del num_heads, qk_dim, v_dim, phases, scale
 
     @staticmethod
@@ -565,13 +542,13 @@ class FA4Adapter:
         causal: bool,
         scale: float,
     ) -> tuple[Tensor, Tensor]:
+        """Execute one phase through the public FA4 varlen API."""
         _require(
             cu_q.dtype == torch.int32 and cu_kv.dtype == torch.int32,
             "FA4 cu_seqlens must have dtype torch.int32",
         )
         _require(
-            cu_q.is_contiguous() and cu_kv.is_contiguous(),
-            "FA4 cu_seqlens must be contiguous",
+            cu_q.is_contiguous() and cu_kv.is_contiguous(), "FA4 cu_seqlens must be contiguous"
         )
         _require(
             cu_q.device == q.device and cu_kv.device == k.device,
@@ -655,9 +632,7 @@ def _aligned_token_capacity(tokens: int) -> int:
 
 def _pad_token_rows(tensor: Tensor, capacity: int) -> Tensor:
     _require(tensor.size(0) <= capacity, "cuDNN token capacity is too small")
-    padded = torch.empty(
-        (capacity, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
-    )
+    padded = torch.empty((capacity, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
     padded[: tensor.size(0)].copy_(tensor)
     return padded
 
@@ -679,6 +654,7 @@ class _CudnnSDPAFunction(torch.autograd.Function):
         scale: float,
         adapter: "CudnnFusedAttentionAdapter",
     ) -> tuple[Tensor, Tensor]:
+        """Execute public cuDNN Graph SDPA and save its backward inputs."""
         raw_output, stats = adapter._execute_forward(
             q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale
         )
@@ -694,6 +670,7 @@ class _CudnnSDPAFunction(torch.autograd.Function):
     def backward(
         ctx: Any, grad_output: Tensor | None, grad_lse: Tensor | None
     ) -> tuple[Tensor, Tensor, Tensor, None, None, None, None, None, None, None]:
+        """Execute corrected public cuDNN Graph SDPA backward."""
         q, k, v, raw_output, stats, cu_q, cu_kv = ctx.saved_tensors
         if grad_output is None:
             grad_output = torch.zeros_like(raw_output, dtype=torch.float32)
@@ -727,9 +704,7 @@ def _resolve_cudnn_frontend_version(cudnn: Any) -> str:
     except importlib.metadata.PackageNotFoundError:
         version = getattr(cudnn, "__version__", None)
     if version is None:
-        raise BackendNotQualifiedError(
-            "cuDNN Frontend package version metadata is missing"
-        )
+        raise BackendNotQualifiedError("cuDNN Frontend package version metadata is missing")
     return str(version)
 
 
@@ -795,14 +770,9 @@ class CudnnFusedAttentionAdapter:
             self._handle = None
 
     def _assert_bound_device(self, device: torch.device) -> None:
-        _require(
-            os.getpid() == self.process_id,
-            "a forked process cannot reuse a cuDNN adapter",
-        )
+        _require(os.getpid() == self.process_id, "a forked process cannot reuse a cuDNN adapter")
         _require(device.type == "cuda", "cuDNN plans require a CUDA device")
-        device_index = (
-            torch.cuda.current_device() if device.index is None else device.index
-        )
+        device_index = torch.cuda.current_device() if device.index is None else device.index
         _require(
             device_index == self.device_index,
             "cuDNN adapter/handle cannot be reused across CUDA devices",
@@ -879,8 +849,7 @@ class CudnnFusedAttentionAdapter:
         )
         with torch.cuda.device(self.device_index):
             self.cudnn.set_stream(
-                handle=self._handle,
-                stream=torch.cuda.current_stream(self.device_index).cuda_stream,
+                handle=self._handle, stream=torch.cuda.current_stream(self.device_index).cuda_stream
             )
             return self.cudnn.pygraph(
                 io_data_type=self.cudnn.data_type.BFLOAT16,
@@ -899,24 +868,9 @@ class CudnnFusedAttentionAdapter:
         o_shape = (key.batch, key.heads, key.max_q, key.v_dim)
         stats_shape = (key.batch, key.heads, key.max_q, 1)
         tensor_specs: list[tuple[_CudnnUid, tuple[int, ...], tuple[int, ...], Any]] = [
-            (
-                _CudnnUid.Q,
-                q_shape,
-                _packed_bshd_stride(q_shape),
-                self.cudnn.data_type.BFLOAT16,
-            ),
-            (
-                _CudnnUid.K,
-                k_shape,
-                _packed_bshd_stride(k_shape),
-                self.cudnn.data_type.BFLOAT16,
-            ),
-            (
-                _CudnnUid.V,
-                v_shape,
-                _packed_bshd_stride(v_shape),
-                self.cudnn.data_type.BFLOAT16,
-            ),
+            (_CudnnUid.Q, q_shape, _packed_bshd_stride(q_shape), self.cudnn.data_type.BFLOAT16),
+            (_CudnnUid.K, k_shape, _packed_bshd_stride(k_shape), self.cudnn.data_type.BFLOAT16),
+            (_CudnnUid.V, v_shape, _packed_bshd_stride(v_shape), self.cudnn.data_type.BFLOAT16),
         ]
         if backward:
             tensor_specs.extend(
@@ -1047,9 +1001,7 @@ class CudnnFusedAttentionAdapter:
         try:
             graph.validate()
             graph.build_operation_graph()
-            graph.create_execution_plans(
-                [self.cudnn.heur_mode.A, self.cudnn.heur_mode.FALLBACK]
-            )
+            graph.create_execution_plans([self.cudnn.heur_mode.A, self.cudnn.heur_mode.FALLBACK])
             graph.check_support()
             graph.build_plans()
         except self.cudnn.cudnnGraphNotSupportedError as error:
@@ -1076,6 +1028,7 @@ class CudnnFusedAttentionAdapter:
         phases: tuple[PhaseSpec, ...],
         scale: float,
     ) -> None:
+        """Build or reuse public cuDNN Graph plans for every phase."""
         device = torch.device("cuda", self.device_index)
         for phase in phases:
             key = self._plan_key_from_metadata(
@@ -1105,14 +1058,8 @@ class CudnnFusedAttentionAdapter:
         causal: bool,
         scale: float,
     ) -> _CudnnPlanKey:
-        _require(
-            q.dtype == k.dtype == v.dtype == torch.bfloat16,
-            "cuDNN Q/K/V must all be BF16",
-        )
-        _require(
-            q.device == k.device == v.device,
-            "cuDNN Q/K/V must use one CUDA device",
-        )
+        _require(q.dtype == k.dtype == v.dtype == torch.bfloat16, "cuDNN Q/K/V must all be BF16")
+        _require(q.device == k.device == v.device, "cuDNN Q/K/V must use one CUDA device")
         _require(
             q.ndim == k.ndim == v.ndim == 3
             and q.size(1) == k.size(1) == v.size(1)
@@ -1120,8 +1067,7 @@ class CudnnFusedAttentionAdapter:
             "invalid cuDNN THD Q/K/V shapes",
         )
         _require(
-            q.size(0) == int(cu_q[-1].item())
-            and k.size(0) == v.size(0) == int(cu_kv[-1].item()),
+            q.size(0) == int(cu_q[-1].item()) and k.size(0) == v.size(0) == int(cu_kv[-1].item()),
             "cuDNN tensor rows disagree with cumulative lengths",
         )
         return self._plan_key_from_metadata(
@@ -1157,9 +1103,7 @@ class CudnnFusedAttentionAdapter:
         k_buffer = _pad_token_rows(k, key.capacity_kv)
         v_buffer = _pad_token_rows(v, key.capacity_kv)
         o_buffer = torch.empty(
-            (key.capacity_q, key.heads, key.v_dim),
-            dtype=torch.bfloat16,
-            device=q.device,
+            (key.capacity_q, key.heads, key.v_dim), dtype=torch.bfloat16, device=q.device
         )
         stats_buffer = torch.empty(
             (key.capacity_q, key.heads, 1), dtype=torch.float32, device=q.device
@@ -1177,8 +1121,7 @@ class CudnnFusedAttentionAdapter:
         )
         with self._execution_lock, torch.cuda.device(self.device_index):
             self.cudnn.set_stream(
-                handle=self._handle,
-                stream=torch.cuda.current_stream(self.device_index).cuda_stream,
+                handle=self._handle, stream=torch.cuda.current_stream(self.device_index).cuda_stream
             )
             plan.forward_graph.execute(pack, workspace, self._handle)
         return o_buffer[: q.size(0)], stats_buffer[: q.size(0), :, 0]
@@ -1227,8 +1170,7 @@ class CudnnFusedAttentionAdapter:
         )
         with self._execution_lock, torch.cuda.device(self.device_index):
             self.cudnn.set_stream(
-                handle=self._handle,
-                stream=torch.cuda.current_stream(self.device_index).cuda_stream,
+                handle=self._handle, stream=torch.cuda.current_stream(self.device_index).cuda_stream
             )
             plan.backward_graph.execute(pack, workspace, self._handle)
         return dq_buffer[: q.size(0)], dk_buffer[: k.size(0)], dv_buffer[: v.size(0)]
@@ -1245,37 +1187,27 @@ class CudnnFusedAttentionAdapter:
         causal: bool,
         scale: float,
     ) -> tuple[Tensor, Tensor]:
-        return _CudnnSDPAFunction.apply(
-            q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale, self
-        )
+        """Execute one phase through the differentiable cuDNN Graph wrapper."""
+        return _CudnnSDPAFunction.apply(q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale, self)
 
 
 _CUDNN_ADAPTER_CACHE_LOCK: Final[threading.Lock] = threading.Lock()
-_CUDNN_ADAPTER_CACHE: dict[
-    tuple[int, int, QualifiedBackendTuple], CudnnFusedAttentionAdapter
-] = {}
+_CUDNN_ADAPTER_CACHE: dict[tuple[int, int, QualifiedBackendTuple], CudnnFusedAttentionAdapter] = {}
 
 
-def _shared_cudnn_adapter(
-    runtime_identity: QualifiedBackendTuple,
-) -> CudnnFusedAttentionAdapter:
+def _shared_cudnn_adapter(runtime_identity: QualifiedBackendTuple) -> CudnnFusedAttentionAdapter:
     """Return the process/device-scoped adapter shared by every local MLA layer."""
 
     cache_key = (os.getpid(), torch.cuda.current_device(), runtime_identity)
     with _CUDNN_ADAPTER_CACHE_LOCK:
         adapter = _CUDNN_ADAPTER_CACHE.get(cache_key)
         if adapter is None:
-            adapter = CudnnFusedAttentionAdapter(
-                runtime_identity, device_index=cache_key[1]
-            )
+            adapter = CudnnFusedAttentionAdapter(runtime_identity, device_index=cache_key[1])
             _CUDNN_ADAPTER_CACHE[cache_key] = adapter
         return adapter
 
 
-GridIdentity: TypeAlias = tuple[
-    tuple[tuple[int, ...], ...],
-    tuple[tuple[int, ...], ...],
-]
+GridIdentity: TypeAlias = tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]
 
 
 @dataclass(frozen=True)
@@ -1339,15 +1271,12 @@ def get_backend_preflight_counters() -> BackendPreflightCounters:
 
     with _BACKEND_PREFLIGHT_LOCK:
         return BackendPreflightCounters(
-            **_BACKEND_PREFLIGHT_COUNTS,
-            success_cache_entries=len(_BACKEND_PREFLIGHT_SUCCESS),
+            **_BACKEND_PREFLIGHT_COUNTS, success_cache_entries=len(_BACKEND_PREFLIGHT_SUCCESS)
         )
 
 
 def _grid_identity(
-    cp_group: dist.ProcessGroup,
-    tp_group: dist.ProcessGroup,
-    device: torch.device,
+    cp_group: dist.ProcessGroup, tp_group: dist.ProcessGroup, device: torch.device
 ) -> GridIdentity:
     """Resolve a rank-common ordered identity for the injected TP x CP grid once."""
 
@@ -1366,18 +1295,11 @@ def _grid_identity(
 
     local_tp_tensor = torch.tensor(local_tp_ranks, dtype=torch.int64, device=device)
     if cp_size > 1:
-        gathered_tp_tensors = [
-            torch.empty_like(local_tp_tensor) for _ in range(cp_size)
-        ]
-        dist.all_gather(
-            gathered_tp_tensors,
-            local_tp_tensor,
-            group=cp_group,
-        )
+        gathered_tp_tensors = [torch.empty_like(local_tp_tensor) for _ in range(cp_size)]
+        dist.all_gather(gathered_tp_tensors, local_tp_tensor, group=cp_group)
         _increment_preflight_counter("grid_identity_collectives")
         tp_rows = tuple(
-            tuple(int(rank) for rank in row.cpu().tolist())
-            for row in gathered_tp_tensors
+            tuple(int(rank) for rank in row.cpu().tolist()) for row in gathered_tp_tensors
         )
     else:
         tp_rows = (local_tp_ranks,)
@@ -1387,9 +1309,7 @@ def _grid_identity(
         for tp_index in range(tp_size)
     )
     _require(local_tp_ranks in tp_rows, "local TP group is absent from grid identity")
-    _require(
-        local_cp_ranks in cp_columns, "local CP group is absent from grid identity"
-    )
+    _require(local_cp_ranks in cp_columns, "local CP group is absent from grid identity")
     flattened = tuple(rank for row in tp_rows for rank in row)
     _require(
         len(flattened) == cp_size * tp_size and len(set(flattened)) == len(flattened),
@@ -1432,8 +1352,7 @@ def _runtime_backend_tuple(backend: AttnBackend) -> QualifiedBackendTuple:
 
 
 def _qualified_backend_adapter(
-    backend: AttnBackend,
-    runtime_tuple: QualifiedBackendTuple | None = None,
+    backend: AttnBackend, runtime_tuple: QualifiedBackendTuple | None = None
 ) -> tuple[DirectAttentionAdapter, QualifiedBackendTuple]:
     if runtime_tuple is None:
         runtime_tuple = _runtime_backend_tuple(backend)
@@ -1467,14 +1386,10 @@ def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> No
         "linear_proj must use the local MCore RowParallelLinear spec",
     )
     _require(
-        submodules.q_layernorm is WrappedTorchNorm
-        and submodules.kv_layernorm is WrappedTorchNorm,
+        submodules.q_layernorm is WrappedTorchNorm and submodules.kv_layernorm is WrappedTorchNorm,
         "Q/KV norms must use standalone local MCore WrappedTorchNorm",
     )
-    _require(
-        submodules.linear_qkv_down_proj is None,
-        "fused MLA down projection is unsupported",
-    )
+    _require(submodules.linear_qkv_down_proj is None, "fused MLA down projection is unsupported")
     _require(
         submodules.core_attention is IdentityOp,
         "core_attention must be IdentityOp; use make_mla_with_latent_cp_spec",
@@ -1496,9 +1411,7 @@ class MLAWithLatentCP(MLASelfAttention):
         is_mtp_layer: bool = False,
         name: str | None = None,
     ) -> None:
-        _require(
-            pg_collection is not None, "an explicit ProcessGroupCollection is required"
-        )
+        _require(pg_collection is not None, "an explicit ProcessGroupCollection is required")
         _require(
             hasattr(pg_collection, "tp")
             and pg_collection.tp is not None
@@ -1519,9 +1432,7 @@ class MLAWithLatentCP(MLASelfAttention):
             is_mtp_layer=is_mtp_layer,
             name=name,
         )
-        self._cp_comm_type = (
-            cp_comm_type if cp_comm_type is not None else config.cp_comm_type
-        )
+        self._cp_comm_type = cp_comm_type if cp_comm_type is not None else config.cp_comm_type
         self._layout_adapter: LatentCPLayoutAdapter = AlreadyZigZagTHDAdapter()
         self._backend_adapter: DirectAttentionAdapter | None = None
         self._backend_runtime_tuple: QualifiedBackendTuple | None = None
@@ -1533,28 +1444,16 @@ class MLAWithLatentCP(MLASelfAttention):
         config = self.config
         tp_size = dist.get_world_size(self.pg_collection.tp)
         cp_size = dist.get_world_size(self.pg_collection.cp)
-        _require(
-            isinstance(config, MLATransformerConfig), "MLATransformerConfig is required"
-        )
-        _require(
-            config.multi_latent_attention, "multi_latent_attention=True is required"
-        )
+        _require(isinstance(config, MLATransformerConfig), "MLATransformerConfig is required")
+        _require(config.multi_latent_attention, "multi_latent_attention=True is required")
         _require(config.mla_latent_cp, "mla_latent_cp=True is required")
         _require(config.qk_layernorm, "standalone Q/KV layer norms must be enabled")
+        _require(not config.add_bias_linear, "all MLA projection biases must be disabled")
+        _require(config.rotary_percent == 1.0, "partial rotary dimensions are unsupported")
         _require(
-            not config.add_bias_linear, "all MLA projection biases must be disabled"
+            self.attn_mask_type is AttnMaskType.causal, "only causal self-attention is supported"
         )
-        _require(
-            config.rotary_percent == 1.0, "partial rotary dimensions are unsupported"
-        )
-        _require(
-            self.attn_mask_type is AttnMaskType.causal,
-            "only causal self-attention is supported",
-        )
-        _require(
-            cp_size == 1 or self._cp_comm_type == "p2p",
-            "CP>1 requires cp_comm_type='p2p'",
-        )
+        _require(cp_size == 1 or self._cp_comm_type == "p2p", "CP>1 requires cp_comm_type='p2p'")
         _require(
             config.tensor_model_parallel_size == tp_size,
             "configured TP size disagrees with the injected TP group",
@@ -1565,17 +1464,11 @@ class MLAWithLatentCP(MLASelfAttention):
         )
         _require(config.q_lora_rank is not None, "a nonzero q_lora_rank is required")
         _require(config.q_lora_rank > 0, "q_lora_rank must be positive")
+        _require(config.normalization == "RMSNorm", "only RMSNorm projection specs are supported")
+        _require(tp_size == 1 or config.sequence_parallel, "TP>1 requires sequence_parallel=True")
+        _require(config.num_attention_heads % tp_size == 0, "attention heads must divide TP")
         _require(
-            config.normalization == "RMSNorm",
-            "only RMSNorm projection specs are supported",
-        )
-        _require(not config.sequence_parallel, "sequence parallelism is unsupported")
-        _require(
-            config.num_attention_heads % tp_size == 0, "attention heads must divide TP"
-        )
-        _require(
-            config.num_query_groups == config.num_attention_heads,
-            "v1 requires Hq=Hkv (no GQA)",
+            config.num_query_groups == config.num_attention_heads, "v1 requires Hq=Hkv (no GQA)"
         )
         _require(
             config.qk_head_dim == 128
@@ -1583,21 +1476,14 @@ class MLAWithLatentCP(MLASelfAttention):
             and config.v_head_dim == 128,
             "v1 requires qk content/rope/value dimensions 128/64/128",
         )
-        _require(
-            config.rope_type in ("rope", "yarn"), "only rope and yarn are supported"
-        )
+        _require(config.rope_type in ("rope", "yarn"), "only rope and yarn are supported")
         _require(not config.apply_rope_fusion, "fused RoPE is unsupported")
         _require(config.attention_dropout == 0.0, "attention dropout must be zero")
         _require(config.bf16 and not config.fp16, "v1 requires BF16 and rejects FP16")
+        _require(config.fp8 is None and config.fp4 is None, "FP8 and FP4 are unsupported")
+        _require(not config.cache_mla_latents, "inference latent caching is unsupported")
         _require(
-            config.fp8 is None and config.fp4 is None, "FP8 and FP4 are unsupported"
-        )
-        _require(
-            not config.cache_mla_latents, "inference latent caching is unsupported"
-        )
-        _require(
-            config.recompute_granularity is None
-            and config.recompute_modules in (None, []),
+            config.recompute_granularity is None and config.recompute_modules in (None, []),
             "outer/selective recompute is unsupported; set recompute_modules=[]",
         )
         _require(
@@ -1637,14 +1523,11 @@ class MLAWithLatentCP(MLASelfAttention):
         _require(
             output_projection.input_is_parallel
             and output_projection.skip_bias_add
-            and not output_projection.sequence_parallel
+            and output_projection.sequence_parallel == self.config.sequence_parallel
             and not output_projection.explicit_expert_comm,
             "linear_proj must be a non-expert row-parallel projection with parallel input",
         )
-        _require(
-            output_projection.bias is None,
-            "linear_proj bias is unsupported",
-        )
+        _require(output_projection.bias is None, "linear_proj bias is unsupported")
 
     def _validate_forward(
         self,
@@ -1663,9 +1546,7 @@ class MLAWithLatentCP(MLASelfAttention):
         inference_params: Any,
     ) -> PackedSeqParams:
         _require(self.training, "v1 is training-only")
-        _require(
-            hidden_states.ndim == 3, "hidden_states must have shape [T, 1, hidden]"
-        )
+        _require(hidden_states.ndim == 3, "hidden_states must have shape [T, 1, hidden]")
         _require(hidden_states.size(1) == 1, "THD requires the singleton batch axis")
         _require(hidden_states.is_cuda, "activations must be CUDA tensors")
         _require(
@@ -1675,27 +1556,22 @@ class MLAWithLatentCP(MLASelfAttention):
         _require(hidden_states.dtype == torch.bfloat16, "activations must be BF16")
         _require(attention_mask is None, "explicit attention masks are unsupported")
         _require(key_value_states is None, "cross attention is unsupported")
-        _require(
-            inference_context is None and inference_params is None,
-            "inference is unsupported",
-        )
+        _require(inference_context is None and inference_params is None, "inference is unsupported")
         _require(rotary_pos_emb is None, "external rotary_pos_emb is unsupported")
         _require(
-            rotary_pos_cos is None
-            and rotary_pos_sin is None
-            and rotary_pos_cos_sin is None,
+            rotary_pos_cos is None and rotary_pos_sin is None and rotary_pos_cos_sin is None,
             "flash-decoding/fused rotary inputs are unsupported",
         )
         _require(attention_bias is None, "attention bias is unsupported")
         _require(position_ids is None, "external position_ids are unsupported")
         _require(sequence_len_offset is None, "sequence offsets are unsupported")
+        _require(isinstance(packed_seq_params, PackedSeqParams), "PackedSeqParams is required")
+        local_tokens = hidden_states.size(0)
+        if self.config.sequence_parallel:
+            local_tokens *= dist.get_world_size(self.pg_collection.tp)
         _require(
-            isinstance(packed_seq_params, PackedSeqParams),
-            "PackedSeqParams is required",
-        )
-        _require(
-            packed_seq_params.total_tokens in (None, hidden_states.size(0)),
-            "total_tokens must equal the physical local THD token count",
+            packed_seq_params.total_tokens in (None, local_tokens),
+            "total_tokens must equal the pre-SP local THD token count",
         )
         _require(
             packed_seq_params.pad_between_seqs in (None, False),
@@ -1704,29 +1580,22 @@ class MLAWithLatentCP(MLASelfAttention):
         if not self._parameter_dtypes_validated:
             for name, parameter in self.named_parameters():
                 if parameter.is_floating_point():
-                    _require(
-                        parameter.dtype == torch.bfloat16,
-                        f"parameter {name} must be BF16",
-                    )
+                    _require(parameter.dtype == torch.bfloat16, f"parameter {name} must be BF16")
             self._parameter_dtypes_validated = True
         return packed_seq_params
 
-    def _explicit_output_projection(
-        self, core_output: Tensor
-    ) -> tuple[Tensor, Tensor | None]:
+    def _explicit_output_projection(self, core_output: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the inherited row-sharded weight without an implicit TP-group lookup."""
 
         projection = self.linear_proj
         _require(core_output.dtype == torch.bfloat16, "linear_proj input must be BF16")
         _require(projection.bias is None, "linear_proj bias is unsupported")
         _require(
-            not self.config.cpu_offloading
-            and self.config._cpu_offloading_context is None,
+            not self.config.cpu_offloading and self.config._cpu_offloading_context is None,
             "CPU offloading is unsupported",
         )
         _require(
-            projection.weight.requires_grad,
-            "frozen linear_proj weights are unsupported in v1",
+            projection.weight.requires_grad, "frozen linear_proj weights are unsupported in v1"
         )
         output_parallel = mcore_tp.linear_with_grad_accumulation_and_async_allreduce(
             input=core_output,
@@ -1739,9 +1608,14 @@ class MLAWithLatentCP(MLASelfAttention):
             wgrad_deferral_limit=0,
             tp_group=self.pg_collection.tp,
         )
-        output = mcore_tp.reduce_from_tensor_model_parallel_region(
-            output_parallel, group=self.pg_collection.tp
-        )
+        if self.config.sequence_parallel:
+            output = mcore_tp.reduce_scatter_to_sequence_parallel_region(
+                output_parallel, group=self.pg_collection.tp
+            )
+        else:
+            output = mcore_tp.reduce_from_tensor_model_parallel_region(
+                output_parallel, group=self.pg_collection.tp
+            )
         return output, None
 
     def _get_backend(self, layout: ZigZagLayout) -> DirectAttentionAdapter:
@@ -1755,17 +1629,13 @@ class MLAWithLatentCP(MLASelfAttention):
         current_tuple: QualifiedBackendTuple | None = None
         try:
             tp_rows, cp_columns = _grid_identity(
-                self.pg_collection.cp,
-                self.pg_collection.tp,
-                device,
+                self.pg_collection.cp, self.pg_collection.tp, device
             )
             current_tuple = _runtime_backend_tuple(self.config.attention_backend)
             properties = torch.cuda.get_device_properties(device_index)
             global_lengths = tuple(
                 int(length)
-                for length in (layout.cu_global[1:] - layout.cu_global[:-1])
-                .cpu()
-                .tolist()
+                for length in (layout.cu_global[1:] - layout.cu_global[:-1]).cpu().tolist()
             )
             signature = _BackendPreflightSignature(
                 runtime_identity=current_tuple,
@@ -1817,25 +1687,15 @@ class MLAWithLatentCP(MLASelfAttention):
             local_error = error
 
         backend_ok = torch.tensor(
-            0 if local_error is not None else 1,
-            dtype=torch.int32,
-            device=device,
+            0 if local_error is not None else 1, dtype=torch.int32, device=device
         )
         # CP-first then TP propagates any failure through the complete TP x CP grid.
         # Singleton dimensions are the trivial consensus and launch no collective.
         if cp_size > 1:
-            dist.all_reduce(
-                backend_ok,
-                op=dist.ReduceOp.MIN,
-                group=self.pg_collection.cp,
-            )
+            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=self.pg_collection.cp)
             _increment_preflight_counter("cp_consensus_collectives")
         if tp_size > 1:
-            dist.all_reduce(
-                backend_ok,
-                op=dist.ReduceOp.MIN,
-                group=self.pg_collection.tp,
-            )
+            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=self.pg_collection.tp)
             _increment_preflight_counter("tp_consensus_collectives")
         if int(backend_ok.item()) == 0:
             _increment_preflight_counter("failed_preflights")
@@ -1844,9 +1704,7 @@ class MLAWithLatentCP(MLASelfAttention):
             ) from local_error
         if signature is None or adapter is None or current_tuple is None:
             _increment_preflight_counter("failed_preflights")
-            raise LatentCPError(
-                "backend consensus succeeded without complete preflight state"
-            )
+            raise LatentCPError("backend consensus succeeded without complete preflight state")
 
         # No local attempt and no partial consensus can populate this cache.
         success_key = (os.getpid(), device_index, signature)
@@ -1857,9 +1715,7 @@ class MLAWithLatentCP(MLASelfAttention):
         self._backend_runtime_tuple = current_tuple
         return adapter
 
-    def _latent_cp_down_projection(
-        self, hidden_states: Tensor
-    ) -> tuple[Tensor, Tensor]:
+    def _latent_cp_down_projection(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
         """Run local projection modules and gather every shard with the injected TP group."""
 
         q_compressed, _ = self.linear_q_down_proj(hidden_states)
@@ -1878,38 +1734,33 @@ class MLAWithLatentCP(MLASelfAttention):
             "Q down-projection gather produced the wrong size",
         )
         _require(
-            kv_combined.size(-1) == expected_kv,
-            "KV down-projection gather produced the wrong size",
+            kv_combined.size(-1) == expected_kv, "KV down-projection gather produced the wrong size"
         )
         return q_compressed, kv_combined
 
     def _project_query_and_payload(
-        self,
-        hidden_states: Tensor,
-        packed_seq_params: PackedSeqParams,
-        layout: ZigZagLayout,
+        self, hidden_states: Tensor, packed_seq_params: PackedSeqParams, layout: ZigZagLayout
     ) -> tuple[Tensor, Tensor]:
         q_compressed, kv_combined = self._latent_cp_down_projection(hidden_states)
         q_compressed = q_compressed.squeeze(1)
         kv_combined = kv_combined.squeeze(1)
         kv_compressed, k_rope_raw = torch.split(
-            kv_combined,
-            [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim],
-            dim=-1,
+            kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
+        if self.config.sequence_parallel:
+            q_compressed = tp_mappings.scatter_to_sequence_parallel_region(
+                q_compressed, group=self.pg_collection.tp
+            )
+            kv_compressed = tp_mappings.scatter_to_sequence_parallel_region(
+                kv_compressed, group=self.pg_collection.tp
+            )
         q_compressed = self.q_layernorm(q_compressed)
         kv_compressed = self.kv_layernorm(kv_compressed)
 
         q, _ = self.linear_q_up_proj(q_compressed)
-        q = q.view(
-            q.size(0),
-            self.num_attention_heads_per_partition,
-            self.q_head_dim,
-        )
+        q = q.view(q.size(0), self.num_attention_heads_per_partition, self.q_head_dim)
         q_content, q_rope = torch.split(
-            q,
-            [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim],
-            dim=-1,
+            q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
         )
         k_rope = k_rope_raw.unsqueeze(1)
 
@@ -1941,47 +1792,39 @@ class MLAWithLatentCP(MLASelfAttention):
             mla_rotary_interleaved=True,
             max_seqlen=layout.max_global,
         )
-        k_rope = tp_mappings.copy_to_tensor_model_parallel_region(
-            k_rope, group=self.pg_collection.tp
-        )
+        if self.config.sequence_parallel:
+            k_rope = tp_mappings.scatter_to_sequence_parallel_region(
+                k_rope, group=self.pg_collection.tp
+            )
         query = torch.cat((q_content, q_rope), dim=-1).contiguous()
         payload = torch.cat((kv_compressed, k_rope.squeeze(1)), dim=-1).contiguous()
         _require(query.dtype == torch.bfloat16, "query projection must remain BF16")
-        _require(
-            payload.dtype == torch.bfloat16, "latent ring payload must remain BF16"
-        )
+        _require(payload.dtype == torch.bfloat16, "latent ring payload must remain BF16")
         return query, payload
 
     def _phase_attention(
-        self,
-        query: Tensor,
-        payload: Tensor,
-        phase: PhaseSpec,
-        backend: DirectAttentionAdapter,
+        self, query: Tensor, payload: Tensor, phase: PhaseSpec, backend: DirectAttentionAdapter
     ) -> tuple[Tensor, Tensor]:
         latent, k_rope = torch.split(
-            payload,
-            [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim],
-            dim=-1,
+            payload, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
         expanded, _ = self.linear_kv_up_proj(latent)
+        if self.config.sequence_parallel:
+            k_rope = tp_mappings.gather_from_sequence_parallel_region(
+                k_rope, tensor_parallel_output_grad=True, group=self.pg_collection.tp
+            )
         expanded = expanded.view(
             expanded.size(0),
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
         )
+        expanded = expanded.index_select(0, phase.kv_indices)
+        k_rope = k_rope.index_select(0, phase.kv_indices)
         k_content, value = torch.split(
-            expanded,
-            [self.config.qk_head_dim, self.config.v_head_dim],
-            dim=-1,
+            expanded, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
         )
         key = torch.cat(
-            (
-                k_content,
-                k_rope.unsqueeze(1).expand(
-                    -1, self.num_attention_heads_per_partition, -1
-                ),
-            ),
+            (k_content, k_rope.unsqueeze(1).expand(-1, self.num_attention_heads_per_partition, -1)),
             dim=-1,
         ).contiguous()
         output, lse = backend.forward_phase(
@@ -2016,6 +1859,7 @@ class MLAWithLatentCP(MLASelfAttention):
         *,
         inference_params: Any = None,
     ) -> tuple[Tensor, Tensor | None]:
+        """Run latent-P2P context-parallel MLA for one packed THD input."""
         packed_seq_params = self._validate_forward(
             hidden_states,
             attention_mask,
@@ -2032,7 +1876,11 @@ class MLAWithLatentCP(MLASelfAttention):
             inference_params,
         )
         layout = self._layout_adapter.prepare(
-            hidden_states, packed_seq_params, self.pg_collection.cp
+            hidden_states,
+            packed_seq_params,
+            self.pg_collection.cp,
+            tp_group=self.pg_collection.tp,
+            sequence_parallel=self.config.sequence_parallel,
         )
         backend = self._get_backend(layout)
         query, local_payload = self._project_query_and_payload(
@@ -2046,11 +1894,9 @@ class MLAWithLatentCP(MLASelfAttention):
         leases = transport.iter_payloads(local_payload, layout.phases)
         for phase, lease in zip(layout.phases, leases, strict=True):
             lease_count += 1
-            _require(
-                lease.owner == phase.owner, "transport owner order disagrees with plan"
-            )
+            _require(lease.owner == phase.owner, "transport owner order disagrees with plan")
             q_phase = query.index_select(0, phase.q_indices)
-            payload_phase = lease.tensor.index_select(0, phase.kv_indices)
+            payload_phase = lease.tensor
 
             def run_phase(
                 q_input: Tensor,
@@ -2058,32 +1904,20 @@ class MLAWithLatentCP(MLASelfAttention):
                 phase_spec: PhaseSpec = phase,
                 phase_backend: DirectAttentionAdapter = backend,
             ) -> tuple[Tensor, Tensor]:
-                return self._phase_attention(
-                    q_input, payload_input, phase_spec, phase_backend
-                )
+                return self._phase_attention(q_input, payload_input, phase_spec, phase_backend)
 
             partial_output, partial_lse = checkpoint(
-                run_phase,
-                q_phase,
-                payload_phase,
-                use_reentrant=False,
-                preserve_rng_state=False,
+                run_phase, q_phase, payload_phase, use_reentrant=False, preserve_rng_state=False
             )
             if phase.scatter_indices is not None:
                 partial_output, partial_lse = scatter_upper_phase(
-                    partial_output,
-                    partial_lse,
-                    phase.scatter_indices,
-                    layout.local_tokens,
+                    partial_output, partial_lse, phase.scatter_indices, layout.local_tokens
                 )
             if merged_output is None:
                 merged_output, merged_lse = partial_output, partial_lse
             else:
                 merged_output, merged_lse = merge_attention_partials(
-                    merged_output,
-                    merged_lse,
-                    partial_output,
-                    partial_lse,
+                    merged_output, merged_lse, partial_output, partial_lse
                 )
 
         _require(
@@ -2092,14 +1926,10 @@ class MLAWithLatentCP(MLASelfAttention):
         )
 
         if merged_output is None:
-            raise LatentCPError(
-                "zigzag phase plan unexpectedly produced no attention output"
-            )
+            raise LatentCPError("zigzag phase plan unexpectedly produced no attention output")
         # This is the one and only post-backend FP32-to-BF16 cast.
         core_output = merged_output.to(torch.bfloat16).reshape(
-            layout.local_tokens,
-            1,
-            self.num_attention_heads_per_partition * self.config.v_head_dim,
+            layout.local_tokens, 1, self.num_attention_heads_per_partition * self.config.v_head_dim
         )
         return self._explicit_output_projection(core_output)
 
@@ -2109,9 +1939,7 @@ def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
 
     from megatron.core.transformer.dot_product_attention import DotProductAttention
 
-    _require(
-        isinstance(base_mla_spec, ModuleSpec), "base_mla_spec must be a ModuleSpec"
-    )
+    _require(isinstance(base_mla_spec, ModuleSpec), "base_mla_spec must be a ModuleSpec")
     _require(
         base_mla_spec.module is MLASelfAttention,
         "base_mla_spec must be layer_spec.submodules.self_attention from local MLA",
@@ -2137,18 +1965,14 @@ def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
         "base MLA spec must use local MCore RowParallelLinear output",
     )
     _require(
-        original.q_layernorm is WrappedTorchNorm
-        and original.kv_layernorm is WrappedTorchNorm,
+        original.q_layernorm is WrappedTorchNorm and original.kv_layernorm is WrappedTorchNorm,
         "base MLA spec must use standalone WrappedTorchNorm Q/KV norms",
     )
     _require(
         original.core_attention is DotProductAttention,
         "base MLA spec must use the local MCore core-attention placeholder",
     )
-    _require(
-        original.linear_qkv_down_proj is None,
-        "fused MLA down projection is unsupported",
-    )
+    _require(original.linear_qkv_down_proj is None, "fused MLA down projection is unsupported")
     _require(
         base_mla_spec.params.get("attn_mask_type") is AttnMaskType.causal,
         "base MLA spec must be causal",

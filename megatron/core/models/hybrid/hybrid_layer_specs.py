@@ -392,8 +392,7 @@ def hybrid_mla_latent_cp_stack_spec(config):
         params=dict(hybrid_stack_spec.params),
         metainfo=dict(hybrid_stack_spec.metainfo),
         submodules=dataclasses.replace(
-            hybrid_stack_spec.submodules,
-            attention_layer=latent_attention_layer,
+            hybrid_stack_spec.submodules, attention_layer=latent_attention_layer
         ),
     )
 

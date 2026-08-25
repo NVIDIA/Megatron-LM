@@ -32,6 +32,7 @@ The first version will:
 
 - support training-only MLA self-attention in THD format;
 - support static P2P CP with the zigzag partition;
+- require sequence parallelism whenever tensor parallelism is greater than one;
 - support the unfused `rope` and `yarn` rotary modes;
 - select a direct attention adapter with the existing
   `TransformerConfig.attention_backend`: `AttnBackend.fused` selects the cuDNN Frontend Graph API
@@ -42,9 +43,9 @@ The first version will:
 - expose narrow layout and transport interfaces for later contiguous-to-zigzag and A2A+P2P work.
 
 The first version intentionally does not support inference/KV cache, arbitrary masks, dropout,
-FP16, FP8/FP4, CUDA graphs, dynamic CP groups, sequence parallelism, padded THD storage, fused
-MLA RoPE, GQA, outer layer recompute, fine-grained activation offload, CPU offloading, frozen
-output-projection weights, or the absorbed-MLA algorithm. It does not change standard
+FP16, FP8/FP4, CUDA graphs, dynamic CP groups, padded THD storage, fused MLA RoPE, GQA, outer layer
+recompute, fine-grained activation offload, CPU offloading, frozen output-projection weights, or
+the absorbed-MLA algorithm. It does not change standard
 attention, the legacy MLA path, TE, or TE's CP implementation.
 
 ## Existing code reused, and the dependency boundary
@@ -62,15 +63,13 @@ The new module uses a short, new-file-local `_latent_cp_down_projection` helper 
 `apply_rotary_pos_emb` export. It must not call the inherited `_qkv_down_projection`: that protected
 helper gathers Q with an omitted group and can therefore resolve the global tensor-parallel group.
 The local down-projection helper calls the inherited projection *modules*, not any inherited
-projection helper, and passes the injected TP group to every mapping operation. After owner-local
-RoPE, only the rotated shared positional key is wrapped by the public
-`copy_to_tensor_model_parallel_region(..., group=pg_collection.tp)` mapping. This is a forward
-identity whose backward explicitly sums the shared-key gradients contributed by every TP head
-shard. A second local `_explicit_output_projection` helper applies the inherited row-sharded weight
-through the public `linear_with_grad_accumulation_and_async_allreduce` export with the injected TP
-group and then calls public
-`reduce_from_tensor_model_parallel_region(..., group=pg_collection.tp)`. No private TE symbol is
-imported.
+projection helper, and passes the injected TP group to every mapping operation. For TP greater than
+one, the complete compressed Q/KV outputs are scattered over the sequence dimension before their
+norms. The rotated shared positional key is scattered into the same per-TP sequence lane. A second
+local `_explicit_output_projection` helper applies the inherited row-sharded weight through the
+public `linear_with_grad_accumulation_and_async_allreduce` export with the injected TP group and
+then calls the public sequence reduce-scatter (or the ordinary row reduction for TP=1). No private
+TE symbol is imported.
 
 The construction helper replaces the base MLA `core_attention` submodule with `IdentityOp`.
 `MLASelfAttention.__init__` therefore retains projection construction and state-dict keys without
@@ -88,9 +87,10 @@ the current module-spec/config contract:
 | `ModuleSpec`, `IdentityOp` | `megatron/core/transformer/spec_utils.py`, `megatron/core/transformer/identity_op.py` | Explicit opt-in construction without a legacy attention wrapper. |
 | `apply_rotary_pos_emb` | `megatron/core/models/common/embeddings/__init__.py` | Existing differentiable packed MLA RoPE behavior. |
 | `gather_from_tensor_model_parallel_region` | `megatron/core/tensor_parallel/mappings.py` | Public autograd-aware Q/KV output gather, always called with the injected TP group. |
-| `copy_to_tensor_model_parallel_region` | `megatron/core/tensor_parallel/mappings.py` | Public forward-identity/backward-all-reduce mapping for the rotated shared K-RoPE only, always called with the injected TP group. |
+| `scatter_to_sequence_parallel_region` | `megatron/core/tensor_parallel/mappings.py` | Public first-dimension scatter for complete Q/KV latents and rotated K-RoPE, always called with the injected TP group. |
+| `gather_from_sequence_parallel_region` | `megatron/core/tensor_parallel/mappings.py` | Public first-dimension gather for a received K-RoPE shard; its backward reduce-scatter sums shared-key gradients across TP heads. |
 | `linear_with_grad_accumulation_and_async_allreduce` | `megatron/core/tensor_parallel/__init__.py`, `layers.py` | Public exported linear autograd primitive; preserves local weight-gradient/`main_grad` accumulation semantics and receives the injected TP group. |
-| `reduce_from_tensor_model_parallel_region` | `megatron/core/tensor_parallel/__init__.py`, `mappings.py` | Public autograd-aware row-parallel forward reduction, always called with the injected TP group. |
+| `reduce_scatter_to_sequence_parallel_region`, `reduce_from_tensor_model_parallel_region` | `megatron/core/tensor_parallel/__init__.py`, `mappings.py` | Public row-parallel output reductions for TP>1 SP and TP=1 respectively, always called with the injected TP group. |
 | `CpPartitionModeConverter` and related exports | `megatron/core/context_parallel_layout/__init__.py` | Future layout adapter only; v1 validates an already-zigzag input. |
 
 No new code imports or reads a process group from `parallel_state`. The caller injects a populated
@@ -118,57 +118,42 @@ V1 requires a nonzero `q_lora_rank`. It rejects `FusedMLASelfAttention`, inferen
 an identity/fused KV norm. Supporting those projection variants later requires its own parity matrix;
 they are not accepted merely because the parent class can construct them.
 
-Sequence parallelism is disabled, so `[T_r, 1, hidden_size]` is replicated within each TP group.
-For TP size `N`, the exact path is:
+TP=1 uses the ordinary non-SP path. TP size `N>1` requires `sequence_parallel=True`, so each TP
+rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exact TP>1 path is:
 
-1. `linear_q_down_proj` and `linear_kv_down_proj` produce last-dimension shards
+1. The sequence-parallel `linear_q_down_proj` and `linear_kv_down_proj` first gather the input
+   sequence and produce last-dimension shards
    `[T_r, 1, q_lora_rank/N]` and `[T_r, 1, (C+D_r)/N]`.
 2. `_latent_cp_down_projection` invokes both projection modules directly. When the resulting last
    dimensions are sharded, it gathers Q and KV with
    `gather_from_tensor_model_parallel_region(tensor, group=self.pg_collection.tp)`. It never calls
-   `_qkv_down_projection` and never omits `group`. There is no sequence scatter because sequence
-   parallel is off. Its complete control flow is:
+   `_qkv_down_projection` and never omits `group`. The complete compressed tensors are then split
+   over their first dimension with `scatter_to_sequence_parallel_region(..., group=TP)` before Q/KV
+   norm. Thus each norm consumes `[T_r/N, q_lora_rank]` or `[T_r/N, C]`, as in ordinary SP.
 
-   ```python
-   q_compressed, _ = self.linear_q_down_proj(hidden_states)
-   kv_combined, _ = self.linear_kv_down_proj(hidden_states)
-   expected_kv_dim = self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim
-   if q_compressed.size(-1) != self.config.q_lora_rank:
-       q_compressed = gather_from_tensor_model_parallel_region(
-           q_compressed, group=self.pg_collection.tp
-       )
-   if kv_combined.size(-1) != expected_kv_dim:
-       kv_combined = gather_from_tensor_model_parallel_region(
-           kv_combined, group=self.pg_collection.tp
-       )
-   return q_compressed, kv_combined
-   ```
-3. Every TP lane now owns identical full `[T_r, 1, q_lora_rank]` and
-   `[T_r, 1, C+D_r]` tensors. It splits KV, applies standalone Q/KV norms, and applies owner-local
-   RoPE. It then applies
-   `copy_to_tensor_model_parallel_region(rotated_k_rope, group=self.pg_collection.tp)` to only the
-   rotated shared positional key before payload concatenation. The mapping is a forward identity,
-   so the communicated `[T_r, C+D_r]` payload remains bitwise equal across TP lanes and to the
-   unwrapped forward value. Its backward sums the shared-key contributions from all TP-local head
-   shards before the gathered KV down-projection backward splits its input gradient. The normalized
-   latent branch is deliberately not wrapped: `linear_kv_up_proj` already TP-all-reduces its input
-   gradient, and another copy mapping would double-reduce it.
-4. `linear_q_up_proj` maps the replicated normalized Q latent to the local head shard
-   `[T_r, H_tp, D_qk]`. For every received CP payload, `linear_kv_up_proj` maps replicated latent
-   KV to local K-content/V heads.
+3. Sequence-parallel `linear_q_up_proj` gathers the normalized Q shards and produces the full local
+   query rows `[T_r, H_tp, D_qk]`. K-RoPE is applied once to full owner-local rows, then scattered
+   over the sequence dimension. Each TP lane communicates only its corresponding
+   `[T_r/N, C+D_r]` latent/RoPE shard around the CP ring.
+4. For every received shard, sequence-parallel `linear_kv_up_proj` gathers latent KV over TP before
+   producing local K-content/V heads. The module independently gathers the received K-RoPE shard
+   with `gather_from_sequence_parallel_region(..., tensor_parallel_output_grad=True, group=TP)`.
+   It then applies the phase KV indices to both full-row tensors. The gather's backward
+   reduce-scatter is the single TP sum for the shared positional-key gradient; the KV up-projection
+   supplies the corresponding latent-input reduce-scatter.
 5. The merged `[T_r, H_tp, D_v]` output is flattened, cast once to BF16, and passed to the
    new-file-local `_explicit_output_projection`. That helper reuses `linear_proj.weight` without
    replacing the module or changing state-dict/sharded-state-dict names. It calls the public MCore
    linear primitive with `bias=None`, the stored `gradient_accumulation_fusion` flag,
    `allreduce_dgrad=False`, `sequence_parallel=False`, and `tp_group=self.pg_collection.tp`; it then
-   calls the public row-parallel reduction with the same explicit group. The reduction produces the
-   replicated layer output across TP lanes, while backward leaves dInput and the local weight/main
-   gradient on their normal row shard. V1 rejects output-projection bias, frozen output weights, and
-   CPU offloading rather than silently changing those semantics.
+   calls `reduce_scatter_to_sequence_parallel_region(..., group=TP)`. The returned layer output is
+   `[T_r/N, 1, hidden_size]`; backward all-gathers dInput and leaves the local weight/main gradient
+   on its normal row shard. V1 rejects output-projection bias, frozen output weights, and CPU
+   offloading rather than silently changing those semantics.
 
 `pg_collection.cp` contains ranks with the same TP lane, and `pg_collection.tp` contains ranks with
-the same CP ownership. Latent communication is therefore duplicated across TP lanes in v1; future
-A2A work may remove that duplication.
+the same CP ownership. Each CP ring therefore carries a distinct sequence shard rather than a
+replicated payload. Future A2A work may fuse the TP sequence redistribution with CP layout changes.
 
 ## Tensor and RoPE contract
 
@@ -192,48 +177,44 @@ count divisible by TP, but requires those head dimensions and `H_q=H_kv`.
 
 After the exact TP path above, the module forms:
 
-- normalized compressed KV `Z_kv`: `[T_r, C]`;
+- normalized compressed KV `Z_kv`: `[T_r/N, C]` per TP lane;
 - raw shared positional key `K_rope_raw`: `[T_r, D_r]`;
 - query `Q`: `[T_r, H_tp, D_qk]`, after Q up-projection and Q RoPE; and
-- rotated shared positional key `K_rope`: `[T_r, D_r]`, after owner-local RoPE.
+- rotated shared positional key `K_rope`: `[T_r/N, D_r]` per TP lane, after owner-local RoPE and
+  sequence scatter.
 
-Before concatenation, the module applies the public TP copy mapping to only the rotated shared
-positional key:
-
-```text
-K_rope = copy_to_tensor_model_parallel_region(K_rope, group=TP)
-```
-
-This operation is bitwise identity in forward and an explicit TP sum in backward. The exact
-communicated payload is
+The exact per-lane communicated payload is
 
 ```text
-Z = concat(Z_kv, K_rope, dim=-1)       # [T_r, C + D_r], BF16
+Z = concat(Z_kv, K_rope, dim=-1)       # [T_r/N, C + D_r], BF16
 ```
 
 `K_rope` is required: current MLA expands it over heads and concatenates it with the content key.
 Communicating only `Z_kv` leaves a remote rank without the positional key. RoPE is applied on the
-owner before communication so the receiver needs no position metadata. The returned positional-key
-gradient is summed across TP lanes by the copy mapping, then flows through the owner's RoPE and KV
-down projection. The latent gradient instead receives its TP sum from `linear_kv_up_proj` and flows
-through KV norm and KV down projection without another mapping-level reduction.
+owner before communication so the receiver needs no position metadata. After each ring hop, the TP
+group gathers the `N` sequence shards before phase indexing. The K-RoPE gather uses
+`tensor_parallel_output_grad=True`, so its backward reduce-scatter sums the shared-key gradients
+from all TP-local head shards. Sequence-parallel `linear_kv_up_proj` provides the same ownership
+semantics for the latent branch.
 
 For a received payload, the phase callable performs:
 
 ```text
-KV_content = linear_kv_up_proj(Z_kv)
+KV_content = linear_kv_up_proj(sequence_shard(Z_kv))
            -> [T_r, H_tp, D_c + D_v]
+K_rope = gather_from_sequence_parallel_region(sequence_shard(K_rope), group=TP)
+       -> [T_r, D_r]
 K_content, V = split(KV_content, [D_c, D_v], dim=-1)
 K = concat(K_content, expand_heads(K_rope), dim=-1)
   -> [T_r, H_tp, D_qk]
 V -> [T_r, H_tp, D_v]
 ```
 
-The logical full-K/V payload has `T_r * H_tp * (D_qk + D_v)` elements. The latent payload has
-`T_r * (C + D_r)` elements, for the logical communication ratio
+The legacy full-K/V payload per TP lane has `T_r * H_tp * (D_qk + D_v)` elements. The latent
+payload per TP lane has `(T_r/N) * (C + D_r)` elements, for the communication ratio
 
 ```text
-(C + D_r) / (H_tp * (D_qk + D_v)).
+(C + D_r) / (N * H_tp * (D_qk + D_v)).
 ```
 
 This excludes any extra V padding in another implementation and therefore does not overstate the
@@ -397,9 +378,10 @@ so backward traverses ring hops in reverse phase order.
 Gradient ownership is:
 
 - Q gradients accumulate over all local phases and flow through the local Q projection;
-- payload gradients follow the reverse ring. The latent component is already TP-all-reduced by
-  `linear_kv_up_proj`; the shared K-RoPE component alone is TP-all-reduced by the explicit copy
-  mapping before both branches flow through owner-local RoPE/KV norm and KV down projection;
+- payload gradients follow the reverse ring on the same TP sequence lane. The latent component is
+  TP-reduce-scattered by sequence-parallel `linear_kv_up_proj`; the shared K-RoPE component is
+  TP-reduce-scattered by its explicit sequence gather. The earlier sequence scatters then
+  all-gather both gradients before owner-local RoPE/KV norm and KV down projection;
 - `linear_kv_up_proj` parameter gradients sum its phase uses locally; and
 - normal MCore distributed parameter buffers reduce replicated parameter gradients over DP-CP.
   The module does not add another parameter all-reduce.
@@ -713,8 +695,10 @@ Construction or pre-collective validation requires:
 - causal logical mask, `attention_mask is None`, and self-attention;
 - BF16 activations and weights, a trainable bias-free output projection, zero dropout, and
   FP16/FP8/FP4 disabled;
-- training without inference context/cache, CUDA graph, sequence parallel, outer/selective
-  recompute, fine-grained activation offload, or CPU offloading;
+- TP greater than one only with `sequence_parallel=True`; the physical input/output tokens are the
+  corresponding first-dimension TP shard while packed metadata retains the pre-SP CP-local count;
+- training without inference context/cache, CUDA graph, outer/selective recompute, fine-grained
+  activation offload, or CPU offloading;
 - `rope_type` equal to `rope` or `yarn`, with fused RoPE disabled;
 - heads divisible by TP, `H_q=H_kv`, `D_c+D_r=192`, and `D_v=128`;
 - backend exactly `AttnBackend.fused` or `AttnBackend.flash`; and
@@ -817,19 +801,17 @@ All tests live in the new experimental test file; existing MLA tests remain unto
 2. **Global-position parity.** For multi-sequence THD, independently construct original per-sequence
    positions, zigzag-shard them, and compare owner Q/K rotation for both `rope` and `yarn`. Assert
    original `cu_global/max_global` reach RoPE and derived `cu_full/cu_half` reach only backends.
-3. **Projection and TP contract.** Assert the accepted spec classes, exact Q/KV gathers, split/norm
-   order, and bitwise equality of the BF16 latent/RoPE payload across TP lanes before the CP ring.
-   Spy on every `gather_from_tensor_model_parallel_region` call and require
-   `group is pg_collection.tp`. Spy on `copy_to_tensor_model_parallel_region` and require exactly
-   one call, on only the rotated shared K-RoPE, with the same explicit group. Compare against an
-   identity-wrapped forward and require bitwise-equal payloads; use lane-dependent backward seeds
-   to prove the K-RoPE gradient is TP-summed while the normalized latent gradient remains lane-local
-   at the payload boundary. Replace the default-group resolver with a function that raises, and
-   assert every accepted projection stores the injected TP group. For output projection, make the
-   inherited `RowParallelLinear.forward` and every default resolver raise, spy on the two public
-   primitives, and require the injected TP group on both calls. Compare BF16 forward, dInput, and
-   local weight gradient against independent `F.linear` plus an explicit-reduction contract for both
-   gradient-accumulation flag values; assert the original weight object and state-dict key remain.
+3. **Projection and TP contract.** Assert the accepted spec classes, exact Q/KV last-dimension
+   gathers, and three first-dimension scatters (Q latent, KV latent, and rotated K-RoPE), all with
+   `group is pg_collection.tp`. TP>1 with SP disabled must fail at construction. Gather the
+   per-lane BF16 payloads along the sequence dimension and require the pre-SP token count. For a
+   real phase, spy on the explicit K-RoPE sequence gather and require
+   `tensor_parallel_output_grad=True`; the obsolete non-SP copy mapping and every default-group
+   resolver must raise. Assert every accepted projection stores the injected TP group. For output
+   projection, make inherited `RowParallelLinear.forward` and default resolution raise, require the
+   explicit TP group on the public linear and sequence reduce-scatter calls, and compare BF16
+   forward, dInput, and local weight gradient against independent `F.linear` plus an explicit
+   reduce-scatter contract for both gradient-accumulation flag values.
 4. **Payload and ring tests.** Assert each forward P2P tensor has `T_r*(C+D_r)` elements, never the
    full-K/V size. For CP=2/4, prove forward owner routing, reverse gradient routing, fixed peer order,
    that every recorded `P2POp` constructor receives `group=pg_collection.cp`, and wait-at-each-hop
@@ -843,11 +825,11 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    SM100 fused/FA4 cases use normal production qualification/preflight, assert the exact tuple
    epsilon for every metric, and require the newly observed candidate epsilon not to exceed it.
    Separately construct the unchanged `MLASelfAttention + TEDotProductAttention` P2P CP path with
-   identical TP=2 x CP=2 weights and packed zigzag input; compare latent-CP and legacy full-KV-CP
-   forward output for rope and YARN with the exact qualified-backend epsilon. This direct comparison
-   is intentionally forward-only: legacy TE CP backward is not the numerical oracle for latent
-   recomputation. Input and every mapped parameter gradient remain covered by the independent
-   pinned `NaiveMLA` parity above after explicit CP reduction and TP reconstruction.
+   identical TP=2 x CP=2 SP-sharded input, weights, and upstream gradient. For rope and YARN, compare
+   latent-CP and legacy full-KV-CP output and SP-sharded input gradient directly, then compare every
+   parameter gradient after the same explicit CP reduction and TP reconstruction. This accounts for
+   latent recomputation and legacy pre-expansion assigning KV-up work to different CP ranks. The
+   independent pinned `NaiveMLA` parity remains the backend-independent oracle.
 6. **Backend dispatch, qualification, and preflight caches.** Assert fused creates only the direct
    shared cuDNN adapter and flash only FA4; TE `DotProductAttention` is neither built nor called.
    The fake public FA4 callable receives the exact planner-owned int32 tensors by identity; invalid
@@ -873,8 +855,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    Q/K-shaped saved state, proving the recorder would catch the regression.
 10. **Negative validation.** Cover unsupported projection specs, SBHD, contiguous/A2A modes,
     padding, non-divisible lengths, dynamic CP, non-causal/explicit masks, FP16/FP8/FP4, dropout,
-    inference, sequence parallel, fused RoPE, unsupported head dims, missing groups, outer/selective
-    recompute, fine-grained offload, CPU offloading, frozen output weights, unqualified
+    inference, TP>1 without sequence parallel, fused RoPE, unsupported head dims, missing groups,
+    outer/selective recompute, fine-grained offload, CPU offloading, frozen output weights, unqualified
     versions/hardware, and unsupported backend enums.
 11. **Hardware policy.** H100/SM90 runs the exact qualified fused/cuDNN tuple and keeps the FA4
     architecture skip. SM100 runs both exact qualified backends. A different installed runtime
@@ -916,7 +898,7 @@ worklog. The upstream document and GitHub-bound commit contain no internal clust
 - **Collectives:** all ranks must construct an identical autograd graph; v1 sacrifices overlap to
   make ordering and lifetime explicit.
 - **Projection scope:** only the local MCore Column/RowParallel projection spec, trainable bias-free
-  output weight, and TP without sequence parallel or CPU offloading are supported. The output helper
+  output weight, TP=1 non-SP or TP>1 with SP, and no CPU offloading are supported. The output helper
   deliberately preserves the inherited module/weight/state dict while bypassing only its
   implicit-group forward. TE/fused projection specs are future work.
 - **Recompute/offload:** outer/selective recompute and fine-grained activation offload are rejected,
