@@ -704,6 +704,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             "output_logits",
             logits,
             tp_shard_dim=None if gather_output else -1,
+            sequence_dim=0,
+            batch_dim=1,
         )
 
         # Restore sequence parallel execution to the output layer if necessary.

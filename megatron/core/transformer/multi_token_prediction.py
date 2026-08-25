@@ -1142,6 +1142,8 @@ def process_mtp_loss(
                 "mtp_logits",
                 mtp_logits,
                 tp_shard_dim=None if gather_output else -1,
+                sequence_dim=0,
+                batch_dim=1,
             )
         mtp_labels, _ = roll_tensor(
             mtp_labels,

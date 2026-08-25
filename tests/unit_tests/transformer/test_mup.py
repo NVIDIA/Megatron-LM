@@ -671,3 +671,4 @@ class TestMuPMTPLossScaling:
         assert len(observed_metric_logits) == 1
         assert observed_metric_logits[0][1:3] == ("mtp_logits.0", "mtp_logits")
         assert observed_metric_logits[0][3].mean().item() == pytest.approx(3.0)
+        assert observed_metric_logits[0][4:] == (-1, 0, 1)

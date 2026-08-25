@@ -32,7 +32,7 @@ def test_tensor_observation_scope_filters_source_kinds_and_restores_noop():
     assert len(observed) == 1
     assert observed[0][:3] == (owner, "output_logits", "output_logits")
     torch.testing.assert_close(observed[0][3], torch.tensor([1.0]))
-    assert observed[0][4] is None
+    assert observed[0][4:] == (None, None, None)
 
 
 def test_layer_residual_observation_separates_accumulator_and_net_contribution():
@@ -55,6 +55,8 @@ def test_layer_residual_observation_separates_accumulator_and_net_contribution()
     torch.testing.assert_close(observed[1][3], torch.tensor([3.0, 5.0]))
     assert observed[0][4] == 0
     assert observed[1][4] == 0
+    assert observed[0][5:] == (0, 1)
+    assert observed[1][5:] == (0, 1)
     assert not observed[1][3].requires_grad
 
 
@@ -198,6 +200,7 @@ def test_router_observes_raw_logits_before_forced_benchmark_routing(monkeypatch)
     assert observed[0][:3] == (router, "router_logits", "router_logits")
     torch.testing.assert_close(observed[0][3], raw_logits)
     assert observed[0][4] == 0
+    assert observed[0][5:] == (0, 1)
     torch.testing.assert_close(routed_logits[0], raw_logits + 100.0)
 
 
@@ -238,4 +241,5 @@ def test_router_observes_normalized_configured_decision_scores():
         assert observed[0][:3] == (router, "router_scores", "router_scores")
         torch.testing.assert_close(observed[0][3], expected)
         assert observed[0][4] is None
+        assert observed[0][5:] == (0, 1)
         assert not observed[0][3].requires_grad
