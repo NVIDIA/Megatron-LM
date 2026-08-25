@@ -26,6 +26,8 @@ class InferenceMode:
     """
 
     _is_active: bool = False
+    _is_decode_only: bool = False
+    _decode_token_upper_bound: int | None = None
 
     @classmethod
     def is_active(cls) -> bool:
@@ -34,13 +36,35 @@ class InferenceMode:
 
     @classmethod
     def set_active(cls) -> None:
-        """Mark the inference engine as active. Idempotent."""
+        """Mark the inference engine active and reset its phase to the safe default."""
         cls._is_active = True
+        cls._is_decode_only = False
+        cls._decode_token_upper_bound = None
+
+    @classmethod
+    def set_decode_state(cls, is_decode_only: bool, token_upper_bound: int | None) -> None:
+        """Publish the current dynamic-inference phase and safe decode token bound."""
+        if token_upper_bound is not None and token_upper_bound <= 0:
+            raise ValueError(f"decode token upper bound must be positive; got {token_upper_bound}")
+        cls._is_decode_only = is_decode_only
+        cls._decode_token_upper_bound = token_upper_bound
+
+    @classmethod
+    def is_decode_only(cls) -> bool:
+        """Return True only while the current dynamic-inference step is decode-only."""
+        return cls._is_decode_only
+
+    @classmethod
+    def decode_token_upper_bound(cls) -> int | None:
+        """Return a host-known upper bound on EP-wide tokens in a decode-only step."""
+        return cls._decode_token_upper_bound
 
     @classmethod
     def unset_active(cls) -> None:
         """Mark the inference engine as inactive. Idempotent."""
         cls._is_active = False
+        cls._is_decode_only = False
+        cls._decode_token_upper_bound = None
 
     @classmethod
     @contextlib.contextmanager

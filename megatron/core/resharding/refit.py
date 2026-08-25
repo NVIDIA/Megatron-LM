@@ -279,6 +279,17 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     core = unwrap_model(lm)
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
+    grouped_gemm_backend = getattr(
+        lm.config.inference_grouped_gemm_backend,
+        "value",
+        lm.config.inference_grouped_gemm_backend,
+    )
+    if grouped_gemm_backend == "flashinfer":
+        raise ValueError(
+            "MXFP8 refit does not yet support the FlashInfer routed-MoE backend: "
+            "its derived shuffled expert weights must be refreshed in place after each refit."
+        )
+
     # 1. Compute which parameters are eligible for MXFP8 conversion.
     #    Must be done while params are still visible as nn.Parameter (BF16).
     convertible: set[str] = set()

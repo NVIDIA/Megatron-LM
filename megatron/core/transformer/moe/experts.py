@@ -79,6 +79,12 @@ try:
     import flashinfer.fused_moe as fused_moe
     from flashinfer.fused_moe.core import ActivationType
 
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        FlashInferRoutedMXFP8Weight,
+        flashinfer_routed_mxfp8_moe,
+        prepare_routed_mxfp8_weights,
+    )
+
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
@@ -1133,7 +1139,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
     Supports three forward paths:
     - Training: delegates to parent TEGroupedMLP
-    - Inference + CUDA graphed: FlashInfer cutlass_fused_moe (fused permute + GEMM)
+    - Inference + FlashInfer: CUTLASS fused MoE for BF16 or routed block-scale MoE for MXFP8
     - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
     """
 
@@ -1164,6 +1170,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
+        self._flashinfer_mxfp8_token_capacity = (
+            config.inference_flashinfer_mxfp8_token_capacity
+        )
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1199,7 +1208,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         After quantize_model_to_mxfp8, each per-expert weight (weight0, weight1, ...)
         has been replaced with an MXFP8Tensor. This method stacks their data and
-        scales into _fc1_weight / _fc2_weight for scaled_grouped_mm.
+        scales into _fc1_weight / _fc2_weight. The torch path keeps the
+        scaled_grouped_mm layout; the FlashInfer path derives shuffled Major-K
+        weights for its routed MoE kernel.
 
         Note: this creates a contiguous copy since per-expert MXFP8Tensor attributes
         are not contiguous across experts. This is a one-time cost at first forward.
@@ -1210,7 +1221,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         intended for non-colocated inference.
         """
 
-        backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
+        use_flashinfer_routed = (
+            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+        )
+        backend = (
+            "triton"
+            if use_flashinfer_routed
+            else resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
+        )
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
@@ -1234,21 +1252,39 @@ class InferenceGroupedMLP(TEGroupedMLP):
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
-            setattr(
-                self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend)
+            stacked_weight = MXFP8Tensor(
+                data=stacked_data,
+                scale=stacked_scale,
+                backend=backend,
             )
+            if use_flashinfer_routed:
+                concatenated_weight = prepare_routed_mxfp8_weights(stacked_weight)
+                logger.info(
+                    "Prepared FlashInfer routed MXFP8 %s weights: experts=%d "
+                    "shape=(%d, %d)->(%d, %d)",
+                    linear_name,
+                    self.num_local_experts,
+                    concatenated_weight.logical_rows,
+                    concatenated_weight.logical_cols,
+                    concatenated_weight.padded_rows,
+                    concatenated_weight.padded_cols,
+                )
+            else:
+                concatenated_weight = stacked_weight
+            setattr(self, buf_name, concatenated_weight)
 
-            # Redirect per-expert weight .data to views into the stacked buffer,
-            # mirroring _build_concatenated_weights. This frees the original
-            # allocations while keeping the Parameter objects intact.
-            for i in range(self.num_local_experts):
-                w = getattr(linear, f'weight{i}')
-                if isinstance(w, MXFP8Tensor):
-                    w.data = stacked_data[i]
-                    w.scale = stacked_scale[i]
-                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
-                    w.data.data = stacked_data[i]
-                    w.data.scale = stacked_scale[i]
+            # The torch path can redirect per-expert storage into the stacked
+            # representation. FlashInfer keeps the canonical Triton tensors intact
+            # because its shuffled Major-K weights are a derived representation.
+            if not use_flashinfer_routed:
+                for i in range(self.num_local_experts):
+                    w = getattr(linear, f'weight{i}')
+                    if isinstance(w, MXFP8Tensor):
+                        w.data = stacked_data[i]
+                        w.scale = stacked_scale[i]
+                    elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                        w.data.data = stacked_data[i]
+                        w.data.scale = stacked_scale[i]
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
@@ -1298,6 +1334,28 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
+        if isinstance(self._fc1_weight, FlashInferRoutedMXFP8Weight):
+            if not isinstance(self._fc2_weight, FlashInferRoutedMXFP8Weight):
+                raise TypeError("FC1 and FC2 must use the same FlashInfer MXFP8 format")
+            output = flashinfer_routed_mxfp8_moe(
+                hidden_states,
+                routing_map,
+                probs,
+                self._fc1_weight,
+                self._fc2_weight,
+                num_experts=self.num_local_experts * self.ep_group.size(),
+                local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+                activation_type=self._flashinfer_activation_type.value,
+                out=(
+                    NVLSAllGatherVDispatcher._get_rsv_tensor()
+                    if self._nvls_dispatcher
+                    else None
+                ),
+                token_capacity=self._flashinfer_mxfp8_token_capacity,
+                decode_only=InferenceMode.is_decode_only(),
+                decode_token_upper_bound=InferenceMode.decode_token_upper_bound(),
+            )
+            return output, None
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
             routing_map.int(),
@@ -1359,9 +1417,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Forward pass with three modes:
 
         - Training: delegates to parent TEGroupedMLP.
-        - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
-          is not used in this path; the FlashInfer kernel operates directly on
-          routing_map.
+        - Inference + FlashInfer: fused BF16 or routed MXFP8 MoE. tokens_per_expert
+          is not used in this path; the FlashInfer kernels operate directly on routing_map.
         - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
 
         Args:
