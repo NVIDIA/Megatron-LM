@@ -711,7 +711,7 @@ def _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection) ->
     (including ``is_qkv_fn``, ``qkv_split_shapes`` and ``pg_collection`` — the
     latter is what makes the empty-``param_ns_homes`` fallback TP-correct) come
     from the shared TensorParallelMuon builder, then LayerShardedMuon's own
-    muon-prefixed attrs and the (GTP, TP) process groups are added. NS home
+    muon-prefixed attrs and the (GTP_remat, TP) process groups are added. NS home
     assignments are wired after construction by
     ``LayerWiseDistributedOptimizer._wire_layer_sharding_ns_homes``.
     """
@@ -719,7 +719,10 @@ def _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection) ->
 
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
     kwargs.update(_kwargs_from_config(LayerShardedMuon, "muon", config))
-    kwargs['gtp_group'] = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
+    # Explicit injections: reflective matching cannot cover these (no config attr).
+    kwargs['gtp_remat_group'] = (
+        getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
+    )
     kwargs['tp_group'] = getattr(pg_collection, 'tp', None) if pg_collection else None
     return kwargs
 
@@ -731,7 +734,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     shared by optimizers that do not support layer sharding (``adaptive_muon``
     layers :func:`_adaptive_muon_config_to_kwargs` on top of it), so it must stay
     a pure :class:`TensorParallelMuon` kwargs builder. Layer-sharding dispatch
-    lives in :func:`_muon_entry_config_to_kwargs`, wired only to the ``muon``
+    lives in :func:`_muon_registry_config_to_kwargs`, wired only to the ``muon``
     registry entry alongside its ``config_to_cls``.
     """
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
@@ -741,7 +744,7 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     return kwargs
 
 
-def _muon_entry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """``config_to_kwargs`` for the ``muon`` registry entry only.
 
     Dispatches to :func:`_layer_sharded_muon_config_to_kwargs` when
@@ -778,7 +781,7 @@ _EMERGING_OPTIMIZERS.update(
         'muon': EmergingOptimizerEntry(
             optimizer_cls=TensorParallelMuon,
             init_state_fn=_eopt_init_state_fn,
-            config_to_kwargs=_muon_entry_config_to_kwargs,
+            config_to_kwargs=_muon_registry_config_to_kwargs,
             config_to_cls=_muon_config_to_cls,
             default_param_overrides={
                 ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
