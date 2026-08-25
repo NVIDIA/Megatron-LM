@@ -10,6 +10,7 @@ spec:
   gpus: 4
   n_repeat: 1
   platforms: dgx_gb200
+  time_limit: 1800
   script_setup: |
     unset https_proxy
     umask 077

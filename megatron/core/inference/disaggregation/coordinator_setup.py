@@ -17,13 +17,13 @@ DECODE = "decode"
 
 def _validate_disagg_specs(specs: list[InferenceShardSpec]) -> None:
     """Require at least one shard for each disaggregated role."""
-    untagged = [s for s in specs if s.role not in (PREFILL, DECODE)]
+    untagged = [spec for spec in specs if spec.role not in (PREFILL, DECODE)]
     if untagged:
         raise ValueError(
             "every disaggregated shard must declare role=prefill or role=decode; "
             f"{len(untagged)} shard(s) did not: {untagged}"
         )
-    roles = {s.role for s in specs}
+    roles = {spec.role for spec in specs}
     if not {PREFILL, DECODE}.issubset(roles):
         raise ValueError("disaggregation needs at least one prefill and one decode shard")
 
@@ -45,11 +45,11 @@ def configure_prebuilt_disagg_engine(engine: Any) -> None:
     offset = 0
     my_index = None
     my_spec = None
-    for i, s in enumerate(specs):
-        if offset <= rank < offset + s.world_size:
-            my_index, my_spec = i, s
+    for shard_index, spec in enumerate(specs):
+        if offset <= rank < offset + spec.world_size:
+            my_index, my_spec = shard_index, spec
             break
-        offset += s.world_size
+        offset += spec.world_size
     assert my_spec is not None, f"rank {rank} not in any disagg shard window"
 
     # Each shard replica needs a distinct coordinator identity.

@@ -228,16 +228,6 @@ class DisaggCoordinatorScheduler:
 
         return self._capacity.get(identity)
 
-    def decode_usage(self, identity) -> int:
-        """Return currently reserved decode slots."""
-
-        return self._decode.usage.get(identity, 0)
-
-    def prefill_usage(self, identity) -> int:
-        """Return currently reserved prefill slots."""
-
-        return self._prefill.usage.get(identity, 0)
-
     @staticmethod
     def _load(state: _RoleState, identity) -> tuple[int, int, int]:
         return (

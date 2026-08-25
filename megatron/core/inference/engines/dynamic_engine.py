@@ -2325,9 +2325,9 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> Optional[int]:
         """Select a graphed chunk size, or wait for the resident batch to drain.
 
-        A deferred request remains at the queue head, so no new work is admitted
-        behind it. The finite resident batch can therefore drain and change the
-        graph shape. A miss on an empty engine means graph coverage is incomplete.
+        A deferred request remains at the queue head, so the resident batch can
+        drain and change the graph shape. A lone in-flight continuation cannot
+        defer, so it falls back to eager execution when no graph covers it.
         """
         chunk_size = self._find_cg_chunk_size(max_chunk_tokens)
         if chunk_size is not None:
@@ -2337,6 +2337,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.num_prefill_requests or self.context.num_decode_requests:
             self._register_cg_wait(req)
             return None
+
+        if self.context.chunked_prefill_request_id == req.request_id:
+            req.cg_wait_iters = 0
+            return max_chunk_tokens
 
         raise RuntimeError(
             f"No captured CUDA graph can admit a {max_chunk_tokens}-token chunked prefill"
@@ -3273,8 +3277,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             "State transfer submission failed while source storage may still be in use"
                         ) from error
             elif header == Headers.KV_HANDOFF_COMPLETE:
+                # Older peers omit source_safe; keep source storage pinned in that case.
+                source_safe = bool(data[3]) if len(data) > 3 else False
                 self._record_handoff_completion_notification(
-                    int(data[1]), bool(data[2]), bool(data[3])
+                    int(data[1]), bool(data[2]), source_safe
                 )
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])

@@ -280,12 +280,12 @@ def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
     runtime.handle_engine_aborted(5, source_safe=False)
 
     assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
-    assert runtime.scheduler.prefill_usage(b"prefill") == 1
+    assert runtime.scheduler.prefill_load(b"prefill") == (0, 1, 1)
     assert 5 in runtime.terminating_request_ids
 
     runtime.handle_kv_read_done(b"decode", 5)
     assert runtime.scheduler.reserved_engine("prefill", 5) is None
-    assert runtime.scheduler.prefill_usage(b"prefill") == 0
+    assert runtime.scheduler.prefill_load(b"prefill") == (0, 0, 0)
 
     runtime.handle_engine_aborted(5, source_safe=True)
     assert runtime.scheduler.assigned_engine("decode", 5) is None
@@ -307,7 +307,7 @@ def test_decode_removal_does_not_release_inflight_source():
     runtime.remove_engine(b"decode")
 
     assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
-    assert runtime.scheduler.prefill_usage(b"prefill") == 1
+    assert runtime.scheduler.prefill_load(b"prefill") == (0, 1, 1)
     assert not any(
         identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
         for identity, message in sent
@@ -335,7 +335,7 @@ def test_undelivered_decode_handoff_releases_prefill_source():
     )
 
     assert runtime.scheduler.reserved_engine("prefill", 5) is None
-    assert runtime.scheduler.prefill_usage(b"prefill") == 0
+    assert runtime.scheduler.prefill_load(b"prefill") == (0, 0, 0)
     assert runtime.scheduler.assigned_engine("decode", 5) is None
     assert 5 not in runtime.terminating_request_ids
     assert 5 not in runtime.coordinator.request_id_to_client_id
@@ -399,12 +399,12 @@ def test_late_source_safety_releases_prefill_after_request_failure():
     runtime.handle_engine_failure(5, "transfer failed", source_safe=False)
 
     assert runtime.scheduler.reserved_engine("prefill", 5) == b"prefill"
-    assert runtime.scheduler.prefill_usage(b"prefill") == 1
+    assert runtime.scheduler.prefill_load(b"prefill") == (0, 1, 1)
 
     runtime.handle_kv_read_done(b"decode", 5)
 
     assert runtime.scheduler.reserved_engine("prefill", 5) is None
-    assert runtime.scheduler.prefill_usage(b"prefill") == 0
+    assert runtime.scheduler.prefill_load(b"prefill") == (0, 0, 0)
 
     runtime.handle_engine_aborted(5, source_safe=True)
 

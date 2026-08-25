@@ -36,9 +36,9 @@ def disagg_refit_pools(inference_shards, world_size: int, rank: int | None = Non
 def _iter_shard_windows(specs, rank):
     """Yield each shard's rank offset and local-membership flag."""
     offset = 0
-    for s in specs:
-        yield offset, s, (offset <= rank < offset + s.world_size)
-        offset += s.world_size
+    for spec in specs:
+        yield offset, spec, (offset <= rank < offset + spec.world_size)
+        offset += spec.world_size
 
 
 def build_disagg_inference_model(
@@ -57,19 +57,19 @@ def build_disagg_inference_model(
     my_pg = None
     my_spec = None
     specs = parse_inference_shards_spec(args.inference_shards, args.world_size)
-    for offset, s, mine in _iter_shard_windows(specs, rank):
+    for offset, spec, is_local in _iter_shard_windows(specs, rank):
         pg = build_inference_pg_collection(
-            world_size=s.world_size,
-            tp_size=s.tp,
-            pp_size=s.pp,
+            world_size=spec.world_size,
+            tp_size=spec.tp,
+            pp_size=spec.pp,
             cp_size=1,
-            ep_size=s.ep,
-            expt_tp_size=s.expt_tp,
+            ep_size=spec.ep,
+            expt_tp_size=spec.expt_tp,
             rank_offset=offset,
             use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
         )
-        if mine:
-            my_pg, my_spec = pg, s
+        if is_local:
+            my_pg, my_spec = pg, spec
     assert my_pg is not None and my_spec is not None, f"rank {rank} not in any disagg shard window"
 
     # RL inference shards use CP=1.

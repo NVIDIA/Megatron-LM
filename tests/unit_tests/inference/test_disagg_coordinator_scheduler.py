@@ -41,7 +41,7 @@ def test_weighted_decode_reservations_are_fifo_and_held_until_release():
     third = flow.pop_next_admissible(b"decode")
 
     assert [second.request_id, third.request_id] == [2, 3]
-    assert flow.decode_usage(b"decode") == 3
+    assert flow.decode_load(b"decode") == (0, 2, 3)
 
 
 def test_request_capacity_limits_attention_only_engines():
@@ -74,7 +74,7 @@ def test_queue_admission_reserves_only_one_handoff_at_a_time():
     admitted = flow.pop_next_admissible(b"decode")
 
     assert admitted.request_id == 1
-    assert flow.decode_usage(b"decode") == 2
+    assert flow.decode_load(b"decode") == (1, 1, 2)
     assert flow.has_queued(b"decode")
 
 
@@ -83,7 +83,7 @@ def test_oversized_handoff_is_rejected_without_mutating_usage():
     flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=4)])
 
     assert not flow.can_ever_fit(b"decode", 5)
-    assert flow.decode_usage(b"decode") == 0
+    assert flow.decode_load(b"decode") == (0, 0, 0)
 
 
 def test_invalid_advertised_capacity_is_rejected():
@@ -142,7 +142,7 @@ def test_prefill_reservations_use_advertised_handoff_bound_and_fifo_queue():
     admitted = flow.pop_next_prefill(b"prefill")
 
     assert admitted.request_id == 2
-    assert flow.prefill_usage(b"prefill") == 1
+    assert flow.prefill_load(b"prefill") == (0, 1, 1)
 
 
 def test_available_fraction_uses_binding_request_or_state_capacity():

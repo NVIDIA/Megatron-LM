@@ -462,12 +462,14 @@ class TestChunkedPrefillCgGating:
         with pytest.raises(RuntimeError, match="No captured CUDA graph"):
             engine._select_cg_chunk_size(req, max_chunk_tokens=7)
 
-    def test_lone_continuation_uses_captured_graph(self):
+    def test_lone_continuation_falls_back_when_no_graph_matches(self):
         engine = _create_engine(
-            [_get_cudagraph(8, 1, 0)], chunked_prefill_request_id=1, is_hybrid=True
+            [_get_cudagraph(8, 0, 8)], chunked_prefill_request_id=1, is_hybrid=True
         )
+        req = _make_request(cg_wait_iters=3)
 
-        assert engine._select_cg_chunk_size(_make_request(), max_chunk_tokens=7) == 7
+        assert engine._select_cg_chunk_size(req, max_chunk_tokens=7) == 7
+        assert req.cg_wait_iters == 0
 
     def test_hybrid_continuation_retries_after_batch_shape_changes(self):
         # At full request occupancy, the next geometric P bucket (4P + 28D)
