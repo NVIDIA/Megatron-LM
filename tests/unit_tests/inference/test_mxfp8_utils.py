@@ -11,6 +11,8 @@ Tests cover:
 import pytest
 import torch
 
+from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
+
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.internal,
@@ -271,8 +273,6 @@ class TestMXFP8Tensor:
 
     @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
     def test_copy_preserves_storage_and_logical_metadata(self, backend):
-        from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
-
         if backend == "flashinfer" and not HAVE_FLASHINFER:
             pytest.skip("FlashInfer not available")
 
@@ -295,8 +295,6 @@ class TestMXFP8Tensor:
         assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
     def test_copy_rejects_shape_mismatch(self):
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
         tensor = MXFP8Tensor.from_bf16(
             torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
         )
@@ -304,8 +302,6 @@ class TestMXFP8Tensor:
             tensor.copy_(torch.randn(32, 128, device="cuda", dtype=torch.bfloat16))
 
     def test_copy_requires_backend(self):
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
         source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
         quantized = MXFP8Tensor.from_bf16(source, backend="triton")
         backendless = MXFP8Tensor(data=quantized.data, scale=quantized.scale, dtype=source.dtype)
@@ -313,8 +309,6 @@ class TestMXFP8Tensor:
             backendless.copy_(source)
 
     def test_copy_preserves_source_dtype_for_legacy_constructor(self):
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
         initial = MXFP8Tensor.from_bf16(
             torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
         )
@@ -329,8 +323,6 @@ class TestMXFP8Tensor:
         assert torch.equal(tensor.scale, expected.scale)
 
     def test_failed_legacy_copy_keeps_dtype_unknown(self):
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
         initial = MXFP8Tensor.from_bf16(
             torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
         )
@@ -344,8 +336,6 @@ class TestMXFP8Tensor:
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
     def test_copy_uses_explicit_logical_dtype(self, dtype):
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
         source = torch.randn(16, 128, device="cuda", dtype=dtype)
         tensor = MXFP8Tensor.from_bf16(source, backend="triton")
         update = torch.randn(16, 128, device="cuda", dtype=torch.float32)
