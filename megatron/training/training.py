@@ -4370,6 +4370,8 @@ def train(
             optimizers=[optimizer],
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
+        if config.cuda_graph_parallel_prewarm:
+            cuda_graph_helper.parallel_prewarm_thd_chunks()
 
     # Run training iterations till done.
     buffered_rollouts = None

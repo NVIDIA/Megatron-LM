@@ -1355,6 +1355,21 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
         return (grad_output,)
 
 
+class FineGrainedOffloadingBackwardCaptureStartFunction(torch.autograd.Function):
+    """Fork the H2D stream when a whole-module CUDA graph starts backward."""
+
+    @staticmethod
+    def forward(ctx, tensor) -> torch.Tensor:
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if torch.cuda.is_current_stream_capturing():
+            mgr = PipelineOffloadManager.get_instance()
+            mgr.h2d_stream.wait_stream(torch.cuda.current_stream())
+        return (grad_output,)
+
+
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""
 
@@ -1432,9 +1447,32 @@ class FineGrainedActivationOffloadingInterface:
         torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
 
     @staticmethod
+    def forward_capture_start() -> None:
+        """Fork the D2H stream from a whole-module CUDA graph capture."""
+        if not torch.cuda.is_current_stream_capturing():
+            return
+        mgr = PipelineOffloadManager.get_instance()
+        mgr.d2h_stream.wait_stream(torch.cuda.current_stream())
+
+    @staticmethod
     def backward_record(tensor) -> torch.Tensor:
         """Record the backward event for cuda graph capture."""
         return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
+
+    @staticmethod
+    def backward_capture_start(output):
+        """Attach the H2D-stream fork to the primary output's backward edge."""
+        if isinstance(output, tuple):
+            return (
+                FineGrainedOffloadingBackwardCaptureStartFunction.apply(output[0]),
+                *output[1:],
+            )
+        if isinstance(output, list):
+            return [
+                FineGrainedOffloadingBackwardCaptureStartFunction.apply(output[0]),
+                *output[1:],
+            ]
+        return FineGrainedOffloadingBackwardCaptureStartFunction.apply(output)
 
     @staticmethod
     def reset():

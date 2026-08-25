@@ -2418,6 +2418,15 @@ def _add_inference_args(parser):
         'to the new API in validate_args.',
     )
     group.add_argument(
+        '--cuda-graph-granularity',
+        type=str,
+        default='layer',
+        choices=['layer', 'chunk'],
+        help='Select the Transformer Engine training CUDA graph callable boundary. '
+        '"layer" keeps per-layer graphs; "chunk" captures one decoder TransformerBlock per '
+        'PP/VPP model chunk and requires an empty --cuda-graph-modules list.',
+    )
+    group.add_argument(
         '--use-legacy-static-engine',
         action='store_true',
         default=False,
@@ -2762,6 +2771,7 @@ def _add_network_size_args(parser):
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
+        "cuda_graph_granularity",
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these

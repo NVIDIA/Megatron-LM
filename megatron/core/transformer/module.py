@@ -424,6 +424,15 @@ class GraphableMegatronModule(MegatronModule):
         """
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
+        # During chunk capture the TransformerBlock is the TE callable. Its child layers must run
+        # their normal forward path inside that outer graph instead of changing their output
+        # signature to the per-layer capture contract.
+        if (
+            getattr(self.config, 'cuda_graph_granularity', 'layer') == 'chunk'
+            and not getattr(self, 'is_cuda_graph_chunk_callable', False)
+        ):
+            return False
+
         return (
             self.config.cuda_graph_impl == "transformer_engine"
             and self.training
