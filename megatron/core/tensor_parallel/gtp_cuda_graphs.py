@@ -82,7 +82,7 @@ class GraphWgradRingSlot:
     @classmethod
     def allocate(cls, param, *, key: tuple, index: int = 0) -> Self:
         """Allocate padded persistent storage; the caller records its initial ready event."""
-        symm = is_gtp_symm_pool_registered(param.group)
+        symm = is_gtp_symm_pool_registered(param.group, mode="rs")
         with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
             tensor = torch.empty(
                 param._unsharded_shape_padded,
