@@ -144,9 +144,7 @@ def _optimizer_metric_tensors(
         for view in _optimizer_tensor_views(parameter_names, optimizer, pg_collection)
     }
     if manifest is None:
-        manifest = _build_optimizer_parameter_manifest(
-            parameter_names, optimizer, pg_collection
-        )
+        manifest = _build_optimizer_parameter_manifest(parameter_names, optimizer, pg_collection)
     if not local_views and manifest:
         raise ValueError("Optimizer parameter metadata has no local tensor device.")
     local_device = next(iter(local_views.values())).parameter.device if local_views else None
@@ -162,17 +160,13 @@ def _optimizer_metric_tensors(
 
         view = local_views.get(entry.name)
         if view is None:
-            parameter = torch.empty(
-                0, dtype=entry.parameter_dtype, device=local_device
-            )
+            parameter = torch.empty(0, dtype=entry.parameter_dtype, device=local_device)
             wgrad = torch.empty(0, dtype=entry.wgrad_dtype, device=local_device)
         else:
             parameter = view.parameter
             wgrad = view.wgrad
             if wgrad is None:
-                wgrad = torch.empty(
-                    0, dtype=entry.wgrad_dtype, device=parameter.device
-                )
+                wgrad = torch.empty(0, dtype=entry.wgrad_dtype, device=parameter.device)
 
         if include_parameter:
             values.append(
@@ -203,9 +197,7 @@ def _optimizer_parameter_manifest_entry(
     model_parameter = view.model_parameter
     wgrad_dtype = view.wgrad.dtype if view.wgrad is not None else view.parameter.dtype
     model_relations = _model_parallel_relations(model_parameter, pg_collection)
-    ep_relation = next(
-        (relation for relation in model_relations if relation.axis == "ep"), None
-    )
+    ep_relation = next((relation for relation in model_relations if relation.axis == "ep"), None)
     ep_owner = (
         ep_relation.placement.rank
         if ep_relation is not None and isinstance(ep_relation.placement, Owned)
@@ -231,9 +223,7 @@ def _model_parallel_relations(
     tensor_group_attribute = "expt_tp" if is_expert else "tp"
     tensor_group = getattr(pg_collection, tensor_group_attribute, None)
     if tensor_group is None:
-        raise ValueError(
-            f"Tensor metric observation requires the {tensor_axis} process group."
-        )
+        raise ValueError(f"Tensor metric observation requires the {tensor_axis} process group.")
     if getattr(model_parameter, "tensor_model_parallel", False):
         tensor_placement = Shard(getattr(model_parameter, "partition_dim", None))
     else:
@@ -242,9 +232,7 @@ def _model_parallel_relations(
 
     ep_group = getattr(pg_collection, "ep", None)
     if ep_group is not None:
-        ep_placement = (
-            Owned(ep_group.rank()) if is_expert and ep_group.size() > 1 else Replica()
-        )
+        ep_placement = Owned(ep_group.rank()) if is_expert and ep_group.size() > 1 else Replica()
         relations.append(RankRelation("ep", ep_placement))
 
     gtp_axis = "expert_gtp" if is_expert else "gtp"
@@ -263,8 +251,7 @@ def _model_parallel_relations(
 
 
 def _local_optimizer_tensor_views(
-    optimizer: MegatronOptimizer,
-    pg_collection: ProcessGroupCollection,
+    optimizer: MegatronOptimizer, pg_collection: ProcessGroupCollection
 ) -> list[_OptimizerTensorView]:
     """Return locally valid parameter and wgrad views for a Megatron optimizer.
 
@@ -455,9 +442,7 @@ def _distributed_optimizer_tensor_views(
 
 
 def _distributed_optimizer_tensor_view(
-    optimizer: DistributedOptimizer,
-    model_parameter: torch.nn.Parameter,
-    parameter: torch.Tensor,
+    optimizer: DistributedOptimizer, model_parameter: torch.nn.Parameter, parameter: torch.Tensor
 ) -> _OptimizerTensorView:
     param_range = optimizer._get_model_param_range_map(model_parameter)["param"]
     model_wgrad = _model_parameter_wgrad(model_parameter)
@@ -489,16 +474,13 @@ def _distributed_optimizer_tensor_view(
 
 
 def _layerwise_optimizer_tensor_views(
-    optimizer: LayerWiseDistributedOptimizer,
-    pg_collection: ProcessGroupCollection,
+    optimizer: LayerWiseDistributedOptimizer, pg_collection: ProcessGroupCollection
 ) -> list[_OptimizerTensorView]:
     owner_maps = _layerwise_parameter_owner_maps(optimizer)
     views = []
     for child in optimizer.chained_optimizers:
         for view in _unplaced_optimizer_tensor_views(child):
-            relation = _layerwise_storage_relation(
-                view.model_parameter, pg_collection, owner_maps
-            )
+            relation = _layerwise_storage_relation(view.model_parameter, pg_collection, owner_maps)
             group = _data_parallel_group(pg_collection, relation.axis)
             placement = relation.placement
             if isinstance(placement, Owned) and placement.rank != group.rank():
@@ -518,9 +500,7 @@ def _missing_optimizer_storage_relations(
     if isinstance(optimizer, LayerWiseDistributedOptimizer):
         return (
             _layerwise_storage_relation(
-                model_parameter,
-                pg_collection,
-                layerwise_owner_maps[id(optimizer)],
+                model_parameter, pg_collection, layerwise_owner_maps[id(optimizer)]
             ),
         )
     if isinstance(optimizer, DistributedOptimizer):
@@ -534,31 +514,21 @@ def _missing_optimizer_storage_relations(
         for child in layerwise_children:
             owner_maps = layerwise_owner_maps[id(child)]
             if _layerwise_owner_rank(model_parameter, owner_maps) is not None:
-                return (
-                    _layerwise_storage_relation(
-                        model_parameter, pg_collection, owner_maps
-                    ),
-                )
+                return (_layerwise_storage_relation(model_parameter, pg_collection, owner_maps),)
         if layerwise_children and getattr(
             model_parameter, "is_managed_by_layer_wise_optimizer", False
         ):
             return (
                 _layerwise_storage_relation(
-                    model_parameter,
-                    pg_collection,
-                    layerwise_owner_maps[id(layerwise_children[0])],
+                    model_parameter, pg_collection, layerwise_owner_maps[id(layerwise_children[0])]
                 ),
             )
-        if any(
-            isinstance(child, DistributedOptimizer) for child in optimizer.chained_optimizers
-        ):
+        if any(isinstance(child, DistributedOptimizer) for child in optimizer.chained_optimizers):
             return (_empty_flat_shard_relation(model_parameter, pg_collection),)
         if len(layerwise_children) == 1:
             return (
                 _layerwise_storage_relation(
-                    model_parameter,
-                    pg_collection,
-                    layerwise_owner_maps[id(layerwise_children[0])],
+                    model_parameter, pg_collection, layerwise_owner_maps[id(layerwise_children[0])]
                 ),
             )
     raise ValueError(
@@ -623,9 +593,7 @@ def _trim_gtp_padding(
         parameter = view.parameter.reshape(physical_shape)[: logical_shape[0]]
         if view.wgrad is not None:
             if view.wgrad.numel() != physical_numel:
-                raise ValueError(
-                    "A padded GTP wgrad must match its physical model shard size."
-                )
+                raise ValueError("A padded GTP wgrad must match its physical model shard size.")
             wgrad = view.wgrad.reshape(physical_shape)[: logical_shape[0]]
         else:
             wgrad = None
@@ -681,13 +649,14 @@ def _layerwise_storage_relation(
         return RankRelation(axis, Replica())
     owner_rank = _layerwise_owner_rank(model_parameter, owner_maps)
     if owner_rank is None:
-        raise ValueError("A LayerWise optimizer parameter has no owner in its data-parallel layout.")
+        raise ValueError(
+            "A LayerWise optimizer parameter has no owner in its data-parallel layout."
+        )
     return RankRelation(axis, Owned(owner_rank))
 
 
 def _layerwise_owner_rank(
-    model_parameter: torch.nn.Parameter,
-    owner_maps: dict[str, dict[int, int]],
+    model_parameter: torch.nn.Parameter, owner_maps: dict[str, dict[int, int]]
 ) -> int | None:
     return owner_maps[_data_parallel_axis(model_parameter)].get(id(model_parameter))
 
@@ -715,17 +684,15 @@ def _layerwise_parameter_owner_maps(
     optimizer: LayerWiseDistributedOptimizer,
 ) -> dict[str, dict[int, int]]:
     return {
-        "dp": _parameter_owner_map(getattr(optimizer, "dp_cp_params_list", None)),
-        "expert_dp": _parameter_owner_map(
-            getattr(optimizer, "expt_dp_params_list", None)
-        ),
+        "dp_cp": _parameter_owner_map(getattr(optimizer, "dp_cp_params_list", None)),
+        "expert_dp": _parameter_owner_map(getattr(optimizer, "expt_dp_params_list", None)),
     }
 
 
 def _data_parallel_group(
     pg_collection: ProcessGroupCollection, axis: str
 ) -> torch.distributed.ProcessGroup:
-    attribute = "expt_dp" if axis == "expert_dp" else "dp_cp"
+    attribute = "expt_dp" if axis == "expert_dp" else axis
     group = getattr(pg_collection, attribute, None)
     if group is None:
         raise ValueError(f"LayerWise tensor metric observation requires the {axis} group.")
@@ -748,9 +715,7 @@ def _parameter_owner_map(
 
 
 def _with_storage_relation(
-    view: _OptimizerTensorView,
-    axis: str,
-    placement: Replica | Shard | Owned,
+    view: _OptimizerTensorView, axis: str, placement: Replica | Shard | Owned
 ) -> _OptimizerTensorView:
     return _OptimizerTensorView(
         model_parameter=view.model_parameter,
@@ -767,8 +732,7 @@ def _has_remote_owner(
     """Return whether any owned storage axis names a different local group rank."""
     return any(
         isinstance(relation.placement, Owned)
-        and relation.placement.rank
-        != _data_parallel_group(pg_collection, relation.axis).rank()
+        and relation.placement.rank != _data_parallel_group(pg_collection, relation.axis).rank()
         for relation in relations
     )
 
@@ -780,4 +744,4 @@ def _model_parameter_wgrad(model_parameter: torch.nn.Parameter) -> torch.Tensor 
 
 
 def _data_parallel_axis(model_parameter: torch.nn.Parameter) -> str:
-    return "dp" if getattr(model_parameter, "allreduce", True) else "expert_dp"
+    return "dp_cp" if getattr(model_parameter, "allreduce", True) else "expert_dp"

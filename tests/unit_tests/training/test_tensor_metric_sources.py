@@ -142,7 +142,7 @@ def test_float16_optimizer_source_uses_main_parameter_and_finalized_wgrad():
     assert views[0].model_parameter is model_parameter
     assert views[0].parameter.data_ptr() == main_parameter.data_ptr()
     assert views[0].wgrad.data_ptr() == model_parameter.main_grad.data_ptr()
-    assert views[0].storage_relations[0].axis == "dp"
+    assert views[0].storage_relations[0].axis == "dp_cp"
     assert views[0].storage_relations[0].placement == Replica()
 
 
@@ -172,7 +172,7 @@ def test_distributed_optimizer_source_uses_only_valid_local_ranges():
     assert views[0].model_parameter is model_parameter
     assert views[0].parameter.data_ptr() == main_parameter.data_ptr()
     torch.testing.assert_close(views[0].wgrad, torch.tensor([30.0, 40.0]))
-    assert views[0].storage_relations[0].axis == "dp"
+    assert views[0].storage_relations[0].axis == "dp_cp"
     assert views[0].storage_relations[0].placement == FlatShard((2, 2), 2, 4)
 
 
@@ -262,7 +262,7 @@ def test_layerwise_optimizer_source_marks_whole_parameter_owner():
     assert len(views) == 1
     assert views[0].parameter.data_ptr() == main_parameter.data_ptr()
     assert views[0].wgrad.data_ptr() == model_parameter.main_grad.data_ptr()
-    assert views[0].storage_relations[0].axis == "dp"
+    assert views[0].storage_relations[0].axis == "dp_cp"
     assert views[0].storage_relations[0].placement == Owned(1)
 
 
@@ -344,7 +344,7 @@ def test_rank_symmetric_distributed_optimizer_source_adds_empty_flat_shard():
     assert views[0].wgrad.numel() == 0
     assert not views[0].is_placeholder
     assert len(views[0].storage_relations) == 1
-    assert views[0].storage_relations[0].axis == "dp"
+    assert views[0].storage_relations[0].axis == "dp_cp"
     assert views[0].storage_relations[0].placement == FlatShard((2, 2), 0, 0)
     assert views[1].storage_relations[0].placement == FlatShard((2,), 0, 2)
 
@@ -444,11 +444,11 @@ def test_optimizer_metric_tensors_compose_model_and_storage_placements():
     )
 
     assert [value.sites[0].kind for value in values] == ["parameter", "wgrad"]
-    assert [relation.axis for relation in values[0].rank_relations] == ["tp", "ep", "gtp", "dp"]
+    assert [relation.axis for relation in values[0].rank_relations] == ["tp", "ep", "gtp", "dp_cp"]
     assert values[0].relation("tp").placement == Shard(0)
     assert values[0].relation("ep").placement == Replica()
     assert values[0].relation("gtp").placement == Replica()
-    assert values[0].relation("dp").placement == FlatShard((2,), 0, 1)
+    assert values[0].relation("dp_cp").placement == FlatShard((2,), 0, 1)
     assert all(not value.is_placeholder for value in values)
     torch.testing.assert_close(values[1].tensor, torch.tensor([3.0]))
 
@@ -565,7 +565,7 @@ def test_ep_manifest_preserves_rank_local_dense_optimizer_shards(monkeypatch):
     def fake_all_gather_object(output, local_entries, group):
         assert group is pg_collection.ep
         remote_entry = replace(
-            local_entries[0], storage_relations=(RankRelation("dp", FlatShard((2,), 1, 2)),)
+            local_entries[0], storage_relations=(RankRelation("dp_cp", FlatShard((2,), 1, 2)),)
         )
         output[:] = [local_entries, (remote_entry,)]
 
@@ -574,7 +574,7 @@ def test_ep_manifest_preserves_rank_local_dense_optimizer_shards(monkeypatch):
     manifest = _build_optimizer_parameter_manifest(parameter_names, optimizer, pg_collection)
 
     assert len(manifest) == 1
-    assert manifest[0].storage_relations == (RankRelation("dp", FlatShard((2,), 0, 1)),)
+    assert manifest[0].storage_relations == (RankRelation("dp_cp", FlatShard((2,), 0, 1)),)
 
 
 def test_rank_symmetric_flat_shards_execute_same_collective_with_empty_ranks():
@@ -613,7 +613,7 @@ def test_rank_symmetric_flat_shards_execute_same_collective_with_empty_ranks():
             rank_relations=views[0].storage_relations,
         )
     ]
-    results = TensorMetricExecutor({"dp": world}).run(MeanRowL2NormMetric(), values)
+    results = TensorMetricExecutor({"dp_cp": world}).run(MeanRowL2NormMetric(), values)
 
     torch.testing.assert_close(results[0].tensor, torch.tensor(9.0, device=device))
 

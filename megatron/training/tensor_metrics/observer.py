@@ -327,6 +327,8 @@ class TrainingTensorMetricObserver:
             source_kind: str,
             tensor: torch.Tensor,
             tp_shard_dim: int | None,
+            sequence_dim: int | None,
+            batch_dim: int | None,
         ) -> None:
             """Prepare one forward tensor for every active metric."""
             owner_name = module_names.get(id(owner))
@@ -339,7 +341,9 @@ class TrainingTensorMetricObserver:
             value = MetricTensor(
                 tensor=tensor,
                 sites=(site,),
-                rank_relations=_forward_rank_relations(tp_shard_dim, pg_collection),
+                rank_relations=_forward_rank_relations(
+                    tp_shard_dim, sequence_dim, batch_dim, pg_collection
+                ),
             )
             # Deliberately untimed: Megatron timers synchronize the device when they start and
             # stop, which would serialize the forward-backward pass once per observed tensor. The
@@ -512,23 +516,29 @@ class TrainingTensorMetricObserver:
 
 
 def _forward_rank_relations(
-    tp_shard_dim: int | None, pg_collection: ProcessGroupCollection
+    tp_shard_dim: int | None,
+    sequence_dim: int | None,
+    batch_dim: int | None,
+    pg_collection: ProcessGroupCollection,
 ) -> tuple[RankRelation, ...]:
-    """Describe a forward tensor over tensor, GTP, and data/context parallel ranks."""
+    """Describe a forward tensor over tensor, context, GTP, and data parallel ranks."""
     tp_group = getattr(pg_collection, "tp", None)
+    cp_group = getattr(pg_collection, "cp", None)
     gtp_group = getattr(pg_collection, "gtp_remat", None)
-    dp_cp_group = getattr(pg_collection, "dp_cp", None)
-    if tp_group is None or gtp_group is None or dp_cp_group is None:
-        raise ValueError("Forward tensor metrics require tp, gtp_remat, and dp_cp process groups.")
+    dp_group = getattr(pg_collection, "dp", None)
+    if tp_group is None or cp_group is None or gtp_group is None or dp_group is None:
+        raise ValueError("Forward tensor metrics require tp, cp, gtp_remat, and dp process groups.")
     tp_placement = (
         Shard(tp_shard_dim) if tp_shard_dim is not None and tp_group.size() > 1 else Replica()
     )
-    # Like DP peers, GTP peers execute distinct microbatches even though their activations are not
-    # tensor-dimension shards of one another.
-    gtp_placement = Shard(None) if gtp_group.size() > 1 else Replica()
-    dp_placement = Shard(None) if dp_cp_group.size() > 1 else Replica()
+    # CP, GTP, and DP ranks always carry distinct activation populations. If a source cannot name
+    # their tensor dimension, preserve that fact as Shard(None) rather than calling it a replica.
+    cp_placement = Shard(sequence_dim) if cp_group.size() > 1 else Replica()
+    gtp_placement = Shard(batch_dim) if gtp_group.size() > 1 else Replica()
+    dp_placement = Shard(batch_dim) if dp_group.size() > 1 else Replica()
     return (
         RankRelation("tp", tp_placement),
+        RankRelation("cp", cp_placement),
         RankRelation("gtp", gtp_placement),
         RankRelation("dp", dp_placement),
     )
@@ -570,9 +580,11 @@ def _tensor_metric_process_groups(
         ("tp", "tp"),
         ("expert_tp", "expt_tp"),
         ("ep", "ep"),
+        ("cp", "cp"),
         ("gtp", "gtp_remat"),
         ("expert_gtp", "expt_gtp_remat"),
-        ("dp", "dp_cp"),
+        ("dp", "dp"),
+        ("dp_cp", "dp_cp"),
         ("expert_dp", "expt_dp"),
     ):
         group = getattr(pg_collection, attribute, None)
