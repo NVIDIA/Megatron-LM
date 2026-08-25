@@ -1843,3 +1843,110 @@ def test_build_gtp_group_non_grid_falls_back():
     assert _build_gtp_group(a_group, b_group) is None
     # The (None) result is cached too: no second world collective.
     assert _build_gtp_group(a_group, b_group) is None
+
+
+# ---------------------------------------------------------------------------
+# a2a routing-plan cache: the exchange metadata is a pure function of shapes,
+# homes, pdims and group sizes — rebuilt only when the routed param set
+# changes. Warm (cached) steps must be bitwise identical to cold ones, and the
+# cache must invalidate when a grad goes missing (direct-API case).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["two_stage", "fused"])
+def test_exchange_plan_cache_bitwise_and_reused(fused):
+    _require_four_ranks()
+    tp_group, gtp_remat_group = _get_2d_groups()
+    T = 2
+    r = dist.get_rank()
+    t_rank, g_rank = r % T, r // T
+    fused_group = _build_gtp_group(gtp_remat_group, tp_group) if fused else None
+
+    torch.manual_seed(_SEED + 700)
+    NUM_STEPS = 3
+    # Mixed shapes/pdims to exercise every plan tag (s1f/s2f/s2b/s1b or ff/fb).
+    full_w = [torch.randn(16, 12), torch.randn(8, 16)]
+    pdims = [0, 1]
+    step_grads = [[torch.randn_like(w) for w in full_w] for _ in range(NUM_STEPS)]
+
+    def _shard(t, pd):
+        tp_local = (
+            t[t_rank * (t.shape[0] // T) :][: t.shape[0] // T]
+            if pd == 0
+            else t[:, t_rank * (t.shape[1] // T) :][:, : t.shape[1] // T]
+        )
+        rows = tp_local.shape[0] // 2
+        return tp_local[g_rank * rows : (g_rank + 1) * rows].clone()
+
+    def _build():
+        params = []
+        for w, pd in zip(full_w, pdims):
+            p = _gtp_param(_shard(w, pd))
+            p.partition_dim = pd
+            params.append(p)
+        opt = LayerShardedMuon(
+            params, lr=1e-2, weight_decay=0.0, num_ns_steps=5,
+            fp32_matmul_prec="highest", gtp_remat_group=gtp_remat_group,
+            tp_group=tp_group, fused_group=fused_group,
+        )
+        opt.set_param_ns_homes({id(params[0]): (0, 1), id(params[1]): (1, 0)})
+        return params, opt
+
+    params_a, opt_a = _build()  # warm: plans persist across steps
+    params_b, opt_b = _build()  # cold: plans cleared before every step
+
+    plan_ids = None
+    for step in range(NUM_STEPS):
+        for params, opt, cold in ((params_a, opt_a, False), (params_b, opt_b, True)):
+            for i, p in enumerate(params):
+                p.grad = _shard(step_grads[step][i], pdims[i])
+            if cold:
+                opt._exchange_plans.clear()
+            opt.step()
+        for pa, pb in zip(params_a, params_b):
+            assert torch.equal(pa.data, pb.data), (
+                f"warm/cold divergence at step {step} (fused={fused})"
+            )
+        # The warm optimizer must reuse the SAME plan dicts across steps.
+        current = {
+            tag: id(sub)
+            for tag, sub in opt_a._exchange_plans[0].items()
+            if tag != 'key'
+        }
+        assert current, "no plans were cached"
+        if plan_ids is None:
+            plan_ids = current
+        else:
+            assert current == plan_ids, "plan dicts were rebuilt on a warm step"
+
+
+def test_exchange_plan_rebuilds_when_param_set_changes():
+    """Direct-API: dropping a grad changes the routed param set; the plan must
+    rebuild (not silently reuse stale routing) and the step must complete."""
+    _require_multi_rank()
+    S = dist.get_world_size()
+    r = dist.get_rank()
+    torch.manual_seed(_SEED + 710)
+    full_w = [torch.randn(4 * S, 8) for _ in range(2)]
+
+    def _shard(t):
+        return t[r * 4 : (r + 1) * 4].clone()
+
+    params = [_gtp_param(_shard(w)) for w in full_w]
+    opt = LayerShardedMuon(
+        [{'params': params}], lr=1e-2, weight_decay=0.0, num_ns_steps=5,
+        fp32_matmul_prec="highest", gtp_remat_group=_world(),
+    )
+    opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(params)})
+
+    for p, w in zip(params, full_w):
+        p.grad = _shard(torch.randn_like(w))
+    opt.step()
+    key_both = opt._exchange_plans[0]['key']
+
+    params[1].grad = None  # direct-API caller skips one param this step
+    params[0].grad = _shard(torch.randn_like(full_w[0]))
+    before = params[1].data.clone()
+    opt.step()
+    assert opt._exchange_plans[0]['key'] != key_both, "stale plan reused"
+    assert torch.equal(params[1].data, before), "grad-less param must not move"
