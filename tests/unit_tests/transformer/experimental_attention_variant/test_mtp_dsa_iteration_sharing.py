@@ -19,7 +19,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
 from megatron.core.transformer.multi_token_prediction import (
@@ -31,6 +34,8 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.launch_on_gb200
 
 
 def _make_config(**overrides) -> MLATransformerConfig:
@@ -91,10 +96,6 @@ def _make_config(**overrides) -> MLATransformerConfig:
         ({"mtp_use_repeated_layer": False}, "requires mtp_use_repeated_layer"),
         ({"mtp_num_layers": 1}, "requires mtp_num_layers > 1"),
         (
-            {"recompute_granularity": "selective", "recompute_modules": ["mla_up_proj"]},
-            "not compatible with selective mla_up_proj recompute",
-        ),
-        (
             {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": ["attn"]},
             "does not yet support CUDA graph scopes that capture attention",
         ),
@@ -113,6 +114,59 @@ def test_iteration_sharing_accepts_moe_only_cuda_graph_scope():
     )
 
     assert config.cuda_graph_modules == [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess]
+
+
+def test_iteration_sharing_accepts_selective_mla_up_projection_recompute():
+    config = _make_config(recompute_granularity="selective", recompute_modules=["mla_up_proj"])
+
+    assert config.recompute_modules == ["mla_up_proj"]
+
+
+def test_nonsharing_selective_mla_up_projection_keeps_joint_qk_checkpoint(monkeypatch):
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(1122)
+        config = _make_config(
+            dsa_mtp_index_kv_share=False,
+            recompute_granularity="selective",
+            recompute_modules=["mla_up_proj"],
+        )
+        attention_spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
+        attention = build_module(attention_spec, config=config, layer_number=1).bfloat16().cuda()
+
+        checkpoint_output_arities = []
+        original_checkpoint = CheckpointWithoutOutput.checkpoint
+
+        def observed_checkpoint(checkpoint, run_function, *args):
+            outputs = original_checkpoint(checkpoint, run_function, *args)
+            checkpoint_output_arities.append(
+                1 if isinstance(outputs, torch.Tensor) else len(outputs)
+            )
+            return outputs
+
+        monkeypatch.setattr(CheckpointWithoutOutput, "checkpoint", observed_checkpoint)
+
+        total_tokens = 9
+        hidden_states = torch.randn(
+            total_tokens,
+            1,
+            config.hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
+        )
+        valid = _causal_segment_mask(total_tokens, None, device="cuda")
+        attention_mask = torch.zeros(
+            (1, 1, total_tokens, total_tokens), dtype=torch.float32, device="cuda"
+        ).masked_fill(~valid.view(1, 1, total_tokens, total_tokens), float("-inf"))
+
+        output, _ = attention(hidden_states, attention_mask=attention_mask)
+        output.float().square().mean().backward()
+
+        assert checkpoint_output_arities == [2]
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _rope_positions(total_tokens: int, segment_lengths: list[int] | None, device) -> torch.Tensor:
@@ -328,14 +382,23 @@ def _assert_similarity(left: torch.Tensor, right: torch.Tensor, tolerance: float
 
 
 @pytest.mark.parametrize("segment_lengths", [None, [5, 4]])
-def test_repeated_mtp_dsa_index_and_kv_share_native_parity(monkeypatch, segment_lengths):
+@pytest.mark.parametrize("recompute_up_proj", [False, True])
+def test_repeated_mtp_dsa_index_and_kv_share_native_parity(
+    monkeypatch, segment_lengths, recompute_up_proj
+):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(1234)
         torch.manual_seed(1234)
         torch.cuda.manual_seed(1234)
 
-        config = _make_config()
+        recompute_overrides = {}
+        if recompute_up_proj:
+            recompute_overrides = {
+                "recompute_granularity": "selective",
+                "recompute_modules": ["mla_up_proj"],
+            }
+        config = _make_config(**recompute_overrides)
         attention_spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
         real_attention = (
             build_module(attention_spec, config=config, layer_number=1, is_mtp_layer=True)
@@ -366,6 +429,17 @@ def test_repeated_mtp_dsa_index_and_kv_share_native_parity(monkeypatch, segment_
             )
 
         call_counts = {"q": 0, "kv": 0, "indexer": 0, "sparse": 0}
+        checkpoint_output_arities = []
+        original_checkpoint = CheckpointWithoutOutput.checkpoint
+
+        def observed_checkpoint(checkpoint, run_function, *args):
+            outputs = original_checkpoint(checkpoint, run_function, *args)
+            checkpoint_output_arities.append(
+                1 if isinstance(outputs, torch.Tensor) else len(outputs)
+            )
+            return outputs
+
+        monkeypatch.setattr(CheckpointWithoutOutput, "checkpoint", observed_checkpoint)
         hooks = [
             real_attention.linear_q_down_proj.register_forward_hook(
                 lambda *_args: call_counts.__setitem__("q", call_counts["q"] + 1)
@@ -423,6 +497,7 @@ def test_repeated_mtp_dsa_index_and_kv_share_native_parity(monkeypatch, segment_
             native_outputs.append(native_output)
 
         assert real_shared is not None
+        assert real_shared.key.untyped_storage().nbytes() > 0
         assert torch.equal(real_shared.topk_indices, native_topk)
         for row, indices in enumerate(real_shared.topk_indices[0]):
             indices = indices[indices >= 0]
@@ -445,6 +520,7 @@ def test_repeated_mtp_dsa_index_and_kv_share_native_parity(monkeypatch, segment_
             _assert_similarity(real_parameter.grad, native_parameter.grad)
 
         assert call_counts == {"q": 7, "kv": 1, "indexer": 1, "sparse": 7}
+        assert checkpoint_output_arities == ([1] * 7 if recompute_up_proj else [])
         for hook in hooks:
             hook.remove()
     finally:
@@ -582,7 +658,10 @@ def test_source_indexer_loss_and_gradients_match_unshared_oracle(monkeypatch):
 
 
 @pytest.mark.parametrize("dynamic_cp", [False, True])
-def test_cp2_reuses_global_source_kv_and_topk_with_gradient_flow(monkeypatch, dynamic_cp):
+@pytest.mark.parametrize("recompute_up_proj", [False, True])
+def test_cp2_reuses_global_source_kv_and_topk_with_gradient_flow(
+    monkeypatch, dynamic_cp, recompute_up_proj
+):
     if Utils.world_size < 2:
         pytest.skip("CP2 MTP DSA sharing requires at least two distributed ranks")
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
@@ -591,7 +670,15 @@ def test_cp2_reuses_global_source_kv_and_topk_with_gradient_flow(monkeypatch, dy
         torch.manual_seed(3456 + parallel_state.get_context_parallel_rank())
         torch.cuda.manual_seed(3456 + parallel_state.get_context_parallel_rank())
 
-        config = _make_config(context_parallel_size=2, cp_comm_type="all_gather")
+        recompute_overrides = {}
+        if recompute_up_proj:
+            recompute_overrides = {
+                "recompute_granularity": "selective",
+                "recompute_modules": ["mla_up_proj"],
+            }
+        config = _make_config(
+            context_parallel_size=2, cp_comm_type="all_gather", **recompute_overrides
+        )
         attention_spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
         attention = (
             build_module(
@@ -604,7 +691,13 @@ def test_cp2_reuses_global_source_kv_and_topk_with_gradient_flow(monkeypatch, dy
             .bfloat16()
             .cuda()
         )
-        call_counts = {"kv": 0, "indexer": 0, "sparse": 0}
+        call_counts = {
+            "kv": 0,
+            "indexer": 0,
+            "sparse": 0,
+            "kv_cp_gather": 0,
+            "indexer_cp_gather": 0,
+        }
         hooks = [
             attention.linear_kv_down_proj.register_forward_hook(
                 lambda *_args: call_counts.__setitem__("kv", call_counts["kv"] + 1)
@@ -620,6 +713,17 @@ def test_cp2_reuses_global_source_kv_and_topk_with_gradient_flow(monkeypatch, dy
             return original_sparse_attention(*args, **kwargs)
 
         monkeypatch.setattr(dsa_module, "_run_sparse_attention", counted_sparse_attention)
+        original_gather = dsa_module.gather_from_sequence_parallel_region
+
+        def counted_cp_gather(tensor, group=None, **kwargs):
+            if group is parallel_state.get_context_parallel_group():
+                if tensor.size(-1) == config.kv_lora_rank + config.qk_pos_emb_head_dim:
+                    call_counts["kv_cp_gather"] += 1
+                elif tensor.size(-1) == config.dsa_indexer_head_dim:
+                    call_counts["indexer_cp_gather"] += 1
+            return original_gather(tensor, group=group, **kwargs)
+
+        monkeypatch.setattr(dsa_module, "gather_from_sequence_parallel_region", counted_cp_gather)
 
         local_tokens = 8
         global_tokens = local_tokens * 2
@@ -653,6 +757,8 @@ def test_cp2_reuses_global_source_kv_and_topk_with_gradient_flow(monkeypatch, dy
             mtp_dsa_context=source_context,
         )
         shared = source_context.require_source_tensors()
+        source_key_data_ptr = shared.key.data_ptr()
+        assert shared.key.untyped_storage().nbytes() > 0
         consumer_context = MTPDSAIterationContext(iteration=1, shared_tensors=shared)
         consumer_output, _ = attention(
             consumer_hidden,
@@ -663,13 +769,21 @@ def test_cp2_reuses_global_source_kv_and_topk_with_gradient_flow(monkeypatch, dy
         consumer_output.float().square().mean().backward()
 
         assert shared.key.size(0) == global_tokens
+        assert shared.key.data_ptr() == source_key_data_ptr
+        assert shared.key.untyped_storage().nbytes() > 0
         assert torch.all(shared.topk_indices >= -1)
         assert torch.all(shared.topk_indices < global_tokens)
         assert source_hidden.grad is not None and source_hidden.grad.float().norm() > 0
         assert consumer_hidden.grad is not None and consumer_hidden.grad.float().norm() > 0
         assert torch.isfinite(source_hidden.grad).all()
         assert torch.isfinite(consumer_hidden.grad).all()
-        assert call_counts == {"kv": 1, "indexer": 1, "sparse": 2}
+        assert call_counts == {
+            "kv": 1,
+            "indexer": 1,
+            "sparse": 2,
+            "kv_cp_gather": 1,
+            "indexer_cp_gather": 1,
+        }
         for hook in hooks:
             hook.remove()
     finally:
