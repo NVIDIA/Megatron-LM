@@ -223,6 +223,7 @@ class DataParallelInferenceCoordinator:
         # timestamps (positive int).  Missing entries are implicitly zero.
         self._hash_table: dict[int, dict[int, int]] = {}
         self._hash_assignment_counter = 0
+        self._generation_epoch = None
 
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()

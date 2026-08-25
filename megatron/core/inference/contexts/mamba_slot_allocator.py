@@ -717,17 +717,21 @@ class MambaSlotAllocator:
     # Reset
     # =========================================================================
 
-    def reset(self) -> None:
-        """Reset all state (mappings, free pool, cache, intermediate tracking)."""
+    def invalidate_cache(self) -> None:
+        """Discard durable and pending prefix state without touching GPU storage."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
         torch.arange(self.max_slots, out=self.free_slots)
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
-        self.intermediate_ssm_out.zero_()
-        self.intermediate_conv_out.zero_()
         self._intermediate_offsets_cpu.fill_(0)
         self._intermediate_counts_cpu.fill_(0)
         self._intermediate_block_ids_cpu.fill_(-1)
         self._eos_cache_block_id_cpu.fill_(-1)
         self._has_intermediates = False
+
+    def reset(self) -> None:
+        """Reset all state (mappings, free pool, cache, intermediate tracking)."""
+        self.invalidate_cache()
+        self.intermediate_ssm_out.zero_()
+        self.intermediate_conv_out.zero_()

@@ -3054,6 +3054,53 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    @torch.inference_mode()
+    def _set_generation_epoch(self, generation_epoch: int) -> None:
+        """Apply a model-generation epoch received from the inference client."""
+        if generation_epoch == self._generation_epoch:
+            return
+
+        self.context.kv_block_allocator.invalidate_prefix_cache()
+        if self.context.mamba_slot_allocator is not None:
+            self.context.mamba_slot_allocator.invalidate_cache()
+        self.context.dynamo_helper.notify_kv_cache_cleared()
+        self._generation_epoch = generation_epoch
+
+        # RECOMPUTE suspension deletes tensor attributes, and no request owns live
+        # KV in that state. OFFLOAD and PERSIST retain their bookkeeping tensors.
+        if hasattr(self.context, "request_ids"):
+            context_request_ids = set(
+                self.context.request_ids[: self.context.total_request_count].tolist()
+            )
+            if self.context.chunked_prefill_request_id != -1:
+                context_request_ids.add(self.context.chunked_prefill_request_id)
+        else:
+            context_request_ids = set()
+
+        # Stamp all requests with the new epoch. Each field stores a
+        # sparse list of (start_token_index, epoch) boundaries.
+        for request_id, entry in self.requests.items():
+            request = entry.record[-1]
+            owns_live_kv = request_id in context_request_ids
+            if owns_live_kv and request.enable_prefix_caching:
+                # This request may still own KV computed by the prior model.
+                # Let it finish, but do not publish any more of its blocks for
+                # reuse by requests that start in the new epoch.
+                request.enable_prefix_caching = False
+                request.precomputed_block_hashes = []
+            total = len(request.prompt_tokens) + len(request.generated_tokens)
+            if total > 0:
+                boundary = (total - 1, generation_epoch)
+                never_started = not owns_live_kv and len(entry.record.requests) == 1
+                if request.policy_epoch is None or never_started:
+                    request.policy_epoch = [(0, generation_epoch)]
+                else:
+                    request.policy_epoch.append(boundary)
+                if request.kv_cache_epoch is None or not owns_live_kv:
+                    request.kv_cache_epoch = [(0, generation_epoch)]
+                else:
+                    request.kv_cache_epoch.append(boundary)
+
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
@@ -3204,22 +3251,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._poll_pending_kv_pushes()
 
         if new_generation_epoch is not None:
-            self._generation_epoch = new_generation_epoch
-            # Stamp all active requests with the new epoch.
-            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
-            for entry in self.requests.values():
-                request = entry.record[-1]
-                total = len(request.prompt_tokens) + len(request.generated_tokens)
-                if total > 0:
-                    boundary = (total - 1, new_generation_epoch)
-                    if request.policy_epoch is None:
-                        request.policy_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.policy_epoch.append(boundary)
-                    if request.kv_cache_epoch is None:
-                        request.kv_cache_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.kv_cache_epoch.append(boundary)
+            self._set_generation_epoch(new_generation_epoch)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

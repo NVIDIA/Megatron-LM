@@ -312,6 +312,47 @@ class KVBlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
+    def invalidate_prefix_cache(self) -> None:
+        """Make all cached prefixes undiscoverable without disrupting live requests.
+
+        Evictable blocks are returned to the free pool immediately. Blocks that
+        are still referenced by live requests keep their storage until those
+        requests release them, but their hashes and replay metadata are cleared
+        so a new request cannot reuse state computed by an older model.
+        """
+        if not self.enable_prefix_caching:
+            return
+
+        registered_mask = self.block_hashes != -1
+        registered_ids = torch.nonzero(registered_mask, as_tuple=True)[0]
+        if registered_ids.numel() == 0:
+            return
+
+        registered_ids_list = registered_ids.tolist()
+        registered_hashes = set(self.block_hashes[registered_ids].tolist())
+        self.kv_hash_to_block_id.clear()
+
+        evictable_ids = registered_ids[self.block_ref_counts[registered_ids] == 0]
+        if evictable_ids.numel() > 0:
+            count = evictable_ids.numel()
+            self.block_bag[self.pool_avail : self.pool_avail + count] = evictable_ids
+            self.pool_avail += count
+            routed_ids = set(evictable_ids.tolist()) & self.block_routing.keys()
+            deque(map(self.block_routing.pop, routed_ids), maxlen=0)
+
+        self.block_hashes[registered_ids] = -1
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            self.block_timestamps[registered_ids] = 0
+            self.block_parent_id[registered_ids] = -1
+            self.block_child_count[registered_ids] = 0
+
+        # Preserve the normal deregistration ordering: callbacks observe committed
+        # KV bookkeeping, including during a model-generation epoch change.
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(registered_ids_list, registered_hashes)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(registered_ids_list, registered_hashes)
+
     def register_kv_block_hashes(
         self,
         block_ids: list[int],

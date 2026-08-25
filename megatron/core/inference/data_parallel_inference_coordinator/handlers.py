@@ -239,6 +239,12 @@ def handle_control_signal(coordinator, sender_identity, payload):
     if transition.new_state is not None:
         coordinator.state = transition.new_state
 
+    if header == Headers.SET_GENERATION_EPOCH:
+        generation_epoch = payload[1]
+        if generation_epoch != coordinator._generation_epoch:
+            coordinator._hash_table.clear()
+            coordinator._generation_epoch = generation_epoch
+
     # Broadcast the control signal. Forward the full deserialized payload so
     # that data-bearing signals (e.g. SET_GENERATION_EPOCH) retain their args.
     coordinator._broadcast_to_engines(payload)
