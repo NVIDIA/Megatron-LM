@@ -504,6 +504,26 @@ class TestParallelTransformerBlockCudagraphs:
                 .fwd_graph
             )
 
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_dense_mlp_scope_constructs(self):
+        config = TransformerConfig(
+            num_layers=8,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[CudaGraphModule.mlp],
+        )
+
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+
+        assert block.layers
+        assert all(not layer.is_moe_layer for layer in block.layers)
+        assert all(isinstance(layer.cudagraph_manager, CudaGraphManager) for layer in block.layers)
+
 
 @pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
