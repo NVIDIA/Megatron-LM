@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
@@ -397,6 +398,159 @@ class OffloadTensorGroup:
         self.total_tensor_count += 1
 
 
+class LocalCudaGraphOffloadGroup:
+    """Fixed-address VMM slots for one local-graph activation group."""
+
+    def __init__(self, name: str, min_tensor_size: int):
+        self.name = name
+        self.min_tensor_size = min_tensor_size
+        self.descriptors = []
+        self.allocations = []
+        self.device_tensors = []
+        self.host_tensors = []
+        self.capture_index = 0
+        self.state = "discovering"
+        self.d2h_event = torch.cuda.Event()
+        self.h2d_event = torch.cuda.Event()
+
+    def _eligible(self, tensor):
+        return (
+            torch.is_tensor(tensor)
+            and not isinstance(tensor, torch.nn.Parameter)
+            and tensor.device.type == "musa"
+            and tensor.numel() >= self.min_tensor_size
+            and not _te_do_not_offload(tensor)
+            and not getattr(tensor, "_do_not_offload", False)
+        )
+
+    @staticmethod
+    def _descriptor(tensor):
+        return (
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device,
+        )
+
+    def discover_tensor(self, tensor):
+        """Record an eligible saved-tensor descriptor without changing eager autograd."""
+        if self._eligible(tensor):
+            self.descriptors.append(self._descriptor(tensor))
+        return tensor
+
+    @staticmethod
+    def load_tensor(tensor):
+        """Return the tensor represented by a saved-tensor hook payload."""
+        return tensor
+
+    def allocate(self):
+        """Allocate all fixed-address slots outside graph capture."""
+        from transformer_engine.pytorch.vmm_activation import MUSAActivationVMMAllocation
+
+        assert self.state == "discovering"
+        for shape, stride, dtype, device in self.descriptors:
+            allocation = MUSAActivationVMMAllocation(shape, stride, dtype, device)
+            self.allocations.append(allocation)
+            self.device_tensors.append(allocation.tensor)
+            self.host_tensors.append(
+                torch.empty_strided(shape, stride, dtype=dtype, device="cpu", pin_memory=True)
+            )
+        self.state = "mapped"
+
+    def begin_capture(self):
+        """Reset ordered descriptor consumption before forward graph capture."""
+        assert self.state == "mapped"
+        self.capture_index = 0
+
+    def save_tensor(self, tensor):
+        """Capture a D2D write and save the matching VMM tensor for backward."""
+        if not self._eligible(tensor):
+            return tensor
+        if self.capture_index >= len(self.descriptors):
+            raise RuntimeError(f"{self.name}: capture saved more tensors than discovery")
+        descriptor = self._descriptor(tensor)
+        expected = self.descriptors[self.capture_index]
+        if descriptor != expected:
+            raise RuntimeError(
+                f"{self.name}: activation descriptor drift at slot {self.capture_index}: "
+                f"expected={expected}, actual={descriptor}"
+            )
+        slot_tensor = self.device_tensors[self.capture_index]
+        slot_tensor.copy_(tensor)
+        PipelineOffloadManager._local_graph_debug(
+            f"capture group={self.name} slot={self.capture_index} "
+            f"source={hex(tensor.data_ptr())} vmm_va={hex(slot_tensor.data_ptr())} "
+            f"shape={tuple(tensor.shape)} stride={tuple(tensor.stride())} dtype={tensor.dtype} "
+            f"aligned_bytes={self.allocations[self.capture_index].aligned_bytes}"
+        )
+        self.capture_index += 1
+        return slot_tensor
+
+    def finish_capture(self):
+        """Ensure capture consumed exactly the descriptors discovered during warmup."""
+        if self.capture_index != len(self.descriptors):
+            raise RuntimeError(
+                f"{self.name}: capture consumed {self.capture_index}/{len(self.descriptors)} slots"
+            )
+
+    @property
+    def logical_bytes(self):
+        return sum(tensor.numel() * tensor.element_size() for tensor in self.device_tensors)
+
+    @property
+    def physical_bytes(self):
+        return sum(allocation.aligned_bytes for allocation in self.allocations)
+
+    def offload_and_release(self, d2h_stream, compute_stream):
+        """Copy slots to pinned host buffers, then release their physical backing."""
+        if not self.device_tensors:
+            return
+        if self.state != "mapped":
+            raise RuntimeError(f"{self.name}: cannot offload slots in state {self.state}")
+        d2h_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(d2h_stream):
+            for host_tensor, device_tensor in zip(self.host_tensors, self.device_tensors):
+                host_tensor.copy_(device_tensor, non_blocking=True)
+            self.d2h_event.record(d2h_stream)
+        self.d2h_event.synchronize()
+        before = self._driver_free_memory()
+        for allocation in self.allocations:
+            allocation.unmap_and_release()
+        after = self._driver_free_memory()
+        self.state = "unmapped"
+        PipelineOffloadManager._local_graph_debug(
+            f"release group={self.name} logical_bytes={self.logical_bytes} "
+            f"physical_bytes={self.physical_bytes} driver_free_delta={after - before}"
+        )
+
+    def remap_and_reload(self, h2d_stream, compute_stream):
+        """Remap fresh backing at the fixed VAs and restore slot contents."""
+        if not self.device_tensors:
+            return
+        if self.state != "unmapped":
+            raise RuntimeError(f"{self.name}: cannot reload slots in state {self.state}")
+        before = self._driver_free_memory()
+        for allocation in self.allocations:
+            allocation.create_and_remap()
+        after = self._driver_free_memory()
+        with torch.cuda.stream(h2d_stream):
+            for device_tensor, host_tensor in zip(self.device_tensors, self.host_tensors):
+                device_tensor.copy_(host_tensor, non_blocking=True)
+            self.h2d_event.record(h2d_stream)
+        compute_stream.wait_event(self.h2d_event)
+        self.state = "mapped"
+        PipelineOffloadManager._local_graph_debug(
+            f"remap group={self.name} logical_bytes={self.logical_bytes} "
+            f"physical_bytes={self.physical_bytes} driver_free_delta={after - before}"
+        )
+
+    @staticmethod
+    def _driver_free_memory():
+        from transformer_engine.pytorch.vmm_activation import vmm_driver_memory_info
+
+        return vmm_driver_memory_info()["free_bytes"]
+
+
 class PipelineOffloadManager:
     """
     Singleton manager for coordinating activation offloading across pipeline stages.
@@ -449,6 +603,17 @@ class PipelineOffloadManager:
         # Index of the current forward chunk in the cached chunks forward.
         self._cached_chunks_index_forward = 0
 
+        # Whole-layer local CUDA graph capture records fixed activation slots here. These are
+        # separate from eager chunk state because schedule reset runs before graph creation.
+        self._local_graph_capture_runner = None
+        self._local_graph_mode = None
+        self._local_graph_capture_groups = []
+        self._local_graph_capture_group = None
+        self._local_graph_group_index = 0
+        self._local_graph_saved_tensors_hooks = None
+        self._local_graph_d2h_bytes = 0
+        self._local_graph_h2d_bytes = 0
+
         self.do_offload = True
 
         # Do not offload the last X groups so that the reloading won't block the computing stream.
@@ -488,6 +653,147 @@ class PipelineOffloadManager:
     def cpu_tensor_pool(self):
         """Get the shared CPU tensor pool."""
         return self._cpu_tensor_pool
+
+    @property
+    def in_local_graph_capture(self):
+        """Whether a whole-layer local graph is currently recording activation slots."""
+        return self._local_graph_capture_runner is not None
+
+    @staticmethod
+    def _local_graph_debug(message):
+        if os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_DEBUG") != "1":
+            return
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(f"[local-full-graph-offload] {message}", flush=True)
+
+    @staticmethod
+    def _local_graph_group_bytes(groups):
+        return sum(group.logical_bytes for group in groups)
+
+    def begin_local_graph_discovery(self, runner):
+        """Discover saved activation descriptors during the final eager warmup."""
+        assert not self.in_local_graph_capture, "Nested local graph offload discovery"
+        self._local_graph_capture_runner = runner
+        self._local_graph_mode = "discovery"
+        self._local_graph_capture_groups = []
+        self._local_graph_capture_group = None
+        self._local_graph_group_index = 0
+
+    def end_local_graph_discovery(self, success=True):
+        """Allocate fixed-address slots after descriptor discovery."""
+        runner = self._local_graph_capture_runner
+        if runner is None or self._local_graph_mode != "discovery":
+            return
+        assert self._local_graph_capture_group is None, "Unclosed discovery group"
+        groups = list(self._local_graph_capture_groups)
+        if success:
+            for group in groups:
+                group.allocate()
+            runner.local_graph_offload_groups = groups
+            self._local_graph_debug(
+                f"discovered groups={len(groups)} logical_bytes={self._local_graph_group_bytes(groups)} "
+                f"physical_bytes={sum(group.physical_bytes for group in groups)}"
+            )
+        else:
+            runner.local_graph_offload_groups = []
+        self._local_graph_capture_runner = None
+        self._local_graph_mode = None
+        self._local_graph_capture_groups = []
+        self._local_graph_group_index = 0
+
+    def begin_local_graph_capture(self, runner):
+        """Bind graph capture to slots allocated during descriptor discovery."""
+        assert not self.in_local_graph_capture, "Nested local CUDA graph offload capture"
+        groups = getattr(runner, "local_graph_offload_groups", [])
+        self._local_graph_capture_runner = runner
+        self._local_graph_mode = "capture"
+        self._local_graph_capture_groups = groups
+        self._local_graph_capture_group = None
+        self._local_graph_group_index = 0
+        for group in groups:
+            group.begin_capture()
+
+    def end_local_graph_capture(self, success=True):
+        """Validate capture-time descriptor consumption and retain runner slots."""
+        runner = self._local_graph_capture_runner
+        if runner is None or self._local_graph_mode != "capture":
+            return
+        assert self._local_graph_capture_group is None, "Unclosed local graph offload group"
+        groups = self._local_graph_capture_groups
+        if success:
+            if self._local_graph_group_index != len(groups):
+                raise RuntimeError(
+                    f"local graph capture consumed {self._local_graph_group_index}/{len(groups)} groups"
+                )
+            for group in groups:
+                group.finish_capture()
+            self._local_graph_debug(
+                f"captured groups={len(groups)} bytes={self._local_graph_group_bytes(groups)}"
+            )
+        else:
+            runner.local_graph_offload_groups = []
+        self._local_graph_capture_runner = None
+        self._local_graph_mode = None
+        self._local_graph_capture_groups = []
+        self._local_graph_group_index = 0
+
+    def local_graph_group_start(self, name, min_tensor_size):
+        """Open saved-tensor hooks for one discovery or capture group."""
+        assert self.in_local_graph_capture
+        assert self._local_graph_capture_group is None, "Overlapping local graph offload groups"
+        if self._local_graph_mode == "discovery":
+            group = LocalCudaGraphOffloadGroup(name, min_tensor_size)
+            pack_hook = group.discover_tensor
+        else:
+            if self._local_graph_group_index >= len(self._local_graph_capture_groups):
+                raise RuntimeError(f"capture produced unexpected activation group {name}")
+            group = self._local_graph_capture_groups[self._local_graph_group_index]
+            if group.name != name or group.min_tensor_size != min_tensor_size:
+                raise RuntimeError(
+                    f"local graph activation group drift: expected={group.name}, actual={name}"
+                )
+            pack_hook = group.save_tensor
+        self._local_graph_capture_group = group
+        self._local_graph_saved_tensors_hooks = saved_tensors_hooks(pack_hook, group.load_tensor)
+        self._local_graph_saved_tensors_hooks.__enter__()
+
+    def local_graph_group_context_exit(self):
+        """Close the current group's saved-tensor hooks."""
+        if self._local_graph_saved_tensors_hooks is not None:
+            self._local_graph_saved_tensors_hooks.__exit__(None, None, None)
+            self._local_graph_saved_tensors_hooks = None
+
+    def local_graph_group_commit(self, name):
+        """Commit one ordered discovery or capture group."""
+        group = self._local_graph_capture_group
+        assert group is not None and group.name == name
+        assert self._local_graph_saved_tensors_hooks is None, "Offload context must exit before commit"
+        if self._local_graph_mode == "discovery":
+            self._local_graph_capture_groups.append(group)
+        else:
+            group.finish_capture()
+        self._local_graph_group_index += 1
+        self._local_graph_capture_group = None
+
+    def local_graph_forward_replay(self, runner):
+        """D2H-save and physically release VMM slots after forward graph replay."""
+        compute_stream = torch.cuda.current_stream()
+        groups = getattr(runner, "local_graph_offload_groups", [])
+        for group in groups:
+            group.offload_and_release(self.d2h_stream, compute_stream)
+        step_bytes = self._local_graph_group_bytes(groups)
+        self._local_graph_d2h_bytes += step_bytes
+        self._local_graph_debug(f"d2h bytes={step_bytes} total_d2h={self._local_graph_d2h_bytes}")
+
+    def local_graph_backward_replay(self, runner):
+        """Remap and restore VMM slots before backward graph replay."""
+        compute_stream = torch.cuda.current_stream()
+        groups = getattr(runner, "local_graph_offload_groups", [])
+        for group in reversed(groups):
+            group.remap_and_reload(self.h2d_stream, compute_stream)
+        step_bytes = self._local_graph_group_bytes(groups)
+        self._local_graph_h2d_bytes += step_bytes
+        self._local_graph_debug(f"h2d bytes={step_bytes} total_h2d={self._local_graph_h2d_bytes}")
 
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
@@ -954,7 +1260,7 @@ class ChunkOffloadHandler:
         return (
             not isinstance(tensor, torch.nn.Parameter)
             and not torch_stray_tensor
-            and tensor.device.type == "cuda"
+            and tensor.device.type in ("cuda", "musa")
         )
 
     def tensor_push(self, tensor):
@@ -1047,7 +1353,6 @@ class ChunkOffloadHandler:
                 # Only reload if tensor was offloaded (stored as tuple)
                 if isinstance(state, tuple):
                     recovered_tensor = self.reload(state)
-                    debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                     group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
         self._groups_to_reload.pop()
@@ -1360,18 +1665,29 @@ class FineGrainedActivationOffloadingInterface:
         self.offload = offload
         self.tensor = tensor
         self.name = name
+        self._local_graph_capture = False
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         if self.offload:
-            self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
-            PipelineOffloadManager.get_instance().__enter__()
+            manager = PipelineOffloadManager.get_instance()
+            if manager.in_local_graph_capture:
+                self._local_graph_capture = True
+                min_tensor_size = manager._local_graph_capture_runner.base_module.config.min_offloaded_tensor_size
+                manager.local_graph_group_start(self.name, min_tensor_size)
+            else:
+                self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
+                manager.__enter__()
         return self.tensor
 
     def __exit__(self, *args: Any):
         """Exit context manager to disable activation offloading hooks."""
         if self.offload:
-            PipelineOffloadManager.get_instance().__exit__()
+            manager = PipelineOffloadManager.get_instance()
+            if self._local_graph_capture:
+                manager.local_graph_group_context_exit()
+            else:
+                manager.__exit__()
 
     @staticmethod
     def cuda_graph_stream():
@@ -1412,6 +1728,10 @@ class FineGrainedActivationOffloadingInterface:
     def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
         """Group offload the tensors."""
         if self.offload:
+            manager = PipelineOffloadManager.get_instance()
+            if self._local_graph_capture:
+                manager.local_graph_group_commit(self.name)
+                return tensor
             return fine_grained_offloading_group_offload(
                 tensor, self.name, forced_released_tensors, delay_offload
             )

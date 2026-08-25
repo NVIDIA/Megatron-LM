@@ -2607,25 +2607,19 @@ class TransformerConfig(ModelParallelConfig):
                         "'fused_group_mlp'. "
                         f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
                     )
-                    assert self.cuda_graph_modules, (
-                        "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "is not supported with whole-layer CUDA graph capture."
-                    )
-                local_partial_moe_offload = (
+                local_moe_offload = (
                     self.cuda_graph_impl == "local"
                     and bool(offload_modules)
                     and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
-                    and CudaGraphModule.moe not in self.cuda_graph_modules
                 )
                 assert (
                     self.cuda_graph_impl in ("transformer_engine", "full_iteration")
-                    or local_partial_moe_offload
+                    or local_moe_offload
                 ), (
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
-                    "implementation with partial MoE offload. Local partial CUDA graphs "
-                    "are supported only for expert_fc1, moe_act, or fused_group_mlp "
-                    "offload when the full MoE module is not captured."
+                    "implementation with MoE expert offload (expert_fc1, moe_act, or "
+                    "fused_group_mlp)."
                 )
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
