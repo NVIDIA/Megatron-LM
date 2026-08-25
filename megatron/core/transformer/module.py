@@ -297,6 +297,15 @@ class GraphableMegatronModule(MegatronModule):
         """
         return [self]
 
+    def _uses_local_cudagraph_for_training(self) -> bool:
+        """Return whether this module owns a training-time local CUDA graph.
+
+        Model and block classes also inherit ``GraphableMegatronModule`` for inference graphs.
+        Training graph owners must opt in so their default ``[self]`` scope does not classify an
+        eager model or block subtree as graph-owned.
+        """
+        return False
+
     def _get_additional_cudagraph_parameters(self):
         """Return graph parameters outside the selected graph submodule trees.
 

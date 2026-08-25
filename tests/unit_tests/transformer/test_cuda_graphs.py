@@ -42,6 +42,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudaGraphRunner,
     create_cudagraphs,
     delete_cuda_graphs,
+    get_cuda_graph_param_ids,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -90,6 +91,40 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert len(created_streams) == pool_size
     assert len({stream.cuda_stream for stream in created_streams}) == pool_size
     assert assigned[:pool_size] == assigned[pool_size:]
+
+
+@pytest.mark.parametrize("missing_api", ["getter", "setter"])
+def test_stale_capture_stream_override_is_optional_and_warns_once(monkeypatch, missing_api):
+    warnings = []
+    if missing_api == "getter":
+        monkeypatch.setattr(torch._C, "_override_stale_capture_stream", None)
+    else:
+        monkeypatch.setattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
+    monkeypatch.setattr(cuda_graphs_module, "_STALE_CAPTURE_STREAM_OVERRIDE_WARNING_EMITTED", False)
+    monkeypatch.setattr(cuda_graphs_module.logger, "warning", warnings.append)
+
+    with cuda_graphs_module._override_stale_capture_stream():
+        pass
+    with cuda_graphs_module._override_stale_capture_stream():
+        pass
+
+    assert len(warnings) == 1
+    assert "pytorch/pytorch#180090" in warnings[0]
+
+
+def test_stale_capture_stream_override_restores_state_after_error(monkeypatch):
+    setter_calls = []
+    monkeypatch.setattr(torch._C, "_override_stale_capture_stream", lambda: False)
+    monkeypatch.setattr(
+        torch.autograd.graph, "set_override_stale_capture_stream", setter_calls.append
+    )
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        with cuda_graphs_module._override_stale_capture_stream():
+            assert setter_calls == [True]
+            raise RuntimeError("capture failed")
+
+    assert setter_calls == [True, False]
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -522,6 +557,24 @@ class TestParallelTransformerBlockCudagraphs:
         assert block.layers
         assert all(not layer.is_moe_layer for layer in block.layers)
         assert all(isinstance(layer.cudagraph_manager, CudaGraphManager) for layer in block.layers)
+
+    def test_training_graph_param_discovery_skips_inference_only_block_manager(self):
+        config = TransformerConfig(
+            num_layers=8,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[CudaGraphModule.mlp],
+        )
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+
+        graph_param_ids = get_cuda_graph_param_ids(block)
+        for layer in block.layers:
+            assert {id(param) for param in layer.mlp.parameters()} <= graph_param_ids
+            assert {id(param) for param in layer.self_attention.parameters()}.isdisjoint(
+                graph_param_ids
+            )
 
 
 @pytest.mark.skipif(
@@ -1769,6 +1822,9 @@ class _CheckpointDependencyModule(MegatronModule):
         # Model a visible graph scope that does not own the checkpointed child.
         return (self.projection,)
 
+    def _uses_local_cudagraph_for_training(self):
+        return True
+
     def _get_additional_cudagraph_parameters(self):
         # The recompute closure reaches this child outside the visible projection scope.
         return self.checkpointed.parameters()
@@ -1817,6 +1873,9 @@ class _ScopedCudaGraphModule(MegatronModule):
 
     def _get_submodules_under_cudagraphs(self):
         return tuple(getattr(self, scope.name) for scope in self.config.cuda_graph_modules)
+
+    def _uses_local_cudagraph_for_training(self):
+        return True
 
 
 class _SimpleNonModule:

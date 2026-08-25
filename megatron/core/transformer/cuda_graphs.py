@@ -101,6 +101,7 @@ _IS_GRAPH_WARMUP = False
 _CUDA_GRAPH_STREAM_POOL_SIZE = 3
 _CUDA_GRAPH_STREAM_POOLS = None
 _CUDA_GRAPH_STREAM_NEXT_SLOT = 0
+_STALE_CAPTURE_STREAM_OVERRIDE_WARNING_EMITTED = False
 logger = logging.getLogger(__name__)
 
 
@@ -153,13 +154,28 @@ def _get_cuda_graph_stream() -> torch.cuda.Stream:
 
 @contextmanager
 def _override_stale_capture_stream():
-    """Redirect autograd nodes with stale stream affinity during backward capture."""
-    previous = torch._C._override_stale_capture_stream()
-    torch.autograd.graph.set_override_stale_capture_stream(True)
+    """Redirect stale autograd stream affinity when supported by the PyTorch build."""
+    global _STALE_CAPTURE_STREAM_OVERRIDE_WARNING_EMITTED
+
+    getter = getattr(torch._C, "_override_stale_capture_stream", None)
+    setter = getattr(torch.autograd.graph, "set_override_stale_capture_stream", None)
+    if getter is None or setter is None:
+        if not _STALE_CAPTURE_STREAM_OVERRIDE_WARNING_EMITTED:
+            logger.warning(
+                "PyTorch does not provide the stale capture-stream override; local CUDA graph "
+                "backward capture may fail if an autograd node retains another stream. Upgrade "
+                "to a PyTorch build that includes pytorch/pytorch#180090."
+            )
+            _STALE_CAPTURE_STREAM_OVERRIDE_WARNING_EMITTED = True
+        yield
+        return
+
+    previous = getter()
+    setter(True)
     try:
         yield
     finally:
-        torch.autograd.graph.set_override_stale_capture_stream(previous)
+        setter(previous)
 
 
 def _get_tensor_alias_chain(tensor):
@@ -265,16 +281,23 @@ def get_cuda_graph_capture_stream() -> torch.cuda.Stream | None:
 def get_cuda_graph_param_ids(module: torch.nn.Module) -> set[int]:
     """Return parameter IDs belonging to local CUDA graphs in ``module``.
 
-    Graphable modules describe their visible graph scope through
-    ``_get_submodules_under_cudagraphs``. Parameters reached only through a recomputation or
-    checkpoint closure can be declared separately through
-    ``_get_additional_cudagraph_parameters``.
+    Only modules that opt into training graphs are considered; model and block classes may own
+    inference-only managers. Training graph owners describe their visible scope through
+    ``_get_submodules_under_cudagraphs`` and declare parameters reached only through a
+    recomputation or checkpoint closure through ``_get_additional_cudagraph_parameters``.
     """
     param_ids = set()
     for graph_owner in module.modules():
         config = getattr(graph_owner, "config", None)
+        uses_training_graph = getattr(graph_owner, "_uses_local_cudagraph_for_training", None)
         get_graph_submodules = getattr(graph_owner, "_get_submodules_under_cudagraphs", None)
-        if config is None or config.cuda_graph_impl != "local" or get_graph_submodules is None:
+        if (
+            config is None
+            or config.cuda_graph_impl != "local"
+            or uses_training_graph is None
+            or not uses_training_graph()
+            or get_graph_submodules is None
+        ):
             continue
 
         for graph_submodule in get_graph_submodules():
