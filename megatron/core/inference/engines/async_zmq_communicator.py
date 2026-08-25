@@ -41,11 +41,23 @@ class AsyncZMQCommunicator:
             hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
                 If None, defaults to socket.gethostname().
         """
+        # Normalize None to the default (world) group. get_rank/get_world_size
+        # already treat None this way, but get_process_group_ranks below does
+        # not accept None, so resolve it once here for all three calls.
+        if process_group is None:
+            process_group = dist.group.WORLD
+
         self.rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
         self.is_leader = self.rank == 0
-        # Get the global rank of the leader (first rank in the process group)
-        src_rank = dist.get_process_group_ranks(process_group)[0]
+        # Get the global rank of the leader (first rank in the process group).
+        # `process_group=None` is torch's idiom for the default world group;
+        # its leader is always global rank 0, and dist.get_process_group_ranks
+        # does not accept None.
+        if process_group is None:
+            src_rank = 0
+        else:
+            src_rank = dist.get_process_group_ranks(process_group)[0]
 
         if self.is_leader:
             local_ip = hostname or socket.gethostname()

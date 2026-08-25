@@ -2,12 +2,15 @@
 
 import io
 import pickle
+import threading
 from argparse import Namespace
 from io import BytesIO
 from pathlib import PosixPath
 from signal import Signals
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import numpy
 import torch
 from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
@@ -16,7 +19,12 @@ from numpy.dtypes import UInt32DType
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode, RerunState
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.enums import (
+    AttnBackend,
+    CudaGraphModule,
+    CudaGraphScope,
+    InferenceCudaGraphScope,
+)
 
 SAFE_GLOBALS = [
     SimpleNamespace,
@@ -27,7 +35,9 @@ SAFE_GLOBALS = [
     UInt32DType,
     Namespace,
     AttnBackend,
+    CudaGraphModule,
     CudaGraphScope,
+    InferenceCudaGraphScope,
     ModelType,
     OptimizerConfig,
     RerunDiagnostic,
@@ -37,6 +47,8 @@ SAFE_GLOBALS = [
     Signals,
     torch._C.Generator,  # Needed for torch ckpt format loading after weights_only default change
 ]
+
+_pickle_patch_lock = threading.Lock()
 
 
 def register_safe_globals():
@@ -48,6 +60,18 @@ def register_safe_globals():
 def safe_load_from_bytes(b):
     """Safe version (weights_only=True) of `torch.storage._load_from_bytes`."""
     return torch.load(io.BytesIO(b), weights_only=True)
+
+
+def _safe_pickle_load(file, **kwargs):
+    """Safe version of `pickle.load`."""
+    return SafeUnpickler(file, **kwargs).load()
+
+
+def safe_numpy_load(path, **kwargs):
+    """Safe version of `numpy.load` which calls `pickle.load`."""
+    with _pickle_patch_lock:
+        with patch('pickle.load', _safe_pickle_load):
+            return numpy.load(path, **kwargs)
 
 
 class SafeUnpickler(pickle.Unpickler):
@@ -87,6 +111,9 @@ class SafeUnpickler(pickle.Unpickler):
             ("transformer_engine.common.recipe", "QParams"),
             ("megatron.core.extensions.transformer_engine", "TEDelayedScaling"),
             ("megatron.core.safe_globals", "safe_load_from_bytes"),
+            ("numpy._core.multiarray", "_reconstruct"),
+            ("numpy", "ndarray"),
+            ("numpy", "dtype"),
         }
     )
 
@@ -94,6 +121,5 @@ class SafeUnpickler(pickle.Unpickler):
         if (module, name) not in self._SAFE_CLASSES:
             raise pickle.UnpicklingError(
                 f"Refusing to unpickle disallowed class '{module}.{name}' "
-                "in FP8 extra-state checkpoint."
             )
         return super().find_class(module, name)

@@ -9,14 +9,29 @@ TransformerLayer, MoELayer, TopKRouter, TEGroupedMLP, HybridStack).
 """
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
-import torch.nn as nn
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.utils import split_tensor_along_last_dim
 from megatron.core.transformer.moe.moe_utils import get_capacity, group_limited_topk
+
+
+class _AttributeRestoreHandle:
+    """Small removable-handle adapter for temporary instance attribute patches."""
+
+    def __init__(self, obj, attr_name, original_value):
+        self.obj = obj
+        self.attr_name = attr_name
+        self.original_value = original_value
+        self.removed = False
+
+    def remove(self):
+        """Restore the original instance attribute value."""
+        if not self.removed:
+            setattr(self.obj, self.attr_name, self.original_value)
+            self.removed = True
 
 
 class FlextronMambaElasticityManager:
@@ -44,9 +59,10 @@ class FlextronMambaElasticityManager:
         """Initialize embedding dimension masks."""
         mask_list = []
         for emb_int in self.config.emb_int_list:
-            assert (
-                0 <= emb_int <= self.config.hidden_size
-            ), f'emb_int_list entries must be in [0, hidden_size={self.config.hidden_size}], got {emb_int}.'
+            assert 0 <= emb_int <= self.config.hidden_size, (
+                f'emb_int_list entries must be in [0, hidden_size={self.config.hidden_size}], '
+                f'got {emb_int}.'
+            )
             mask = torch.zeros(self.config.hidden_size, dtype=torch.bool)
             mask[:emb_int] = True
             mask_list.append(mask)
@@ -118,12 +134,14 @@ class FlextronMambaElasticityManager:
 
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         for mamba_int in self.config.mamba_int_list:
-            assert (
-                0 <= mamba_int <= self.mamba_mixer.nheads
-            ), f"mamba_int_list entries must be in [0, nheads={self.mamba_mixer.nheads}], got {mamba_int}."
-            assert (
-                mamba_int % tp_size == 0
-            ), f"mamba_int_list entries must be evenly divisible by tp_size={tp_size}, got {mamba_int}."
+            assert 0 <= mamba_int <= self.mamba_mixer.nheads, (
+                f'mamba_int_list entries must be in [0, nheads={self.mamba_mixer.nheads}], '
+                f'got {mamba_int}.'
+            )
+            assert mamba_int % tp_size == 0, (
+                f'mamba_int_list entries must be evenly divisible by tp_size={tp_size}, '
+                f'got {mamba_int}.'
+            )
             mamba_nhead_idx = mamba_int // tp_size
 
             in_proj_mask = torch.zeros(
@@ -259,20 +277,6 @@ class FlextronMambaElasticityManager:
                     emb_effective_per = emb_choice / self.config.hidden_size
                     xz = xz * router_emb_logits * (emb_effective_per**0.5)
 
-                # Apply mamba router logic (hard mask only)
-                if not self.config.soft_mask:
-                    if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
-                        )
-                        router_mamba_logits = torch.max(self.current_router_mamba[0][mamba_idx])
-                        mamba_per = self.current_router_mamba[1][mamba_idx]
-                    else:
-                        router_mamba_logits, mamba_per = (
-                            torch.max(self.current_router_mamba[0]),
-                            self.current_router_mamba[1],
-                        )
-
                 # Apply mamba masking
                 if self.config.soft_mask:
                     soft_in_proj_mask = torch.zeros_like(self.in_proj_mask_list[0])
@@ -290,24 +294,8 @@ class FlextronMambaElasticityManager:
                         ):
                             soft_in_proj_mask.add_(mask * per_logit)
                     in_proj_mask = soft_in_proj_mask
+                    xz = xz * in_proj_mask.to(device=xz.device)[None, None, :]
                 else:
-                    in_proj_mask = self.in_proj_mask_list[self.mamba_masks_lookup[mamba_per]]
-
-                xz = xz * in_proj_mask.to(device=xz.device)[None, None, :]
-
-                if not self.config.soft_mask:
-                    xz = xz * router_mamba_logits
-
-                # Reset eps to original
-                module.eps = self.config.layernorm_epsilon
-
-                return (xz, bias)
-            return output
-
-        # Hook 4: conv1d output masking
-        def conv1d_mask_hook(module, input, output):
-            if self.config.flextron and self.current_router_mamba is not None:
-                if not self.config.soft_mask:
                     if self.config.flex_hetero_mamba:
                         mamba_idx = (
                             self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
@@ -319,7 +307,18 @@ class FlextronMambaElasticityManager:
                             torch.max(self.current_router_mamba[0]),
                             self.current_router_mamba[1],
                         )
+                    in_proj_mask = self.in_proj_mask_list[self.mamba_masks_lookup[mamba_per]]
+                    xz = xz * in_proj_mask.to(device=xz.device)[None, None, :]
+                    xz = xz * router_mamba_logits
 
+                # Reset eps to original
+                module.eps = self.config.layernorm_epsilon
+
+                return (xz, bias)
+            return output
+
+        def conv1d_output_scale():
+            if self.config.flextron and self.current_router_mamba is not None:
                 # Apply conv1d masking
                 if self.config.soft_mask:
                     soft_conv1d_mask = torch.zeros_like(self.conv1d_mask_list[0])
@@ -336,16 +335,45 @@ class FlextronMambaElasticityManager:
                             self.conv1d_mask_list, self.current_router_mamba[0]
                         ):
                             soft_conv1d_mask.add_(mask * per_logit)
-                    conv1d_mask = soft_conv1d_mask
+                    return soft_conv1d_mask
+
+                if self.config.flex_hetero_mamba:
+                    mamba_idx = (
+                        self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
+                    )
+                    router_mamba_logits = torch.max(self.current_router_mamba[0][mamba_idx])
+                    mamba_per = self.current_router_mamba[1][mamba_idx]
                 else:
-                    conv1d_mask = self.conv1d_mask_list[self.mamba_masks_lookup[mamba_per]]
-                masked_output = output * conv1d_mask.to(device=output.device)[None, :, None]
+                    router_mamba_logits, mamba_per = (
+                        torch.max(self.current_router_mamba[0]),
+                        self.current_router_mamba[1],
+                    )
 
-                if not self.config.soft_mask:
-                    masked_output = masked_output * router_mamba_logits
+                conv1d_mask = self.conv1d_mask_list[self.mamba_masks_lookup[mamba_per]]
+                conv1d_mask = conv1d_mask * router_mamba_logits
+                return conv1d_mask
+            return None
 
-                return masked_output
-            return output
+        original_get_conv1d_weight = mamba_mixer.cp.get_conv1d_weight
+        original_get_conv1d_bias = mamba_mixer.cp.get_conv1d_bias
+
+        def get_masked_conv1d_weight():
+            weight = original_get_conv1d_weight()
+            scale = conv1d_output_scale()
+            if scale is None:
+                return weight
+            scale = mamba_mixer.cp._slice_conv_param(scale)
+            scale = scale.to(device=weight.device, dtype=weight.dtype)
+            return weight * scale[:, None, None]
+
+        def get_masked_conv1d_bias():
+            bias = original_get_conv1d_bias()
+            scale = conv1d_output_scale()
+            if scale is None:
+                return bias
+            scale = mamba_mixer.cp._slice_conv_param(scale)
+            scale = scale.to(device=bias.device, dtype=bias.dtype)
+            return bias * scale
 
         # Hook 5a: RMSNorm pre-hook for eps modification
         def norm_pre_hook(module, input):
@@ -460,9 +488,17 @@ class FlextronMambaElasticityManager:
         self.hook_handles.append(in_proj_pre_handle)
         self.hook_handles.append(in_proj_post_handle)
 
-        # Attach conv1d hook (this will handle the standard conv1d path)
-        conv_handle = mamba_mixer.conv1d.register_forward_hook(conv1d_mask_hook)
-        self.hook_handles.append(conv_handle)
+        # MambaMixer stores conv1d weights as direct parameters and passes them to the fused Mamba
+        # kernels, so there is no nn.Conv1d module to hook. Scaling the retrieved weight and bias
+        # is equivalent to scaling the pre-activation depthwise conv output.
+        mamba_mixer.cp.get_conv1d_weight = get_masked_conv1d_weight
+        mamba_mixer.cp.get_conv1d_bias = get_masked_conv1d_bias
+        self.hook_handles.append(
+            _AttributeRestoreHandle(mamba_mixer.cp, 'get_conv1d_weight', original_get_conv1d_weight)
+        )
+        self.hook_handles.append(
+            _AttributeRestoreHandle(mamba_mixer.cp, 'get_conv1d_bias', original_get_conv1d_bias)
+        )
 
         # Attach RMSNorm hooks if rmsnorm is enabled
         norm_pre_handle = mamba_mixer.norm.register_forward_pre_hook(norm_pre_hook)
@@ -1021,6 +1057,7 @@ class FlextronMoEElasticityManager:
 
 
 class FlextronGroupedMLPElasticityManager:
+    """Manages elasticity hooks for grouped MLP layers."""
 
     def __init__(self, config, layer_idx=0):
         self.config = config
@@ -1739,7 +1776,7 @@ def add_flextron_stack_elasticity(stack, config):
 
 # Convenience function to apply elasticity to all modules in a model
 def apply_flextron_elasticity_to_model(model, config):
-    """Apply elasticity to all MambaMixer, MLP/MoE, and Attention instances in a model based on hybrid pattern."""
+    """Apply elasticity managers to model modules based on the hybrid pattern."""
     managers = []
 
     if not hasattr(config, 'hybrid_layer_pattern') or not config.hybrid_layer_pattern:

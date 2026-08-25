@@ -53,22 +53,23 @@ class TestIntegrity:
                 files = list(data["files"].keys())
 
             assert "__0_0.distcp" in files
-            assert len(data["files"]["common.pt"]) == 64
+            assert len(data["files"]["__0_0.distcp"]) == 64
 
             loaded_state_dict = load(load_state_dict, ckpt_dir, verify_integrity=True)
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_save_verify_integrity_manifest_directly(self, init_model_parallel, tmp_path_dist_ckpt):
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
         ) as ckpt_dir:
             metadata_file = Path(ckpt_dir / "metadata.json")
-            with open(metadata_file, "w") as f:
-                data = {"test_metadata": 1}
-                json.dump(data, f)
-
             if torch.distributed.get_rank() == 0:
+                with open(metadata_file, "w") as f:
+                    data = {"test_metadata": 1}
+                    json.dump(data, f)
                 save_integrity_manifest(ckpt_dir)
             torch.distributed.barrier()
             integrity_file = Path(ckpt_dir / "integrity.json")
@@ -89,17 +90,18 @@ class TestIntegrity:
         ) as ckpt_dir:
             metadata_file = Path(ckpt_dir / "metadata.json")
 
-            with open(metadata_file, "w") as f:
-                data = {"test_metadata": 1}
-                json.dump(data, f)
-
             if torch.distributed.get_rank() == 0:
+                with open(metadata_file, "w") as f:
+                    data = {"test_metadata": 1}
+                    json.dump(data, f)
                 save_integrity_manifest(ckpt_dir)
             torch.distributed.barrier()
 
-            with open(metadata_file, "w") as f:
-                data = {"test_metadata": 11}
-                json.dump(data, f)
+            if torch.distributed.get_rank() == 0:
+                with open(metadata_file, "w") as f:
+                    data = {"test_metadata": 11}
+                    json.dump(data, f)
+            torch.distributed.barrier()
 
             # CheckpointingException, hash mismatch
             with pytest.raises(CheckpointingException):

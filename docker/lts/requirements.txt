@@ -1,0 +1,24 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+# LTS Python dependency pins for Megatron-LM.
+#
+# To bump the LTS pin set:
+#   1. Edit the versions below (or regenerate with `uv pip compile` against a
+#      requirements.in containing the loose specs).
+#   2. Rebuild `docker/Dockerfile.ci.lts` and run the LTS CI lane.
+
+tqdm==4.67.3
+einops==0.8.2                          # was: einops~=0.8
+tensorstore==0.1.84                    # was: tensorstore~=0.1,!=0.1.46,!=0.1.72
+multi-storage-client==0.49.0           # was: multi-storage-client~=0.27
+opentelemetry-api==1.33.1              # was: opentelemetry-api~=1.33.1
+megatron-energon[av_decode]==7.3.2     # was: megatron-energon[av_decode]~=6.0.1
+av==17.0.1
+flashinfer-python==0.6.11.post3        # was: flashinfer-python>=0.5.0,<0.7.0
+wget==3.2
+onnxscript==0.7.0
+fastapi==0.136.3                       # was: fastapi~=0.50 (forces compat with pydantic 2.0)
+datasets==4.8.5
+emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0
+nvidia-resiliency-ext==0.6.0
+zstandard==0.25.0

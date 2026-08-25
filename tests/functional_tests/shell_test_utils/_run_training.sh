@@ -8,6 +8,23 @@
 
 set -euxo pipefail
 
+is_sensitive_env_name() {
+    local name="${1^^}"
+    [[ "$name" == *KEY* || "$name" == *TOKEN* || "$name" == *API* ]]
+}
+
+export_env_assignment() {
+    local key="$1"
+    local value="$2"
+
+    export "$key"="$value"
+    if is_sensitive_env_name "$key"; then
+        printf '%s=<redacted>\n' "$key"
+    else
+        printf '%s=%s\n' "$key" "$value"
+    fi
+}
+
 set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
@@ -15,8 +32,7 @@ for ARGUMENT in "$@"; do
     KEY_LENGTH=${#KEY}
     VALUE="${ARGUMENT:$KEY_LENGTH+1}"
 
-    export "$KEY"="$VALUE"
-    echo "$KEY=$VALUE"
+    export_env_assignment "$KEY" "$VALUE"
 done
 set -x
 
@@ -56,6 +72,7 @@ TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
 set -x
 
 # Pull env vars to export
+set +x
 ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
 while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
@@ -63,9 +80,9 @@ while IFS= read -r ARGUMENT; do
     KEY_LENGTH=${#KEY}
     VALUE="${ARGUMENT:$KEY_LENGTH+1}"
 
-    export "$KEY"="$VALUE"
-    echo "$KEY=$VALUE"
+    export_env_assignment "$KEY" "$VALUE"
 done <<<"$ENV_VARS"
+set -x
 
 # Run before script
 BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.BEFORE_SCRIPT')
@@ -148,9 +165,22 @@ else
     # Split into array while preserving quotes
     eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
     if [[ -n "${SLURM_JOB_END_TIME:-}" && -n "${SLURM_JOB_START_TIME:-}" ]]; then
+        # Leave a buffer before SLURM kills the job so training can exit
+        # gracefully. For normal (long) windows this is window - 15 min. For
+        # short windows (e.g. L0-smoke with a tight --time-limit) a flat 15 min
+        # buffer would go negative and make training exit after a single step,
+        # so fall back to 80% of the window with a 1-minute floor.
+        WINDOW_MIN=$((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60))
+        BUFFER_MIN=15
+        if ((WINDOW_MIN > BUFFER_MIN)); then
+            EXIT_DURATION_MIN=$((WINDOW_MIN - BUFFER_MIN))
+        else
+            EXIT_DURATION_MIN=$((WINDOW_MIN * 4 / 5))
+            ((EXIT_DURATION_MIN < 1)) && EXIT_DURATION_MIN=1
+        fi
         PARAMS=(
             "--exit-duration-in-mins"
-            $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
+            "$EXIT_DURATION_MIN"
         )
     fi
 fi
@@ -160,15 +190,17 @@ PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+set +x
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+set -x
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
 LAST_RANK=$((GPUS_PER_NODE - 1))
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
@@ -214,7 +246,7 @@ fi
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
-fi 
+fi
 
 # Set permissions
 chmod -R g+w $OUTPUT_PATH

@@ -16,6 +16,7 @@ import contextlib
 import inspect
 import logging
 import operator
+import os
 from contextlib import nullcontext
 from functools import reduce
 from importlib.metadata import version
@@ -471,11 +472,7 @@ def safe_get_rank() -> int:
         return torch.distributed.get_rank()
 
     # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        return int(os.environ.get("RANK", 0))
-    except (ValueError, TypeError):
-        # Return rank 0 regardless of the actual rank.
-        return 0
+    return int(os.environ.get("RANK", 0))
 
 
 def log_single_rank(logger_: logging.Logger, level: int, msg: str, *args, rank: int = 0, **kwargs):

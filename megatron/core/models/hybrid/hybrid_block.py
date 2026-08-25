@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -12,10 +13,11 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core.context_parallel import ContextParallelLayoutManager
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -25,9 +27,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -44,6 +47,7 @@ class HybridStackSubmodules:
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    mla_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -87,7 +91,12 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ) -> None:
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
@@ -98,6 +107,8 @@ class HybridStack(MegatronModule):
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp
+        self.cp_group = pg_collection.cp
+        self.tp_cp_group = pg_collection.tp_cp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -108,6 +119,26 @@ class HybridStack(MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
+        self._cp_layout_manager = None
+        if self.cp_group.size() > 1:
+            layer_layouts = tuple(
+                (
+                    self.config.attention_cp_layout
+                    if layer_type in LayerSymbols.ATTENTION_LAYERS
+                    else self.config.linear_cp_layout
+                )
+                for layer_type in self.layer_type_list
+            )
+            self._cp_layout_manager = ContextParallelLayoutManager(
+                layer_layouts=layer_layouts,
+                boundary_layout=self.config.linear_cp_layout,
+                sequence_parallel=self.config.sequence_parallel,
+                cp_group=self.cp_group,
+                tp_group=self.tp_group,
+                tp_cp_group=self.tp_cp_group,
+            )
+        if getattr(self.config, "mla_down_proj_fusion", False):
+            submodules = self._fuse_mla_down_proj(submodules)
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -127,6 +158,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
@@ -137,10 +169,22 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
                         submodules.dsa_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.MLA:
+                    layer = build_module(
+                        submodules.mla_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -155,6 +199,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
@@ -162,20 +207,35 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.GDN:
+                    gdn_layer_spec = submodules.gdn_layer
+                    if self.config.experimental_attention_variant == "gdn2":
+                        # 'G' layers build the GDN2 variant when the gdn2 experimental
+                        # attention variant is selected.
+                        from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
+
+                        gdn_layer_spec = copy.deepcopy(gdn_layer_spec)
+                        gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
                     layer = build_module(
-                        submodules.gdn_layer,
+                        gdn_layer_spec,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
+
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -187,6 +247,26 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+    def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
+        # Avoid modifying the original object so users don't get surprised about their `submodules`
+        # being modified underneath them.
+        submodules = copy.deepcopy(submodules)
+        mla_spec = submodules.mla_layer
+        # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
+        mla_spec.submodules.input_layernorm = IdentityOp
+        mla_spec.submodules.self_attention.module = FusedMLASelfAttention
+        mla_spec.submodules.self_attention.submodules.linear_qkv_down_proj = (
+            TELayerNormColumnParallelLinear
+        )
+        mla_spec.submodules.self_attention.submodules.linear_q_down_proj = None
+        mla_spec.submodules.self_attention.submodules.linear_kv_down_proj = None
+        mla_spec.submodules.sharded_state_dict_keys_map = {
+            "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+        }
+        return submodules
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -200,12 +280,14 @@ class HybridStack(MegatronModule):
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
-        Returns the Mamba conv and ssm states shapes per input sequence
-        if this block contains Mamba layers (this may not be the case with PP > 1).
+        Returns the recurrent mixer's conv and SSM state shapes per input sequence
+        if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
+            if layer_type == LayerSymbols.GDN:
+                return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
     def forward(
@@ -239,6 +321,10 @@ class HybridStack(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_layout_state = None
+        if self._cp_layout_manager is not None:
+            cp_layout_state = self._cp_layout_manager.build_forward_state(packed_seq_params)
+
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
@@ -255,13 +341,7 @@ class HybridStack(MegatronModule):
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
         if (
-            (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context
             and inference_context.is_static_batching()
             and InferenceMode.is_active()
@@ -313,9 +393,15 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    cp_layout_state=cp_layout_state,
                 )
             else:
-                for layer in self.layers:
+                for layer_index, layer in enumerate(self.layers):
+                    layer_packed_seq_params = packed_seq_params
+                    if cp_layout_state is not None:
+                        hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
+                            layer_index, hidden_states
+                        )
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
@@ -328,7 +414,7 @@ class HybridStack(MegatronModule):
                                 inference_context=inference_context,
                                 rotary_pos_emb=rotary_pos_emb,
                                 sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=packed_seq_params,
+                                packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
                             )
                         else:  # MambaLayer, Expert, or MLP
@@ -336,7 +422,7 @@ class HybridStack(MegatronModule):
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
                                 inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
+                                packed_seq_params=layer_packed_seq_params,
                             )
 
                     # The attention layer (currently a simplified transformer layer)
@@ -344,6 +430,8 @@ class HybridStack(MegatronModule):
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+                    if cp_layout_state is not None:
+                        hidden_states = cp_layout_state.finalize_layer(layer_index, hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

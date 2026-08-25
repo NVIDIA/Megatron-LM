@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.moe.router import Router
+from megatron.core.utils import unwrap_model
 
 from .checkpointing import save_grads
-from .utils import unwrap_model
 
 
 def _discover_te_types():

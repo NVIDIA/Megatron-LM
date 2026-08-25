@@ -9,5 +9,5 @@ assignees: ''
 ---
 
 **Your question**
-Ask a clear and concise question about Megatron-LM. Tag the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) 
+Ask a clear and concise question about Megatron-LM. Tag @NVIDIA/mcore-oncall
 to get oncall's attention to this issue.
