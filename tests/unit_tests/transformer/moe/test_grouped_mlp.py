@@ -81,11 +81,50 @@ def test_paged_stash_allows_non_fused_grouped_tensor_hybridep():
         moe_expert_rank_capacity_factor=1.5,
         moe_paged_stash=True,
         use_transformer_engine_op_fuser=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=True,
     )
 
     assert config.moe_paged_stash is True
     assert config.moe_use_grouped_tensor is True
     assert config.use_transformer_engine_op_fuser is False
+
+
+@pytest.mark.parametrize(
+    "invalid_fused_activation_config",
+    [
+        pytest.param({"bias_activation_fusion": False}, id="fusion-disabled"),
+        pytest.param({"gated_linear_unit": False}, id="not-gated"),
+        pytest.param({"activation_func": F.gelu}, id="unsupported-activation"),
+        pytest.param({"moe_mlp_glu_interleave_size": 16}, id="glu-interleaved"),
+    ],
+)
+def test_non_fused_grouped_tensor_paged_stash_requires_fused_bias_activation(
+    invalid_fused_activation_config,
+):
+    kwargs = {
+        "num_layers": 1,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "num_moe_experts": 2,
+        "moe_grouped_gemm": True,
+        "moe_use_grouped_tensor": True,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_expert_rank_capacity_factor": 1.5,
+        "moe_paged_stash": True,
+        "use_transformer_engine_op_fuser": False,
+        "gated_linear_unit": True,
+        "activation_func": F.silu,
+        "bias_activation_fusion": True,
+    }
+    kwargs.update(invalid_fused_activation_config)
+
+    with pytest.raises(
+        ValueError, match="non-op-fuser GroupedTensor path requires fused SwiGLU or QuickGeGLU"
+    ):
+        TransformerConfig(**kwargs)
 
 
 def test_paged_stash_marking_delegates_to_transformer_engine(monkeypatch):
