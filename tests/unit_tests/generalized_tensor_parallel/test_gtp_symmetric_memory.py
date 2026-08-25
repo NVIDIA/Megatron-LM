@@ -115,6 +115,7 @@ class TestTeardownContract:
 
         # Own state is gone: registries empty, free lists dropped.
         assert not gtp_symm._pools and not gtp_symm._registered
+        assert not gtp_symm._registered_modes
         assert not symmetric_wgrad_pool._free
         # Foreign allocations survive teardown untouched.
         torch.cuda.synchronize()
@@ -206,6 +207,27 @@ class TestSymmPoolBackend:
             assert calls == ["nccl_init", "nccl_pool"]
         finally:
             gtp_symm._pools.pop("fallback_group", None)
+
+
+class TestRegisterModes:
+    def test_rejects_empty_and_unknown_modes(self):
+        with pytest.raises(ValueError, match="non-empty subset"):
+            gtp_symm.register_gtp_symm_pool(_StubGroup(size=2), modes=())
+        with pytest.raises(ValueError, match="non-empty subset"):
+            gtp_symm.register_gtp_symm_pool(_StubGroup(size=2), modes=("foo",))
+
+    def test_mode_query_reflects_registration(self):
+        group = _StubGroup(name="mode_query_group")
+        # Fake a live rs-only registration; the query must scope by mode.
+        gtp_symm._registered[group.group_name] = group
+        gtp_symm._registered_modes[group.group_name] = frozenset({"rs"})
+        try:
+            assert gtp_symm.is_gtp_symm_pool_registered(group)
+            assert gtp_symm.is_gtp_symm_pool_registered(group, mode="rs")
+            assert not gtp_symm.is_gtp_symm_pool_registered(group, mode="ag")
+        finally:
+            del gtp_symm._registered[group.group_name]
+            del gtp_symm._registered_modes[group.group_name]
 
 
 class TestRegisteredLIFOPool:
@@ -324,8 +346,8 @@ def _worker_wgrad_split(rank, world_size, port):
     # Patch BOTH consuming namespaces: gtp_module's binding drives the routing decisions;
     # gtp_symm's own drives RegisteredLIFOPool.alloc's pool-vs-plain branch, so LIFO
     # allocations genuinely land in the group's ncclMemAlloc pool.
-    gtp_module.is_gtp_symm_pool_registered = lambda g: g is group
-    gtp_symm.is_gtp_symm_pool_registered = lambda g: g is group
+    gtp_module.is_gtp_symm_pool_registered = lambda g, mode=None: g is group
+    gtp_symm.is_gtp_symm_pool_registered = lambda g, mode=None: g is group
     try:
         # Unpadded symm weight: the GEMM scratch is a view of a registered LIFO parent.
         assert group.group_name not in gtp_symm._pools
@@ -450,7 +472,7 @@ def _worker_symm_backward_numerics(rank, world_size, port):
             layer = _make_gtp_linear(64, 128, group, dtype)
             w = layer.weight
             w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
-            pred = (lambda g: g is group) if symm else saved_pred
+            pred = (lambda g, mode=None: g is group) if symm else saved_pred
             gtp_module.is_gtp_symm_pool_registered = pred
             gtp_symm.is_gtp_symm_pool_registered = pred if symm else saved_symm_pred
             x = inp.clone().requires_grad_(True)
@@ -488,6 +510,9 @@ def _worker_real_pool_registration(rank, world_size, port):
         assert is_gtp_symm_pool_registered(group)
         # Idempotent re-register must not raise or re-issue the warmup.
         register_gtp_symm_pool(group)
+        # Default registration covers both modes.
+        assert is_gtp_symm_pool_registered(group, mode="ag")
+        assert is_gtp_symm_pool_registered(group, mode="rs")
         with gtp_symm_pool_ctx(group):
             src = torch.full((4,), float(rank), device="cuda")
             out = torch.empty(4 * world_size, device="cuda")

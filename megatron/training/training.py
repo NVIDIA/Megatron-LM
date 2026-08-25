@@ -2912,9 +2912,15 @@ def setup_model_and_optimizer(
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(pg_collection, is_expert=False),
+                modes=args.gtp_remat_nccl_ub,
+            )
         if getattr(args, 'gtp_expert_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(pg_collection, is_expert=True),
+                modes=args.gtp_expert_remat_nccl_ub,
+            )
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)

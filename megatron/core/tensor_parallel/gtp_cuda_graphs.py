@@ -274,7 +274,7 @@ def allocate_graph_wgrad_rings(
             "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
             "every param sharing a ring key must share its process group"
         )
-        symm = is_gtp_symm_pool_registered(exemplar.group)
+        symm = is_gtp_symm_pool_registered(exemplar.group, mode="rs")
         for slot_index in range(slot_count):
             with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
                 tensor = torch.empty(
