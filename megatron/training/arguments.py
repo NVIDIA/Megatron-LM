@@ -2813,21 +2813,15 @@ def _add_rl_args(parser):
             '2) torch_memory_saver (when UVM is not enabled; requires torch_memory_saver to be installed).'
         ),
     )
-    group.add_argument(
-        '--refit-method',
-        type=str,
-        default='gloo',
-        choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem', 'nixl'],
-        help=(
-            'Method to refit model weights. '
-            'nccl: use NCCLCopyService; '
-            'nccl_m2n: use the official NCCL M2N API from a non-RL launcher such as the '
-            'ReFIT benchmark; '
-            'gloo: use GlooCopyService over CPU; '
-            'nvshmem: use NVSHMEMCopyService; '
-            'nixl: use NixlCopyService.'
-        ),
-    )
+    group.add_argument('--refit-method', type=str, default='gloo',
+                       choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem', 'nixl'],
+                       help=('Method to refit model weights. '
+                             'nccl: use NCCLCopyService; '
+                             'nccl_m2n: use the official NCCL M2N API from a non-RL '
+                             'launcher such as the ReFIT benchmark; '
+                             'gloo: use GlooCopyService over CPU; '
+                             'nvshmem: use NVSHMEMCopyService; '
+                             'nixl: use NixlCopyService.'))
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
