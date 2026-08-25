@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import datetime
 import logging
 import math
@@ -1144,7 +1145,9 @@ class RerunDataIterator:
             return n
         n = next(self.iterable)
         if get_rerun_state_machine().get_mode() != RerunMode.DISABLED:
-            self.saved_microbatches.append(n)
+            # Shallow-copy so downstream dict-entry mutations do not
+            # corrupt the saved snapshot used for replay.
+            self.saved_microbatches.append(copy.copy(n))
         return n
 
     def rewind(self) -> None:

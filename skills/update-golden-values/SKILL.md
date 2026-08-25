@@ -204,6 +204,6 @@ Triage rules of thumb:
 - The download script's `_fetch_and_filter_artifacts` honors `--only-failing` only on the GitHub path. The Gitlab path applies it per-job inside `download_from_gitlab`.
 - A brand-new golden file (no `git HEAD` baseline) is silently skipped by the comparison script with a warning. Subtract these from the file count when reporting "files with baseline".
 - Steps where `|old|` is below `1e-12` are excluded from the average — division blows up there (think `num-zeros` step 0 on a dense model, or `mem-*` before allocation). If every shared step is excluded for a metric, that `(file, metric)` row is omitted entirely.
-- Some artifacts have a literal string `"nan"` in step 1 of `iteration-time`; the comparison script filters those out, so other steps for that metric still contribute. Don't flag `iteration-time` as a correctness problem unless something else also moved.
+- Functional-test metric collection removes leading `iteration-time` NaNs before artifacts are uploaded. The comparison script filters NaN/inf values at other steps, so other values for that metric still contribute.
 - The script's filename is `compare_golden_values_kl.py` for legacy reasons; it no longer computes KL divergence. The function and CSV column names reflect what it actually does (`avg_rel_diff`).
 - Never commit `GITHUB_TOKEN`, `RO_API_TOKEN`, or any value derived from `gh auth token`. If the user wants you to commit, only stage golden-value files and the optional CSV — not the env or the venv.

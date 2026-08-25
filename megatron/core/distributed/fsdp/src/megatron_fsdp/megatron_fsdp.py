@@ -18,7 +18,7 @@ import logging
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -177,6 +177,12 @@ class MegatronFSDP(torch.nn.Module):
             userbuffer registration when nccl_ub is set.
         enable_fine_grained_param_gather (bool): Whether to enable "fine-grained" param all-gather,
             which can improve performance when using MXFP8 parameters with activation recomputation.
+        enable_fine_grained_param_gather_backward_hook (bool): Register pre-backward unshard hooks
+            on each submodule (used by 1F1B EP overlap and similar schedules).
+        fine_grained_recurse_module_types (Optional[Tuple[Type[nn.Module], ...]]):
+            Module classes for which fine-grained pre-forward / pre-backward unshard uses
+            ``parameters(recurse=True)`` (container modules whose sharded weights live on
+            children). Checked with :func:`isinstance`. Defaults to empty (none).
         report_nan_in_param_grad (bool): Whether to enable precise NaN-checking for parameter wgrad.
             Can significantly degrade performance. Defaults to False.
 
@@ -217,6 +223,7 @@ class MegatronFSDP(torch.nn.Module):
         disable_symmetric_registration: bool = False,
         enable_fine_grained_param_gather_hook: bool = False,
         enable_fine_grained_param_gather_backward_hook: bool = False,
+        fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
         report_nan_in_param_grad: bool = False,
     ):
         super().__init__()
@@ -272,6 +279,8 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_backward_hook = (
             enable_fine_grained_param_gather_backward_hook
         )
+        recurse_types = fine_grained_recurse_module_types or ()
+        self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
@@ -496,10 +505,12 @@ class MegatronFSDP(torch.nn.Module):
             # un-shard of the FSDP params.
             param.__fsdp_param__ = True
             # Transformer Engine accumulates gradient on top of the `main_grad`
-            # buffer when gradient accumulation fusion in enabled. But with FSDP,
-            # we want to overwrite the `main_grad` which is enabled by this
-            # attribute.
-            param.overwrite_main_grad = True
+            # buffer when gradient accumulation fusion in enabled. When sharding
+            # the gradient, we want to overwrite the allocated gradient buffer.
+            param.overwrite_main_grad = self.data_parallel_sharding_strategy in [
+                "optim_grads",
+                "optim_grads_params",
+            ]
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
@@ -545,6 +556,48 @@ class MegatronFSDP(torch.nn.Module):
         shard model parameters.
         """
         fsdp_unit_modules = self.fsdp_unit_modules
+
+        def _param_list_for_submodule_unshard(
+            module: nn.Module, pass_direction: Literal["forward", "backward"]
+        ) -> List[nn.Parameter]:
+            """Build the parameter list for fine-grained or FSDP-unit unshard hooks.
+
+            Parameter buckets designated by this function are all-gathered and may
+            pre-fetch subsequent buckets in FSDP bucket order during runtime.
+            """
+            # Fine-grained hooks are attached to all sub-modules; this function
+            # controls which parameters each hook should unshard.
+            fine_grained_enabled = (
+                self.enable_fine_grained_param_gather_backward_hook
+                if pass_direction == "backward"
+                else self.enable_fine_grained_param_gather_hook
+            )
+            if fine_grained_enabled:
+                # Fine-grained hooks run on every submodule: shallow params by
+                # default, including on FSDP units (e.g. TransformerLayer). Leaf
+                # child hooks gather their own nested weights. Container modules
+                # in fine_grained_recurse_module_types (e.g. TEGroupedMLP,
+                # SharedExpertMLP) need recurse=True because weights live on
+                # children and the container is the compute entry point.
+                if self.fine_grained_recurse_module_types and isinstance(
+                    module, self.fine_grained_recurse_module_types
+                ):
+                    return list(module.parameters(recurse=True))
+                else:
+                    # Only unshard direct parameters. Used when submodules are
+                    # called in isolation of an FSDP-unit forward (e.g. mxfp8
+                    # param gather, EP-overlap 1F1B schedule). Leaf modules
+                    # (e.g. TELinear) still gather their own weights via
+                    # separate hooks. Also limits unshard scope for activation
+                    # recomputation on individual submodules.
+                    return list(module.parameters(recurse=False))
+            else:
+                if isinstance(module, tuple(fsdp_unit_modules)):
+                    # FSDP unit modules should be unsharded and communicated together.
+                    return list(module.parameters())
+                else:
+                    # Non-unit modules should only unshard the direct parameters they need.
+                    return list(module.parameters(recurse=False))
 
         def release_module_parameters(module, bwd, lazy=False, *unused):
             """
@@ -701,13 +754,25 @@ class MegatronFSDP(torch.nn.Module):
             for param in param_list:
                 _grad_acc(param)
 
+            # Only reduce if we are sharding gradients, or are on the final microbatch.
+            # If is_last_microbatch is not specified, then we should reduce gradients
+            # if model_auto_sync is enabled, otherwise wait until is_last_microbatch
+            # is specified by the user, context manager, or FW before reduction.
             grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [
                 "optim_grads",
                 "optim_grads_params",
             ]
             is_last_microbatch = getattr(self, "is_last_microbatch", False)
 
-            if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
+            if grad_reduce_every_bprop or (
+                # "no_shard" and "optim" can have overlapped or non-overlapped
+                # gradient reduction. Non-overlapped gradient reduction happens
+                # in start_grad_sync() or synchronize_gradient_reduce().
+                # Must only happen once on the final microbatch prior to optimization,
+                # or else unsharded gradient buffers will be redundantly reduced.
+                self.ddp_config.overlap_grad_reduce
+                and (is_last_microbatch or self.model_auto_sync)
+            ):
                 # Launch asynchronous reduce-scatter of gradients before the optimizer
                 # step. This requires a later call to finish_grad_sync() to wait for
                 # completion.
@@ -736,16 +801,7 @@ class MegatronFSDP(torch.nn.Module):
             else:
                 module._training_state = TrainingState.FORWARD
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
-                param_list = list(module.parameters())
-            else:
-                # All-gather the shallow parameters in every forward pass for modules
-                # that are not FSDP units. Do not recurse unless absolutely necessary,
-                # to allocate as little memory as possible for this forward pass.
-                param_list = list(module.parameters(recurse=False))
-
-            if self.enable_fine_grained_param_gather_hook:
-                param_list = list(module.parameters(recurse=False))
+            param_list = _param_list_for_submodule_unshard(module, "forward")
 
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
@@ -816,17 +872,24 @@ class MegatronFSDP(torch.nn.Module):
             for param in ordered_params:
                 _grad_acc(param)
 
-            # Reduce the remaining gradients.
-            grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [
-                "optim_grads",
-                "optim_grads_params",
-            ]
             # Only reduce if we are sharding gradients, or are on the final microbatch.
             # If is_last_microbatch is not specified, then we should reduce gradients
             # if model_auto_sync is enabled, otherwise wait until is_last_microbatch
             # is specified by the user, context manager, or FW before reduction.
+            grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [
+                "optim_grads",
+                "optim_grads_params",
+            ]
             is_last_microbatch = getattr(self, "is_last_microbatch", False)
-            if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
+            if grad_reduce_every_bprop or (
+                # "no_shard" and "optim" can have overlapped or non-overlapped
+                # gradient reduction. Non-overlapped gradient reduction happens
+                # in start_grad_sync() or synchronize_gradient_reduce().
+                # Must only happen once on the final microbatch prior to optimization,
+                # or else unsharded gradient buffers will be redundantly reduced.
+                self.ddp_config.overlap_grad_reduce
+                and (is_last_microbatch or self.model_auto_sync)
+            ):
                 self.grad_reduce_pipeline.reduce_gradients(
                     ordered_params,
                     suggested_queue_capacity=self.suggested_RS_queue_capacity,
@@ -861,10 +924,7 @@ class MegatronFSDP(torch.nn.Module):
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.PRE_BACKWARD
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
-                param_list = list(module.parameters())
-            else:
-                param_list = list(module.parameters(recurse=False))
+            param_list = _param_list_for_submodule_unshard(module, "backward")
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
@@ -915,6 +975,8 @@ class MegatronFSDP(torch.nn.Module):
 
         @torch.compiler.disable
         def _post_forward(module: nn.Module, input: Any, output: Any):
+            assert self.data_parallel_sharding_strategy == "optim_grads_params"
+
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
             # after the forward pass. In this case, the resharding is performed lazily.
@@ -1026,12 +1088,15 @@ class MegatronFSDP(torch.nn.Module):
 
             if isinstance(module, tuple(fsdp_unit_modules)):
                 fsdp_modules.append(module)
-                # Register the forward post-hook to reshard FSDP unit module parameters
-                # after the forward pass, except when recomputing forward activations,
-                # in which case we skip resharding for the subsequent backward pass.
-                self.forward_hooks[f"release module {name} parameters"] = (
-                    module.register_forward_hook(_post_forward, prepend=False)
-                )
+
+                if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                    # Register the forward post-hook to reshard FSDP unit module parameters
+                    # after the forward pass, except when recomputing forward activations,
+                    # in which case we skip resharding for the subsequent backward pass.
+                    # Only relevant when using ZeRO-3 / FSDP.
+                    self.forward_hooks[f"release module {name} parameters"] = (
+                        module.register_forward_hook(_post_forward, prepend=False)
+                    )
 
                 _register_pre_backward_param_unshard_hook(module)
             elif (
@@ -1291,7 +1356,14 @@ class MegatronFSDP(torch.nn.Module):
             self.grad_reduce_pipeline.wait_for_previous_grad_reduce(0)
             self.grad_reduce_pipeline.reset()
         else:
-            # Synchronous gradient all-reduce when sharding optimizer state or not sharding.
+            assert self.data_parallel_sharding_strategy not in [
+                "optim_grads",
+                "optim_grads_params",
+            ], (
+                "Cannot sync-reduce gradients for optim_grads / optim_grads_params!"
+                "Ensure that overlap_grad_reduce=True for ZeRO-2 and ZeRO-3."
+            )
+            # Synchronous gradient reduction when sharding optimizer state or not sharding.
             self.start_grad_sync()
 
     def attach_grad_to_optimizer_state(self):
@@ -1448,7 +1520,7 @@ class MegatronFSDP(torch.nn.Module):
         self._replace_param_with_raw_if_needed()
         with torch.autograd.profiler.record_function("CustomFSDP.forward"):
             # Call the forward pass of the wrapped module.
-            output = self.module.forward(*inputs, **kwargs)
+            output = self.module(*inputs, **kwargs)
             return output
 
 

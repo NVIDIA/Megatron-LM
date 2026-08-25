@@ -4,7 +4,7 @@ description: CI/CD reference for Megatron-LM. Covers CI pipeline structure, PR s
 license: Apache-2.0
 when_to_use: Investigating a CI failure; understanding the pipeline structure; which CI label to attach; triggering internal GitLab CI; 'CI is red', 'how do I trigger CI', 'PR labels', 'where are the logs', 'pull-request branch'.
 metadata:
-  author: Philip Petrakian <ppetrakian@nvidia.com>
+  author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # CI/CD Guide
@@ -19,8 +19,11 @@ For PR-label or trigger questions, lead with the exact values:
 - `Run tests`: `scope=mr-github`, `n_repeat=1`, `lightweight=true`.
 - `Run functional tests`: `scope=mr-github`, `n_repeat=5`, `lightweight=false`.
 - `container::lts` only switches the container image path to LTS and combines
-  with any scope label.
+  with any scope label. **Opt-in only — attach it solely when the user
+  explicitly asks for LTS validation; never add it on your own initiative, even
+  for a container or dependency change.**
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
+- `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
   `pull-request/<branch>`. Always run with `--dry-run` first and confirm the
@@ -74,8 +77,9 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 | Label | Effect |
 |-------|--------|
-| **`container::lts`** | Use the LTS base image instead of `dev` (combinable with any scope label) |
+| **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
+| **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite |
 
 ### Which label to attach when opening a PR
 
@@ -88,8 +92,9 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | **Re-enabling a disabled test** (scope `-broken` → active) | `Run functional tests` |
 | Non-numerical library code (logging, error handling, CLI flags, refactors) | `Run tests` |
 | Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
-| Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` + `container::lts` |
+| Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` (add `container::lts` **only if the user explicitly asks** to validate LTS) |
 | Touches MBridge integration | add `Run MBridge tests` |
+| Could affect NeMo RL's Megatron integration | add `Run NeMoRL tests` |
 
 **Rule of thumb:** default to `Run tests`. Always use `Run functional tests` when the PR adds new test cases (golden values must be generated) or when the change could plausibly shift loss curves.
 

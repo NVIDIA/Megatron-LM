@@ -1,12 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
+from argparse import Namespace
 from datetime import timedelta
+from typing import Literal
 
 import torch
 from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 
 
 class TestModel(torch.nn.Module):
@@ -36,7 +43,11 @@ def clear_nvte_env_vars():
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    rank = int(os.environ.get('LOCAL_RANK', '0'))
+    # Global rank, which LOCAL_RANK only matches when the launch is confined to one
+    # node. Reading LOCAL_RANK here makes every node claim ranks 0..local_size-1 of
+    # the rendezvous, so multi-node runs hang on duplicate check-ins.
+    rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
     store = None
 
@@ -52,10 +63,10 @@ class Utils:
                 f'Initializing torch.distributed with rank: {Utils.rank}, '
                 f'world_size: {Utils.world_size}'
             )
-            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+            torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
             init_method = 'tcp://'
             master_ip = os.getenv('MASTER_ADDR', 'localhost')
-            master_port = os.getenv('MASTER_PORT', '6000')
+            master_port = os.getenv('MASTER_PORT', '29500')
             init_method += master_ip + ':' + master_port
             rendezvous_iterator = rendezvous(
                 init_method, Utils.rank, Utils.world_size, timeout=timedelta(minutes=1)
@@ -85,7 +96,7 @@ class Utils:
             torch.distributed.destroy_process_group()
 
         if rank is None:
-            Utils.rank = int(os.environ['LOCAL_RANK'])
+            Utils.rank = int(os.environ.get('RANK', os.environ['LOCAL_RANK']))
             if Utils.rank >= Utils.world_size:
                 Utils.rank = -1
         else:
@@ -133,6 +144,19 @@ class Utils:
             **kwargs,
         )
         Utils.inited = True
+
+    @staticmethod
+    def pretrain_config_from_global_args(args: Namespace, model_class: Literal["gpt", "hybrid"]):
+        if model_class == "gpt":
+            model_cfg = gpt_config_from_args(args)
+        elif model_class == "hybrid":
+            model_cfg = hybrid_config_from_args(args)
+        else:
+            raise ValueError(
+                f"MCore model type {model_class} not supported. Choose one of 'gpt' or 'hybrid'."
+            )
+
+        return pretrain_cfg_container_from_args(args, model_cfg)
 
     @staticmethod
     def fake_initialize_model_parallel(

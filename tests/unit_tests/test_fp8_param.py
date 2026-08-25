@@ -16,6 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -25,7 +26,7 @@ from megatron.training.global_vars import (
     set_args,
     set_global_variables,
 )
-from megatron.training.training import get_model, setup_model_and_optimizer
+from megatron.training.training import force_param_sync, get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -97,7 +98,7 @@ class TestFP8Param:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocal_size,
+            vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -125,7 +126,7 @@ class TestFP8Param:
         sys.argv = ['test_fp8_param.py']
         args = parse_args()
         args.num_layers = 4
-        args.vocal_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -222,6 +223,9 @@ class TestFP8Param:
         **kwargs,
     ):
         """Test fp8_param with a small GPT model."""
+        # Test-only knob: not a model arg, so pop before create_test_args (which asserts every
+        # kwarg is a real arg attribute).
+        save_at_steps_kw = kwargs.pop("save_at_steps", ())
         args = self.create_test_args(
             tp_size,
             recipe,
@@ -243,20 +247,32 @@ class TestFP8Param:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             expert_model_parallel_size=args.expert_model_parallel_size,
+            # Enable GTP weight-remat when the test requested it (default 1 => no GTP, so
+            # non-GTP fp8 tests are unaffected).
+            gtp_remat_size=getattr(args, "gtp_weight_remat_size", 1),
         )
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:
-            gpt_model = get_model(
-                self.model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False
+            model_cfg = cfg_container.model
+            builder_cls = model_cfg.get_builder_cls()
+            builder = builder_cls(model_cfg)
+            gpt_model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
             )
             gpt_model[0].eval()
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder,
+                self.model_provider,
+                cfg_container=cfg_container,
+                pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -322,10 +338,26 @@ class TestFP8Param:
         loss_list = []
         eval_loss_list = []
 
+        # Optional: generate the sharded_state_dict (the checkpoint-save metadata path) at these
+        # steps to catch save side-effects on the live weights — a correct save must not perturb
+        # the subsequent training step (regression guard for GTP native-FP8 save corruption).
+        save_at_steps = set(save_at_steps_kw or ())
+
         for i in range(100):
             if not inference:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
+
+            if i in save_at_steps:
+                # Mirror production save_checkpoint_and_time: when the forward pre-hook is disabled
+                # for the save, a forced param-sync runs first. Passing the optimizer makes it copy
+                # the FP32 masters into the param buffer before the copy-back re-quantizes, so
+                # native-FP8 GTP shards are refreshed from masters (not stale grad scratch).
+                # Exercise it so the save-perturbation test is a real regression test for the
+                # post-save loss spike.
+                if should_disable_forward_pre_hook(args):
+                    force_param_sync(gpt_model, optimizer=optimizer)
+                _ = gpt_model[0].sharded_state_dict()
 
             # Capture CUDA graphs after warmup if helper is provided.
             # Hard coded cuda_graph_warmup_steps = 0.

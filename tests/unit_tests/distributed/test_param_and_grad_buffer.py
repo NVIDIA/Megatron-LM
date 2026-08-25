@@ -78,12 +78,19 @@ def get_model_and_buffers(
     # Wrap with DistributedDataParallel, and get underlying buffer.
     # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
     # errors for num_attention_heads and num_layers.
-    # Pre-compute parameter layouts for the distributed optimizer.
+    # Pre-compute parameter layouts for the distributed optimizer. Size the layout by the group
+    # the optimizer shards over, which is the intra-instance group when there are several
+    # optimizer instances. This is the same group DDP hands to the buffer below.
     full_param_layout = None
     if use_distributed_optimizer:
         all_params = [p for p in model.parameters() if p.requires_grad]
         full_param_layout = DistributedOptimizer.compute_full_param_layout(
-            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+            all_params,
+            bucket_size,
+            parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
+            ddp_config,
         )
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1),
@@ -789,7 +796,9 @@ class TestNVFP4IndexMaps:
                 'megatron.core.distributed.param_and_grad_buffer.get_nvfp4_rowwise_packed_shape',
                 side_effect=mock_packed_shape,
             ),
-            mock.patch('megatron.core.fp4_utils.modify_nvfp4_rowwise_storage'),
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.modify_nvfp4_rowwise_storage'
+            ),
             mock.patch('torch.cuda.current_device', return_value='cpu'),
             mock.patch(
                 'megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage'
@@ -934,6 +943,55 @@ class TestNVFP4IndexMaps:
         assert buffer.param_index_map[params[0]] == (small_unpacked_start, small_unpacked_end, 0)
 
 
+@pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
+def test_optimizer_shards_cover_every_param(num_distributed_optimizer_instances: int):
+    """Every parameter must be owned by exactly one rank of the buffer's data-parallel group.
+
+    ``DistributedOptimizer._build_model_gbuf_range`` splits each bucket into N shards and gives
+    rank ``r`` the r-th one, while the reduce-scatter/all-gather runs over the buffer's
+    ``data_parallel_group``. N must therefore equal that group's size. If N is larger (e.g. taken
+    from a layout sized by the full DP world while the group is intra-optimizer-instance), the
+    trailing shards belong to no rank: those params are never updated by the optimizer and vanish
+    from grad-norm, num-zeros and params-norm, which are summed over owned shards only.
+    """
+    Utils.initialize_model_parallel(
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances
+    )
+
+    _, param_and_grad_buffer, _ = get_model_and_buffers(
+        input_dim=100,
+        output_dim=100,
+        num_layers=2,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=None,
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=False,
+        average_in_collective=False,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+    )
+
+    # Sum the parameter elements this rank owns across every bucket.
+    owned_numel = 0
+    for bucket_index in range(len(param_and_grad_buffer.buckets)):
+        param_map = DistributedOptimizer._build_model_gbuf_range(
+            param_and_grad_buffer, bucket_index
+        )["param_map"]
+        for param_ranges in param_map.values():
+            owned_numel += param_ranges["param"].size
+
+    owned_total = torch.tensor([owned_numel], dtype=torch.long, device='cuda')
+    torch.distributed.all_reduce(owned_total, group=param_and_grad_buffer.data_parallel_group)
+
+    expected_numel = sum(param.numel() for param in param_and_grad_buffer.params)
+    assert owned_total.item() == expected_numel, (
+        f"Optimizer shards cover {owned_total.item()} of {expected_numel} param elements; "
+        f"{expected_numel - owned_total.item()} elements are owned by no rank"
+    )
+
+    Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: bool):
     """Verify that expert-parallel params (allreduce=False) land in separate buffers
@@ -965,7 +1023,12 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
     if use_distributed_optimizer:
         all_params = [p for p in model.parameters() if p.requires_grad]
         full_param_layout = DistributedOptimizer.compute_full_param_layout(
-            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+            all_params,
+            bucket_size,
+            parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
+            ddp_config,
         )
 
     ddp_model = DistributedDataParallel(

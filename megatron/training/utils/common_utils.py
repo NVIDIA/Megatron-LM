@@ -5,18 +5,17 @@ import json
 import os
 import sys
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
-from collections import defaultdict
 from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-
 from megatron.core._slurm_utils import resolve_slurm_local_rank
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -36,17 +35,46 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_data_parallel_group_if_dtensor,
+    get_pg_rank,
     to_local_if_dtensor,
     unwrap_model,
 )
+from megatron.training import get_adlr_autoresume, get_args, get_timers
 
-from megatron.core.transformer.module import param_is_not_shared
+
+
+def _compute_norm_2(params_list):
+    """Compute squared L2 norm of a list of tensors. Returns a CUDA scalar."""
+    if len(params_list) > 0:
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm, dummy_overflow_buf, [params_list], False,
+        )
+        return norm * norm
+    return torch.zeros((1,), dtype=torch.float32, device='cuda')
+
+
+def _get_param_data(param, force_create_fp32_copy, bf16):
+    """Extract the appropriate data tensor from a param for norm computation.
+
+    Returns (data_tensor, is_sharded) where is_sharded indicates the param has
+    a sharded main_param from the distributed optimizer.
+    """
+    if bf16:
+        if not force_create_fp32_copy and hasattr(param, 'main_param'):
+            if getattr(param, 'main_param_sharded', False):
+                if param.main_param is not None:
+                    return param.main_param, True
+                return None, True
+            return param.main_param, False
+        return param.data.float(), False
+    return param.data, False
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -71,129 +99,116 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
         return calc_dtensor_params_l2_norm(params)
 
-    # Seperate moe and dense params
-    params_data = []
-    moe_params_data = []
-    sharded_params_data = []
-    data_parallel_group = None
+    # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
+    # Each category needs different reduction groups.
+    params_data = []                # Dense, non-sharded
+    sharded_params_data = []        # Dense, sharded → reduce over dp_cp
+    gtp_params_data = []            # GTP_remat, non-sharded
+    gtp_sharded_params_data = []    # GTP_remat, sharded → reduce over dp_cp
+    moe_params_data = []            # MoE, non-sharded
+    moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
+    moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
+    moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
+
+    gtp_rank = mpu.get_gtp_weight_remat_rank()
+    egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
+    tp_group = mpu.get_tensor_model_parallel_group()
+    expert_tp_group = mpu.get_expert_tensor_parallel_group()
 
     for model_chunk in model:
         for param in model_chunk.parameters():
-            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if not is_not_tp_duplicate:
+            is_gtp = getattr(param, 'is_gtp_weight_remat', False)
+
+            # Filter TP duplicates. GTP_remat params are always unique across TP ranks
+            # so skip this check for them.
+            if not is_gtp and not param_is_not_tensor_parallel_duplicate(
+                param, tp_group=tp_group, expert_tp_group=expert_tp_group
+            ):
                 continue
-            assert is_not_tp_duplicate
-            if not getattr(param, 'allreduce', True):
+            is_expert = not getattr(param, 'allreduce', True)
+
+            # Filter GTP_remat duplicates: non-GTP_remat params replicate across GTP_remat ranks.
+            if is_expert:
+                if not is_gtp and egtp_rank != 0:
+                    continue
+            else:
+                if not is_gtp and gtp_rank != 0:
+                    continue
+
+            # Route to the correct bucket.
+            if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                if args.bf16:
-                    if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                        if getattr(param, 'main_param_sharded', False):
-                            if param.main_param is not None:
-                                sharded_params_data.append(param.main_param)
-                        else:
-                            moe_params_data.append(param.main_param)
-                    else:
-                        # Fallback to original logic of making a fp32 copy of the
-                        # parameter if `.main_param` attribute is not available.
-                        moe_params_data.append(param.data.float())
+                data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                if data is None:
+                    continue
+                if is_gtp:
+                    (moe_gtp_sharded_params_data if is_sharded else moe_gtp_params_data).append(data)
                 else:
-                    moe_params_data.append(param.data)
+                    (moe_sharded_params_data if is_sharded else moe_params_data).append(data)
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
-                    if args.bf16:
-                        if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                            if getattr(param, 'main_param_sharded', False):
-                                if param.main_param is not None:
-                                    sharded_params_data.append(param.main_param)
-                            else:
-                                params_data.append(param.main_param)
-                        else:
-                            # Fallback to original logic of making a fp32 copy of the
-                            # parameter if `.main_param` attribute is not available.
-                            params_data.append(param.data.float())
+                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                    if data is None:
+                        continue
+                    if is_gtp:
+                        (gtp_sharded_params_data if is_sharded else gtp_params_data).append(data)
                     else:
-                        params_data.append(param.data)
+                        (sharded_params_data if is_sharded else params_data).append(data)
 
-    # Calculate norm.
-    dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-    if len(params_data) > 0:
-        norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm, dummy_overflow_buf, [params_data], False  # no per-parameter norm.
-        )
-        norm_2 = norm * norm
-    else:
-        norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    # --- Compute local norm^2 for each bucket ---
+    params_norm_2 = _compute_norm_2(params_data)
+    sharded_norm_2 = _compute_norm_2(sharded_params_data)
+    gtp_norm_2 = _compute_norm_2(gtp_params_data)
+    gtp_sharded_norm_2 = _compute_norm_2(gtp_sharded_params_data)
+    moe_norm_2 = _compute_norm_2(moe_params_data)
+    moe_sharded_norm_2 = _compute_norm_2(moe_sharded_params_data)
+    moe_gtp_norm_2 = _compute_norm_2(moe_gtp_params_data)
+    moe_gtp_sharded_norm_2 = _compute_norm_2(moe_gtp_sharded_params_data)
 
-    if data_parallel_group is not None:
-        torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
-        )
+    def _sum_reduce(tensor, group):
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=group)
 
-    # Add norm contribution from params with sharded main_params. These norms need to be
-    # accumulated across the DP group since the main parameters are sharded because
-    # of distributed optimizer.
-    if len(sharded_params_data) > 0:
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-        sharded_norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm,
-            dummy_overflow_buf,
-            [sharded_params_data],
-            False,  # no per-parameter norm.
-        )
-        sharded_norm_2 = sharded_norm * sharded_norm
-    else:
-        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
-    # Sum over all DP groups, including CP since distributed optimizer state is
-    # sharded jointly over DP+CP.
-    torch.distributed.all_reduce(
+    # --- Sharded optimizer DP reductions (each category uses its own group) ---
+    # Reduce over the gtp_remat-EXCLUDED replicate group (with_gtp_remat=False): the model-parallel
+    # reduce below already spans the gtp_remat axis, so a gtp_remat-inclusive group here would
+    # over-count by gtp_remat. No-op for non-GTP_remat runs.
+    _sum_reduce(
         sharded_norm_2,
-        op=torch.distributed.ReduceOp.SUM,
-        group=mpu.get_data_parallel_group(with_context_parallel=True)
+        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
     )
-    norm_2 += sharded_norm_2
+    _sum_reduce(
+        gtp_sharded_norm_2,
+        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
+    )
+    _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
+    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
 
-    # Add norm contribution from expert layers in MoEs.
-    if len(moe_params_data) > 0:
-        moe_norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm,
-            dummy_overflow_buf,
-            [moe_params_data],
-            False,  # no per-parameter norm.
-        )
-        moe_norm_2 = moe_norm * moe_norm
+    # --- Combine dense + GTP_remat norms ---
+    # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
+    norm_2 = params_norm_2 + sharded_norm_2 + gtp_norm_2 + gtp_sharded_norm_2
 
-    # Account for MoE norm even if current rank doesn't have any expert params to prevent
-    # hang in models with un-even numbers of MoE layers.
-    # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
-    else:
-        moe_norm_2 = torch.zeros_like(norm_2)
+    # --- Combine MoE + MoE-GTP_remat norms ---
+    # expert_model_parallel = TP×EP×PP (does NOT include EGTP_remat), so we need
+    # an explicit EGTP_remat reduction for MoE-GTP_remat before the model-parallel reduce.
+    moe_gtp_combined_norm_2 = moe_gtp_norm_2 + moe_gtp_sharded_norm_2
+    _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_gtp_weight_remat_group())
+    moe_total_norm_2 = moe_norm_2 + moe_sharded_norm_2 + moe_gtp_combined_norm_2
 
-    # Reduce norm across model parallel groups (dense and expert).
-    # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
+    # --- Model-parallel reductions ---
     dense_reduce_group = mpu.get_model_parallel_group()
-    ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
-    # Expert params should sum across all model-parallel GPUs (expert + tensor + pipeline).
     expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+    ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
     ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
 
-    # If dense and expert reduce groups are the same, sum then reduce.
     if ranks_in_dense_reduce_group == ranks_in_expert_reduce_group:
-        norm_2 += moe_norm_2
-        torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=dense_reduce_group
-        )
-    # If dense and expert reduce groups are different, reduce then sum.
+        norm_2 += moe_total_norm_2
+        _sum_reduce(norm_2, dense_reduce_group)
     else:
-        torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=dense_reduce_group
-        )
-        torch.distributed.all_reduce(
-            moe_norm_2, op=torch.distributed.ReduceOp.SUM, group=expert_reduce_group
-        )
-        norm_2 += moe_norm_2
+        _sum_reduce(norm_2, dense_reduce_group)
+        _sum_reduce(moe_total_norm_2, expert_reduce_group)
+        norm_2 += moe_total_norm_2
 
     return norm_2.item() ** 0.5
 
@@ -295,8 +310,12 @@ def logical_and_across_model_parallel_group(
     return bool(input.item())
 
 
-def report_memory(name):
-    """Simple GPU memory report."""
+def report_memory(name, process_group=None):
+    """Simple GPU memory report.
+
+    process_group: optional data-parallel group to gate the rank-0 print on; None falls back
+        to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
+    """
     args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
@@ -306,7 +325,12 @@ def report_memory(name):
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
     if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
-    if mpu.get_data_parallel_rank() == 0:
+    is_dp_rank_0 = (
+        get_pg_rank(process_group) == 0
+        if process_group is not None
+        else mpu.get_data_parallel_rank() == 0
+    )
+    if is_dp_rank_0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
 
@@ -353,20 +377,44 @@ def get_ltor_masks_and_position_ids(data,
                                     reset_position_ids,
                                     reset_attention_mask,
                                     eod_mask_loss,
-                                    pad_mask_loss):
-    """Build masks and position id for left to right model."""
+                                    pad_mask_loss,
+                                    create_attention_mask=True):
+    """Build masks and position id for left to right model.
+
+    Args:
+        data: Token ids, shape [micro_batch_size, seq_length].
+        eod_token: End-of-document token id.
+        pad_token: Padding token id.
+        reset_position_ids: Restart position ids from 0 after each EOD token.
+        reset_attention_mask: Additionally mask attention across document boundaries,
+            turning the shared causal mask into a per-sample block-causal mask.
+            Requires create_attention_mask, since it modifies the materialized mask.
+        eod_mask_loss: Zero the loss mask at EOD tokens.
+        pad_mask_loss: Zero the loss mask at pad tokens.
+        create_attention_mask: Materialize the dense causal attention mask.
+            Can be disabled if the attention kernel generates the mask by itself
+            (e.g. from PackedSeqParams), in which case attention_mask is returned as None.
+
+    Returns:
+        Tuple of (attention_mask or None, loss_mask, position_ids).
+    """
+    assert create_attention_mask or not reset_attention_mask, \
+        "reset_attention_mask requires the attention mask to be created."
 
     # Extract batch size and sequence length.
     micro_batch_size, seq_length = data.size()
 
     # Attention mask (lower triangular).
-    if reset_attention_mask:
-        att_mask_batch = micro_batch_size
+    if create_attention_mask:
+        if reset_attention_mask:
+            att_mask_batch = micro_batch_size
+        else:
+            att_mask_batch = 1
+        attention_mask = torch.tril(
+            torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)
+        ).view(att_mask_batch, 1, seq_length, seq_length)
     else:
-        att_mask_batch = 1
-    attention_mask = torch.tril(
-        torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)
-    ).view(att_mask_batch, 1, seq_length, seq_length)
+        attention_mask = None
 
     # Loss mask.
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
@@ -405,7 +453,8 @@ def get_ltor_masks_and_position_ids(data,
                     prev_index = i + 1
 
     # Convert attention mask to binary:
-    attention_mask = attention_mask < 0.5
+    if create_attention_mask:
+        attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
 
@@ -455,6 +504,14 @@ def is_hybrid_model(args):
     return args.hybrid_layer_pattern is not None
 
 
+def is_gtp_remat_active(args):
+    """Returns True if GTP weight-remat is enabled on the decoder or expert axis."""
+    return (
+        getattr(args, 'gtp_weight_remat_size', 1) > 1
+        or getattr(args, 'expert_gtp_weight_remat_size', 1) > 1
+    )
+
+
 def is_first_or_last_pipeline_stage(vp_stage):
     """Return True if on first or last pipeline stage, taking into account virtual
     pipeline parallelism."""
@@ -488,14 +545,14 @@ def get_blend_and_blend_per_split(args):
     if use_data_path:
         if args.data_args_path is not None:
             assert args.data_path is None
-            with open_file(args.data_args_path, 'r') as f:
+            with maybe_msc.open(args.data_args_path, 'r') as f:
                 blend = get_blend_from_list(f.read().split())
         else:
             assert args.data_path is not None
             blend = get_blend_from_list(args.data_path)
     elif use_per_split_data_path:
         if args.per_split_data_args_path is not None:
-            with open_file(args.per_split_data_args_path, 'r') as f:
+            with maybe_msc.open(args.per_split_data_args_path, 'r') as f:
                 per_split_data_args = json.load(f)
                 # Each element in blend_per_split should be a list of files (and optional
                 # weights), so split string if needed.

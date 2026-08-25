@@ -105,6 +105,7 @@ def fully_shard_model(
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -277,6 +278,13 @@ def fully_shard_model(
             creating a casted-copy of the gradient shard that cannot be dereferenced due
             to replay. Defaults to False.
 
+        maxpool_double_buffer (bool):
+            Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+            FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+            parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+            user buffer registration and CUDA graph replay for models with asymmetrical
+            FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
     """
@@ -373,6 +381,7 @@ def fully_shard_model(
         disable_symmetric_registration=disable_symmetric_registration,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
         megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
+        megatron_fsdp_max_pool_double_buffer=maxpool_double_buffer,
     )
 
     # Create FSDPDistributedIndex.
@@ -490,7 +499,13 @@ def fully_shard_optimizer(
     optimizer_step_base_func = type(optimizer).step
     optimizer_zero_grad_base_func = type(optimizer).zero_grad
 
-    # Pre-initialize the optimizer state for checkpoint loading via DCP.
+    # Materialize lazy optimizer state so DCP has state tensors to load into. This
+    # follows PyTorch DCP's `_init_optim_state`, which takes a synthetic zero-gradient
+    # step before loading optimizer state.
+    # TODO: Consider moving this initialization to the checkpoint-loading path, as in
+    # the MFSDP v2 checkpoint API (#6024), where checkpoint state immediately
+    # overwrites the synthetic state. Keeping it in fully_shard_optimizer() means that
+    # fresh training may follow, so this synthetic step must be numerically inert.
     for group in optimizer.param_groups:
         for param in group["params"]:
             if param.numel() == 0 or (
@@ -500,8 +515,46 @@ def fully_shard_optimizer(
                 continue
             # Optimizer state is built from wgrad.
             param.grad = torch.zeros_like(param)
-    # Non-lazy optimizer state initialization.
+
+    # A zero gradient alone does not make optimizer.step() inert. Set lr to zero
+    # to prevent parameter updates. Also disable weight decay because optimizers
+    # with coupled decay add it to the gradient before updating their persistent
+    # moment buffers, independently of lr.
+    optimizer_group_settings = []
+    for group in optimizer.param_groups:
+        optimizer_group_settings.append(
+            (group, {key: group[key] for key in ("lr", "weight_decay") if key in group})
+        )
+        if "lr" in group:
+            # Capturable optimizers may require lr to remain a device tensor.
+            group["lr"] = (
+                torch.zeros_like(group["lr"]) if isinstance(group["lr"], torch.Tensor) else 0.0
+            )
+        if "weight_decay" in group:
+            group["weight_decay"] = 0.0
+    # Allocate the state, then restore the caller's optimizer settings.
     optimizer.step()
+    for group, settings in optimizer_group_settings:
+        group.update(settings)
+
+    # Optimizers advance their step counters even when lr is zero. Reset them so
+    # the first real update uses step 1 for bias correction.
+    for group in optimizer.param_groups:
+        if "step" not in group:
+            continue
+        if isinstance(group["step"], torch.Tensor):
+            group["step"].zero_()
+        else:
+            group["step"] = 0
+    for state in optimizer.state.values():
+        if "step" not in state:
+            continue
+        if isinstance(state["step"], torch.Tensor):
+            state["step"].zero_()
+        else:
+            state["step"] = 0
+
+    # Remove the synthetic gradients installed above.
     optimizer.zero_grad()
 
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
@@ -680,6 +733,7 @@ def fully_shard(
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -731,6 +785,7 @@ def fully_shard(
         disable_symmetric_registration=disable_symmetric_registration,
         use_decoupled_grad=use_decoupled_grad,
         cuda_graph_mode=cuda_graph_mode,
+        maxpool_double_buffer=maxpool_double_buffer,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.

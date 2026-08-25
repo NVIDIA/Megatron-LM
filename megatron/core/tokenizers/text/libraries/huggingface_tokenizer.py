@@ -14,6 +14,13 @@ from megatron.core.utils import log_single_rank
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
+try:
+    import gigatoken as gt
+
+    HAVE_GIGATOKEN = True
+except ModuleNotFoundError:
+    HAVE_GIGATOKEN = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +47,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         trust_remote_code: Optional[bool] = False,
         include_special_tokens: bool = True,
         chat_template: str = None,
+        use_gigatoken: bool = False,
     ):
         """
         Args:
@@ -62,6 +70,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             use_fast: whether to use fast HuggingFace tokenizer
             include_special_tokens: when True, converting text to ids will include special
                 tokens / prompt tokens (if any), yielding self.tokenizer(text).input_ids
+            use_gigatoken: whether to use GigaToken implementation
         """
 
         try:
@@ -83,7 +92,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     pretrained_model_name_or_path=tokenizer_path,
                     vocab_file=vocab_file,
-                    merge_files=merges_file,
+                    merges_file=merges_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
                 )
@@ -101,10 +110,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         else:
             self.tokenizer.chat_template = chat_template
 
+        self.use_gigatoken = use_gigatoken
         self.include_special_tokens = include_special_tokens
         self.original_vocab_size = len(self.tokenizer)
-        self.chat_template = chat_template
         self.eos_token = eos_token
+        self.chat_template = chat_template
         special_tokens_dict = {}
 
         # # setting special tokens, by default the default model's special tokens will be preserved
@@ -184,6 +194,20 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             'x'
         ) + self.text_to_tokens('y')
         self._inv_vocab_dict = {}
+
+        if self.use_gigatoken:
+            # restore tokenizer with gigatoken
+            if HAVE_GIGATOKEN:
+                self._hf_tokenizer = self.tokenizer
+                logger.info(f"Restoring {tokenizer_path} tokenizer with gigatoken.")
+                self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
+        else:
+            self._hf_tokenizer = self.tokenizer
 
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
@@ -286,9 +310,21 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def apply_chat_template(self, conversation, chat_template, **kwargs):
         """Applies chat template and tokenizes results"""
-        return self.tokenizer.apply_chat_template(
+        return self._hf_tokenizer.apply_chat_template(
             conversation=conversation, chat_template=chat_template, **kwargs
         )
+
+    def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
+        """Encodes whole jsonl file."""
+        if self.use_gigatoken:
+            return self.tokenizer.tokenizer.encode_files(
+                gt.JsonlFileSource(paths, field=field), parallel=True
+            )
+        else:
+            raise NotImplementedError(
+                "This method is supported only for gigatoken tokenizers. "
+                "Please, set `use_gigatoken=True`."
+            )
 
     @property
     def vocab(self) -> list:
@@ -364,10 +400,10 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def save_vocabulary(self, save_directory: str, filename_prefix: str = None):
         """Saves tokenizer's vocabulary and other artifacts to the specified directory"""
-        return self.tokenizer.save_vocabulary(
+        return self._hf_tokenizer.save_vocabulary(
             save_directory=save_directory, filename_prefix=filename_prefix
         )
 
     def save_pretrained(self, save_directory: str):
         """Saves tokenizer's vocabulary and other artifacts to the specified directory"""
-        return self.tokenizer.save_pretrained(save_directory)
+        return self._hf_tokenizer.save_pretrained(save_directory)

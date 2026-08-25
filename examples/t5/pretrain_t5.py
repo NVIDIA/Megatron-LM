@@ -275,9 +275,9 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider,
         get_embedding_ranks=t5_embedding_ranks,
         get_position_embedding_ranks=t5_position_embedding_ranks,
     )
