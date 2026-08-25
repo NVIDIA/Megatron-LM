@@ -35,6 +35,10 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
+def _make_pg_collection():
+    return SimpleNamespace(pp=None, tp=None, cp=SimpleNamespace(size=lambda: 1), tp_cp=None)
+
+
 @pytest.mark.parametrize(
     ("layer_pattern", "expected_spec_names"),
     [
@@ -78,7 +82,7 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
         pp_layer_offset=5,
         post_layer_norm=False,
         post_process=False,
-        pg_collection=SimpleNamespace(pp=None, tp=None),
+        pg_collection=_make_pg_collection(),
         name="decoder",
     )
 
@@ -92,6 +96,65 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
     expected_layer_numbers = list(range(6, 6 + len(layer_pattern)))
     assert [kwargs["layer_number"] for _, kwargs in build_calls] == expected_layer_numbers
     assert [layer.layer_number for layer in block.layers] == expected_layer_numbers
+
+
+def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
+    """Each layer config type selects the corresponding context-parallel layout."""
+
+    class BuiltLayer(torch.nn.Module):
+
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+
+    layout_manager_kwargs = {}
+
+    class CapturingLayoutManager:
+
+        def __init__(self, **kwargs):
+            layout_manager_kwargs.update(kwargs)
+
+    monkeypatch.setattr(hybrid_block_module, "ContextParallelLayoutManager", CapturingLayoutManager)
+    monkeypatch.setattr(
+        hybrid_block_module,
+        "build_module",
+        lambda module_spec, **kwargs: BuiltLayer(kwargs["config"], kwargs["layer_number"]),
+    )
+
+    config = MLATransformerConfig(
+        num_layers=7,
+        hidden_size=64,
+        num_attention_heads=4,
+        linear_cp_layout="contiguous",
+        attention_cp_layout="zigzag",
+    )
+    layer_config_list = validate_segment_layers("MG*-E", config) + validate_segment_layers(
+        "D+", config
+    )
+
+    HybridStack(
+        config=config,
+        submodules=hybrid_stack_spec.submodules,
+        layer_config_list=layer_config_list,
+        pre_process=False,
+        post_layer_norm=False,
+        post_process=False,
+        pg_collection=SimpleNamespace(
+            pp=None, tp=None, cp=SimpleNamespace(size=lambda: 2), tp_cp=None
+        ),
+    )
+
+    assert layout_manager_kwargs["layer_layouts"] == (
+        "contiguous",
+        "contiguous",
+        "zigzag",
+        "contiguous",
+        "contiguous",
+        "zigzag",
+        "zigzag",
+    )
+    assert layout_manager_kwargs["boundary_layout"] == "contiguous"
 
 
 def test_hybrid_stack_accepts_layer_config_subclasses(monkeypatch):
@@ -124,7 +187,7 @@ def test_hybrid_stack_accepts_layer_config_subclasses(monkeypatch):
         pre_process=False,
         post_layer_norm=False,
         post_process=False,
-        pg_collection=SimpleNamespace(pp=None, tp=None),
+        pg_collection=_make_pg_collection(),
     )
 
     assert build_calls == [hybrid_stack_spec.submodules.mamba_layer]
@@ -159,7 +222,7 @@ def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatc
             [Symbols.MAMBA, Symbols.MLA, Symbols.MLP],
             post_layer_norm=False,
             post_process=False,
-            pg_collection=SimpleNamespace(pp=None, tp=None),
+            pg_collection=_make_pg_collection(),
         )
     emitted_warnings = {(warning.category, str(warning.message)) for warning in warning_records}
     assert (
@@ -230,7 +293,7 @@ def test_explicit_layer_config_mutations_are_isolated(monkeypatch):
         pre_process=False,
         post_layer_norm=False,
         post_process=False,
-        pg_collection=SimpleNamespace(pp=None, tp=None),
+        pg_collection=_make_pg_collection(),
     )
 
     assert type(layer_configs) is list
@@ -264,7 +327,7 @@ def test_hybrid_stack_requires_exactly_one_layer_list(
             pre_process=False,
             post_layer_norm=False,
             post_process=False,
-            pg_collection=SimpleNamespace(pp=None, tp=None),
+            pg_collection=_make_pg_collection(),
         )
 
 
@@ -284,7 +347,7 @@ def test_hybrid_stack_rejects_multi_character_layer_type():
                 pre_process=False,
                 post_layer_norm=False,
                 post_process=False,
-                pg_collection=SimpleNamespace(pp=None, tp=None),
+                pg_collection=_make_pg_collection(),
             )
 
 
@@ -326,7 +389,7 @@ def test_hybrid_stack_rejects_same_named_config_type():
             pre_process=False,
             post_layer_norm=False,
             post_process=False,
-            pg_collection=SimpleNamespace(pp=None, tp=None),
+            pg_collection=_make_pg_collection(),
         )
 
 

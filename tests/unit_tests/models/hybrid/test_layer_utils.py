@@ -45,6 +45,13 @@ class TestSymbols:
             layer_utils.Symbols.MOE,
         ]
 
+    def test_attention_layer_symbols(self):
+        assert layer_utils.Symbols.ATTENTION_LAYERS == {
+            layer_utils.Symbols.ATTENTION,
+            layer_utils.Symbols.DS_ATTENTION,
+            layer_utils.Symbols.MLA,
+        }
+
 
 @pytest.mark.internal
 class TestCreateLayerConfig:
