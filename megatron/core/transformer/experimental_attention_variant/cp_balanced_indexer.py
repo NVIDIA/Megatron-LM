@@ -19,7 +19,7 @@ pack takes the GLOBAL CHUNK-PAIR FOLDING, where each chunk is scored by a per-ch
 ``csa_utils.cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
 ``[l_local, topk]`` layout, so the downstream index-building and sparse attention are unchanged.
 
-Triage/A-B switches: ``MCORE_DSA_CP_BAL_PACK_SCOPE=1`` forces the chunk-pair folding path
+Triage/A-B switches: ``MCORE_DSA_CP_BAL_PACK_SCOPE=1`` forces the reference fallback
 (disables the per-sequence zigzag); ``MCORE_DSA_CP_BAL_DEBUG=1`` logs the gate decision once.
 Both must be set uniformly across CP ranks (they select the collective sequence).
 
@@ -41,7 +41,7 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 logger = logging.getLogger(__name__)
 
 # Run-constant A/B switches, read once at import (see the module docstring).
-_FORCE_FOLDING = os.environ.get("MCORE_DSA_CP_BAL_PACK_SCOPE") == "1"
+_FORCE_REFERENCE = os.environ.get("MCORE_DSA_CP_BAL_PACK_SCOPE") == "1"
 _GATE_DEBUG = os.environ.get("MCORE_DSA_CP_BAL_DEBUG") == "1"
 
 # Score-buffer sizing contract for the fused cuDNN indexer kernel. Widths are
@@ -56,19 +56,14 @@ _KV_BOUND_QUANTUM = 8192
 _KV_TIGHT_WIDTH_CEILING = 65536
 
 
-# Static all-to-all metadata and staging buffers, cached per (group, cp_size, l_local[, dtype,
-# width]). The chunk map is a fixed permutation: chunk ``c``'s rows are OWNED by rank ``c // 2``
-# (contiguous layout) and COMPUTED by rank ``proc(c) = c if c < cp_size else 2*cp_size - 1 - c``.
-# Dispatch moves each owned half-chunk to its computing rank; combine moves each computed top-k
-# chunk back to its owner. Payload is ~l_local rows per rank per direction (vs. cp_size*l_local
-# for AllGather, or an S-row zero-padded reduce_scatter for the combine). All split sizes are
-# static for a fixed pack size, so ``all_to_all_single`` is CUDA-graph capturable, and the cached
-# staging buffers keep the allocator pool static (no expandable-segments cuMem churn).
-# NOTE: these process-global caches are append-only by design (entries are keyed by
+# Staging buffers for the balanced exchanges, cached per (tag, group, width, dtype).
+# All split sizes are static for a fixed pack size, so ``all_to_all_single`` is
+# CUDA-graph capturable, and the cached staging buffers keep the allocator pool static
+# (no expandable-segments cuMem churn).
+# NOTE: this process-global cache is append-only by design (entries are keyed by
 # (group, size, dtype, width) and reused for the life of the run). Under dynamic CP
 # each bucket's subgroup adds its own entries, so the footprint is bounded by the
 # number of distinct CP buckets — small in practice, but not evicted.
-_A2A_META: dict = {}
 _A2A_BUF: dict = {}
 
 # Last prebuilt zigzag plan per (group, rank) — latest wins, so the slot count is
@@ -84,14 +79,14 @@ _LAST_PLAN: dict = {}
 # Per-(group, l_local) verdict from the last prebuild: does the CURRENT pack support the
 # per-sequence zigzag path (every padded sequence length divisible by 2 * cp_size)? The
 # config-level gate in ``_use_zigzag`` cannot see the actual pack; prebuild can, and
-# records it here so both eager and captured forwards fall back to the folding path for
+# records it here so both eager and captured forwards fall back to the reference path for
 # packs the zigzag builders do not support (instead of consuming a stale plan or building
 # an out-of-range runtime plan).
 _ZZ_PACK_OK: dict = {}
 
 # Last OBSERVED (l_local, cu composition) per group, recorded on every prebuild
 # call — independent of whether a plan is ever built. The static-composition
-# gate compares against this, not against a plan: a folding-only run (e.g. pad
+# gate compares against this, not against a plan: a reference-fallback run (e.g. pad
 # alignment that never opens the zigzag gate) builds no plans, yet its captured
 # graphs still bake composition-sensitive host state (mq/gkv widths derived
 # from max_seqlen_q, and the gate/single-multi host branches), so a composition
@@ -125,59 +120,6 @@ def _group_key(cp_group):
     return getattr(cp_group, "group_name", None) or id(cp_group)
 
 
-def _a2a_meta(cp_group, cp_size, l_local):
-    key = (_group_key(cp_group), cp_size, l_local)
-    meta = _A2A_META.get(key)
-    if meta is not None:
-        return meta
-    N, nch = cp_size, 2 * cp_size
-    S = N * l_local
-    r = cp_group.rank()
-    bounds = [(k * S) // nch for k in range(nch + 1)]
-    size = [bounds[k + 1] - bounds[k] for k in range(nch)]
-
-    def proc(c):  # computing rank of chunk c (head for c < N, tail otherwise)
-        return c if c < N else nch - 1 - c
-
-    def own(c):  # owning rank of chunk c in the contiguous layout
-        return c // 2
-
-    head_c, tail_c = r, nch - 1 - r
-
-    # Convention on both sides: rows for one peer are ordered by ascending chunk id, and
-    # all_to_all_single orders the buffers by peer rank. head_c < tail_c and
-    # own(head_c) <= own(tail_c) always hold, so [head | tail] is already peer-ordered on the
-    # receive side of the dispatch and on the send side of the combine. The owner's local pair
-    # (2r, 2r+1) needs a swap iff proc(2r) > proc(2r+1) (true for 2r >= N).
-    d_in = [0] * N
-    d_in[proc(2 * r)] += size[2 * r]
-    d_in[proc(2 * r + 1)] += size[2 * r + 1]
-    d_out = [0] * N
-    d_out[own(head_c)] += size[head_c]
-    d_out[own(tail_c)] += size[tail_c]
-    c_in = [0] * N
-    c_in[own(head_c)] += size[head_c]
-    c_in[own(tail_c)] += size[tail_c]
-    c_out = [0] * N
-    c_out[proc(2 * r)] += size[2 * r]
-    c_out[proc(2 * r + 1)] += size[2 * r + 1]
-    swap_pair = proc(2 * r) > proc(2 * r + 1)
-
-    meta = {
-        "d_in": d_in,
-        "d_out": d_out,
-        "c_in": c_in,
-        "c_out": c_out,
-        "swap_pair": swap_pair,
-        "s0": size[2 * r],
-        "s1": size[2 * r + 1],
-        "sh": size[head_c],
-        "st": size[tail_c],
-    }
-    _A2A_META[key] = meta
-    return meta
-
-
 def _a2a_buf(tag, rows, width, dtype, dev, cp_group, persistent=True):
     if not persistent:
         # S-sized fallback buffers: allocate transiently. In eager the caching
@@ -206,61 +148,6 @@ def _a2a_buf(tag, rows, width, dtype, dev, cp_group, persistent=True):
         buf = torch.empty((rows, width), dtype=dtype, device=dev)
         _A2A_BUF[key] = buf
     return buf[:rows]
-
-
-def _alltoall_dispatch(x, meta, cp_group, tag):
-    """Move my owned half-chunks to their computing ranks; return (head_rows, tail_rows).
-
-    ``x`` is ``[l_local, D]`` (leading dims collapsed). The returned tensors are views into a
-    cached receive buffer; they are consumed by the chunk top-k within the same layer, before the
-    next dispatch reuses the buffer (stream-ordered).
-    """
-    D = x.shape[-1]
-    # Detached: the dispatch feeds only the integer top-k (mirrors the other
-    # dispatch paths); an undetached copy_ would flip the process-global staging
-    # buffer to requires_grad and retain the producer's autograd graph.
-    x2 = x.detach().reshape(-1, D)
-    l_local = x2.shape[0]
-    s0 = meta["s0"]
-    send = _a2a_buf(tag + "_send", l_local, D, x2.dtype, x.device, cp_group)
-    if meta["swap_pair"]:
-        send[: l_local - s0].copy_(x2[s0:])
-        send[l_local - s0 :].copy_(x2[:s0])
-    else:
-        send.copy_(x2)
-    recv = _a2a_buf(tag + "_recv", meta["sh"] + meta["st"], D, x2.dtype, x.device, cp_group)
-    dist.all_to_all_single(
-        recv, send, output_split_sizes=meta["d_out"], input_split_sizes=meta["d_in"], group=cp_group
-    )
-    return recv[: meta["sh"]], recv[meta["sh"] :]
-
-
-def _alltoall_dispatch_async(x, meta, cp_group, tag):
-    """Async variant of :func:`_alltoall_dispatch`: returns ``(work, recv)``.
-
-    The caller runs unrelated compute (compressor, K gather) between issue and wait, so
-    the NCCL transfer overlaps instead of sitting on the critical path.
-    """
-    D = x.shape[-1]
-    x2 = x.detach().reshape(-1, D)  # see _alltoall_dispatch: integer top-k only
-    l_local = x2.shape[0]
-    s0 = meta["s0"]
-    send = _a2a_buf(tag + "_send", l_local, D, x2.dtype, x.device, cp_group)
-    if meta["swap_pair"]:
-        send[: l_local - s0].copy_(x2[s0:])
-        send[l_local - s0 :].copy_(x2[:s0])
-    else:
-        send.copy_(x2)
-    recv = _a2a_buf(tag + "_recv", meta["sh"] + meta["st"], D, x2.dtype, x.device, cp_group)
-    work = dist.all_to_all_single(
-        recv,
-        send,
-        output_split_sizes=meta["d_out"],
-        input_split_sizes=meta["d_in"],
-        group=cp_group,
-        async_op=True,
-    )
-    return work, recv
 
 
 def dispatch_chunks_async(
@@ -294,8 +181,8 @@ def dispatch_chunks_async(
       merged payload; row selection is deferred to consume time.
     - ``"ag2"``: same fallback, but qr/weights dtypes differ so the merged payload
       cannot carry both — two separate AllGathers.
-    - ``"a2a"``: non-zigzag balanced path — the ``_a2a_meta`` head/tail chunk
-      ``all_to_all_single`` (contiguous pair -> folded (r, 2N-1-r) assignment).
+    - ``None``: zigzag ineligible — nothing to prefetch; the compute side takes the
+      reference fallback and scores this rank's own rows against the gathered K.
     """
     if cp_size <= 1:
         return None
@@ -367,37 +254,9 @@ def dispatch_chunks_async(
         wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
         ww, gw = _all_gather_rows_buf(w2, l_local, cp_group, cp_size, "zz_w")
         return {"kind": "ag2", "works": [wq, ww], "gq": gq, "gw": gw, "q_lora": q_lora}
-    meta = _a2a_meta(cp_group, cp_size, l_local)
-    if q2.dtype != w2.dtype:
-        wq, rq = _alltoall_dispatch_async(q2, meta, cp_group, "qr")
-        ww, rw = _alltoall_dispatch_async(w2, meta, cp_group, "w")
-        return {"kind": "a2a", "meta": meta, "works": [wq, ww], "recvs": [rq, rw], "q_lora": q_lora}
-    rows = q2.shape[0]
-    width = q_lora + n_heads
-    dev = q2.device
-    send = _a2a_buf("qw_send", rows, width, q2.dtype, dev, cp_group)
-    s0 = meta["s0"]
-    if meta["swap_pair"]:
-        send[: rows - s0, :q_lora].copy_(q2[s0:])
-        send[: rows - s0, q_lora:].copy_(w2[s0:])
-        send[rows - s0 :, :q_lora].copy_(q2[:s0])
-        send[rows - s0 :, q_lora:].copy_(w2[:s0])
-    else:
-        send[:, :q_lora].copy_(q2)
-        send[:, q_lora:].copy_(w2)
-    recv = _a2a_buf("qw_recv", meta["sh"] + meta["st"], width, q2.dtype, dev, cp_group)
-    work = dist.all_to_all_single(
-        recv,
-        send,
-        output_split_sizes=meta["d_out"],
-        input_split_sizes=meta["d_in"],
-        group=cp_group,
-        async_op=True,
-    )
-    return {"kind": "a2a", "meta": meta, "works": [work], "recvs": [recv], "q_lora": q_lora}
-
-
-_FP8_AUTOCAST = None  # resolved once by _no_fp8_ctx: TE fp8_autocast, or False when TE absent
+    # Zigzag ineligible: the reference fallback scores this rank's own rows
+    # against the already-gathered K, so there is nothing to prefetch.
+    return None
 
 
 def _no_fp8_ctx():
@@ -462,52 +321,6 @@ _NO_PLAN_REASON = (
 )
 
 
-def _dispatch_wait(handle, meta):
-    """Complete an async dispatch; return (qr_head, w_head, qr_tail, w_tail)."""
-    for work in handle["works"]:
-        work.wait()
-    sh = meta["sh"]
-    q_lora = handle["q_lora"]
-    if len(handle["recvs"]) == 2:
-        rq, rw = handle["recvs"]
-        return rq[:sh], rw[:sh], rq[sh:], rw[sh:]
-    recv = handle["recvs"][0]
-    # Column slices of the merged buffer are strided; contiguify (tens of MB, D2D) so the
-    # projection GEMM and the fused scorer see plain dense tensors.
-    return (
-        recv[:sh, :q_lora].contiguous(),
-        recv[:sh, q_lora:].contiguous(),
-        recv[sh:, :q_lora].contiguous(),
-        recv[sh:, q_lora:].contiguous(),
-    )
-
-
-def _alltoall_combine(tk_head, tk_tail, meta, cp_group):
-    """Move computed top-k chunks back to their owners; return contiguous ``[l_local, tkw]``.
-
-    The output is a fresh (allocator-pooled, fixed-size) tensor rather than a cached buffer so no
-    caller-held reference can alias the next layer's combine.
-    """
-    tkw = tk_head.shape[-1]
-    dev = tk_head.device
-    sh, st = meta["sh"], meta["st"]
-    s0, s1 = meta["s0"], meta["s1"]
-    send = _a2a_buf("cmb_send", sh + st, tkw, tk_head.dtype, dev, cp_group)
-    send[:sh].copy_(tk_head)
-    send[sh:].copy_(tk_tail)
-    recv = _a2a_buf("cmb_recv", s0 + s1, tkw, tk_head.dtype, dev, cp_group)
-    dist.all_to_all_single(
-        recv, send, output_split_sizes=meta["c_out"], input_split_sizes=meta["c_in"], group=cp_group
-    )
-    out = torch.empty((s0 + s1, tkw), dtype=tk_head.dtype, device=dev)
-    if meta["swap_pair"]:
-        out[:s0].copy_(recv[s1:])
-        out[s0:].copy_(recv[:s1])
-    else:
-        out.copy_(recv)
-    return out
-
-
 def _all_gather_rows_buf(x, l_local, cp_group, cp_size, tag):
     """AllGather into a buffer (async): returns (work, gathered[cp_size*l_local, D]).
 
@@ -538,29 +351,29 @@ def _use_zigzag(cp_size, l_local, use_fused, config):
     divisibility comes from the data / dataset padding, and under CUDA graphs the
     integer alignment is replaced by target-length padding entirely). Whether the
     ACTUAL pack is representable is decided per microbatch by ``_pack_zigzag_ok``;
-    ineligible packs take the fully general folding path.
-    ``MCORE_DSA_CP_BAL_PACK_SCOPE=1`` forces folding (A/B testing).
+    ineligible packs take the reference fallback (this rank scores its own rows).
+    ``MCORE_DSA_CP_BAL_PACK_SCOPE=1`` forces that fallback (A/B testing).
     """
     verdict = None
-    if _FORCE_FOLDING:
+    if _FORCE_REFERENCE:
         verdict = False
     elif not use_fused:
         verdict = False
     if verdict is None:
         # Unified path: single-full-pack sequences are the nseg==1 special case of the
-        # per-sequence zigzag (identical chunks to the global folding), served by the same
+        # per-sequence zigzag (the same chunks a global 2N-fold would produce), served by the same
         # plan/route machinery with per-call tight compressed-K bounds (K-slice general).
         pad = getattr(config, "pad_packed_seq_alignment", None)
         verdict = isinstance(pad, int) and pad % (2 * cp_size) == 0 and (l_local % 2 == 0)
     if _GATE_DEBUG and not getattr(_use_zigzag, "_logged", False):
         _use_zigzag._logged = True
         logger.info(
-            "[zz-gate] verdict=%s S=%s use_fused=%s pad=%r force_folding=%s",
+            "[zz-gate] verdict=%s S=%s use_fused=%s pad=%r force_reference=%s",
             verdict,
             cp_size * l_local,
             use_fused,
             getattr(config, "pad_packed_seq_alignment", None),
-            _FORCE_FOLDING,
+            _FORCE_REFERENCE,
         )
     return verdict
 
@@ -575,7 +388,7 @@ def _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
     eagerly warmed-up pack, whose probe already wrote the registry. Frontends that never
     prebuild (e.g. the legacy varlen ``get_batch``) can hand over raw, non-2N-aligned
     packs; without this gate they would reach ``_zigzag_plan``'s hard error instead of
-    the (fully general) folding path.
+    the reference fallback.
     """
     if layout_cache is not None:
         cached = layout_cache.get("zz_pack_ok")
@@ -595,7 +408,7 @@ def _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
         )
     if cu_seqlens is None:
         # No pack to probe: only a recorded verdict can admit zigzag; default to the
-        # fully general folding path.
+        # reference fallback.
         return _ZZ_PACK_OK.get(key, False)
     S = cp_size * l_local
     nch = 2 * cp_size
@@ -775,12 +588,15 @@ def balanced_compute_cp_indexer_topk(
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
     Returns ``(compressed_topk, layout)`` in the same contiguous ``[l_local, topk]`` layout the
-    caller expects, so ``build_attention_indices`` / sparse attention are unchanged. The global
-    sequence is tiled into ``2 * cp_size`` near-equal chunks; this rank dispatches its head chunk
-    (``r``) and tail chunk (``2 * cp_size - 1 - r``), scores each with a per-chunk call to
-    ``compute_cp_indexer_topk`` at the chunk's global offset (so RoPE positions, causal offsets,
-    multi-sequence packing, and the ``use_fused`` flag all follow the reference), then combines the
-    top-k back to contiguous order.
+    caller expects, so ``build_attention_indices`` / sparse attention are unchanged. Every sequence is
+    tiled into ``2 * cp_size`` chunks; this rank scores chunk ``r`` (head) and chunk
+    ``2 * cp_size - 1 - r`` (tail) of every sequence — one cheap and one expensive under
+    the causal mask — via per-chunk calls that follow the reference (RoPE positions,
+    causal offsets, packing, tight KV bounds), then combines the top-k back to contiguous
+    order. Packs the zigzag builders cannot represent (a sequence length not divisible by
+    ``2 * cp_size``) take the reference fallback instead: this rank scores its own
+    contiguous rows exactly like the unbalanced path (the former chunk-pair folding
+    fallback measured slower than that baseline on unequal packs and was removed).
     """
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
@@ -791,9 +607,7 @@ def balanced_compute_cp_indexer_topk(
     dev = indexer_qr.device
     comp = int(k_seq_major.shape[0])
     S = cp_size * l_local
-    nch = 2 * cp_size
     r = cp_group.rank()
-    head_c, tail_c = r, nch - 1 - r
 
     # Contiguous layout for the return value: downstream builds indices from it plus the (balanced,
     # re-contiguous) top-k, so it is identical to the reference path.
@@ -956,20 +770,17 @@ def balanced_compute_cp_indexer_topk(
     # benchmarked configuration — are unaffected (end-to-end loss parity vs the
     # reference). Regimes that ALTERNATE fused-call shapes within one process
     # (``dsa_cp_balance_min_seqlen > 0`` mixing balanced half-row calls with
-    # full-row reference calls, or eager varlen whose l_local varies — the
+    # full-row reference calls, pack-eligibility alternation doing the same through the
+    # reference fallback, or eager varlen whose l_local varies — the
     # latter already mixes shapes with the flag off) await the kernel-side fix.
 
     # "kind" legend lives on dispatch_chunks_async: zzr/ag/ag2 are the three zigzag
-    # transports (routed a2a / merged AllGather / split AllGather), "a2a" is the
-    # non-zigzag balanced chunk exchange. The dispatch already committed the layout,
+    # transports (routed a2a / merged AllGather / split AllGather); a None handle means
+    # zigzag was ineligible at dispatch time. The dispatch already committed the layout,
     # so the compute side keys off the handle rather than re-deriving eligibility.
-    zz = (
-        dispatch_handle.get("kind") in ("ag", "ag2", "zzr")
-        if dispatch_handle is not None
-        else (
-            _use_zigzag(cp_size, l_local, use_fused, config)
-            and _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
-        )
+    zz = dispatch_handle is not None or (
+        _use_zigzag(cp_size, l_local, use_fused, config)
+        and _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
     )
     if zz:
         # ---- Per-sequence zigzag: exact balance for any pack composition -------------
@@ -1149,54 +960,14 @@ def balanced_compute_cp_indexer_topk(
         nvtx_range_pop("Bal_Combine")
         return compressed_topk, layout
 
-    # ---- Chunk-pair folding (the fully general fallback) --------------------------
-    # Tile [0, S) into ``nch`` near-equal chunks: even l_local -> bounds[k] = k*(l_local//2); odd
-    # l_local -> chunk sizes differ by at most one row, so no row is ever dropped.
-    bounds = [(k * S) // nch for k in range(nch + 1)]
-    hs, he = bounds[head_c], bounds[head_c + 1]
-    ts, te = bounds[tail_c], bounds[tail_c + 1]
-    # Dispatch: bring this rank's head-chunk and tail-chunk rows of qr and weights here.
-    meta = _a2a_meta(cp_group, cp_size, l_local)
-    nvtx_range_push("Bal_Dispatch")
-    if dispatch_handle is not None:
-        # Transfer was issued early by dispatch_chunks_async and overlapped with the
-        # compressor / compressed-K gather; just complete it here.
-        qr_head, w_head, qr_tail, w_tail = _dispatch_wait(dispatch_handle, meta)
-    else:
-        # NCCL all_to_all_single over the fixed chunk permutation: ~l_local rows per rank instead
-        # of an S-row AllGather, static splits (CUDA-graph capturable), cached staging buffers.
-        qr_head, qr_tail = _alltoall_dispatch(indexer_qr, meta, cp_group, "qr")
-        w_head, w_tail = _alltoall_dispatch(weights_indexer_cp, meta, cp_group, "w")
-    nvtx_range_pop("Bal_Dispatch")
-
-    nvtx_range_push("BalancedIndexerScore")
-    # Score the LARGER chunk of the pair first. The fused indexer package keeps a
-    # cross-call workspace sized by the first call's row count and reuses it
-    # without a capacity check (a small-then-large call sequence corrupts the
-    # larger call's rows — measured; see the ordering note in the unit tests, to
-    # be raised with the kernel owners). The near-equal tiling makes the pair
-    # differ by at most one row (odd l_local), so ordering by size costs nothing
-    # and keeps every subsequent call within the first call's capacity: chunk
-    # shapes are constant across layers and microbatches for a fixed capacity.
-    head_first = (he - hs) >= (te - ts)
-    for which in ("head", "tail") if head_first else ("tail", "head"):
-        if which == "head":
-            nvtx_range_push("Bal_Head")
-            tk_head = _chunk_topk(qr_head, w_head, hs, he - hs)
-            nvtx_range_pop("Bal_Head")
-        else:
-            nvtx_range_push("Bal_Tail")
-            tk_tail = _chunk_topk(qr_tail, w_tail, ts, te - ts)
-            nvtx_range_pop("Bal_Tail")
-    nvtx_range_pop("BalancedIndexerScore")
-
-    # Combine: return each computed chunk to the rank that owns its contiguous rows. The chunk map
-    # is a fixed permutation (each rank sends 2 chunks and receives its own 2), so this is an exact
-    # all_to_all of ~l_local rows — no S-row zero-padded buffer and no SUM reduction.
-    nvtx_range_push("Bal_Combine")
-    compressed_topk = _alltoall_combine(tk_head, tk_tail, meta, cp_group)
-    nvtx_range_pop("Bal_Combine")
-    return compressed_topk, layout
+    # ---- Reference fallback (zigzag ineligible) ----------------------------------
+    # Score this rank's own contiguous rows exactly like the unbalanced path — same
+    # projection, RoPE positions, tight KV bounds, and fused/unfused split as the
+    # reference call. The former chunk-pair folding fallback measured slower than
+    # this baseline on unequal packs and was removed; ineligible packs now pay the
+    # original imbalance rather than a regression.
+    tk = _chunk_topk(indexer_qr, weights_indexer_cp, int(global_start), l_local)
+    return tk, (layout if tk is not None else None)
 
 
 def prebuild_balanced_layouts(
