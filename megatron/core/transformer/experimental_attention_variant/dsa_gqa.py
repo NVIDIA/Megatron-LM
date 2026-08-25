@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint as torch_checkpoint
 
 from megatron.core.extensions.transformer_engine import TELinear, TENorm
 from megatron.core.models.common.embeddings import (
@@ -1042,7 +1041,6 @@ class DSGQACoreAttention(MegatronModule):
             sparse_indexer_loss_use_topk_only = getattr(
                 self.config, "dsa_indexer_sparse_loss_use_topk_only", False
             )
-            recompute_indexer_loss = False
             if simplified_indexer:
                 if simplified_learned_k:
                     q_index, k_index = self.indexer.forward_qk(
@@ -1063,7 +1061,6 @@ class DSGQACoreAttention(MegatronModule):
                     hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
                 )
             key_chunk_size = None
-            recompute_topk = False
             use_chunked_topk = (
                 key_chunk_size is not None
                 and key_chunk_size > 0
@@ -1095,20 +1092,11 @@ class DSGQACoreAttention(MegatronModule):
                 routing_inputs_require_grad = q_index.requires_grad or k_index.requires_grad or (
                     weights is not None and weights.requires_grad
                 )
-                if recompute_topk and routing_inputs_require_grad:
-                    topk_scores, topk_indices = torch_checkpoint.checkpoint(
-                        _compute_chunked_topk,
-                        q_index,
-                        k_index,
-                        weights if weights is not None else q_index.new_empty((0,)),
-                        use_reentrant=False,
-                    )
-                else:
-                    topk_scores, topk_indices = _compute_chunked_topk(
-                        q_index,
-                        k_index,
-                        weights if weights is not None else q_index.new_empty((0,)),
-                    )
+                topk_scores, topk_indices = _compute_chunked_topk(
+                    q_index,
+                    k_index,
+                    weights if weights is not None else q_index.new_empty((0,)),
+                )
                 index_scores = None
             else:
                 if simplified_indexer:
@@ -1148,14 +1136,7 @@ class DSGQACoreAttention(MegatronModule):
                             selected_index_scores=selected_scores_tensor,
                         )
 
-                    if recompute_indexer_loss and topk_scores.requires_grad:
-                        indexer_loss = torch_checkpoint.checkpoint(
-                            _compute_sparse_topk_only_indexer_loss,
-                            topk_scores,
-                            use_reentrant=False,
-                        )
-                    else:
-                        indexer_loss = _compute_sparse_topk_only_indexer_loss(topk_scores)
+                    indexer_loss = _compute_sparse_topk_only_indexer_loss(topk_scores)
                 else:
                     def _compute_indexer_loss(index_scores_tensor: torch.Tensor) -> torch.Tensor:
                         return compute_gqa_dsa_indexer_loss(
@@ -1171,63 +1152,27 @@ class DSGQACoreAttention(MegatronModule):
                             None,
                         )
 
-                    if recompute_indexer_loss and index_scores.requires_grad:
-                        indexer_loss = torch_checkpoint.checkpoint(
-                            _compute_indexer_loss,
-                            index_scores,
-                            use_reentrant=False,
-                        )
-                    else:
-                        indexer_loss = _compute_indexer_loss(index_scores)
+                    indexer_loss = _compute_indexer_loss(index_scores)
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                 )
-
-            recompute_sparse_attention = False
             sparse_attention_use_gather = getattr(
                 self.config, "dsa_sparse_attention_use_gather", False
             )
             sparse_attention_query_chunk_size = None
-            if recompute_sparse_attention and (
-                query.requires_grad or key.requires_grad or value.requires_grad
-            ):
-                def _compute_sparse_attention(
-                    query_tensor: torch.Tensor,
-                    key_tensor: torch.Tensor,
-                    value_tensor: torch.Tensor,
-                ) -> torch.Tensor:
-                    return unfused_grouped_dsa_fn(
-                        query_tensor,
-                        key_tensor,
-                        value_tensor,
-                        topk_indices,
-                        self.softmax_scale,
-                        mask=sparse_attention_mask,
-                        query_chunk_size=sparse_attention_query_chunk_size,
-                        use_gather=sparse_attention_use_gather,
-                    )
-
-                output = torch_checkpoint.checkpoint(
-                    _compute_sparse_attention,
-                    query,
-                    key,
-                    value,
-                    use_reentrant=False,
-                )
-            else:
-                output = unfused_grouped_dsa_fn(
-                    query,
-                    key,
-                    value,
-                    topk_indices,
-                    self.softmax_scale,
-                    mask=sparse_attention_mask,
-                    query_chunk_size=sparse_attention_query_chunk_size,
-                    use_gather=sparse_attention_use_gather,
-                )
+            output = unfused_grouped_dsa_fn(
+                query,
+                key,
+                value,
+                topk_indices,
+                self.softmax_scale,
+                mask=sparse_attention_mask,
+                query_chunk_size=sparse_attention_query_chunk_size,
+                use_gather=sparse_attention_use_gather,
+            )
             if indexer_loss is not None:
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output
