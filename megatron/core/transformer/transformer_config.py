@@ -1129,6 +1129,14 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_warmup_steps: int = 3
     """Number of warmup steps for CUDA graphs"""
 
+    cuda_graph_parallel_prewarm: bool = False
+    """Prewarm Transformer Engine CUDA Graph kernels independently on every PP stage.
+
+    Before the first pipeline iteration, each rank runs one synthetic forward/backward for every
+    graphable layer in its local PP/VPP model chunks. This avoids serializing lazy kernel
+    initialization through pipeline P2P dependencies.
+    """
+
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
     When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
@@ -3251,6 +3259,15 @@ class TransformerConfig(ModelParallelConfig):
                 f"(experimental_attention_variant={self.experimental_attention_variant!r}, "
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
+            )
+
+        if self.cuda_graph_parallel_prewarm:
+            assert self.cuda_graph_impl == "transformer_engine", (
+                "cuda_graph_parallel_prewarm requires "
+                "cuda_graph_impl='transformer_engine'."
+            )
+            assert self.pipeline_model_parallel_size > 1, (
+                "cuda_graph_parallel_prewarm requires pipeline_model_parallel_size > 1."
             )
 
         if self.cuda_graph_impl != "none":

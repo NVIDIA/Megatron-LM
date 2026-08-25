@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -1910,6 +1910,240 @@ class TECudaGraphHelper:
         were found, and True if at least one graph was successfully created.
         """
         return self._graphs_created
+
+    @staticmethod
+    def _get_local_prewarm_order(num_model_chunks):
+        """Return one local forward/backward pair for every VPP model chunk."""
+        assert num_model_chunks > 0
+        forward = list(range(1, num_model_chunks + 1))
+        return forward + [-chunk_id for chunk_id in reversed(forward)]
+
+    def _get_local_prewarm_arguments(self):
+        """Build one static sample for every local graph callable."""
+        previous_num_microbatches = self.num_microbatches
+        try:
+            self.num_microbatches = 1
+            order = self._get_local_prewarm_order(self.num_model_chunks)
+            return self._get_sample_arguments(order)
+        finally:
+            self.num_microbatches = previous_num_microbatches
+
+    @staticmethod
+    def _collect_differentiable_tensors(value):
+        """Flatten differentiable tensors from a nested callable output."""
+        if torch.is_tensor(value):
+            return [value] if value.requires_grad else []
+        if isinstance(value, dict):
+            tensors = []
+            for item in value.values():
+                tensors.extend(TECudaGraphHelper._collect_differentiable_tensors(item))
+            return tensors
+        if isinstance(value, (tuple, list)):
+            tensors = []
+            for item in value:
+                tensors.extend(TECudaGraphHelper._collect_differentiable_tensors(item))
+            return tensors
+        return []
+
+    @staticmethod
+    def _get_prewarm_quantization_context(callable_module, is_mtp):
+        """Return the per-layer FP8/FP4 context used by normal model execution."""
+        config = callable_module.config
+        layer_number = -1 if is_mtp else callable_module.layer_number - 1
+        if config.fp8:
+            from megatron.core.fp8_utils import get_fp8_context
+
+            return get_fp8_context(config, layer_number)
+        if config.fp4:
+            from megatron.core.fp4_utils import get_fp4_context
+
+            return get_fp4_context(config, layer_number)
+        return nullcontext()
+
+    def parallel_prewarm(self):
+        """Initialize lazy kernels concurrently across pipeline stages.
+
+        Each process executes one synthetic forward/backward for every local graphable layer.
+        These calls use only collectives within the local stage's TP/CP/EP groups, so different
+        pipeline stages can initialize kernels concurrently without pipeline P2P communication.
+        """
+        assert not self._capture_finished
+
+        if getattr(self.config, 'moe_paged_stash', False):
+            from megatron.core.transformer.moe.paged_stash import PagedStashManager
+
+            assert not PagedStashManager.get_instance().enabled, (
+                "Parallel CUDA graph prewarm must run before the first Paged Stash schedule."
+            )
+
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+        start_time = time.time()
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.INFO,
+            msg=(
+                f'Rank {torch.distributed.get_rank()}: starting parallel CUDA graph prewarm for '
+                f'{len(self.flattened_callables)} local layers.'
+            ),
+        )
+
+        sample_args = []
+        sample_kwargs = []
+        buffer_backups = []
+        first_microbatch_backups = []
+        saved_fp8_tensors = None
+        offload_disabled = False
+        capture_started = False
+        warmup_started = False
+
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+            DSAIndexerLossLoggingHelper,
+        )
+        from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+
+        dsa_tracker = DSAIndexerLossLoggingHelper.tracker
+        dsa_tracker_backup = {
+            key: value.clone() if torch.is_tensor(value) else value
+            for key, value in dsa_tracker.items()
+        }
+        loss_scale_backups = (
+            (DSAIndexerLossAutoScaler, DSAIndexerLossAutoScaler.main_loss_backward_scale),
+            (MoEAuxLossAutoScaler, MoEAuxLossAutoScaler.main_loss_backward_scale),
+        )
+
+        try:
+            sample_args, sample_kwargs = self._get_local_prewarm_arguments()
+            assert (
+                len(sample_args)
+                == len(sample_kwargs)
+                == len(self.flattened_callables)
+                == len(self.flattened_callables_is_mtp)
+            ), "Parallel prewarm requires exactly one sample for every local graph callable."
+
+            seen_buffers = set()
+            seen_modules = set()
+            for callable_module in self.flattened_callables:
+                for module in callable_module.modules():
+                    module_id = id(module)
+                    if module_id not in seen_modules:
+                        seen_modules.add(module_id)
+                        if hasattr(module, 'is_first_microbatch'):
+                            first_microbatch_backups.append((module, module.is_first_microbatch))
+                            module.is_first_microbatch = True
+                    for buffer in module.buffers(recurse=False):
+                        buffer_id = id(buffer)
+                        if buffer_id not in seen_buffers:
+                            seen_buffers.add(buffer_id)
+                            buffer_backups.append((buffer, buffer.clone()))
+
+            if self.config.fp8:
+                from megatron.core.fp8_utils import get_fp8_recipe
+
+                saved_fp8_tensors = save_fp8_tensors(
+                    self.flattened_callables, get_fp8_recipe(self.config)
+                )
+            elif self.config.fp4:
+                from megatron.core.fp4_utils import get_fp4_recipe
+
+                saved_fp8_tensors = save_fp8_tensors(
+                    self.flattened_callables, get_fp4_recipe(self.config)
+                )
+
+            if self.config.fine_grained_activation_offloading:
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
+                )
+
+                off_interface.disable_offload()
+                offload_disabled = True
+
+            from megatron.core.enums import Fp8Recipe
+            from megatron.core.fp8_utils import get_fp8_context
+            from megatron.core.tensor_parallel.random import _fork_rng
+
+            outer_quantization_context = (
+                get_fp8_context(self.config)
+                if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+                else nullcontext()
+            )
+
+            _set_capture_start()
+            capture_started = True
+            _set_warmup_start()
+            warmup_started = True
+            with ExitStack() as stack:
+                for model_chunk in self.model:
+                    no_sync = getattr(model_chunk, 'no_sync', None)
+                    if callable(no_sync):
+                        stack.enter_context(no_sync())
+
+                with _fork_rng(), outer_quantization_context:
+                    for callable_module, is_mtp, args, kwargs in zip(
+                        self.flattened_callables,
+                        self.flattened_callables_is_mtp,
+                        sample_args,
+                        sample_kwargs,
+                    ):
+                        inner_quantization_context = (
+                            nullcontext()
+                            if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+                            else self._get_prewarm_quantization_context(callable_module, is_mtp)
+                        )
+                        with inner_quantization_context:
+                            outputs = callable_module._te_cuda_graph_capture(*args, **kwargs)
+                        differentiable_outputs = self._collect_differentiable_tensors(outputs)
+                        assert differentiable_outputs, (
+                            "A training CUDA graph prewarm must produce a differentiable tensor."
+                        )
+                        torch.autograd.backward(
+                            differentiable_outputs,
+                            grad_tensors=[
+                                torch.zeros_like(output) for output in differentiable_outputs
+                            ],
+                        )
+                        del outputs, differentiable_outputs
+
+            torch.cuda.synchronize()
+        finally:
+            if warmup_started:
+                _set_warmup_end()
+            if capture_started:
+                _set_capture_end()
+            if saved_fp8_tensors is not None:
+                restore_fp8_tensors(self.flattened_callables, saved_fp8_tensors)
+            with torch.no_grad():
+                for buffer, backup in buffer_backups:
+                    buffer.copy_(backup)
+            for module, is_first_microbatch in first_microbatch_backups:
+                module.is_first_microbatch = is_first_microbatch
+            if offload_disabled:
+                off_interface.enable_offload()
+            self._reset_after_capture()
+            dsa_tracker.clear()
+            dsa_tracker.update(dsa_tracker_backup)
+            for loss_scaler, loss_scale in loss_scale_backups:
+                loss_scaler.main_loss_backward_scale = loss_scale
+
+            del sample_args, sample_kwargs, buffer_backups
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        elapsed = time.time() - start_time
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.INFO,
+            msg=(
+                f'Rank {torch.distributed.get_rank()}: parallel CUDA graph prewarm completed '
+                f'{len(self.flattened_callables)} local layers in {elapsed:.2f}s.'
+            ),
+        )
+        torch.distributed.barrier()
 
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """
