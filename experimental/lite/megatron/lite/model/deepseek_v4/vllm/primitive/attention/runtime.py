@@ -112,6 +112,7 @@ class AttentionKernelMetadata:
     cos_sin_cache: torch.Tensor
     packed_seq_params: Any
     compressor_metadata: DS4CompressorMetadata | None
+    indexer_compressor_metadata: DS4CompressorMetadata | None
 
 
 def _allocate_k_cache(
@@ -136,10 +137,12 @@ def _build_compressor_metadata(
     ratio: int,
     rows: int,
     cos_sin_cache: torch.Tensor,
+    head_dim: int | None = None,
 ) -> DS4CompressorMetadata | None:
     if ratio not in (4, 128):
         return None
     device = cos_sin_cache.device
+    head_dim = config.head_dim if head_dim is None else head_dim
     d_comp = 8 if ratio == 4 else ratio
     alignment = 32 // math.gcd(32, ratio)
     capacity = _round_up(max(1, (rows + d_comp) // ratio), alignment)
@@ -158,7 +161,7 @@ def _build_compressor_metadata(
         state_cache=torch.zeros(
             state.num_blocks,
             state_block_size,
-            2 * coff * config.head_dim,
+            2 * coff * head_dim,
             dtype=torch.float32,
             device=device,
         ),
@@ -171,7 +174,7 @@ def _build_compressor_metadata(
         k_cache=_allocate_k_cache(
             compressed.num_blocks,
             compressed_block_size,
-            584,
+            584 if head_dim == 512 else 132,
             device=device,
         ),
         k_slot_mapping=compressed.slot_mapping,
@@ -279,6 +282,17 @@ class AttentionMetadataBuilder:
                 ratio=self.ratio,
                 rows=positions.numel(),
                 cos_sin_cache=self.cos_sin_cache,
+            ),
+            indexer_compressor_metadata=(
+                _build_compressor_metadata(
+                    self.config,
+                    ratio=self.ratio,
+                    rows=positions.numel(),
+                    cos_sin_cache=self.cos_sin_cache,
+                    head_dim=self.config.index_head_dim,
+                )
+                if self.ratio == 4
+                else None
             ),
         )
 
@@ -405,7 +419,34 @@ def quantized_main_k_visible(functional_k: torch.Tensor) -> torch.Tensor:
         functional_k.detach().contiguous(), cache, slots, block_size=64
     )
     visible = _dequantize_packed_cache(cache, rows)
-    return functional_k + (visible - functional_k).detach()
+    return visible + (functional_k - functional_k.detach())
+
+
+def _dequantize_indexer_k_cache(
+    k_cache: torch.Tensor, rows: int
+) -> torch.Tensor:
+    block_size = k_cache.shape[1]
+    storage = k_cache.as_strided(
+        (k_cache.shape[0] * k_cache.stride(0),),
+        (1,),
+    )
+    slots = torch.arange(rows, dtype=torch.int64, device=k_cache.device)
+    block_ids = torch.div(slots, block_size, rounding_mode="floor")
+    block_offsets = slots % block_size
+    block_bases = block_ids * k_cache.stride(0)
+    columns = torch.arange(128, device=k_cache.device)
+    fp8_bytes = storage[
+        block_bases[:, None] + block_offsets[:, None] * 128 + columns
+    ].contiguous()
+    scale_bytes = storage[
+        block_bases[:, None]
+        + block_size * 128
+        + block_offsets[:, None] * 4
+        + torch.arange(4, device=k_cache.device)
+    ].contiguous()
+    visible = fp8_bytes.view(torch.float8_e4m3fn).float()
+    visible *= scale_bytes.view(torch.float32)
+    return visible.to(torch.bfloat16)
 
 
 def official_compact_compressed_visible(
@@ -476,28 +517,33 @@ def official_compact_compressed_visible(
             head_dim=head_dim,
             metadata=segment,
         )
-        output = torch.empty(
-            (1, segment_groups, head_dim),
-            dtype=torch.bfloat16,
-            device=compact_score.device,
-        )
-        blocks = (segment_groups + block_size - 1) // block_size
-        dequantize_and_gather_k_cache_triton(
-            output,
-            segment.k_cache,
-            torch.tensor(
-                [segment_groups], dtype=torch.int32, device=compact_score.device
-            ),
-            None,
-            torch.arange(
-                blocks, dtype=torch.int32, device=compact_score.device
-            ).unsqueeze(0),
-            block_size,
-            0,
-        )
-        visible_parts.append(output.squeeze(0))
+        if head_dim == 128:
+            visible_parts.append(
+                _dequantize_indexer_k_cache(segment.k_cache, segment_groups)
+            )
+        else:
+            output = torch.empty(
+                (1, segment_groups, head_dim),
+                dtype=torch.bfloat16,
+                device=compact_score.device,
+            )
+            blocks = (segment_groups + block_size - 1) // block_size
+            dequantize_and_gather_k_cache_triton(
+                output,
+                segment.k_cache,
+                torch.tensor(
+                    [segment_groups], dtype=torch.int32, device=compact_score.device
+                ),
+                None,
+                torch.arange(
+                    blocks, dtype=torch.int32, device=compact_score.device
+                ).unsqueeze(0),
+                block_size,
+                0,
+            )
+            visible_parts.append(output.squeeze(0))
     visible = torch.cat(visible_parts)
-    return functional_k + (visible - functional_k).detach()
+    return visible + (functional_k - functional_k.detach())
 
 
 def official_local_qk_visible(
@@ -533,8 +579,8 @@ def official_local_qk_visible(
         kv, positions, cos_sin_cache, rope_dim, eps, normalize=False
     )
     return (
-        q_graph + (q_visible - q_graph).detach(),
-        k_graph + (k_visible - k_graph).detach(),
+        q_visible + (q_graph - q_graph.detach()),
+        k_visible + (k_graph - k_graph.detach()),
     )
 
 

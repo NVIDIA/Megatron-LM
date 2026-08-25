@@ -541,6 +541,22 @@ class VLLMAttention(CompressedSparseAttention):
                     rope_dim=self.config.qk_rope_head_dim,
                     eps=self.config.rms_norm_eps,
                 )
+                if metadata.indexer_compressor_metadata is None:
+                    raise RuntimeError(
+                        "C4 indexer requires official compressor metadata"
+                    )
+                index_k_local = official_compact_compressed_visible(
+                    index_k_local,
+                    compact_index_score,
+                    self.indexer.compressor.ape.detach(),
+                    self.indexer.compressor.norm.weight.detach(),
+                    group_ids,
+                    metadata.cos_sin_cache,
+                    operation=compressor_operation,
+                    runtime_metadata=metadata.indexer_compressor_metadata,
+                    ratio=ratio,
+                    head_dim=self.config.index_head_dim,
+                )
                 if cp_size > 1:
                     index_k_rank_major, index_k_seq_major = gather_cp_compressed_rows(
                         index_k_local,

@@ -101,6 +101,13 @@ def test_training_metadata_has_only_local_packed_state(
         assert compressor is not None
         assert compressor.token_to_req_indices.shape == (expected_tokens,)
         assert compressor.token_to_req_indices.count_nonzero().item() == 0
+    if layer_idx == 2:
+        indexer = metadata.indexer_compressor_metadata
+        assert indexer is not None
+        assert indexer.state_cache.shape[-1] == 512
+        assert indexer.k_cache.shape[-1] == 132
+    else:
+        assert metadata.indexer_compressor_metadata is None
 
 
 def _compressor_metadata(tokens: int = 4):
