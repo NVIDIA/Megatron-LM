@@ -267,12 +267,7 @@ def create_group(
 
 
 def _create_local_sync_group_for_rank(
-    rank_groups,
-    rank,
-    timeout=None,
-    backend=None,
-    pg_options=None,
-    group_desc=None,
+    rank_groups, rank, timeout=None, backend=None, pg_options=None, group_desc=None
 ):
     """Create one local-sync group per rank for a disjoint group family.
 
@@ -508,9 +503,7 @@ class RankGenerator(object):
         rank_offset: int = 0,
         gtp_remat: int = 1,
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp

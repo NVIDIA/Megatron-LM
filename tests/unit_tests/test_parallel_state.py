@@ -64,14 +64,7 @@ def test_pipeline_parallel_initializations(order):
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize(
-    ('tp', 'pp', 'ep'),
-    (
-        (1, 2, 1),
-        (2, 2, 1),
-        (1, 2, 2),
-    ),
-)
+@pytest.mark.parametrize(('tp', 'pp', 'ep'), ((1, 2, 1), (2, 2, 1), (1, 2, 2)))
 def test_local_sync_group_name_alignment(tp, pp, ep):
     """Sparse PP subgroups must not desynchronize later cross-PP group names."""
     Utils.initialize_distributed()
