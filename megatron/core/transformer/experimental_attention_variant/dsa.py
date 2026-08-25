@@ -296,8 +296,17 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        # MTP layers use global layer numbers beyond the decoder-layer count. Grow the
+        # tracker to the largest observed layer number so those losses remain addressable.
+        needed = max(num_layers, layer_number)
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < needed:
+            grown = torch.zeros(
+                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
@@ -312,16 +321,41 @@ class DSAIndexerLossLoggingHelper:
         tracker["avg_group"] = None
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(num_layers: Optional[int] = None):
+        """Collect and reduce the indexer losses across ranks.
+
+        Pipeline ranks can observe different highest layer numbers when MTP is placed on
+        only one stage. Negotiate one tracker size before reducing the loss values so every
+        rank enters the collective with the same tensor shape.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        if tracker.get("agreed_size") is not None:
+            size = tracker["agreed_size"]
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_tensor = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(
+                size_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
+            )
+            size = int(size_tensor.item())
+            tracker["agreed_size"] = size
+        if size == 0:
             return
+        if "values" not in tracker:
+            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -1798,8 +1832,16 @@ class DSAttention(MegatronModule):
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
 
+        shared_key_is_tp_cp_global = (
+            reuse_mtp_source
+            and sequence_parallel_tp
+            and cp_size > 1
+            and key.size(0) == sequence_parallel_tp_full_rows * cp_size
+        )
         if sequence_parallel_tp:
-            if key.size(0) == local_sequence_rows:
+            if shared_key_is_tp_cp_global:
+                pass
+            elif key.size(0) == local_sequence_rows:
                 key = gather_from_sequence_parallel_region(key, group=tp_group)
             elif key.size(0) != sequence_parallel_tp_full_rows:
                 raise RuntimeError(

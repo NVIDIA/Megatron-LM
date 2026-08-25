@@ -30,12 +30,24 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     MultiTokenPredictionLayer,
 )
-from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.launch_on_gb200
+
+
+class _CustomAttentionWithoutMTPKeyword(nn.Module):
+    """Minimal custom attention builder retaining the pre-existing constructor contract."""
+
+    def __init__(self, *, config, layer_number, pg_collection, name=None):
+        super().__init__()
+        self.config = config
+        self.layer_number = layer_number
+        self.pg_collection = pg_collection
+        self.name = name
 
 
 def _make_config(**overrides) -> MLATransformerConfig:
@@ -120,6 +132,29 @@ def test_iteration_sharing_accepts_selective_mla_up_projection_recompute():
     config = _make_config(recompute_granularity="selective", recompute_modules=["mla_up_proj"])
 
     assert config.recompute_modules == ["mla_up_proj"]
+
+
+def test_feature_off_mtp_keeps_custom_attention_builder_contract():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    try:
+        config = _make_config(
+            dsa_mtp_index_kv_share=False,
+            experimental_attention_variant=None,
+            multi_latent_attention=False,
+        )
+        custom_attention = ModuleSpec(module=_CustomAttentionWithoutMTPKeyword)
+        layer = TransformerLayer(
+            config,
+            TransformerLayerSubmodules(
+                self_attention=custom_attention, cross_attention=custom_attention
+            ),
+            is_mtp_layer=True,
+        )
+
+        assert isinstance(layer.self_attention, _CustomAttentionWithoutMTPKeyword)
+        assert isinstance(layer.cross_attention, _CustomAttentionWithoutMTPKeyword)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_nonsharing_selective_mla_up_projection_keeps_joint_qk_checkpoint(monkeypatch):
@@ -527,8 +562,9 @@ def test_repeated_mtp_dsa_index_and_kv_share_native_parity(
         Utils.destroy_model_parallel()
 
 
-def test_indexer_loss_is_computed_only_by_the_source_iteration(monkeypatch):
+def test_indexer_loss_is_computed_only_by_the_source_iteration():
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    dsa_module.DSAIndexerLossLoggingHelper.tracker.clear()
     try:
         model_parallel_cuda_manual_seed(2345)
         torch.manual_seed(2345)
@@ -541,13 +577,6 @@ def test_indexer_loss_is_computed_only_by_the_source_iteration(monkeypatch):
             .bfloat16()
             .cuda()
         )
-        tracked_losses = []
-        monkeypatch.setattr(
-            dsa_module.DSAIndexerLossLoggingHelper,
-            "save_loss_to_tracker",
-            staticmethod(lambda **kwargs: tracked_losses.append(kwargs["loss"])),
-        )
-
         total_tokens = 9
         valid = _causal_segment_mask(total_tokens, None, device="cuda")
         attention_mask = torch.zeros(
@@ -574,14 +603,50 @@ def test_indexer_loss_is_computed_only_by_the_source_iteration(monkeypatch):
 
         sum(output.float().sum() for output in outputs).backward()
 
-        assert len(tracked_losses) == 1
-        assert tracked_losses[0].requires_grad
+        tracker_values = dsa_module.DSAIndexerLossLoggingHelper.tracker["values"]
+        assert tracker_values.shape == (config.num_layers + 1,)
+        assert tracker_values[config.num_layers] > 0
         for name in ("linear_wq_b.weight", "linear_wk.weight", "linear_weights_proj.weight"):
             parameter = dict(attention.core_attention.indexer.named_parameters())[name]
             assert parameter.grad is not None
             assert torch.isfinite(parameter.grad).all()
     finally:
+        dsa_module.DSAIndexerLossLoggingHelper.tracker.clear()
         Utils.destroy_model_parallel()
+
+
+def test_indexer_loss_tracker_negotiates_mtp_size_on_empty_pp_rank(monkeypatch):
+    tracker = dsa_module.DSAIndexerLossLoggingHelper.tracker
+    tracker.clear()
+    pp_group = object()
+    dp_group = object()
+    collectives = []
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_group", lambda: pp_group)
+    monkeypatch.setattr(
+        parallel_state, "get_data_parallel_group", lambda with_context_parallel=False: dp_group
+    )
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        collectives.append((tensor.shape, op, group))
+        if tensor.dtype == torch.long:
+            tensor.fill_(3)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    try:
+        dsa_module.DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(num_layers=2)
+
+        assert tracker["agreed_size"] == 3
+        assert tracker["values"].shape == (3,)
+        assert torch.count_nonzero(tracker["values"]) == 0
+        assert collectives[0] == ((1,), torch.distributed.ReduceOp.MAX, pp_group)
+        assert collectives[1][0] == (3,)
+        assert collectives[1][2] is pp_group
+        assert collectives[-1][2] is dp_group
+    finally:
+        tracker.clear()
 
 
 def test_source_indexer_loss_and_gradients_match_unshared_oracle(monkeypatch):
@@ -863,6 +928,133 @@ def test_tp2_sequence_parallel_reuses_global_source_kv_and_topk(monkeypatch):
         assert torch.isfinite(source_hidden.grad).all()
         assert torch.isfinite(consumer_hidden.grad).all()
         assert call_counts == {"kv": 1, "indexer": 1, "sparse": 2}
+        for hook in hooks:
+            hook.remove()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_tp2_cp2_reuses_already_global_source_kv_without_regather(monkeypatch):
+    if Utils.world_size < 4:
+        pytest.skip("TP2 x CP2 MTP DSA sharing requires at least four distributed ranks")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(4123)
+        rank_seed = (
+            4123
+            + parallel_state.get_tensor_model_parallel_rank()
+            + 2 * parallel_state.get_context_parallel_rank()
+        )
+        torch.manual_seed(rank_seed)
+        torch.cuda.manual_seed(rank_seed)
+
+        config = _make_config(
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+            sequence_parallel=True,
+            cp_comm_type="all_gather",
+        )
+        attention_spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
+        attention = (
+            build_module(
+                attention_spec,
+                config=config,
+                layer_number=1,
+                cp_comm_type=config.cp_comm_type,
+                is_mtp_layer=True,
+            )
+            .bfloat16()
+            .cuda()
+        )
+        call_counts = {
+            "kv": 0,
+            "indexer": 0,
+            "sparse": 0,
+            "kv_cp_gather": 0,
+            "indexer_cp_gather": 0,
+        }
+        hooks = [
+            attention.linear_kv_down_proj.register_forward_hook(
+                lambda *_args: call_counts.__setitem__("kv", call_counts["kv"] + 1)
+            ),
+            attention.core_attention.indexer.linear_wq_b.register_forward_hook(
+                lambda *_args: call_counts.__setitem__("indexer", call_counts["indexer"] + 1)
+            ),
+        ]
+        original_sparse_attention = dsa_module._run_sparse_attention
+
+        def counted_sparse_attention(*args, **kwargs):
+            call_counts["sparse"] += 1
+            return original_sparse_attention(*args, **kwargs)
+
+        monkeypatch.setattr(dsa_module, "_run_sparse_attention", counted_sparse_attention)
+        original_gather = dsa_module.gather_from_sequence_parallel_region
+
+        def counted_gather(tensor, group=None, **kwargs):
+            if group is parallel_state.get_context_parallel_group():
+                if tensor.size(-1) == config.kv_lora_rank + config.qk_pos_emb_head_dim:
+                    call_counts["kv_cp_gather"] += 1
+                elif tensor.size(-1) == config.dsa_indexer_head_dim:
+                    call_counts["indexer_cp_gather"] += 1
+            return original_gather(tensor, group=group, **kwargs)
+
+        monkeypatch.setattr(dsa_module, "gather_from_sequence_parallel_region", counted_gather)
+
+        local_tokens = 8
+        tp_cp_tokens = local_tokens * config.tensor_model_parallel_size
+        global_tokens = tp_cp_tokens * config.context_parallel_size
+        cu_seqlens = torch.tensor([0, global_tokens], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens.clone(),
+            cu_seqlens_kv_padded=cu_seqlens.clone(),
+            max_seqlen_q=global_tokens,
+            max_seqlen_kv=global_tokens,
+        )
+        source_hidden = torch.randn(
+            local_tokens,
+            1,
+            config.hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
+        )
+        consumer_hidden = torch.randn_like(source_hidden, requires_grad=True)
+
+        source_context = MTPDSAIterationContext(iteration=0)
+        attention(
+            source_hidden,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+            mtp_dsa_context=source_context,
+        )
+        shared = source_context.require_source_tensors()
+        consumer_context = MTPDSAIterationContext(iteration=1, shared_tensors=shared)
+        consumer_output, _ = attention(
+            consumer_hidden,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+            mtp_dsa_context=consumer_context,
+        )
+        consumer_output.float().square().mean().backward()
+
+        assert shared.key.size(0) == global_tokens
+        assert shared.topk_indices.size(1) == tp_cp_tokens
+        assert torch.all(shared.topk_indices >= -1)
+        assert torch.all(shared.topk_indices < global_tokens)
+        assert source_hidden.grad is not None and source_hidden.grad.float().norm() > 0
+        assert consumer_hidden.grad is not None and consumer_hidden.grad.float().norm() > 0
+        assert torch.isfinite(source_hidden.grad).all()
+        assert torch.isfinite(consumer_hidden.grad).all()
+        assert call_counts == {
+            "kv": 1,
+            "indexer": 1,
+            "sparse": 2,
+            "kv_cp_gather": 1,
+            "indexer_cp_gather": 1,
+        }
         for hook in hooks:
             hook.remove()
     finally:
