@@ -78,7 +78,7 @@ class TestInferenceConfig:
     @pytest.mark.parametrize(
         "async_sched_mode, expected",
         [
-            (None, AsyncScheduleMode.LEGACY),
+            (None, AsyncScheduleMode.ASYNC),
             ("legacy", AsyncScheduleMode.LEGACY),
             (AsyncScheduleMode.LEGACY, AsyncScheduleMode.LEGACY),
             ("async", AsyncScheduleMode.ASYNC),
@@ -86,7 +86,7 @@ class TestInferenceConfig:
         ],
     )
     def test_async_sched_mode_default_and_coercion(self, async_sched_mode, expected):
-        """Ensure async scheduling mode defaults to legacy and accepts strings."""
+        """Ensure async scheduling mode defaults to async and accepts strings."""
         kwargs = {} if async_sched_mode is None else {"async_sched_mode": async_sched_mode}
         assert InferenceConfig(**kwargs).async_sched_mode == expected
 
@@ -96,11 +96,19 @@ class TestInferenceConfig:
         with pytest.raises(ValueError):
             InferenceConfig(async_sched_mode=invalid_mode)
 
-    def test_async_sched_argparse_plumbing(self):
-        """Ensure the CLI exposes async scheduling mode."""
+    @pytest.mark.parametrize(
+        "cli_args, expected",
+        [
+            ([], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "async"], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "legacy"], "legacy"),
+        ],
+    )
+    def test_async_sched_argparse_plumbing(self, cli_args, expected):
+        """Ensure the CLI defaults to async and supports an explicit legacy opt-out."""
         parser = _add_inference_args(ArgumentParser())
-        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "async"])
-        assert args.inference_dynamic_batching_async_sched_mode == "async"
+        args = parser.parse_args(cli_args)
+        assert args.inference_dynamic_batching_async_sched_mode == expected
 
     @pytest.mark.parametrize("invalid_mode", ["serial", "overlap"])
     def test_async_sched_argparse_rejects_removed_modes(self, invalid_mode):
@@ -109,7 +117,15 @@ class TestInferenceConfig:
         with pytest.raises(SystemExit):
             parser.parse_args(["--inference-dynamic-batching-async-sched-mode", invalid_mode])
 
-    def test_inference_setup_config_maps_async_sched_mode(self):
+    @pytest.mark.parametrize(
+        "setup_mode, expected",
+        [
+            (None, AsyncScheduleMode.ASYNC),
+            ("async", AsyncScheduleMode.ASYNC),
+            ("legacy", AsyncScheduleMode.LEGACY),
+        ],
+    )
+    def test_inference_setup_config_maps_async_sched_mode(self, setup_mode, expected):
         """Ensure declarative inference config maps async scheduling mode to runtime config."""
         model = SimpleNamespace(
             position_embedding_type="rope",
@@ -117,7 +133,12 @@ class TestInferenceConfig:
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="async")
+        kwargs = (
+            {}
+            if setup_mode is None
+            else {"inference_dynamic_batching_async_sched_mode": setup_mode}
+        )
+        setup_config = InferenceSetupConfig(**kwargs)
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -127,7 +148,7 @@ class TestInferenceConfig:
             verbose=False,
         )
 
-        assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
+        assert inference_config.async_sched_mode == expected
 
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""

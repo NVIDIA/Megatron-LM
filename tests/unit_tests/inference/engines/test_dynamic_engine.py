@@ -6189,7 +6189,14 @@ class TestChunkedPrefillCudaGraphs:
         model.eval()
         return model
 
-    def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
+    def _build_engine(
+        self,
+        model,
+        enable_chunked_prefill,
+        num_cuda_graphs,
+        context_max_tokens,
+        async_sched_mode=None,
+    ):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
         # FP32 recurrent state. Chunked prefill hands a request's recurrence
@@ -6214,6 +6221,8 @@ class TestChunkedPrefillCudaGraphs:
             max_requests=128,
             sampling_backend='torch',
         )
+        if async_sched_mode is not None:
+            inference_config_kwargs.update(async_sched_mode=async_sched_mode)
         if mamba_config is not None:
             inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
         context = DynamicInferenceContext(
@@ -6391,7 +6400,12 @@ class TestChunkedPrefillCudaGraphs:
 
         baseline_snapshots = []
         baseline_engine = self._build_engine(
-            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+            model,
+            enable_chunked_prefill=False,
+            num_cuda_graphs=None,
+            context_max_tokens=None,
+            # Snapshot counts below intentionally describe the legacy step layout.
+            async_sched_mode=AsyncScheduleMode.LEGACY,
         )
         baseline_outputs, _ = self._run_to_completion(
             baseline_engine, prompts, num_tokens_to_generate, conv_snapshots=baseline_snapshots
@@ -6403,6 +6417,7 @@ class TestChunkedPrefillCudaGraphs:
             enable_chunked_prefill=True,
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=context_max_tokens,
+            async_sched_mode=AsyncScheduleMode.LEGACY,
         )
         chunked_outputs, _ = self._run_to_completion(
             chunked_engine, prompts, num_tokens_to_generate, conv_snapshots=chunked_snapshots

@@ -2229,12 +2229,12 @@ def _add_inference_args(parser):
                        help='Use the same inference sampling seed on every data-parallel rank. '
                             '--deterministic-mode also uses the same seed on every DP rank.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
-                       type=str, default='legacy',
-                       choices=['legacy', 'async'],
+                       type=str, default='async',
+                       choices=['async', 'legacy'],
                        help='Async scheduling mode for dynamic batching. '
-                            '"legacy" (default) preserves the existing resolve-before-prepare '
-                            'path. "async" overlaps asynchronous scheduling phases by reordering '
-                            'them to prepare-before-resolve.')
+                            '"async" (default) overlaps asynchronous scheduling phases by '
+                            'reordering them to prepare-before-resolve. Select "legacy" to '
+                            'disable async scheduling and use the resolve-before-prepare path.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
