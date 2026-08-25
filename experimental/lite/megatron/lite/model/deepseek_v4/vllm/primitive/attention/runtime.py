@@ -461,11 +461,18 @@ def official_compact_compressed_visible(
     runtime_metadata,
     ratio: int,
     head_dim: int,
+    valid_groups: int | None = None,
 ) -> torch.Tensor:
     """Evaluate compact CP groups with the official compressor kernel."""
-    groups = compressed_group_ids.numel()
+    groups = (
+        compressed_group_ids.numel()
+        if valid_groups is None
+        else min(int(valid_groups), compressed_group_ids.numel())
+    )
     if groups == 0:
-        return functional_k
+        return functional_k[:0]
+    functional_k = functional_k[:groups]
+    compressed_group_ids = compressed_group_ids[:groups]
     # Each packed request needs an independent compressor state reset.
     starts = torch.cat(
         (

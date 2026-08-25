@@ -504,6 +504,7 @@ class VLLMAttention(CompressedSparseAttention):
                     runtime_metadata=metadata.compressor_metadata,
                     ratio=ratio,
                     head_dim=self.config.head_dim,
+                    valid_groups=int(cu_seqlens_compressed[-1].item()),
                 )
                 compressed_local = compressed_graph
             else:
@@ -556,6 +557,7 @@ class VLLMAttention(CompressedSparseAttention):
                     runtime_metadata=metadata.indexer_compressor_metadata,
                     ratio=ratio,
                     head_dim=self.config.index_head_dim,
+                    valid_groups=int(cu_seqlens_compressed[-1].item()),
                 )
                 if cp_size > 1:
                     index_k_rank_major, index_k_seq_major = gather_cp_compressed_rows(
@@ -564,11 +566,7 @@ class VLLMAttention(CompressedSparseAttention):
                         cp_group=cp_group,
                     )
                 else:
-                    index_k_seq_major = torch.index_select(
-                        index_k_local,
-                        0,
-                        seq_to_rank_row.clamp_min(0).long(),
-                    )
+                    index_k_seq_major = index_k_local
                 compressed_topk = official_indexer_topk(
                     index_q,
                     indexer_weights,
@@ -640,28 +638,97 @@ class VLLMAttention(CompressedSparseAttention):
         indices = indices.unsqueeze(1)
         scale = self.config.head_dim**-0.5
         sink = self.sinks.float().contiguous()
-        output_buffer = torch.empty_like(q_visible)
+        if cu_seqlens.numel() > 2:
+            # vLLM's BI prefill path launches FlashMLA with request-local M/N.
+            # Keep that geometry for every CP size.  The CP workspace is laid
+            # out as [boundary | local KV | rank-major compressed KV], so build
+            # a request-owned view from the lowered physical indices instead
+            # of relying on CP1's contiguous [KV | compressed KV] layout.
+            result = torch.zeros_like(q_visible)
+            for seq_idx in range(cu_seqlens.numel() - 1):
+                seq_start = int(cu_seqlens[seq_idx].item())
+                seq_end = int(cu_seqlens[seq_idx + 1].item())
+                token_start = max(0, seq_start - global_start)
+                token_end = min(l_local, seq_end - global_start)
+                if token_end <= token_start:
+                    continue
 
-        def visible_attention(q_value, kv_value):
-            return flash_mla_sparse_fwd(
-                q=q_value,
-                kv=kv_value,
-                indices=indices,
-                sm_scale=scale,
-                attn_sink=sink,
-                topk_length=topk_length,
-                out=output_buffer,
+                local_indices = indices[token_start:token_end].clone()
+                valid = local_indices >= 0
+                used_rows = torch.unique(local_indices[valid].to(torch.int64), sorted=True)
+                request_capacity = seq_end - seq_start
+                if cu_seqlens_compressed is not None:
+                    request_capacity += int(
+                        (
+                            cu_seqlens_compressed[seq_idx + 1]
+                            - cu_seqlens_compressed[seq_idx]
+                        ).item()
+                    )
+                if used_rows.numel() > request_capacity:
+                    raise RuntimeError(
+                        "DS4 request-local CP workspace exceeds its request-owned "
+                        f"capacity: used={used_rows.numel()}, capacity={request_capacity}"
+                    )
+                selected_workspace = workspace.index_select(0, used_rows)
+                padding = selected_workspace.new_zeros(
+                    (request_capacity - used_rows.numel(),) + selected_workspace.shape[1:]
+                )
+                local_workspace = torch.cat((selected_workspace, padding), dim=0)
+                remapped = torch.searchsorted(
+                    used_rows, local_indices.clamp_min(0).to(torch.int64)
+                ).to(local_indices.dtype)
+                local_indices = torch.where(
+                    valid, remapped, torch.full_like(local_indices, -1)
+                )
+                # The CuTe backward ABI requires every tensor data pointer to
+                # be 16-byte aligned.  An int32 slice starts at a potentially
+                # unaligned request offset, so give it request-owned storage.
+                local_lengths = topk_length[token_start:token_end].clone()
+                local_output = torch.empty_like(q_visible[token_start:token_end])
+
+                def visible_attention(q_value, kv_value):
+                    return flash_mla_sparse_fwd(
+                        q=q_value,
+                        kv=kv_value,
+                        indices=local_indices,
+                        sm_scale=scale,
+                        attn_sink=sink,
+                        topk_length=local_lengths,
+                        out=local_output,
+                    )
+
+                result[token_start:token_end] = visible_sparse_attention(
+                    visible_attention,
+                    q_visible[token_start:token_end],
+                    local_workspace,
+                    local_indices,
+                    local_lengths,
+                    sink,
+                    softmax_scale=scale,
+                )
+        else:
+            output_buffer = torch.empty_like(q_visible)
+
+            def visible_attention(q_value, kv_value):
+                return flash_mla_sparse_fwd(
+                    q=q_value,
+                    kv=kv_value,
+                    indices=indices,
+                    sm_scale=scale,
+                    attn_sink=sink,
+                    topk_length=topk_length,
+                    out=output_buffer,
+                )
+
+            result = visible_sparse_attention(
+                visible_attention,
+                q_visible,
+                workspace,
+                indices,
+                topk_length,
+                sink,
+                softmax_scale=scale,
             )
-
-        result = visible_sparse_attention(
-            visible_attention,
-            q_visible,
-            workspace,
-            indices,
-            topk_length,
-            sink,
-            softmax_scale=scale,
-        )
         result = result[:, : self.config.num_attention_heads, :]
         if self.indexer_loss_coeff:
             assert indexer_topk_for_loss is not None

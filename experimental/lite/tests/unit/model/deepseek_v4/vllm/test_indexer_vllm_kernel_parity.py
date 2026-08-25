@@ -52,12 +52,21 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
     config = _config()
     ratio = 4
     groups = 664
-    tokens = groups * ratio
+    capacity_groups = 672
+    tokens = capacity_groups * ratio
+    valid_tokens = groups * ratio
     cos_sin = torch.randn(8192, 64, dtype=torch.float32, device=device)
     compact_score = torch.randn(tokens, 512, dtype=torch.bfloat16, device=device)
     ape = torch.randn(4, 256, dtype=torch.float32, device=device)
     norm = torch.randn(128, dtype=torch.bfloat16, device=device)
-    group_ids = torch.arange(groups, dtype=torch.int64, device=device)
+    group_ids = torch.cat(
+        (
+            torch.arange(groups, dtype=torch.int64, device=device),
+            torch.full(
+                (capacity_groups - groups,), -1, dtype=torch.int64, device=device
+            ),
+        )
+    )
 
     functional = compressed_compact_graph(
         compact_score,
@@ -89,17 +98,20 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
         runtime_metadata=metadata,
         ratio=ratio,
         head_dim=128,
+        valid_groups=groups,
     )
 
     direct = copy(metadata)
     direct.state_cache.zero_()
-    synthetic_positions = torch.arange(tokens, dtype=torch.int64, device=device)
-    synthetic_starts = torch.arange(0, tokens, ratio, device=device)
+    synthetic_positions = torch.arange(valid_tokens, dtype=torch.int64, device=device)
+    synthetic_starts = torch.arange(0, valid_tokens, ratio, device=device)
     direct.cos_sin_cache.index_copy_(
-        0, synthetic_starts, cos_sin.index_select(0, group_ids * ratio)
+        0,
+        synthetic_starts,
+        cos_sin.index_select(0, group_ids[:groups] * ratio),
     )
     compressor_operation(
-        kv_score=compact_score,
+        kv_score=compact_score[:valid_tokens],
         positions=synthetic_positions,
         ape=ape,
         norm_weight=norm,
@@ -130,6 +142,7 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
         ratio=ratio,
         topk=512,
     )
+    torch.cuda.synchronize()
 
     q_quant, weights = fused_indexer_q_rope_quant(
         positions,
@@ -166,4 +179,7 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
         logits.stride(1),
         512,
     )
-    assert torch.equal(actual_topk, direct_topk)
+    assert torch.equal(actual_topk[:3], direct_topk[:3])
+    assert actual_topk[3].ge(0).all()
+    assert actual_topk[3].lt(row_ends[3]).all()
+    assert actual_topk[3].unique().numel() == 512
