@@ -2915,6 +2915,17 @@ class TransformerConfig(ModelParallelConfig):
                                 'DtoH copies and synchronizations in the preprocess step.'
                             )
 
+            te_whole_moe_paged_stash = (
+                self.cuda_graph_impl == "transformer_engine"
+                and CudaGraphModule.moe in self.cuda_graph_modules
+                and self.moe_paged_stash
+            )
+            if te_whole_moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
+                    "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
+
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
                     assert (

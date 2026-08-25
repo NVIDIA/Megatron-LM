@@ -96,6 +96,21 @@ def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
 
 
+def _te_whole_moe_paged_stash_config(**overrides) -> TransformerConfig:
+    kwargs = {
+        "cuda_graph_impl": "transformer_engine",
+        "cuda_graph_modules": [CudaGraphModule.moe],
+        "num_moe_experts": 4,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_expert_rank_capacity_factor": 1.2,
+        "moe_paged_stash": True,
+        "use_transformer_engine_op_fuser": True,
+    }
+    kwargs.update(overrides)
+    return _base_cuda_graph_config(**kwargs)
+
+
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -189,18 +204,14 @@ class TestCudaGraphConfigAndArguments:
             )
 
     def test_te_whole_moe_graph_allows_sync_free_hybridep_paged_stash(self):
-        cfg = _base_cuda_graph_config(
-            cuda_graph_impl="transformer_engine",
-            cuda_graph_modules=[CudaGraphModule.moe],
-            num_moe_experts=4,
-            moe_token_dispatcher_type="flex",
-            moe_flex_dispatcher_backend="hybridep",
-            moe_expert_rank_capacity_factor=1.2,
-            moe_paged_stash=True,
-            use_transformer_engine_op_fuser=True,
-        )
+        cfg = _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=2)
 
         assert cfg.cuda_graph_modules == [CudaGraphModule.moe]
+
+    @pytest.mark.parametrize("warmup_steps", [0, 1])
+    def test_te_whole_moe_paged_stash_requires_two_warmup_steps(self, warmup_steps):
+        with pytest.raises(AssertionError, match="require at least 2 cuda_graph_warmup_steps"):
+            _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=warmup_steps)
 
     def test_te_whole_moe_graph_rejects_sync_free_hybridep_without_paged_stash(self):
         with pytest.raises(

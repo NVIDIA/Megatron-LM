@@ -2850,7 +2850,9 @@ class TECudaGraphHelper:
             )
             with (
                 rng_context,
-                paged_stash_te_graph_capture(te_whole_moe_paged_stash, order=kwargs['_order']),
+                paged_stash_te_graph_capture(
+                    te_whole_moe_paged_stash, order=kwargs['_order'], config=self.config
+                ),
             ):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs

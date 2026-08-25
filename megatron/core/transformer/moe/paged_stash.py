@@ -654,6 +654,44 @@ class PagedStashManager:
             ),
         )
 
+    def prepare_stash_buffers(self, config=None):
+        """Allocate and reset buffers for an already-recorded paged-stash schedule.
+
+        This intentionally leaves the iteration and pipeline schedule coordinates unchanged so
+        TE graph capture can recover buffers released by a warmup fallback without pretending to
+        start another training iteration.
+        """
+        assert (
+            self.status == 'captured'
+        ), "Paged stash buffers can only be prepared after the schedule has been captured."
+        if self.stash_buffers is None:
+            cuda_factor = (
+                config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
+            )
+            cpu_factor = (
+                config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
+            )
+            self.allocate_stash_buffers(
+                moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
+                moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
+            )
+
+        assert (
+            self.stash_buffers is not None
+        ), "Paged stash: captured state but stash_buffers is None after allocation."
+        for dtype_buffers in self.stash_buffers.values():
+            for stash_buffer in dtype_buffers.values():
+                stash_buffer.reset()
+        self.overflow.zero_()
+        self.host_spill.zero_()
+        assert (
+            len(self.paged_tensors_to_stash) == 0
+        ), f"paged_tensors_to_stash is not empty {self.paged_tensors_to_stash}"
+        assert len(self.paged_tensors_stash_in_progress) == 0, (
+            f"paged_tensors_stash_in_progress is not empty "
+            f"{self.paged_tensors_stash_in_progress}"
+        )
+
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
         if self._pp_schedule is None:
@@ -757,6 +795,11 @@ class PagedStashManager:
                     f"entry {chunk_id!r} is not supported."
                 )
             vp_stage = abs(chunk_id)
+            if not 1 <= vp_stage <= self.vp_size:
+                raise RuntimeError(
+                    "Paged stash received an invalid VP stage in TE's graph capture order: "
+                    f"chunk ID {chunk_id}, expected magnitude in [1, {self.vp_size}]."
+                )
             template = layer_templates.get(vp_stage)
             if template is None:
                 continue
@@ -783,27 +826,36 @@ class PagedStashManager:
                 )
         return schedule
 
-    def start_te_graph_capture(self, order):
+    def start_te_graph_capture(self, order, config=None):
         """Temporarily install TE's final capture order as the paged-stash schedule."""
-        if not self.enabled or self.status != 'captured':
+        if self.status != 'captured':
             raise RuntimeError(
                 "Paged stash must finish its schedule and buffer warmup before TE graph capture."
             )
         if self._te_graph_capture:
             raise RuntimeError("Paged-stash TE graph capture is already active.")
+        capture_schedule = self._build_te_graph_capture_schedule(order)
+        self.prepare_stash_buffers(config)
         runtime_state = (
+            self.enabled,
             self._pp_schedule,
             self.current_schedule_index,
             self.current_layer,
             self.current_microbatch,
             self.current_vp_stage,
         )
-        self._pp_schedule = self._build_te_graph_capture_schedule(order)
+        self._pp_schedule = capture_schedule
+        # Forward-only evaluation disables the singleton manager and can run immediately before
+        # capture. Capture readiness is tracked by ``status``; temporarily re-enable the manager
+        # so the directly-invoked TE callables still execute their stash hooks.
+        self.enabled = True
         self._te_graph_capture = True
         self.current_schedule_index = 0
-        self.current_layer = [1 for _ in range(self.vp_size)]
-        self.current_microbatch = [0 for _ in range(self.vp_size)]
-        self.current_vp_stage = 0
+        # Install capture-private schedule coordinates. The list cursors must not alias the
+        # saved runtime lists; the VP stage stays unset until decoded from the capture schedule.
+        self.current_layer = None
+        self.current_microbatch = None
+        self.current_vp_stage = None
         return runtime_state
 
     def finish_te_graph_capture(self, runtime_state):
@@ -812,6 +864,7 @@ class PagedStashManager:
             return
         self._te_graph_capture = False
         (
+            self.enabled,
             self._pp_schedule,
             self.current_schedule_index,
             self.current_layer,
@@ -1079,14 +1132,14 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
 
 
 @contextmanager
-def paged_stash_te_graph_capture(enabled, order=None):
+def paged_stash_te_graph_capture(enabled, order=None, config=None):
     """Scope TE capture over a stash schedule built from TE's final capture order."""
     if not enabled:
         yield
         return
 
     stash_manager = PagedStashManager.get_instance()
-    runtime_state = stash_manager.start_te_graph_capture(order)
+    runtime_state = stash_manager.start_te_graph_capture(order, config=config)
     try:
         yield
     finally:
@@ -1114,45 +1167,11 @@ def paged_stash_reset(enabled=True, config=None):
         stash_manager.status = 'capture'
     elif stash_manager.status == 'capture':
         stash_manager.status = 'captured'
-        cuda_factor = config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
-        cpu_factor = config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
-        stash_manager.allocate_stash_buffers(
-            moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
-            moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
-        )
-    elif stash_manager.status == 'captured':
-        # Buffers may have been released after a PagedStashRunner fallback; reallocate using
-        # the same capture-derived maxima and current config factors.
-        if stash_manager.stash_buffers is None:
-            cuda_factor = (
-                config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
-            )
-            cpu_factor = (
-                config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
-            )
-            stash_manager.allocate_stash_buffers(
-                moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
-                moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
-            )
 
     if stash_manager.status == 'captured':
-        assert (
-            stash_manager.stash_buffers is not None
-        ), "Paged stash: captured state but stash_buffers is None after reset/allocation."
-        for dtype in stash_manager.stash_buffers.keys():
-            for hidden_size in stash_manager.stash_buffers[dtype].keys():
-                stash_manager.stash_buffers[dtype][hidden_size].reset()
-        stash_manager.overflow.zero_()
-        stash_manager.host_spill.zero_()
+        stash_manager.prepare_stash_buffers(config)
         stash_manager.current_layer = [1 for _ in range(stash_manager.vp_size)]
         stash_manager.current_microbatch = [0 for _ in range(stash_manager.vp_size)]
-        assert (
-            len(stash_manager.paged_tensors_to_stash) == 0
-        ), f"paged_tensors_to_stash is not empty {stash_manager.paged_tensors_to_stash}"
-        assert len(stash_manager.paged_tensors_stash_in_progress) == 0, (
-            f"paged_tensors_stash_in_progress is not empty "
-            f"{stash_manager.paged_tensors_stash_in_progress}"
-        )
 
 
 def check_paged_stash_overflow():
@@ -1182,6 +1201,8 @@ class PagedStashRunner:
         self.model = model
         self.optimizer = optimizer
         self.forward_backward_func = forward_backward_func
+        self._te_graph_capture_finished = False
+        self._te_graph_runtime_num_microbatches: int | None = None
         self.moe_layers = []
         # Peak per-rank receive capacity the last over-budget step needed, and the
         # moe_expert_rank_capacity_factor that would have covered it, if the backend reports
@@ -1254,6 +1275,11 @@ class PagedStashRunner:
         """Set moe_paged_stash on every tracked training, model, and MoE config."""
         for c in self._configs_to_sync_moe_paged_stash:
             c.moe_paged_stash = value
+
+    def mark_te_graph_captured(self, num_microbatches: int) -> None:
+        """Record rank-consistent TE capture completion and its runtime schedule size."""
+        self._te_graph_capture_finished = True
+        self._te_graph_runtime_num_microbatches = num_microbatches
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -1333,14 +1359,16 @@ class PagedStashRunner:
         return stash_overflow_ranks, overbudget_ranks, host_spill_ranks
 
     def _raise_if_te_whole_moe_graph_overflow(
-        self, stash_overflow_ranks: int, overbudget_ranks: int
+        self, stash_overflow_ranks: int, overbudget_ranks: int, training: bool
     ) -> None:
         """Fail fast when a captured TE whole-MoE graph exceeds its static buffers."""
-        te_whole_moe_graph = (
-            self.config.cuda_graph_impl == "transformer_engine"
+        te_whole_moe_graph_replay = (
+            training
+            and self.config.cuda_graph_impl == "transformer_engine"
             and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and self._te_graph_capture_finished
         )
-        if not te_whole_moe_graph or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
+        if not te_whole_moe_graph_replay or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
             return
 
         raise RuntimeError(
@@ -1351,6 +1379,25 @@ class PagedStashRunner:
             "Increase --moe-expert-rank-capacity-factor and/or "
             "--moe-paged-stash-buffer-size-factor-cuda, then restart the job."
         )
+
+    def _validate_te_whole_moe_graph_runtime(self, training: bool, num_microbatches: int) -> None:
+        """Require the runtime microbatch count to remain fixed after TE graph capture."""
+        te_whole_moe_paged_stash_replay = (
+            training
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and self.config.moe_paged_stash
+            and self._te_graph_capture_finished
+        )
+        if not te_whole_moe_paged_stash_replay:
+            return
+
+        if num_microbatches != self._te_graph_runtime_num_microbatches:
+            raise RuntimeError(
+                "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
+                "runtime microbatch count after capture: expected "
+                f"{self._te_graph_runtime_num_microbatches}, got {num_microbatches}."
+            )
 
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun: go dropless, disable paged stashing, and reset grads/graph.
@@ -1469,6 +1516,7 @@ class PagedStashRunner:
 
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
+        self._validate_te_whole_moe_graph_runtime(training, num_microbatches)
         saved_moe_paged_stash_values = [
             (config, config.moe_paged_stash) for config in self._configs_to_sync_moe_paged_stash
         ]
@@ -1483,7 +1531,9 @@ class PagedStashRunner:
             result = self.forward_backward_func(*args, **kwargs)
 
             stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
-            self._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks, overbudget_ranks)
+            self._raise_if_te_whole_moe_graph_overflow(
+                stash_overflow_ranks, overbudget_ranks, training
+            )
             if stash_overflow_ranks == 0 and overbudget_ranks == 0:
                 if host_spill_ranks > 0:
                     log_single_rank(

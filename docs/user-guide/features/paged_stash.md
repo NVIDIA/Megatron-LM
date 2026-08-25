@@ -22,18 +22,26 @@ Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-ba
 For Transformer Engine per-layer CUDA graphs, the whole MoE scope
 (`--cuda-graph-impl transformer_engine --cuda-graph-modules moe`) is supported by the sync-free
 HybridEP + paged-stash configuration above. Its captured graph is tied to the static expert-rank
-and stash capacities. If either capacity overflows, training fails immediately instead of
-attempting the dynamic rerun; increase the corresponding capacity factor and restart the job.
+and stash capacities. Before graph capture, and during eager evaluation, capacity overflow can
+still use the dynamic rerun. After graph capture, training fails immediately instead of attempting
+an invalid rerun; increase the corresponding capacity factor and restart the job.
 
 Transformer Engine warmup and graph capture both replay the previously recorded paged-stash
 layer templates, preserving the training layer, microbatch, and virtual-pipeline coordinates. The
-runtime paged-stash schedule remains unchanged. Graph capture temporarily expands Transformer
-Engine's final `_order` (which may use a larger dynamic-CP slot upper bound) into a capture-only
-schedule and restores the recorded runtime schedule afterward. This mode requires a Transformer
-Engine version whose ordered warmup follows `_order`; it does not use per-callable cursor hooks.
-The stash/reload kernels remain inside their corresponding CUDA graphs.
-Each per-layer graph joins the stash and reload work it launched on the auxiliary stream before
-its capture ends because CUDA stream dependencies cannot cross independent capture boundaries.
+runtime paged-stash schedule remains unchanged. This mode requires a fixed runtime microbatch
+schedule: the microbatch count may not change after capture, and at least two CUDA graph warmup
+steps are required to record the pipeline schedule. Graph capture temporarily expands Transformer
+Engine's final `_order` into a capture-only schedule and restores the recorded runtime schedule
+afterward. This mode requires a Transformer Engine version whose ordered warmup follows `_order`;
+it does not use per-callable cursor hooks. The stash/reload kernels remain inside their
+corresponding CUDA graphs.
+
+Because Transformer Engine captures each MoE layer as an independent graph, the auxiliary
+pack/unpack stream must rejoin the graph's capture stream before that graph ends. These joins are
+captured graph nodes and therefore execute on every replay. Stash/reload work launched by one MoE
+graph consequently cannot overlap eager work or another graph beyond that graph boundary, although
+work inside the same graph may still overlap before the join. This correctness constraint can
+reduce paged-stash overlap and throughput; benchmark the target PP/VPP configuration.
 
 ## Prerequisites
 
