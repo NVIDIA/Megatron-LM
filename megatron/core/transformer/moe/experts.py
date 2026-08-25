@@ -1214,7 +1214,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
-            logical_dtypes: set[torch.dtype | None] = set()
+            source_dtype: torch.dtype | None = None
             for i in range(self.num_local_experts):
                 w = getattr(linear, f'weight{i}')
                 if isinstance(w, MXFP8Tensor):
@@ -1229,17 +1229,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 validate_mxfp8_tensor(
                     mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
                 )
-                logical_dtypes.add(mxfp8.dtype)
+                if mxfp8.dtype is not None:
+                    if source_dtype is not None and mxfp8.dtype != source_dtype:
+                        raise RuntimeError(
+                            f"Conflicting source dtypes for {linear_name} expert weights: "
+                            f"{source_dtype} and {mxfp8.dtype}."
+                        )
+                    source_dtype = mxfp8.dtype
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
-            known_dtypes = logical_dtypes - {None}
-            if len(known_dtypes) > 1:
-                raise RuntimeError(
-                    f"Conflicting logical dtypes for {linear_name} expert weights: "
-                    f"{known_dtypes}."
-                )
-            logical_dtype = next(iter(known_dtypes), None)
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
@@ -1247,7 +1246,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self,
                 buf_name,
                 MXFP8Tensor(
-                    data=stacked_data, scale=stacked_scale, dtype=logical_dtype, backend=backend
+                    data=stacked_data, scale=stacked_scale, dtype=source_dtype, backend=backend
                 ),
             )
 
