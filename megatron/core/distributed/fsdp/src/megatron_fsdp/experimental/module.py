@@ -27,6 +27,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .placement import Flat
 
 
 def _is_in_backward() -> bool:
