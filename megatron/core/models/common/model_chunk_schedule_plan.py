@@ -1,14 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core.enums import Fp8Recipe
-from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -222,20 +218,7 @@ class TransformerLayerSchedulePlan:
 
     def get_low_precision_context(self):
         """Get the low-precision context for the transformer layer."""
-        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
-        use_inner_fp8_context = (
-            self.layer.config.fp8 and self.layer.config.fp8_recipe != Fp8Recipe.delayed
-        )
-        use_inner_fp4_context = self.layer.config.fp4 and not isinstance(
-            self.layer, MultiTokenPredictionLayer
-        )
-
-        if use_inner_fp8_context:
-            return get_fp8_context(self.layer.config, self.layer.layer_number - 1)
-        if use_inner_fp4_context:
-            return get_fp4_context(self.layer.config, self.layer.layer_number - 1)
-        return nullcontext()
+        return self.layer.get_inner_quantization_context()
 
     @staticmethod
     def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
