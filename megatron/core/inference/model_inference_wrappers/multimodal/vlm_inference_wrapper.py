@@ -430,6 +430,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             embed_dim = language_embeddings.shape[-1]
             final_embedding = language_embeddings.clone()
 
+            # Inject vision embeddings into the decoder input.
             if image_token_mask is not None and image_embeddings is not None:
                 image_positions = image_token_mask >= 0
 

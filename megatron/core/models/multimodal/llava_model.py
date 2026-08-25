@@ -680,6 +680,7 @@ class LLaVAModel(MegatronModule):
         if use_inference_kv_cache:
             return language_embeddings, labels, loss_mask, input_ids, position_ids
 
+        # Temporal media count index for the number of frame/tubelet embeddings only per "video".
         if media_token_counts is not None:
             media_token_counts = media_token_counts.to(device=input_ids.device)
         media_counts = media_token_counts if media_token_counts is not None else num_image_tiles
@@ -1287,17 +1288,20 @@ class LLaVAModel(MegatronModule):
                         )
                     chunks = _pixel_shuffle_dynamic_resolution_chunks(chunks, sizes, patch_dim)
                 tubelet_token_counts = (
-                    [chunk.shape[0] for chunk in chunks] if self.add_decoder else None
+                    torch.tensor(
+                        [chunk.shape[0] for chunk in chunks],
+                        dtype=torch.int32,
+                        device=image_embeddings.device,
+                    )
+                    if self.add_decoder
+                    else None
                 )
                 image_embeddings = torch.cat(chunks, dim=0)
 
                 image_embeddings = image_embeddings.unsqueeze(0)
                 if tubelet_token_counts is not None:
-                    placeholder_token_counts = _group_temporal_token_counts(
+                    media_token_counts = _group_temporal_token_counts_tensor(
                         tubelet_token_counts, media_tubelet_counts
-                    )
-                    media_token_counts = torch.tensor(
-                        placeholder_token_counts, dtype=torch.int, device=image_embeddings.device
                     )
             else:
                 # Stock CLIPViTModel does not accept VLM-specific kwargs.
@@ -1662,22 +1666,6 @@ def _pixel_shuffle_dynamic_resolution_chunks(
         )
         shuffled_chunks.append(shuffled.squeeze(0) if restore_2d else shuffled)
     return shuffled_chunks
-
-
-def _group_temporal_token_counts(
-    tubelet_token_counts: list[int], media_tubelet_counts: list[int]
-) -> list[int]:
-    """Return one token count per temporal media item."""
-    if sum(media_tubelet_counts) != len(tubelet_token_counts):
-        raise ValueError("media_tubelet_counts must partition tubelet_token_counts exactly.")
-    media_token_counts = []
-    tubelet_offset = 0
-    for tubelet_count in media_tubelet_counts:
-        media_token_counts.append(
-            sum(tubelet_token_counts[tubelet_offset : tubelet_offset + tubelet_count])
-        )
-        tubelet_offset += tubelet_count
-    return media_token_counts
 
 
 def _group_temporal_token_counts_tensor(

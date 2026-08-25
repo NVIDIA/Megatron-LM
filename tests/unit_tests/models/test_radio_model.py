@@ -373,18 +373,17 @@ class TestPixelShuffleNonSquare:
 
     @pytest.mark.internal
     def test_temporal_token_counts_group_one_placeholder_per_media(self):
-        from megatron.core.models.multimodal.llava_model import (
-            _group_temporal_token_counts,
-            _group_temporal_token_counts_tensor,
-        )
+        from megatron.core.models.multimodal.llava_model import _group_temporal_token_counts_tensor
 
-        tubelet_counts = [252, 252, 128]
+        tubelet_counts = torch.tensor([252, 252, 128], dtype=torch.int32, device="cuda")
         media_tubelet_counts = [2, 1]
-        assert _group_temporal_token_counts(tubelet_counts, media_tubelet_counts) == [504, 128]
+        grouped_counts = _group_temporal_token_counts_tensor(tubelet_counts, media_tubelet_counts)
+        assert torch.equal(
+            grouped_counts, torch.tensor([504, 128], dtype=torch.int32, device="cuda")
+        )
 
         # temporal_patch_dim=1 makes every frame one tubelet. A per-video
         # placeholder therefore receives the sum of all frame embeddings.
-        assert _group_temporal_token_counts([64, 64, 32], [2, 1]) == [128, 32]
         device_counts = torch.tensor([64, 64, 32], dtype=torch.int32, device="cuda")
         grouped_counts = _group_temporal_token_counts_tensor(device_counts, [2, 1])
         assert torch.equal(
@@ -392,7 +391,7 @@ class TestPixelShuffleNonSquare:
         )
 
         with pytest.raises(ValueError, match="must partition"):
-            _group_temporal_token_counts(tubelet_counts, [1, 1])
+            _group_temporal_token_counts_tensor(tubelet_counts, [1, 1])
 
 
 class TestRADIODynamicResAndTemporal:

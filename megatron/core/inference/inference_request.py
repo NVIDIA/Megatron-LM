@@ -49,6 +49,26 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
+def _normalize_raw_media_items(modality_data: Any) -> Optional[List[bytes]]:
+    """Normalize supported raw-media inputs, or return None for preprocessed data."""
+    if isinstance(modality_data, (bytes, bytearray)):
+        return [bytes(modality_data)]
+    if isinstance(modality_data, list):
+        if any(not isinstance(item, (bytes, bytearray)) for item in modality_data):
+            raise TypeError("Raw media lists must contain only bytes or bytearray values.")
+        return [bytes(item) for item in modality_data]
+    return None
+
+
+def _media_tensor_keys(modality: str) -> Tuple[str, ...]:
+    """Return the tensor fields that define a preprocessed media input."""
+    if modality == "video":
+        return ("imgs", "imgs_sizes", "num_frames")
+    if modality == "image":
+        return ("imgs", "imgs_sizes", "num_tiles")
+    raise ValueError(f"Unsupported media modality: {modality!r}.")
+
+
 def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     """Return a stable content key for raw or preprocessed media.
 
@@ -61,52 +81,41 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     digest.update(modality.encode())
     digest.update(b"\0")
 
-    if isinstance(modality_data, (bytes, bytearray)):
-        items = [bytes(modality_data)]
-    elif isinstance(modality_data, list):
-        items = [bytes(item) for item in modality_data]
-    else:
-        items = None
-
-    if items is not None:
+    raw_items = _normalize_raw_media_items(modality_data)
+    if raw_items is not None:
         digest.update(b"raw\0")
-        for item in items:
+        for item in raw_items:
             digest.update(len(item).to_bytes(8, "big"))
             digest.update(item)
         return digest.hexdigest()
 
-    if not isinstance(modality_data, dict):
-        raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
+    if isinstance(modality_data, dict):
+        digest.update(b"preprocessed\0")
+        cache_fields = set(_media_tensor_keys(modality)) | {"num_img_embeddings_per_tile"}
+        for name in sorted(set(modality_data) & cache_fields):
+            value = modality_data[name]
+            digest.update(name.encode())
+            digest.update(b"\0")
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().contiguous().cpu()
+                digest.update(str(tensor.dtype).encode())
+                digest.update(b"\0")
+                digest.update(repr(tuple(tensor.shape)).encode())
+                digest.update(b"\0")
+                # Viewing a flattened tensor as uint8 works for dtypes such as
+                # bfloat16 that NumPy cannot represent directly.
+                digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+            elif name == "num_img_embeddings_per_tile":
+                digest.update(str(int(value)).encode())
+            else:
+                raise TypeError(
+                    f"Cannot compute a media cache key from field {name!r} "
+                    f"of type {type(value).__name__}."
+                )
+            digest.update(b"\0")
+        return digest.hexdigest()
 
-    digest.update(b"preprocessed\0")
-    tensor_fields = (
-        {"imgs", "imgs_sizes", "num_frames"}
-        if modality == "video"
-        else {"imgs", "imgs_sizes", "num_tiles"}
-    )
-    cache_fields = tensor_fields | {"num_img_embeddings_per_tile"}
-    for name in sorted(set(modality_data) & cache_fields):
-        value = modality_data[name]
-        digest.update(name.encode())
-        digest.update(b"\0")
-        if isinstance(value, torch.Tensor):
-            tensor = value.detach().contiguous().cpu()
-            digest.update(str(tensor.dtype).encode())
-            digest.update(b"\0")
-            digest.update(repr(tuple(tensor.shape)).encode())
-            digest.update(b"\0")
-            # Viewing a flattened tensor as uint8 works for dtypes such as
-            # bfloat16 that NumPy cannot represent directly.
-            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
-        elif name == "num_img_embeddings_per_tile":
-            digest.update(str(int(value)).encode())
-        else:
-            raise TypeError(
-                f"Cannot compute a media cache key from field {name!r} "
-                f"of type {type(value).__name__}."
-            )
-        digest.update(b"\0")
-    return digest.hexdigest()
+    raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
 
 
 def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]:
@@ -157,41 +166,31 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             f"got {type(media_tokens_preexpanded)}."
         )
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
-    if isinstance(modality_data, (bytes, bytearray)):
-        items = [bytes(modality_data)]
-        media_cache_key = compute_media_cache_key(modality, items)
-        return {modality: items, "media_cache_key": media_cache_key, **metadata}
-    if isinstance(modality_data, list):
-        if any(not isinstance(item, (bytes, bytearray)) for item in modality_data):
-            raise TypeError(f"multi_modal_data[{modality!r}] list must contain only bytes.")
-        items = [bytes(item) for item in modality_data]
-        media_cache_key = compute_media_cache_key(modality, items)
-        return {modality: items, "media_cache_key": media_cache_key, **metadata}
-    if not isinstance(modality_data, dict):
+    raw_items = _normalize_raw_media_items(modality_data)
+    if raw_items is not None:
+        media_cache_key = compute_media_cache_key(modality, raw_items)
+        return {modality: raw_items, "media_cache_key": media_cache_key, **metadata}
+    elif isinstance(modality_data, dict):
+        media_cache_key = compute_media_cache_key(modality, modality_data)
+        wire: Dict[str, Any] = {}
+        for key in _media_tensor_keys(modality):
+            value = modality_data.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"multi_modal_data[{modality!r}][{key!r}] must be a Tensor, "
+                    f"got {type(value)}."
+                )
+            wire[key] = serialize_tensor(value)
+        if "num_img_embeddings_per_tile" in modality_data:
+            wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
+        return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
+    else:
         raise TypeError(
             f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
             f"preprocessed tensor dict; got {type(modality_data)}."
         )
-    media_cache_key = compute_media_cache_key(modality, modality_data)
-
-    wire: Dict[str, Any] = {}
-    tensor_keys = (
-        ("imgs", "imgs_sizes", "num_frames")
-        if modality == "video"
-        else ("imgs", "imgs_sizes", "num_tiles")
-    )
-    for key in tensor_keys:
-        value = modality_data.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(
-                f"multi_modal_data[{modality!r}][{key!r}] must be a Tensor, " f"got {type(value)}."
-            )
-        wire[key] = serialize_tensor(value)
-    if "num_img_embeddings_per_tile" in modality_data:
-        wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
-    return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
 
 
 def resolve_multimodal_data_for_engine(
@@ -999,6 +998,7 @@ class DynamicInferenceRequestRecord:
         common_kwargs = dict(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
+            compact_prompt_tokens=old_request.compact_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
@@ -1015,6 +1015,9 @@ class DynamicInferenceRequestRecord:
                 num_img_embeddings_per_tile=old_request.num_img_embeddings_per_tile,
                 imgs=old_request.imgs,
                 num_tiles=old_request.num_tiles,
+                imgs_sizes=old_request.imgs_sizes,
+                num_frames=old_request.num_frames,
+                media_tokens_preexpanded=old_request.media_tokens_preexpanded,
                 decoder_seq_length=old_request.decoder_seq_length,
                 image_embeddings=old_request.image_embeddings,
                 image_token_mask=old_request.image_token_mask,
@@ -1173,3 +1176,6 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
 
     image_embeddings: Optional[torch.Tensor] = None  # [seq_img, 1, hidden]
     image_token_mask: Optional[torch.Tensor] = None  # 1D, -1=text, >=0=image index
+    imgs_sizes: Optional[torch.Tensor] = None
+    num_frames: Optional[torch.Tensor] = None
+    media_tokens_preexpanded: bool = False

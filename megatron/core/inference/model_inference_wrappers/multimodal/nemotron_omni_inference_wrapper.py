@@ -175,6 +175,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         )
         combined_embeddings = decoder_input.transpose(0, 1).contiguous()
 
+        # Inject vision embeddings into the decoder input.
         image_positions = image_token_mask >= 0
         if image_positions.any():
             if image_embeddings is None:

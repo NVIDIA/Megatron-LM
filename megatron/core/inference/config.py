@@ -455,8 +455,9 @@ class InferenceConfig:
     """Maximum GPU bytes retained for reusable vision embeddings.
 
     A value of zero disables the cache. Cache entries use an automatically
-    generated media-content key and are discarded whenever the inference engine
-    is suspended.
+    generated media-content key and, unless ``allow_stale_vision_embeddings``
+    is enabled, are discarded whenever the inference engine is suspended or its
+    generation epoch changes.
     """
 
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
@@ -595,6 +596,14 @@ class InferenceConfig:
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
+
+    allow_stale_vision_embeddings: bool = False
+    """Allow projected-media embeddings to survive weight-change boundaries.
+
+    By default, suspend/resume and generation-epoch changes invalidate both the
+    shared vision-embedding cache and request-local vision state. Enable this
+    only when model weights are guaranteed not to change across those boundaries.
+    """
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose

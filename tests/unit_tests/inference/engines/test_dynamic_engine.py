@@ -39,6 +39,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
@@ -982,6 +983,8 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
     engine._add_request = mock.Mock()
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
@@ -1007,6 +1010,87 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed
+
+
+def test_vision_state_invalidation_marks_request_local_embeddings_stale():
+    request = DynamicVLMInferenceRequest(
+        request_id=31,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(2, 1, 4),
+        image_token_mask=torch.tensor([0, 1, -1]),
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_vision_embeddings = False
+    engine._vision_embedding_cache = {"media": request.image_embeddings}
+    engine._vision_embedding_cache_bytes = request.image_embeddings.numel() * 4
+    engine.requests = {
+        request.request_id: types.SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(request)
+        )
+    }
+
+    engine._invalidate_vision_state()
+
+    assert not engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 0
+    assert request.image_embeddings is None
+    assert request.image_token_mask is None
+
+
+def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_vision_embeddings = True
+    engine._vision_embedding_cache = {"media": torch.ones(1)}
+    engine._vision_embedding_cache_bytes = 4
+    engine.requests = {}
+
+    engine._invalidate_vision_state()
+
+    assert "media" in engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 4
+
+
+def test_refresh_vlm_request_recomputes_embeddings_and_mask():
+    request = DynamicVLMInferenceRequest(
+        request_id=32,
+        prompt_tokens=torch.tensor([99, 99, 5, 7]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        block_hash_salt="media",
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=None,
+        image_token_mask=None,
+    )
+    wrapper = types.SimpleNamespace(
+        resolve_media_token_id=mock.Mock(return_value=99),
+        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
+    engine._cache_vision_embedding = mock.Mock()
+
+    engine._refresh_vlm_request_data(request)
+
+    assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
+    assert request.image_token_mask.tolist() == [0, 1, -1, -1]
+    engine.context.add_vlm_request_data.assert_called_once_with(
+        request.request_id,
+        image_embeddings=request.image_embeddings,
+        image_token_mask=request.image_token_mask,
+    )
 
 
 def test_streaming_partials_are_sent():
