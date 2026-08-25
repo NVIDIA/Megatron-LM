@@ -731,6 +731,99 @@ def test_materialized_thd_mrope_option_fallbacks_do_not_call_te(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cp_size, cp_rank", [(1, 0), (2, 0), (2, 1)])
+def test_materialized_thd_short_freqs_fall_back_without_calling_te(monkeypatch, cp_size, cp_rank):
+    global_token_capacity = 8
+    local_token_capacity = global_token_capacity // cp_size
+    generator = torch.Generator(device="cuda").manual_seed(9012)
+    t = torch.randn(
+        local_token_capacity, 3, 20, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    freqs = torch.randn(4, 1, 1, 16, dtype=torch.float32, device="cuda", generator=generator)
+    cu_seqlens = torch.tensor([0, 2, global_token_capacity], dtype=torch.int32, device="cuda")
+    cp_group = FakeCPGroup(size=cp_size, rank=cp_rank)
+    config = TransformerConfig(
+        num_attention_heads=t.shape[1],
+        num_layers=1,
+        context_parallel_size=cp_size,
+        apply_rope_fusion=True,
+    )
+
+    def unexpected_te_thd_call(*args, **kwargs):
+        raise AssertionError("TE THD fused RoPE should not be called with a short frequency table")
+
+    monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb_thd", unexpected_te_thd_call)
+    with warnings.catch_warnings(record=True) as recorded_warnings:
+        warnings.simplefilter("always")
+        out = apply_rotary_pos_emb(
+            t, freqs, config, cu_seqlens, cp_group=cp_group, max_seqlen=global_token_capacity
+        )
+
+    fallback_warnings = _fallback_warnings(recorded_warnings)
+    assert len(fallback_warnings) == 1
+    assert "frequency table length (4) to cover max_seqlen (8)" in str(fallback_warnings[0].message)
+    assert _ROPE_FUSION_FALLBACK_WARNINGS == {"te-rope-thd-short-freqs"}
+
+    ref = _apply_rotary_pos_emb_thd(
+        t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=global_token_capacity
+    )
+    torch.testing.assert_close(ref.float(), out.float(), **_dtype_tols(t.dtype))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_materialized_thd_short_freqs_fallback_captures_and_replays(monkeypatch):
+    global_token_capacity = 8
+    cp_group = FakeCPGroup(size=2, rank=1)
+    generator = torch.Generator(device="cuda").manual_seed(3456)
+    t = torch.randn(
+        global_token_capacity // cp_group.size(),
+        3,
+        20,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    freqs = torch.randn(4, 1, 1, 16, dtype=torch.float32, device="cuda", generator=generator)
+    cu_seqlens = torch.tensor([0, 2, global_token_capacity], dtype=torch.int32, device="cuda")
+    config = TransformerConfig(
+        num_attention_heads=t.shape[1],
+        num_layers=1,
+        context_parallel_size=cp_group.size(),
+        apply_rope_fusion=True,
+    )
+
+    def apply_short_freq_rope():
+        return apply_rotary_pos_emb(
+            t, freqs, config, cu_seqlens, cp_group=cp_group, max_seqlen=global_token_capacity
+        )
+
+    def unexpected_te_thd_call(*args, **kwargs):
+        raise AssertionError("TE THD fused RoPE should not be called with a short frequency table")
+
+    monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb_thd", unexpected_te_thd_call)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with (
+        torch.cuda.stream(warmup_stream),
+        pytest.warns(UserWarning, match="frequency table length"),
+    ):
+        apply_short_freq_rope()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = apply_short_freq_rope()
+
+    t.copy_(torch.randn(t.shape, dtype=t.dtype, device=t.device, generator=generator))
+    cu_seqlens.copy_(torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda"))
+    graph.replay()
+    ref = _apply_rotary_pos_emb_thd(
+        t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=global_token_capacity
+    )
+    torch.testing.assert_close(ref.float(), graph_out.float(), **_dtype_tols(t.dtype))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
 @pytest.mark.parametrize("interleaved_mrope", [False, True])
 @pytest.mark.parametrize("cp_size, cp_rank", [(1, 0), (2, 0), (2, 1)])

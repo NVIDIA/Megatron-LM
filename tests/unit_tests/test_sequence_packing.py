@@ -82,7 +82,7 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
 
 
-def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
+def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
     class _Group:
         def __init__(self, size, rank):
             self._size = size
@@ -137,6 +137,7 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
         output.copy_(torch.cat([input_, remote]))
 
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
     monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
     monkeypatch.setattr(
         torch.distributed,
@@ -161,7 +162,35 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
     assert torch.equal(received[2]['position_ids'], torch.tensor([0, 1, 2, 3]))
     assert torch.equal(received[2]['original_seq_len'], torch.tensor([4], dtype=torch.int32))
     assert torch.equal(received[2]['padded_seq_len'], torch.tensor([4], dtype=torch.int32))
-    assert gather_groups == [dp_group] * 6
+    assert gather_groups == [dp_cp_group] * 6
+
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=_Group(size=2, rank=1),
+            dp_cp_group=dp_cp_group,
+        )
+
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        'get_process_group_ranks',
+        lambda group: [0, 1] if group is dp_group else [0, 2],
+    )
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=dp_group,
+            dp_cp_group=dp_cp_group,
+        )
 
 
 def test_scheduler_reroute_rejects_unsupported_sample_keys():

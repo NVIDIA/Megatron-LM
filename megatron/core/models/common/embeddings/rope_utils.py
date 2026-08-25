@@ -780,6 +780,13 @@ def apply_rotary_pos_emb(
                         "Using unfused implementation.",
                     ),
                     (
+                        max_seqlen is not None and freqs.size(0) < max_seqlen,
+                        "te-rope-thd-short-freqs",
+                        "Transformer Engine fused RoPE for THD layout requires the frequency "
+                        f"table length ({freqs.size(0)}) to cover max_seqlen ({max_seqlen}). "
+                        "Using unfused implementation.",
+                    ),
+                    (
                         fused_apply_rotary_pos_emb_thd is None,
                         "te-rope-thd-unavailable",
                         "Transformer Engine fused RoPE for THD layout is unavailable. "
