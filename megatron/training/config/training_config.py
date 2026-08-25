@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
-
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
@@ -367,6 +366,27 @@ class LoggerConfig:
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 
+    moe_routing_trace_path: str | None = None
+    """Directory for MoE router decision traces (JSONL).  When set, a RouterTracer is initialized
+    at training start and hooks are registered on all TopKRouter modules.
+    Traces are written in the same format as inference traces so the analysis scripts under
+    tools/moe_routing work on both."""
+
+    moe_routing_trace_max_training_iters: int | None = None
+    """Maximum number of training iterations to trace.  Tracing stops
+    automatically after this many calls to advance_step().  Defaults
+    to tracing all iterations when moe_routing_trace_path is set.
+    (Inference uses --moe-routing-trace-max-inference-steps instead.)"""
+
+    moe_routing_trace_capture_logits: bool = False
+    """Capture pre-topk routing logits for each router call."""
+
+    moe_routing_trace_capture_hidden_states: bool = False
+    """Capture input hidden-state tensors for each router call."""
+
+    moe_routing_trace_dump_weights: bool = False
+    """Save router weight tensors to a .pt sidecar file."""
+
 
 @dataclass(kw_only=True)
 class CheckpointConfig:
@@ -528,6 +548,14 @@ class CheckpointConfig:
     "gather_object": Gather the checkpoint from all ranks in a single operation.
     """
 
+    ckpt_fully_parallel_load_per_rank_objects: bool = False
+    """Load ShardedObjects per-rank during fully parallel load of distributed checkpoints.
+    When True, every rank reads all of its own ShardedObjects (RNG states,
+    TE `_extra_state`, ...) directly from storage, which removes the WORLD-wide
+    `all_gather_object` that otherwise exchanges them. Objects are
+    content-addressable by `unique_key`, so the loaded values are identical.
+    When False (default), the legacy gather-based object exchange is used."""
+
     ckpt_fully_parallel_save_process_group: Literal["dp", "ep_dp"] = "dp"
     """Process group for fully parallel save of distributed checkpoints.
     "dp"(default): Data parallel process group.
@@ -543,10 +571,31 @@ class CheckpointConfig:
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_pg_tensors_cache_path: Optional[str] = None
+    """Directory of the parallelization-group distribution cache for fully parallel
+    save/load of distributed checkpoints. When set, the expensive
+    ``all_gather_object`` in ``determine_main_replica_uniform_distribution`` is
+    replaced by a single per-group file read (the load and save distributions are
+    loaded from this directory). Only safe when the config and world size match the
+    run that created the cache (see ``--ckpt-pg-tensors-cache-create``); no
+    existence/validity checks are performed, for the lowest possible latency.
+    Default (None) preserves the original collective-based behaviour."""
+
+    ckpt_pg_tensors_cache_create: bool = False
+    """Create (rather than read) the parallelization-group distribution cache at
+    ``--ckpt-pg-tensors-cache-path``. Set this for a single run with a matching
+    config/world size: the collective runs as usual but both the save and load
+    distributions are derived from that single gather and written to disk, one
+    file per parallelization group. Subsequent runs set only
+    ``--ckpt-pg-tensors-cache-path`` (leave this False) to skip the collective.
+    Default: False."""
+
     ckpt_load_validate_sharding_integrity: bool = True
-    """Whether to validate sharding access integrity when loading a distributed checkpoint.
-    When True (default), each tensor shard is checked to be accessed exactly once as main
-    replica by some rank. Disabling skips this validation"""
+    """Whether to validate sharding access integrity when loading *and saving* a distributed
+    checkpoint. When True (default), each tensor shard is checked to be accessed exactly once as
+    main replica by some rank. Disabling skips this validation; on save this also skips the
+    world-wide determine_global_metadata all_gather_object (otherwise run on the first save of a
+    job)."""
 
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
@@ -562,7 +611,10 @@ class CheckpointConfig:
         "ignore_all",
     ] = "assume_ok_unexpected"
     """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model.
+    For fsdp_dtensor checkpoints it covers model weights a partial load cannot supply, and
+    assume_ok_unexpected raises like raise_unexpected there because a partial load never raises
+    on its own. Use ignore_all to opt out."""
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.
@@ -631,6 +683,9 @@ class TokenizerConfig:
     """Vocabulary size of the model (padded to be divisible by tensor model parallel size). 
     If not provided, it will be automatically calculated from vocab-size."""
 
+    pad_vocab_size: bool = True
+    """Whether to pad vocab size of the model automatically if padded_vocab_size is not provided."""
+
     vocab_file: str = None
     """Path to the vocab file."""
 
@@ -678,6 +733,9 @@ class TokenizerConfig:
     tokenizer_sentencepiece_legacy: bool = False
     """SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage."""
 
+    tokenizer_sentencepiece_ignore_extra_whitespaces: bool = True
+    """Whether to ignore extra whitespaces in the input text while encoding."""
+
     tokenizer_hf_no_use_fast: bool = False
     """Whether to use fast HuggingFace tokenizer."""
 
@@ -696,3 +754,6 @@ class TokenizerConfig:
 
     chat_template: Optional[str] = None
     """Custom chat template in jinja format for conversation formatting."""
+
+    use_gigatoken: Optional[bool] = False
+    """Whether to use faster implementation of tokenizers (gigatoken)"""

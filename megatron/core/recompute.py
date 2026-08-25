@@ -5,6 +5,7 @@ from typing import List, Optional, Set, Tuple, Union
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel import ContextParallelLayoutState
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
@@ -12,10 +13,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
-te_checkpoint = None
-
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import te_checkpoint
+else:
+    te_checkpoint = None
 
 
 def checkpointed_forward(
@@ -31,6 +32,7 @@ def checkpointed_forward(
     padding_mask: Optional[Tensor] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
+    cp_layout_state: Optional[ContextParallelLayoutState] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -41,6 +43,7 @@ def checkpointed_forward(
         layer_offset (int): The global layer offset for the current
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
+        cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -50,14 +53,36 @@ def checkpointed_forward(
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
 
+    # Wrap non-dual RoPE to tuple to unify custom_forward interface.
+    is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
+    assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
+    rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+
     def custom(start: int, end: int):
         def custom_forward(
-            hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb_local,
+            rotary_pos_emb_global,
+            padding_mask=None,
         ):
+            rotary_pos_emb = (
+                (rotary_pos_emb_local, rotary_pos_emb_global)
+                if is_dual_rope
+                else rotary_pos_emb_global
+            )
+
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
+                layer_packed_seq_params = packed_seq_params
+                if cp_layout_state is not None:
+                    hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
+                        index, hidden_states
+                    )
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -86,7 +111,7 @@ def checkpointed_forward(
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     inference_context=None,
-                    packed_seq_params=packed_seq_params,
+                    packed_seq_params=layer_packed_seq_params,
                     padding_mask=padding_mask,
                 )
                 with inner_quantization_context:
@@ -101,6 +126,8 @@ def checkpointed_forward(
                 # Some layer paths may still return a tuple (defensive).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+                if cp_layout_state is not None:
+                    hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
 
         return custom_forward
@@ -108,7 +135,8 @@ def checkpointed_forward(
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
         cf = custom(start, end)
-        args = (hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask)
+        # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
+        args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.

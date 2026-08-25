@@ -181,12 +181,21 @@ class SFTDataset(MegatronDataset):
         adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
 
+        # Pad cu_seqlens to a fixed length so that default_collate can
+        # stack samples with different numbers of documents.  Trailing
+        # entries are filled with pack_length; the merge helper strips
+        # them later.
+        padded_cu_seqlens = torch.full(
+            (pack_length + 1,), pack_length, dtype=torch.int32,
+        )
+        padded_cu_seqlens[:cu_seqlens.numel()] = cu_seqlens
+
         return {
             'tokens': input_ids,
             'labels': labels,
             # 'attention_mask': attention_mask,  # PyTorch collate cannot handle NoneType
             'loss_mask': loss_mask,
             'position_ids': position_ids,
-            'cu_seqlens': cu_seqlens,
+            'cu_seqlens': padded_cu_seqlens,
             'max_seqlen': max_seqlen,
         }

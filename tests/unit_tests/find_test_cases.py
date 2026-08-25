@@ -5,6 +5,26 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Platforms whose unit-test selection is driven by a pytest marker rather than
+# by the full recipe bucket. Only files carrying the marker are launched.
+PLATFORM_MARKERS = {"gb200": "launch_on_gb200"}
+
+
+def file_has_marker(filepath, marker):
+    """Return True if the test file references the given pytest marker.
+
+    Args:
+        filepath: Path to a Python test file.
+        marker: The pytest marker name to look for (e.g. ``launch_on_gb200``).
+
+    Returns:
+        True if the marker name appears anywhere in the file, else False.
+    """
+    try:
+        return marker in Path(filepath).read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+
 
 def get_test_cases(yaml_file):
     result = subprocess.run(
@@ -61,6 +81,17 @@ def main():
     for test_case in all_test_cases:
         if test_case != BUCKET and is_child_of_bucket(test_case, BUCKET):
             files_to_ignore.update(expand_pattern(test_case))
+
+    # On marker-driven platforms, ignore any test file that does not carry the
+    # platform marker so only marked tests are launched. Restrict to pytest test
+    # files (test_*.py) so conftest.py and helper modules stay collectable.
+    marker = PLATFORM_MARKERS.get(GPU_TYPE)
+    if marker:
+        files_to_ignore.update(
+            f
+            for f in bucket_files
+            if Path(f).name.startswith("test_") and not file_has_marker(f, marker)
+        )
 
     # Output files to ignore
     for file in sorted(files_to_ignore & bucket_files):

@@ -326,9 +326,16 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 or "global_aux_loss" in config.moe_router_load_balancing_type
             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
+            if getattr(module, 'qb_beta_accum', None) is not None:
+                module.qb_beta_accum.zero_()
+                module.qb_beta_count.zero_()
 
 
-def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+def _update_router_expert_bias(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
     """
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
@@ -341,7 +348,11 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
             # cases where only the student is in training mode but the teacher is in eval mode
             # when using online knoweldge-distillation with Model-Optimizer. In this case, we want
             # to avoid updating teacher's expert_bias.
-            if hasattr(module, 'expert_bias') and module.training:
+            if (
+                hasattr(module, 'expert_bias')
+                and module.training
+                and not getattr(module, 'frozen_expert_bias', False)
+            ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
@@ -350,11 +361,56 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
     stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+        stacked_tokens_per_expert,
+        stacked_expert_bias,
+        config.moe_router_bias_update_rate,
+        tp_dp_cp_group=tp_dp_cp_group,
     )
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
+
+
+def _update_router_qb_beta(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Update the quantile-balancing per-expert bias once per global batch.
+
+    Averages each router's accumulated quantile (qb_beta_accum/qb_beta_count) across
+    DP, EMA-blends it with the current qb_beta, re-centers, and writes it back.
+    """
+    qb_beta_list = []
+    qb_beta_accum_list = []
+    qb_beta_count_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if getattr(module, 'qb_beta_accum', None) is not None and module.training:
+                qb_beta_list.append(module.qb_beta)
+                qb_beta_accum_list.append(module.qb_beta_accum)
+                qb_beta_count_list.append(module.qb_beta_count)
+
+    if len(qb_beta_list) == 0:
+        return
+
+    stacked_beta = torch.stack(qb_beta_list, dim=0)
+    local_avg_list = [
+        accum / count.clamp(min=1).to(accum.dtype)
+        for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
+    ]
+    stacked_local_avg = torch.stack(local_avg_list, dim=0)
+
+    torch.distributed.all_reduce(
+        stacked_local_avg, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group
+    )
+
+    ema = config.moe_router_quantile_balancing_ema
+    stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_local_avg
+    stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True)
+
+    for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
+        qb_beta.copy_(new_beta)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -435,6 +491,72 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
+def _allreduce_replicated_grads_over_gtp_remat_group(
+    model: List[torch.nn.Module],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    egtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    calculate_per_token_loss: bool = False,
+):
+    """Complete the gtp_remat / egtp_remat axis reduction for replicated parameters.
+
+    Replicated (non-gtp-sharded) params have a grad per gtp_remat peer (each from distinct data);
+    the data-parallel collective only reduced the replicate axis, so the
+    gtp_remat axis is still missing. How to complete it depends on the loss normalization:
+
+    - ``calculate_per_token_loss=False`` (default): the DP collective produced the 1/replicate mean,
+      so a MEAN (AVG) over the gtp_remat axis yields the exact full (replicate x gtp) mean, keeping
+      gradient scaling decoupled from the DP degree. (gtp_remat-sharded params self-average via
+      their reduce-scatter mean and are skipped here.)
+    - ``calculate_per_token_loss=True``: DDP applies NO 1/dp scaling; finalize divides every grad by
+      1/total_global_tokens (which counts the gtp_remat peers' distinct tokens). The gtp_remat axis
+      must therefore be SUM-reduced (like the DP axis) — an AVG would shrink each grad by 1/gtp.
+
+    No-op when GTP_remat is inactive (group size <= 1).
+    """
+    dense_active = gtp_remat_group is not None and gtp_remat_group.size() > 1
+    expert_active = egtp_remat_group is not None and egtp_remat_group.size() > 1
+    if not dense_active and not expert_active:
+        return
+
+    dense_params, dense_grads = [], []
+    expert_params, expert_grads = [], []
+    for model_chunk in model:
+        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+            if not param.requires_grad or getattr(param, 'is_gtp_weight_remat', False):
+                continue  # GTP-sharded params: their gtp_remat axis is handled by the RS-mean.
+            grad_attr = _get_main_grad_attr(param)
+            grad = getattr(param, grad_attr, None)
+            if grad is None:
+                continue
+            grad = _unshard_if_dtensor(grad)
+            if getattr(param, 'allreduce', True):
+                dense_params.append(param)
+                dense_grads.append(grad.data)
+            else:
+                expert_params.append(param)
+                expert_grads.append(grad.data)
+
+    for params, grads, group in (
+        (dense_params, dense_grads, gtp_remat_group),
+        (expert_params, expert_grads, egtp_remat_group),
+    ):
+        if not grads or group is None or group.size() <= 1:
+            continue
+        coalesced = _flatten_dense_tensors(grads)
+        # SUM vs AVG per the loss-normalization regime documented above.
+        op = (
+            torch.distributed.ReduceOp.SUM
+            if calculate_per_token_loss
+            else torch.distributed.ReduceOp.AVG
+        )
+        torch.distributed.all_reduce(coalesced, op=op, group=group)
+        for param, buf, synced in zip(params, grads, _unflatten_dense_tensors(coalesced, grads)):
+            buf.copy_(synced)
+            grad_attr = _get_main_grad_attr(param)
+            orig_grad = getattr(param, grad_attr)
+            setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+
+
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
@@ -448,6 +570,7 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
+    tp_dp_cp_group = None
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
         assert hasattr(pg_collection, 'pp')
@@ -466,17 +589,49 @@ def finalize_model_grads(
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
         assert hasattr(pg_collection, 'dp_cp')
+        if config.moe_router_enable_expert_bias:
+            assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
+                "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
+            )
+            tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
         embd_group = pg_collection.embd
         pos_emb_group = pg_collection.pos_embd
-        dp_cp_group = pg_collection.dp_cp
+        # Full DP x CP x gtp_remat group: num_tokens (the per-token-loss divisor below) counts the
+        # gtp_remat peers' distinct tokens. Falls back to replicate dp_cp when gtp is inactive.
+        dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
+        gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+        egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+        egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+
+    # A missing group would silently skip the gtp_remat-axis reduction below and train on
+    # wrong gradients, so fail loudly whenever the config says the axis is active.
+    for axis, group, axis_size in (
+        ('gtp_remat', gtp_remat_group, config.gtp_weight_remat_size),
+        ('expt_gtp_remat', egtp_remat_group, config.expert_gtp_weight_remat_size),
+    ):
+        if axis_size > 1:
+            found = 'None' if group is None else f'a size-{group.size()} group'
+            assert group is not None and group.size() == axis_size, (
+                f"{axis} is enabled (size={axis_size}) but pg_collection provides {found}. "
+                f"Pass a pg_collection carrying `{axis}` to finalize_model_grads."
+            )
+
+    # Fence the current stream against all GTP backward grad work before the DP gradient sync.
+    if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:
+        from megatron.core.tensor_parallel.gtp_api import (
+            wait_for_gtp_grad_reduction_on_current_stream,
+        )
+
+        wait_for_gtp_grad_reduction_on_current_stream()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
@@ -504,6 +659,12 @@ def finalize_model_grads(
             barrier=config.barrier_with_L1_time
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
+    _allreduce_replicated_grads_over_gtp_remat_group(
+        model,
+        gtp_remat_group,
+        egtp_remat_group,
+        calculate_per_token_loss=config.calculate_per_token_loss,
+    )
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
 
@@ -519,7 +680,14 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        _update_router_expert_bias(model, config)
+        if pg_collection is None:
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
+
+    if config.moe_router_load_balancing_type == "quantile_balancing":
+        _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 
@@ -536,7 +704,10 @@ def finalize_model_grads(
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+
+        # Clamp to avoid div-by-zero without a host-side branch on a device tensor,
+        # which would otherwise cause a sync that is illegal during CUDA graph capture.
+        safe_num_tokens = torch.clamp(num_tokens, min=1)
+        scaling = 1.0 / safe_num_tokens
         for model_chunk in model:
-            if num_tokens > 0:
-                scaling = 1.0 / num_tokens
-                model_chunk.scale_gradients(scaling)
+            model_chunk.scale_gradients(scaling)

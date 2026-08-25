@@ -9,6 +9,11 @@ from unittest.mock import MagicMock
 
 import torch
 
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_COL_BLOCK,
+    MXFP8_SCALE_ROW_BLOCK,
+)
 from megatron.core.utils import null_decorator
 
 try:
@@ -81,6 +86,119 @@ def padded_squared_relu(
 
 
 @triton.jit
+def _swiglu_kernel(
+    input_ptr,
+    output_ptr,
+    src_idx_ptr,
+    n_used_ptr,
+    N,  # output width = ffn_hidden (input row width is 2N)
+    max_rows,
+    BLOCK_N: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """SwiGLU: SiLU(gate) * up, skipping rows beyond n_used and padding rows (perm_map == -1).
+
+    Input row width is 2N: gate = first N cols, up = last N cols (megatron chunk convention).
+    Output row width is N. Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph compatible.
+    """
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+    two_N = 2 * N
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(src_idx_ptr + row) >= 0:
+                for n in tl.range(0, N, BLOCK_N):
+                    o = n + tl.arange(0, BLOCK_N)
+                    m = o < N
+                    gate = tl.load(input_ptr + row * two_N + o, mask=m).to(tl.float32)
+                    up = tl.load(input_ptr + row * two_N + N + o, mask=m).to(tl.float32)
+                    silu = gate * tl.sigmoid(gate)
+                    tl.store(output_ptr + row * N + o, (silu * up).to(tl.bfloat16), mask=m)
+
+
+def padded_swiglu(
+    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+) -> torch.Tensor:
+    """SwiGLU activation (SiLU(gate) * up); skips rows beyond n_used and alignment-padding rows.
+
+    Gated counterpart of padded_squared_relu: FC1 output is 2x wide (gate | up), so the
+    output width is half the input.
+
+    Args:
+        x: [output_size, 2 * ffn_hidden] BF16 FC1 output.
+        permutation_map: [output_size] int32, original token index or -1 for padding.
+        n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
+    Returns:
+        [output_size, ffn_hidden] BF16.
+    """
+    M, two_N = x.shape
+    assert two_N % 2 == 0, f"SwiGLU FC1 output width must be even, got {two_N}"
+    N = two_N // 2
+    out = torch.empty(M, N, dtype=x.dtype, device=x.device)
+    BLOCK_N = min(triton.next_power_of_2(N), 1024)
+    NUM_BLOCKS = min(M, 512)
+    _swiglu_kernel[(NUM_BLOCKS,)](
+        x, out, permutation_map, n_used, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+    )
+    return out
+
+
+@triton.jit
+def _silu_mul_bounded_kernel(
+    input_ptr,
+    output_ptr,
+    n_rows_ptr,
+    N,  # output width (input row width is 2N)
+    max_rows,
+    BLOCK_N: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+):
+    """SiLU(gate) * up on the first n_rows rows; rows beyond are left untouched.
+
+    For the flat token-major FC1 layout (no permutation map): rows [0, n_rows) are
+    live. n_rows is a device scalar, so the fixed grid stays CUDA-graph compatible.
+    """
+    pid = tl.program_id(0)
+    n_rows = tl.load(n_rows_ptr)
+    if pid >= n_rows:
+        return
+    two_N = 2 * N
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_rows:
+            for n in tl.range(0, N, BLOCK_N):
+                o = n + tl.arange(0, BLOCK_N)
+                m = o < N
+                gate = tl.load(input_ptr + row * two_N + o, mask=m).to(tl.float32)
+                up = tl.load(input_ptr + row * two_N + N + o, mask=m).to(tl.float32)
+                silu = gate * tl.sigmoid(gate)
+                tl.store(output_ptr + row * N + o, (silu * up).to(tl.bfloat16), mask=m)
+
+
+def bounded_silu_mul(x: torch.Tensor, n_rows: torch.Tensor) -> torch.Tensor:
+    """SwiGLU (SiLU(gate) * up) over the first n_rows rows of a flat [M, 2N] tensor.
+
+    Args:
+        x: [M, 2 * ffn_hidden] BF16 FC1 output (gate = first half, up = second half).
+        n_rows: scalar int32/int64 CUDA tensor with the number of live rows
+            (e.g. valid_tokens * topk). Rows >= n_rows are skipped, not zeroed.
+    Returns:
+        [M, ffn_hidden] BF16 (rows >= n_rows undefined).
+    """
+    M, two_N = x.shape
+    assert two_N % 2 == 0, f"SwiGLU FC1 output width must be even, got {two_N}"
+    N = two_N // 2
+    out = torch.empty(M, N, dtype=x.dtype, device=x.device)
+    BLOCK_N = min(triton.next_power_of_2(N), 1024)
+    NUM_BLOCKS = min(M, 512)
+    _silu_mul_bounded_kernel[(NUM_BLOCKS,)](
+        x, out, n_rows, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+    )
+    return out
+
+
+@triton.jit
 def _squared_relu_quantize_kernel(
     input_ptr,
     out_fp8_ptr,
@@ -113,7 +231,9 @@ def _squared_relu_quantize_kernel(
                 # Load and apply squared ReLU
                 x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
                 relu = tl.maximum(x, 0.0)
-                activated = relu * relu
+                # Match training and unfused inference: squared ReLU is materialized
+                # in BF16 before MXFP8 quantization, which determines the MXFP8 bins.
+                activated = (relu * relu).to(tl.bfloat16).to(tl.float32)
 
                 # Per-group-of-32 quantization
                 x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
@@ -169,18 +289,18 @@ def squared_relu_and_quantize_mxfp8(
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
     M, K = x.shape
-    assert K % 32 == 0
+    assert K % MXFP8_BLOCK_SIZE == 0
 
-    scale_cols = K // 32
-    n_row_blocks = _ceil_div(M, 128)
-    n_col_blocks = _ceil_div(scale_cols, 4)
-    total_scale_bytes = n_row_blocks * n_col_blocks * 512
+    scale_cols = K // MXFP8_BLOCK_SIZE
+    n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
+    n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
     out_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
 
     BLOCK_K = triton.next_power_of_2(K)
-    BLOCK_GROUPS = BLOCK_K // 32
+    BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
     NUM_BLOCKS = min(M, 512)
 
     _squared_relu_quantize_kernel[(NUM_BLOCKS,)](

@@ -18,11 +18,13 @@ class Symbols:
     GDN = 'G'
     ATTENTION = "*"
     DS_ATTENTION = "D"
+    MLA = "+"
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
+    ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -293,7 +295,7 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
             )
 
     # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
+    if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
@@ -321,7 +323,7 @@ def validate_segment_layers(segment: str) -> List[str]:
             )
 
     # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
+    if Symbols.ATTENTION in segment and (Symbols.DS_ATTENTION in segment or Symbols.MLA in segment):
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
     return layer_type_list
@@ -333,6 +335,8 @@ def select_pipeline_segment(
     vp_stage: Optional[int],
     first_stage_layers: Optional[int] = None,
     last_stage_layers: Optional[int] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[List[str], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
@@ -352,6 +356,8 @@ def select_pipeline_segment(
             uneven PP. Only valid when the pattern has no pipe separators.
         last_stage_layers: Number of layers on the last pipeline stage for
             uneven PP. Only valid when the pattern has no pipe separators.
+        tp_group: Optional tensor-parallel process group used for per-stage logging.
+        dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
 
     Returns:
         Tuple of (layer_type_list, layer_offset) where layer_type_list is
@@ -445,6 +451,8 @@ def select_pipeline_segment(
             f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
             f"layers='{''.join(selected)}' ({len(selected)} layers), "
             f"layer_offset={offset} (auto-split)",
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
         )
         return selected, offset
 
@@ -479,6 +487,8 @@ def select_pipeline_segment(
         f"segment_index={segment_index}/{len(segments)}, "
         f"layers='{my_segment}' ({len(layer_type_list)} layers), "
         f"layer_offset={layer_offset}",
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
     )
 
     return layer_type_list, layer_offset

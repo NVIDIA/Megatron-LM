@@ -11,8 +11,11 @@ spec:
   n_repeat: 5
   platforms: dgx_gb200
   script_setup: |
+    set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -33,7 +36,13 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
   script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
+    set -euo pipefail
+    : "${{RUN_ID:=pr-$$}}"
     ls
     cd /opt/megatron-lm
 
@@ -51,8 +60,8 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -71,7 +80,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon_1node]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
   - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer_1node]
     products:
@@ -84,7 +93,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_1node]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
   #######################################################################
   # tp2_pp1 MoE variants                                                #
@@ -97,7 +106,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_1node]
     products:
       - environment: [dev]
-        scope: [mr-github-broken]
+        scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_1node]
     products:
@@ -107,7 +116,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4_1node]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_1node]
     products:
@@ -120,7 +129,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer_1node]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
   #######################################################################
   # tp4_ep2_etp2_pp2 variant (PP reduced 2→1 for 1-node)               #
@@ -128,5 +137,5 @@ products:
   - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph_1node]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]

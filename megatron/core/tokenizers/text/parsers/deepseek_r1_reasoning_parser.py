@@ -7,11 +7,12 @@ class DeepSeekR1ReasoningParser(BaseParser):
 
     @staticmethod
     def parse(text: str, **kwargs) -> tuple[str, dict[str, str]]:
-        """
-        Extracts the reasoning content from the text using <think>...</think> tags.
-        Only extracts the first set of think tags.
-        If an initial <think> tag is not present but a </think> tag is,
-        it will infer a <think> tag at the beginning of the text.
+        """Extract reasoning content delimited by `<think>...</think>` tags.
+
+        Any text before the first `<think>` is discarded.
+        When no `</think>` follows, the model is still "thinking": all text is reasoning,
+        unless a configured implicit end marker (such as `<tool_call>`) appears.
+        Otherwise the text is split at the first reasoning boundary.
 
         Args:
             text (str): The text to parse.
@@ -20,14 +21,26 @@ class DeepSeekR1ReasoningParser(BaseParser):
             tuple[str, dict[str, str]]: A tuple containing the unprocessed text
             and a dictionary with the extracted reasoning content.
         """
+        # Discard anything before the first `<think>`.
+        before, think_open, after = text.partition("<think>")
+        remaining = after if think_open else before
 
-        if "</think>" in text:
-            if "<think>" in text:
-                # Strip the <think> prefix (it might not be present if it was part of the prompt)
-                pre_text, text = text.split("<think>", maxsplit=1)
-            else:
-                pre_text = ""
-            reasoning_content, remaining_text = text.split("</think>", maxsplit=1)
-            return pre_text + remaining_text, {'reasoning': reasoning_content}
+        reasoning_end = remaining.find("</think>")
+        content_start = reasoning_end + len("</think>")
+
+        for marker in kwargs.get("implicit_reasoning_end_markers", ()):
+            marker_index = remaining.find(marker)
+            if marker_index >= 0 and (reasoning_end < 0 or marker_index < reasoning_end):
+                reasoning_end = marker_index
+                # Preserve the marker for the downstream tool parser.
+                content_start = marker_index
+
+        if reasoning_end < 0:
+            # No closing tag: treat the remaining text as unterminated reasoning.
+            reasoning_content, content = remaining, ""
         else:
-            return text, {}
+            reasoning_content = remaining[:reasoning_end]
+            content = remaining[content_start:]
+
+        info = {"reasoning": reasoning_content} if reasoning_content else {}
+        return content, info

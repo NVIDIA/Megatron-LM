@@ -1,0 +1,78 @@
+{
+  "h100": {
+    "batch_1": {
+      "batch_size": 1,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 60.2,
+      "num_output_tokens": 256,
+      "num_iters": 5,
+      "throughput_tok_per_sec": 10.769140788963465,
+      "avg_latency_ms": 23771.573346015066,
+      "p50_latency_ms": 23764.9713489227,
+      "p99_latency_ms": 24204.065156169236,
+      "tpot_ms_per_tok": 92.85791871388938
+    },
+    "batch_8": {
+      "batch_size": 8,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 59.625,
+      "num_output_tokens": 256,
+      "num_iters": 5,
+      "throughput_tok_per_sec": 84.46829823481039,
+      "avg_latency_ms": 24243.28422200051,
+      "p50_latency_ms": 24333.226206013933,
+      "p99_latency_ms": 24442.530745174736,
+      "tpot_ms_per_tok": 94.71008848504425
+    },
+    "batch_32": {
+      "batch_size": 32,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 62.475,
+      "num_output_tokens": 256,
+      "num_iters": 5,
+      "throughput_tok_per_sec": 324.7526388613147,
+      "avg_latency_ms": 25220.91832018632,
+      "p50_latency_ms": 25256.027992116287,
+      "p99_latency_ms": 25858.840166125447,
+      "tpot_ms_per_tok": 98.53653572208714
+    }
+  },
+  "gb200": {
+    "batch_1": {
+      "batch_size": 1,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 60.2,
+      "num_output_tokens": 256,
+      "num_iters": 5,
+      "throughput_tok_per_sec": 8.730727052335947,
+      "avg_latency_ms": 29321.640068572015,
+      "p50_latency_ms": 29087.193082086742,
+      "p99_latency_ms": 29842.50010503456,
+      "tpot_ms_per_tok": 114.53799826813338
+    },
+    "batch_8": {
+      "batch_size": 8,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 59.625,
+      "num_output_tokens": 256,
+      "num_iters": 5,
+      "throughput_tok_per_sec": 67.88291923838084,
+      "avg_latency_ms": 30166.746381134726,
+      "p50_latency_ms": 30188.65841627121,
+      "p99_latency_ms": 30236.23501090333,
+      "tpot_ms_per_tok": 117.84997006252524
+    },
+    "batch_32": {
+      "batch_size": 32,
+      "dataset": "gsm8k",
+      "num_input_tokens_avg": 62.475,
+      "num_output_tokens": 256,
+      "num_iters": 5,
+      "throughput_tok_per_sec": 265.14951553992756,
+      "avg_latency_ms": 30890.607724475558,
+      "p50_latency_ms": 30882.426110096276,
+      "p99_latency_ms": 30938.3913022466,
+      "tpot_ms_per_tok": 120.68662443089124
+    }
+  }
+}

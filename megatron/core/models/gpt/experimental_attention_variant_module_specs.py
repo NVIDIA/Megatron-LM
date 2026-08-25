@@ -1,22 +1,25 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+    is_dsa_skip_topk_layer,
+    source_dsa_compute_layer,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.multi_latent_attention import (
-    MLASelfAttention,
-    MLASelfAttentionSubmodules,
-)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
@@ -51,6 +54,17 @@ except ImportError:
 
 
 ##########
+# Experimental Attention Variant Names
+##########
+
+# Canonical ``experimental_attention_variant`` names served by the gated delta net family.
+GDN_ATTENTION_VARIANTS = ("gdn", "gdn2")
+
+# Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
+_DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
+
+
+##########
 # Experimental Attention Variant Module Specs
 ##########
 
@@ -64,8 +78,12 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
+    # gdn2 reuses the GDN submodules and spec structure with the GatedDeltaNet2 module.
+    gdn_module = (
+        GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
+    )
     attention = ModuleSpec(
-        module=GatedDeltaNet,
+        module=gdn_module,
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
@@ -82,17 +100,6 @@ def get_dsa_module_spec_for_backend(
     """Helper function to get module spec for Sparse Attention."""
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
-
-    linear_q_up_proj = (
-        backend.column_parallel_layer_norm_linear()
-        if config.qk_layernorm
-        else backend.column_parallel_linear()
-    )
-    linear_kv_up_proj = (
-        backend.column_parallel_layer_norm_linear()
-        if config.qk_layernorm
-        else backend.column_parallel_linear()
-    )
 
     # Because TransformerEngine does not support sparse attention yet, we use local
     # implementation whether the backend is TransformerEngine or not.
@@ -111,19 +118,27 @@ def get_dsa_module_spec_for_backend(
         ),
     )
 
+    # Adjust for RMS norm.
+    rms_norm = config.normalization == "RMSNorm"
+    # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
+    # with linear projection and have to use unfused qk layernorm.
+    qk_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+    )
+
     attention = ModuleSpec(
-        module=MLASelfAttention,
+        module=AbsorbedMLASelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
-        submodules=MLASelfAttentionSubmodules(
+        submodules=AbsorbedMLASelfAttentionSubmodules(
             linear_q_proj=backend.column_parallel_linear(),
             linear_q_down_proj=backend.linear(),
-            linear_q_up_proj=linear_q_up_proj,
+            linear_q_up_proj=backend.column_parallel_linear(),
             linear_kv_down_proj=backend.linear(),
-            linear_kv_up_proj=linear_kv_up_proj,
+            linear_kv_up_proj=backend.column_parallel_linear(),
             core_attention=core_attention,
             linear_proj=backend.row_parallel_linear(),
-            q_layernorm=IdentityOp,
-            kv_layernorm=IdentityOp,
+            q_layernorm=qk_norm,
+            kv_layernorm=qk_norm,
         ),
         metainfo={"fuse_input_layernorm": False},
     )
@@ -139,7 +154,7 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant == "gated_delta_net":
+    if is_gated_delta_net_variant(config.experimental_attention_variant):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
@@ -154,12 +169,12 @@ def get_experimental_attention_variant_module_spec(
 ##########
 
 
-def get_transformer_block_with_experimental_attention_variant_spec(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
-) -> TransformerBlockSubmodules:
-    """Build transformer block spec with experimental attention variants (e.g., linear attention).
+def get_transformer_layer_with_experimental_attention_variant_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> List[ModuleSpec]:
+    """Build transformer layer specs with experimental attention variants (e.g., linear attention).
 
-    This function constructs a heterogeneous transformer block that supports mixing different
+    This function is for constructing a heterogeneous transformer that supports mixing different
     attention mechanisms (experimental vs standard) and MLP types (MoE vs dense) across layers.
     **Note that, this API is a experimental API in the short term, and might be deprecated in the
     future. In the long run, we will move to a new design that better support hybrid models.**
@@ -175,22 +190,19 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         2. Per-Layer Spec Construction: Iterates through layers, constructing transformer
            layer specs based on attention and MLP patterns.
 
-        3. Pipeline Slicing: Extracts layer specs for the current pipeline stage.
-
     Args:
         config: Transformer configuration containing model hyperparameters and feature flags.
-        vp_stage: Virtual pipeline stage index for interleaved pipeline parallelism.
-        pp_rank: Pipeline model parallel rank.
 
     Returns:
-        TransformerBlockSubmodules containing per-layer specs and final layer norm.
+        List[ModuleSpec] containing per-layer specs.
 
     Note:
         Currently only supports transformer_engine backend. Kitchen backend can be used as a
         wrapper with TE fallback for unsupported operations.
     """
 
-    backend = _get_backend_spec_provider(config=config)
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
 
     # Get attention patterns and specs
     experimental_attention_pattern = [0] * config.num_layers
@@ -271,6 +283,42 @@ def get_transformer_block_with_experimental_attention_variant_spec(
             )
         )
 
+    return layer_specs
+
+
+def get_transformer_block_with_experimental_attention_variant_spec(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> TransformerBlockSubmodules:
+    """Build transformer block spec with experimental attention variants (e.g., linear attention).
+
+    This function constructs a heterogeneous transformer block that supports mixing different
+    attention mechanisms (experimental vs standard) and MLP types (MoE vs dense) across layers.
+    **Note that, this API is a experimental API in the short term, and might be deprecated in the
+    future. In the long run, we will move to a new design that better support hybrid models.**
+
+    Constructing transformer layer specs by
+    `get_transformer_layer_with_experimental_attention_variant_spec` and then slicing the
+    layer specs to only include the layers that are built in this pipeline stage.
+
+    Args:
+        config: Transformer configuration containing model hyperparameters and feature flags.
+        vp_stage: Virtual pipeline stage index for interleaved pipeline parallelism.
+        pp_rank: Pipeline model parallel rank.
+
+    Returns:
+        TransformerBlockSubmodules containing per-layer specs and final layer norm.
+
+    Note:
+        Currently only supports transformer_engine backend. Kitchen backend can be used as a
+        wrapper with TE fallback for unsupported operations.
+    """
+
+    backend = _get_backend_spec_provider(config=config)
+
+    layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(
+        config=config, backend=backend
+    )
+
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     if config.pipeline_model_parallel_layout is not None:
         local_layer_ids = config.pipeline_model_parallel_layout.get_layer_id_list(
@@ -281,9 +329,11 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_ids = range(offset, offset + num_layers_to_build)
 
+    _validate_dsa_index_share_pipeline_split(config, local_layer_ids)
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
 
     # Get GPT decoder block spec
+    rms_norm = config.normalization == "RMSNorm"
     gpt_decoder_block_spec = TransformerBlockSubmodules(
         layer_specs=layer_specs, layer_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False)
     )
@@ -296,10 +346,88 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 ##########
 
 
+def normalize_experimental_attention_variant(
+    experimental_attention_variant: Optional[str],
+) -> Optional[str]:
+    """Resolve a deprecated ``experimental_attention_variant`` spelling to its canonical name.
+
+    ``gated_delta_net`` is the deprecated spelling of ``gdn``. Passing it emits a
+    ``DeprecationWarning`` and returns the canonical name so that every downstream
+    consumer only has to handle ``gdn``.
+
+    Args:
+        experimental_attention_variant: The configured variant name, possibly a
+            deprecated alias.
+
+    Returns:
+        The canonical variant name, or the argument unchanged when it is not an alias.
+    """
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(experimental_attention_variant)
+    if canonical is None:
+        return experimental_attention_variant
+
+    warnings.warn(
+        f"experimental_attention_variant='{experimental_attention_variant}' is deprecated "
+        f"and will be removed in a future release. Use '{canonical}' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return canonical
+
+
+def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """Check if the experimental attention variant is served by a gated delta net layer.
+
+    Accepts the deprecated ``gated_delta_net`` spelling without warning; use
+    :func:`normalize_experimental_attention_variant` to emit the deprecation notice.
+    """
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(
+        experimental_attention_variant, experimental_attention_variant
+    )
+    return canonical in GDN_ATTENTION_VARIANTS
+
+
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
-    return experimental_attention_variant in linear_attention_variants
+    return is_gated_delta_net_variant(experimental_attention_variant)
+
+
+def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
+    """Ensure DSA top-k sharing does not require top-k indices from another PP stage."""
+    if (
+        config.experimental_attention_variant != "dsa"
+        or getattr(config, "dsa_indexer_topk_freq", 1) <= 1
+    ):
+        return
+
+    local_layer_ids = list(local_layer_ids)
+    local_layer_positions = {
+        layer_id: position for position, layer_id in enumerate(local_layer_ids)
+    }
+    for position, layer_id in enumerate(local_layer_ids):
+        layer_number = layer_id + 1
+        if not is_dsa_skip_topk_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        ):
+            continue
+
+        source_layer_number = source_dsa_compute_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        )
+        source_layer_id = source_layer_number - 1
+        if (
+            source_layer_id not in local_layer_positions
+            or local_layer_positions[source_layer_id] > position
+        ):
+            raise RuntimeError(
+                "DSA index-share pipeline split is invalid: local layer "
+                f"{layer_number} reuses top-k indices from computing layer "
+                f"{source_layer_number}, but that source layer is not earlier in this "
+                "pipeline stage. Cross-layer top-k sharing does not cross PP boundaries. "
+                "Choose a pipeline layout where each stage starts on a computing layer "
+                f"(dsa_indexer_topk_freq={config.dsa_indexer_topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={config.dsa_indexer_skip_topk_offset})."
+            )
 
 
 def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:

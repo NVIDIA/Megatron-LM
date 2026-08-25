@@ -651,6 +651,56 @@ class TestArgumentGroupFactoryArgparseMeta:
             args = parser.parse_args(['--unsupported-with-metadata', 'baz'])
 
 
+class TestMegatronNetworkArgumentGeneration:
+    """Test Megatron's TransformerConfig-derived argument group."""
+
+    def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
+        """Callback fields are runtime hooks, not CLI-provided values."""
+        from megatron.training.arguments import _add_network_size_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+
+        destinations = {action.dest for action in parser._actions}
+        callback_fields = {
+            "timers",
+            "finalize_model_grads_func",
+            "grad_scale_func",
+            "moe_grad_scale_func",
+            "no_sync_func",
+            "grad_sync_func",
+            "param_sync_func",
+        }
+
+        assert destinations.isdisjoint(callback_fields)
+        args = parser.parse_args([])
+        for field_name in callback_fields:
+            assert not hasattr(args, field_name)
+
+
+class TestMegatronMixedPrecisionArguments:
+    """Test language-model logit dtype CLI choices."""
+
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_mixed_precision_args
+
+        return _add_mixed_precision_args(ArgumentParser(exit_on_error=False))
+
+    def test_logit_dtype_defaults_to_input_dtype(self):
+        args = self._parser().parse_args([])
+        assert args.logit_dtype is None
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+    def test_logit_dtype_accepts_supported_choices(self, dtype):
+        args = self._parser().parse_args(["--output-logit-dtype", dtype])
+        assert args.logit_dtype == dtype
+
+    def test_logit_dtype_rejects_fp16(self):
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            self._parser().parse_args(["--output-logit-dtype", "fp16"])
+
+
 # ---------------------------------------------------------------------------
 # Tests for pretrain_cfg_container_from_args
 # ---------------------------------------------------------------------------

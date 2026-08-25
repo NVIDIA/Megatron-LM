@@ -9,11 +9,28 @@ MEGATRON_TOKENIZERS = ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETo
 
 SP_TOKENIZERS = ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer', 'Llama2Tokenizer']
 
+SUPPORTED_TOKENIZERS = [
+    'HuggingFaceTokenizer',
+    'TikTokenizer',
+    'MultimodalTokenizer',
+    'NullTokenizer',
+    'NullMultimodalTokenizer',
+    'SFTTokenizer',
+    *MEGATRON_TOKENIZERS,
+    *SP_TOKENIZERS,
+]
+
 logger = logging.getLogger(__name__)
 
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
+    if args.tokenizer_type not in SUPPORTED_TOKENIZERS:
+        raise ValueError(
+            f"tokenizer_type {args.tokenizer_type} is not supported. "
+            f"See list of available tokenizers: {SUPPORTED_TOKENIZERS}"
+        )
+
     kwargs = {}
     tokenizer_library = None
     tokenizer_path = None
@@ -30,14 +47,18 @@ def build_tokenizer(args, **kwargs):
         kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
+        kwargs['use_gigatoken'] = args.use_gigatoken
     elif args.tokenizer_type in SP_TOKENIZERS:
         tokenizer_library = 'sentencepiece'
         tokenizer_path = args.tokenizer_model
+        kwargs['chat_template'] = args.chat_template
+        kwargs['ignore_extra_whitespaces'] = args.tokenizer_sentencepiece_ignore_extra_whitespaces
         kwargs['legacy'] = args.tokenizer_sentencepiece_legacy
         kwargs['special_tokens'] = args.special_tokens
     elif args.tokenizer_type == 'TikTokenizer':
         tokenizer_library = 'tiktoken'
         tokenizer_path = args.tokenizer_model
+        kwargs['chat_template'] = args.chat_template
         if args.tiktoken_pattern:
             kwargs['pattern'] = args.tiktoken_pattern
         if args.vocab_size:
@@ -47,16 +68,25 @@ def build_tokenizer(args, **kwargs):
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
         tokenizer_library = 'huggingface'
         tokenizer_path = args.tokenizer_model
+        kwargs['chat_template'] = args.chat_template
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
         kwargs['additional_special_tokens'] = args.special_tokens if args.special_tokens else []
         kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
+        kwargs['use_gigatoken'] = args.use_gigatoken
     elif args.tokenizer_type == 'MultimodalTokenizer':
         tokenizer_library = 'multimodal'
+        tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.tokenizer_prompt_format
-        kwargs['special_tokens'] = args.special_tokens
+        # Fall back to the pre-rename attribute name when the checkpoint or CLI
+        # populated only args.special_tokens.
+        kwargs['special_tokens'] = (
+            getattr(args, 'tokenizer_special_tokens', None)
+            or getattr(args, 'special_tokens', None)
+            or []
+        )
         kwargs['image_tag_type'] = args.image_tag_type
         kwargs['force_system_message'] = args.force_system_message
     elif args.tokenizer_type == 'SFTTokenizer':
@@ -80,7 +110,8 @@ def build_tokenizer(args, **kwargs):
         tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, **kwargs)
 
         # Add vocab size (if not already set from a checkpoint).
-        _set_padded_vocab_size(args, tokenizer)
+        if args.pad_vocab_size:
+            _set_padded_vocab_size(args, tokenizer)
 
         return tokenizer
 
@@ -93,7 +124,8 @@ def build_tokenizer(args, **kwargs):
     )
 
     # Add vocab size (if not already set from a checkpoint).
-    _set_padded_vocab_size(args, tokenizer)
+    if args.pad_vocab_size:
+        _set_padded_vocab_size(args, tokenizer)
 
     return tokenizer
 

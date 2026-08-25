@@ -2,7 +2,7 @@
 
 import logging
 import math
-from collections import defaultdict
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -20,6 +20,8 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
+    _get_param_grad_norm_group,
+    _validate_grad_norm_group,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import (
@@ -31,6 +33,148 @@ from .param_layout import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
+    """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
+
+    Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
+    via Newton-Schulz, and False for parameters routed to Muon's scalar fallback:
+    explicit ``use_muon=False`` exclusions, embeddings, and non-matrix parameters.
+
+    This DDP-buffer ownership rule must match Muon's parameter-group routing.
+    """
+    if not getattr(param, 'use_muon', True):
+        return False
+    if not param.dim() == 2:
+        return False
+    if getattr(param, 'is_embedding_or_output_parameter', False):
+        return False
+    return True
+
+
+def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: bool = True) -> bool:
+    """Whether a DDP bucket belongs to a LayerWise-managed buffer.
+
+    Buckets are built from params that share a :class:`BufferKey`, so checking
+    the first param's tag is sufficient. ``default_for_untagged`` controls the
+    legacy (no-tagging) case: callers asking "is this mine?" from the LayerWise
+    side pass ``True`` (legacy LayerWise owns everything); callers asking from
+    the DistOpt side pass ``False`` (legacy DistOpt also owns everything, so
+    untagged buckets are *not* LayerWise-managed).
+    """
+    if not bucket.params_list:
+        return False
+    param = bucket.params_list[0]
+    if not hasattr(param, 'is_managed_by_layer_wise_optimizer'):
+        return default_for_untagged
+    return param.is_managed_by_layer_wise_optimizer
+
+
+def tag_params_for_buffer_routing(model_chunks) -> None:
+    """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
+
+    Run this once on the un-DDP-wrapped model chunks before
+    :class:`DistributedDataParallel` constructs its grad/param buffers — the
+    grouping function ``group_params_for_buffers`` reads this attribute to
+    decide which buffer each param lands in (LayerWise shard-aligned buffer vs
+    DistOpt-style byte-level buffer).
+    """
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            if not param.requires_grad:
+                continue
+            param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+
+
+def _all_gather_param_group_metadata(param_group, pg_collection):
+    """Gather optimizer-group metadata within the group that owns the parameters."""
+    process_group = (
+        pg_collection.expt_dp
+        if param_group.get('is_expert_parallel', False)
+        else pg_collection.dp_cp
+    )
+    assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
+    all_rank_groups = [None for _ in range(get_pg_size(process_group))]
+    torch.distributed.all_gather_object(all_rank_groups, param_group, group=process_group)
+    return all_rank_groups
+
+
+def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
+    """Map each (E)GTP_remat-REPLICATED param to ``(gtp_rank, gtp_remat_size)`` for folding.
+
+    PROBLEM: LayerWise keeps (E)GTP_remat-replicated params (identical per gtp_remat peer) WHOLE, so
+    their optimizer-state ShardedTensors share one key+offset across those peers. The DP-coord reset
+    in ``sharded_state_dict`` would then mark all peers the all-zero "main replica" -> DCP sees N
+    writers for one shard and rejects the save.
+
+    FIX: fold the (e)gtp_remat rank into ``replica_id[1]`` so one peer writes. (E)GTP_remat-SHARDED
+    params (``is_gtp_param``) are offset-sharded and excluded -- each shard already has a
+    distinct offset, hence a unique writer.
+
+    Returns: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when GTP_remat is unavailable or
+    no group spans >1 rank. Names are bare (all ``module.`` wrappers stripped, layer index
+    collapsed) to match the optimizer-state checkpoint key suffix.
+    """
+    gtp_fold: Dict[str, Tuple[int, int]] = {}
+    try:
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, is_gtp_param
+    except ImportError:
+        return gtp_fold
+    if not HAVE_GTP:
+        return gtp_fold
+
+    assert pg_collection is not None, (
+        "_build_gtp_replica_fold requires a pg_collection carrying gtp_remat/expt_gtp_remat; "
+        "the optimizer factory must materialize it before constructing the optimizer."
+    )
+    gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+    egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
+
+    for model_chunk in model_chunks:
+        for name, p in model_chunk.named_parameters():
+            if is_gtp_param(p):
+                continue
+            grp = egtp_remat_group if getattr(p, 'is_expert_parallel', False) else gtp_remat_group
+            if grp is None or grp.size() <= 1:
+                continue
+            # Normalize the param name so it matches the optimizer-state checkpoint key suffix,
+            # which is wrapper-free and layer-collapsed. Three transforms, in order:
+            #   1. drop every leading 'module.' (DDP + Float16Module can double-wrap the model),
+            #   2. collapse the layer index (the checkpoint key drops it -- a sharded axis), and
+            #   3. collapse SequentialMLP 'local_experts.<N>' to the grouped key 'experts' (the
+            #      checkpoint groups them, matching TEGroupedMLP), else expert replicas collide.
+            # e.g.  'module.module.decoder.layers.3.mlp.router.weight'
+            #         -> 'decoder.layers.mlp.router.weight'
+            nm = name
+            while nm.startswith('module.'):
+                nm = nm[len('module.') :]
+            nm = re.sub(r'\.layers\.\d+\.', '.layers.', nm)
+            nm = re.sub(r'\.local_experts\.\d+\.', '.experts.', nm)
+            gtp_fold[nm] = (grp.rank(), grp.size())
+    return gtp_fold
+
+
+def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
+    """Compute a ShardedTensor's writer-disambiguating replica_id for fixed-DP checkpointing.
+
+    Base reset: keep (PP, TP), zero DP -- every DP rank holds the same shard, so one writer
+    remains. Correct for normal params.
+
+    For an (e)gtp-replicated param (in ``gtp_fold``), reset leaves ``gtp_remat_size`` writers, so
+    fold the peer gtp_remat rank into TP slot to re-spread: ``new_tp = old_tp * gtp_remat_size +
+    gtp_rank`` (rank 0 stays the writer, the others move off the all-zero main replica) -> one
+    writer per shard. Suffix-match (bare fold name vs fully-qualified key) and collapse the key's
+    layer index too, so it matches per-layer and already-collapsed keys.
+    """
+    rid = (*replica_id[:2], 0)
+    if not gtp_fold:
+        return rid
+    key = re.sub(r'\.layers\.\d+\.', '.layers.', key or '')
+    for nm, (gtp_rank, gtp_remat_size) in gtp_fold.items():
+        if key.endswith(nm):
+            return (rid[0], rid[1] * gtp_remat_size + gtp_rank, rid[2])
+    return rid
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -69,29 +213,34 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         ddp_config,
         param_indices: Optional[List[int]] = None,
     ) -> 'PerBufferParamLayout':
-        """Compute parameter layout with shard-aligned buckets via size-matching.
+        """Compute parameter layout with shard-aligned buckets via LPT bin-packing.
 
-        Assigns parameters to ``dp_size`` equal-sized shards within each bucket
-        so that no parameter is ever split across a shard boundary.
+        Assigns parameters to ``dp_size`` shards within each bucket so that no
+        parameter is split across a shard boundary, while keeping each bucket
+        confined to a contiguous range in backprop order.
 
         **Algorithm** (operates in reverse model / backprop order):
 
-        1. Separate shared-embedding parameters (isolated buckets, emitted first).
-        2. Pool the remaining parameters in backprop order, indexed by numel.
-        3. Pop the next unassigned parameter and assign it to shard 0.
-        4. For shards 1 … ``dp_size - 1``, assign the next unassigned parameter
-           of the same numel (also in backprop order).  If none is available,
-           insert padding of that numel.  Every shard grows by the same amount,
-           so all shards stay the same size.
-        5. When the bucket total reaches *bucket_size*, finalise the bucket
-           (pad shard size to :meth:`_shard_divisor`) and start a new one.
-        6. Repeat from 3 until all parameters are assigned.
+        1. Walk parameters in backprop order, accumulating them into a chunk.
+           A shared (tied) embedding triggers an immediate finalisation
+           followed by an isolated bucket for that embedding alone.
+        2. When the chunk's total numel reaches ``bucket_size`` (or all
+           params have been consumed), bin-pack the chunk into ``dp_size``
+           shards: sort by estimated Newton-Schulz compute cost descending and
+           assign each param to the shard with the smallest accumulated compute
+           load, subject to a per-bucket numel cap that bounds shard-imbalance
+           padding. Compute loads persist across buckets so expensive
+           (GTP-sharded) matrices spread over the whole buffer instead of
+           clustering inside each bucket.
+        3. Pad each shard to ``max(shard_cursors)`` aligned to
+           :meth:`_shard_divisor`, then emit the bucket.
 
-        Because repeated layers produce many parameters of the same shape,
-        size-matching naturally keeps whole parameters together without any
-        name-parsing heuristic.  Padding overhead is low (depending on number
-        of layers and number of shards) — zero when every shape group has a
-        count divisible by ``dp_size``.
+        Each bucket therefore spans a contiguous backprop range so that
+        ``overlap_grad_reduce`` can dispatch the bucket's reduce-scatter as
+        soon as the bucket's backward segment finishes — preserving the
+        original DDP overlap semantics.  Greedy bin-packing keeps shards close
+        to balanced; for uniform transformer blocks where ``params_per_layer
+        * num_layers`` is a multiple of ``dp_size`` the packing is perfect.
 
         Args:
             params: Parameters in model-definition (forward) order.
@@ -106,184 +255,186 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         dp_size = data_parallel_world_size
         shard_divisor = LayerWiseDistributedOptimizer._shard_divisor(dp_size, ddp_config)
 
-        # -- 0. Separate shared-embedding params. -------------------------
-        shared_embedding_params: List[torch.nn.Parameter] = []
-        regular_params: List[torch.nn.Parameter] = []
-        total_param_numel = 0
-        for param in params:
-            total_param_numel += param.data.nelement()
-            if getattr(param, 'shared_embedding', False):
-                shared_embedding_params.append(param)
-            else:
-                regular_params.append(param)
+        total_param_numel = sum(p.data.nelement() for p in params)
 
-        # -- 1. Build backprop-order pool & per-size index. ---------------
-        pool = list(reversed(regular_params))
-        assigned_param_ids: set[int] = set()  # id(param) of assigned params
-
-        size_groups: Dict[int, List[torch.nn.Parameter]] = defaultdict(list)
-        for param in pool:
-            size_groups[param.data.nelement()].append(param)
-        size_cursors: Dict[int, int] = defaultdict(int)
-
-        overall_cursor = 0
-
-        def _next_unassigned() -> Optional[torch.nn.Parameter]:
-            nonlocal overall_cursor
-            while overall_cursor < len(pool):
-                if id(pool[overall_cursor]) not in assigned_param_ids:
-                    return pool[overall_cursor]
-                overall_cursor += 1
-            return None
-
-        def _next_with_size(param_numel: int) -> Optional[torch.nn.Parameter]:
-            """Next unassigned param of size *param_numel* in backprop order."""
-            group = size_groups[param_numel]
-            cursor = size_cursors[param_numel]
-            while cursor < len(group):
-                if id(group[cursor]) not in assigned_param_ids:
-                    size_cursors[param_numel] = cursor
-                    return group[cursor]
-                cursor += 1
-            size_cursors[param_numel] = cursor
-            return None
-
-        # -- 2. Output accumulators and per-bucket shard state. ----------
         param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = {}
         bucket_indices: List[Tuple[int, int]] = []
         per_bucket_numel_unpadded: List[int] = []
-        buffer_cursor = 0  # write position in the contiguous buffer
+        buffer_cursor = 0
         bucket_id = 0
+        shard_imbalance_padding_numel = 0
 
-        # Per-shard state for the bucket currently being built.
-        # `shard_assignments[i]` holds an ordered list of (param | None, numel)
-        # entries to be written into shard i; a `None` entry is empty padding
-        # that keeps every shard the same size.
-        shard_assignments: List[List[Tuple[Optional[torch.nn.Parameter], int]]] = [
-            [] for _ in range(dp_size)
-        ]
-        shard_cursor = 0  # position within each shard (identical for all shards)
-        bucket_numel_unpadded = 0
-        size_match_padding_numel = 0  # elements used for empty-shard-slot padding
+        # Persistent compute loads across buckets so LPT spreads expensive
+        # (GTP-sharded) params evenly instead of clustering them per bucket.
+        shard_compute_loads = [0] * dp_size
 
-        def _finalize_bucket() -> None:
-            nonlocal buffer_cursor, bucket_id, shard_assignments
-            nonlocal shard_cursor, bucket_numel_unpadded
-            if shard_cursor == 0:
+        def _ns_compute_cost(param):
+            """Estimate Newton-Schulz compute cost for a parameter.
+
+            Newton-Schulz only runs on matrices, so anything that is not 2D falls
+            back to its element count. For a 2D param the cost is
+            ~ max(M,N) * min(M,N)^2, the dominant term in the orthogonalization;
+            GTP-sharded params reconstruct the full post-AllGather shape first
+            (GTP always shards along dim 0).
+            """
+            if param.dim() != 2:
+                return param.data.nelement()
+            m, n = param.data.shape
+            if getattr(param, 'is_gtp_weight_remat', False):
+                m = m * getattr(param, 'gtp_remat_size', 1)
+            big, small = max(m, n), min(m, n)
+            return big * small * small
+
+        def _emit_bucket(
+            chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
+        ) -> None:
+            """Bin-pack *chunk_params* into ``dp_size`` shards and emit a bucket.
+
+            With ``shared_embedding=True``, the chunk must contain a single
+            parameter; it goes into shard 0 with same-size padding in
+            shards 1..dp_size-1 so the embedding fits entirely within one
+            shard (needed for the cross-stage tied-embedding all-reduce).
+            """
+            nonlocal buffer_cursor, bucket_id, shard_imbalance_padding_numel
+            if not chunk_params:
                 return
-            padded_shard_size = pad_to_divisor(shard_cursor, shard_divisor)
-            bucket_start_index = buffer_cursor
 
+            shard_assignments: List[List[Tuple[Optional[torch.nn.Parameter], int]]] = [
+                [] for _ in range(dp_size)
+            ]
+            shard_cursors = [0] * dp_size
+
+            if shared_embedding:
+                assert len(chunk_params) == 1
+                param = chunk_params[0]
+                numel = param.data.nelement()
+                shard_assignments[0].append((param, numel))
+                shard_cursors[0] = numel
+                for shard_id in range(1, dp_size):
+                    shard_assignments[shard_id].append((None, numel))
+                    shard_cursors[shard_id] = numel
+            else:
+                # Compute-balanced LPT: sort by Newton-Schulz compute cost
+                # (accounts for full post-AllGather shape under GTP), assign to
+                # the shard with least accumulated compute load. Compute loads
+                # persist across buckets; numel cursors reset per bucket.
+                # A per-bucket numel cap prevents excessive padding.
+                # The within-shard order is sorted-by-compute-cost, not backprop;
+                # that is fine because all params in the chunk share the same
+                # bucket_id, so DDP's backprop-order iteration still sees
+                # monotonic bucket_ids across the chunk boundary.
+                _NUMEL_EPSILON = 0.3
+                total_chunk_numel = sum(p.data.nelement() for p in chunk_params)
+                max_shard_numel = total_chunk_numel / dp_size * (1 + _NUMEL_EPSILON)
+                for param in sorted(chunk_params, key=lambda p: -_ns_compute_cost(p)):
+                    numel = param.data.nelement()
+                    candidates = [
+                        s
+                        for s in range(dp_size)
+                        if pad_param_start(shard_cursors[s]) + numel <= max_shard_numel
+                    ]
+                    if candidates:
+                        min_shard = min(candidates, key=lambda s: shard_compute_loads[s])
+                    else:
+                        min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
+                    placement = pad_param_start(shard_cursors[min_shard])
+                    shard_assignments[min_shard].append((param, numel))
+                    shard_cursors[min_shard] = placement + numel
+                    shard_compute_loads[min_shard] += _ns_compute_cost(param)
+
+            padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
+            bucket_start_index = buffer_cursor
             for shard_id in range(dp_size):
                 shard_start_index = bucket_start_index + shard_id * padded_shard_size
                 cursor = shard_start_index
-                for param, numel in shard_assignments[shard_id]:
+                for p, numel in shard_assignments[shard_id]:
                     cursor = pad_param_start(cursor)
-                    if param is not None:
-                        param_index_map[param] = (cursor, cursor + numel, bucket_id)
+                    if p is not None:
+                        param_index_map[p] = (cursor, cursor + numel, bucket_id)
                     cursor += numel
-
+                shard_imbalance_padding_numel += padded_shard_size - shard_cursors[shard_id]
             bucket_end_index = bucket_start_index + dp_size * padded_shard_size
             bucket_indices.append((bucket_start_index, bucket_end_index))
-            per_bucket_numel_unpadded.append(bucket_numel_unpadded)
+            per_bucket_numel_unpadded.append(sum(p.data.nelement() for p in chunk_params))
             buffer_cursor = bucket_end_index
             bucket_id += 1
 
-            shard_assignments = [[] for _ in range(dp_size)]
-            shard_cursor = 0
-            bucket_numel_unpadded = 0
-
-        # -- 3. Emit one isolated bucket per shared-embedding param. -----
-        # Shared (tied) embeddings need their own bucket — typically because
-        # input and output embeddings are tied across pipeline-parallel
-        # stages and need a cross-stage all-reduce. Each shared embedding
-        # occupies shard 0 of its bucket alone; shards 1..dp_size-1 are
-        # filled with empty (padding) slots of the same numel so the bucket
-        # is shard-aligned and the embedding fits entirely within shard 0.
+        # Each chunk spans a contiguous backprop range. Bucket ids therefore
+        # increase monotonically when ``_ParamAndGradBuffer.__init__`` iterates
+        # params in backprop order, satisfying its ``bucket_id == cur + 1``
+        # invariant.
         #
-        # NOTE: This is expensive. Padding cost per shared embedding is
-        # (dp_size - 1) * pad_to_divisor(numel, shard_divisor) elements,
-        # which for a vocab x hidden embedding (e.g. 128k x 8192) at dp_size
-        # = 8 is roughly 7 * (vocab * hidden) elements — many GBs of the
-        # param buffer (and again of the grad buffer) per shared embedding.
-        # The cost is unavoidable while preserving the "no parameter crosses
-        # a shard boundary" invariant the layerwise scheme depends on for
-        # correct reduce-scatter + local optimizer step.
-        for param in reversed(shared_embedding_params):
+        # Padding floor: the on-buffer bucket size is ``dp_size *
+        # max_shard_cursor``, which is at least ``dp_size * chunk_max_param``
+        # because some shard must hold that param whole. ``bucket_size`` is a
+        # soft *minimum*: once it is reached we keep absorbing params as long
+        # as each one fits into the existing shard padding (i.e., without
+        # growing ``dp_size * max_shard_cursor``), and only close the bucket
+        # when the next param would otherwise enlarge it. This fills shard
+        # padding with real params instead of emitting padded-out buckets.
+        # When the params pack evenly across ``dp_size`` shards the overhead
+        # is zero. ``int(dp_size * chunk_max_param * PADDING_FLOOR)`` keeps the
+        # soft minimum sensible when a single param dominates a shard.
+        PADDING_FLOOR = 0.9
+        chunk_params: List[torch.nn.Parameter] = []
+        chunk_numel = 0
+        chunk_max_param = 0
+        # Approximate _emit_bucket's placement so we can decide, per param,
+        # whether it still fits in the current bucket. This estimates rather
+        # than mirrors, for two reasons: _emit_bucket sorts the chunk before
+        # packing it, while this places params in backprop order, and
+        # _emit_bucket assigns by Newton-Schulz compute cost, while this tracks
+        # numel. Equal-sized params make both differences vanish, because
+        # sorting is then a no-op and cost is proportional to numel. Mixed
+        # sizes send params to different shards under the two orders, so the
+        # real maximum shard load can exceed the estimated one. _absorbs then
+        # admits a param that does grow the bucket, leaving a buffer larger
+        # than closing the bucket early would have produced. The layout stays
+        # valid either way; see test_mixed_sizes_can_absorb_into_larger_bucket.
+        shard_loads = [0] * dp_size
+
+        def _absorbs(numel: int) -> bool:
+            """True if ``numel`` fits in the least-loaded shard without growing
+            the bucket's padded size (``dp_size * padded_shard_size``), i.e.,
+            it fills existing shard padding instead of adding a new row."""
+            target = pad_to_divisor(max(shard_loads), shard_divisor)
+            return pad_param_start(min(shard_loads)) + numel <= target
+
+        def _place(numel: int) -> None:
+            shard_id = min(range(dp_size), key=lambda s: shard_loads[s])
+            shard_loads[shard_id] = pad_param_start(shard_loads[shard_id]) + numel
+
+        for param in reversed(params):
             param_numel = param.data.nelement()
-            assigned_param_ids.add(id(param))
-            shard_assignments[0].append((param, param_numel))
-            bucket_numel_unpadded += param_numel
-            # No size-matching: each shared embedding must be alone in its
-            # bucket. Pad shards 1..dp_size-1 with same-size empty slots.
-            for shard_id in range(1, dp_size):
-                shard_assignments[shard_id].append((None, param_numel))
-                size_match_padding_numel += param_numel
-            shard_cursor = pad_param_start(shard_cursor) + param_numel
-            _finalize_bucket()
+            if getattr(param, 'shared_embedding', False):
+                # Finalize any in-progress chunk so the shared-embedding
+                # bucket comes after it in backprop order.
+                _emit_bucket(chunk_params)
+                chunk_params = []
+                chunk_numel = 0
+                chunk_max_param = 0
+                shard_loads[:] = [0] * dp_size
+                _emit_bucket([param], shared_embedding=True)
+                continue
+            # Close the bucket once it has met its soft-minimum size *and* this
+            # param can no longer be absorbed into the existing shard padding
+            # (adding it would grow the bucket).
+            if bucket_size is not None and chunk_params:
+                threshold = max(bucket_size, int(dp_size * chunk_max_param * PADDING_FLOOR))
+                if chunk_numel >= threshold and not _absorbs(param_numel):
+                    _emit_bucket(chunk_params)
+                    chunk_params = []
+                    chunk_numel = 0
+                    chunk_max_param = 0
+                    shard_loads[:] = [0] * dp_size
+            _place(param_numel)
+            chunk_params.append(param)
+            chunk_numel += param_numel
+            chunk_max_param = max(chunk_max_param, param_numel)
+        _emit_bucket(chunk_params)
 
-        # -- 4. Size-matching loop for regular params. --------------------
-        while True:
-            param = _next_unassigned()
-            if param is None:
-                break
-
-            param_numel = param.data.nelement()
-            assigned_param_ids.add(id(param))
-            shard_assignments[0].append((param, param_numel))
-            bucket_numel_unpadded += param_numel
-
-            for shard_id in range(1, dp_size):
-                # Prefer an exact-numel peer; this gives the cleanest layout
-                # (no inner-shard padding).
-                matched_param = _next_with_size(param_numel)
-                if matched_param is not None:
-                    assigned_param_ids.add(id(matched_param))
-                    shard_assignments[shard_id].append((matched_param, param_numel))
-                    bucket_numel_unpadded += param_numel
-                    continue
-
-                # No exact peer. Greedily pack as many smaller params from the
-                # queue as fit within this shard slot (sized to ``param_numel``).
-                # Cuts overhead from unique-large seeds (e.g. an embedding)
-                # that would otherwise force ``(dp_size - 1) * param_numel`` of
-                # empty padding.
-                useful_in_slot = 0
-                slot_cursor = 0
-                while True:
-                    candidate_param = _next_unassigned()
-                    if candidate_param is None:
-                        break
-                    candidate_numel = candidate_param.data.nelement()
-                    candidate_start = pad_param_start(slot_cursor)
-                    if candidate_start + candidate_numel > param_numel:
-                        break
-                    assigned_param_ids.add(id(candidate_param))
-                    shard_assignments[shard_id].append((candidate_param, candidate_numel))
-                    bucket_numel_unpadded += candidate_numel
-                    slot_cursor = candidate_start + candidate_numel
-                    useful_in_slot += candidate_numel
-
-                # Pad the remainder of the slot up to ``param_numel``.
-                padding_start = pad_param_start(slot_cursor)
-                padding_size = param_numel - padding_start
-                if padding_size > 0:
-                    shard_assignments[shard_id].append((None, padding_size))
-                size_match_padding_numel += param_numel - useful_in_slot
-
-            shard_cursor = pad_param_start(shard_cursor) + param_numel
-
-            if bucket_size is not None:
-                bucket_total = dp_size * pad_to_divisor(shard_cursor, shard_divisor)
-                if bucket_total >= bucket_size:
-                    _finalize_bucket()
-
-        _finalize_bucket()
-
-        # -- 5. Log padding overhead. ------------------------------------
         total_buffer_numel = bucket_indices[-1][1] if bucket_indices else 0
         total_padding = total_buffer_numel - total_param_numel
-        alignment_and_shard_end_padding = total_padding - size_match_padding_numel
         log_single_rank(
             logger,
             logging.INFO,
@@ -293,8 +444,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             f"total_param_numel={total_param_numel}, "
             f"total_buffer_numel={total_buffer_numel}, "
             f"total_padding={total_padding} "
-            f"(size_match={size_match_padding_numel}, "
-            f"alignment+shard_end={alignment_and_shard_end_padding}), "
+            f"(shard_imbalance={shard_imbalance_padding_numel}), "
             f"overhead={total_padding / max(total_param_numel, 1) * 100:.1f}%",
         )
 
@@ -303,6 +453,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=dp_size,
         )
 
     @staticmethod
@@ -331,6 +482,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Returns:
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
         """
+        # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
+        from .distrib_optimizer import DistributedOptimizer
+
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
@@ -343,7 +497,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else:
                 dp_world_size = data_parallel_world_size
 
-            layouts[buffer_key] = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
+            # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
+            # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
+            # get DistOpt's byte-level layout.
+            if buffer_key.is_managed_by_layer_wise_optimizer:
+                compute_per_buffer_layout = (
+                    LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
+                )
+            else:
+                compute_per_buffer_layout = DistributedOptimizer._compute_per_buffer_param_layout
+            layouts[buffer_key] = compute_per_buffer_layout(
                 group_params, bucket_size, dp_world_size, ddp_config, param_indices
             )
         return FullParamLayout(layouts=layouts)
@@ -368,6 +531,36 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+        self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
+
+        # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
+        # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
+        self.ddp_config = None
+        if model_chunks:
+            self.ddp_config = model_chunks[0].ddp_config
+            if any(model_chunk.ddp_config != self.ddp_config for model_chunk in model_chunks[1:]):
+                raise ValueError("LayerWise optimizer model chunks must share one DDP config")
+
+        # The data-parallel groups this optimizer shards parameters over. Cached here so the
+        # sharding, all-gather and broadcast paths read one attribute instead of reaching back
+        # into pg_collection at every use.
+        self.dp_cp = getattr(pg_collection, 'dp_cp', None) if pg_collection is not None else None
+        self.expt_dp = (
+            getattr(pg_collection, 'expt_dp', None) if pg_collection is not None else None
+        )
+
+        # LayerWise assigns whole params to ranks of the full dp_cp group and all-gathers over
+        # that same group, so it has no notion of optimizer instances. With more than one
+        # instance, DDP reduce-scatters gradients over the smaller intra-instance group, so a
+        # rank would be asked to update params whose gradients it does not hold. Reject the
+        # combination instead of silently training on partial gradients.
+        intra_dp_cp = (
+            getattr(pg_collection, 'intra_dp_cp', None) if pg_collection is not None else None
+        )
+        assert intra_dp_cp is None or get_pg_size(intra_dp_cp) == get_pg_size(self.dp_cp), (
+            "LayerWiseDistributedOptimizer does not support "
+            "num_distributed_optimizer_instances > 1."
+        )
 
         full_param_layouts = None
         if model_chunks is not None:
@@ -386,8 +579,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # path.
         self.use_buffer_param_sync = full_param_layouts is not None
 
-        # Set up overlap param gather using DDP bucket infrastructure.
-        self.overlap_param_gather = config.overlap_param_gather
+        # Fall back to OptimizerConfig only for direct construction without model chunks.
+        self.overlap_param_gather = (
+            self.ddp_config.overlap_param_gather
+            if self.ddp_config is not None
+            else config.overlap_param_gather
+        )
         if self.overlap_param_gather and not self.use_buffer_param_sync:
             # Legacy path: set up per-bucket param lists for variable-size all-gather.
             # When use_buffer_param_sync is True, the standard distributed optimizer
@@ -416,6 +613,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers[i] = Float16OptimizerWithFloat16Params(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
+
+        self.tp_group = self.pg_collection.tp
+        self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
+        for optimizer in optimizers:
+            # Child optimizers perform duplicate filtering and gradient-stat reductions.
+            optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
+            optimizer.tp_group = self.tp_group
+            optimizer.expert_tp_group = self.expert_tp_group
 
         super().__init__(optimizers)
 
@@ -451,13 +656,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 chunk).  ``None`` triggers the legacy fallback.
         """
         # Simplify when dp_cp group size is 1.
-        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        dp_cp_size = get_pg_size(self.dp_cp)
         if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
+        expt_dp_size = get_pg_size(self.expt_dp)
 
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
@@ -466,8 +671,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
-        dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
-        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
+        dp_cp_rank = get_pg_rank(self.dp_cp)
+        expt_dp_rank = get_pg_rank(self.expt_dp)
 
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
@@ -476,14 +681,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         param_to_shard: Dict[torch.nn.Parameter, int] = {}
         for full_layout in full_param_layouts:
             for buffer_key, layout in full_layout.layouts.items():
-                dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
+                # Non-LayerWise buffers (e.g. Adam-managed embeddings, biases,
+                # layernorms with a DistOpt byte-level layout) are managed by a
+                # separate DistributedOptimizer; LayerWise does not own them.
+                if not buffer_key.is_managed_by_layer_wise_optimizer:
+                    continue
                 for param, (
                     param_start_index,
                     param_end_index,
                     bucket_id,
                 ) in layout.param_index_map.items():
                     bucket_start_index, bucket_end_index = layout.bucket_indices[bucket_id]
-                    shard_size = (bucket_end_index - bucket_start_index) // dp_size
+                    shard_size = (
+                        bucket_end_index - bucket_start_index
+                    ) // layout.num_optimizer_shards
                     shard_id = (param_start_index - bucket_start_index) // shard_size
                     shard_end_index = bucket_start_index + (shard_id + 1) * shard_size
                     assert param_end_index <= shard_end_index, (
@@ -559,12 +770,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
-                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.expt_dp):
+                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.expt_dp):
                     param_groups_this_rank[group_index].append(p)
                 self.expt_dp_params_list[expt_dp_loop[expt_dp_idx]].append(p)
                 expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
             else:
-                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.pg_collection.dp_cp):
+                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.dp_cp):
                     param_groups_this_rank[group_index].append(p)
                 self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
                 dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
@@ -595,21 +806,28 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
                 for bucket in group.buckets:
-                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
-                    for bucket_list, full_params_list in zip(
-                        bucket_params_list, self.dp_cp_params_list
-                    ):
-                        for param in full_params_list:
-                            if param in bucket.params:
-                                bucket_list.append(param)
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                        continue
+                    if self.dp_cp_params_list is not None:
+                        bucket_params_list = [[] for _ in range(get_pg_size(self.dp_cp))]
+                        for bucket_list, full_params_list in zip(
+                            bucket_params_list, self.dp_cp_params_list
+                        ):
+                            for param in full_params_list:
+                                if param in bucket.params:
+                                    bucket_list.append(param)
+                    else:
+                        # dp_cp_size == 1: single rank owns all params, no
+                        # all-gather needed but data structures must be initialized.
+                        bucket_params_list = [list(bucket.params_list)]
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
                 for bucket in group.buckets:
+                    if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
+                        continue
                     if self.expt_dp_params_list is not None:
-                        bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
-                        ]
+                        bucket_params_list = [[] for _ in range(get_pg_size(self.expt_dp))]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.expt_dp_params_list
                         ):
@@ -672,9 +890,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.pg_collection is None:
             return
         if self.dp_cp_params_list:
-            _allgather_helper(self.dp_cp_params_list, self.pg_collection.dp_cp)
+            _allgather_helper(self.dp_cp_params_list, self.dp_cp)
         if self.expt_dp_params_list:
-            _allgather_helper(self.expt_dp_params_list, self.pg_collection.expt_dp)
+            _allgather_helper(self.expt_dp_params_list, self.expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):
@@ -683,23 +901,62 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.dp_cp_params_list is None:
             return
         for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.dp_cp, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
+                torch.distributed.broadcast(p, src_global_rank, self.dp_cp)
         if self.expt_dp_params_list is None:
             return
         for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.expt_dp, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
+                torch.distributed.broadcast(p, src_global_rank, self.expt_dp)
 
     @torch.no_grad()
     def get_grad_norm(self):
-        # similar to dist opt, always aggregate globally
+        # Aggregate across the module-local optimizer domain.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
-            grads_for_norm += optimizer.get_main_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+            grads_for_norm += optimizer.get_grads_for_grad_norm()
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
+        return grad_norm
+
+    def has_grad_norm_group(self, grad_norm_group: str) -> bool:
+        """Whether any rank in this optimizer's module owns a registered grad-norm group.
+
+        The existence check uses the same module-local group as the corresponding
+        gradient-norm reductions so heterogeneous modules cannot mismatch collectives.
+        """
+        _validate_grad_norm_group(grad_norm_group)
+        if getattr(self, '_has_grad_norm_group_cache', None) is None:
+            self._has_grad_norm_group_cache = {}
+        cache = self._has_grad_norm_group_cache
+        if grad_norm_group not in cache:
+            local = False
+            for optimizer in self.chained_optimizers:
+                for param in optimizer.get_parameters():
+                    param_grad_norm_group = _get_param_grad_norm_group(param)
+                    if param_grad_norm_group is None:
+                        continue
+                    _validate_grad_norm_group(param_grad_norm_group)
+                    local = local or param_grad_norm_group == grad_norm_group
+            flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.grad_stats_parallel_group
+            )
+            cache[grad_norm_group] = bool(flag.item() > 0)
+        return cache[grad_norm_group]
+
+    @torch.no_grad()
+    def _get_grad_norm_for_group(self, grad_norm_group: str):
+        # Aggregate across the module-local optimizer domain.
+        grads_for_norm = []
+        for optimizer in self.chained_optimizers:
+            grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
         return grad_norm
 
     @torch.no_grad()
@@ -709,35 +966,58 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params += optimizer.get_parameters()
         return count_zeros_fp32(
             params,
-            grad_stats_parallel_group=None,
+            grad_stats_parallel_group=self.grad_stats_parallel_group,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.tp_group,
+            expert_tp_group=self.expert_tp_group,
         )
 
-    @torch.no_grad()
-    def step(self):  # type: ignore[no-untyped-def]
-        """step function for layer-wise optimizer.
+    def start_param_sync_for_bucket_group_subset(self) -> None:
+        """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
 
-        NOTE: bypassed when this optimizer is a child of an outer
-        ChainedOptimizer; in that case the sibling DistributedOptimizer's
-        step_with_ready_grads handles the param sync.
+        Walks each model chunk's dense + expert-parallel bucket groups and
+        skips any group not managed by LayerWise, so a sibling
+        :class:`DistributedOptimizer`'s own ``start_param_sync`` call does not
+        double-sync the same buckets. Uses
+        :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
+        post-all-gather processing (and MXFP8 copy) still runs.
         """
-        update_successful, grad_norm, num_zeros_in_grad = super().step()
+        for model_chunk in self.model_chunks:
+            for bucket_group in (
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            ):
+                if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
+                    bucket_group.buckets[0]
+                ):
+                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Step then all-gather LayerWise-managed param buffers.
+
+        Placed on ``step_with_ready_grads`` (not ``step``) so the param sync also
+        runs when this optimizer is a child of an outer ``ChainedOptimizer``,
+        which calls ``step_with_ready_grads`` directly on each child and bypasses
+        ``step``.
+        """
+        success = super().step_with_ready_grads()
 
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
         if not self.overlap_param_gather:
             if self.use_buffer_param_sync:
                 # Model params are views into the DDP param buffer
-                # (ddp_config.use_distributed_optimizer=True).  The optimizer step
+                # (ddp_config.use_distributed_optimizer=True). The optimizer step
                 # already copied updated fp32 main params → bf16 model params (=
-                # buffer views), so the buffer is up-to-date.  Trigger the standard
-                # buffer all-gather (matches DistributedOptimizer's call site).
-                for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                # buffer views), so the buffer is up-to-date. Trigger the standard
+                # buffer all-gather, but only for LayerWise-managed bucket groups
+                # so a sibling DistributedOptimizer's own ``start_param_sync`` call
+                # is not duplicated for the same buckets.
+                self.start_param_sync_for_bucket_group_subset()
             else:
                 self.allgather_params()
 
-        return update_successful, grad_norm, num_zeros_in_grad
+        return success
 
     # TODO(deyuf): need to improve dist checkpointing design to properly handle this
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty
@@ -767,14 +1047,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             model_sharded_state_dict, is_loading, **kwargs
         )
 
+        # (E)GTP_remat-replicated -> (gtp_rank, gtp_remat_size), consumed by _fold_replica_id.
+        gtp_fold = _build_gtp_replica_fold(self.pg_collection, self.model_chunks)
+
         # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
             if hasattr(sh_base, 'replica_id'):
                 assert (
                     isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
                 ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
-                sh_base.replica_id = (
-                    0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
+                if isinstance(sh_base.replica_id, int):
+                    sh_base.replica_id = 0
+                    continue
+                sh_base.replica_id = _fold_replica_id(
+                    sh_base.replica_id, getattr(sh_base, 'key', ''), gtp_fold
                 )
 
         # later code assume list but chained optimizer fallback to non-list if there's only one
@@ -805,8 +1091,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
                 group['params'] = bool(local_params.unwrap())
-                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather_object(all_rank_groups, group)
+                all_rank_groups = _all_gather_param_group_metadata(group, self.pg_collection)
                 # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params

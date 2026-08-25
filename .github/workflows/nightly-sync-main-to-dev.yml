@@ -17,25 +17,23 @@ name: Nightly Sync Main to Dev
 on:
   workflow_dispatch:
   schedule:
-    # 21:00 UTC = 2 PM PDT (1 PM PST during winter — GitHub Actions cron
-    # is UTC-only and does not follow DST).
-    - cron: '0 21 * * *'
+    # Twice-weekly cadence: Monday and Thursday at 15:00 UTC.
+    # 15:00 UTC = 8 AM PDT (7 AM PST during winter — GitHub Actions cron
+    # is UTC-only and does not follow DST). Days-of-week: 1=Mon, 4=Thu.
+    - cron: '0 15 * * 1,4'
 
 concurrency:
   group: nightly-sync-main-to-dev
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  id-token: write
+  contents: read
 
 jobs:
   # Re-dispatch scheduled runs as workflow_dispatch via a PAT so the heavy
   # job runs with a real User-type actor. On `schedule` events GitHub sets
   # `github.actor` to `github-merge-queue` (no Users-API entry), which
-  # crashes anthropics/claude-code-action@v1 in `checkHumanActor` with a
+  # crashes anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1 in `checkHumanActor` with a
   # 404 before `allowed_bots` is ever consulted. Upstream fix PR
   # https://github.com/anthropics/claude-code-action/pull/1212 is closed
   # and unmerged; see issue
@@ -55,13 +53,15 @@ jobs:
 
   sync-main-to-dev:
     if: github.event_name == 'workflow_dispatch' && github.repository == 'NVIDIA/Megatron-LM'
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # GitHub-hosted runners are capped at 6h; use an NVIDIA runner so the
+    # sync bot can wait through long CI queues and retries.
+    runs-on: linux-amd64-cpu16
+    timeout-minutes: 720
     env:
       GH_TOKEN: ${{ secrets.PAT }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT }}
@@ -108,11 +108,97 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install pre-push merge guidance
+        if: steps.check-sync.outputs.skip != 'true'
+        run: |
+          cat > .git/hooks/pre-push <<'HOOK'
+          #!/usr/bin/env bash
+
+          # This hook is advisory. Run the checks in a strict subshell so an
+          # audit error can be reported without blocking the push.
+          set +e
+          (
+          set -euo pipefail
+
+          echo "=== nightly-sync pre-push guidance ==="
+
+          merge_commit=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
+          if [ -n "$merge_commit" ]; then
+            dev_ref="${merge_commit}^1"
+            main_ref="${merge_commit}^2"
+          else
+            dev_ref="origin/dev"
+            main_ref="origin/main"
+          fi
+
+          if ! git diff --quiet "$dev_ref" HEAD -- .github/CODEOWNERS; then
+            echo "WARNING: .github/CODEOWNERS differs from dev. Restore it before finalizing the sync."
+          fi
+
+          for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
+            if ! git diff --quiet "$dev_ref" HEAD -- "$f"; then
+              echo "WARNING: $f differs from dev"
+            fi
+          done
+
+          if [ -z "$merge_commit" ]; then
+            echo "No merge commit found in HEAD history; skipping dev-feature audit."
+            exit 0
+          fi
+
+          intentional_override_regex='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
+          skip_regex='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
+
+          findings=0
+          while IFS= read -r f; do
+            [[ "$f" =~ $skip_regex ]] && continue
+            [[ "$f" =~ $intentional_override_regex ]] && continue
+            git cat-file -e "HEAD:$f" 2>/dev/null || continue
+
+            missing=$(comm -23 \
+                        <(git show "$dev_ref:$f" 2>/dev/null | sort -u) \
+                        <(git show "$main_ref:$f" 2>/dev/null | sort -u) \
+                      | comm -23 - <(git show "HEAD:$f" 2>/dev/null | sort -u) \
+                      | grep -E '[[:alnum:]_]' \
+                      || true)
+
+            if [ -n "$missing" ]; then
+              echo "=== $f ==="
+              printf '%s\n' "$missing"
+              findings=$((findings + $(printf '%s\n' "$missing" | grep -c .)))
+            fi
+          done < <(git diff --name-only "$dev_ref"..HEAD \
+                    -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
+                       '*.sh' '*.cpp' '*.cu' '*.h' \
+                    | sort -u)
+
+          if [ "$findings" -gt 0 ]; then
+            echo "WARNING: $findings potential dev-only line removal(s) were detected."
+            echo "Review each finding: restore merge accidents and document intentional main removals in the PR body."
+            echo "This audit is advisory; the push will continue."
+          else
+            echo "No potential dev-only line removals detected."
+          fi
+
+          echo "nightly-sync pre-push guidance complete"
+          )
+          guidance_status=$?
+          if [ "$guidance_status" -ne 0 ]; then
+            echo "WARNING: nightly-sync pre-push guidance failed with status $guidance_status; allowing the push to continue."
+          fi
+          exit 0
+          HOOK
+          chmod +x .git/hooks/pre-push
+
       - name: Run Claude Code to merge, fix, and iterate
         if: steps.check-sync.outputs.skip != 'true'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ secrets.PAT }}
           prompt: |
             You are an automated sync bot. Merge `main` into `dev`, create a
@@ -158,6 +244,23 @@ jobs:
             state). Do NOT break a long wait into many short polls with
             conversation in between — that wastes `--max-turns` and
             creates windows where the agent could forget the loop.
+
+            **Pre-push guidance:** The workflow installs a local git pre-push
+            hook that reports CODEOWNERS, dependency-triple, and dev-feature
+            preservation findings. It is advisory and MUST NOT block a push.
+            Do not use `--no-verify`; let the hook run and review its output.
+            Restore genuine merge accidents and CODEOWNERS changes. For
+            intentional main removals or formatting/reordering false positives,
+            document the evidence in the PR body and continue. Do not stop or
+            ask for authorization solely because advisory findings remain.
+
+            **Merge strategy:** Start from `origin/dev` and run
+            `git merge origin/main --no-edit`. Do NOT use global
+            `git merge -X theirs`. Main's version may be taken wholesale only
+            for files explicitly listed in the nightly-sync skill's
+            "Files to Override from Main" section. For other conflicts,
+            preserve recent dev-only additions and combine them with main's
+            incoming changes.
 
             **Source of truth for CI status:**
             `gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`
@@ -209,9 +312,8 @@ jobs:
             `Nemo_CICD_Test`, `copyright-check`, `pre-flight`, wheel
             builds, etc. — is NOT exempt and must reach a terminal
             green conclusion.
-          show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
-            --model "opus[1m]"
+            --model "${{ vars.CLAUDE_MODEL }}"
             --effort max
             --max-turns 1500

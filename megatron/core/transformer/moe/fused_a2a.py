@@ -3,7 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
-import os
+import inspect
 from typing import Optional
 
 from megatron.core.utils import internal_api
@@ -269,7 +269,6 @@ else:
 
 
 try:
-    import hybrid_ep_cpp
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
@@ -277,62 +276,10 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
-_HYBRID_EP_TOKEN_ALIGNMENT = 16
-_HYBRID_EP_MIN_BUFFER_TOKENS = 512
-_HYBRID_EP_IB_QP_MAX_DEPTH = 65535
-_HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN = 3
 
 
-def _round_up_to_multiple(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def _hybrid_ep_num_nodes(group: torch.distributed.ProcessGroup) -> int:
-    """Mirror HybridEP's NVLink-domain detection without constructing the full buffer."""
-    ranks_per_nvlink_domain_env = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
-    if ranks_per_nvlink_domain_env is not None:
-        ranks_per_nvlink_domain = int(ranks_per_nvlink_domain_env)
-    else:
-        allocator = hybrid_ep_cpp.ExtendedMemoryAllocator()
-        ranks_per_nvlink_domain = allocator.detect_accessible_ranks(group)
-
-    assert group.size() % ranks_per_nvlink_domain == 0, (
-        f"The number of ranks {group.size()} should be divisible by the number of ranks per "
-        f"NVLink domain {ranks_per_nvlink_domain}."
-    )
-    return group.size() // ranks_per_nvlink_domain
-
-
-def _hybrid_ep_uses_internode_rdma(group: torch.distributed.ProcessGroup) -> bool:
-    if _hybrid_ep_buffer is not None and hasattr(_hybrid_ep_buffer, "num_of_nodes"):
-        return _hybrid_ep_buffer.num_of_nodes > 1
-    return _hybrid_ep_num_nodes(group) > 1
-
-
-def _validate_hybrid_ep_ib_tx_depth(num_tokens: int, group: torch.distributed.ProcessGroup) -> None:
-    buffer_tokens = max(
-        _round_up_to_multiple(num_tokens, _HYBRID_EP_TOKEN_ALIGNMENT), _HYBRID_EP_MIN_BUFFER_TOKENS
-    )
-    tx_depth = _HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN * buffer_tokens + 1
-    if tx_depth <= _HYBRID_EP_IB_QP_MAX_DEPTH:
-        return
-
-    if not _hybrid_ep_uses_internode_rdma(group):
-        return
-
-    max_supported_tokens = (
-        ((_HYBRID_EP_IB_QP_MAX_DEPTH - 1) // _HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN)
-        // _HYBRID_EP_TOKEN_ALIGNMENT
-        * _HYBRID_EP_TOKEN_ALIGNMENT
-    )
-    raise ValueError(
-        f"HybridEP InfiniBand dispatch queue pair depth ({tx_depth}) exceeds the hardware "
-        f"limit of {_HYBRID_EP_IB_QP_MAX_DEPTH}. DeepEP computes this depth from the "
-        f"tokens per rank rounded up to a {_HYBRID_EP_TOKEN_ALIGNMENT}-token buffer "
-        f"alignment ({buffer_tokens}). Reduce sequence length or micro-batch size, or "
-        f"increase Tensor Parallelism (TP) / Context Parallelism (CP), so tokens per rank "
-        f"are at most {max_supported_tokens} for multi-node HybridEP."
-    )
+# HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
+HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
 def init_hybrid_ep_buffer(
@@ -345,6 +292,7 @@ def init_hybrid_ep_buffer(
     num_blocks_permute: Optional[int] = None,
     num_blocks_unpermute: Optional[int] = None,
     fp8_dispatch: bool = False,
+    num_sms_preprocessing_api: Optional[int] = None,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -373,6 +321,8 @@ def init_hybrid_ep_buffer(
             Number of blocks used by the unpermute part.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
+        num_sms_preprocessing_api (Optional[int]):
+            Number of SMs used by the preprocessing (metadata scan) kernel.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -385,6 +335,8 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_permute'] = num_blocks_permute
     if num_blocks_unpermute is not None:
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+    if num_sms_preprocessing_api is not None:
+        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -423,6 +375,7 @@ class HybridEPDispatch(torch.autograd.Function):
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -444,9 +397,8 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        num_tokens, hidden_dim = x.shape[-2:]
-        _validate_hybrid_ep_ib_tx_depth(num_tokens, group)
         if _hybrid_ep_buffer is None:
+            num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
@@ -458,6 +410,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute,
                 num_blocks_unpermute,
                 fp8_dispatch,
+                num_sms_preprocessing_api,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
@@ -509,6 +462,7 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -577,6 +531,7 @@ if HAVE_HYBRIDEP:
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -608,6 +563,8 @@ if HAVE_HYBRIDEP:
             pad_multiple (int):
                 Alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
+            num_sms_preprocessing_api (int):
+                Number of SMs used by the preprocessing (metadata scan) kernel.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -622,6 +579,7 @@ if HAVE_HYBRIDEP:
             fused,
             num_permuted_tokens,
             pad_multiple,
+            num_sms_preprocessing_api,
         )
 
     @internal_api
@@ -647,3 +605,203 @@ if HAVE_HYBRIDEP:
 else:
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
+
+
+try:
+    from transformer_engine.pytorch import ep as te_ep
+
+    HAVE_TE_EP = True
+except ImportError:
+    HAVE_TE_EP = False
+
+
+def ensure_nccl_ep_bootstrapped(
+    ep_group,
+    num_experts,
+    max_tokens_per_rank,
+    recv_capacity_per_rank,
+    hidden_dim,
+    num_topk,
+    num_sms=0,
+    zero_copy=False,
+):
+    """Initialize the process-wide NCCL EP context once. Idempotent.
+
+    Collective on ``ep_group``: TE's ``ep_bootstrap`` issues a barrier and borrows the
+    group's NCCL communicator, so every rank must call this with identical arguments
+    before the first dispatch. Reuses TransformerEngine's own one-time flag, so repeated
+    calls (e.g. once per MoE layer) are no-ops.
+
+    Args:
+        ep_group (torch.distributed.ProcessGroup): The expert-parallel process group.
+        num_experts (int): Total experts across ``ep_group`` (global, not per-rank).
+        max_tokens_per_rank (int): Upper bound on local input tokens per forward. Must be
+            even (NCCL EP requires ``num_tokens_per_rank * inner_dim % 4 == 0``).
+        recv_capacity_per_rank (int, optional): Per-rank receive-buffer capacity in tokens. Must
+            be ``>= max_tokens_per_rank``. ``None`` selects eager mode, where TE sizes the
+            receive buffer per step from the actual received-token count.
+        hidden_dim (int): Token hidden size.
+        num_topk (int): Per-token top-k over ``ep_group``; sizes NCCL EP's internal buffers.
+            This is the same TP-scaled top-k used for the receive-capacity budget, not the
+            raw ``moe_router_topk``.
+        num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
+    """
+    if not HAVE_TE_EP:
+        raise RuntimeError(
+            "transformer_engine.pytorch.ep is unavailable. The 'ncclep' flex dispatcher backend "
+            "requires a TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
+        )
+    if is_nccl_ep_bootstrapped():  # reuse TE's own one-time guard; no parallel state to drift
+        return
+    te_ep.ep_bootstrap(
+        ep_group,
+        num_experts=num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        recv_capacity_per_rank=recv_capacity_per_rank,
+        hidden_dim=hidden_dim,
+        num_topk=num_topk,
+        max_num_sms=num_sms,
+        zero_copy=zero_copy,
+        drop_on_overflow=recv_capacity_per_rank is not None,
+    )
+
+
+def is_nccl_ep_bootstrapped() -> bool:
+    """Whether TE's process-wide NCCL EP context is live. is_ep_bootstrapped is TE 3321."""
+    if not HAVE_TE_EP:
+        return False
+    if hasattr(te_ep, "is_ep_bootstrapped"):
+        return te_ep.is_ep_bootstrapped()
+    return te_ep._BOOTSTRAPPED
+
+
+def nccl_ep_finalize():
+    """Tear down the NCCL EP context. Idempotent; safe when never bootstrapped.
+
+    Releases the borrowed NCCL communicator and must run before the process group is
+    destroyed.
+    """
+    if HAVE_TE_EP:
+        te_ep.ep_finalize()
+
+
+if HAVE_TE_EP:
+
+    def alloc_ep_symm_buffer(shape, dtype, ep_group):
+        """Allocate one persistent NCCL symm-mem buffer (per-buffer collective rendezvous). mcore's
+        zero-copy buffers are all persistent and non-pool; the symm mem-pool is used only by TE for
+        the per-call recv buffers it recycles."""
+        return te_ep.symm_mem_alloc(shape, dtype, ep_group)
+
+    # Whether this TE build supports quantized EP dispatch/combine payloads.
+    _TE_EP_BUFFER_HAS_QUANT_RECIPE = (
+        "dispatch_fwd_quant_recipe" in inspect.signature(te_ep.EpBuffer).parameters
+    )
+
+    def new_nccl_ep_buffer(
+        top_k,
+        max_tokens_per_rank,
+        recv_capacity_per_rank,
+        hidden_dim,
+        num_local_experts,
+        alignment=0,
+        dispatch_fwd_quant_recipe=None,
+        combine_bwd_quant_recipe=None,
+    ):
+        """Build a fresh TE EpBuffer for one dispatch/combine pair.
+
+        The buffer owns handle_mem (the routing table dispatch writes and combine reads); a new one
+        is built per dispatch and dropped after combine. Payload symm buffers are not owned here —
+        they are caller-supplied to dispatch/combine or allocated on the fly by TE.
+
+        dispatch_fwd_quant_recipe / combine_bwd_quant_recipe (TE Recipe, optional): quantize the
+        dispatch forward payload / combine backward gradient over the wire,
+        the corresponding output is returned as a per-expert GroupedTensor.
+        """
+        quant_kwargs = {}
+        if dispatch_fwd_quant_recipe is not None or combine_bwd_quant_recipe is not None:
+            if not _TE_EP_BUFFER_HAS_QUANT_RECIPE:
+                raise RuntimeError(
+                    "Quantized NCCL EP dispatch/combine payloads require a TransformerEngine "
+                    "build with EpBuffer quant-recipe support "
+                    "(dispatch_fwd_quant_recipe / combine_bwd_quant_recipe)."
+                )
+            quant_kwargs = dict(
+                dispatch_fwd_quant_recipe=dispatch_fwd_quant_recipe,
+                combine_bwd_quant_recipe=combine_bwd_quant_recipe,
+            )
+        return te_ep.EpBuffer(
+            top_k=top_k,
+            max_tokens_per_rank=max_tokens_per_rank,
+            recv_capacity_per_rank=recv_capacity_per_rank,
+            hidden_dim=hidden_dim,
+            num_local_experts=num_local_experts,
+            alignment=alignment,
+            **quant_kwargs,
+        )
+
+    def nccl_ep_dispatch(
+        buffer, tokens, topk_idx, topk_weights, recv_tokens=None, recv_topk_weights=None
+    ):
+        """Autograd-aware prepare + dispatch via TransformerEngine NCCL EP.
+
+        Args:
+            buffer (te_ep.EpBuffer): The TE EP buffer for this dispatch.
+            tokens (torch.Tensor): Local input tokens ``[num_local_tokens, hidden]``
+                (leading dims flattened by TE), ``payload_dtype``.
+            topk_idx (torch.Tensor): ``int64`` ``[num_local_tokens, top_k]`` global expert
+                ids per token.
+            topk_weights (torch.Tensor): ``float32`` ``[num_local_tokens, top_k]`` weights.
+            recv_tokens, recv_topk_weights (torch.Tensor, optional): caller-owned symm dispatch
+                recv buffers (fp8 zero-copy). Left None, TE allocates them (bf16 zero-copy: symm
+                mem-pool; normal: plain).
+
+        Returns:
+            tuple: ``(recv_tokens, tokens_per_expert, dispatched_probs)``:
+              * ``recv_tokens``: packed received tokens ``[recv_rows, hidden]``, grouped by local
+                expert (no separate compaction step). ``recv_rows`` is
+                ``recv_capacity_per_rank``, or this step's received-token count in eager mode.
+              * ``tokens_per_expert``: ``int64`` ``[num_local_experts]`` device tensor of
+                received counts per local expert (feeds grouped GEMM as group sizes;
+                alignment-padded, == actual when ``alignment=0``).
+              * ``dispatched_probs``: ``float32`` ``[recv_rows]`` per-slot
+                weights; apply them in the expert MLP (combine is called unweighted).
+
+            ``tokens_per_expert`` is non-differentiable.
+        """
+        recv_tokens, dispatched_probs, tokens_per_expert = te_ep.ep_dispatch(
+            buffer,
+            tokens,
+            topk_idx,
+            topk_weights,
+            recv_tokens=recv_tokens,
+            recv_topk_weights=recv_topk_weights,
+        )
+        return recv_tokens, tokens_per_expert, dispatched_probs
+
+    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None, grad_out=None):
+        """Autograd-aware combine via TransformerEngine NCCL EP (no scatter step).
+
+        Args:
+            buffer (te_ep.EpBuffer): The TE EP buffer for this combine.
+            expert_out (torch.Tensor): Expert outputs ``[recv_rows, hidden]`` (the row count
+                ``nccl_ep_dispatch`` returned), already weighted.
+            num_local_tokens (int): Rows of the result (local token count for this
+                forward). When None, TE uses ``buffer.max_tokens_per_rank``.
+            grad_out (torch.Tensor, optional): caller-owned symm buffer the backward scatters the
+                expert_out grad into (zero-copy). Left None, TE allocates it (bf16: symm mem-pool;
+                normal: plain).
+
+        Returns:
+            torch.Tensor: ``[num_local_tokens, hidden]`` combined output, in local token
+            order.
+        """
+        return te_ep.ep_combine(
+            buffer, expert_out, num_local_tokens=num_local_tokens, grad_out=grad_out
+        )
+
+else:
+    alloc_ep_symm_buffer = None
+    new_nccl_ep_buffer = None
+    nccl_ep_dispatch = None
+    nccl_ep_combine = None
