@@ -427,6 +427,7 @@ class TestCudaGraphReplay:
         runner.get_mismatch_errors = lambda args, kwargs: []
         runner.get_tensors = lambda args, kwargs, check_types: []
         runner.to_list = lambda value: list(value) if isinstance(value, tuple) else [value]
+        runner._make_pipeline_output_viewless = lambda output: output
         monkeypatch.setattr(
             cuda_graphs_module,
             "ensure_params_ready",
