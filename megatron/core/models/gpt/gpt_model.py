@@ -773,7 +773,7 @@ class GPTModel(LanguageModule):
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
         gather_output = (
-            getattr(self.output_layer, "gather_output", False)
+            self.output_layer.gather_output
             if runtime_gather_output is None
             else runtime_gather_output
         )
@@ -783,6 +783,8 @@ class GPTModel(LanguageModule):
             "output_logits",
             logits,
             tp_shard_dim=None if gather_output else -1,
+            sequence_dim=0,
+            batch_dim=1,
         )
 
         # Restore sequence parallel execution to the output layer if necessary.

@@ -2,16 +2,19 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import megatron.core.transformer.moe.router as router_mod
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE, te_checkpoint
 from megatron.core.tensor_observation import (
     capture_tensor_observations,
     observe_layer_residuals,
     observe_tensor,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from tests.unit_tests.test_utilities import Utils
 
 
 def test_tensor_observation_scope_filters_source_kinds_and_restores_noop():
@@ -29,7 +32,7 @@ def test_tensor_observation_scope_filters_source_kinds_and_restores_noop():
     assert len(observed) == 1
     assert observed[0][:3] == (owner, "output_logits", "output_logits")
     torch.testing.assert_close(observed[0][3], torch.tensor([1.0]))
-    assert observed[0][4] is None
+    assert observed[0][4:] == (None, None, None)
 
 
 def test_layer_residual_observation_separates_accumulator_and_net_contribution():
@@ -52,6 +55,8 @@ def test_layer_residual_observation_separates_accumulator_and_net_contribution()
     torch.testing.assert_close(observed[1][3], torch.tensor([3.0, 5.0]))
     assert observed[0][4] == 0
     assert observed[1][4] == 0
+    assert observed[0][5:] == (0, 1)
+    assert observed[1][5:] == (0, 1)
     assert not observed[1][3].requires_grad
 
 
@@ -94,6 +99,45 @@ def test_tensor_observation_observes_checkpoint_forward_not_recomputation():
     assert observation[:3] == (owner, "activation", "activation")
     torch.testing.assert_close(observation[3], value.detach() * 2.0)
     torch.testing.assert_close(value.grad, torch.tensor([8.0, 16.0], device="cuda"))
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not available")
+def test_tensor_observation_observes_te_checkpoint_forward_not_recomputation():
+    owner = object()
+    executions = []
+    observed = []
+
+    def checkpointed(value):
+        executions.append(torch.is_grad_enabled())
+        doubled = value * 2.0
+        observe_tensor(owner, "activation", "activation", doubled)
+        return doubled.square()
+
+    Utils.initialize_model_parallel()
+    try:
+        value = torch.tensor([1.0, 2.0], device="cuda", requires_grad=True)
+        with capture_tensor_observations(
+            lambda *args: observed.append((torch.is_grad_enabled(), args)),
+            frozenset({"activation"}),
+        ):
+            output = te_checkpoint(
+                checkpointed,
+                False,
+                tensor_parallel.random.get_cuda_rng_tracker,
+                parallel_state.get_tensor_model_parallel_group(),
+                value,
+            )
+            output.sum().backward()
+
+        assert executions == [False, True]
+        assert len(observed) == 1
+        observed_with_grad, observation = observed[0]
+        assert not observed_with_grad
+        assert observation[:3] == (owner, "activation", "activation")
+        torch.testing.assert_close(observation[3], value.detach() * 2.0)
+        torch.testing.assert_close(value.grad, torch.tensor([8.0, 16.0], device="cuda"))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_tensor_observation_observes_checkpoint_without_output_forward_not_recomputation():
@@ -156,6 +200,7 @@ def test_router_observes_raw_logits_before_forced_benchmark_routing(monkeypatch)
     assert observed[0][:3] == (router, "router_logits", "router_logits")
     torch.testing.assert_close(observed[0][3], raw_logits)
     assert observed[0][4] == 0
+    assert observed[0][5:] == (0, 1)
     torch.testing.assert_close(routed_logits[0], raw_logits + 100.0)
 
 
@@ -196,4 +241,5 @@ def test_router_observes_normalized_configured_decision_scores():
         assert observed[0][:3] == (router, "router_scores", "router_scores")
         torch.testing.assert_close(observed[0][3], expected)
         assert observed[0][4] is None
+        assert observed[0][5:] == (0, 1)
         assert not observed[0][3].requires_grad

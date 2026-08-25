@@ -6,6 +6,7 @@ from typing import cast
 import pytest
 import torch
 
+import megatron.core.transformer.moe.router as router_mod
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
@@ -95,7 +96,9 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_router_forward_observes_compact_diagnostics_when_aux_loss_is_disabled(self):
+    def test_router_forward_observes_compact_diagnostics_when_aux_loss_is_disabled(
+        self, monkeypatch
+    ):
         self.router = self.router.cuda()
         # A complete sequence may still be marked sequence-parallel when TP has only one rank.
         # The compact diagnostics have batch as dimension zero and therefore remain replicated.
@@ -103,6 +106,16 @@ class TestTop2Router:
         self.router.tp_group = _ProcessGroup(1)
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
         observed = []
+        score_grad_modes = []
+        compute_scores = router_mod.compute_routing_scores_for_aux_loss
+
+        def record_score_grad_mode(*args, **kwargs):
+            score_grad_modes.append(torch.is_grad_enabled())
+            return compute_scores(*args, **kwargs)
+
+        monkeypatch.setattr(
+            router_mod, "compute_routing_scores_for_aux_loss", record_score_grad_mode
+        )
 
         with capture_tensor_observations(
             lambda *args: observed.append(args), frozenset({"router_diagnostics"})
@@ -110,9 +123,13 @@ class TestTop2Router:
             self.router(hidden_states)
 
         assert len(observed) == 1
-        owner, name, source_kind, diagnostics, tp_shard_dim = observed[0]
+        assert score_grad_modes == [False]
+        owner, name, source_kind, diagnostics, tp_shard_dim, sequence_dim, batch_dim = observed[0]
         assert owner is self.router
         assert name == source_kind == "router_diagnostics"
+        assert tp_shard_dim is None
+        assert sequence_dim is None
+        assert batch_dim == 0
         assert diagnostics.shape == (2, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, 4)
         torch.testing.assert_close(
             diagnostics[:, RouterDiagnosticChannel.VALID_TOKEN_COUNT, 0],
@@ -122,7 +139,6 @@ class TestTop2Router:
             diagnostics[:, RouterDiagnosticChannel.AUX_ACTUAL_OVERLAP, 0],
             torch.ones(2, device="cuda"),
         )
-        assert tp_shard_dim is None
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
