@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -247,6 +249,17 @@ def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
     return is_te_min_version("2.14.0")
 
 
+def _te_grouped_tensor_environment_supported() -> bool:
+    """Return whether TE GroupedLinear exposes the device-initiated grouped-tensor API."""
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch import GroupedLinear
+    except ImportError:
+        return False
+    return "use_grouped_tensor" in inspect.signature(GroupedLinear.__init__).parameters
+
+
 _TE_GROUPED_MLP_OP_FUSER_SKIP_REASON = (
     "TEGroupedMLP op fuser (tests use use_transformer_engine_op_fuser=True) requires TE>=2.14 "
     "with GroupedLinear/ScaledSwiGLU ops"
@@ -266,6 +279,10 @@ _MXFP8_SKIP_REASON = (
 
 
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
+@pytest.mark.skipif(
+    not _te_grouped_tensor_environment_supported(),
+    reason="Installed TE GroupedLinear does not expose use_grouped_tensor",
+)
 @pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
 class TestPagedStashingGroupedTensor:
     """Paged stashing with device-initiated GroupedLinear and no TE operation fuser."""
