@@ -88,6 +88,22 @@ def test_paged_stash_allows_non_fused_grouped_tensor_hybridep():
     assert config.use_transformer_engine_op_fuser is False
 
 
+def test_paged_stash_marking_delegates_to_transformer_engine(monkeypatch):
+    marked = []
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=True)
+    tensors = (torch.zeros(2, 4), torch.ones(2, 1))
+
+    monkeypatch.setattr(
+        experts_module, "_te_mark_grouped_tensor", lambda *args: marked.append(args)
+    )
+    module._mark_paged_stash_tensors(*tensors)
+
+    assert len(marked) == 1
+    assert marked[0][0] is tensors[0]
+    assert marked[0][1] is tensors[1]
+
+
 def test_clamped_swiglu_allows_te_op_fuser():
     config = TransformerConfig(
         num_layers=1,

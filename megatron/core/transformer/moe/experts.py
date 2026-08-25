@@ -64,6 +64,11 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
     try:
+        from transformer_engine.pytorch.utils import mark_grouped_tensor as _te_mark_grouped_tensor
+    except ImportError:
+        _te_mark_grouped_tensor = None
+
+    try:
         from transformer_engine.pytorch.ops.basic.grouped_linear import (
             GRAD_INPUT_BUFFER_KEY,
             OUTPUT_BUFFER_KEY,
@@ -73,6 +78,7 @@ if HAVE_TE:
 else:
     te = None  # type: ignore[assignment, misc]
     Fp8Padding, Fp8Unpadding = None, None
+    _te_mark_grouped_tensor = None
     GRAD_INPUT_BUFFER_KEY = OUTPUT_BUFFER_KEY = None
 
 try:
@@ -326,8 +332,13 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs, "grouped_tensor_scale_inv"
         )
         if paged_stash_marked:
-            setattr(flat_output, "grouped_tensor_scale_inv", False)
-            setattr(flat_probs, "grouped_tensor_scale_inv", False)
+            if _te_mark_grouped_tensor is None:
+                raise RuntimeError(
+                    "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
+                )
+            # The multiply below saves these two token-shaped operands. The additive output
+            # operand is not saved by autograd and does not need a marker.
+            _te_mark_grouped_tensor(flat_probs)
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -346,7 +357,7 @@ class TEGroupedMLP(MegatronModule):
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
         if paged_stash_marked:
-            setattr(bias_per_token, "grouped_tensor_scale_inv", False)
+            _te_mark_grouped_tensor(bias_per_token)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
     @staticmethod
@@ -739,9 +750,11 @@ class TEGroupedMLP(MegatronModule):
         """Mark dynamic unfused activations for the paged-stash saved-tensor hook."""
         if not self.config.moe_paged_stash:
             return
-        for tensor in tensors:
-            if tensor is not None:
-                setattr(tensor, "grouped_tensor_scale_inv", False)
+        if _te_mark_grouped_tensor is None:
+            raise RuntimeError(
+                "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
+            )
+        _te_mark_grouped_tensor(*tensors)
 
     def _fused_forward(
         self,
@@ -871,18 +884,17 @@ class TEGroupedMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ) -> torch.Tensor:
         """Run FC1, activation, and FC2 without the TE operation fuser."""
-        self._mark_paged_stash_tensors(permuted_local_hidden_states, permuted_probs)
-
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            # MulBackward saves both operands before GroupedLinear sees the scaled input.
+            self._mark_paged_stash_tensors(permuted_local_hidden_states, permuted_probs)
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
-            self._mark_paged_stash_tensors(permuted_local_hidden_states, permuted_probs)
 
         expert_fc1_manager = off_interface(
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
@@ -896,7 +908,6 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[permuted_local_hidden_states],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
-        self._mark_paged_stash_tensors(fc1_output)
 
         moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
 
@@ -970,9 +981,9 @@ class TEGroupedMLP(MegatronModule):
                             x_linear = x_linear.clamp(min=-val, max=val)
                             self._mark_paged_stash_tensors(x_glu, x_linear)
                         x_glu = self.config.activation_func(x_glu)
-                        self._mark_paged_stash_tensors(x_glu)
                         x_linear = x_linear + self.config.glu_linear_offset
-                        self._mark_paged_stash_tensors(x_linear)
+                        # MulBackward saves both newly-created operands.
+                        self._mark_paged_stash_tensors(x_glu, x_linear)
                         return x_glu * x_linear
 
                     intermediate_parallel = glu(intermediate_parallel)
@@ -993,7 +1004,6 @@ class TEGroupedMLP(MegatronModule):
         else:
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-        self._mark_paged_stash_tensors(bias_act_output)
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
@@ -1005,7 +1015,6 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[fc1_output],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
-        self._mark_paged_stash_tensors(output, permuted_probs)
         return self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
     def forward(
