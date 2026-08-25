@@ -950,7 +950,7 @@ try:
 
             logprobs_content = None
             if sampling_params.return_log_probs:
-                token_logprobs = result.get('log_probs', [])
+                token_logprobs = result.get("generated_log_probs") or []
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))

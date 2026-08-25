@@ -57,6 +57,78 @@ def _make_byte_level_fast_tokenizer():
 
 
 @pytest.mark.asyncio
+async def test_chat_completions_uses_generated_logprobs_only_when_requested():
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+        bp as chat_completions_blueprint,
+    )
+
+    class FakeTokenizer:
+        bos = None
+        chat_template = None
+
+        @staticmethod
+        def tokenize(_text):
+            return [11, 12]
+
+        @staticmethod
+        def detokenize(tokens):
+            return "".join(chr(ord("a") + token - 1) for token in tokens)
+
+    class FakeInferenceClient:
+        def __init__(self):
+            self.return_log_probs = []
+
+        async def add_request(self, _prompt_tokens, sampling_params):
+            self.return_log_probs.append(sampling_params.return_log_probs)
+            generated_log_probs = [-0.25, -0.5] if sampling_params.return_log_probs else None
+            return {
+                "status": "COMPLETED",
+                "generated_text": "ab",
+                "prompt_length": 2,
+                "num_cached_tokens": 1,
+                "generated_tokens": [1, 2],
+                "generated_log_probs": generated_log_probs,
+                # This legacy-shaped field catches a regression back to the old lookup.
+                "log_probs": [-9.0, -9.0],
+                "generated_top_n_logprobs": [{"a": -0.25}, {"b": -0.5}],
+                "policy_epoch": [],
+                "kv_cache_epoch": [],
+                "events": [],
+                "sampling_params": {"num_tokens_to_generate": 2},
+                "routing_indices": None,
+            }
+
+    fake_client = FakeInferenceClient()
+    app = quart.Quart(__name__)
+    app.config.update(client=fake_client, tokenizer=FakeTokenizer(), parsers=[], verbose=False)
+    app.register_blueprint(chat_completions_blueprint)
+    client = app.test_client()
+    request_body = {
+        "messages": [{"role": "user", "content": "prompt"}],
+        "max_tokens": 2,
+        "prevent_retokenization": False,
+    }
+
+    with_logprobs = await client.post(
+        "/v1/chat/completions", json={**request_body, "logprobs": True, "top_logprobs": 1}
+    )
+    without_logprobs = await client.post(
+        "/v1/chat/completions", json={**request_body, "logprobs": False}
+    )
+
+    assert with_logprobs.status_code == without_logprobs.status_code == 200
+    with_payload = await with_logprobs.get_json()
+    without_payload = await without_logprobs.get_json()
+    assert fake_client.return_log_probs == [True, False]
+    assert [entry["logprob"] for entry in with_payload["choices"][0]["logprobs"]["content"]] == [
+        -0.25,
+        -0.5,
+    ]
+    assert without_payload["choices"][0]["logprobs"] is None
+
+
+@pytest.mark.asyncio
 async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     stream = AsyncStream(request_id=1, cancel=lambda: None)
     stream.put(

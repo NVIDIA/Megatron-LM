@@ -2027,6 +2027,121 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert np.allclose(alloc.get_block_routing(b1), routing_b1)
 
 
+class TestPrefixCachePromptLogprobs(PrefixCachingTestBase):
+    """Focused real-engine prompt-logprob coverage."""
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prompt_logprobs_bypass_prefix_cache(self):
+        block_size = 256
+        prompt_length = 2 * block_size + 5
+        generated_length = 4
+
+        def run_request(enable_prefix_caching):
+            config = DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=prompt_length,
+                max_prompt_length=prompt_length,
+                num_tokens_to_generate=generated_length,
+                max_sequence_length=prompt_length + generated_length + 4,
+                context_buffer_size_gb=0.02,
+                context_block_size_tokens=block_size,
+                context_max_requests=32,
+                context_max_tokens=4096,
+                model_provider="gpt",
+                enable_prefix_caching=enable_prefix_caching,
+                materialize_only_last_token_logits=False,
+            )
+            engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
+            engine.controller.tokenizer = SimpleNamespace(
+                vocab_size=config.vocab_size,
+                eod=-1,
+                detokenize=lambda tokens: "".join(f"{token} " for token in tokens),
+            )
+            prompt = torch.arange(prompt_length, device=torch.cuda.current_device()) % (
+                config.vocab_size - 1
+            )
+
+            donor = DynamicInferenceRequest(
+                request_id=100,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=8, termination_id=-1, top_k=1
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_prefix_caching,
+            )
+            engine._add_request(donor)
+            engine.step_modern()
+            if enable_prefix_caching:
+                assert donor.precomputed_block_hashes
+                assert set(donor.precomputed_block_hashes) <= (
+                    engine.context.kv_block_allocator.kv_hash_to_block_id.keys()
+                )
+
+            request = DynamicInferenceRequest(
+                request_id=101,
+                prompt_tokens=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=generated_length,
+                    termination_id=-1,
+                    top_k=1,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=False,
+                    top_n_logprobs=5,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_prefix_caching,
+            )
+            if enable_prefix_caching:
+                assert request.precomputed_block_hashes
+            hits_before = engine._prefix_cache_hits
+            engine._add_request(request)
+            assert not request.enable_prefix_caching
+            assert request.precomputed_block_hashes == []
+
+            output = None
+            for _ in range(32):
+                result = engine.step_modern()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    if merged.request_id == request.request_id:
+                        output = merged
+                if output is not None:
+                    break
+
+            assert output is not None, "prompt-logprob request did not finish"
+            assert engine._prefix_cache_hits == hits_before
+            assert output.num_cached_tokens == 0
+            assert len(output.prompt_log_probs) == prompt_length - 1
+            return output
+
+        cached = run_request(enable_prefix_caching=True)
+        baseline = run_request(enable_prefix_caching=False)
+        assert cached.generated_tokens == baseline.generated_tokens
+        assert (
+            len(cached.generated_log_probs) == len(baseline.generated_log_probs) == generated_length
+        )
+        np.testing.assert_allclose(
+            cached.prompt_log_probs, baseline.prompt_log_probs, atol=1e-5, rtol=0
+        )
+        np.testing.assert_allclose(
+            cached.generated_log_probs, baseline.generated_log_probs, atol=1e-5, rtol=0
+        )
+
+        for cached_values, baseline_values, expected_length in (
+            (cached.prompt_top_n_logprobs, baseline.prompt_top_n_logprobs, prompt_length - 1),
+            (cached.generated_top_n_logprobs, baseline.generated_top_n_logprobs, generated_length),
+        ):
+            assert cached_values is not None and baseline_values is not None
+            assert len(cached_values) == len(baseline_values) == expected_length
+            for cached_top_n, baseline_top_n in zip(cached_values, baseline_values):
+                assert tuple(cached_top_n) == tuple(baseline_top_n)
+                np.testing.assert_allclose(
+                    list(cached_top_n.values()), list(baseline_top_n.values()), atol=1e-5, rtol=0
+                )
+
+
 class TestPrefixCacheReuse(PrefixCachingTestBase):
     """Cross-request prefix reuse on hybrid (Mamba) models:
 

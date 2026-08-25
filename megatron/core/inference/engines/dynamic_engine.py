@@ -1261,6 +1261,17 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         request_id = request.request_id
+        if (
+            self.context.enable_prefix_caching
+            and request.enable_prefix_caching
+            and request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        ):
+            # Cached tokens do not retain logits. Compute this request normally so
+            # prompt log probabilities stay complete while other requests can still
+            # use the shared prefix cache.
+            request.enable_prefix_caching = False
+            request.precomputed_block_hashes = []
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
