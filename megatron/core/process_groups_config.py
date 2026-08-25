@@ -142,10 +142,12 @@ class ProcessGroupCollection:
 
     # The full GTP group (GTP = TP x GTP_remat): the flattened domain for
     # layer-sharded Muon's single-all_to_all exchange. Never built from
-    # parallel_state (which is compatibility-only): callers that want the fused
-    # path supply the communicator here; without it the optimizer uses the
-    # bitwise-identical two-stage exchange over the tp and gtp_remat groups.
-    # Rank-order contract: group rank g * tp_size + t, TP innermost (asserted
+    # parallel_state (which is compatibility-only). OPTIONAL OVERRIDE: when
+    # unset, the layer-wise optimizer wiring derives the communicator lazily
+    # from the tp and gtp_remat groups (parallel_state-free, multimodal-safe);
+    # supply it here only to override that. Domains containing GTP-padded
+    # params use the bitwise-identical two-stage exchange instead. Rank-order
+    # contract either way: group rank g * tp_size + t, TP innermost (asserted
     # at step time).
     gtp: torch.distributed.ProcessGroup = field(init=False)
 
