@@ -3,6 +3,7 @@
 import asyncio
 import socket
 import struct
+import time
 
 import torch.distributed as dist
 
@@ -25,6 +26,12 @@ class AsyncZMQCommunicator:
     Only to be used with small amounts of data (e.g., 1 integer)
     on the CPU.
     """
+
+    # Handshake tokens. Every token is 3 bytes so it can never be confused with a
+    # payload, which is always a whole number of 4-byte ints.
+    _SYNC = b"SYN"
+    _SYNC_DONE = b"FIN"
+    _SYNC_ACK = b"ACK"
 
     def __init__(
         self,
@@ -83,6 +90,60 @@ class AsyncZMQCommunicator:
             self.bcast_sock = zmq_context.socket(zmq.SUB)
             self.bcast_sock.connect(bcast_socket_addr)
             self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
+
+        self._bcast_socket_addr = bcast_socket_addr
+        self._synchronize_subscribers()
+
+    def _synchronize_subscribers(self, timeout: float = 300.0) -> None:
+        """Block until every subscriber is guaranteed to receive broadcasts.
+
+        A ZMQ subscription only takes effect once it has propagated to the
+        publisher, and anything published before then is dropped without error.
+        The leader therefore republishes _SYNC until every peer has acknowledged
+        one over the reliable gather channel, then publishes _SYNC_DONE to mark
+        the end of handshake traffic. Subscriptions from another node take long
+        enough to establish that, without this, the first broadcast is routinely
+        lost and every rank that misses it waits for it forever.
+
+        Args:
+            timeout (float): Seconds to wait for the handshake before failing.
+        """
+        if self.world_size <= 1:
+            return
+
+        deadline = time.monotonic() + timeout
+
+        if self.is_leader:
+            unacked = self.world_size - 1
+            while unacked > 0:
+                self.bcast_sock.send(self._SYNC)
+                while unacked > 0 and self.gather_sock.poll(timeout=10):
+                    if self.gather_sock.recv() == self._SYNC_ACK:
+                        unacked -= 1
+                if unacked > 0 and time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"Rank {self.rank} timed out after {timeout}s waiting for {unacked} "
+                        f"of {self.world_size - 1} peers to subscribe to "
+                        f"{self._bcast_socket_addr}"
+                    )
+            self.bcast_sock.send(self._SYNC_DONE)
+        else:
+            acked = False
+            while True:
+                if not self.bcast_sock.poll(timeout=100):
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(
+                            f"Rank {self.rank} timed out after {timeout}s waiting for the "
+                            f"subscription handshake from {self._bcast_socket_addr}"
+                        )
+                    continue
+                message = self.bcast_sock.recv()
+                if message == self._SYNC_DONE:
+                    return
+                if not acked:
+                    # Receiving _SYNC proves this subscription reached the publisher.
+                    self.gather_sock.send(self._SYNC_ACK)
+                    acked = True
 
     async def all_reduce_max(self, *local_vals: int, async_op=True) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.
