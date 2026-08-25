@@ -1377,7 +1377,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         g_w = (go_fp32 * x_fp32 * r).sum(dim=red_dims).to(weight.dtype)
 
         s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
-        dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
+        dx = go_fp32 * (w_fp32 * r) - r3 * (s * x_fp32) / D
         dx = dx.to(x.dtype)
 
         return dx, g_w, None, None
