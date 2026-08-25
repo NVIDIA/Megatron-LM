@@ -53,7 +53,9 @@ async def test_megatron_local_preserves_explicit_greedy_temperature(
     choice.message.num_evictions = 0
 
     client = MagicMock()
-    client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[choice]))
+    client.chat.completions.create = AsyncMock(
+        return_value=MagicMock(id="completion-id", choices=[choice])
+    )
     server = MegatronLocal(host="localhost", port=0)
     server._openai_client = client
     request = InferenceRequest(
