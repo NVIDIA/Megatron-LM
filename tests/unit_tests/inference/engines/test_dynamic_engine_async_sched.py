@@ -2008,6 +2008,47 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
         assert engine.controller._async_sched_logits.token_row_indices is None
 
 
+def test_async_compaction_preserves_all_request_metadata():
+    """Middle-row completion compacts every metadata field into survivor order."""
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller.num_speculative_tokens = 1
+    controller._enable_cuda_graph = False
+    controller._all_logits_cuda = torch.arange(24).reshape(1, 6, 4)
+    controller._async_sched_logits = AsyncScheduleLogitsState()
+    controller._async_sched_logits.set_pending(3, torch.arange(6))
+
+    metadata = {
+        "temperature": torch.tensor([0.5, 0.7, 0.9]),
+        "top_k": torch.tensor([2, 4, 8]),
+        "top_p": torch.tensor([0.1, 0.2, 0.3]),
+        "termination_id": torch.tensor([90, 91, 92]),
+        "return_log_probs": torch.tensor([True, False, True]),
+        "skip_prompt_log_probs": torch.tensor([False, True, True]),
+        "top_n_logprobs": torch.tensor([2, 0, 5]),
+        "custom_metadata": torch.tensor([101, 202, 303]),
+    }
+    gpu_view = SimpleNamespace(
+        temperature=metadata["temperature"].clone(),
+        top_k=metadata["top_k"].clone(),
+        top_p=metadata["top_p"].clone(),
+    )
+    context = SimpleNamespace(active_request_metadata=metadata, gpu_view=gpu_view)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    expected = {label: values[[0, 2]].clone() for label, values in metadata.items()}
+
+    controller._compact_async_sched_logits(torch.tensor([0, 2]))
+
+    for label, values in expected.items():
+        assert torch.equal(context.active_request_metadata[label][:2], values), label
+    assert torch.equal(gpu_view.temperature[:2], expected["temperature"])
+    assert torch.equal(gpu_view.top_k[:2], expected["top_k"])
+    assert torch.equal(gpu_view.top_p[:2], expected["top_p"])
+    assert torch.equal(
+        controller._all_logits_cuda, torch.arange(24).reshape(1, 6, 4)[:, [0, 1, 4, 5]]
+    )
+    assert torch.equal(controller._async_sched_logits.token_row_indices, torch.tensor([0, 1, 4, 5]))
+
+
 def test_async_negative_routing_replay():
     engine = _make_engine(
         model_config_num_moe_experts=4, model_config_moe_enable_routing_replay=True
