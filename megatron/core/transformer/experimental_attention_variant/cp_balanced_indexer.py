@@ -283,6 +283,19 @@ def dispatch_chunks_async(
     on it. When qr and weights share a dtype they ride one all_to_all (single launch).
     ``cu_seqlens`` feeds the eager pack-eligibility probe (``_pack_zigzag_ok``); the
     compute side follows the returned handle's kind, so both stay consistent.
+
+    Handle ``kind`` legend — which transport carried the (qr | weights) payload:
+
+    - ``"zzr"``: zigzag + prebuilt-route ``all_to_all_single`` — each rank exchanges
+      only ~``l_local`` rows; splits/rows come from ``prebuild_balanced_layouts``
+      (host ints), so the exchange is CUDA-graph capturable.
+    - ``"ag"``: zigzag fallback — no usable routed plan (never prebuilt, capacity
+      mismatch, or plan lacks route fields): one static-shape S-row AllGather of the
+      merged payload; row selection is deferred to consume time.
+    - ``"ag2"``: same fallback, but qr/weights dtypes differ so the merged payload
+      cannot carry both — two separate AllGathers.
+    - ``"a2a"``: non-zigzag balanced path — the ``_a2a_meta`` head/tail chunk
+      ``all_to_all_single`` (contiguous pair -> folded (r, 2N-1-r) assignment).
     """
     if cp_size <= 1:
         return None
@@ -946,6 +959,10 @@ def balanced_compute_cp_indexer_topk(
     # full-row reference calls, or eager varlen whose l_local varies — the
     # latter already mixes shapes with the flag off) await the kernel-side fix.
 
+    # "kind" legend lives on dispatch_chunks_async: zzr/ag/ag2 are the three zigzag
+    # transports (routed a2a / merged AllGather / split AllGather), "a2a" is the
+    # non-zigzag balanced chunk exchange. The dispatch already committed the layout,
+    # so the compute side keys off the handle rather than re-deriving eligibility.
     zz = (
         dispatch_handle.get("kind") in ("ag", "ag2", "zzr")
         if dispatch_handle is not None
