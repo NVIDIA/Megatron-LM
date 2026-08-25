@@ -1,10 +1,11 @@
 # Megatron Inference
 
-Use `MegatronLLM` (sync) or `MegatronAsyncLLM` (async, with HTTP serving
-through `serve()`) for typical inference workflows. Both classes hide the underlying
-engine pipeline (`DynamicInferenceContext`, `GPTInferenceWrapper`,
-`TextGenerationController`, and `DynamicInferenceEngine`) and provide a vLLM-style
-`generate(prompts, sampling_params)` API.
+Use `MegatronLLM` (sync) or `MegatronAsyncLLM` (async) for typical inference
+workflows. Both classes hide the underlying engine pipeline
+(`DynamicInferenceContext`, `GPTInferenceWrapper`, `TextGenerationController`,
+and `DynamicInferenceEngine`), provide a vLLM-style
+`generate(prompts, sampling_params)` API, and expose OpenAI-compatible HTTP
+serving through `serve()`.
 
 For the full documentation, including supported features, basic and advanced
 usage, direct compared to coordinator modes, the OpenAI-compatible server, known
