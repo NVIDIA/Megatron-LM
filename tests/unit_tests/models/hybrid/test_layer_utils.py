@@ -4,12 +4,7 @@ import warnings
 
 import pytest
 
-from megatron.core.models.hybrid.layer_utils import (
-    Symbols,
-    create_layer_config,
-    get_layer_symbol_from_config,
-    normalize_tp_comm_overlap,
-)
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -20,13 +15,13 @@ from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
 _LAYER_CONFIG_TYPES = [
-    (Symbols.MAMBA, MambaLayerConfig),
-    (Symbols.GDN, GDNLayerConfig),
-    (Symbols.ATTENTION, AttentionLayerConfig),
-    (Symbols.DS_ATTENTION, DSALayerConfig),
-    (Symbols.MLA, MLALayerConfig),
-    (Symbols.MLP, MLPLayerConfig),
-    (Symbols.MOE, MoELayerConfig),
+    (layer_utils.Symbols.MAMBA, MambaLayerConfig),
+    (layer_utils.Symbols.GDN, GDNLayerConfig),
+    (layer_utils.Symbols.ATTENTION, AttentionLayerConfig),
+    (layer_utils.Symbols.DS_ATTENTION, DSALayerConfig),
+    (layer_utils.Symbols.MLA, MLALayerConfig),
+    (layer_utils.Symbols.MLP, MLPLayerConfig),
+    (layer_utils.Symbols.MOE, MoELayerConfig),
 ]
 
 
@@ -40,14 +35,14 @@ def _make_transformer_config(tp_comm_overlap: bool = False) -> TransformerConfig
 class TestSymbols:
 
     def test_name_sorted_valid_layer_symbols(self):
-        assert Symbols.name_sorted_valid_layer_symbols() == [
-            Symbols.ATTENTION,
-            Symbols.DS_ATTENTION,
-            Symbols.GDN,
-            Symbols.MAMBA,
-            Symbols.MLA,
-            Symbols.MLP,
-            Symbols.MOE,
+        assert layer_utils.Symbols.name_sorted_valid_layer_symbols() == [
+            layer_utils.Symbols.ATTENTION,
+            layer_utils.Symbols.DS_ATTENTION,
+            layer_utils.Symbols.GDN,
+            layer_utils.Symbols.MAMBA,
+            layer_utils.Symbols.MLA,
+            layer_utils.Symbols.MLP,
+            layer_utils.Symbols.MOE,
         ]
 
 
@@ -59,7 +54,7 @@ class TestCreateLayerConfig:
         config = _make_transformer_config()
         config.test_mutable_value = {"items": []}
 
-        layer_config = create_layer_config(config, layer_symbol)
+        layer_config = layer_utils.create_layer_config(config, layer_symbol)
 
         assert type(layer_config) is config_type
         assert layer_config is not config
@@ -72,7 +67,7 @@ class TestCreateLayerConfig:
 
     def test_rejects_unknown_symbol(self):
         with pytest.raises(ValueError, match="Unexpected hybrid layer symbol: X"):
-            create_layer_config(_make_transformer_config(), "X")
+            layer_utils.create_layer_config(_make_transformer_config(), "X")
 
 
 @pytest.mark.internal
@@ -82,7 +77,7 @@ class TestGetLayerSymbolFromConfig:
     def test_returns_symbol_for_each_config_type(self, expected_symbol, config_type):
         layer_config = config_type.from_config(_make_transformer_config())
 
-        assert get_layer_symbol_from_config(layer_config) == expected_symbol
+        assert layer_utils.get_layer_symbol_from_config(layer_config) == expected_symbol
 
     def test_accepts_config_subclasses(self):
         class CustomMambaLayerConfig(MambaLayerConfig):
@@ -90,7 +85,7 @@ class TestGetLayerSymbolFromConfig:
 
         layer_config = CustomMambaLayerConfig.from_config(_make_transformer_config())
 
-        assert get_layer_symbol_from_config(layer_config) == Symbols.MAMBA
+        assert layer_utils.get_layer_symbol_from_config(layer_config) == layer_utils.Symbols.MAMBA
 
     def test_rejects_unknown_config_type(self):
         config = _make_transformer_config()
@@ -98,7 +93,7 @@ class TestGetLayerSymbolFromConfig:
         with pytest.raises(
             ValueError, match="Unexpected hybrid layer config type: TransformerConfig"
         ):
-            get_layer_symbol_from_config(config)
+            layer_utils.get_layer_symbol_from_config(config)
 
     def test_rejects_ambiguous_config_type(self):
         class AmbiguousLayerConfig(MambaLayerConfig, AttentionLayerConfig):
@@ -107,7 +102,7 @@ class TestGetLayerSymbolFromConfig:
         layer_config = AmbiguousLayerConfig.from_config(_make_transformer_config())
 
         with pytest.raises(ValueError, match="Ambiguous hybrid layer config type"):
-            get_layer_symbol_from_config(layer_config)
+            layer_utils.get_layer_symbol_from_config(layer_config)
 
 
 @pytest.mark.internal
@@ -116,10 +111,10 @@ class TestNormalizeTpCommOverlap:
     @pytest.mark.parametrize(
         ("segment", "has_mtp", "unsupported_features"),
         [
-            (Symbols.MLA, False, "MLA"),
-            (Symbols.DS_ATTENTION, False, "DSA"),
+            (layer_utils.Symbols.MLA, False, "MLA"),
+            (layer_utils.Symbols.DS_ATTENTION, False, "DSA"),
             ("", True, "MTP"),
-            (Symbols.DS_ATTENTION + Symbols.MLA, True, "MLA/DSA/MTP"),
+            (layer_utils.Symbols.DS_ATTENTION + layer_utils.Symbols.MLA, True, "MLA/DSA/MTP"),
         ],
     )
     def test_disables_overlap_for_unsupported_features(
@@ -132,7 +127,7 @@ class TestNormalizeTpCommOverlap:
         )
 
         with pytest.warns(UserWarning) as warning_records:
-            normalize_tp_comm_overlap(config, segment, has_mtp)
+            layer_utils.normalize_tp_comm_overlap(config, segment, has_mtp)
 
         assert config.tp_comm_overlap is False
         assert [str(warning.message) for warning in warning_records] == [expected_warning]
@@ -142,10 +137,14 @@ class TestNormalizeTpCommOverlap:
         [
             (
                 True,
-                Symbols.MAMBA + Symbols.GDN + Symbols.ATTENTION + Symbols.MLP + Symbols.MOE,
+                layer_utils.Symbols.MAMBA
+                + layer_utils.Symbols.GDN
+                + layer_utils.Symbols.ATTENTION
+                + layer_utils.Symbols.MLP
+                + layer_utils.Symbols.MOE,
                 False,
             ),
-            (False, Symbols.MLA, False),
+            (False, layer_utils.Symbols.MLA, False),
             (False, "", True),
         ],
     )
@@ -156,7 +155,7 @@ class TestNormalizeTpCommOverlap:
 
         with warnings.catch_warnings(record=True) as warning_records:
             warnings.simplefilter("always")
-            normalize_tp_comm_overlap(config, segment, has_mtp)
+            layer_utils.normalize_tp_comm_overlap(config, segment, has_mtp)
 
         assert config.tp_comm_overlap is tp_comm_overlap
         assert warning_records == []

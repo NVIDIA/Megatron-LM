@@ -14,7 +14,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.models.hybrid.layer_utils import normalize_tp_comm_overlap
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -225,7 +225,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # independent per-layer config copies, so normalize the root config first to ensure
         # MTP's required tp_comm_overlap disablement is inherited by every decoder-layer config.
         # Previously, decoder layers shared the root config and observed the mutation directly.
-        normalize_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
+        layer_utils.normalize_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 

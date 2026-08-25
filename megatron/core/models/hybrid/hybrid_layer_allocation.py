@@ -6,14 +6,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from megatron.core.models.hybrid.layer_utils import (
-    Symbols,
-    create_layer_config,
-    get_layer_symbol_from_config,
-    normalize_tp_comm_overlap,
-)
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
+
+Symbols = layer_utils.Symbols
 
 logger = logging.getLogger(__name__)
 
@@ -316,7 +313,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Tra
 
     layer_configs: list[TransformerConfig] = []
     for layer_symbol in segment:
-        layer_configs.append(create_layer_config(config, layer_symbol))
+        layer_configs.append(layer_utils.create_layer_config(config, layer_symbol))
 
     return layer_configs
 
@@ -439,7 +436,7 @@ def select_pipeline_segment(
             count = layers_per_rank
 
         selected_pattern = full_pattern[offset : offset + count]
-        normalize_tp_comm_overlap(config, selected_pattern)
+        layer_utils.normalize_tp_comm_overlap(config, selected_pattern)
         selected = validate_segment_layers(selected_pattern, config)
         log_on_each_pipeline_stage(
             logger,
@@ -474,7 +471,7 @@ def select_pipeline_segment(
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
-    normalize_tp_comm_overlap(config, my_segment)
+    layer_utils.normalize_tp_comm_overlap(config, my_segment)
     layer_config_list = validate_segment_layers(my_segment, config)
 
     log_on_each_pipeline_stage(
@@ -519,4 +516,6 @@ def get_layer_type_list_from_layer_config_list(
     Returns:
         The canonical layer symbol for each config.
     """
-    return [get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list]
+    return [
+        layer_utils.get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list
+    ]
