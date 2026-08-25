@@ -113,7 +113,7 @@ def execute_reshard_plan(
         torch.cuda.synchronize()
         if service.requires_process_group_barrier:
             dist.barrier(group=group)
-        _refresh_module_caches(dst_module)
+        refresh_module_caches(dst_module)
         torch.cuda.synchronize()
         logger.info("Reshard complete")
         return
