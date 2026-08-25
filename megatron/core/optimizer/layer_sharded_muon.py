@@ -7,8 +7,15 @@ is assigned one NS home rank in the (GTP_remat x TP) domain. Two all_to_all stag
 momentum shards so the home holds the complete (P, Q) matrix, Newton-Schulz runs there
 with zero communication and zero redundancy — the exact same full-matrix NS as
 duplicated mode — and two reverse all_to_all stages scatter the result back to the
-original shards. All collectives use the existing gtp / tp process groups.
+original shards. All collectives use the existing gtp_remat / tp process groups.
 """
+
+# Postpone annotation evaluation: the emerging-optimizers type aliases
+# (FP32MatmulPrecT, NSCoeffT, MuonScaleT) only exist when the try-import below
+# succeeds; without this, importing the module on an environment without
+# emerging-optimizers raised NameError at class definition instead of the
+# ImportError-shaped absence the callers guard against.
+from __future__ import annotations
 
 import contextlib
 import logging
@@ -173,7 +180,9 @@ class LayerShardedMuon(TensorParallelMuon):
             a group are unchanged, so results are unaffected, but the transient
             buffers of all groups are live at once -- lower ``ns_batch_size`` or set
             this to False if that pushes peak memory too high. No effect with fewer
-            than two param groups or without CUDA.
+            than two param groups or without CUDA. Requires the groups' domains to
+            be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
+            serialized (NCCL forbids concurrent collectives on one communicator).
         All other args: same as :class:`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
             ``pg_collection`` only take effect on the paths that delegate to the
@@ -396,10 +405,36 @@ class LayerShardedMuon(TensorParallelMuon):
         return ns_by_k
 
     def _param_group_streams(self) -> "list | None":
-        """Per-group CUDA streams, or None when the groups must stay serialized."""
+        """Per-group CUDA streams, or None when the groups must stay serialized.
+
+        Concurrency requires the groups' communication domains to be disjoint:
+        NCCL serializes collectives per communicator, so two param groups
+        sharing a (gtp_remat, tp) domain (e.g. two dense groups produced by a
+        per-layer lr override) issuing collectives from different streams can
+        interleave and deadlock. Such configurations fall back to serialized
+        execution (bitwise-neutral, see the concurrent_groups docstring).
+        """
         if not self.concurrent_groups or len(self.param_groups) < 2:
             return None
         if not torch.cuda.is_available():
+            return None
+        domain_keys = []
+        for group_index in range(len(self.param_groups)):
+            pgs = self._group_process_groups.get(
+                group_index, (self.gtp_remat_group, self.tp_group, self.fused_group)
+            )
+            domain_keys.append((id(pgs[0]), id(pgs[1])))
+        if len(set(domain_keys)) != len(domain_keys):
+            if not getattr(self, '_warned_shared_domain', False):
+                self._warned_shared_domain = True
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "LayerShardedMuon: param groups share a (gtp_remat, tp) "
+                    "communication domain; serializing groups instead of running "
+                    "them on concurrent streams (NCCL requires per-communicator "
+                    "serialization). Results are unaffected.",
+                )
             return None
         if self._group_streams is None or len(self._group_streams) != len(self.param_groups):
             self._group_streams = [torch.cuda.Stream() for _ in self.param_groups]
@@ -689,9 +724,23 @@ class LayerShardedMuon(TensorParallelMuon):
                         full_by_k[k] = stage1[k]
 
                 # 4. Full-matrix Newton-Schulz on the home (identical to duplicated
-                #    mode), batched by shape — see _run_ns.
+                #    mode), batched by shape — see _run_ns. The pdim-None
+                #    (TP-replicated) subset runs through its OWN _run_ns call:
+                #    every TP column orthogonalizes those matrices independently
+                #    and scatters its own result over gtp_remat alone, so their
+                #    batch chunking must not depend on the column's TP-sharded
+                #    params (a different set per column) — pooled chunking would
+                #    put the same replicated matrix in a baddbmm chunk on one
+                #    column and addmm on another, and the TP replicas of its
+                #    weight would drift apart and compound every step.
+                tp_replicated_keys = set(sub_pos[None])
                 with _phase("ns"):
-                    ns_by_k = self._run_ns(full_by_k)
+                    ns_by_k = self._run_ns(
+                        {k: v for k, v in full_by_k.items() if k not in tp_replicated_keys}
+                    )
+                    ns_by_k.update(
+                        self._run_ns({k: full_by_k[k] for k in sub_pos[None]})
+                    )
 
             with _phase("a2a_bwd"):
                 # 5. Reverse stage-2 all_to_all: scatter NS results back to TP parts.

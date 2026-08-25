@@ -30,7 +30,8 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 # real CI signal — even on containers pinned to older emerging-optimizers.
 # (A try/except around the import would guard nothing anyway: layer_sharded_muon
 # swallows its own emerging-optimizers import failures behind
-# HAVE_EMERGING_OPTIMIZERS, so the import always succeeds.)
+# HAVE_EMERGING_OPTIMIZERS and postpones annotation evaluation
+# (from __future__ import annotations), so the import always succeeds.)
 # INVARIANT for future additions: tests in this file must stay signature/registry
 # level (inspect, kwargs dicts) and never instantiate an optimizer — the moment
 # one does, it inherits LayerShardedMuon's version-conditional construction
