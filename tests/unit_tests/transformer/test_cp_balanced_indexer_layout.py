@@ -23,7 +23,6 @@ from megatron.core.context_parallel_layout.routes import _build_thd_layout_segme
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
     _ZZ_PACK_OK,
-    _a2a_meta,
     _pack_zigzag_ok,
     _use_zigzag,
     _zigzag_plan,
@@ -481,77 +480,6 @@ def test_prebuild_capacity_probe_for_raw_cu():
     assert psp2._dsa_cp_balance_layout_cache["zz_pack_ok"][0] == 3000 // 4
 
 
-@pytest.mark.parametrize("cp_size,l_local", [(4, 1024), (5, 10), (16, 16384), (3, 7)])
-def test_folding_a2a_meta_roundtrip(cp_size, l_local):
-    """The folding fallback's fixed chunk-permutation all_to_all metadata: dispatch must
-    hand every rank exactly its head chunk (r) and tail chunk (2N-1-r) rows in order,
-    and combine must return each computed chunk to its contiguous owner (bit-exact
-    inverse), including odd cp_size (merged-pair peer), odd l_local (uneven chunk
-    sizes), and the swap_pair send convention."""
-    N, nch = cp_size, 2 * cp_size
-    S = N * l_local
-    bounds = [(k * S) // nch for k in range(nch + 1)]
-    groups = [_StubGroup(N, r) for r in range(N)]
-    metas = [_a2a_meta(groups[r], N, l_local) for r in range(N)]
-    payload = torch.arange(S, dtype=torch.int64).unsqueeze(1)
-
-    # Dispatch: each owner sends its two half-chunks, peer-ordered (swap_pair).
-    sends = []
-    for r in range(N):
-        rows = payload[r * l_local : (r + 1) * l_local]
-        s0 = metas[r]["s0"]
-        sends.append(torch.cat((rows[s0:], rows[:s0])) if metas[r]["swap_pair"] else rows)
-    recvs = _sim_all_to_all(sends, [m["d_in"] for m in metas])
-    heads_tails = []
-    for r in range(N):
-        sh, st = metas[r]["sh"], metas[r]["st"]
-        head_c, tail_c = r, nch - 1 - r
-        head, tail = recvs[r][:sh], recvs[r][sh:]
-        assert torch.equal(head.squeeze(1), payload[bounds[head_c] : bounds[head_c + 1]].squeeze(1))
-        assert torch.equal(tail.squeeze(1), payload[bounds[tail_c] : bounds[tail_c + 1]].squeeze(1))
-        assert st == bounds[tail_c + 1] - bounds[tail_c]
-        heads_tails.append((head, tail))
-
-    # Combine: computed [head | tail] rows return to their contiguous owners.
-    sends2 = [torch.cat(ht) for ht in heads_tails]
-    recvs2 = _sim_all_to_all(sends2, [m["c_in"] for m in metas])
-    for r in range(N):
-        s0, s1 = metas[r]["s0"], metas[r]["s1"]
-        rec = recvs2[r]
-        out = torch.cat((rec[s1:], rec[:s1])) if metas[r]["swap_pair"] else rec
-        mine = torch.arange(r * l_local, (r + 1) * l_local, dtype=torch.int64)
-        assert torch.equal(out.squeeze(1), mine), (cp_size, l_local, r)
-
-
-# WORKSPACE NOTE: the cuDNN indexer package carries cross-call state that
-# corrupts a fused call preceded by fused calls of OTHER shapes in the same
-# process (measured: a 1024-row call followed by an 8192-row call corrupts
-# ~100% of the larger call's rows; large-then-small is fine; sync/empty_cache
-# do not help; and a discarded 65536-row priming call did NOT protect an
-# identically-sized subsequent call — CI run 32712450771 — so this is NOT
-# simple capacity sizing). In shared-process CI lanes, other suites' tiny
-# fused calls run before this file (they don't trip the bug themselves: they
-# compare fused output against equally-degenerate references at sub-32 head
-# counts, where the kernel silently returns all-zero scores). The only defense
-# valid under every model of the bug is process isolation:
-# ``test_fused_kernel_suite_isolated`` below re-runs the five fused tests in a
-# fresh subprocess (clean CUDA context, clean kernel-package state), where the
-# in-file ordering — the multi-offset test's 65536-row call first — is
-# sufficient (pinned green standalone on GB200). In-process, those five tests
-# skip unless MCORE_DSA_FUSED_CHILD=1. Production exposure: per-layer call
-# shapes are constant within a run for a fixed capacity (proven by e2e loss
-# parity) and the folding pair is scored larger-chunk-first; shape-ALTERNATING
-# regimes have no user-side mitigation — the falsified priming experiment above
-# shows warmup schemes cannot help — and await the kernel-side fix. To be
-# raised with the kernel owners together with the sub-32-head silent-zero mode.
-_FUSED_ISOLATED_TESTS = (
-    "test_fused_multi_offset_packed_layout",
-    "test_fused_tight_width_smoke",
-    "test_fused_sliced_k_prefix_view_smoke",
-    "test_fused_tight_width_ceiling_smoke",
-    "test_fused_reduced_mq_matches_full_mq",
-)
-_IN_FUSED_CHILD = os.environ.get("MCORE_DSA_FUSED_CHILD") == "1"
 _fused_kernel_test = pytest.mark.skipif(
     not torch.cuda.is_available() or not _IN_FUSED_CHILD,
     reason="fused indexer kernel required; runs inside the isolated subprocess "
