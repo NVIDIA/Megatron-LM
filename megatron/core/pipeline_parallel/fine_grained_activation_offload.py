@@ -17,6 +17,7 @@ try:
 except ImportError:
     from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
+from megatron.core.transformer.cuda_graph_utils import default_stream_allocation
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -940,9 +941,13 @@ class ChunkOffloadHandler:
         dev, cpu_backup, use_cpu_pool, view_meta = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
-        gpu_tensor = torch.empty(
-            cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
-        )
+        with default_stream_allocation():
+            gpu_tensor = torch.empty(
+                cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
+            )
+        # The reload runs on the current H2D stream, so prevent allocator reuse until its
+        # asynchronous copy has completed.
+        gpu_tensor.record_stream(torch.cuda.current_stream())
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)

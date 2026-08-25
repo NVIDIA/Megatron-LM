@@ -48,6 +48,7 @@ from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     is_gtp_symm_pool_registered,
     symmetric_wgrad_pool,
 )
+from megatron.core.transformer.cuda_graph_utils import default_stream_allocation
 from megatron.core.utils import ensure_params_ready, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -322,15 +323,25 @@ def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     return buf
 
 
-def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
+def _wgrad_pool_get(
+    shape: tuple, dtype: torch.dtype, device, *, allocate_on_default_stream: bool = False
+) -> torch.Tensor:
     """Get a pool buffer or allocate fresh, tagged so _wgrad_pool_put accepts only
-    pool-owned buffers (other callers fall through to the caching allocator on release)."""
+    pool-owned buffers (other callers fall through to the caching allocator on release).
+
+    ``allocate_on_default_stream`` applies only to a fresh allocation; pooled reuse does not
+    enqueue another cross-stream event.
+    """
     key = (shape, dtype)
     pool = _wgrad_buf_pool.get(key)
     if pool:
         buf = pool.pop()
     else:
-        buf = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
+        allocation_context = (
+            default_stream_allocation() if allocate_on_default_stream else nullcontext()
+        )
+        with allocation_context:
+            buf = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
     buf._from_gtp_wgrad_pool = True
     return buf
 
@@ -1953,7 +1964,9 @@ class GTPShardedParam(torch.nn.Parameter):
         caller waits the handle (immediately when sync) and then releases the scratch.
 
         The all-to-all scratch is unsharded-sized, so it comes from the wgrad pool: GTP keeps
-        several RS in flight and an empty_like each would add that much peak memory.
+        several RS operations in flight, and an allocation per operation would increase peak
+        memory. Ungraphed chains allocate new pool storage through the default stream to avoid
+        retaining an allocator segment for each communication stream.
         """
         # Local import: tensor_parallel has no top-level dependency on core.distributed.
         from megatron.core.distributed.reduce_scatter_with_fp32_accumulation import (
@@ -1961,11 +1974,26 @@ class GTPShardedParam(torch.nn.Parameter):
         )
 
         tensor = tensor.contiguous()
+        graphed = _chain_is_graphed(self.chain_id)
         if out_buffer is None:
             out_shape = [tensor.shape[0] // self.group.size(), *tensor.shape[1:]]
-            out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
+            default_owned_output = not graphed
+            allocation_context = (
+                default_stream_allocation() if default_owned_output else nullcontext()
+            )
+            with allocation_context:
+                out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
+            if default_owned_output:
+                # Allocation belongs to the default-stream pool, but the RS stream consumes it.
+                # Transfer allocator lifetime tracking without moving the collective itself.
+                out_buffer.record_stream(torch.cuda.current_stream())
 
-        a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
+        a2a_buf = _wgrad_pool_get(
+            tuple(tensor.shape), tensor.dtype, tensor.device, allocate_on_default_stream=not graphed
+        )
+        if not graphed:
+            # The RS stream consumes default-owned storage until its deferred handle is waited.
+            a2a_buf.record_stream(torch.cuda.current_stream())
         handle = reduce_scatter_with_fp32_accumulation(
             out_buffer,
             tensor,

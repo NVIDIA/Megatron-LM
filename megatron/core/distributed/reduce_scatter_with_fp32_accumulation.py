@@ -5,6 +5,8 @@ from typing import Any, Optional
 
 import torch
 
+from megatron.core.transformer.cuda_graph_utils import default_stream_allocation
+
 
 class _ReduceScatterWithFP32AccumulationWorkHandle:
     """Work handle to return to user when using reduce_scatter_with_fp32_accumulation with
@@ -29,10 +31,14 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
         if self.all_to_all_handle is not None:
             self.all_to_all_handle.wait()
 
-        # Accumulate into a fp32 sum.
-        output_tensor_in_fp32 = torch.sum(
-            self.all_to_all_output_tensor.view((self.world_size, -1)), dim=0, dtype=torch.float32
-        )
+        # The wait may run on a communication or CUDA graph replay stream. Allocate the temporary
+        # result from the default-stream pool, then track its actual consumer stream until the
+        # downcast below completes.
+        all_to_all_output = self.all_to_all_output_tensor.view((self.world_size, -1))
+        with default_stream_allocation():
+            output_tensor_in_fp32 = torch.empty_like(self.output_tensor, dtype=torch.float32)
+        output_tensor_in_fp32.record_stream(torch.cuda.current_stream())
+        torch.sum(all_to_all_output, dim=0, dtype=torch.float32, out=output_tensor_in_fp32.view(-1))
         assert output_tensor_in_fp32.dtype == torch.float32
 
         # Copy downcasted sum into output_tensor.
@@ -77,9 +83,12 @@ def reduce_scatter_with_fp32_accumulation(
 
     # Call all_to_all (every rank should have their respective gradient shards collected from
     # all ranks). We also create a tensor for the all-to-all output (the all-to-all collective
-    # cannot be performed in-place).
+    # cannot be performed in-place). This function may run on a communication or graph replay
+    # stream; default ownership avoids retaining a native allocator segment for that side stream.
     if all_to_all_output_tensor is None:
-        all_to_all_output_tensor = torch.empty_like(input_tensor)
+        with default_stream_allocation():
+            all_to_all_output_tensor = torch.empty_like(input_tensor)
+        all_to_all_output_tensor.record_stream(torch.cuda.current_stream())
     else:
         assert all_to_all_output_tensor.shape == input_tensor.shape, (
             f"all_to_all_output_tensor shape {tuple(all_to_all_output_tensor.shape)} does not "

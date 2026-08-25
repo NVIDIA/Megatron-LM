@@ -1753,9 +1753,10 @@ class _CheckpointDependencyModule(MegatronModule):
         super().__init__(config)
         self.checkpointed = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.eager_only = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        return self.my_op(x)
+        return self.my_op(x) + self.eager_only(x)
 
     def my_op(self, x):
         checkpoint = CheckpointWithoutOutput()
@@ -1763,6 +1764,59 @@ class _CheckpointDependencyModule(MegatronModule):
         output = self.projection(hidden)
         checkpoint.discard_output_and_register_recompute(output)
         return output
+
+    def _get_submodules_under_cudagraphs(self):
+        # Model a visible graph scope that does not own the checkpointed child.
+        return (self.projection,)
+
+    def _get_additional_cudagraph_parameters(self):
+        # The recompute closure reaches this child outside the visible projection scope.
+        return self.checkpointed.parameters()
+
+
+class _ScopedCudaGraphModule(MegatronModule):
+    """Small mixed eager/graph model that mirrors the production partial-CG scope names."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.mamba = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.attn = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.moe_router = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.eager_tail = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+        self.cudagraph_managers = torch.nn.ModuleDict()
+        for scope, function_name in (
+            (CudaGraphModule.mamba, "run_mamba"),
+            (CudaGraphModule.attn, "run_attn"),
+            (CudaGraphModule.moe_router, "run_moe_router"),
+        ):
+            if scope in config.cuda_graph_modules:
+                self.cudagraph_managers[scope.name] = CudaGraphManager(
+                    config, base_module=self, function_name=function_name
+                )
+
+    def run_mamba(self, x):
+        return self.mamba(x)
+
+    def run_attn(self, x):
+        return self.attn(x)
+
+    def run_moe_router(self, x):
+        return self.moe_router(x)
+
+    @property
+    def moe_preprocess(self):
+        # Local-CG configuration expands moe_router into the paired preprocess/router scopes.
+        return self.moe_router
+
+    def forward(self, x):
+        x = self.run_mamba(x)
+        x = self.run_attn(x)
+        x = self.run_moe_router(x)
+        return self.eager_tail(x)
+
+    def _get_submodules_under_cudagraphs(self):
+        return tuple(getattr(self, scope.name) for scope in self.config.cuda_graph_modules)
 
 
 class _SimpleNonModule:
@@ -1832,11 +1886,14 @@ class TestCheckpointParameterDiscovery:
             DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
             module,
         )
+        assert module.projection.weight._ddp_grad_acc_on_cudagraph_stream
+        assert module.checkpointed.weight._ddp_grad_acc_on_cudagraph_stream
+        assert not module.eager_only.weight._ddp_grad_acc_on_cudagraph_stream
 
         # Distinct inputs make the expected DDP result the average of different local gradients.
         torch.manual_seed(1000 + ddp_model.dp_group.rank())
         test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
-        reference_output = reference.my_op(test_input.detach().clone().requires_grad_(True))
+        reference_output = reference(test_input.detach().clone().requires_grad_(True))
         reference_output_value = reference_output.detach().clone()
         reference_output.sum().backward()
         reference_wgrads = {
@@ -1869,6 +1926,110 @@ class TestCheckpointParameterDiscovery:
             for name, param in module.named_parameters():
                 assert param.grad is None
                 torch.testing.assert_close(param.main_grad, reference_wgrads[name])
+
+
+class TestScopedDDPCudaGraphCapture:
+    """DDP backward capture works for the partial-CG scopes used by hybrid training."""
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize(
+        "cuda_graph_modules",
+        [
+            pytest.param([CudaGraphModule.mamba, CudaGraphModule.attn], id="mamba-attn"),
+            pytest.param([CudaGraphModule.moe_router], id="moe-router"),
+            pytest.param(
+                [CudaGraphModule.mamba, CudaGraphModule.attn, CudaGraphModule.moe_router],
+                id="mamba-attn-moe-router",
+            ),
+        ],
+    )
+    def test_scoped_capture_and_backward_replay(self, tp_size, cuda_graph_modules):
+        if int(os.environ.get("WORLD_SIZE", 1)) % tp_size != 0:
+            pytest.skip(f"world size must be divisible by TP{tp_size}")
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        model_parallel_cuda_manual_seed(123)
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            tensor_model_parallel_size=tp_size,
+            num_moe_experts=(4 if CudaGraphModule.moe_router in cuda_graph_modules else None),
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph_warmup_steps=0,
+        )
+        torch.manual_seed(123)
+        module = _ScopedCudaGraphModule(config).cuda()
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
+            module,
+        )
+
+        selected_names = {scope.name for scope in cuda_graph_modules}
+        for name in ("mamba", "attn", "moe_router"):
+            param = getattr(module, name).weight
+            assert param._ddp_grad_acc_on_cudagraph_stream == (name in selected_names)
+        assert not module.eager_tail.weight._ddp_grad_acc_on_cudagraph_stream
+
+        # Use the same input on every DP rank so this test isolates scoped graph capture and
+        # replay. The checkpoint/DDP test above uses rank-distinct inputs to validate reduction.
+        input_generator = torch.Generator(device="cuda").manual_seed(456)
+        test_input = torch.randn(
+            4, config.hidden_size, device="cuda", generator=input_generator, requires_grad=True
+        )
+
+        def run_backward():
+            ddp_model.zero_grad_buffer()
+            output = ddp_model(test_input.detach().clone().requires_grad_(True))
+            output.square().mean().backward()
+            ddp_model.finish_grad_sync()
+            torch.cuda.synchronize()
+            return output.detach().clone(), {
+                name: param.main_grad.detach().clone() for name, param in module.named_parameters()
+            }
+
+        try:
+            expected_output, _ = run_backward()
+            ddp_model.zero_grad_buffer()
+            create_cudagraphs()
+
+            assert _CudagraphGlobalRecord.cudagraph_created
+            assert len(module.cudagraph_managers) == len(cuda_graph_modules)
+            assert all(
+                len(manager.cudagraph_runners) == 1
+                for manager in module.cudagraph_managers.values()
+            )
+
+            first_replay_grads = None
+            for _ in range(2):
+                replay_output, replay_grads = run_backward()
+                torch.testing.assert_close(replay_output, expected_output)
+                for grad in replay_grads.values():
+                    assert torch.isfinite(grad).all()
+                    assert torch.count_nonzero(grad) > 0
+                if first_replay_grads is None:
+                    first_replay_grads = replay_grads
+                else:
+                    for name, expected_grad in first_replay_grads.items():
+                        torch.testing.assert_close(
+                            replay_grads[name],
+                            expected_grad,
+                            msg=lambda message: f"{name}: {message}",
+                        )
+        finally:
+            torch.cuda.synchronize()
+            delete_cuda_graphs()
+            Utils.destroy_model_parallel()
 
 
 class TestInlineCaptureManager:

@@ -297,6 +297,14 @@ class GraphableMegatronModule(MegatronModule):
         """
         return [self]
 
+    def _get_additional_cudagraph_parameters(self):
+        """Return graph parameters outside the selected graph submodule trees.
+
+        Override when a recomputation or checkpoint closure reaches a parameter that
+        ``_get_submodules_under_cudagraphs`` does not expose.
+        """
+        return ()
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
