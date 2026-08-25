@@ -3,68 +3,96 @@
 """all_to_all routing utilities for layer-sharded Muon.
 
 Layer sharding assigns every 2D weight one Newton-Schulz "home" rank inside the
-(GTP x TP) weight-shard domain. The forward exchanges route each rank's local
-momentum shards so the home assembles the complete matrix; the backward
-exchanges scatter the orthogonalized result back to the original shards.
+(GTP_remat x TP) weight-shard domain — i.e. the GTP domain (GTP = TP x
+GTP_remat). The forward exchanges route each rank's local momentum shards so
+the home assembles the complete matrix; the backward exchanges scatter the
+orthogonalized result back to the original shards.
 
 Two equivalent exchange strategies are provided:
 
 - Two-stage (``layer_sharded_all_to_all_{fwd,bwd}``): one all_to_all over the
-  GTP group (dim 0), then one over the TP group (along ``partition_dim``),
-  reusing the existing process groups.
+  GTP_remat group (dim 0), then one over the TP group (along
+  ``partition_dim``), reusing the existing process groups. These helpers are
+  axis-generic — the caller invokes them once with the GTP_remat group and once
+  with the TP group — so their arguments are named for the role (``group``,
+  ``shard_dim``), not for a specific axis.
 - Fused (``layer_sharded_fused_{fwd,bwd}``): a single all_to_all per direction
-  over the flattened (GTP x TP) domain group. It moves the exact same shard
-  blocks and assembles them in the exact same order, so the NS input is
+  over the flattened (GTP_remat x TP) domain group. It moves the exact same
+  shard blocks and assembles them in the exact same order, so the NS input is
   bit-identical to the two-stage path.
 
 All functions support heterogeneous parameter shapes and uneven home
-assignments (ranks may own zero matrices in a given exchange).
+assignments (ranks may own zero matrices in a given exchange, receiving
+zero-size all_to_all splits).
 """
 
 import torch
 
 
+def _group_rank_and_size(group: "torch.distributed.ProcessGroup | None") -> tuple[int, int]:
+    """(rank, size) of ``group``, honouring the module convention that ``None``
+    means "no group / size 1" — NOT torch's "the default group"."""
+    if group is None:
+        return 0, 1
+    return group.rank(), group.size()
+
+
 def layer_sharded_all_to_all_fwd(
     momentum_list: list[torch.Tensor],
-    param_to_gtp_rank: dict,
-    gtp_rank: int,
-    gtp_size: int,
-    gtp_group: "torch.distributed.ProcessGroup",
-    gtp_dim: int = 0,
+    param_to_home_rank: dict,
+    group: "torch.distributed.ProcessGroup | None",
+    shard_dim: int = 0,
 ) -> tuple[list[torch.Tensor], list[int]]:
-    """Forward all_to_all for layer sharding: redistribute GTP momentum shards.
+    """Forward all_to_all for layer sharding: redistribute momentum shards.
 
-    Each GPU holds (P/S, Q) momentum shards for all L/DP params. This redistributes
-    them so each GPU ends up with complete (P, Q) momentum for its GTP-assigned subset.
+    Each rank holds a (P/S, Q) momentum shard of every param. This
+    redistributes them so each rank ends up with the complete (P, Q) momentum
+    for its assigned subset.
 
     Args:
-        momentum_list: List of momentum tensors, one per param. Each has shape (P/S, Q)
-            where S = gtp_size (the GTP row shard on this GPU).
-        param_to_gtp_rank: Dict mapping param index -> NS home GTP rank.
-        gtp_rank: This GPU's rank within gtp_group.
-        gtp_size: Size of gtp_group.
-        gtp_group: The GTP process group to communicate within.
-        gtp_dim: Dimension sharded by GTP (0 for column-parallel weights).
+        momentum_list: List of momentum tensors, one per param. Each has shape
+            (P/S, Q) where S = group size (this rank's shard along
+            ``shard_dim``).
+        param_to_home_rank: Dict mapping param index -> NS home rank in
+            ``group``.
+        group: The process group to communicate within (the GTP_remat group in
+            stage 1, the TP group in stage 2). None means size 1: no exchange.
+        shard_dim: Dimension the shards split (0 for the GTP_remat stage; the
+            param's partition_dim for the TP stage).
 
     Returns:
         Tuple of:
-            - complete_momentums: List of complete (P, Q) tensors for params assigned
-              to this GPU (ns_home == gtp_rank), in the order they appear in momentum_list.
-            - my_param_indices: Indices into momentum_list for params assigned to this GPU.
+            - complete_momentums: List of complete (P, Q) tensors for params
+              assigned to this rank, in the order they appear in momentum_list.
+            - my_param_indices: Indices into momentum_list for params assigned
+              to this rank.
     """
-    # Group params by their NS home GTP rank
-    params_for_rank = [[] for _ in range(gtp_size)]
-    for i, m in enumerate(momentum_list):
-        home = param_to_gtp_rank.get(i, i % gtp_size)
-        params_for_rank[home].append((i, m))
+    rank, size = _group_rank_and_size(group)
+    if size <= 1:
+        # Trivial group: every param is homed locally and the shard IS the
+        # complete matrix. Also keeps a None group away from
+        # all_to_all_single, where None would mean the WORLD group.
+        return list(momentum_list), list(range(len(momentum_list)))
+
+    # Group params by their NS home rank. The wired path (LPT bin-packing in
+    # LayerWiseDistributedOptimizer) always supplies every entry; the
+    # ``i % size`` default is a round-robin FALLBACK for direct-API callers or
+    # missing entries only. Assignments may be uneven — with fewer params than
+    # ranks, the unassigned ranks simply receive zero-size splits below.
+    rank_to_param_mapping = [[] for _ in range(size)]
+    for param_idx, param_momentum in enumerate(momentum_list):
+        home = param_to_home_rank.get(param_idx, param_idx % size)
+        rank_to_param_mapping[home].append((param_idx, param_momentum))
 
     # Build flat send buffer: [data_for_rank_0 | data_for_rank_1 | ...]
-    # For each destination g', send my momentum shards for params assigned to g'
+    # For each destination r', send my momentum shards for params assigned to r'
     send_parts = []
     input_split_sizes = []
-    for g_prime in range(gtp_size):
-        if params_for_rank[g_prime]:
-            chunk = torch.cat([m.contiguous().flatten() for _, m in params_for_rank[g_prime]])
+    for r_prime in range(size):
+        if rank_to_param_mapping[r_prime]:
+            chunk = torch.cat(
+                [m.contiguous().flatten() for _, m in rank_to_param_mapping[r_prime]]
+            )
             send_parts.append(chunk)
             input_split_sizes.append(chunk.numel())
         else:
@@ -81,47 +109,47 @@ def layer_sharded_all_to_all_fwd(
         )
     )
 
-    # Compute recv split sizes: from each source g', we receive momentum shards
-    # for all params assigned to us (gtp_rank). Each shard has the same numel as the param.
-    my_params = params_for_rank[gtp_rank]
+    # Compute recv split sizes: from each source r', we receive momentum shards
+    # for all params assigned to us. Each shard has the same numel as the param.
+    my_params = rank_to_param_mapping[rank]
     my_param_numel = sum(m.numel() for _, m in my_params)
-    output_split_sizes = [my_param_numel] * gtp_size
+    output_split_sizes = [my_param_numel] * size
 
-    recv_buf = torch.empty(my_param_numel * gtp_size, dtype=send_buf.dtype, device=send_buf.device)
+    recv_buf = torch.empty(my_param_numel * size, dtype=send_buf.dtype, device=send_buf.device)
 
     torch.distributed.all_to_all_single(
         recv_buf,
         send_buf,
         output_split_sizes=output_split_sizes,
         input_split_sizes=input_split_sizes,
-        group=gtp_group,
+        group=group,
     )
 
-    # Unpack: for each of my assigned params, concatenate GTP shards from all sources.
-    # recv_buf layout: [from_g0 | from_g1 | ... | from_g(S-1)], where each
-    # from_gk block contains that source's shards of my params, in order.
+    # Unpack: for each of my assigned params, concatenate the shards from all
+    # sources. recv_buf layout: [from_r0 | from_r1 | ... | from_r(S-1)], where
+    # each from_rk block contains that source's shards of my params, in order.
     my_param_indices = [i for i, _ in my_params]
 
     # Prefix offsets of each of my params within one source block. Precomputed:
-    # deriving them inline is O(n^2 * gtp_size), and n reaches the hundreds when a
+    # deriving them inline is O(n^2 * size), and n reaches the hundreds when a
     # home owns many same-shape expert weights.
     param_offsets = [0]
     for _, m in my_params:
         param_offsets.append(param_offsets[-1] + m.numel())
 
     complete_momentums = []
-    for param_idx, (_, m_template) in enumerate(my_params):
+    for pos, (_, m_template) in enumerate(my_params):
         numel = m_template.numel()
-        offset = param_offsets[param_idx]
-        # Slices of a 1-D contiguous buffer are already contiguous, so cat can take
-        # the views directly.
+        offset = param_offsets[pos]
+        # Slices of a 1-D contiguous buffer are already contiguous, so cat can
+        # take the views directly.
         shards = [
             recv_buf[
-                g_prime * my_param_numel + offset : g_prime * my_param_numel + offset + numel
+                r_prime * my_param_numel + offset : r_prime * my_param_numel + offset + numel
             ].view(m_template.shape)
-            for g_prime in range(gtp_size)
+            for r_prime in range(size)
         ]
-        complete_momentums.append(torch.cat(shards, dim=gtp_dim))  # (P, Q)
+        complete_momentums.append(torch.cat(shards, dim=shard_dim))  # (P, Q)
 
     return complete_momentums, my_param_indices
 
@@ -130,66 +158,75 @@ def layer_sharded_all_to_all_bwd(
     ns_results: list[torch.Tensor],
     my_param_indices: list[int],
     momentum_list: list[torch.Tensor],
-    param_to_gtp_rank: dict,
-    gtp_rank: int,
-    gtp_size: int,
-    gtp_group: "torch.distributed.ProcessGroup",
-    gtp_dim: int = 0,
-) -> list[torch.Tensor | None]:
-    """Backward all_to_all for layer sharding: distribute NS results as GTP shards.
+    param_to_home_rank: dict,
+    group: "torch.distributed.ProcessGroup | None",
+    shard_dim: int = 0,
+) -> list["torch.Tensor | None"]:
+    """Backward all_to_all for layer sharding: distribute NS results as shards.
 
-    Each NS-home GPU has complete (P, Q) NS results for its assigned params. This
-    redistributes them so every GPU gets the (P/S, Q) GTP row shard for all L/DP params.
+    Each NS-home rank has complete (P, Q) NS results for its assigned params.
+    This redistributes them so every rank gets its (P/S, Q) shard for every
+    param.
 
     Args:
-        ns_results: Complete (P, Q) NS result tensors, one per assigned param, in order
-            corresponding to my_param_indices.
-        my_param_indices: Indices into momentum_list for params assigned to this GPU.
+        ns_results: Complete (P, Q) NS result tensors, one per assigned param,
+            in the order of my_param_indices.
+        my_param_indices: Indices into momentum_list for params assigned to
+            this rank.
         momentum_list: List of original momentum tensors (provides shapes).
-        param_to_gtp_rank: Dict mapping param index -> NS home GTP rank.
-        gtp_rank: This GPU's rank within gtp_group.
-        gtp_size: Size of gtp_group.
-        gtp_group: The GTP process group to communicate within.
-        gtp_dim: Dimension sharded by GTP (0 for column-parallel weights).
+        param_to_home_rank: Dict mapping param index -> NS home rank in
+            ``group``.
+        group: The process group to communicate within (see the fwd docstring).
+            None means size 1: no exchange.
+        shard_dim: Dimension the shards split (see the fwd docstring).
 
     Returns:
-        List of (P/S, Q) NS update shards, one per param in momentum_list order.
-        None for params that did not participate (should not occur in normal usage).
+        List of (P/S, Q) NS update shards, one per param in momentum_list
+        order. None for params that did not participate (should not occur in
+        normal usage).
     """
     if not momentum_list:
         return []
 
-    # Group params by their NS home GTP rank (same grouping as fwd)
-    params_for_rank = [[] for _ in range(gtp_size)]
-    for i, m in enumerate(momentum_list):
-        home = param_to_gtp_rank.get(i, i % gtp_size)
-        params_for_rank[home].append((i, m))
+    rank, size = _group_rank_and_size(group)
+    if size <= 1:
+        update_shards: list["torch.Tensor | None"] = [None] * len(momentum_list)
+        for ns_r, idx in zip(ns_results, my_param_indices):
+            update_shards[idx] = ns_r
+        return update_shards
 
-    # Precondition: ns_r must span exactly gtp_size equal-sized shards so the
+    # Group params by their NS home rank (same grouping and same round-robin
+    # fallback as fwd — see the comment there).
+    rank_to_param_mapping = [[] for _ in range(size)]
+    for param_idx, param_momentum in enumerate(momentum_list):
+        home = param_to_home_rank.get(param_idx, param_idx % size)
+        rank_to_param_mapping[home].append((param_idx, param_momentum))
+
+    # Precondition: ns_r must span exactly ``size`` equal-sized shards so the
     # uniform-stride narrow below is correct.  A violated invariant produces silent
     # corruption (narrow is in-bounds but slices the wrong rows).
     if ns_results:
         for ns_r, idx in zip(ns_results, my_param_indices):
-            expected = momentum_list[idx].shape[gtp_dim] * gtp_size
-            assert ns_r.shape[gtp_dim] == expected, (
-                f"layer_sharded_all_to_all_bwd: full-matrix dim[{gtp_dim}]="
-                f"{ns_r.shape[gtp_dim]} != shard_size="
-                f"{momentum_list[idx].shape[gtp_dim]} × gtp_size={gtp_size}; "
+            expected = momentum_list[idx].shape[shard_dim] * size
+            assert ns_r.shape[shard_dim] == expected, (
+                f"layer_sharded_all_to_all_bwd: full-matrix dim[{shard_dim}]="
+                f"{ns_r.shape[shard_dim]} != shard_size="
+                f"{momentum_list[idx].shape[shard_dim]} × group size={size}; "
                 "all shards must be equal-sized (divisibility/padding invariant violated)."
             )
 
-    # Build send buffer: for each destination g', send that rank's GTP row shard
-    # of each of MY ns_results. Shard size is per-param (heterogeneous shapes).
+    # Build send buffer: for each destination r', send that rank's shard of
+    # each of MY ns_results. Shard size is per-param (heterogeneous shapes).
     send_parts = []
     input_split_sizes = []
-    for g_prime in range(gtp_size):
+    for r_prime in range(size):
         if ns_results:
             chunk = torch.cat(
                 [
                     ns_r.narrow(
-                        gtp_dim,
-                        g_prime * momentum_list[idx].shape[gtp_dim],
-                        momentum_list[idx].shape[gtp_dim],
+                        shard_dim,
+                        r_prime * momentum_list[idx].shape[shard_dim],
+                        momentum_list[idx].shape[shard_dim],
                     )
                     .contiguous()
                     .flatten()
@@ -212,12 +249,12 @@ def layer_sharded_all_to_all_bwd(
         )
     )
 
-    # Recv: from each source g', receive the GTP row shard for MY rank of their NS results
+    # Recv: from each source r', receive the shard for MY rank of their NS results
     output_split_sizes = []
-    for g_prime in range(gtp_size):
-        # Number of params assigned to g', each contributing shard_size * Q elements
-        g_prime_params = params_for_rank[g_prime]
-        total_numel = sum(m.numel() for _, m in g_prime_params)  # P/S * Q * n_params
+    for r_prime in range(size):
+        # Number of params assigned to r', each contributing shard_size * Q elements
+        r_prime_params = rank_to_param_mapping[r_prime]
+        total_numel = sum(m.numel() for _, m in r_prime_params)  # P/S * Q * n_params
         output_split_sizes.append(total_numel)
 
     recv_buf = torch.empty(sum(output_split_sizes), dtype=send_buf.dtype, device=send_buf.device)
@@ -227,14 +264,14 @@ def layer_sharded_all_to_all_bwd(
         send_buf,
         output_split_sizes=output_split_sizes,
         input_split_sizes=input_split_sizes,
-        group=gtp_group,
+        group=group,
     )
 
     # Unpack into per-param update shards
-    update_shards: list[torch.Tensor | None] = [None] * len(momentum_list)
+    update_shards: list["torch.Tensor | None"] = [None] * len(momentum_list)
     offset = 0
-    for g_prime in range(gtp_size):
-        for i, m_template in params_for_rank[g_prime]:
+    for r_prime in range(size):
+        for i, m_template in rank_to_param_mapping[r_prime]:
             shard = recv_buf[offset : offset + m_template.numel()].view(m_template.shape)
             update_shards[i] = shard.contiguous()
             offset += m_template.numel()
@@ -246,48 +283,53 @@ def layer_sharded_fused_fwd(
     momentum_list: list[torch.Tensor],
     param_homes: list[tuple[int, int]],
     partition_dims: list["int | None"],
-    g_rank: int,
-    t_rank: int,
-    gtp_size: int,
+    gtp_remat_rank: int,
+    tp_rank: int,
+    gtp_remat_size: int,
     tp_size: int,
     fused_group: "torch.distributed.ProcessGroup",
 ) -> tuple[list[torch.Tensor], list[int]]:
-    """Single fused all_to_all over the flattened (GTP x TP) domain (forward).
+    """Single fused all_to_all over the flattened (GTP_remat x TP) domain (forward).
 
-    Functionally identical to the two-stage ``layer_sharded_all_to_all_fwd`` (over GTP)
-    followed by a second stage over TP: the exact same shard blocks travel to the same
-    NS home and are concatenated in the exact same order, so the assembled full matrix
-    is bit-identical. One collective replaces up to three (GTP, then TP once per
-    non-empty partition_dim).
+    Functionally identical to the two-stage ``layer_sharded_all_to_all_fwd``
+    (over GTP_remat) followed by a second stage over TP: the exact same shard
+    blocks travel to the same NS home and are concatenated in the exact same
+    order, so the assembled full matrix is bit-identical. One collective
+    replaces up to three (GTP_remat, then TP once per non-empty partition_dim).
 
-    Rank convention: the caller must construct ``fused_group`` so that its group rank
-    ``g * tp_size + t`` is the process with coordinates ``(g, t)`` in (gtp_group,
-    tp_group) — i.e. TP innermost, matching Megatron's ``tp-gtp_remat-...`` order.
+    Rank convention: the caller must construct ``fused_group`` so that its
+    group rank ``g * tp_size + t`` is the process with coordinates ``(g, t)``
+    in (gtp_remat_group, tp_group) — i.e. TP innermost, matching Megatron's
+    ``tp-gtp_remat-...`` order.
 
     Sharding model per full matrix ``(P, Q)`` (mirrors the two-stage path):
-      - ``partition_dim == 0``: TP shards dim 0, then GTP shards the TP-local rows.
-        Source ``(g, t)`` holds full rows ``[t*P/T + g*P/(T*G), ...)`` — block index
-        ``t*G + g`` along dim 0.
-      - ``partition_dim == 1``: GTP shards dim 0, TP shards dim 1. Source ``(g, t)``
-        holds the 2-D block ``[g*P/G:(g+1)*P/G, t*Q/T:(t+1)*Q/T]``.
-      - ``partition_dim is None``: not TP-sharded; every TP peer holds the identical
-        ``(P/G, Q)`` shard, so only sources with ``t == t_home`` contribute.
+      - ``partition_dim == 0``: TP shards dim 0, then GTP_remat shards the
+        TP-local rows. Source ``(g, t)`` holds full rows
+        ``[t*P/T + g*P/(T*G), ...)`` — block index ``t*G + g`` along dim 0.
+      - ``partition_dim == 1``: GTP_remat shards dim 0, TP shards dim 1. Source
+        ``(g, t)`` holds the 2-D block ``[g*P/G:(g+1)*P/G, t*Q/T:(t+1)*Q/T]``.
+      - ``partition_dim is None``: not TP-sharded; every TP peer holds the
+        identical ``(P/G, Q)`` shard, so only sources with ``t == t_home``
+        contribute.
 
     Args:
         momentum_list: Local momentum shard per param.
         param_homes: ``(g_home, t_home)`` per param.
         partition_dims: TP partition dim per param (0, 1, or None).
-        g_rank / t_rank: This rank's coordinates.
-        gtp_size / tp_size: Domain extents.
-        fused_group: Flattened process group of size ``gtp_size * tp_size``.
+        gtp_remat_rank / tp_rank: This rank's coordinates. Not derivable from
+            ``fused_group`` alone, so they stay explicit parameters (unlike the
+            two-stage helpers).
+        gtp_remat_size / tp_size: Domain extents.
+        fused_group: Flattened process group of size
+            ``gtp_remat_size * tp_size``.
 
     Returns:
-        ``(full_mats, my_param_indices)`` — complete matrices for params homed on this
-        rank, and their indices into ``momentum_list``.
+        ``(full_mats, my_param_indices)`` — complete matrices for params homed
+        on this rank, and their indices into ``momentum_list``.
     """
-    G, T = gtp_size, tp_size
+    G, T = gtp_remat_size, tp_size
     S = G * T
-    my_flat = g_rank * T + t_rank
+    my_flat = gtp_remat_rank * T + tp_rank
     n = len(momentum_list)
 
     dest = [gh * T + th for gh, th in param_homes]
@@ -297,7 +339,7 @@ def layer_sharded_fused_fwd(
     # hold identical data; sending T copies would be pure waste).
     send_lists: list[list[int]] = [[] for _ in range(S)]
     for i in range(n):
-        if partition_dims[i] is None and t_rank != param_homes[i][1]:
+        if partition_dims[i] is None and tp_rank != param_homes[i][1]:
             continue
         send_lists[dest[i]].append(i)
 
@@ -323,13 +365,13 @@ def layer_sharded_fused_fwd(
     )
 
     # --- recv: from source (g_s, t_s) I receive shards of my params, except the
-    # non-TP-sharded ones arrive only from the t_s == t_rank column.
+    # non-TP-sharded ones arrive only from the t_s == tp_rank column.
     my_param_indices = [i for i in range(n) if dest[i] == my_flat]
     contrib: list[list[int]] = []
     output_split_sizes = []
     for s in range(S):
         t_s = s % T
-        lst = [i for i in my_param_indices if partition_dims[i] is not None or t_s == t_rank]
+        lst = [i for i in my_param_indices if partition_dims[i] is not None or t_s == tp_rank]
         contrib.append(lst)
         output_split_sizes.append(sum(momentum_list[i].numel() for i in lst))
 
@@ -364,7 +406,7 @@ def layer_sharded_fused_fwd(
             rows = [torch.cat([piece[(g * T + t, i)] for t in range(T)], dim=1) for g in range(G)]
             full_mats.append(torch.cat(rows, dim=0))
         else:
-            blocks = [piece[(g * T + t_rank, i)] for g in range(G)]
+            blocks = [piece[(g * T + tp_rank, i)] for g in range(G)]
             full_mats.append(torch.cat(blocks, dim=0))
 
     return full_mats, my_param_indices
@@ -376,25 +418,25 @@ def layer_sharded_fused_bwd(
     momentum_list: list[torch.Tensor],
     param_homes: list[tuple[int, int]],
     partition_dims: list["int | None"],
-    g_rank: int,
-    t_rank: int,
-    gtp_size: int,
+    gtp_remat_rank: int,
+    tp_rank: int,
+    gtp_remat_size: int,
     tp_size: int,
     fused_group: "torch.distributed.ProcessGroup",
 ) -> list["torch.Tensor | None"]:
-    """Single fused all_to_all over the flattened (GTP x TP) domain (backward).
+    """Single fused all_to_all over the flattened (GTP_remat x TP) domain (backward).
 
     Inverse of :func:`layer_sharded_fused_fwd`: each NS home slices its full-matrix
     results into the per-source blocks defined there and scatters them back. Every
     rank receives exactly one update shard per param — including non-TP-sharded
-    params, whose ``(P/G, Q)`` shard is sent to all T TP peers of each GTP row.
+    params, whose ``(P/G, Q)`` shard is sent to all T TP peers of each GTP_remat row.
 
     Args / conventions: see :func:`layer_sharded_fused_fwd`.
 
     Returns:
         Update shards in ``momentum_list`` order (same shapes as the local shards).
     """
-    G, T = gtp_size, tp_size
+    G, T = gtp_remat_size, tp_size
     S = G * T
     n = len(momentum_list)
     if n == 0:

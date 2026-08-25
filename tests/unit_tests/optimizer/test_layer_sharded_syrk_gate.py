@@ -35,7 +35,7 @@ def _make_opt(monkeypatch=None, **kwargs):
         monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
         monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: True)
     p = torch.nn.Parameter(torch.randn(4, 4))
-    return LayerShardedMuon([p], lr=0.1, gtp_group=None, **kwargs)
+    return LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, **kwargs)
 
 
 class TestBatchedSyrkSymbolDetection:
@@ -130,7 +130,7 @@ class TestConstructorGuards:
         monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: True)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         p = torch.nn.Parameter(torch.randn(4, 4))
-        opt = LayerShardedMuon([p], lr=0.1, gtp_group=None, use_syrk=True)
+        opt = LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, use_syrk=True)
         assert opt.use_syrk is False
         assert opt._batched_syrk is False
 
@@ -142,7 +142,7 @@ class TestConstructorGuards:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: False)
         p = torch.nn.Parameter(torch.randn(4, 4))
-        opt = LayerShardedMuon([p], lr=0.1, gtp_group=None, use_syrk=True)
+        opt = LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, use_syrk=True)
         assert opt.use_syrk is False
 
     def test_split_qkv_is_rejected(self):
@@ -150,4 +150,4 @@ class TestConstructorGuards:
         the update rule depend on whether homes are set — reject at the class."""
         p = torch.nn.Parameter(torch.randn(4, 4))
         with pytest.raises(ValueError, match="split-QKV"):
-            LayerShardedMuon([p], lr=0.1, gtp_group=None, split_qkv=True)
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, split_qkv=True)
