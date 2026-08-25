@@ -21,7 +21,6 @@ from examples.mimo.model_providers.radio_encoder import (
 from examples.mimo.utils.hetero import get_grid_dim_size
 from megatron.core.activations import squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.hyper_comm_grid import _is_process_group_member as is_process_group_member
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
@@ -145,10 +144,13 @@ def _vision_projection_input_size(
 
 
 def nemotron_projection_config(
-    args: argparse.Namespace, tp_size: int, projection_input_size: int
+    args: argparse.Namespace,
+    tp_size: int,
+    projection_input_size: int,
+    base_config: TransformerConfig | None = None,
 ) -> TransformerConfig:
     """Vision-to-Nemotron projection config: stock from-args base + overrides."""
-    config = deepcopy(_base_config(args))
+    config = deepcopy(base_config if base_config is not None else _base_config(args))
     config.num_layers = 1
     config.hidden_size = int(args.hidden_size)
     config.num_attention_heads = 1
@@ -160,9 +162,30 @@ def nemotron_projection_config(
     config.normalization = "RMSNorm"
     _make_dense_non_hybrid(config)  # Projection inherits no MoE/Mamba/hybrid settings.
     config.tensor_model_parallel_size = tp_size
-    _disable_gtp(config)
+    if base_config is None:
+        _disable_gtp(config)
     config.sequence_parallel = False
     return config
+
+
+def _nemotron_projection_spec(
+    args: argparse.Namespace,
+    input_size: int,
+    tp_size: int,
+    pg_collection: ProcessGroupCollection | None,
+    base_config: TransformerConfig | None = None,
+) -> ModuleSpec:
+    """Build the RADIO-to-language projection for its owning grid."""
+    return ModuleSpec(
+        module=MultimodalProjector,
+        params={
+            "config": nemotron_projection_config(args, tp_size, input_size, base_config),
+            "submodules": nemotron_projection_layer_spec().submodules,
+            "projector_type": args.vision_projection_type,
+            "input_size": input_size,
+            "pg_collection": pg_collection,
+        },
+    )
 
 
 def language_model_spec(
@@ -238,25 +261,40 @@ def vision_submodules_spec(
     vision_config = radio_vision_config(args, tp_size, pp_size)
     vision_encoder_spec = radio_vision_encoder_spec(args, vision_config, pg_collection)
     projection_input_size = _vision_projection_input_size(args, vision_config)
-    # affine -> single linear_fc1; mlp -> fc1+act+fc2 (core MultimodalProjector
-    # branches on vision_projection_type).
-    vision_projection_spec = ModuleSpec(
-        module=MultimodalProjector,
-        params={
-            "config": nemotron_projection_config(args, tp_size, projection_input_size),
-            "submodules": nemotron_projection_layer_spec().submodules,
-            "projector_type": args.vision_projection_type,
-            "input_size": projection_input_size,
-            "tp_group": tp_pg if is_process_group_member(tp_pg) else None,
-        },
-    )
+    input_projections = []
+    if not args.mimo_run_input_projections_on_llm_ranks:
+        input_projections.append(
+            _nemotron_projection_spec(args, projection_input_size, tp_size, pg_collection)
+        )
     return ModuleSpec(
         module=VisionModalitySubmodules,
         params={"pg_collection": pg_collection},
         submodules={
             "encoders": {RADIO_ENCODER_MODULE_NAME: vision_encoder_spec},
-            "input_projections": [vision_projection_spec],
+            "input_projections": input_projections,
         },
+    )
+
+
+def language_input_projection_spec(
+    args: argparse.Namespace,
+    pg_collection: ProcessGroupCollection | None,
+    language_grid: HyperCommGrid,
+    language_spec: ModuleSpec,
+) -> ModuleSpec | None:
+    """Build the RADIO input projection on the first language stage when requested."""
+    if not args.mimo_run_input_projections_on_llm_ranks:
+        return None
+
+    del language_grid
+    vision_config = radio_vision_config(args, args.mimo_encoder_tp, 1)
+    language_config = language_spec.params["config"]
+    return _nemotron_projection_spec(
+        args,
+        _vision_projection_input_size(args, vision_config),
+        language_config.tensor_model_parallel_size,
+        pg_collection,
+        language_config,
     )
 
 
@@ -288,4 +326,5 @@ def nemotron_provider() -> MimoProvider:
         encoder_specs={RADIO_ENCODER_MODULE_NAME: vision_submodules_spec},
         special_token_ids=nemotron_special_token_ids,
         build_communicator=build_nemotron_communicator,
+        language_input_projection_specs={RADIO_ENCODER_MODULE_NAME: language_input_projection_spec},
     )

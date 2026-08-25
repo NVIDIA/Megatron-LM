@@ -17,7 +17,7 @@ from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from examples.mimo.training.grad_sync import configure_grad_sync
-from examples.mimo.training.runtime import wrap_active_modules_with_ddp
+from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -37,6 +37,7 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -118,8 +119,8 @@ def get_pg_collection(grid):
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
     pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
     pg_collection.expt_tp = pg_collection.tp
-    pg_collection.gtp_remat = None
-    pg_collection.expt_gtp_remat = None
+    pg_collection.gtp_remat = pg_collection.cp
+    pg_collection.expt_gtp_remat = pg_collection.ep
     # Expert groups from the expert view (dense here, so tp_ep_pp resolves to tp x pp).
     pg_collection.mp = grid.get_pg(["tp", "pp"])
     pg_collection.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
@@ -278,13 +279,18 @@ def get_projection_config(hidden_size, bias=True):
     return cfg
 
 
-def get_projection_layer_spec():
+def get_projection_layer_spec(projection_type="mlp"):
     """Layer spec for the vision-projection MLP."""
     if TEColumnParallelLinear is None or TERowParallelLinear is None:
         raise RuntimeError("TEColumnParallelLinear and TERowParallelLinear are required")
     return ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+        submodules=MLPSubmodules(
+            linear_fc1=(
+                ColumnParallelLinear if projection_type == "affine" else TEColumnParallelLinear
+            ),
+            linear_fc2=TERowParallelLinear,
+        ),
     )
 
 
@@ -298,6 +304,7 @@ def get_vision_submodules_spec(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    projection_type="mlp",
 ):
     """Get the submodule spec for the vision modality.
 
@@ -350,10 +357,11 @@ def get_vision_submodules_spec(
         module=MultimodalProjector,
         params={
             "config": get_projection_config(hidden_size=language_hidden_size, bias=bias),
-            "submodules": get_projection_layer_spec().submodules,
-            "projector_type": "mlp",
+            "submodules": get_projection_layer_spec(projection_type).submodules,
+            "projector_type": projection_type,
             "input_size": vision_config.hidden_size,
             "tp_group": pg_collection.tp,
+            "pg_collection": pg_collection,
         },
     )
 
@@ -381,6 +389,12 @@ def get_mimo_model(
     dropout=True,
     per_token_loss=False,
     use_layer_wise_distributed_optimizer=False,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+    freeze_encoder=False,
+    projection_type="mlp",
+    language_pg_collection=None,
+    vision_pg_collection=None,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -403,8 +417,18 @@ def get_mimo_model(
         use_layer_wise_distributed_optimizer: Whether to wrap active modules through the
             production MIMO LayerWise parameter-layout path.
     """
-    language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
-    vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
+    encoder_hidden_size = encoder_hidden_size or hidden_size
+    language_pg = language_pg_collection
+    if language_pg is None:
+        language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
+    vision_pg = vision_pg_collection
+    if vision_pg is None:
+        vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
+
+    if is_rank_in_grid(encoder_grid):
+        configure_module_rng(SimpleNamespace(seed=123), vision_pg, 10_000)
+    if is_rank_in_grid(llm_grid):
+        configure_module_rng(SimpleNamespace(seed=123), language_pg, 0)
 
     language_model_spec = get_language_model_spec(
         num_layers=num_layers,
@@ -418,9 +442,20 @@ def get_mimo_model(
         dropout=dropout,
         per_token_loss=per_token_loss,
     )
+    language_gtp_size = (
+        llm_grid.shape[llm_grid.dim_names.index("gtp_remat")]
+        if "gtp_remat" in llm_grid.dim_names
+        else 1
+    )
+    language_config = language_model_spec.params["config"]
+    language_config.use_cpu_initialization = language_gtp_size == 1
+    language_config.gtp_weight_remat_size = language_gtp_size
+    language_config.tensor_parallel_num_weight_shards = (
+        language_config.tensor_model_parallel_size * language_gtp_size
+    )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
-        hidden_size=hidden_size,
+        hidden_size=encoder_hidden_size,
         num_attention_heads=8,
         language_hidden_size=hidden_size,
         pg_collection=vision_pg,
@@ -428,7 +463,30 @@ def get_mimo_model(
         bias=bias,
         dropout=dropout,
         per_token_loss=per_token_loss,
+        projection_type=projection_type,
     )
+    language_input_projections = {}
+    if language_rank_input_projection:
+        projection_config = get_projection_config(hidden_size=hidden_size, bias=bias)
+        projection_config.tensor_model_parallel_size = llm_grid.shape[
+            llm_grid.dim_names.index("tp")
+        ]
+        projection_config.gtp_weight_remat_size = language_gtp_size
+        projection_config.tensor_parallel_num_weight_shards = (
+            projection_config.tensor_model_parallel_size * language_gtp_size
+        )
+        language_input_projections[encoder_name] = ModuleSpec(
+            module=MultimodalProjector,
+            params={
+                "config": projection_config,
+                "submodules": get_projection_layer_spec(projection_type).submodules,
+                "projector_type": projection_type,
+                "input_size": encoder_hidden_size,
+                "tp_group": language_pg.tp,
+                "pg_collection": language_pg,
+            },
+        )
+        vision_submodule_spec.submodules["input_projections"] = []
 
     module_to_grid_map = {encoder_name: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid}
     topology = {encoder_name: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []}
@@ -436,6 +494,7 @@ def get_mimo_model(
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={encoder_name: vision_submodule_spec},
+        language_model_input_projections_spec=language_input_projections,
         special_token_ids={encoder_name: 50257},
         module_to_grid_map=module_to_grid_map,
     )
@@ -454,12 +513,12 @@ def get_mimo_model(
             use_distributed_optimizer=True,
         )
 
-    if use_layer_wise_distributed_optimizer:
+    if use_layer_wise_distributed_optimizer or freeze_encoder:
         wrap_active_modules_with_ddp(
             SimpleNamespace(
                 mimo_encoder_ddp_overlap=False,
                 freeze_lm=False,
-                freeze_vit=False,
+                freeze_vit=freeze_encoder,
                 freeze_projection=False,
             ),
             mimo_model,
@@ -467,7 +526,7 @@ def get_mimo_model(
                 module_pgs={MIMO_LANGUAGE_MODULE_KEY: language_pg, encoder_name: vision_pg}
             ),
             ddp_config,
-            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=True,
         )
     else:
@@ -598,6 +657,10 @@ def run_mimo_1f1b_test(
     micro_batch_size=2,
     num_microbatches=4,
     use_layer_wise_distributed_optimizer=False,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+    freeze_encoder=False,
+    projection_type="mlp",
 ):
     """Run MIMO model through 1F1B schedule and verify.
 
@@ -615,6 +678,7 @@ def run_mimo_1f1b_test(
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
     encoder_name = "images"
+    encoder_hidden_size = encoder_hidden_size or hidden_size
 
     encoder_grid = create_hypercomm_grid(
         offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
@@ -638,6 +702,10 @@ def run_mimo_1f1b_test(
         seq_len=seq_length,
         per_token_loss=True,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+        encoder_hidden_size=encoder_hidden_size,
+        language_rank_input_projection=language_rank_input_projection,
+        freeze_encoder=freeze_encoder,
+        projection_type=projection_type,
     )
 
     # Use the production grad-sync hook (finalize per module over its own groups +
@@ -698,14 +766,18 @@ def run_mimo_1f1b_test(
         is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))
     )
     if encoder_needs_data and not llm_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, encoder_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            encoder_hidden_size, seq_length, encoder_mbs, vocab_size, encoder_name
+        )
     elif llm_needs_data and not encoder_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, llm_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            encoder_hidden_size, seq_length, llm_mbs, vocab_size, encoder_name
+        )
     elif encoder_needs_data and llm_needs_data:
         # Colocated: both encoder and LLM on same rank. Use LLM's MBS since
         # the LLM drives the schedule. (encoder_dp == llm_dp when colocated)
         data_iterator = DataIterator(
-            hidden_size, seq_length, micro_batch_size, vocab_size, encoder_name
+            encoder_hidden_size, seq_length, micro_batch_size, vocab_size, encoder_name
         )
 
     # Build MultiModuleProcessGroupCollection (reuse pre-created pg_collections)
@@ -950,6 +1022,32 @@ class TestMimo1F1BSchedule:
             seq_length=64,
             micro_batch_size=1,
             num_microbatches=4,
+        )
+
+    def test_language_rank_input_projection_with_frozen_encoder_8gpu(self):
+        """Language ranks project unequal-width features from frozen encoder ranks."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=1,
+            encoder_pp=1,
+            encoder_dp=4,
+            encoder_offset=0,
+            llm_tp=2,
+            llm_pp=1,
+            llm_dp=2,
+            llm_offset=4,
+            hidden_size=256,
+            encoder_hidden_size=128,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=2,
+            language_rank_input_projection=True,
+            freeze_encoder=True,
+            projection_type="affine",
         )
 
     @pytest.mark.parametrize("use_layer_wise_distributed_optimizer", [False, True])
