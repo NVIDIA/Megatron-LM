@@ -191,7 +191,6 @@ class BiasSwiGLUFunction(torch.autograd.Function):
             torch.Tensor: Result of applying bias addition followed by SwiGLU activation.
         """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
-        _propagate_paged_stash_marker(input, input_for_backward)
         if cpu_offload_input:
             input_for_backward.activation_offloading = True
             bias.activation_offloading = True
@@ -250,7 +249,6 @@ class SwiGLUFunction(torch.autograd.Function):
             torch.Tensor: Result of applying SwiGLU activation.
         """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
-        _propagate_paged_stash_marker(input, input_for_backward)
         if cpu_offload_input:
             input_for_backward.activation_offloading = True
         ctx.save_for_backward(input_for_backward)
@@ -338,7 +336,7 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
-    input = _propagate_paged_stash_marker(input, input.view(-1, ori_shape[-1]))
+    input = input.view(-1, ori_shape[-1])
     if bias is not None:
         output = BiasSwiGLUFunction.apply(
             input, bias, fp8_input_store, cpu_offload_input, clamp_value
