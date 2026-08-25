@@ -9,7 +9,10 @@ import pytest
 import torch
 
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    DynamicInferenceContext,
+)
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
@@ -538,6 +541,53 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_parent_id[s1].item() == s0
         assert alloc.block_parent_id[sx].item() == s1
         assert alloc.kv_hash_to_block_id[h1] == s1
+
+    @pytest.mark.internal
+    def test_failed_partial_hit_admission_rolls_back_and_retries(self):
+        """A failed allocation must not pin or double-count a matched prefix."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        producer = self._req(ctx, self._prompt(2 * bs))
+        ctx.add_request(producer)
+        matched_blocks = self._block_ids(ctx, 0, 2)
+        matched_hashes = list(producer.precomputed_block_hashes)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # Keep every raw pool block in use. The only allocatable blocks are the
+        # two cached matches, which the follower pins before requesting its tail.
+        drained = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert drained is not None
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 2
+
+        follower = self._req(ctx, self._prompt(3 * bs), request_id=2)
+        hits_before = ctx.prefix_cache_hits
+        blocks_before = ctx.prefix_cache_blocks_matched
+        with pytest.raises(BlockOverflowError):
+            ctx.add_request(follower)
+
+        assert ctx.total_request_count == 0
+        assert follower.num_cached_tokens == 0
+        assert ctx.prefix_cache_hits == hits_before
+        assert ctx.prefix_cache_blocks_matched == blocks_before
+        assert [alloc.block_ref_counts[block].item() for block in matched_blocks] == [0, 0]
+        assert all(
+            alloc.kv_hash_to_block_id[hash_] == block
+            for hash_, block in zip(matched_hashes, matched_blocks)
+        )
+
+        # Releasing one unregistered block makes the retry succeed. The prefix
+        # is counted once, and the cached blocks stay shared rather than evicted.
+        alloc.release_memory_blocks(drained[:1])
+        ctx.add_request(follower)
+        assert follower.num_cached_tokens == 2 * bs
+        assert ctx.prefix_cache_hits == hits_before + 1
+        assert ctx.prefix_cache_blocks_matched == blocks_before + 2
+        assert self._block_ids(ctx, 0, 2) == matched_blocks
+        assert len(set(self._block_ids(ctx, 0, 3))) == 3
 
     @pytest.mark.internal
     def test_check_availability_excludes_already_pinned_matches(self):
