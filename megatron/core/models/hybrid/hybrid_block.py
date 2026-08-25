@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core.context_parallel import ContextParallelLayoutManager
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -106,6 +107,8 @@ class HybridStack(MegatronModule):
 
         self.pp_group = pg_collection.pp
         self.tp_group = pg_collection.tp
+        self.cp_group = pg_collection.cp
+        self.tp_cp_group = pg_collection.tp_cp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -116,7 +119,24 @@ class HybridStack(MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
-
+        self._cp_layout_manager = None
+        if self.cp_group.size() > 1:
+            layer_layouts = tuple(
+                (
+                    self.config.attention_cp_layout
+                    if layer_type in LayerSymbols.ATTENTION_LAYERS
+                    else self.config.linear_cp_layout
+                )
+                for layer_type in self.layer_type_list
+            )
+            self._cp_layout_manager = ContextParallelLayoutManager(
+                layer_layouts=layer_layouts,
+                boundary_layout=self.config.linear_cp_layout,
+                sequence_parallel=self.config.sequence_parallel,
+                cp_group=self.cp_group,
+                tp_group=self.tp_group,
+                tp_cp_group=self.tp_cp_group,
+            )
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
 
@@ -301,6 +321,10 @@ class HybridStack(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_layout_state = None
+        if self._cp_layout_manager is not None:
+            cp_layout_state = self._cp_layout_manager.build_forward_state(packed_seq_params)
+
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
@@ -369,9 +393,15 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    cp_layout_state=cp_layout_state,
                 )
             else:
-                for layer in self.layers:
+                for layer_index, layer in enumerate(self.layers):
+                    layer_packed_seq_params = packed_seq_params
+                    if cp_layout_state is not None:
+                        hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
+                            layer_index, hidden_states
+                        )
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
@@ -384,7 +414,7 @@ class HybridStack(MegatronModule):
                                 inference_context=inference_context,
                                 rotary_pos_emb=rotary_pos_emb,
                                 sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=packed_seq_params,
+                                packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
                             )
                         else:  # MambaLayer, Expert, or MLP
@@ -392,7 +422,7 @@ class HybridStack(MegatronModule):
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
                                 inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
+                                packed_seq_params=layer_packed_seq_params,
                             )
 
                     # The attention layer (currently a simplified transformer layer)
@@ -400,6 +430,8 @@ class HybridStack(MegatronModule):
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+                    if cp_layout_state is not None:
+                        hidden_states = cp_layout_state.finalize_layer(layer_index, hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

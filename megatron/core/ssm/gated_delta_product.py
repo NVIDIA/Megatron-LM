@@ -457,6 +457,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             A_log_cp1=self.A_log,
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
+            sequence_is_contiguous=self.config.linear_cp_layout == "contiguous",
         )
 
     def forward(
