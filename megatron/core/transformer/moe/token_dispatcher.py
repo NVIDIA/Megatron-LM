@@ -1220,7 +1220,11 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
                 fused=self.config.moe_permute_fusion_into_hybridep,
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
-                num_dispatch_output_buffers=(self.config.moe_hybridep_num_dispatch_output_buffers),
+                num_dispatch_output_buffers=(
+                    self.config.moe_hybridep_num_dispatch_output_buffers
+                    if self.config.moe_hybridep_reuse_dispatch_output_buffers
+                    else 0
+                ),
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:

@@ -1047,12 +1047,16 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
-    moe_hybridep_num_dispatch_output_buffers: int = 0
+    moe_hybridep_reuse_dispatch_output_buffers: bool = False
+    """Reuse persistent caller-provided buffers for HybridEP permuted token outputs."""
+
+    moe_hybridep_num_dispatch_output_buffers: int = 4
     """Number of persistent caller-provided buffers for HybridEP permuted token outputs.
 
-    A positive value avoids caching-allocator pending-free accumulation in the combined-1F1B
-    schedule. Two buffers preserve overlap between forward and backward expert computation.
-    Requires static HybridEP output shapes and low-precision expert GEMMs. Zero disables reuse.
+    Four buffers avoid caching-allocator pending-free accumulation without consumer-event
+    backpressure in the combined-1F1B schedule. Requires static HybridEP output shapes and
+    low-precision expert GEMMs. Reuse remains opt-in through
+    ``moe_hybridep_reuse_dispatch_output_buffers``.
     """
 
     moe_ncclep_static_shape: bool = False
@@ -2114,7 +2118,12 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_hybridep_num_dispatch_output_buffers < 0:
             raise ValueError("moe_hybridep_num_dispatch_output_buffers must be non-negative")
-        if self.moe_hybridep_num_dispatch_output_buffers > 0:
+        if self.moe_hybridep_reuse_dispatch_output_buffers:
+            if self.moe_hybridep_num_dispatch_output_buffers == 0:
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers must be positive when "
+                    "moe_hybridep_reuse_dispatch_output_buffers is enabled"
+                )
             if (
                 self.moe_token_dispatcher_type != "flex"
                 or self.moe_flex_dispatcher_backend != "hybridep"
