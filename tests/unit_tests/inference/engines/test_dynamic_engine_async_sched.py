@@ -601,6 +601,22 @@ _ASYNC_PAIR_SCENARIOS = (
         parity="reproducible",
     ),
     _pair_scenario(
+        "raw-prompt-top-n-logprobs",
+        "logprobs:raw",
+        "logprobs:prompt",
+        "logprobs:top-n",
+        "logits:full",
+        config={"return_log_probs": True, "materialize_only_last_token_logits": False},
+        sampling=(
+            {"return_log_probs": True, "top_n_logprobs": 2},
+            {"return_log_probs": True, "top_n_logprobs": 5},
+        ),
+        signals=("full-logits", "logprobs", "top-n"),
+        # Different forward batch shapes may exchange a near-tied, non-selected
+        # final candidate; the harness still requires exact async-repeat top-N.
+        exact_top_n=False,
+    ),
+    _pair_scenario(
         "processed-skip-prompt-logprobs",
         "logprobs:processed",
         "logprobs:skip-prompt",
@@ -654,6 +670,26 @@ _ASYNC_PAIR_SCENARIOS = (
         "speculation:mtp-depth-one",
         config={"num_speculative_tokens": 1},
         signals=("mtp",),
+    ),
+    _pair_scenario(
+        "mtp-graph-heterogeneous-logprobs",
+        "speculation:mtp-depth-two",
+        "interaction:mtp-graph-metadata-compaction",
+        config={
+            "num_speculative_tokens": 2,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=(
+            {"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 2},
+            {"return_log_probs": False, "skip_prompt_log_probs": True},
+            {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
+        ),
+        signals=("cuda-graph", "logprobs", "metadata-compaction", "mtp", "top-n"),
+        # MTP changes the forward batch shape; near-tied non-selected alternatives
+        # may exchange the final top-N slot while selected-token parity remains exact.
+        exact_top_n=False,
     ),
     _pair_scenario(
         "hybrid-mamba",
@@ -2047,6 +2083,53 @@ def test_async_compaction_preserves_all_request_metadata():
         controller._all_logits_cuda, torch.arange(24).reshape(1, 6, 4)[:, [0, 1, 4, 5]]
     )
     assert torch.equal(controller._async_sched_logits.token_row_indices, torch.tensor([0, 1, 4, 5]))
+
+
+def test_post_process_skips_logprobs_for_opted_out_request():
+    """A mixed async batch must not append step-level logprobs to an opted-out request."""
+    requests = []
+    for request_id, return_log_probs in enumerate((True, False)):
+        request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=torch.tensor([1, 2], dtype=torch.int64),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=2,
+                termination_id=-1,
+                return_log_probs=return_log_probs,
+                skip_prompt_log_probs=True,
+            ),
+        )
+        request.add_event_add_engine()
+        requests.append(request)
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = SimpleNamespace(kv_block_allocator=SimpleNamespace())
+    engine.requests = {
+        request.request_id: SimpleNamespace(record=[request]) for request in requests
+    }
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine.stop_word_finished_request_ids = set()
+
+    active_request_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.tensor([0, 1], dtype=torch.int64),
+        finished_request_ids=torch.empty(0, dtype=torch.int64),
+        evict_request_ids=None,
+        step_time=0.0,
+        sample=torch.tensor([11, 22], dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[[-1.0], [-2.0]],
+        consumed_chunked_prefill_request_id=-1,
+    )
+
+    assert active_request_ids == [0, 1]
+    assert finished_records == []
+    assert requests[0].generated_log_probs == [-1.0]
+    assert requests[1].prompt_log_probs is None
+    assert requests[1].generated_log_probs is None
 
 
 def test_async_negative_routing_replay():

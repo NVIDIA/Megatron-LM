@@ -1863,7 +1863,8 @@ class DynamicInferenceEngine(AbstractEngine):
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
             if (
-                request_log_probs is not None
+                request.sampling_params.return_log_probs
+                and request_log_probs is not None
                 and request_id not in self.stop_word_being_finished_ids
             ):
                 # Initialize lists if they don't exist
