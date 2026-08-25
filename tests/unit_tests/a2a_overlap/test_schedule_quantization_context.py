@@ -37,12 +37,29 @@ def test_transformer_layer_uses_fp4_context():
     expected_context = nullcontext()
 
     with patch(
-        "megatron.core.transformer.transformer_layer.get_fp4_context", return_value=expected_context
+        "megatron.core.fp4_utils.get_fp4_context", return_value=expected_context
     ) as get_fp4_context:
         context = layer.get_inner_quantization_context()
 
     assert context is expected_context
     get_fp4_context.assert_called_once_with(config, 2)
+
+
+def test_transformer_layer_uses_fp8_context():
+    config = SimpleNamespace(fp8="e4m3", fp8_recipe=Fp8Recipe.tensorwise, fp4=None)
+    layer = TransformerLayer.__new__(TransformerLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = config
+    layer.layer_number = 3
+    expected_context = nullcontext()
+
+    with patch(
+        "megatron.core.fp8_utils.get_fp8_context", return_value=expected_context
+    ) as get_fp8_context:
+        context = layer.get_inner_quantization_context()
+
+    assert context is expected_context
+    get_fp8_context.assert_called_once_with(config, 2)
 
 
 def test_mtp_layer_uses_global_fp8_context():
