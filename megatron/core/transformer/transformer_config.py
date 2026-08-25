@@ -1106,6 +1106,18 @@ class TransformerConfig(ModelParallelConfig):
     the linear-attention kernel on the full sequence for a shard of heads. Correct but memory-heavy.
     """
 
+    #############################
+    # Pipeline Parallel Prewarm
+    #############################
+    pipeline_model_parallel_prewarm: bool = False
+    """Initialize lazy kernels concurrently across pipeline stages before training.
+
+    Each PP rank runs one synthetic eager forward/backward pass for every transformer layer in
+    its local PP/VPP model chunks. The passes do not use pipeline P2P communication, so pipeline
+    stages can initialize their local kernels concurrently. This does not capture or replay CUDA
+    Graphs and can be used independently of ``cuda_graph_impl``.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -1128,14 +1140,6 @@ class TransformerConfig(ModelParallelConfig):
 
     cuda_graph_warmup_steps: int = 3
     """Number of warmup steps for CUDA graphs"""
-
-    cuda_graph_parallel_prewarm: bool = False
-    """Prewarm Transformer Engine CUDA Graph kernels independently on every PP stage.
-
-    Before the first pipeline iteration, each rank runs one synthetic forward/backward for every
-    graphable layer in its local PP/VPP model chunks. This avoids serializing lazy kernel
-    initialization through pipeline P2P dependencies.
-    """
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
@@ -3261,13 +3265,9 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
 
-        if self.cuda_graph_parallel_prewarm:
-            assert self.cuda_graph_impl == "transformer_engine", (
-                "cuda_graph_parallel_prewarm requires "
-                "cuda_graph_impl='transformer_engine'."
-            )
+        if self.pipeline_model_parallel_prewarm:
             assert self.pipeline_model_parallel_size > 1, (
-                "cuda_graph_parallel_prewarm requires pipeline_model_parallel_size > 1."
+                "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
             )
 
         if self.cuda_graph_impl != "none":

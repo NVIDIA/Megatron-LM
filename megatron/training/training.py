@@ -97,6 +97,7 @@ from megatron.core.parallel_state import (
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -4360,6 +4361,15 @@ def train(
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
+    if config.pipeline_model_parallel_prewarm:
+        prewarm_pipeline_model_parallel(
+            model=model,
+            config=config,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            optimizers=[optimizer],
+        )
+
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper = TECudaGraphHelper(
@@ -4370,8 +4380,6 @@ def train(
             optimizers=[optimizer],
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
-        if config.cuda_graph_parallel_prewarm:
-            cuda_graph_helper.parallel_prewarm()
 
     # Run training iterations till done.
     buffered_rollouts = None

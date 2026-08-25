@@ -281,15 +281,17 @@ class GraphableMegatronModule(MegatronModule):
             and self.config.cuda_graph_impl != "none"
         )
 
-    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+    def get_layer_static_inputs(
+        self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False
+    ):
         """
-        Get the static inputs for the layer.
+        Get synthetic inputs for the layer.
         We assume that the module has one hidden_states input, whose shape is inferred
         from the seq_length, micro_batch_size, and parallel config.
         Override this method if the module has other inputs.
 
-        For THD + CUDA Graph, hidden_states uses the padded max sequence length with
-        micro_batch_size=1 (packed sequence format).
+        For THD CUDA Graph capture or pipeline prewarm, hidden_states uses the padded maximum
+        sequence length with micro_batch_size=1 (packed sequence format).
 
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
@@ -299,11 +301,15 @@ class GraphableMegatronModule(MegatronModule):
         sequence_parallel = self.config.sequence_parallel
         tensor_model_parallel_size = self.config.tensor_model_parallel_size
 
-        if self._is_thd_cuda_graph():
-            # THD + CUDA Graph: pre-padded packed-sequence buffer, batch dim = 1.
+        use_padded_thd = self._is_thd_cuda_graph() or (
+            for_pipeline_prewarm
+            and getattr(self.config, 'sequence_packing_scheduler', None) is not None
+        )
+        if use_padded_thd:
+            # THD static execution: pre-padded packed-sequence buffer, batch dim = 1.
             assert (
                 self.config.max_seqlen_per_dp_cp_rank is not None
-            ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
+            ), "max_seqlen_per_dp_cp_rank must be set for padded THD synthetic inputs."
             slen_full = self.config.max_seqlen_per_dp_cp_rank
             batch = 1
         else:
