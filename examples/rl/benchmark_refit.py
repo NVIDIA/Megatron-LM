@@ -6,7 +6,9 @@ Benchmark script for model refit performance.
 Measures the time to transfer model weights between different parallelism configurations.
 Supports both collocated (models share GPUs) and non-collocated (separate GPU sets) modes.
 """
+import json
 import time
+from pathlib import Path
 
 import torch
 
@@ -20,7 +22,7 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
 
@@ -46,6 +48,12 @@ def add_benchmark_args(parser):
         type=int,
         default=10,
         help='Number of timed benchmark iterations.'
+    )
+    group.add_argument(
+        '--benchmark-output',
+        type=str,
+        default=None,
+        help='Optional JSON output path. Rank 0 writes one aggregate result file.',
     )
 
     return parser
@@ -98,8 +106,6 @@ def print_config_summary(args, src_config, dst_config, world_size, mode):
 
 def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iterations):
     """Run warmup and benchmark iterations, return timings."""
-    rank = torch.distributed.get_rank()
-
     # Warmup (builds refit plan on first iteration)
     print_rank_0(f"Warmup: {num_warmup} iterations...")
     for i in range(num_warmup):
@@ -124,8 +130,11 @@ def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iteration
         torch.cuda.synchronize()
         end_time = time.perf_counter()
 
-        elapsed = end_time - start_time
-        timings.append(elapsed)
+        # End-to-end distributed latency is determined by the slowest rank,
+        # not by rank 0's local CUDA completion time.
+        elapsed = torch.tensor(end_time - start_time, dtype=torch.float64, device='cuda')
+        torch.distributed.all_reduce(elapsed, op=torch.distributed.ReduceOp.MAX)
+        timings.append(elapsed.item())
         torch.distributed.barrier()
 
     return timings
@@ -134,9 +143,29 @@ def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iteration
 def print_results(timings):
     """Print benchmark results."""
     if torch.distributed.get_rank() == 0:
+        args = get_args()
         mean_time = sum(timings) / len(timings)
         min_time = min(timings)
         max_time = max(timings)
+
+        result = {
+            'backend': args.refit_method,
+            'mode': args.refit_mode,
+            'world_size': torch.distributed.get_world_size(),
+            'source_tp': args.tensor_model_parallel_size,
+            'source_pp': args.pipeline_model_parallel_size,
+            'destination_tp': args.rl_inference_tensor_model_parallel_size,
+            'destination_pp': args.rl_inference_pipeline_model_parallel_size,
+            'num_layers': args.num_layers,
+            'hidden_size': args.hidden_size,
+            'sequence_length': args.seq_length,
+            'warmup_iterations': args.num_benchmark_warmup,
+            'benchmark_iterations': args.num_benchmark_iterations,
+            'mean_ms': mean_time * 1000,
+            'min_ms': min_time * 1000,
+            'max_ms': max_time * 1000,
+            'timings_ms': [timing * 1000 for timing in timings],
+        }
 
         print(f"\n{'='*80}")
         print("RESULTS")
@@ -145,6 +174,14 @@ def print_results(timings):
         print(f"Min:  {min_time*1000:.2f} ms")
         print(f"Max:  {max_time*1000:.2f} ms")
         print(f"{'='*80}\n")
+        print(f"REFIT_RESULT_JSON={json.dumps(result, sort_keys=True)}")
+
+        if args.benchmark_output:
+            output_path = Path(args.benchmark_output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+            )
 
 
 def benchmark_collocated():
@@ -195,6 +232,7 @@ def benchmark_collocated():
     if args.num_experts:
         dst_config.expert_model_parallel_size = dst_ep
     dst_config.tensor_model_parallel_size = dst_tp
+    dst_config.pipeline_model_parallel_size = dst_pp
     if args.rl_inference_expert_tensor_model_parallel_size:
         dst_config.expert_tensor_parallel_size = args.rl_inference_expert_tensor_model_parallel_size
 
@@ -203,7 +241,9 @@ def benchmark_collocated():
             pre_process=pre_process, post_process=post_process,
             pg_collection=dst_pg_collection, config=dst_config
         ),
-        wrap_with_ddp=False
+        wrap_with_ddp=False,
+        config=dst_config,
+        pg_collection=dst_pg_collection,
     )
     dst_model[0] = dst_model[0].cuda()
 
@@ -295,6 +335,7 @@ def benchmark_non_collocated():
         if args.num_experts:
             dst_config.expert_model_parallel_size = dst_ep
         dst_config.tensor_model_parallel_size = dst_tp
+        dst_config.pipeline_model_parallel_size = dst_pp
         if args.rl_inference_expert_tensor_model_parallel_size:
             dst_config.expert_tensor_parallel_size = args.rl_inference_expert_tensor_model_parallel_size
 
@@ -303,7 +344,9 @@ def benchmark_non_collocated():
                 pre_process=pre_process, post_process=post_process,
                 pg_collection=dst_pg_collection, config=dst_config
             ),
-            wrap_with_ddp=False
+            wrap_with_ddp=False,
+            config=dst_config,
+            pg_collection=dst_pg_collection,
         )
         dst_model[0] = dst_model[0].cuda()
         src_model = None
@@ -325,7 +368,7 @@ def benchmark_non_collocated():
 
 def main():
     """Main benchmark function."""
-    initialize_megatron(
+    parse_and_validate_args(
         extra_args_provider=add_benchmark_args,
         args_defaults={
             'tokenizer_type': 'NullTokenizer',
@@ -336,6 +379,9 @@ def main():
         },
         ignore_unknown_args=False,
     )
+    # This synthetic benchmark does not construct datasets, so it does not
+    # require the native dataset index helper.
+    initialize_megatron(skip_dependency_compilation=True)
 
     args = get_args()
 
