@@ -199,12 +199,13 @@ def chunk_gated_delta_product_varlen(
     # consumes a bf16 view of `h`, so `o` is bit-for-bit unchanged.
     chunk_states_dtype = None
     if return_chunk_states:
+        # Match the cache the caller will snapshot into. With neither cache nor
+        # initial state to match, leave it to the kernel's default (input dtype)
+        # rather than silently paying for fp32.
         if state is not None:
             chunk_states_dtype = state.dtype
         elif initial_state is not None:
             chunk_states_dtype = initial_state.dtype
-        else:
-            chunk_states_dtype = torch.float32
 
     h, v_new, final_state = chunk_gated_delta_product_fwd_h(
         k=k,
