@@ -437,6 +437,8 @@ def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
     class MockOptimizer:
         """Mock that mimics the ChainedOptimizer step interface."""
 
+        skip_grad_norm_clip = False
+
         def __init__(self, param, config):
             self.config = config
             self.param = param
@@ -497,6 +499,8 @@ def test_chained_optimizer_does_not_skip_update_for_large_mtp_grads():
     class MockOptimizer:
         """Mock that exposes real MTP grads for group-norm computation."""
 
+        skip_grad_norm_clip = False
+
         def __init__(self, main_param, mtp_param, config):
             self.config = config
             self.main_param = main_param
@@ -550,6 +554,70 @@ def test_chained_optimizer_does_not_skip_update_for_large_mtp_grads():
         # ... yet the update was not skipped, because skip uses the main norm only.
         assert update_successful is True
         assert optimizer.step_called is True
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_chained_optimizer_mtp_clip_norm_excludes_exempt_suboptimizer():
+    """An exempt sub-optimizer's MTP grads must not scale a clippable sub's MTP grads."""
+    from megatron.core import parallel_state
+
+    class MockOptimizer:
+        """Minimal optimizer exposing a single MTP parameter."""
+
+        skip_grad_norm_clip = False
+
+        def __init__(self, param, config, skip_grad_norm_clip=False):
+            self.config = config
+            self.param = param
+            self.param_groups = [{"params": [param]}]
+            self.step_called = False
+            self.is_stub_optimizer = False
+            self.skip_grad_norm_clip = skip_grad_norm_clip
+
+        def prepare_grads(self):
+            return False
+
+        def get_grad_norm(self):
+            return 0.0
+
+        def get_parameters(self):
+            return [self.param]
+
+        def get_grad_stats_parallel_group(self):
+            return parallel_state.get_model_parallel_group()
+
+        def has_grad_norm_group(self, grad_norm_group):
+            return grad_norm_group == 'mtp'
+
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
+            return [self.param.grad] if grad_norm_group == 'mtp' else []
+
+        def step_with_ready_grads(self):
+            self.step_called = True
+            return True
+
+    Utils.initialize_model_parallel()
+    try:
+        config = OptimizerConfig(clip_grad=1.0)
+        exempt_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        exempt_param.grad_norm_group = 'mtp'
+        exempt_param.grad = torch.full_like(exempt_param, 1.0e5)
+        clippable_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        clippable_param.grad_norm_group = 'mtp'
+        clippable_param.grad = torch.full_like(clippable_param, 0.25)
+
+        exempt_optimizer = MockOptimizer(exempt_param, config, skip_grad_norm_clip=True)
+        clippable_optimizer = MockOptimizer(clippable_param, config)
+        chained_optimizer = ChainedOptimizer([exempt_optimizer, clippable_optimizer])
+
+        update_successful, _, _ = chained_optimizer.step()
+
+        assert update_successful is True
+        assert exempt_optimizer.step_called is True
+        assert clippable_optimizer.step_called is True
+        assert chained_optimizer.grad_norms_by_group['mtp'] < config.clip_grad
+        torch.testing.assert_close(clippable_param.grad, torch.full_like(clippable_param, 0.25))
     finally:
         Utils.destroy_model_parallel()
 
