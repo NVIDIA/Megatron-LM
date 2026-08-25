@@ -3,7 +3,7 @@
 import asyncio
 import itertools
 from contextlib import aclosing
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pytest
@@ -22,7 +22,49 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline, _SubmissionGate
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
-from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw, ReturnsTokens
+from megatron.rl.inference import (
+    InferenceRequest,
+    InferenceResponse,
+    LLMChatMessage,
+    ReturnsRaw,
+    ReturnsTokens,
+)
+from megatron.rl.inference.megatron import MegatronLocal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "temperature, expected_temperature", [(None, 1.0), (0.0, 0.0)], ids=["default", "greedy"]
+)
+async def test_megatron_local_preserves_explicit_greedy_temperature(
+    monkeypatch, temperature, expected_temperature
+):
+    monkeypatch.setattr("megatron.rl.inference.megatron.get_args", lambda: MagicMock())
+    monkeypatch.setattr("megatron.rl.inference.megatron.get_tokenizer", lambda: MagicMock(bos=None))
+
+    choice = MagicMock(finish_reason="stop")
+    choice.message.model_dump.return_value = {"role": "assistant", "content": "response"}
+    choice.message.raw_text = "response"
+    choice.message.prompt_token_ids = [1]
+    choice.message.generation_token_ids = [2]
+    choice.message.generation_log_probs = [0.0]
+    choice.message.policy_epoch = [(0, 0)]
+    choice.message.kv_cache_epoch = [(0, 0)]
+    choice.message.num_evictions = 0
+
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[choice]))
+    server = MegatronLocal(host="localhost", port=0)
+    server._openai_client = client
+    request = InferenceRequest(
+        prompt=[LLMChatMessage(role="user", content="prompt")],
+        generation_args={"temperature": temperature},
+    )
+
+    await server.base_generate(request)
+
+    client.chat.completions.create.assert_awaited_once()
+    assert client.chat.completions.create.await_args.kwargs["temperature"] == expected_temperature
 
 
 class MockInferenceInterface(ReturnsRaw):
