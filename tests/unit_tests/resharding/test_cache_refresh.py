@@ -29,6 +29,7 @@ def test_execute_reshard_plan_refreshes_caches_before_final_sync(monkeypatch):
     target_core = torch.nn.Sequential(_CacheAwareModule(events))
     service = MagicMock()
     service.requires_process_group_barrier = False
+    service.execute_plan.return_value = False
     service.run.side_effect = lambda: events.append("transfer")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
 
