@@ -1504,3 +1504,180 @@ def test_weight_update_hooks_called_on_all_paths(fused):
     p2.grad = torch.randn_like(p2)
     opt2.step()
     assert calls2 == {"pre": 1, "post": 1}, f"hooks missed on the degenerate path: {calls2}"
+
+
+# ---------------------------------------------------------------------------
+# GTP alignment padding (param.pad_length): stripped before NS so the scale
+# factor sees the true dims, restored before the reverse gtp exchange. Every
+# shape below is chosen so the clean dim0 is NOT divisible by the sharding,
+# forcing pad_length > 0 — the configuration none of the other tests reach.
+# ---------------------------------------------------------------------------
+
+
+def _padded_shard(clean_tp_local, S, r, pad):
+    """Pad the TP-local tensor's dim0 with ``pad`` zero rows, take gtp shard r of S."""
+    padded = torch.cat(
+        [clean_tp_local, torch.zeros(pad, clean_tp_local.shape[1], dtype=clean_tp_local.dtype)]
+    )
+    rows_pp = padded.shape[0] // S
+    return padded[r * rows_pp : (r + 1) * rows_pp].clone()
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["two_stage", "fused"])
+def test_padded_param_matches_duplicated(fused):
+    """gtp-only padded param == duplicated mode with the parent's strip, bitwise."""
+    _require_multi_rank()
+    S = dist.get_world_size()
+    r = dist.get_rank()
+    lr, momentum = 1e-2, 0.95
+    PAD = 3
+    M = 4 * S - PAD  # clean rows; padded to 4*S, per-rank 4
+    Q = 24
+
+    torch.manual_seed(_SEED + 500)
+    NUM_STEPS = 2
+    full_w = torch.randn(M, Q)
+    step_grads = [torch.randn(M, Q) for _ in range(NUM_STEPS)]
+
+    p = _gtp_param(_padded_shard(full_w, S, r, PAD))
+    p.pad_length = PAD
+    opt = LayerShardedMuon(
+        [p],
+        lr=lr,
+        momentum=momentum,
+        weight_decay=0.0,
+        num_ns_steps=5,
+        fp32_matmul_prec="highest",
+        gtp_group=_world(),
+        fused_group=_world() if fused else None,
+    )
+    opt.set_param_ns_homes({id(p): (1 % S, 0)})
+
+    ref_shard = _padded_shard(full_w, S, r, PAD)
+    ref_mom = torch.zeros_like(ref_shard)
+
+    for step in range(NUM_STEPS):
+        g_shard = _padded_shard(step_grads[step], S, r, PAD)  # pad rows: zero grads
+        p.grad = g_shard.clone()
+        opt.step()
+
+        # Reference: duplicated mode with the parent's strip/restore.
+        ref_mom.lerp_(g_shard, 1 - momentum)
+        gathered = [torch.zeros_like(ref_mom) for _ in range(S)]
+        dist.all_gather(gathered, ref_mom.contiguous(), group=_world())
+        full_padded = torch.cat(gathered, dim=0)  # (M + PAD, Q)
+        clean = full_padded[:-PAD]
+        orth = newton_schulz(clean.float(), steps=5, coefficient_type="quintic")
+        orth = orth * (max(M, Q) ** 0.5) * 1.0  # scale on TRUE dims
+        restored = torch.nn.functional.pad(orth, (0, 0, 0, PAD))
+        rows_pp = restored.shape[0] // S
+        ref_shard.add_(restored[r * rows_pp : (r + 1) * rows_pp], alpha=-lr)
+
+        assert torch.equal(p.data, ref_shard), (
+            f"Padded parity mismatch (fused={fused}) on rank {r} step {step}: "
+            f"max_diff={(p.data - ref_shard).abs().max().item():.2e}"
+        )
+    # Pad rows (zero grads -> zero momentum -> zero update) must stay untouched.
+    if r == S - 1:
+        assert torch.equal(p.data[-PAD:], torch.zeros(PAD, Q)), "pad rows were modified"
+
+
+@pytest.mark.parametrize("pd", [0, 1], ids=["col_parallel", "row_parallel"])
+def test_padded_param_2d_two_stage_matches_reference(pd):
+    """Padded param on the GTP(2) x TP(2) grid, two-stage path, both partition dims.
+
+    pd=0 is the case that pins the strip POINT: after TP assembly the pad would
+    be embedded per TP block, so stripping must happen at the stage-1 seam.
+    """
+    _require_four_ranks()
+    tp_group, gtp_group = _get_2d_groups()
+    T, G = 2, 2
+    r = dist.get_rank()
+    t_rank, g_rank = r % T, r // T
+    lr, momentum = 1e-2, 0.95
+    PAD = 3
+
+    if pd == 0:
+        # TP shards dim0: clean full (26, Q); TP-local (13, Q) -> padded (16, Q).
+        M_full, Q = 26, 24
+        M_local = M_full // T
+    else:
+        # TP shards dim1: clean full (13, 32); TP-local (13, 16) -> padded (16, 16).
+        M_full, Q = 13, 32
+        M_local = M_full
+
+    torch.manual_seed(_SEED + 510)
+    NUM_STEPS = 2
+    full_w = torch.randn(M_full, Q)
+    step_grads = [torch.randn(M_full, Q) for _ in range(NUM_STEPS)]
+
+    def _tp_local(t):
+        if pd == 0:
+            return t[t_rank * M_local : (t_rank + 1) * M_local, :]
+        return t[:, t_rank * (Q // T) : (t_rank + 1) * (Q // T)]
+
+    p = _gtp_param(_padded_shard(_tp_local(full_w), G, g_rank, PAD))
+    p.partition_dim = pd
+    p.pad_length = PAD
+    opt = LayerShardedMuon(
+        [p],
+        lr=lr,
+        momentum=momentum,
+        weight_decay=0.0,
+        num_ns_steps=5,
+        fp32_matmul_prec="highest",
+        gtp_group=gtp_group,
+        tp_group=tp_group,
+    )
+    opt.set_param_ns_homes({id(p): (1, 1)})
+
+    ref_shard = _padded_shard(_tp_local(full_w), G, g_rank, PAD)
+    ref_mom = torch.zeros_like(ref_shard)
+
+    for step in range(NUM_STEPS):
+        g_shard = _padded_shard(_tp_local(step_grads[step]), G, g_rank, PAD)
+        p.grad = g_shard.clone()
+        opt.step()
+
+        # Reference: gather gtp (dim0), strip, gather tp (pd), NS + scale on
+        # true dims, slice my tp part, restore pad, slice my gtp shard.
+        ref_mom.lerp_(g_shard, 1 - momentum)
+        g_parts = [torch.zeros_like(ref_mom) for _ in range(G)]
+        dist.all_gather(g_parts, ref_mom.contiguous(), group=gtp_group)
+        tp_local_padded = torch.cat(g_parts, dim=0)
+        tp_local_clean = tp_local_padded[:-PAD]
+        t_parts = [torch.zeros_like(tp_local_clean) for _ in range(T)]
+        dist.all_gather(t_parts, tp_local_clean.contiguous(), group=tp_group)
+        full_clean = torch.cat(t_parts, dim=pd)
+        orth = newton_schulz(full_clean.float(), steps=5, coefficient_type="quintic")
+        orth = orth * (max(M_full, Q) ** 0.5) * 1.0
+        my_tp_part = (
+            orth[t_rank * M_local : (t_rank + 1) * M_local, :]
+            if pd == 0
+            else orth[:, t_rank * (Q // T) : (t_rank + 1) * (Q // T)]
+        )
+        restored = torch.nn.functional.pad(my_tp_part, (0, 0, 0, PAD))
+        rows_pg = restored.shape[0] // G
+        ref_shard.add_(restored[g_rank * rows_pg : (g_rank + 1) * rows_pg], alpha=-lr)
+
+        assert torch.equal(p.data, ref_shard), (
+            f"Padded 2-D parity mismatch (pd={pd}) on rank {r} step {step}: "
+            f"max_diff={(p.data - ref_shard).abs().max().item():.2e}"
+        )
+
+
+def test_padded_param_2d_fused_raises():
+    """Padded params on a genuinely 2-D fused domain are rejected loudly."""
+    _require_four_ranks()
+    tp_group, gtp_group = _get_2d_groups()
+    p = _gtp_param(torch.randn(8, 6))
+    p.partition_dim = 0
+    p.pad_length = 2
+    opt = LayerShardedMuon(
+        [p], lr=0.1, weight_decay=0.0, gtp_group=gtp_group, tp_group=tp_group,
+        fused_group=_world(),
+    )
+    opt.set_param_ns_homes({id(p): (0, 0)})
+    p.grad = torch.randn_like(p)
+    with pytest.raises(NotImplementedError, match="fused"):
+        opt.step()
