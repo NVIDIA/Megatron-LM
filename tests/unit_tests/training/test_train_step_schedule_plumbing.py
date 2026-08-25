@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for explicit objects threaded through ``train_step``."""
+"""Tests for explicit objects threaded through `train_step`."""
 
 from contextlib import contextmanager
 from types import SimpleNamespace

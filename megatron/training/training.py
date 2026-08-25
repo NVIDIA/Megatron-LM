@@ -1591,10 +1591,10 @@ def pretrain(
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
         tensor_metric_observer: Optional callback invoked immediately before each optimizer step.
-            Observers exposing ``observe_forward_backward`` also receive a context around the
+            Observers exposing `observe_forward_backward` also receive a context around the
             forward-backward execution. The callback runs on every rank and owns tensor selection,
             metric execution, and sinks. It overrides any observer selected by
-            ``cfg_container.logger.tensor_metrics``.
+            `cfg_container.logger.tensor_metrics`.
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
@@ -3165,7 +3165,7 @@ def train_step(
         preserves the default behavior.
     tensor_metric_observer: optional callback invoked after backward and immediately before the
         optimizer step. The callback sees finalized but not necessarily unscaled gradients.
-        Observers exposing ``observe_forward_backward`` also receive a context around the
+        Observers exposing `observe_forward_backward` also receive a context around the
         forward-backward execution for short-lived tensors.
     """
     args = get_args()
