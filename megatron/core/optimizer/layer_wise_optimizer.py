@@ -87,6 +87,19 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
 
 
+def _all_gather_param_group_metadata(param_group, pg_collection):
+    """Gather optimizer-group metadata within the group that owns the parameters."""
+    process_group = (
+        pg_collection.expt_dp
+        if param_group.get('is_expert_parallel', False)
+        else pg_collection.dp_cp
+    )
+    assert process_group is not None, "LayerWise optimizer checkpoint group is not initialized"
+    all_rank_groups = [None for _ in range(get_pg_size(process_group))]
+    torch.distributed.all_gather_object(all_rank_groups, param_group, group=process_group)
+    return all_rank_groups
+
+
 def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
     """Map each (E)GTP_remat-REPLICATED param to ``(gtp_rank, gtp_remat_size)`` for folding.
 
@@ -518,6 +531,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+        self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
+
+        # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
+        # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
+        self.ddp_config = None
+        if model_chunks:
+            self.ddp_config = model_chunks[0].ddp_config
+            if any(model_chunk.ddp_config != self.ddp_config for model_chunk in model_chunks[1:]):
+                raise ValueError("LayerWise optimizer model chunks must share one DDP config")
 
         # The data-parallel groups this optimizer shards parameters over. Cached here so the
         # sharding, all-gather and broadcast paths read one attribute instead of reaching back
@@ -557,8 +579,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # path.
         self.use_buffer_param_sync = full_param_layouts is not None
 
-        # Set up overlap param gather using DDP bucket infrastructure.
-        self.overlap_param_gather = config.overlap_param_gather
+        # Fall back to OptimizerConfig only for direct construction without model chunks.
+        self.overlap_param_gather = (
+            self.ddp_config.overlap_param_gather
+            if self.ddp_config is not None
+            else config.overlap_param_gather
+        )
         if self.overlap_param_gather and not self.use_buffer_param_sync:
             # Legacy path: set up per-bucket param lists for variable-size all-gather.
             # When use_buffer_param_sync is True, the standard distributed optimizer
@@ -591,7 +617,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
         for optimizer in optimizers:
-            # Child optimizers perform TP duplicate filtering when collecting gradients.
+            # Child optimizers perform duplicate filtering and gradient-stat reductions.
+            optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
             optimizer.tp_group = self.tp_group
             optimizer.expert_tp_group = self.expert_tp_group
 
@@ -886,21 +913,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
-        # similar to dist opt, always aggregate globally
+        # Aggregate across the module-local optimizer domain.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
         return grad_norm
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
-        """Whether any global rank owns params for a registered grad-norm group.
+        """Whether any rank in this optimizer's module owns a registered grad-norm group.
 
-        Overrides ChainedOptimizer to use a single global all-reduce (group=None),
-        matching the scope of get_grad_norm and _get_grad_norm_for_group which also
-        reduce globally. All LayerWise grad-stats reductions are global (identical to
-        DistributedOptimizer's pattern), so the existence check must be too — using
-        a per-sub-optimizer group here would create a collective mismatch.
+        The existence check uses the same module-local group as the corresponding
+        gradient-norm reductions so heterogeneous modules cannot mismatch collectives.
         """
         _validate_grad_norm_group(grad_norm_group)
         if getattr(self, '_has_grad_norm_group_cache', None) is None:
@@ -916,17 +942,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     _validate_grad_norm_group(param_grad_norm_group)
                     local = local or param_grad_norm_group == grad_norm_group
             flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
-            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=None)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.grad_stats_parallel_group
+            )
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
 
     @torch.no_grad()
     def _get_grad_norm_for_group(self, grad_norm_group: str):
-        # similar to dist opt, always aggregate globally
+        # Aggregate across the module-local optimizer domain.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group
+        )
         return grad_norm
 
     @torch.no_grad()
@@ -936,7 +966,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params += optimizer.get_parameters()
         return count_zeros_fp32(
             params,
-            grad_stats_parallel_group=None,
+            grad_stats_parallel_group=self.grad_stats_parallel_group,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=self.tp_group,
             expert_tp_group=self.expert_tp_group,
@@ -1061,8 +1091,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 local_params = group.pop('params')
                 # save whether this group is empty, so we can use non-empty rank for metadata
                 group['params'] = bool(local_params.unwrap())
-                all_rank_groups = [None for _ in range(torch.distributed.get_world_size())]
-                torch.distributed.all_gather_object(all_rank_groups, group)
+                all_rank_groups = _all_gather_param_group_metadata(group, self.pg_collection)
                 # find first non-empty group if it exists
                 nonempty_rank_group = next((g for g in all_rank_groups if g['params']), group)
                 nonempty_rank_group['params'] = local_params

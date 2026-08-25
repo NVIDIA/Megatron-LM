@@ -9,6 +9,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.context_parallel import CPLayout
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -1046,6 +1047,12 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    linear_cp_layout: CPLayout = "zigzag"
+    """CP layout for linear-attention layers."""
+
+    attention_cp_layout: CPLayout = "zigzag"
+    """CP layout for softmax-attention layers."""
+
     ##################
     # Cuda Graphs
     ##################
@@ -1390,12 +1397,53 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    def _validate_cp_layouts(self) -> None:
+        """Validate context-parallel layout settings."""
+        if self.linear_cp_layout not in ("contiguous", "zigzag"):
+            raise ValueError(
+                "linear_cp_layout must be either 'contiguous' or 'zigzag', "
+                f"got {self.linear_cp_layout!r}"
+            )
+        if self.attention_cp_layout not in ("contiguous", "zigzag"):
+            raise ValueError(
+                "attention_cp_layout must be either 'contiguous' or 'zigzag', "
+                f"got {self.attention_cp_layout!r}"
+            )
+        if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
+            raise ValueError(
+                "attention_cp_layout='contiguous' is not yet supported with context parallelism."
+            )
+        if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
+            raise ValueError(
+                "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
+            )
+        if (
+            self.context_parallel_size > 1
+            and self.linear_cp_layout != self.attention_cp_layout
+            and self.sequence_parallel
+            and self.tensor_model_parallel_size > 1
+            and self.tensor_model_parallel_size % 2 != 0
+        ):
+            raise ValueError(
+                "Sequence-parallel CP layout conversion requires an even "
+                f"tensor-parallel size, got {self.tensor_model_parallel_size}."
+            )
+        if (
+            self.linear_cp_layout == "contiguous"
+            and self.context_parallel_size > 1
+            and (self.mtp_num_layers or 0) > 0
+        ):
+            raise ValueError(
+                "linear_cp_layout='contiguous' with context parallelism does not yet support MTP."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        self._validate_cp_layouts()
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
