@@ -14,7 +14,8 @@ Two parts:
   - Pool lifecycle: create, register, query, and tear down the per-group pools,
     plus the allocation context ``gtp_symm_pool_ctx``.
   - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
-    send buffers for the wgrad reduce-scatter.
+    send buffers for eager wgrad reduce-scatter. Local CUDA graphs allocate their
+    plan-owned persistent send arenas through ``gtp_symm_pool_ctx`` instead.
 """
 
 from __future__ import annotations
@@ -212,14 +213,19 @@ symmetric_wgrad_pool = RegisteredLIFOPool()
 
 def deregister_and_clear_gtp_symm_pools() -> None:
     """Tear down what this module owns: deregister the pools' windows, then drop the
-    recycled send buffers. Allocations owned by others (e.g. graph wgrad ring slots)
-    are not freed here. Call on all ranks before teardown; no-op if never registered."""
+    recycled send buffers. Allocations owned by others, including CUDA-graph persistent
+    arenas, are not freed here and must remain alive until this call returns. Call on all
+    ranks before releasing external pool allocations; safe to call more than once."""
+    if not (_registered or _pools or symmetric_wgrad_pool._free):
+        return
+
     # Wait for all GPU work to finish first: a kernel or collective still reading
     # pool memory would fault once the windows go away.
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.synchronize()
-    # Deregister while the recycled send buffers are still alive. Their memory keeps
-    # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
+    # Deregister while every pool allocation is still alive. Besides keeping the pool
+    # non-empty (deregister_mem_pool skips empty pools), this prevents allocation cleanup
+    # from trying to remove an individual window behind ProcessGroupNCCL's pool registry.
     for name in sorted(_registered):
         nccl_allocator.deregister_mem_pool(_pools[name], _registered[name])
     # Only now drop the buffers and the pools; the windows are gone, so the memory
