@@ -56,15 +56,6 @@ _KV_BOUND_QUANTUM = 8192
 _KV_TIGHT_WIDTH_CEILING = 65536
 
 
-def _all_gather_rows(x, l_local, cp_group, cp_size):
-    """AllGather x[l_local, D] across the CP group -> [cp_size*l_local, D] (global-row order)."""
-    D = x.shape[-1]
-    x2 = x.reshape(l_local, D).contiguous()
-    g = torch.empty((cp_size * l_local, D), dtype=x2.dtype, device=x2.device)
-    dist.all_gather_into_tensor(g, x2, group=cp_group)
-    return g
-
-
 # Static all-to-all metadata and staging buffers, cached per (group, cp_size, l_local[, dtype,
 # width]). The chunk map is a fixed permutation: chunk ``c``'s rows are OWNED by rank ``c // 2``
 # (contiguous layout) and COMPUTED by rank ``proc(c) = c if c < cp_size else 2*cp_size - 1 - c``.
@@ -764,7 +755,6 @@ def balanced_compute_cp_indexer_topk(
     softmax_scale,
     max_seqlen_q,
     use_fused=True,
-    dispatch='alltoall',
     dispatch_handle=None,
     layout_cache=None,
     multi_seq=True,
@@ -777,8 +767,7 @@ def balanced_compute_cp_indexer_topk(
     (``r``) and tail chunk (``2 * cp_size - 1 - r``), scores each with a per-chunk call to
     ``compute_cp_indexer_topk`` at the chunk's global offset (so RoPE positions, causal offsets,
     multi-sequence packing, and the ``use_fused`` flag all follow the reference), then combines the
-    top-k back to contiguous order. ``dispatch`` selects the redistribute backend ('alltoall' or
-    'hybridep'; 'hybridep' requires an even ``l_local`` and otherwise uses 'alltoall').
+    top-k back to contiguous order.
     """
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
@@ -961,8 +950,7 @@ def balanced_compute_cp_indexer_topk(
         dispatch_handle.get("kind") in ("ag", "ag2", "zzr")
         if dispatch_handle is not None
         else (
-            dispatch != 'hybridep'
-            and _use_zigzag(cp_size, l_local, use_fused, config)
+            _use_zigzag(cp_size, l_local, use_fused, config)
             and _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
         )
     )
@@ -1157,22 +1145,6 @@ def balanced_compute_cp_indexer_topk(
         # Transfer was issued early by dispatch_chunks_async and overlapped with the
         # compressor / compressed-K gather; just complete it here.
         qr_head, w_head, qr_tail, w_tail = _dispatch_wait(dispatch_handle, meta)
-    elif (
-        dispatch == 'hybridep' and l_local % 2 == 0 and indexer_qr.dtype == weights_indexer_cp.dtype
-    ):
-        # DeepEP all-to-all (moves only 2 chunks per rank). Requires equal chunks (even l_local).
-        qr_head, w_head, qr_tail, w_tail = _hybridep_dispatch_chunks(
-            indexer_qr,
-            weights_indexer_cp,
-            cp_group,
-            cp_size,
-            l_local,
-            l_local // 2,
-            r,
-            q_lora,
-            n_heads,
-            dev,
-        )
     else:
         # NCCL all_to_all_single over the fixed chunk permutation: ~l_local rows per rank instead
         # of an S-row AllGather, static splits (CUDA-graph capturable), cached staging buffers.
@@ -1210,116 +1182,6 @@ def balanced_compute_cp_indexer_topk(
     return compressed_topk, layout
 
 
-# Cache one HybridEPBuffer per (cp_group, cp_size, l_local, width). The buffer's __init__ does
-# cudaMalloc + NCCL/RDMA setup, which is not CUDA-graph capturable; creating it per call would break
-# both partial (attention module) and full-iteration capture. It is created once on the first eager
-# (warmup) call and reused, so the capture step only sees the capturable dispatch kernels.
-_HEP_BUF: dict = {}
-
-
-def _get_hep_buffer(cp_group, cp_size, l_local, width):
-    key = (_group_key(cp_group), cp_size, l_local, width)
-    buf = _HEP_BUF.get(key)
-    if buf is None:
-        from deep_ep import HybridEPBuffer
-
-        buf = HybridEPBuffer(
-            group=cp_group,
-            hidden_dim=width,
-            max_num_of_tokens_per_rank=l_local,
-            num_local_experts=1,
-            use_fp8=False,
-        )
-        _HEP_BUF[key] = buf
-    return buf
-
-
-# Keys for which the DeepEP dispatch ordering has been cross-checked against AllGather.
-_HEP_VALIDATED: set = set()
-
-
-def _validate_hep_order(qr, qr_head, qr_tail, cp_group, cp_size, l_local, C, r):
-    """One-time cross-check that the ``disp[0:C]``=head / ``disp[C:2C]``=tail split is correct.
-
-    The split relies on DeepEP landing dispatched rows grouped by ascending source rank (head
-    owner <= tail owner; equal for the middle rank of an odd cp_size) in original within-chunk
-    order. That ordering is not a documented contract, so on
-    the first call per (group, cp_size, l_local) verify the dispatched head/tail chunks bit-match
-    the AllGather-selected chunks, and raise loudly if DeepEP ever orders tokens differently (which
-    would otherwise silently corrupt the top-k). One extra AllGather on the first eager call only.
-    """
-    key = (_group_key(cp_group), cp_size, l_local)
-    if key in _HEP_VALIDATED:
-        return
-    gq = _all_gather_rows(qr, l_local, cp_group, cp_size)
-    head_c, tail_c = r, 2 * cp_size - 1 - r
-    ok = torch.equal(qr_head, gq[head_c * C : (head_c + 1) * C]) and torch.equal(
-        qr_tail, gq[tail_c * C : (tail_c + 1) * C]
-    )
-    # Agree on the verdict across the CP group: a per-rank raise would leave the
-    # other ranks blocked in their next collective (NCCL hang) instead of failing.
-    ok_t = torch.tensor([0 if ok else 1], dtype=torch.int32, device=qr.device)
-    dist.all_reduce(ok_t, op=dist.ReduceOp.MAX, group=cp_group)
-    ok = int(ok_t.item()) == 0
-    if not ok:
-        raise RuntimeError(
-            "hybridEP dispatch order does not match the expected [head | tail] layout; "
-            "re-run with --dsa-cp-balance-dispatch alltoall."
-        )
-    _HEP_VALIDATED.add(key)
-
-
-def _hybridep_dispatch_chunks(qr, weights, cp_group, cp_size, l_local, C, r, q_lora, n_heads, dev):
-    """Move this rank's head chunk (index r) and tail chunk (index 2 * cp_size - 1 - r) rows here
-    via a DeepEP hybridEP all-to-all instead of AllGather. Returns (qr_head, w_head, qr_tail,
-    w_tail), each ``[C, *]``. Requires equal chunks (even ``l_local``, ``C = l_local // 2``) and the
-    ``deep_ep`` package.
-
-    With ``num_local_experts=1`` the dispatch is a pure token permutation across CP ranks: each
-    local row's destination is the processor rank of the chunk it belongs to
-    (``processor(c) = c if c < cp_size else 2 * cp_size - 1 - c``). The head owner (``r // 2``) is
-    never greater than the tail owner (``(2 * cp_size - 1 - r) // 2``; equal for the middle rank
-    of an odd ``cp_size``, whose rows arrive in send order), so the dispatched rows land as
-    ``[head chunk (C rows) | tail chunk (C rows)]`` in original within-chunk order.
-
-    The dispatch uses a fixed ``num_permuted_tokens=l_local`` (bijective permutation, no D2H
-    sync) with ``non_blocking=True``, so the dispatch kernels are capturable in isolation —
-    but the end-to-end DeepEP path (buffer creation, handshakes) is not, and the CSA
-    integration forces 'alltoall' whenever CUDA graphs are enabled (``cuda_graph_impl !=
-    'none'``); this path only runs graph-free.
-    """
-    N = cp_size
-    # Integer top-k only: no gradient flows through the dispatch (mirrors the A2A
-    # paths); DeepEP ops need not see autograd-tracked inputs.
-    qr = qr.detach()
-    weights = weights.detach()
-    local_chunk = torch.arange(l_local, device=dev) // C  # 0 for rows [0, C), 1 for [C, 2C)
-    global_chunk = 2 * r + local_chunk  # owner chunk id in [0, 2 * cp_size)
-    dest_rank = torch.where(global_chunk < N, global_chunk, 2 * N - 1 - global_chunk).long()
-    routing_map = torch.zeros((l_local, N), dtype=torch.bool, device=dev)
-    routing_map.scatter_(1, dest_rank.view(-1, 1), True)  # one True per row = destination CP rank
-    probs = routing_map.to(torch.float32)  # HybridEP requires fp32 probs
-    payload = torch.cat(
-        [qr.reshape(l_local, q_lora), weights.reshape(l_local, n_heads)], dim=-1
-    )  # move qr and weights under one permutation
-    width = q_lora + n_heads
-    buf = _get_hep_buffer(cp_group, cp_size, l_local, width)
-    disp, _p, _s, _t, _h = buf.dispatch_with_permute(
-        hidden=payload,
-        routing_map=routing_map,
-        probs=probs,
-        scaling_factor=None,
-        num_of_experts_per_rank=1,
-        pad_multiple=None,
-        num_permuted_tokens=l_local,
-        non_blocking=True,
-    )
-    qr_head, w_head = disp[0:C, :q_lora], disp[0:C, q_lora:]
-    qr_tail, w_tail = disp[C : 2 * C, :q_lora], disp[C : 2 * C, q_lora:]
-    _validate_hep_order(qr, qr_head, qr_tail, cp_group, cp_size, l_local, C, r)
-    return qr_head, w_head, qr_tail, w_tail
-
-
 def prebuild_balanced_layouts(
     packed_seq_params,
     cp_group=None,
@@ -1327,7 +1189,6 @@ def prebuild_balanced_layouts(
     capacity=None,
     min_seqlen=0,
     graphs_enabled=False,
-    build_routes=True,
 ):
     """Data-prep-time prebuild of the balanced-indexer zigzag plan and multi-seq gate.
 
@@ -1436,11 +1297,6 @@ def prebuild_balanced_layouts(
         # cu probed with a different capacity hint): not reusable for idempotency.
         prev = None
 
-    if not build_routes:
-        # The consumer's dispatch mode (e.g. 'hybridep') can never take the zigzag
-        # path; the verdicts recorded above are all it needs.
-        _stash_verdict(False)
-        return
     if pad_alignment is not _PAD_UNSPECIFIED and not (
         isinstance(pad_alignment, int) and pad_alignment % (2 * N) == 0
     ):

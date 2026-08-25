@@ -398,10 +398,9 @@ class TransformerConfig(ModelParallelConfig):
     contiguous order. Packs whose padded sequence lengths are all multiples of ``2 * cp_size`` take
     the per-sequence zigzag with prebuilt A2A routes (``prebuild_balanced_layouts``) when
     ``pad_packed_seq_alignment`` is an integer divisible by ``2 * cp_size`` (``None``/``"max"``
-    disqualify), the fused indexer kernel backend is active, and ``dsa_cp_balance_dispatch`` is
-    'alltoall'; any other pack
-    (or the unfused backend, or 'hybridep' dispatch) takes the fully general chunk-pair folding
-    fallback. The alignment condition is a prefilter: per-microbatch pack divisibility decides.
+    disqualify) and the fused indexer kernel backend is active; any other pack (or the unfused
+    backend) takes the fully general chunk-pair folding fallback. The alignment condition is a
+    prefilter: per-microbatch pack divisibility decides.
     Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
     history sees fewer recordings than the reference during eval (training forwards identical).
     CUDA-graph support in this PR is scoped to STATIC pack compositions with
@@ -424,13 +423,6 @@ class TransformerConfig(ModelParallelConfig):
     within one process, exercising a known cross-call issue in the kernel package (see the
     WORKSPACE NOTE in tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py); pending
     the kernel-side fix, validate such mixed runs against the reference."""
-
-    dsa_cp_balance_dispatch: Literal['alltoall', 'hybridep'] = 'alltoall'
-    """Dispatch backend for the balanced CP indexer. 'alltoall' moves only the two chunks each rank
-    needs via an NCCL all_to_all_single over the fixed chunk permutation (static splits, CUDA-graph
-    capturable); 'hybridep' uses the DeepEP all-to-all instead. 'hybridep' is not CUDA-graph
-    capturable and automatically falls back to 'alltoall' whenever CUDA graphs are enabled
-    (``cuda_graph_impl != 'none'``)."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -1800,13 +1792,6 @@ class TransformerConfig(ModelParallelConfig):
         if (self.dsa_cp_balance_min_seqlen or 0) < 0:
             raise ValueError(
                 f"dsa_cp_balance_min_seqlen must be >= 0, got {self.dsa_cp_balance_min_seqlen!r}."
-            )
-        if self.dsa_cp_balance_dispatch not in ('alltoall', 'hybridep'):
-            # Literal annotations are not enforced for direct/YAML construction; a
-            # typo would otherwise silently select the alltoall backend.
-            raise ValueError(
-                "dsa_cp_balance_dispatch must be 'alltoall' or 'hybridep', got "
-                f"{self.dsa_cp_balance_dispatch!r}."
             )
 
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention

@@ -2738,7 +2738,6 @@ class CompressedSparseAttention(MegatronModule):
                 weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
                 nvtx_range_pop("dsv4_cp_indexer_q_weights")
 
-                bal_dispatch_mode = None
                 bal_dispatch_handle = None
                 bal_multi_seq = False
                 if use_balance:
@@ -2795,33 +2794,27 @@ class CompressedSparseAttention(MegatronModule):
                         cp_balanced_indexer,
                     )
 
-                    # The hybridEP (DeepEP) all-to-all is not CUDA-graph capturable; fall back to
-                    # the graph-safe NCCL alltoall backend under any graph capture.
-                    bal_dispatch_mode = self.config.dsa_cp_balance_dispatch
-                    if bal_dispatch_mode == "hybridep" and self.config.cuda_graph_impl != "none":
-                        bal_dispatch_mode = "alltoall"
-                    if bal_dispatch_mode != "hybridep":
-                        # Create the per-microbatch cache BEFORE the first dispatch so
-                        # the eager pack probe of layer 1 lands in it (frontends that
-                        # never prebuild would otherwise pay a second D2H on layer 2).
-                        if getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None) is None:
-                            packed_seq_params._dsa_cp_balance_layout_cache = {}
-                        # Issue the chunk dispatch now (async) so the transfer overlaps with the
-                        # in-flight compressed-K/KV all-gathers instead of sitting on the
-                        # critical path right before the top-k.
-                        bal_dispatch_handle = cp_balanced_indexer.dispatch_chunks_async(
-                            indexer_qr,
-                            weights_indexer_cp,
-                            cp_group,
-                            cp_size,
-                            l_local,
-                            config=self.config,
-                            use_fused=self.use_fused_kernels,
-                            layout_cache=getattr(
-                                packed_seq_params, "_dsa_cp_balance_layout_cache", None
-                            ),
-                            cu_seqlens=cu_seqlens,
-                        )
+                    # Create the per-microbatch cache BEFORE the first dispatch so
+                    # the eager pack probe of layer 1 lands in it (frontends that
+                    # never prebuild would otherwise pay a second D2H on layer 2).
+                    if getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None) is None:
+                        packed_seq_params._dsa_cp_balance_layout_cache = {}
+                    # Issue the chunk dispatch now (async) so the transfer overlaps with the
+                    # in-flight compressed-K/KV all-gathers instead of sitting on the
+                    # critical path right before the top-k.
+                    bal_dispatch_handle = cp_balanced_indexer.dispatch_chunks_async(
+                        indexer_qr,
+                        weights_indexer_cp,
+                        cp_group,
+                        cp_size,
+                        l_local,
+                        config=self.config,
+                        use_fused=self.use_fused_kernels,
+                        layout_cache=getattr(
+                            packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                        ),
+                        cu_seqlens=cu_seqlens,
+                    )
 
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_wait")
                 k_indexer_rank_major = k_indexer_gather.wait()
@@ -2865,7 +2858,6 @@ class CompressedSparseAttention(MegatronModule):
                             indexer.softmax_scale,
                             max_seqlen_q,
                             use_fused=self.use_fused_kernels,
-                            dispatch=bal_dispatch_mode,
                             dispatch_handle=bal_dispatch_handle,
                             layout_cache=bal_layout_cache,
                             multi_seq=bal_multi_seq,

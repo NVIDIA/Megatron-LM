@@ -151,10 +151,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
                 min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
                 graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
-                build_routes=(
-                    getattr(args, "dsa_cp_balance_dispatch", "alltoall") != "hybridep"
-                    or getattr(args, "cuda_graph_impl", "none") != "none"
-                ),
             )
         return batch
 
@@ -212,10 +208,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 capacity=args.seq_length,
                 min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
                 graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
-                build_routes=(
-                    getattr(args, "dsa_cp_balance_dispatch", "alltoall") != "hybridep"
-                    or getattr(args, "cuda_graph_impl", "none") != "none"
-                ),
             )
         return (None, None, None, None, None, packed_seq_params, None)
 
@@ -275,10 +267,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
             min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
             graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
-            build_routes=(
-                getattr(args, "dsa_cp_balance_dispatch", "alltoall") != "hybridep"
-                or getattr(args, "cuda_graph_impl", "none") != "none"
-            ),
         )
 
     # Unpack explicitly to avoid relying on dict insertion order.
