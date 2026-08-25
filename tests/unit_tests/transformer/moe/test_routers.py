@@ -124,9 +124,12 @@ class TestTop2Router:
 
         assert len(observed) == 1
         assert score_grad_modes == [False]
-        owner, name, source_kind, diagnostics, tp_shard_dim = observed[0]
+        owner, name, source_kind, diagnostics, tp_shard_dim, sequence_dim, batch_dim = observed[0]
         assert owner is self.router
         assert name == source_kind == "router_diagnostics"
+        assert tp_shard_dim is None
+        assert sequence_dim is None
+        assert batch_dim == 0
         assert diagnostics.shape == (2, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, 4)
         torch.testing.assert_close(
             diagnostics[:, RouterDiagnosticChannel.VALID_TOKEN_COUNT, 0],
@@ -136,7 +139,6 @@ class TestTop2Router:
             diagnostics[:, RouterDiagnosticChannel.AUX_ACTUAL_OVERLAP, 0],
             torch.ones(2, device="cuda"),
         )
-        assert tp_shard_dim is None
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

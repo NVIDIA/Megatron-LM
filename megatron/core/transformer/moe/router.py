@@ -843,7 +843,13 @@ class TopKRouter(Router):
                     padding_mask=padding_mask,
                 )
                 observe_tensor(
-                    self, "router_diagnostics", "router_diagnostics", diagnostics, tp_shard_dim=None
+                    self,
+                    "router_diagnostics",
+                    "router_diagnostics",
+                    diagnostics,
+                    tp_shard_dim=None,
+                    sequence_dim=None,
+                    batch_dim=0,
                 )
             if apply_aux_loss:
                 probs = self._apply_aux_loss(
@@ -894,13 +900,27 @@ class TopKRouter(Router):
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
         tp_shard_dim = 0 if self.config.sequence_parallel else None
-        observe_tensor(self, "router_logits", "router_logits", logits, tp_shard_dim=tp_shard_dim)
+        observe_tensor(
+            self,
+            "router_logits",
+            "router_logits",
+            logits,
+            tp_shard_dim=tp_shard_dim,
+            sequence_dim=0,
+            batch_dim=1,
+        )
         # Materialize the full decision distribution only when a due metric requests it.
         if is_observing_tensor("router_scores"):
             with torch.no_grad():
                 scores = compute_normalized_router_scores(logits, self.score_function)
             observe_tensor(
-                self, "router_scores", "router_scores", scores, tp_shard_dim=tp_shard_dim
+                self,
+                "router_scores",
+                "router_scores",
+                scores,
+                tp_shard_dim=tp_shard_dim,
+                sequence_dim=0,
+                batch_dim=1,
             )
 
         if self.config.moe_router_force_load_balancing:
