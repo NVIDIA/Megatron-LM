@@ -2,6 +2,7 @@
 
 import torch
 
+
 def dynamic_media_embedding_counts(
     imgs_sizes: torch.Tensor,
     patch_dim: int,
@@ -41,10 +42,7 @@ def dynamic_media_embedding_counts(
 
 
 def dynamic_media_replacement_counts(
-    frame_embedding_counts: list[int],
-    *,
-    num_frames,
-    temporal_patch_size: int,
+    frame_embedding_counts: list[int], *, num_frames, temporal_patch_size: int
 ) -> list[int]:
     """Map per-frame counts to one compact placeholder per image or video."""
     if num_frames is None:

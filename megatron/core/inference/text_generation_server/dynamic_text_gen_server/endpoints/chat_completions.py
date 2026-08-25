@@ -307,9 +307,7 @@ def _extract_media_url_bytes(url: str, *, max_bytes: int) -> bytes:
             or ip.is_reserved
             or ip.is_unspecified
         ):
-            raise ValueError(
-                f"Refusing to fetch media from non-public address: {parsed.hostname}"
-            )
+            raise ValueError(f"Refusing to fetch media from non-public address: {parsed.hostname}")
         req = urllib.request.Request(url, headers={"User-Agent": _MEDIA_FETCH_USER_AGENT})
         with _no_redirect_opener.open(req, timeout=_MEDIA_FETCH_TIMEOUT_S) as response:
             data = response.read(max_bytes + 1)
@@ -831,9 +829,7 @@ try:
                             : last_assistant_message_idx + 1
                         ]
                         previous_media_slots = [
-                            slot
-                            for slot in media_slots
-                            if slot[2] <= last_assistant_message_idx
+                            slot for slot in media_slots if slot[2] <= last_assistant_message_idx
                         ]
                         previous_prompt_token_ids = last_assistant_message.get(
                             "compact_prompt_token_ids"
@@ -844,9 +840,7 @@ try:
                                 "from the previous Megatron-Inference response."
                             )
                         eos_token_id = tokenizer.eos_id
-                        assert (
-                            eos_token_id is not None
-                        ), "Your tokenizer must have an EOS token ID!"
+                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
                         warnings.warn(
                             "Avoiding prefix retokenization."

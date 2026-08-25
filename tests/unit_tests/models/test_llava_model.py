@@ -292,19 +292,13 @@ class TestLLaVAModel:
         hidden_size = 8
         image_token_index = self.model.image_token_index
         image_embeddings = (
-            torch.arange(5 * hidden_size, dtype=torch.float)
-            .reshape(5, 1, hidden_size)
-            .cuda()
+            torch.arange(5 * hidden_size, dtype=torch.float).reshape(5, 1, hidden_size).cuda()
         )
         language_embeddings = (
-            -torch.arange(2 * 3 * hidden_size, dtype=torch.float)
-            .reshape(2, 3, hidden_size)
-            .cuda()
+            -torch.arange(2 * 3 * hidden_size, dtype=torch.float).reshape(2, 3, hidden_size).cuda()
         )
         input_ids = torch.tensor(
-            [[image_token_index, 1, 2], [3, image_token_index, 4]],
-            dtype=torch.long,
-            device="cuda",
+            [[image_token_index, 1, 2], [3, image_token_index, 4]], dtype=torch.long, device="cuda"
         )
         num_image_tiles = torch.ones(2, dtype=torch.int, device="cuda")
         media_token_counts = torch.tensor([2, 3], dtype=torch.int, device="cuda")

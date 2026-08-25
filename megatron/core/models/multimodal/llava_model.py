@@ -751,9 +751,7 @@ class LLaVAModel(MegatronModule):
                 seq_lens = packed_length_per_batch - num_images_per_sample + text_seq_len
             else:
                 # Number of tiles per sample.
-                num_image_tiles_batch = num_image_tiles.split(
-                    num_images_per_sample.tolist(), dim=0
-                )
+                num_image_tiles_batch = num_image_tiles.split(num_images_per_sample.tolist(), dim=0)
                 num_image_tiles_batch = torch.tensor(
                     [x.sum() for x in num_image_tiles_batch], device=input_ids.device
                 )
@@ -1436,9 +1434,7 @@ class LLaVAModel(MegatronModule):
 
         # Assume 1 tile per image if the number of tiles is not provided.
         if num_image_tiles is None and images is not None:
-            num_image_tiles = torch.ones(
-                images.shape[0], dtype=torch.int, device=input_ids.device
-            )
+            num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
         # if context_parallel_lm == 1:
         #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
@@ -1685,8 +1681,7 @@ def _group_temporal_token_counts(
 
 
 def _group_temporal_token_counts_tensor(
-    tubelet_token_counts: torch.Tensor,
-    media_tubelet_counts: list[int],
+    tubelet_token_counts: torch.Tensor, media_tubelet_counts: list[int]
 ) -> torch.Tensor:
     """Return one device-side token count per temporal media item."""
     if sum(media_tubelet_counts) != tubelet_token_counts.numel():

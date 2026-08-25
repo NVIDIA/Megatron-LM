@@ -118,12 +118,8 @@ def dynamic_res_preprocess(
             if height_up * width_up <= max_patches:
                 target_patch_height, target_patch_width = height_up, width_up
             else:
-                target_patch_height = max(
-                    grid_multiple, target_patch_height - height_remainder
-                )
-                target_patch_width = max(
-                    grid_multiple, target_patch_width - width_remainder
-                )
+                target_patch_height = max(grid_multiple, target_patch_height - height_remainder)
+                target_patch_width = max(grid_multiple, target_patch_width - width_remainder)
     else:
         grid_multiple = max(2 if pixel_shuffle else 1, spatial_merge_size)
         # Use math.ceil, not round(x + 0.5) — the latter is banker's rounding and
@@ -137,9 +133,7 @@ def dynamic_res_preprocess(
         target_patch_width = math.floor(factor * closest_patch_width)
 
         if target_patch_height * target_patch_width < min_patches:
-            up_factor = math.sqrt(
-                min_patches / max(target_patch_height * target_patch_width, 1)
-            )
+            up_factor = math.sqrt(min_patches / max(target_patch_height * target_patch_width, 1))
             target_patch_height = math.ceil(up_factor * target_patch_height)
             target_patch_width = math.ceil(up_factor * target_patch_width)
 
@@ -297,19 +291,11 @@ def _video_sample_indices(total_frames: int, config: VideoProcessingConfig) -> l
 
     sample_count = min(config.num_frames, total_frames)
     if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
-        rounded_down = (
-            sample_count // config.temporal_patch_size
-        ) * config.temporal_patch_size
+        rounded_down = (sample_count // config.temporal_patch_size) * config.temporal_patch_size
         sample_count = (
-            rounded_down
-            if rounded_down > 0
-            else min(config.temporal_patch_size, total_frames)
+            rounded_down if rounded_down > 0 else min(config.temporal_patch_size, total_frames)
         )
-    return (
-        np.rint(np.linspace(0, total_frames - 1, num=sample_count))
-        .astype(np.int64)
-        .tolist()
-    )
+    return np.rint(np.linspace(0, total_frames - 1, num=sample_count)).astype(np.int64).tolist()
 
 
 def _decode_sampled_video_frames(encoded_video: bytes, config: VideoProcessingConfig):

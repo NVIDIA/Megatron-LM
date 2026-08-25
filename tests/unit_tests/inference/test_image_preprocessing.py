@@ -26,9 +26,7 @@ class _FakeFrame:
 class _FakeContainer:
     def __init__(self, frames, declared_frames):
         self._frames = frames
-        self.streams = SimpleNamespace(
-            video=[SimpleNamespace(frames=declared_frames)]
-        )
+        self.streams = SimpleNamespace(video=[SimpleNamespace(frames=declared_frames)])
 
     def __enter__(self):
         return self
@@ -42,9 +40,7 @@ class _FakeContainer:
 
 def _install_fake_av(monkeypatch, *, total_frames, declared_frames):
     frames = [_FakeFrame(index) for index in range(total_frames)]
-    fake_av = SimpleNamespace(
-        open=lambda _: _FakeContainer(frames, declared_frames)
-    )
+    fake_av = SimpleNamespace(open=lambda _: _FakeContainer(frames, declared_frames))
     monkeypatch.setitem(sys.modules, "av", fake_av)
     return frames
 

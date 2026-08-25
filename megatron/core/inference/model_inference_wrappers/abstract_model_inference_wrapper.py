@@ -106,9 +106,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if modality not in capabilities:
                 raise ValueError(f"Unknown input modality: {modality!r}.")
             if not capabilities[modality]:
-                raise ValueError(
-                    f"{type(self).__name__} does not support {modality} inputs."
-                )
+                raise ValueError(f"{type(self).__name__} does not support {modality} inputs.")
 
     def resolve_media_token_id(self, tokenizer, modality: str) -> int:
         """Resolve a compact media marker to one nonnegative tokenizer ID."""

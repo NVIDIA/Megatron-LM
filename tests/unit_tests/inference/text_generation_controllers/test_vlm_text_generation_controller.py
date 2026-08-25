@@ -45,9 +45,7 @@ def test_vlm_wrapper_builds_preexpanded_media_token_mask():
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = SimpleNamespace(image_token_index=-200)
 
-    mask = wrapper.build_preexpanded_media_token_mask(
-        torch.tensor([10, -200, -200, 20]), "image"
-    )
+    mask = wrapper.build_preexpanded_media_token_mask(torch.tensor([10, -200, -200, 20]), "image")
 
     assert mask.tolist() == [-1, 0, 1, -1]
 
@@ -57,8 +55,7 @@ def test_vlm_wrapper_resolves_media_id_from_tokenizer_not_model_sentinel():
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = SimpleNamespace(image_token_index=-200)
     tokenizer = SimpleNamespace(
-        convert_tokens_to_ids=lambda token: 99 if token == "<image>" else 0,
-        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: 99 if token == "<image>" else 0, unk_token_id=0
     )
 
     assert wrapper.get_multimodal_prompt_config().image_spec.model_token == "<image>"
@@ -103,9 +100,7 @@ def test_vlm_dynamic_forward_sanitizes_preexpanded_media_sentinel():
             }
         )
 
-    assert torch.equal(
-        embedding.call_args.kwargs["input_ids"], torch.tensor([[10, 0, 0]])
-    )
+    assert torch.equal(embedding.call_args.kwargs["input_ids"], torch.tensor([[10, 0, 0]]))
 
 
 @pytest.mark.internal

@@ -39,24 +39,14 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
     def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
         """Return Nemotron Omni's compact visual-span contract."""
         return MultimodalPromptConfig(
-            image_spec=MediaPromptSpec(
-                model_token="<image>",
-                prefix="<img>",
-                suffix="</img>",
-            ),
-            video_spec=MediaPromptSpec(
-                model_token="<image>",
-                prefix="<img>",
-                suffix="</img>",
-            ),
+            image_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
+            video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
         )
 
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return the model's internal sentinel for already-expanded visual prompts."""
         del modality
-        model = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
         return int(model.image_token_index)
 
     def run_one_forward_step(
@@ -70,13 +60,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         return super().run_one_forward_step(inference_input, recv_buffer_seq_len)
 
     def expand_image_tokens(
-        self,
-        tokens,
-        num_tiles=None,
-        imgs_sizes=None,
-        num_frames=None,
-        *,
-        image_token_id=None,
+        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None, *, image_token_id=None
     ):
         """Expand compact image/video placeholders and build embedding masks."""
         if imgs_sizes is None:
@@ -85,9 +69,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             )
         if num_tiles is not None:
             raise ValueError("num_tiles must be omitted for dynamic-resolution Omni inference.")
-        model = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
         image_token_index = (
             model.image_token_index if image_token_id is None else int(image_token_id)
         )
@@ -156,9 +138,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
                 imgs_sizes.shape[0], dtype=torch.int32, device=imgs_sizes.device
             )
 
-        model = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
         with torch.cuda.nvtx.range(f"megatron.multimodal.{media_kind}_encoder"):
             embeddings = model._encode_images(
                 images, imgs_sizes, vision_packed_seq_params=None, num_frames=num_frames
@@ -186,9 +166,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         attention_mask = inference_input["attention_mask"]
         image_token_mask = inference_input["image_token_mask"]
         image_embeddings = inference_input.get("image_embeddings")
-        model = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
 
         # The mask covers compact-path padding and pre-expanded model sentinels.
         input_ids_text = tokens.masked_fill(image_token_mask >= 0, 0)

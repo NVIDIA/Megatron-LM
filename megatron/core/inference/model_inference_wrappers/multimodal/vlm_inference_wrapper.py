@@ -39,9 +39,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return LLaVA's internal sentinel without exposing it as a vocabulary ID."""
         del modality
-        module = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
         return int(module.image_token_index)
 
     def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
@@ -152,13 +150,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
     # ---- Dynamic inference methods ----
 
     def expand_image_tokens(
-        self,
-        tokens,
-        num_tiles=None,
-        imgs_sizes=None,
-        num_frames=None,
-        *,
-        image_token_id=None,
+        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None, *, image_token_id=None
     ):
         """Expand image tokens to multiple pad tokens.
 
@@ -178,9 +170,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             mask (List[List[int or None]]): Mask indicating image embedding indices for each
                 position, None for non-image positions.
         """
-        module = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
         image_token_index = (
             module.image_token_index if image_token_id is None else int(image_token_id)
         )
@@ -321,11 +311,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         return expanded_tokens_list, mask_list
 
     def _forward_vision_encoder(
-        self,
-        images,
-        num_image_tiles=None,
-        imgs_sizes=None,
-        num_frames=None,
+        self, images, num_image_tiles=None, imgs_sizes=None, num_frames=None
     ) -> torch.Tensor:
         """Run the vision encoder only, returning image embeddings.
 
@@ -342,9 +328,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         """
         from megatron.core.packed_seq_params import PackedSeqParams
 
-        module = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes (see expand_image_tokens for context).
@@ -423,9 +407,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         attention_mask = inference_input.get("attention_mask", None)
         image_embeddings = inference_input.get("image_embeddings", None)
 
-        module = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
 
         if is_pipeline_first_stage(self.pp_group) or self._recv_only_vision_embeds:
             # Media positions may contain either compact-path padding or the
@@ -607,9 +589,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             return super().run_one_forward_step(inference_input)
 
         # Static VLM path
-        module = get_attr_wrapped_model(
-            self.model, "image_token_index", return_model_obj=True
-        )
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
         num_image_tokens = (tokens == module.image_token_index).sum().item()
         num_img_embeddings = inference_input["num_img_embeddings"]
         decoder_seq_length = inference_input["decoder_seq_length"]

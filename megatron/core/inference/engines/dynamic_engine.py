@@ -1565,8 +1565,7 @@ class DynamicInferenceEngine(AbstractEngine):
             ]
             if missing:
                 raise ValueError(
-                    "Video input requires imgs, imgs_sizes, and num_frames; "
-                    f"missing {missing}."
+                    "Video input requires imgs, imgs_sizes, and num_frames; " f"missing {missing}."
                 )
         elif imgs_sizes is not None:
             if imgs is None:
@@ -1638,9 +1637,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if has_images:
             inference_wrapper = self.controller.inference_wrapped_model
             if media_tokens_preexpanded:
-                mask_tensor = inference_wrapper.build_preexpanded_media_token_mask(
-                    tokens, modality
-                )
+                mask_tensor = inference_wrapper.build_preexpanded_media_token_mask(tokens, modality)
                 expected_embedding_count = int((mask_tensor >= 0).sum().item())
             else:
                 media_token_id = inference_wrapper.resolve_media_token_id(
@@ -1651,10 +1648,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
                 if num_frames is not None:
                     expansion_kwargs["num_frames"] = num_frames
-                expanded_tokens_list, mask_list = (
-                    inference_wrapper.expand_image_tokens(
-                        token_list, image_token_id=media_token_id, **expansion_kwargs
-                    )
+                expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
+                    token_list, image_token_id=media_token_id, **expansion_kwargs
                 )
                 # expand_image_tokens pads the embedding slots with -1, but the mask
                 # below is what splices the embeddings in, so keep a real token id in
@@ -1662,8 +1657,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # clients, detokenized for raw_text and hashed for prefix caching, and
                 # none of those accept a negative id.
                 expanded_tokens = [
-                    media_token_id if token < 0 else token
-                    for token in expanded_tokens_list[0]
+                    media_token_id if token < 0 else token for token in expanded_tokens_list[0]
                 ]
                 tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
                 mask_tensor = torch.tensor(
