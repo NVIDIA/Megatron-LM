@@ -9,10 +9,7 @@ from megatron.core.fusions import fused_mtp_tv as fused_tv_module
 from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import multi_token_prediction as mtp_module
-from megatron.core.transformer.multi_token_prediction import (
-    MTPLossAutoScaler,
-    process_mtp_loss,
-)
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -265,15 +262,17 @@ def test_process_mtp_e2e_tv_uses_fused_tv_prefix_and_logs_each_depth(monkeypatch
         fused_prefix_losses.append(prefix_losses.detach().clone())
         return objective, prefix_losses
 
-    def record_loss(loss_sum, num_tokens, layer_number, num_layers, **kwargs):
+    def record_metrics(loss, correct, total, layer_number, num_layers, **kwargs):
         assert num_layers == mtp_num_layers
         assert kwargs["avg_group"] is None
-        logged.append((loss_sum.detach().clone(), num_tokens.detach().clone(), layer_number))
+        logged.append(
+            (loss.detach().clone(), correct.detach().clone(), total.detach().clone(), layer_number)
+        )
 
     monkeypatch.setattr(fused_tv_module, "_fused_vocab_parallel_tv_distance", record_fused_tv)
     monkeypatch.setattr(mtp_module, "mtp_e2e_prefix_objective", record_prefix_objective)
     monkeypatch.setattr(parallel_state, "get_data_parallel_group", lambda **_: None)
-    monkeypatch.setattr(mtp_module.MTPLossLoggingHelper, "save_loss_to_tracker", record_loss)
+    monkeypatch.setattr(mtp_module.MTPLossLoggingHelper, "save_metrics_to_tracker", record_metrics)
 
     MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0, device="cuda"))
     result = process_mtp_loss(
@@ -298,11 +297,19 @@ def test_process_mtp_e2e_tv_uses_fused_tv_prefix_and_logs_each_depth(monkeypatch
     chain_mask = torch.zeros(sequence_length, 1, device="cuda")
     chain_mask[: sequence_length - mtp_num_layers] = 1
     assert len(logged) == mtp_num_layers
-    for layer_number, (loss_sum, num_tokens, logged_layer_number) in enumerate(logged):
+    expected_total = chain_mask.sum()
+    expected_acceptances = 1.0 - actual_tv_distances
+    for layer_number, (loss, correct, total, logged_layer_number) in enumerate(logged):
         assert logged_layer_number == layer_number
-        torch.testing.assert_close(num_tokens, chain_mask.sum(), rtol=0, atol=0)
+        torch.testing.assert_close(total, expected_total, rtol=0, atol=0)
         torch.testing.assert_close(
-            loss_sum, torch.sum(fused_prefix_losses[0][layer_number] * chain_mask), rtol=0, atol=0
+            loss,
+            torch.sum(fused_prefix_losses[0][layer_number] * chain_mask) / expected_total,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            correct, torch.sum(expected_acceptances[layer_number] * chain_mask), rtol=0, atol=0
         )
 
 
@@ -347,8 +354,8 @@ def test_process_mtp_e2e_tv_masks_incomplete_packed_chains():
     assert torch.count_nonzero(draft_1_grad[expected_valid]) > 0
 
 
-def test_process_mtp_e2e_tv_contiguous_packed_cp2_matches_global_reference(monkeypatch):
-    """Contiguous packed CP rolls target distributions without crossing segments."""
+def test_process_mtp_e2e_tv_packed_zigzag_cp2_matches_global_reference(monkeypatch):
+    """Two-chunk packed CP rolls target distributions without crossing segments."""
     if Utils.world_size < 2:
         pytest.skip("A distributed run with at least two ranks is required")
 
@@ -356,21 +363,32 @@ def test_process_mtp_e2e_tv_contiguous_packed_cp2_matches_global_reference(monke
     try:
         cp_group = parallel_state.get_context_parallel_group()
         cp_rank = torch.distributed.get_rank(group=cp_group)
+        cp_size = torch.distributed.get_world_size(group=cp_group)
         mtp_num_layers = 2
-        global_seq_len = 8
-        local_seq_len = global_seq_len // 2
+        global_seq_len = 12
         hidden_size = 5
-        cu_seqlens = (0, 6, 8)
+        cu_seqlens = (0, 8, 12)
+
+        # Main's CP layout gives each rank two chunks from every packed sequence:
+        # chunk ``rank`` and its mirrored tail chunk ``2 * cp_size - rank - 1``.
+        local_indices = []
+        for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]):
+            sequence_length = end - start
+            assert sequence_length % (2 * cp_size) == 0
+            chunk_length = sequence_length // (2 * cp_size)
+            front_start = start + cp_rank * chunk_length
+            tail_start = start + (2 * cp_size - cp_rank - 1) * chunk_length
+            local_indices.extend(range(front_start, front_start + chunk_length))
+            local_indices.extend(range(tail_start, tail_start + chunk_length))
+        local_indices = torch.tensor(local_indices, dtype=torch.long, device="cuda")
+        local_seq_len = local_indices.numel()
 
         torch.manual_seed(23)
         full_hidden = torch.randn(
             (1 + mtp_num_layers) * global_seq_len, 1, hidden_size, device="cuda"
         )
         full_chunks = torch.chunk(full_hidden, 1 + mtp_num_layers, dim=0)
-        local_start = cp_rank * local_seq_len
-        local_chunks = [
-            chunk.narrow(0, local_start, local_seq_len).clone() for chunk in full_chunks
-        ]
+        local_chunks = [chunk.index_select(0, local_indices).clone() for chunk in full_chunks]
         local_hidden = torch.cat(local_chunks, dim=0).requires_grad_(True)
         output_layer = _OutputLayer(torch.eye(hidden_size, device="cuda"))
         config = _make_tv_config(mtp_num_layers, hidden_size)
@@ -379,12 +397,9 @@ def test_process_mtp_e2e_tv_contiguous_packed_cp2_matches_global_reference(monke
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens_tensor,
             cu_seqlens_kv=cu_seqlens_tensor,
-            cu_seqlens_q_padded=cu_seqlens_tensor,
-            cu_seqlens_kv_padded=cu_seqlens_tensor,
-            max_seqlen_q=6,
-            max_seqlen_kv=6,
+            max_seqlen_q=4,
+            max_seqlen_kv=4,
             qkv_format="thd",
-            cp_partition_mode="contiguous",
         )
         local_loss_mask = torch.ones(1, local_seq_len, device="cuda")
         captured_target_steps = []
@@ -423,20 +438,17 @@ def test_process_mtp_e2e_tv_contiguous_packed_cp2_matches_global_reference(monke
         draft_steps = []
         for full_draft in full_chunks[1:]:
             target_logits = _native_roll_packed_sequence_first(target_logits, cu_seqlens)
-            target_steps.append(target_logits.narrow(0, local_start, local_seq_len))
+            target_steps.append(target_logits.index_select(0, local_indices))
             full_mask = _native_roll_packed_sequence_first(full_mask, cu_seqlens)
             full_chain_valid &= full_mask.bool()
 
             draft_reference = (
-                full_draft.narrow(0, local_start, local_seq_len)
-                .detach()
-                .clone()
-                .requires_grad_(True)
+                full_draft.index_select(0, local_indices).detach().clone().requires_grad_(True)
             )
             draft_references.append(draft_reference)
             draft_steps.append(torch.matmul(draft_reference, reference_weight.t()))
 
-        local_chain_mask = full_chain_valid.narrow(0, local_start, local_seq_len).float()
+        local_chain_mask = full_chain_valid.index_select(0, local_indices).float()
         assert len(captured_target_steps) == mtp_num_layers
         for captured_target, target_step in zip(captured_target_steps, target_steps):
             torch.testing.assert_close(captured_target, target_step, rtol=0, atol=0)

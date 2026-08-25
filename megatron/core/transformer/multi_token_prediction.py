@@ -1020,10 +1020,9 @@ def _process_mtp_e2e_tv_loss(
     if is_training:
         avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         for mtp_layer_number in range(config.mtp_num_layers):
-            loss_for_log = (
-                torch.sum(prefix_losses[mtp_layer_number] * chain_mask)
-                / num_tokens.clamp(min=1)
-            )
+            loss_for_log = torch.sum(
+                prefix_losses[mtp_layer_number] * chain_mask
+            ) / num_tokens.clamp(min=1)
             correct = torch.sum(per_step_acceptance[mtp_layer_number] * chain_mask)
             MTPLossLoggingHelper.save_metrics_to_tracker(
                 loss_for_log,

@@ -447,7 +447,7 @@ class _VocabParallelTVDistance(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         """Apply the analytical Bebop gradient to the draft logits only."""
-        (draft_logits, draft_max, draft_denominator, s, draft_above_target, clamp_gradient_mask) = (
+        draft_logits, draft_max, draft_denominator, s, draft_above_target, clamp_gradient_mask = (
             ctx.saved_tensors
         )
 
