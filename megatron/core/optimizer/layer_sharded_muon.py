@@ -115,6 +115,12 @@ class LayerShardedMuon(TensorParallelMuon):
     - A param sharded by neither is whole on every rank of the domain (e.g. the MoE
       router and latent projections): it skips both exchanges and every rank runs the
       same deterministic NS on its own copy.
+    - GTP alignment padding (``param.pad_length`` trailing zero rows on the
+      gtp-gathered, TP-local dim 0) is stripped before Newton-Schulz — so the scale
+      factor sees the true dims, matching the parent's duplicated path bitwise — and
+      restored before the reverse gtp exchange. On the fused exchange this is
+      supported for single-axis domains only (tp_size == 1); a 2-D fused domain with
+      padded params raises NotImplementedError (use the two-stage path there).
 
     ``step()`` runs, per param group:
 
@@ -561,6 +567,14 @@ class LayerShardedMuon(TensorParallelMuon):
             ]
             g_home = {i: homes[i][0] for i in range(len(params))}
 
+            # GTP alignment padding: ``p.pad_length`` trailing zero rows on the
+            # gtp-gathered, TP-LOCAL dim 0 — the same attribute the parent strips
+            # in its duplicated path. Stripped before Newton-Schulz so the scale
+            # factor sees the true dims (and parity with duplicated mode holds),
+            # restored before the reverse gtp exchange, whose split sizes derive
+            # from the padded momentum shards.
+            pads = [getattr(p, 'pad_length', 0) for p in params]
+
             # --- Fused path: one all_to_all over the flattened (GTP x TP) domain
             # replaces the two stages in each direction. Moves the exact same shard
             # blocks and assembles them in the exact same order, so the NS input is
@@ -576,16 +590,32 @@ class LayerShardedMuon(TensorParallelMuon):
                     "flattened (GTP x TP) group must be built with TP innermost."
                 )
                 pdims = [_partition_dim(p) for p in params]
+                if tp_size > 1 and any(pads):
+                    # After 2-D assembly the pad is embedded at the tail of every
+                    # TP block, not the matrix tail, so a single strip is wrong.
+                    raise NotImplementedError(
+                        "LayerShardedMuon: GTP alignment padding on the fused (2-D) "
+                        "exchange is not implemented. Use the two-stage path "
+                        "(fused_group=None) for padded params when tp_size > 1."
+                    )
                 with fp32_matmul_precision(self.fp32_matmul_prec):
                     with _phase("a2a_fwd"):
                         fulls, my_idx = layer_sharded_fused_fwd(
                             moms, homes, pdims, gtp_rank, tp_rank, gtp_size, tp_size, fused_group
                         )
+                        # tp_size == 1 here whenever pads are present: the
+                        # home-assembled matrix has a contiguous dim-0 pad tail.
+                        fulls = [
+                            self._strip_pad(t, pads[my_idx[k]]) for k, t in enumerate(fulls)
+                        ]
                     with _phase("ns"):
                         ns_by_k = self._run_ns(dict(enumerate(fulls)))
                 with _phase("a2a_bwd"):
                     update_shards = layer_sharded_fused_bwd(
-                        [ns_by_k[k] for k in range(len(fulls))],
+                        [
+                            self._restore_pad(ns_by_k[k], pads[my_idx[k]])
+                            for k in range(len(fulls))
+                        ],
                         my_idx,
                         moms,
                         homes,
@@ -608,6 +638,12 @@ class LayerShardedMuon(TensorParallelMuon):
                     stage1, my_g = layer_sharded_all_to_all_fwd(
                         moms, g_home, gtp_rank, gtp_size, gtp_group, 0
                     )
+                    # Strip the GTP alignment padding at the stage-1 seam: the
+                    # stage-1 output is the gtp-gathered TP-LOCAL tensor, where
+                    # the pad is a contiguous dim-0 tail for every partition_dim
+                    # (after TP assembly it would be embedded per TP block) —
+                    # the same strip point the parent's duplicated path uses.
+                    stage1 = [self._strip_pad(t, pads[my_g[k]]) for k, t in enumerate(stage1)]
 
                     # Split this column's params by TP partition dim. Keys 0/1 go
                     # through stage 2; None params are already complete on every TP peer.
@@ -650,6 +686,14 @@ class LayerShardedMuon(TensorParallelMuon):
                         col_updates[pos[n]] = part
                 for k in sub_pos[None]:
                     col_updates[k] = ns_by_k[k]
+
+                # Restore the padding (zero rows) before the reverse gtp
+                # exchange: its split sizes derive from the padded momentum
+                # shards, and every rank's shard slice must line up again.
+                col_updates = [
+                    None if t is None else self._restore_pad(t, pads[my_g[k]])
+                    for k, t in enumerate(col_updates)
+                ]
 
                 # 6. Reverse stage-1 all_to_all: scatter column updates back to GTP shards.
                 update_shards = layer_sharded_all_to_all_bwd(
