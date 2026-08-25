@@ -7,6 +7,7 @@ import torch
 from megatron.core.models.common import fine_grained_callables as common_callables
 from megatron.core.models.common import model_chunk_schedule_plan
 from megatron.core.models.common.fine_grained_callables import build_layer_callables
+from megatron.core.models.gpt import fine_grained_callables as gpt_callables
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -24,6 +25,71 @@ from tests.unit_tests.a2a_overlap.utils import (
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_repeated_mtp_te_graph_owns_backward_dw_wrapper_per_logical_depth():
+    """Each logical use of a repeated MTP layer updates its own wgrad wrapper."""
+
+    class FakeBackwardDWWrapper:
+        def __init__(self):
+            self.graphed_backward_dw_callable = None
+
+        def set_graphed_backward_dw_callable(self, callable_):
+            self.graphed_backward_dw_callable = callable_
+
+    class FakeGraphableLayer(gpt_callables.GraphableMegatronModule):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.config = SimpleNamespace(
+                moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None
+            )
+            self.mlp = object()
+            self.cuda_graphs = [object()]
+            self.current_microbatch = 0
+            self.created_wrappers = []
+            self.graphed_dw_microbatches = []
+
+        def init_backward_dw_wrapper(self):
+            self.backward_dw_wrapper = FakeBackwardDWWrapper()
+            self.created_wrappers.append(self.backward_dw_wrapper)
+
+        def _te_cuda_graph_backward_dw_graph(self, microbatch):
+            self.graphed_dw_microbatches.append(microbatch)
+
+        @staticmethod
+        def _te_cuda_graph_replay(hidden_states, **_kwargs):
+            return hidden_states, None, None, None
+
+    layer = FakeGraphableLayer()
+    logical_callables = []
+    owned_wrappers = []
+    for _ in range(3):
+        forward_callables, backward_dw = gpt_callables.build_transformer_layer_callables(layer)
+        logical_callables.append(forward_callables[0])
+        owned_wrappers.append(backward_dw["pre_dispatch_computation"])
+
+    assert len({id(wrapper) for wrapper in owned_wrappers}) == 3
+    assert layer.backward_dw_wrapper is owned_wrappers[-1]
+
+    chunk_state = SimpleNamespace(
+        padding_mask=None,
+        attention_mask=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+    )
+    hidden_states = torch.ones(2, 1, 4)
+    for logical_depth, callable_ in enumerate(logical_callables):
+        layer.current_microbatch = logical_depth
+        node = SimpleNamespace(chunk_state=chunk_state, layer_state=SimpleNamespace())
+        assert callable_(node, hidden_states) is hidden_states
+
+    assert all(wrapper.graphed_backward_dw_callable is not None for wrapper in owned_wrappers)
+    for wrapper in owned_wrappers:
+        wrapper.graphed_backward_dw_callable()
+    assert layer.graphed_dw_microbatches == [0, 1, 2]
 
 
 def run_model_ref_with_capture(model, input_tensors, iterations):

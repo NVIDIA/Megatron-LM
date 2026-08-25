@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from functools import partial
 from typing import Optional
 
 import torch
@@ -50,6 +51,13 @@ def build_transformer_layer_callables(layer: TransformerLayer):
           (keys: "pre_dispatch_computation", "mlp").
     """
 
+    # Repeated MTP builds one callable set per logical depth while sharing the
+    # same physical TransformerLayer. Keep the delayed-wgrad wrapper owned by
+    # this callable invocation instead of reading the layer's mutable attribute
+    # after a later logical depth has replaced it.
+    layer.init_backward_dw_wrapper()
+    backward_dw_wrapper = layer.backward_dw_wrapper
+
     is_moe = isinstance(layer.mlp, MoELayer)
     enable_deepep = (
         layer.config.moe_token_dispatcher_type == "flex"
@@ -78,7 +86,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             and hasattr(layer, 'cuda_graphs')
             and layer.cuda_graphs
         ):
-            layer.set_te_cuda_graph_backward_dw_wrapper()
+            backward_dw_wrapper.set_graphed_backward_dw_callable(
+                partial(layer._te_cuda_graph_backward_dw_graph, layer.current_microbatch)
+            )
             forward_func = layer._te_cuda_graph_replay
         else:
             # wrapper function that keeps consistent api with cuda graph replay
@@ -277,8 +287,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented
 
-    layer.init_backward_dw_wrapper()
-
     forward_funcs = [pre_dispatch_func, dispatch_func, mlp_func, combine_func, None]
-    backward_dw = {"pre_dispatch_computation": layer.backward_dw_wrapper, "mlp": layer.mlp}
+    backward_dw = {"pre_dispatch_computation": backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
