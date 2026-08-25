@@ -94,12 +94,16 @@ def _has_batched_syrk() -> bool:
 # Phase-level NVTX ranges. Kernel-name classification cannot separate the forward
 # from the reverse all_to_all, nor the momentum update from the weight update, so
 # the step is annotated explicitly. Phase granularity (a handful of pushes per
-# step, not per param) keeps the cost negligible.
-_NVTX_ENABLED = torch.cuda.is_available()
+# step, not per param) keeps the cost negligible. The CUDA probe is lazy (first
+# _phase call, cached) so importing the module never touches the CUDA runtime.
+_NVTX_ENABLED: "bool | None" = None
 
 
 @contextlib.contextmanager
 def _phase(name: str):
+    global _NVTX_ENABLED
+    if _NVTX_ENABLED is None:
+        _NVTX_ENABLED = torch.cuda.is_available()
     if not _NVTX_ENABLED:
         yield
         return
@@ -183,12 +187,20 @@ class LayerShardedMuon(TensorParallelMuon):
             than two param groups or without CUDA. Requires the groups' domains to
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
+        nesterov: Defaults to False here (the parent defaults to True) —
+            intentional: it matches the reference behavior the bitwise parity
+            suite was written against. Direct-API users swapping classes should
+            pass it explicitly; the config path always does.
         All other args: same as :class:`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
             ``pg_collection`` only take effect on the paths that delegate to the
             parent (the empty-``param_ns_homes`` fallback and the degenerate
             single-rank domain, both of which run the parent's TP-aware
-            full-matrix Newton-Schulz).
+            full-matrix Newton-Schulz). "Degenerate" means the LAYER-SHARDING
+            domain (gtp_remat_size * tp_size) is trivial, not that the step is
+            collective-free: with a non-trivial ``pg_collection.tp`` and
+            partition_dim-tagged params (direct API only), the parent path
+            still issues TP collectives.
 
     Note:
         ``None`` for either process group means "no group / size 1", **not** torch's
