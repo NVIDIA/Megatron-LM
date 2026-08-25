@@ -113,12 +113,12 @@ class _VLLMVisibleExperts(Experts):
         permuted_probs: torch.Tensor | None = None,
         tokens_per_expert_list: list[int] | None = None,
     ) -> torch.Tensor:
-        if tokens_per_expert_list is not None:
-            tokens_per_expert = torch.tensor(
-                tokens_per_expert_list,
-                device=tokens_per_expert.device,
-                dtype=tokens_per_expert.dtype,
+        if tokens_per_expert_list is None:
+            raise ValueError(
+                "vLLM grouped MoE requires dispatcher-provided host expert counts"
             )
+        if len(tokens_per_expert_list) != self.num_local_experts:
+            raise ValueError("host expert count does not match local experts")
         w13 = tuple(
             bind_source_scale_to_visible_weight(
                 self.fc1, f"weight{i}", getattr(self.fc1, f"weight{i}")
@@ -133,7 +133,7 @@ class _VLLMVisibleExperts(Experts):
         )
         return VLLMGroupedMoEWithBF16Backward.apply(
             hidden_states,
-            tokens_per_expert,
+            tuple(tokens_per_expert_list),
             self.swiglu_limit,
             *w13,
             *w2,

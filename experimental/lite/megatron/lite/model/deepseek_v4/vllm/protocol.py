@@ -53,6 +53,7 @@ class ImplConfig:
     cache_deployment_weights: bool | None = None
     moe_token_dispatcher_type: str = "deepep"
     hybridep_max_tokens_per_rank: int | None = None
+    profiling_proxy_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.moe_token_dispatcher_type not in {"deepep", "hybridep"}:

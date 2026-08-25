@@ -6,6 +6,7 @@ from __future__ import annotations
 import gc
 import os
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -221,6 +222,61 @@ class MegatronLiteRuntime(RuntimeBase):
             from megatron.lite.runtime.backends.mlite.dynamic_cp import install
 
             install(self, dynamic_cp)
+        self._transfer_streams: dict[str, torch.cuda.Stream] = {}
+        self._transfer_events: dict[str, torch.cuda.Event] = {}
+        self._transfer_stats = {
+            "d2h_calls": 0,
+            "h2d_calls": 0,
+            "d2h_host_waits": 0,
+        }
+
+    def transfer_stats(self) -> dict[str, int]:
+        """Return lifecycle-transfer counters for profiling hooks."""
+        return dict(self._transfer_stats)
+
+    def _transfer_assets(self, direction: str):
+        if not hasattr(self, "_transfer_streams"):
+            self._transfer_streams = {}
+            self._transfer_events = {}
+            self._transfer_stats = {
+                "d2h_calls": 0,
+                "h2d_calls": 0,
+                "d2h_host_waits": 0,
+            }
+        stream = self._transfer_streams.get(direction)
+        if stream is None:
+            stream = torch.cuda.Stream()
+            self._transfer_streams[direction] = stream
+        producer = self._transfer_events.get(f"{direction}_producer")
+        if producer is None:
+            producer = torch.cuda.Event()
+            self._transfer_events[f"{direction}_producer"] = producer
+        complete = self._transfer_events.get(f"{direction}_complete")
+        if complete is None:
+            complete = torch.cuda.Event()
+            self._transfer_events[f"{direction}_complete"] = complete
+        return stream, producer, complete
+
+    def _run_cuda_transfer(self, direction: str, operation: Callable[[], None]):
+        """Order one lifecycle transfer without synchronizing unrelated streams."""
+        stream, producer, complete = self._transfer_assets(direction)
+        current = torch.cuda.current_stream()
+        # All MLite auxiliary producers join the current stream with events
+        # before returning their tensors.  Record that proven latest dependency,
+        # then let the transfer stream consume it.
+        producer.record(current)
+        stream.wait_event(producer)
+        record = getattr(torch.autograd.profiler, "record_function", None)
+        scope = (
+            record(f"mlite::{direction}_lifecycle_transfer")
+            if callable(record)
+            else nullcontext()
+        )
+        with scope, torch.cuda.stream(stream):
+            operation()
+            complete.record(stream)
+        self._transfer_stats[f"{direction}_calls"] += 1
+        return current, complete
 
     # ── build_model ──
 
@@ -455,18 +511,30 @@ class MegatronLiteRuntime(RuntimeBase):
         # scratch buffers or optimizer residency.
         training_transfer = model and grad
         if device == "cpu":
-            if model:
-                offload_model_to_cpu(model_chunks)
-            if (optimizer or training_transfer) and handle._optimizer is not None:
-                offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
-                if callable(offload_state):
-                    offload_state()
-                else:
-                    offload_optimizer(handle._optimizer)
+            def d2h_transfer():
+                if model:
+                    offload_model_to_cpu(model_chunks)
+                if (optimizer or training_transfer) and handle._optimizer is not None:
+                    offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
+                    if callable(offload_state):
+                        offload_state()
+                    else:
+                        offload_optimizer(handle._optimizer)
+
+            completion = None
+            if torch.cuda.is_available() and (model or optimizer or training_transfer):
+                _, completion = self._run_cuda_transfer("d2h", d2h_transfer)
+            else:
+                d2h_transfer()
+            if completion is not None:
+                # Returning CPU-resident model/optimizer state exposes it to a
+                # host consumer regardless of the exact flag combination.
+                # Wait only for this transfer event, never device-wide.
+                completion.synchronize()
+                self._transfer_stats["d2h_host_waits"] += 1
             if training_transfer:
                 self.release_export_scratch(handle)
                 if torch.cuda.is_available():
-                    torch.cuda.synchronize()
                     # R3/full-recompute may leave CUDA tensors reachable only
                     # through dead Python cycles until the next periodic GC.
                     # vLLM remaps its sleeping weights immediately after this
@@ -475,14 +543,23 @@ class MegatronLiteRuntime(RuntimeBase):
                     gc.collect()
                     torch.cuda.empty_cache()
         elif device == "cuda":
-            if model:
-                load_model_to_gpu(model_chunks, load_grad=grad)
-            if (optimizer or training_transfer) and handle._optimizer is not None:
-                load_state = getattr(handle._optimizer, "load_state_to_device", None)
-                if callable(load_state):
-                    load_state()
-                else:
-                    load_optimizer(handle._optimizer)
+            def h2d_transfer():
+                if model:
+                    load_model_to_gpu(model_chunks, load_grad=grad)
+                if (optimizer or training_transfer) and handle._optimizer is not None:
+                    load_state = getattr(handle._optimizer, "load_state_to_device", None)
+                    if callable(load_state):
+                        load_state()
+                    else:
+                        load_optimizer(handle._optimizer)
+
+            if torch.cuda.is_available() and (model or optimizer or training_transfer):
+                consumer, completion = self._run_cuda_transfer("h2d", h2d_transfer)
+                # The next model work is enqueued on the caller's current
+                # stream, which is the first GPU consumer of restored state.
+                consumer.wait_event(completion)
+            else:
+                h2d_transfer()
 
     # ── Mode switching ──
 

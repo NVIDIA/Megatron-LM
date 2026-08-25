@@ -629,6 +629,8 @@ class MegatronLiteEngine(BaseEngine):
 
     def _build_impl_cfg(self) -> dict[str, Any]:
         impl_cfg = dict(self.engine_config.impl_cfg)
+        if self.engine_config.profiling_proxy_mode:
+            impl_cfg["profiling_proxy_mode"] = True
         # The engine always transports a flattened PackedBatch. Model protocols
         # decide whether to materialize THD metadata; vLLM-kernel DS4 consumes
         # the same packed tokens with its own runtime metadata instead.

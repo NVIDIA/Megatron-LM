@@ -23,8 +23,6 @@ _PAD_MULTIPLE = 128
 class HybridEPRouteState:
     buffer: object
     handle: object
-    expert_route_metadata: torch.Tensor
-    source_key_base: int
     source_route_count: int
     source_indices: torch.Tensor
     source_weights: torch.Tensor
@@ -36,6 +34,7 @@ class HybridEPRouteState:
 class HybridEPDispatchResult:
     hidden: torch.Tensor
     tokens_per_expert: torch.Tensor
+    tokens_per_expert_list: list[int]
     probs: torch.Tensor
     state: HybridEPRouteState
 
@@ -101,54 +100,34 @@ class _DispatchRoutes(torch.autograd.Function):
         buffer,
         route_hidden: torch.Tensor,
         route_indices: torch.Tensor,
-        route_keys: torch.Tensor,
         num_experts: int,
         num_local_experts: int,
     ):
         dispatched, _, _, tokens_per_expert, handle = (
             buffer.dispatch_with_permute(
-            hidden=route_hidden.contiguous(),
-            topk_idx=route_indices.reshape(-1, 1).contiguous(),
-            topk_weights=None,
-            num_of_experts=num_experts,
-            scaling_factor=None,
-            num_of_experts_per_rank=num_local_experts,
-            pad_multiple=_PAD_MULTIPLE,
-            num_permuted_tokens=None,
-            non_blocking=False,
+                hidden=route_hidden.contiguous(),
+                topk_idx=route_indices.reshape(-1, 1).contiguous(),
+                topk_weights=None,
+                num_of_experts=num_experts,
+                scaling_factor=None,
+                num_of_experts_per_rank=num_local_experts,
+                pad_multiple=_PAD_MULTIPLE,
+                num_permuted_tokens=None,
+                non_blocking=False,
             )
-        )
-        route_metadata = torch.zeros_like(route_hidden)
-        integer_keys = route_keys.to(dtype=torch.int64)
-        route_metadata[:, 0] = (integer_keys & 0xFF).to(torch.bfloat16)
-        route_metadata[:, 1] = ((integer_keys >> 8) & 0xFF).to(torch.bfloat16)
-        route_metadata[:, 2] = ((integer_keys >> 16) & 0xFF).to(torch.bfloat16)
-        (
-            dispatched_metadata,
-            _,
-            _,
-            _,
-            _,
-        ) = buffer.dispatch_with_permute(
-            hidden=route_metadata,
-            scaling_factor=None,
-            num_permuted_tokens=dispatched.shape[0],
-            pad_multiple=_PAD_MULTIPLE,
-            handle=handle,
-            non_blocking=False,
         )
         ctx.buffer = buffer
         ctx.handle = handle
-        return dispatched, dispatched_metadata, tokens_per_expert, handle
+        return dispatched, tokens_per_expert, handle
 
     @staticmethod
-    def backward(ctx, grad_dispatched, _grad_keys, _grad_counts, _grad_handle):
+    def backward(ctx, grad_dispatched, _grad_counts, _grad_handle):
         grad_routes, _ = ctx.buffer.combine_with_unpermute(
             hidden=grad_dispatched.contiguous(),
             handle=ctx.handle,
             pad_multiple=_PAD_MULTIPLE,
         )
-        return None, grad_routes, None, None, None, None
+        return None, grad_routes, None, None, None
 
 
 class _CombineRoutes(torch.autograd.Function):
@@ -157,9 +136,7 @@ class _CombineRoutes(torch.autograd.Function):
         ctx,
         buffer,
         expert_output: torch.Tensor,
-        expert_route_metadata,
         handle,
-        source_key_base: int,
         source_route_count: int,
     ):
         source_routes, _ = buffer.combine_with_unpermute(
@@ -167,49 +144,16 @@ class _CombineRoutes(torch.autograd.Function):
             handle=handle,
             pad_multiple=_PAD_MULTIPLE,
         )
-        source_metadata, _ = buffer.combine_with_unpermute(
-            hidden=expert_route_metadata.contiguous(),
-            handle=handle,
-            pad_multiple=_PAD_MULTIPLE,
-        )
-        source_keys = (
-            source_metadata[:, 0].to(torch.int64)
-            + (source_metadata[:, 1].to(torch.int64) << 8)
-            + (source_metadata[:, 2].to(torch.int64) << 16)
-        )
-        valid_rows = torch.nonzero(source_keys > 0, as_tuple=False).reshape(-1)
-        valid_keys = source_keys.index_select(0, valid_rows)
-        source_order = valid_rows.index_select(
-            0, torch.argsort(valid_keys, stable=True)
-        )
-        expected = torch.arange(
-            source_key_base + 1,
-            source_key_base + source_route_count + 1,
-            device=source_keys.device,
-            dtype=torch.int64,
-        )
-        ordered_keys = source_keys.index_select(0, source_order)
-        if not bool(torch.all(ordered_keys == expected).item()):
-            unique_keys = torch.unique(source_keys)
-            mismatches = torch.nonzero(
-                ordered_keys != expected, as_tuple=False
-            ).reshape(-1)
-            first = mismatches[:8]
+        if source_routes.shape[0] < source_route_count:
             raise RuntimeError(
-                "HybridEP route metadata was lost or duplicated during combine: "
-                f"rows={source_keys.numel()} unique={unique_keys.numel()} "
-                f"min={float(source_keys.min().item())} "
-                f"max={float(source_keys.max().item())} "
-                f"mismatch_positions={first.cpu().tolist()} "
-                f"actual={ordered_keys.index_select(0, first).cpu().tolist()} "
-                f"expected={expected.index_select(0, first).cpu().tolist()}"
+                "HybridEP combine returned fewer rows than the source route count"
             )
         ctx.buffer = buffer
         ctx.handle = handle
         ctx.num_permuted_tokens = expert_output.shape[0]
-        ctx.source_order = source_order
         ctx.native_source_rows = source_routes.shape[0]
-        return source_routes.index_select(0, source_order)
+        ctx.source_route_count = source_route_count
+        return source_routes.narrow(0, 0, source_route_count)
 
     @staticmethod
     def backward(ctx, grad_source_routes):
@@ -218,7 +162,7 @@ class _CombineRoutes(torch.autograd.Function):
             device=grad_source_routes.device,
             dtype=grad_source_routes.dtype,
         )
-        native_grad.index_copy_(0, ctx.source_order, grad_source_routes)
+        native_grad.narrow(0, 0, ctx.source_route_count).copy_(grad_source_routes)
         grad_expert, _, _, _, _ = ctx.buffer.dispatch_with_permute(
             hidden=native_grad.contiguous(),
             scaling_factor=None,
@@ -226,7 +170,7 @@ class _CombineRoutes(torch.autograd.Function):
             pad_multiple=_PAD_MULTIPLE,
             handle=ctx.handle,
         )
-        return None, grad_expert, None, None, None, None
+        return None, grad_expert, None, None
 
 
 def dispatch_routes(
@@ -251,17 +195,40 @@ def dispatch_routes(
         raise TypeError("hybridep route weights must be FP32")
 
     valid = (topk_indices >= 0) & (topk_indices < num_experts)
-    positions = torch.nonzero(valid, as_tuple=False)
-    token_rows = positions[:, 0]
-    topk_slots = positions[:, 1]
-    route_hidden = hidden_states.index_select(0, token_rows).contiguous()
-    route_indices = topk_indices[token_rows, topk_slots].reshape(-1)
-    source_route_count = positions.shape[0]
-    padded_route_count = torch.tensor(
-        source_route_count, device=hidden_states.device, dtype=torch.int64
-    )
-    dist.all_reduce(padded_route_count, op=dist.ReduceOp.MAX, group=group)
-    padded_route_count = int(padded_route_count.item())
+    if hidden_states.is_cuda:
+        torch._assert_async(
+            torch.all(valid),
+            "CUDA HybridEP requires every DS4 top-k route to be valid",
+        )
+        route_hidden = hidden_states.repeat_interleave(topk_indices.shape[1], dim=0)
+        route_indices = topk_indices.reshape(-1)
+        source_route_count = topk_indices.numel()
+        source_output_index = torch.arange(
+            source_route_count, device=topk_indices.device, dtype=torch.long
+        ).reshape_as(topk_indices)
+        source_all_routes_valid = True
+    else:
+        # CPU compaction is retained only as a unit-test/reference path.
+        positions = torch.nonzero(valid, as_tuple=False)
+        token_rows = positions[:, 0]
+        topk_slots = positions[:, 1]
+        route_hidden = hidden_states.index_select(0, token_rows).contiguous()
+        route_indices = topk_indices[token_rows, topk_slots].reshape(-1)
+        source_route_count = positions.shape[0]
+        source_output_index = torch.full_like(topk_indices, -1, dtype=torch.long)
+        source_output_index[token_rows, topk_slots] = torch.arange(
+            source_route_count, device=topk_indices.device, dtype=torch.long
+        )
+        source_all_routes_valid = source_route_count == topk_indices.numel()
+    if dist.is_initialized():
+        # HybridEP requires every rank to enter with the same route capacity.
+        # Its ABI accepts that capacity as a host integer, so exchange only
+        # Python shape metadata here; never read a CUDA count tensor.
+        route_counts = [None] * dist.get_world_size(group=group)
+        dist.all_gather_object(route_counts, source_route_count, group=group)
+        padded_route_count = max(int(count) for count in route_counts)
+    else:
+        padded_route_count = source_route_count
     if source_route_count < padded_route_count:
         padding = padded_route_count - source_route_count
         route_hidden = torch.cat(
@@ -288,10 +255,6 @@ def dispatch_routes(
             ),
             dim=0,
         )
-    source_output_index = torch.full_like(topk_indices, -1, dtype=torch.long)
-    source_output_index[token_rows, topk_slots] = torch.arange(
-        positions.shape[0], device=topk_indices.device, dtype=torch.long
-    )
     buffer = _get_buffer(
         group,
         hidden_states.shape[1],
@@ -299,41 +262,30 @@ def dispatch_routes(
         padded_route_count,
         hybridep_max_tokens_per_rank,
     )
-    source_key_base = dist.get_rank(group=group) << 20
-    route_keys = torch.zeros(
-        padded_route_count,
-        device=hidden_states.device,
-        dtype=torch.float32,
-    )
-    route_keys[:source_route_count] = torch.arange(
-        source_key_base + 1,
-        source_key_base + source_route_count + 1,
-        device=hidden_states.device,
-        dtype=torch.float32,
-    )
     (
         expert_hidden,
-        expert_route_metadata,
         padded_counts,
         handle,
     ) = _DispatchRoutes.apply(
         buffer,
         route_hidden,
         route_indices,
-        route_keys,
         num_experts,
         num_local_experts,
     )
     if not isinstance(padded_counts, torch.Tensor):
         raise TypeError("HybridEP tokens_per_expert must be a tensor")
-    counts = padded_counts.to(device=hidden_states.device, dtype=torch.int64)
-    if int(counts.sum().item()) != expert_hidden.shape[0]:
+    if padded_counts.device.type != "cpu":
+        raise RuntimeError("HybridEP expert counts must remain CPU metadata")
+    counts_list = [int(value) for value in padded_counts.tolist()]
+    if sum(counts_list) != expert_hidden.shape[0]:
         raise RuntimeError(
             "HybridEP padded expert counts do not cover dispatched rows"
         )
     return HybridEPDispatchResult(
         hidden=expert_hidden,
-        tokens_per_expert=counts,
+        tokens_per_expert=padded_counts,
+        tokens_per_expert_list=counts_list,
         probs=torch.zeros(
             expert_hidden.shape[0],
             device=expert_hidden.device,
@@ -342,13 +294,11 @@ def dispatch_routes(
         state=HybridEPRouteState(
             buffer=buffer,
             handle=handle,
-            expert_route_metadata=expert_route_metadata,
-            source_key_base=source_key_base,
             source_route_count=source_route_count,
             source_indices=topk_indices,
             source_weights=topk_scores,
             source_output_index=source_output_index,
-            source_all_routes_valid=positions.shape[0] == topk_indices.numel(),
+            source_all_routes_valid=source_all_routes_valid,
         ),
     )
 
@@ -359,8 +309,6 @@ def combine_routes(
     return _CombineRoutes.apply(
         state.buffer,
         expert_output,
-        state.expert_route_metadata,
         state.handle,
-        state.source_key_base,
         state.source_route_count,
     )

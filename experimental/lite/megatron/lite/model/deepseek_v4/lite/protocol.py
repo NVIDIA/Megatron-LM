@@ -67,6 +67,13 @@ class ImplConfig:
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
     qat: QATSpec | dict | None = None
+    profiling_proxy_mode: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.profiling_proxy_mode:
+            return
+        if self.offload:
+            raise ValueError("profiling_proxy_mode forbids activation offload")
 
 
 MODULE_MAP = {
