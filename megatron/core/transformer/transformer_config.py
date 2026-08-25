@@ -602,7 +602,7 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm".
+    "shortcut_pre_mlp_layernorm", "mamba".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -620,9 +620,10 @@ class TransformerConfig(ModelParallelConfig):
             enable_mhc_connections=True. Cannot be used with "mlp".
     "shortcut_pre_mlp_layernorm": recompute the shortcut router's input normalization.
             Requires moe_shortcut_connection=True and selective recomputation.
+    "mamba": recompute the Mamba mixer (conv + selective SSM/SSD) in a Mamba layer.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
     "mhc" and "shortcut_pre_mlp_layernorm" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and "mamba" use normal checkpointing.
     """
 
     ####################
@@ -2270,6 +2271,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_qkv",
                     "mhc",
                     "shortcut_pre_mlp_layernorm",
+                    "mamba",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
