@@ -37,11 +37,37 @@ def _group_rank_and_size(group: "torch.distributed.ProcessGroup | None") -> tupl
     return group.rank(), group.size()
 
 
+def _cat_or_empty(parts: list[torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``parts`` into one flat send buffer, or an empty buffer
+    matching ``ref``'s dtype/device when this rank has nothing to send (all of
+    its all_to_all input splits are zero)."""
+    if parts:
+        return torch.cat(parts)
+    return torch.empty(0, dtype=ref.dtype, device=ref.device)
+
+
+def _group_by_home(num_params: int, param_to_home_rank: dict, size: int) -> list[list[int]]:
+    """Group param indices by their NS home rank in the group.
+
+    The wired path (LPT bin-packing in LayerWiseDistributedOptimizer) always
+    supplies every entry; the ``i % size`` default is a round-robin FALLBACK
+    for direct-API callers or missing entries only. Assignments may be uneven —
+    with fewer params than ranks, the unassigned ranks simply get empty lists
+    and receive zero-size all_to_all splits.
+    """
+    send_idx: list[list[int]] = [[] for _ in range(size)]
+    for param_idx in range(num_params):
+        home = param_to_home_rank.get(param_idx, param_idx % size)
+        send_idx[home].append(param_idx)
+    return send_idx
+
+
 def layer_sharded_all_to_all_fwd(
     momentum_list: list[torch.Tensor],
     param_to_home_rank: dict,
     group: "torch.distributed.ProcessGroup | None",
     shard_dim: int = 0,
+    plan: "dict | None" = None,
 ) -> tuple[list[torch.Tensor], list[int]]:
     """Forward all_to_all for layer sharding: redistribute momentum shards.
 
@@ -59,6 +85,14 @@ def layer_sharded_all_to_all_fwd(
             stage 1, the TP group in stage 2). None means size 1: no exchange.
         shard_dim: Dimension the shards split (0 for the GTP_remat stage; the
             param's partition_dim for the TP stage).
+        plan: Optional mutable dict caching the routing metadata (index
+            groupings, split sizes, unpack offsets), which is a pure function
+            of shapes, homes and group size — all static across steps. Pass an
+            empty dict on the first call (it is filled) and the same dict on
+            later calls (the metadata rebuild is skipped; only the data
+            movement runs). The CALLER owns validity: reuse a plan only while
+            the participating params, their shapes and their homes are
+            unchanged. None (default) rebuilds every call.
 
     Returns:
         Tuple of:
@@ -78,71 +112,61 @@ def layer_sharded_all_to_all_fwd(
         # all_to_all_single, where None would mean the WORLD group.
         return list(momentum_list), list(range(len(momentum_list)))
 
-    # Group params by their NS home rank. The wired path (LPT bin-packing in
-    # LayerWiseDistributedOptimizer) always supplies every entry; the
-    # ``i % size`` default is a round-robin FALLBACK for direct-API callers or
-    # missing entries only. Assignments may be uneven — with fewer params than
-    # ranks, the unassigned ranks simply receive zero-size splits below.
-    rank_to_param_mapping = [[] for _ in range(size)]
-    for param_idx, param_momentum in enumerate(momentum_list):
-        home = param_to_home_rank.get(param_idx, param_idx % size)
-        rank_to_param_mapping[home].append((param_idx, param_momentum))
+    # Routing metadata: a pure function of shapes, homes and group size — built
+    # once and reused via ``plan`` (indices and sizes only, never tensors).
+    if plan is None:
+        plan = {}
+    if not plan:
+        send_idx = _group_by_home(len(momentum_list), param_to_home_rank, size)
+        my_param_indices = send_idx[rank]
+        my_param_numel = sum(momentum_list[i].numel() for i in my_param_indices)
+        # Prefix offsets of each of my params within one source block.
+        # Precomputed: deriving them inline is O(n^2 * size), and n reaches the
+        # hundreds when a home owns many same-shape expert weights.
+        param_offsets = [0]
+        for i in my_param_indices:
+            param_offsets.append(param_offsets[-1] + momentum_list[i].numel())
+        plan.update(
+            send_idx=send_idx,
+            input_split_sizes=[
+                sum(momentum_list[i].numel() for i in send_idx[r]) for r in range(size)
+            ],
+            my_param_indices=my_param_indices,
+            my_param_numel=my_param_numel,
+            output_split_sizes=[my_param_numel] * size,
+            param_offsets=param_offsets,
+        )
+    send_idx = plan['send_idx']
+    my_param_indices = plan['my_param_indices']
+    my_param_numel = plan['my_param_numel']
+    param_offsets = plan['param_offsets']
 
     # Build flat send buffer: [data_for_rank_0 | data_for_rank_1 | ...]
     # For each destination r', send my momentum shards for params assigned to r'
-    send_parts = []
-    input_split_sizes = []
-    for r_prime in range(size):
-        if rank_to_param_mapping[r_prime]:
-            chunk = torch.cat(
-                [m.contiguous().flatten() for _, m in rank_to_param_mapping[r_prime]]
-            )
-            send_parts.append(chunk)
-            input_split_sizes.append(chunk.numel())
-        else:
-            input_split_sizes.append(0)
+    send_parts = [
+        torch.cat([momentum_list[i].contiguous().flatten() for i in send_idx[r]])
+        for r in range(size)
+        if send_idx[r]
+    ]
 
-    _ref = momentum_list[0] if momentum_list else None
-    send_buf = (
-        torch.cat(send_parts)
-        if send_parts
-        else torch.empty(
-            0,
-            dtype=_ref.dtype if _ref is not None else torch.float32,
-            device=_ref.device if _ref is not None else torch.device('cpu'),
-        )
-    )
-
-    # Compute recv split sizes: from each source r', we receive momentum shards
-    # for all params assigned to us. Each shard has the same numel as the param.
-    my_params = rank_to_param_mapping[rank]
-    my_param_numel = sum(m.numel() for _, m in my_params)
-    output_split_sizes = [my_param_numel] * size
+    send_buf = _cat_or_empty(send_parts, momentum_list[0])
 
     recv_buf = torch.empty(my_param_numel * size, dtype=send_buf.dtype, device=send_buf.device)
 
     torch.distributed.all_to_all_single(
         recv_buf,
         send_buf,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
+        output_split_sizes=plan['output_split_sizes'],
+        input_split_sizes=plan['input_split_sizes'],
         group=group,
     )
 
     # Unpack: for each of my assigned params, concatenate the shards from all
     # sources. recv_buf layout: [from_r0 | from_r1 | ... | from_r(S-1)], where
     # each from_rk block contains that source's shards of my params, in order.
-    my_param_indices = [i for i, _ in my_params]
-
-    # Prefix offsets of each of my params within one source block. Precomputed:
-    # deriving them inline is O(n^2 * size), and n reaches the hundreds when a
-    # home owns many same-shape expert weights.
-    param_offsets = [0]
-    for _, m in my_params:
-        param_offsets.append(param_offsets[-1] + m.numel())
-
     complete_momentums = []
-    for pos, (_, m_template) in enumerate(my_params):
+    for pos, i in enumerate(my_param_indices):
+        m_template = momentum_list[i]
         numel = m_template.numel()
         offset = param_offsets[pos]
         # Slices of a 1-D contiguous buffer are already contiguous, so cat can
@@ -155,7 +179,7 @@ def layer_sharded_all_to_all_fwd(
         ]
         complete_momentums.append(torch.cat(shards, dim=shard_dim))  # (P, Q)
 
-    return complete_momentums, my_param_indices
+    return complete_momentums, list(my_param_indices)
 
 
 def layer_sharded_all_to_all_bwd(
@@ -165,6 +189,7 @@ def layer_sharded_all_to_all_bwd(
     param_to_home_rank: dict,
     group: "torch.distributed.ProcessGroup | None",
     shard_dim: int = 0,
+    plan: "dict | None" = None,
 ) -> list["torch.Tensor | None"]:
     """Backward all_to_all for layer sharding: distribute NS results as shards.
 
@@ -183,6 +208,9 @@ def layer_sharded_all_to_all_bwd(
         group: The process group to communicate within (see the fwd docstring).
             None means size 1: no exchange.
         shard_dim: Dimension the shards split (see the fwd docstring).
+        plan: Optional routing-metadata cache (see the fwd docstring; same
+            ownership rules). The shape-invariant precondition check also runs
+            only when the plan is built.
 
     Returns:
         List of (P/S, Q) NS update shards, one per param in momentum_list
@@ -199,17 +227,15 @@ def layer_sharded_all_to_all_bwd(
             update_shards[idx] = ns_r
         return update_shards
 
-    # Group params by their NS home rank (same grouping and same round-robin
-    # fallback as fwd — see the comment there).
-    rank_to_param_mapping = [[] for _ in range(size)]
-    for param_idx, param_momentum in enumerate(momentum_list):
-        home = param_to_home_rank.get(param_idx, param_idx % size)
-        rank_to_param_mapping[home].append((param_idx, param_momentum))
+    if plan is None:
+        plan = {}
+    if not plan:
+        send_idx = _group_by_home(len(momentum_list), param_to_home_rank, size)
 
-    # Precondition: ns_r must span exactly ``size`` equal-sized shards so the
-    # uniform-stride narrow below is correct.  A violated invariant produces silent
-    # corruption (narrow is in-bounds but slices the wrong rows).
-    if ns_results:
+        # Precondition: ns_r must span exactly ``size`` equal-sized shards so the
+        # uniform-stride narrow below is correct.  A violated invariant produces
+        # silent corruption (narrow is in-bounds but slices the wrong rows).
+        # Shape-only, so checking once at plan-build time covers every reuse.
         for ns_r, idx in zip(ns_results, my_param_indices):
             expected = momentum_list[idx].shape[shard_dim] * size
             assert ns_r.shape[shard_dim] == expected, (
@@ -219,47 +245,38 @@ def layer_sharded_all_to_all_bwd(
                 "all shards must be equal-sized (divisibility/padding invariant violated)."
             )
 
+        my_numel = sum(momentum_list[i].numel() for i in my_param_indices)
+        plan.update(
+            send_idx=send_idx,
+            input_split_sizes=[my_numel if ns_results else 0] * size,
+            output_split_sizes=[
+                sum(momentum_list[i].numel() for i in send_idx[r]) for r in range(size)
+            ],
+        )
+    send_idx = plan['send_idx']
+    output_split_sizes = plan['output_split_sizes']
+
     # Build send buffer: for each destination r', send that rank's shard of
     # each of MY ns_results. Shard size is per-param (heterogeneous shapes).
     send_parts = []
-    input_split_sizes = []
     for r_prime in range(size):
         if ns_results:
-            chunk = torch.cat(
-                [
-                    ns_r.narrow(
-                        shard_dim,
-                        r_prime * momentum_list[idx].shape[shard_dim],
-                        momentum_list[idx].shape[shard_dim],
-                    )
-                    .contiguous()
-                    .flatten()
-                    for ns_r, idx in zip(ns_results, my_param_indices)
-                ]
+            send_parts.append(
+                torch.cat(
+                    [
+                        ns_r.narrow(
+                            shard_dim,
+                            r_prime * momentum_list[idx].shape[shard_dim],
+                            momentum_list[idx].shape[shard_dim],
+                        )
+                        .contiguous()
+                        .flatten()
+                        for ns_r, idx in zip(ns_results, my_param_indices)
+                    ]
+                )
             )
-            send_parts.append(chunk)
-            input_split_sizes.append(chunk.numel())
-        else:
-            input_split_sizes.append(0)
 
-    _ref_bwd = momentum_list[0] if momentum_list else None
-    send_buf = (
-        torch.cat(send_parts)
-        if send_parts
-        else torch.empty(
-            0,
-            dtype=_ref_bwd.dtype if _ref_bwd is not None else torch.float32,
-            device=_ref_bwd.device if _ref_bwd is not None else torch.device('cpu'),
-        )
-    )
-
-    # Recv: from each source r', receive the shard for MY rank of their NS results
-    output_split_sizes = []
-    for r_prime in range(size):
-        # Number of params assigned to r', each contributing shard_size * Q elements
-        r_prime_params = rank_to_param_mapping[r_prime]
-        total_numel = sum(m.numel() for _, m in r_prime_params)  # P/S * Q * n_params
-        output_split_sizes.append(total_numel)
+    send_buf = _cat_or_empty(send_parts, momentum_list[0])
 
     recv_buf = torch.empty(sum(output_split_sizes), dtype=send_buf.dtype, device=send_buf.device)
 
@@ -267,7 +284,7 @@ def layer_sharded_all_to_all_bwd(
         recv_buf,
         send_buf,
         output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
+        input_split_sizes=plan['input_split_sizes'],
         group=group,
     )
 
@@ -275,7 +292,8 @@ def layer_sharded_all_to_all_bwd(
     update_shards: list["torch.Tensor | None"] = [None] * len(momentum_list)
     offset = 0
     for r_prime in range(size):
-        for i, m_template in rank_to_param_mapping[r_prime]:
+        for i in send_idx[r_prime]:
+            m_template = momentum_list[i]
             shard = recv_buf[offset : offset + m_template.numel()].view(m_template.shape)
             update_shards[i] = shard.contiguous()
             offset += m_template.numel()
@@ -292,6 +310,7 @@ def layer_sharded_fused_fwd(
     gtp_remat_size: int,
     tp_size: int,
     fused_group: "torch.distributed.ProcessGroup",
+    plan: "dict | None" = None,
 ) -> tuple[list[torch.Tensor], list[int]]:
     """Single fused all_to_all over the flattened (GTP_remat x TP) domain (forward).
 
@@ -337,70 +356,83 @@ def layer_sharded_fused_fwd(
 
     G, T = gtp_remat_size, tp_size
     S = G * T
-    my_flat = gtp_remat_rank * T + tp_rank
     n = len(momentum_list)
 
-    dest = [gh * T + th for gh, th in param_homes]
+    # Routing metadata: pure function of shapes, homes, pdims and domain
+    # extents — cacheable across steps via ``plan`` (see the two-stage fwd
+    # docstring for ownership rules).
+    if plan is None:
+        plan = {}
+    if not plan:
+        my_flat = gtp_remat_rank * T + tp_rank
+        dest = [gh * T + th for gh, th in param_homes]
 
-    # --- send: my local shard of param i goes to its home, except that for
-    # non-TP-sharded params only the t == t_home column contributes (all TP peers
-    # hold identical data; sending T copies would be pure waste).
-    send_lists: list[list[int]] = [[] for _ in range(S)]
-    for i in range(n):
-        if partition_dims[i] is None and tp_rank != param_homes[i][1]:
-            continue
-        send_lists[dest[i]].append(i)
+        # send: my local shard of param i goes to its home, except that for
+        # non-TP-sharded params only the t == t_home column contributes (all TP
+        # peers hold identical data; sending T copies would be pure waste).
+        send_lists: list[list[int]] = [[] for _ in range(S)]
+        for i in range(n):
+            if partition_dims[i] is None and tp_rank != param_homes[i][1]:
+                continue
+            send_lists[dest[i]].append(i)
 
-    send_parts = []
-    input_split_sizes = []
-    for d in range(S):
-        if send_lists[d]:
-            chunk = torch.cat([momentum_list[i].contiguous().flatten() for i in send_lists[d]])
-            send_parts.append(chunk)
-            input_split_sizes.append(chunk.numel())
-        else:
-            input_split_sizes.append(0)
-
-    _ref = momentum_list[0] if momentum_list else None
-    send_buf = (
-        torch.cat(send_parts)
-        if send_parts
-        else torch.empty(
-            0,
-            dtype=_ref.dtype if _ref is not None else torch.float32,
-            device=_ref.device if _ref is not None else torch.device('cpu'),
+        # recv: from source (g_s, t_s) I receive shards of my params, except the
+        # non-TP-sharded ones arrive only from the t_s == tp_rank column.
+        my_param_indices = [i for i in range(n) if dest[i] == my_flat]
+        contrib: list[list[int]] = []
+        piece_offsets: dict[tuple[int, int], int] = {}
+        offset = 0
+        for s in range(S):
+            t_s = s % T
+            lst = [
+                i for i in my_param_indices if partition_dims[i] is not None or t_s == tp_rank
+            ]
+            contrib.append(lst)
+            for i in lst:
+                piece_offsets[(s, i)] = offset
+                offset += momentum_list[i].numel()
+        plan.update(
+            send_lists=send_lists,
+            input_split_sizes=[
+                sum(momentum_list[i].numel() for i in send_lists[d]) for d in range(S)
+            ],
+            my_param_indices=my_param_indices,
+            output_split_sizes=[
+                sum(momentum_list[i].numel() for i in lst) for lst in contrib
+            ],
+            piece_offsets=piece_offsets,
         )
+    send_lists = plan['send_lists']
+    my_param_indices = plan['my_param_indices']
+    piece_offsets = plan['piece_offsets']
+
+    send_parts = [
+        torch.cat([momentum_list[i].contiguous().flatten() for i in send_lists[d]])
+        for d in range(S)
+        if send_lists[d]
+    ]
+
+    send_buf = _cat_or_empty(send_parts, momentum_list[0])
+
+    recv_buf = torch.empty(
+        sum(plan['output_split_sizes']), dtype=send_buf.dtype, device=send_buf.device
     )
-
-    # --- recv: from source (g_s, t_s) I receive shards of my params, except the
-    # non-TP-sharded ones arrive only from the t_s == tp_rank column.
-    my_param_indices = [i for i in range(n) if dest[i] == my_flat]
-    contrib: list[list[int]] = []
-    output_split_sizes = []
-    for s in range(S):
-        t_s = s % T
-        lst = [i for i in my_param_indices if partition_dims[i] is not None or t_s == tp_rank]
-        contrib.append(lst)
-        output_split_sizes.append(sum(momentum_list[i].numel() for i in lst))
-
-    recv_buf = torch.empty(sum(output_split_sizes), dtype=send_buf.dtype, device=send_buf.device)
 
     torch.distributed.all_to_all_single(
         recv_buf,
         send_buf,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
+        output_split_sizes=plan['output_split_sizes'],
+        input_split_sizes=plan['input_split_sizes'],
         group=fused_group,
     )
 
-    # --- unpack: index every (source, param) piece via running offsets.
-    piece: dict[tuple[int, int], torch.Tensor] = {}
-    offset = 0
-    for s in range(S):
-        for i in contrib[s]:
-            numel = momentum_list[i].numel()
-            piece[(s, i)] = recv_buf[offset : offset + numel].view(momentum_list[i].shape)
-            offset += numel
+    # --- unpack: every (source, param) piece at its precomputed offset.
+    piece = {
+        key: recv_buf[off : off + momentum_list[key[1]].numel()].view(
+            momentum_list[key[1]].shape
+        )
+        for key, off in piece_offsets.items()
+    }
 
     # --- reassemble in the same block order the two-stage path produces.
     full_mats = []
@@ -417,7 +449,7 @@ def layer_sharded_fused_fwd(
             blocks = [piece[(g * T + tp_rank, i)] for g in range(G)]
             full_mats.append(torch.cat(blocks, dim=0))
 
-    return full_mats, my_param_indices
+    return full_mats, list(my_param_indices)
 
 
 def layer_sharded_fused_bwd(
@@ -431,6 +463,7 @@ def layer_sharded_fused_bwd(
     gtp_remat_size: int,
     tp_size: int,
     fused_group: "torch.distributed.ProcessGroup",
+    plan: "dict | None" = None,
 ) -> list["torch.Tensor | None"]:
     """Single fused all_to_all over the flattened (GTP_remat x TP) domain (backward).
 
@@ -450,32 +483,51 @@ def layer_sharded_fused_bwd(
     if n == 0:
         return []
 
-    dest = [gh * T + th for gh, th in param_homes]
+    if plan is None:
+        plan = {}
+    if not plan:
+        dest = [gh * T + th for gh, th in param_homes]
 
-    # Precondition: each ns_r must span exactly G×T (pd=0) or G (pd=1/None) equal-sized
-    # blocks so the uniform-stride slicing below is correct.  Silent corruption otherwise.
-    for ns_r, i in zip(ns_results, my_param_indices):
-        shape = momentum_list[i].shape
-        pd = partition_dims[i]
-        if pd == 0:
-            assert ns_r.shape[0] == shape[0] * G * T, (
-                f"layer_sharded_fused_bwd pd=0: ns_r.shape[0]={ns_r.shape[0]} != "
-                f"shard_rows={shape[0]} × G={G} × T={T}"
-            )
-        elif pd == 1:
-            assert ns_r.shape[0] == shape[0] * G and ns_r.shape[1] == shape[1] * T, (
-                f"layer_sharded_fused_bwd pd=1: ns_r shape {tuple(ns_r.shape)} != "
-                f"({shape[0]}×{G}, {shape[1]}×{T})"
-            )
-        else:
-            assert ns_r.shape[0] == shape[0] * G, (
-                f"layer_sharded_fused_bwd pd=None: ns_r.shape[0]={ns_r.shape[0]} != "
-                f"shard_rows={shape[0]} × G={G}"
-            )
+        # Precondition: each ns_r must span exactly G×T (pd=0) or G (pd=1/None)
+        # equal-sized blocks so the uniform-stride slicing below is correct
+        # (silent corruption otherwise). Shape-only, so checking once at
+        # plan-build time covers every reuse.
+        for ns_r, i in zip(ns_results, my_param_indices):
+            shape = momentum_list[i].shape
+            pd = partition_dims[i]
+            if pd == 0:
+                assert ns_r.shape[0] == shape[0] * G * T, (
+                    f"layer_sharded_fused_bwd pd=0: ns_r.shape[0]={ns_r.shape[0]} != "
+                    f"shard_rows={shape[0]} × G={G} × T={T}"
+                )
+            elif pd == 1:
+                assert ns_r.shape[0] == shape[0] * G and ns_r.shape[1] == shape[1] * T, (
+                    f"layer_sharded_fused_bwd pd=1: ns_r shape {tuple(ns_r.shape)} != "
+                    f"({shape[0]}×{G}, {shape[1]}×{T})"
+                )
+            else:
+                assert ns_r.shape[0] == shape[0] * G, (
+                    f"layer_sharded_fused_bwd pd=None: ns_r.shape[0]={ns_r.shape[0]} != "
+                    f"shard_rows={shape[0]} × G={G}"
+                )
 
-    # --- send: one piece per (my param, destination rank).
+        my_numel = sum(momentum_list[i].numel() for i in my_param_indices)
+        params_of_home: list[list[int]] = [[] for _ in range(S)]
+        for i in range(n):
+            params_of_home[dest[i]].append(i)
+        plan.update(
+            input_split_sizes=[my_numel] * S,
+            params_of_home=params_of_home,
+            output_split_sizes=[
+                sum(momentum_list[i].numel() for i in params_of_home[s]) for s in range(S)
+            ],
+        )
+    params_of_home = plan['params_of_home']
+    output_split_sizes = plan['output_split_sizes']
+
+    # --- send: one piece per (my param, destination rank). This slicing of the
+    # actual NS results is inherently per-step; only the sizes are cached.
     send_parts = []
-    input_split_sizes = []
     for s in range(S):
         g_d, t_d = divmod(s, T)
         pieces = []
@@ -496,35 +548,19 @@ def layer_sharded_fused_bwd(
                 rows = shape[0]
                 pieces.append(ns_r.narrow(0, g_d * rows, rows).contiguous().flatten())
         if pieces:
-            chunk = torch.cat(pieces)
-            send_parts.append(chunk)
-            input_split_sizes.append(chunk.numel())
-        else:
-            input_split_sizes.append(0)
+            send_parts.append(torch.cat(pieces))
 
-    _ref = momentum_list[0]
-    send_buf = (
-        torch.cat(send_parts)
-        if send_parts
-        else torch.empty(0, dtype=_ref.dtype, device=_ref.device)
-    )
+    send_buf = _cat_or_empty(send_parts, momentum_list[0])
 
     # --- recv: from each home, its params' shards (ordered by ascending param index,
     # matching that home's my_param_indices construction).
-    params_of_home: list[list[int]] = [[] for _ in range(S)]
-    for i in range(n):
-        params_of_home[dest[i]].append(i)
-    output_split_sizes = [
-        sum(momentum_list[i].numel() for i in params_of_home[s]) for s in range(S)
-    ]
-
     recv_buf = torch.empty(sum(output_split_sizes), dtype=send_buf.dtype, device=send_buf.device)
 
     torch.distributed.all_to_all_single(
         recv_buf,
         send_buf,
         output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
+        input_split_sizes=plan['input_split_sizes'],
         group=fused_group,
     )
 
