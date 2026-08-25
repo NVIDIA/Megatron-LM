@@ -1746,3 +1746,100 @@ def test_tp_replicated_ns_chunking_is_column_invariant():
         f"(t={t_rank}, g={g_rank}): "
         f"max_diff={(gathered[0] - gathered[1]).abs().max().item():.2e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Lazy fused-communicator build (_build_gtp_group / _select_fused_group):
+# the wiring derives the full GTP (TP x GTP_remat) communicator from the two
+# axis groups, parallel_state-free. Group rank must satisfy the g*T+t contract
+# by construction; padded and non-grid domains fall back to two-stage.
+# ---------------------------------------------------------------------------
+
+from megatron.core.optimizer.layer_wise_optimizer import (  # noqa: E402
+    _build_gtp_group,
+    _select_fused_group,
+)
+
+
+def test_build_gtp_group_rank_contract_and_bitwise():
+    """The lazily built communicator satisfies g*T+t and, used as fused_group,
+    reproduces the two-stage exchange bitwise."""
+    _require_four_ranks()
+    tp_group, gtp_remat_group = _get_2d_groups()
+    T = 2
+    r = dist.get_rank()
+    t_rank, g_rank = r % T, r // T
+
+    fused = _build_gtp_group(gtp_remat_group, tp_group)
+    assert fused is not None and fused.size() == 4
+    assert dist.get_rank(fused) == g_rank * T + t_rank, (
+        f"rank contract violated: fused rank {dist.get_rank(fused)} != "
+        f"{g_rank} * {T} + {t_rank}"
+    )
+
+    # Bitwise: same params, same grads, fused (lazily built) vs two-stage.
+    torch.manual_seed(_SEED + 600)
+    full = torch.randn(16, 12)
+    grad = torch.randn(16, 12)
+
+    def _shard(t):
+        tp_local = t[t_rank * 8 : (t_rank + 1) * 8, :]  # pd=0 over TP
+        return tp_local[g_rank * 4 : (g_rank + 1) * 4, :].clone()
+
+    results = []
+    for fused_group in (None, fused):
+        p = _gtp_param(_shard(full))
+        p.partition_dim = 0
+        opt = LayerShardedMuon(
+            [p], lr=1e-2, weight_decay=0.0, num_ns_steps=5,
+            fp32_matmul_prec="highest", gtp_remat_group=gtp_remat_group,
+            tp_group=tp_group, fused_group=fused_group,
+        )
+        opt.set_param_ns_homes({id(p): (1, 1)})
+        p.grad = _shard(grad)
+        opt.step()
+        results.append(p.data.clone())
+    assert torch.equal(results[0], results[1]), (
+        f"fused (lazy-built) != two-stage: "
+        f"max_diff={(results[0] - results[1]).abs().max().item():.2e}"
+    )
+
+
+def test_build_gtp_group_cached():
+    """Repeated builds for the same domain return the same communicator."""
+    _require_four_ranks()
+    tp_group, gtp_remat_group = _get_2d_groups()
+    first = _build_gtp_group(gtp_remat_group, tp_group)
+    second = _build_gtp_group(gtp_remat_group, tp_group)
+    assert first is second
+
+
+def test_select_fused_group_pad_gate_and_axes():
+    """Padded domains fall back to two-stage; 1-D domains use the surviving axis."""
+    _require_four_ranks()
+    tp_group, gtp_remat_group = _get_2d_groups()
+    padded = torch.nn.Parameter(torch.randn(4, 4))
+    padded.pad_length = 2
+    clean = torch.nn.Parameter(torch.randn(4, 4))
+
+    assert _select_fused_group(gtp_remat_group, tp_group, None, [clean, padded]) is None
+    got = _select_fused_group(gtp_remat_group, tp_group, None, [clean])
+    assert got is not None and got.size() == 4  # cached from the earlier build
+    # Explicit supply of the right size wins over the lazy build.
+    assert _select_fused_group(gtp_remat_group, tp_group, got, [clean]) is got
+    # 1-D domains: the surviving axis group is the flat domain.
+    assert _select_fused_group(gtp_remat_group, None, None, [clean]) is gtp_remat_group
+    assert _select_fused_group(None, tp_group, None, [clean]) is tp_group
+
+
+def test_build_gtp_group_non_grid_falls_back():
+    """Axis groups that do not form an affine grid yield None (two-stage), not
+    a wrongly ordered communicator or a crash."""
+    _require_four_ranks()
+    # Both "axes" partition the world identically: the additive derivation
+    # produces duplicate members, which the grid check must catch on every rank.
+    a_group, _ = dist.new_subgroups_by_enumeration([[0, 1], [2, 3]])
+    b_group, _ = dist.new_subgroups_by_enumeration([[0, 1], [2, 3]])
+    assert _build_gtp_group(a_group, b_group) is None
+    # The (None) result is cached too: no second world collective.
+    assert _build_gtp_group(a_group, b_group) is None
