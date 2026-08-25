@@ -63,8 +63,11 @@ def _parse_and_validate() -> argparse.Namespace:
         validate_args(args, {"dataloader_type": "external"})
     finally:
         args.world_size = physical_world_size
-    if not args.use_distributed_optimizer:
-        raise ValueError("heterogeneous MIMO training requires --use-distributed-optimizer")
+    if not (
+        args.use_distributed_optimizer
+        or getattr(args, "use_layer_wise_distributed_optimizer", False)
+    ):
+        raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
     validate_encoder_prefetch_args(args)
 
     if getattr(args, "padded_vocab_size", None) is None:
@@ -86,7 +89,7 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs)
+    topology = create_topology(specs, args.high_priority_stream_groups)
 
     communicator = provider.build_communicator(args, topology)
 

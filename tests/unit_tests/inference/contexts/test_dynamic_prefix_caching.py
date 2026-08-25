@@ -14,6 +14,9 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
 )
+from megatron.core.inference.disaggregation.inference_state_handoff import (
+    InferenceStateHandoffMixin,
+)
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -814,7 +817,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         # no prefill skipping
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
 
         ctx.add_request(req2)
@@ -959,6 +962,31 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             self._mctx(prefix_caching_mamba_gb=1e-5)
 
     @pytest.mark.internal
+    def test_hybrid_admission_resumes_after_handoff_releases_live_slot(self):
+        ctx = self._mctx(max_requests=1, rounder=1)
+        ctx.kv_block_allocator.enable_handoff_pinning = True
+        slot = ctx.mamba_metadata.allocate_slot()
+        assert slot is not None
+        ctx.mamba_metadata.request_to_mamba_state_idx[0] = slot
+        ctx.mamba_metadata.detach_state_slot(0)
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert not request_available
+
+        engine = InferenceStateHandoffMixin()
+        engine.context = ctx
+        engine._initialize_disaggregation_state()
+        engine._pinned_handoff_ssm_slots[7] = slot
+        engine.release_handoff_blocks(7)
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+        assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
+
+    @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
         # mamba match limits prefill skip
         ctx = self._mctx()
@@ -970,7 +998,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
 
         # no mamba match means no skip
@@ -979,7 +1007,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2.clone()))
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 0
-        (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
+        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
         # zero prefill for hybrid (mamba-cached, block-aligned)
@@ -989,7 +1017,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx3, self._block_ids(ctx3, 0, 3))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 3
-        (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
+        m3, _, _, _, ps3, ec3 = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
@@ -1001,7 +1029,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
         req4b = self._req(ctx4, p4.clone(), request_id=2)
-        (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
+        m4, _, _, _, ps4, ec4 = ctx4._compute_prefix_match(req4b, len(p4))
         assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
 
@@ -1046,7 +1074,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             == ctx.mamba_chunk_size + 1
         )
 
-        with pytest.raises(AssertionError, match="max_tokens > mamba_chunk_size"):
+        with pytest.raises(AssertionError, match="max_tokens > ssm_chunk_alignment"):
             self._mctx(
                 batch_invariant_mode=True,
                 enable_prefix_caching=False,
@@ -1070,7 +1098,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
-        (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, overall, prefix_skip, _ = ctx._compute_prefix_match(req2, len(prompt))
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
         msa.compute_and_store_offsets(
@@ -1408,6 +1436,15 @@ def _make_cpu_mamba_slot_allocator(
         max_mamba_intermediate_states_per_step=1,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         kv_block_allocator=kv_allocator,
+        # A real context always sets these two together (see
+        # DynamicInferenceContext.__init__), and the allocator asserts their
+        # divisibility on construction. Mamba-only values: a model whose SSM
+        # layers all chunk at 128 aligns at 128.
+        mamba_chunk_size=128,
+        ssm_chunk_alignment=128,
+        # Gated Delta Product prefix caching is unsupported; the allocator
+        # asserts this is 0 on construction (see MambaSlotAllocator.__init__).
+        gdp_num_householder=0,
     )
     return MambaSlotAllocator(
         context=context,
@@ -1923,7 +1960,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 
         # request 2 shares the first 4 blocks, adds 2 new blocks
         req2 = self._req(ctx, self._prompt(bs * 6), request_id=2)
-        (matched, _, _, _, prefix_skip, _) = ctx._compute_prefix_match(req2, bs * 6)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(req2, bs * 6)
         assert len(matched) == 4 and prefix_skip == bs * 4
         ctx.add_request(req2)
 
