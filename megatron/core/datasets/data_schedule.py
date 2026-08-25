@@ -604,7 +604,13 @@ class DpBalancedScheduler(BasePackingScheduler):
             ]
 
             # Step 5: Build packed microbatches
-            new_samples = build_packed_microbatches(grouped_samples, dev)
+            new_samples = build_packed_microbatches(
+                grouped_samples,
+                dev,
+                sample_id_groups=sample_id_groups,
+                dcp_rank=dcp_rank,
+                global_id_seqlens=global_id_seqlens,
+            )
 
             # Step 6: Calculate FLOPs info
             seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
@@ -778,7 +784,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     dev = torch.cuda.current_device()
 
     # data_iterator should return a batch including the following keys.
-    batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
+    batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'zigzag_cp_min_chunk_size']
     if is_first_stage:
         batch_keys.append('tokens')
         batch_keys.append('position_ids')
@@ -790,6 +796,10 @@ def get_batch_on_this_rank_for_sequence_packing(
     if is_tp_rank_0:
         assert data_iterator is not None
         batch = next(data_iterator)
+        # External iterators do not carry the optional scheduler certificate.
+        # Unknown geometry keeps MTP on its established zigzag packed-CP roll path.
+        if 'zigzag_cp_min_chunk_size' not in batch:
+            batch['zigzag_cp_min_chunk_size'] = torch.tensor(-1, dtype=torch.int32, device=dev)
         for key in batch_keys:
             assert key in batch, f"{key} is missing in current batch."
     else:
@@ -888,6 +898,17 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['cu_seqlens_padded'] = torch.empty([cu_seqlen_size], dtype=torch.int32, device=dev)
         batch['max_seqlen'] = torch.empty(1, dtype=torch.int32, device=dev)
 
+    if is_tp_rank_0:
+        if type(batch['zigzag_cp_min_chunk_size']) == int:
+            batch['zigzag_cp_min_chunk_size'] = torch.tensor(
+                batch['zigzag_cp_min_chunk_size'], dtype=torch.int32, device=dev
+            )
+        else:
+            assert batch['zigzag_cp_min_chunk_size'].dtype == torch.int32
+            assert batch['zigzag_cp_min_chunk_size'].numel() == 1
+    else:
+        batch['zigzag_cp_min_chunk_size'] = torch.empty(1, dtype=torch.int32, device=dev)
+
     # Broadcast batch inside TP group.
     broadcast_tensor(batch['tokens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['position_ids'], tp_src_rank, tp_group)
@@ -897,6 +918,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
     broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['zigzag_cp_min_chunk_size'], tp_src_rank, tp_group)
 
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']
@@ -906,7 +928,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     padding_mask = batch['padding_mask']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
-    max_seqlen = batch['max_seqlen'].item()
+    max_seqlen, zigzag_cp_min_chunk_size = (
+        torch.cat([batch['max_seqlen'].reshape(1), batch['zigzag_cp_min_chunk_size'].reshape(1)])
+        .cpu()
+        .tolist()
+    )
+    if zigzag_cp_min_chunk_size < 0:
+        zigzag_cp_min_chunk_size = None
 
     # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
     # get the correct result.
@@ -919,6 +947,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.

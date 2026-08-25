@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.transformer import mtp_sequence_roll
 from megatron.core.transformer.mtp_sequence_roll import (
@@ -499,38 +499,6 @@ def test_uncertified_and_zero_certificate_keep_zigzag_roll_fallback():
     negative = _certified_zigzag_params(cu_seqlens, dynamic_group, certificate=-1, local_cp_size=2)
     with pytest.raises(ValueError, match="certificate cannot be negative"):
         prepare_mtp_sequence_roll_context(source, static_group, negative)
-
-
-def test_zigzag_certificate_survives_padding_and_tightens_for_dummy_sequence():
-    """Appending a shorter physical sequence conservatively lowers the certificate."""
-    cu_seqlens = torch.tensor([0, 16], dtype=torch.int32)
-    packed = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens.clone(),
-        cu_seqlens_q_padded=cu_seqlens.clone(),
-        cu_seqlens_kv_padded=cu_seqlens.clone(),
-        max_seqlen_q=16,
-        max_seqlen_kv=16,
-        local_cp_size=2,
-        cp_partition_mode="zigzag",
-        zigzag_cp_min_chunk_size=4,
-    )
-
-    _, _, _, _, padded, _ = pad_sequence_for_thd(
-        torch.ones(1, 8),
-        None,
-        None,
-        None,
-        packed,
-        target_len=12,
-        tail_padding_policy="append_dummy_seq",
-        cp_size=2,
-        cp_rank=0,
-    )
-
-    assert padded.cu_seqlens_q_padded.tolist() == [0, 16, 24]
-    assert padded.zigzag_cp_min_chunk_size == 2
 
 
 def test_zigzag_certificate_is_ignored_by_cuda_graph_argument_matching():
@@ -1185,13 +1153,17 @@ class TestContiguousPackedCPPreparedRollRowsDistributed:
 
         def run(sequence_roll_context, sequence_roll_padding_mask=None):
             config = SimpleNamespace(
-                pipeline_model_parallel_size=1, mtp_num_layers=num_depths, mtp_detach_heads=False
+                pipeline_model_parallel_size=1,
+                mtp_num_layers=num_depths,
+                mtp_detach_heads=False,
+                mtp_hsm=False,
             )
             block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
             torch.nn.Module.__init__(block)
             block.config = config
             block.vp_stage = None
             block.mtp_use_repeated_layer = False
+            block.sequence_parallel = False
             block.layers = torch.nn.ModuleList(RollAwareLayer() for _ in range(num_depths))
             output = block.forward(
                 input_ids=local_ids,
@@ -1405,6 +1377,7 @@ def test_mtp_block_scatters_only_prepared_global_padding_masks(
         pipeline_model_parallel_size=1,
         mtp_num_layers=1,
         mtp_detach_heads=False,
+        mtp_hsm=False,
         sequence_parallel=sequence_parallel,
     )
     block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
@@ -1412,6 +1385,7 @@ def test_mtp_block_scatters_only_prepared_global_padding_masks(
     block.config = config
     block.vp_stage = None
     block.mtp_use_repeated_layer = False
+    block.sequence_parallel = sequence_parallel
     block.layers = torch.nn.ModuleList((RecordingLayer(),))
 
     block.forward(

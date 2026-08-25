@@ -14,9 +14,39 @@ from megatron.core.datasets.data_schedule import (
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.datasets.data_schedule_utils import build_packed_microbatches
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize(("padded_lengths", "expected_min_chunk"), [((8, 12), 2), ((8, 10), 0)])
+def test_build_packed_microbatches_certifies_zigzag_chunk_size(padded_lengths, expected_min_chunk):
+    """The host schedule emits one conservative certificate per packed microbatch."""
+    samples = []
+    for padded_length in padded_lengths:
+        samples.append(
+            {
+                "tokens": torch.arange(padded_length, dtype=torch.int64),
+                "labels": torch.arange(padded_length, dtype=torch.int64),
+                "loss_mask": torch.ones(padded_length, dtype=torch.float32),
+                "position_ids": torch.arange(padded_length, dtype=torch.int64),
+                "original_seq_len": torch.tensor([padded_length - 1], dtype=torch.int32),
+                "padded_seq_len": torch.tensor([padded_length], dtype=torch.int32),
+            }
+        )
+    sample_id_groups = [[[0, 1], [0, 1]]]
+
+    packed = build_packed_microbatches(
+        [samples],
+        torch.device("cpu"),
+        sample_id_groups=sample_id_groups,
+        dcp_rank=0,
+        global_id_seqlens=list(enumerate(padded_lengths)),
+    )
+
+    assert len(packed) == 1
+    assert packed[0]["zigzag_cp_min_chunk_size"].item() == expected_min_chunk
 
 
 def test_scheduler_thd_padding_mask_from_cu_seqlens():

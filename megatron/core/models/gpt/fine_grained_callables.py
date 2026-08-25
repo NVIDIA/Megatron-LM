@@ -64,7 +64,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         and layer.config.moe_flex_dispatcher_backend == "ncclep"
     )
 
-    def submodule_pre_dispatch_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+    def submodule_pre_dispatch_forward(
+        node: ScheduleNode, hidden_states: torch.Tensor, padding_mask: Optional[Tensor] = None
+    ):
         """
         Performs the same attention forward logic as GPTModel and the forward pass for
         computations between attention and dispatch:
@@ -88,6 +90,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 rotary_pos_sin: Optional[Tensor] = None,
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
+                padding_mask: Optional[Tensor] = None,
             ):
                 hidden_states, _ = layer._forward_attention(
                     hidden_states=hidden_states,
@@ -123,13 +126,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                probs, routing_map = layer.mlp.route(
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
+                )
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
                 return hidden_states, local_tokens, probs, shared_expert_output
 
-        hidden_states, local_tokens, probs, shared_expert_output = forward_func(
+        forward_kwargs = dict(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
@@ -138,6 +143,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
+        effective_padding_mask = (
+            padding_mask if padding_mask is not None else node.chunk_state.padding_mask
+        )
+        if is_moe and effective_padding_mask is not None:
+            forward_kwargs["padding_mask"] = effective_padding_mask
+        hidden_states, local_tokens, probs, shared_expert_output = forward_func(**forward_kwargs)
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
 
