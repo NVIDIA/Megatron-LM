@@ -112,17 +112,17 @@ def _gtp_param(t):
 # ---------------------------------------------------------------------------
 
 _TP_GROUP = None
-_GTP_GROUP = None
+_GTP_REMAT_GROUP = None
 _EGTP_GROUP = None
 
 
 def _get_2d_groups():
     """Create TP(2) x GTP(2) subgroups once. Convention: rank = g * T + t (tp innermost)."""
-    global _TP_GROUP, _GTP_GROUP
+    global _TP_GROUP, _GTP_REMAT_GROUP
     if _TP_GROUP is None:
         _TP_GROUP, _ = dist.new_subgroups_by_enumeration([[0, 1], [2, 3]])
-        _GTP_GROUP, _ = dist.new_subgroups_by_enumeration([[0, 2], [1, 3]])
-    return _TP_GROUP, _GTP_GROUP
+        _GTP_REMAT_GROUP, _ = dist.new_subgroups_by_enumeration([[0, 2], [1, 3]])
+    return _TP_GROUP, _GTP_REMAT_GROUP
 
 
 def _get_expert_group():
@@ -166,11 +166,11 @@ def test_layer_sharding_pipeline_matches_allgather_ns(P, Q, N):
 
     # --- Layer sharding path ---
     complete, my_indices = layer_sharded_all_to_all_fwd(
-        local_shards, assignment, r, S, _world(), gtp_dim=0
+        local_shards, assignment, _world(), shard_dim=0
     )
     ns_results = [newton_schulz(m.float(), steps=5, coefficient_type="quintic") for m in complete]
     update_shards = layer_sharded_all_to_all_bwd(
-        ns_results, my_indices, local_shards, assignment, r, S, _world(), gtp_dim=0
+        ns_results, my_indices, local_shards, assignment, _world(), shard_dim=0
     )
 
     # --- Reference path: all_gather + NS + reshard ---
@@ -253,7 +253,7 @@ def test_layer_sharded_matches_duplicated(P, Q, N, momentum, nesterov):
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",  # match the module fixture precision
-        gtp_group=_world(),
+        gtp_remat_group=_world(),
     )
 
     # Set NS home assignment: param i -> GTP rank i % S
@@ -367,7 +367,7 @@ def test_unequal_assignment_still_correct():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=_world(),
+        gtp_remat_group=_world(),
     )
     optimizer.set_param_ns_homes({id(params[i]): (ns_homes[i], 0) for i in range(N)})
     optimizer.step()
@@ -396,9 +396,9 @@ def test_mixed_partition_dims_match_full_matrix_reference():
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     assert dist.get_rank(tp_group) == t_rank
-    assert dist.get_rank(gtp_group) == g_rank
+    assert dist.get_rank(gtp_remat_group) == g_rank
 
     lr, momentum = 1e-2, 0.95
     torch.manual_seed(_SEED + 40)
@@ -446,7 +446,7 @@ def test_mixed_partition_dims_match_full_matrix_reference():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
     )
     optimizer.set_param_ns_homes({id(p): spec[2] for p, spec in zip(params, specs)})
@@ -488,7 +488,7 @@ def test_replicated_mixed_with_sharded(fused, ns_batch):
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     lr, momentum = 1e-2, 0.95
     torch.manual_seed(_SEED + 60)
 
@@ -540,7 +540,7 @@ def test_replicated_mixed_with_sharded(fused, ns_batch):
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
         fused_group=_world() if fused else None,
         ns_batch_size=ns_batch,
@@ -599,7 +599,7 @@ def test_dense_and_expert_groups_use_their_own_domains():
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     egtp_group = _get_expert_group()
     # Expert layout: EP group = which experts this rank holds, EGTP = row shard.
     ep_rank, egtp_rank = r // 2, r % 2
@@ -654,10 +654,10 @@ def test_dense_and_expert_groups_use_their_own_domains():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
     )
-    optimizer.set_group_process_groups({0: (gtp_group, tp_group), 1: (egtp_group, None)})
+    optimizer.set_group_process_groups({0: (gtp_remat_group, tp_group), 1: (egtp_group, None)})
     homes = {id(p): h for p, (_, h) in zip(dense_params, dense_specs)}
     homes.update({id(p): (h, 0) for p, h in zip(expert_params, expert_homes)})
     optimizer.set_param_ns_homes(homes)
@@ -707,7 +707,7 @@ def test_concurrent_groups_match_serial_bitwise():
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     egtp_group = _get_expert_group()
     ep_rank, egtp_rank = r // 2, r % 2
     lr, momentum = 1e-2, 0.95
@@ -754,12 +754,12 @@ def test_concurrent_groups_match_serial_bitwise():
             scale_mode="spectral",
             extra_scale_factor=1.0,
             fp32_matmul_prec="highest",
-            gtp_group=gtp_group,
+            gtp_remat_group=gtp_remat_group,
             tp_group=tp_group,
             ns_batch_size=1,
             concurrent_groups=concurrent,
         )
-        opt.set_group_process_groups({0: (gtp_group, tp_group), 1: (egtp_group, None)})
+        opt.set_group_process_groups({0: (gtp_remat_group, tp_group), 1: (egtp_group, None)})
         homes = {id(p): h for p, (_, h) in zip(dense, dense_specs)}
         homes.update({id(p): (h, 0) for p, h in zip(expert, expert_homes)})
         opt.set_param_ns_homes(homes)
@@ -783,7 +783,7 @@ def test_degenerate_domain_group_falls_back_to_local_ns():
     """A group whose (GTP x TP) domain is a single rank runs plain local NS."""
     _require_four_ranks()
     r = dist.get_rank()
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     lr, momentum = 1e-2, 0.95
 
     torch.manual_seed(_SEED + 80 + r)  # distinct per rank: purely local math
@@ -814,10 +814,10 @@ def test_degenerate_domain_group_falls_back_to_local_ns():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
     )
-    optimizer.set_group_process_groups({0: (gtp_group, tp_group), 1: (None, None)})
+    optimizer.set_group_process_groups({0: (gtp_remat_group, tp_group), 1: (None, None)})
     optimizer.set_param_ns_homes({id(other): (0, 0)})
     optimizer.step()
 
@@ -909,7 +909,7 @@ def test_batched_matches_unbatched(ns_batch_size, n_same, n_other, home):
             scale_mode="spectral",
             extra_scale_factor=1.0,
             fp32_matmul_prec="highest",
-            gtp_group=_world(),
+            gtp_remat_group=_world(),
             ns_batch_size=batch_size,
         )
         opt.set_param_ns_homes({id(p): homes[i] for i, p in enumerate(ps)})
@@ -967,7 +967,7 @@ def test_batched_expert_group_matches_full_matrix_reference():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=egtp_group,
+        gtp_remat_group=egtp_group,
         ns_batch_size=8,  # 9 experts -> chunks of 8 + 1
     )
     optimizer.set_param_ns_homes({id(p): (i % G, 0) for i, p in enumerate(params)})
@@ -1043,7 +1043,7 @@ def test_fused_bitwise_matches_two_stage():
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     lr, momentum = 1e-2, 0.95
 
     results = {}
@@ -1060,7 +1060,7 @@ def test_fused_bitwise_matches_two_stage():
             scale_mode="spectral",
             extra_scale_factor=1.0,
             fp32_matmul_prec="highest",
-            gtp_group=gtp_group,
+            gtp_remat_group=gtp_remat_group,
             tp_group=tp_group,
             fused_group=fused,
             ns_batch_size=1,  # per-matrix NS -> the paths must be bit-identical
@@ -1081,7 +1081,7 @@ def test_fused_matches_full_matrix_reference():
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     lr, momentum = 1e-2, 0.95
 
     specs, full_w, full_g, params, _shard = _build_mixed_params(T, G, t_rank, g_rank, 210)
@@ -1096,7 +1096,7 @@ def test_fused_matches_full_matrix_reference():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
         fused_group=_world(),
     )
@@ -1126,7 +1126,7 @@ def test_fused_per_group_domains():
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     egtp_group = _get_expert_group()
     ep_rank, egtp_rank = r // 2, r % 2
     lr, momentum = 1e-2, 0.95
@@ -1155,10 +1155,10 @@ def test_fused_per_group_domains():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         fp32_matmul_prec="highest",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
     )
-    opt.set_group_process_groups({0: (gtp_group, tp_group, _world()), 1: (egtp_group, None)})
+    opt.set_group_process_groups({0: (gtp_remat_group, tp_group, _world()), 1: (egtp_group, None)})
     homes = {id(p): s[2] for p, s in zip(dense_params, specs)}
     homes.update({id(p): (i % G, 0) for i, p in enumerate(expert_params)})
     opt.set_param_ns_homes(homes)
@@ -1240,7 +1240,7 @@ def test_syrk_matches_gemm_relative_to_update():
             scale_mode="spectral",
             extra_scale_factor=1.0,
             fp32_matmul_prec="medium",  # SYRK only engages on the bf16 path
-            gtp_group=_world(),
+            gtp_remat_group=_world(),
             ns_batch_size=1,
             use_syrk=use_syrk,
         )
@@ -1273,10 +1273,10 @@ def test_tp_sharded_without_gtp_marker_is_rejected():
     the stage-1 exchange would concatenate the copies as shards. step() must
     raise on every rank (before any collective) instead of corrupting."""
     _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP=2)")
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     p = torch.nn.Parameter(torch.randn(8, 6))
     p.partition_dim = 0  # TP-sharded, but NOT tagged is_gtp_weight_remat.
-    opt = LayerShardedMuon([p], lr=0.1, gtp_group=gtp_group, tp_group=tp_group)
+    opt = LayerShardedMuon([p], lr=0.1, gtp_remat_group=gtp_remat_group, tp_group=tp_group)
     opt.set_param_ns_homes({id(p): (0, 0)})
     p.grad = torch.randn_like(p)
     with pytest.raises(ValueError, match="not GTP-sharded"):
@@ -1295,7 +1295,7 @@ def test_fused_group_wrong_rank_order_is_rejected(monkeypatch):
     the rank query instead; the assert exists to guard future changes to how
     parallel_state builds these groups."""
     _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP=2)")
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     world = _world()
     real_get_rank = dist.get_rank
 
@@ -1308,7 +1308,9 @@ def test_fused_group_wrong_rank_order_is_rejected(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", _skewed_get_rank)
     p = _gtp_param(torch.randn(8, 6))
     p.partition_dim = 0
-    opt = LayerShardedMuon([p], lr=0.1, gtp_group=gtp_group, tp_group=tp_group, fused_group=world)
+    opt = LayerShardedMuon(
+        [p], lr=0.1, gtp_remat_group=gtp_remat_group, tp_group=tp_group, fused_group=world
+    )
     opt.set_param_ns_homes({id(p): (0, 0)})
     p.grad = torch.randn_like(p)
     with pytest.raises(AssertionError, match="TP innermost"):
@@ -1372,7 +1374,7 @@ def test_empty_homes_fallback_matches_duplicated():
         coefficient_type="quintic",
         num_ns_steps=5,
         fp32_matmul_prec="highest",
-        gtp_group=_world(),
+        gtp_remat_group=_world(),
         pg_collection=_PGStub(gtp_remat=_world()),
     )
     # Deliberately NOT calling set_param_ns_homes: this is the fallback.
@@ -1402,7 +1404,7 @@ def test_empty_homes_fallback_matches_duplicated():
 
 
 def test_degenerate_domain_honours_use_syrk():
-    """gtp_size * tp_size <= 1 with use_syrk=True must run the SYRK NS path.
+    """gtp_remat_size * tp_size <= 1 with use_syrk=True must run the SYRK NS path.
 
     Pre-refactor, use_syrk was never forwarded to the parent, so the degenerate
     branch always ran plain GEMM NS. Pins the fix by matching a direct
@@ -1428,12 +1430,12 @@ def test_degenerate_domain_honours_use_syrk():
         coefficient_type="quintic",
         num_ns_steps=5,
         fp32_matmul_prec="medium",
-        gtp_group=None,
+        gtp_remat_group=None,
         use_syrk=True,
     )
     # Homes must be non-empty so step() takes the degenerate-domain branch under
     # test instead of the empty-homes fallback (the home itself is unused: with
-    # gtp_size * tp_size <= 1 the branch runs local NS via orthogonalize()).
+    # gtp_remat_size * tp_size <= 1 the branch runs local NS via orthogonalize()).
     opt.set_param_ns_homes({id(p): (0, 0)})
     p.grad = grad.clone()
     opt.step()
@@ -1474,7 +1476,7 @@ def test_weight_update_hooks_called_on_all_paths(fused):
         weight_decay=0.0,
         num_ns_steps=5,
         fp32_matmul_prec="highest",
-        gtp_group=_world(),
+        gtp_remat_group=_world(),
         fused_group=_world() if fused else None,
     )
     opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(routed_params)})
@@ -1494,7 +1496,7 @@ def test_weight_update_hooks_called_on_all_paths(fused):
     p2 = torch.nn.Parameter(torch.randn(8, 8))
     opt2 = LayerShardedMuon(
         [p2], lr=1e-2, weight_decay=0.0, num_ns_steps=5,
-        fp32_matmul_prec="highest", gtp_group=None,
+        fp32_matmul_prec="highest", gtp_remat_group=None,
     )
     calls2 = {"pre": 0, "post": 0}
     opt2.pre_weight_update_fn_inplace = lambda p, update: calls2.__setitem__(
@@ -1548,7 +1550,7 @@ def test_padded_param_matches_duplicated(fused):
         weight_decay=0.0,
         num_ns_steps=5,
         fp32_matmul_prec="highest",
-        gtp_group=_world(),
+        gtp_remat_group=_world(),
         fused_group=_world() if fused else None,
     )
     opt.set_param_ns_homes({id(p): (1 % S, 0)})
@@ -1590,7 +1592,7 @@ def test_padded_param_2d_two_stage_matches_reference(pd):
     be embedded per TP block, so stripping must happen at the stage-1 seam.
     """
     _require_four_ranks()
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
@@ -1626,7 +1628,7 @@ def test_padded_param_2d_two_stage_matches_reference(pd):
         weight_decay=0.0,
         num_ns_steps=5,
         fp32_matmul_prec="highest",
-        gtp_group=gtp_group,
+        gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
     )
     opt.set_param_ns_homes({id(p): (1, 1)})
@@ -1643,7 +1645,7 @@ def test_padded_param_2d_two_stage_matches_reference(pd):
         # true dims, slice my tp part, restore pad, slice my gtp shard.
         ref_mom.lerp_(g_shard, 1 - momentum)
         g_parts = [torch.zeros_like(ref_mom) for _ in range(G)]
-        dist.all_gather(g_parts, ref_mom.contiguous(), group=gtp_group)
+        dist.all_gather(g_parts, ref_mom.contiguous(), group=gtp_remat_group)
         tp_local_padded = torch.cat(g_parts, dim=0)
         tp_local_clean = tp_local_padded[:-PAD]
         t_parts = [torch.zeros_like(tp_local_clean) for _ in range(T)]
@@ -1669,12 +1671,12 @@ def test_padded_param_2d_two_stage_matches_reference(pd):
 def test_padded_param_2d_fused_raises():
     """Padded params on a genuinely 2-D fused domain are rejected loudly."""
     _require_four_ranks()
-    tp_group, gtp_group = _get_2d_groups()
+    tp_group, gtp_remat_group = _get_2d_groups()
     p = _gtp_param(torch.randn(8, 6))
     p.partition_dim = 0
     p.pad_length = 2
     opt = LayerShardedMuon(
-        [p], lr=0.1, weight_decay=0.0, gtp_group=gtp_group, tp_group=tp_group,
+        [p], lr=0.1, weight_decay=0.0, gtp_remat_group=gtp_remat_group, tp_group=tp_group,
         fused_group=_world(),
     )
     opt.set_param_ns_homes({id(p): (0, 0)})

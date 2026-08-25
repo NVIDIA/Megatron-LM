@@ -1,9 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Layer-sharded Muon: layer sharding for Newton-Schulz over the GTP x TP domain.
+"""Layer-sharded Muon: layer sharding for Newton-Schulz over the GTP_remat x TP domain.
 
 Instead of per-weight all-gather + redundant full-matrix NS on every rank, each weight
-is assigned one NS home rank in the (GTP x TP) domain. Two all_to_all stages route the
+is assigned one NS home rank in the (GTP_remat x TP) domain. Two all_to_all stages route the
 momentum shards so the home holds the complete (P, Q) matrix, Newton-Schulz runs there
 with zero communication and zero redundancy — the exact same full-matrix NS as
 duplicated mode — and two reverse all_to_all stages scatter the result back to the
@@ -104,13 +104,13 @@ def _phase(name: str):
 
 
 class LayerShardedMuon(TensorParallelMuon):
-    """Muon with layer sharding over the GTP x TP domain.
+    """Muon with layer sharding over the GTP_remat x TP domain.
 
     Sharding model per 2D weight of full shape ``(P, Q)``:
 
     - TP shards along ``param.partition_dim`` (0 = column-parallel, 1 = row-parallel,
       None / -1 = not TP-sharded).
-    - GTP shards dim 0 of the TP-local shard, for params tagged
+    - GTP_remat shards dim 0 of the TP-local shard, for params tagged
       ``param.is_gtp_weight_remat`` (Megatron's marker; absent means unsharded).
     - A param sharded by neither is whole on every rank of the domain (e.g. the MoE
       router and latent projections): it skips both exchanges and every rank runs the
@@ -118,14 +118,14 @@ class LayerShardedMuon(TensorParallelMuon):
     - GTP alignment padding (``param.pad_length`` trailing zero rows on the
       gtp-gathered, TP-local dim 0) is stripped before Newton-Schulz — so the scale
       factor sees the true dims, matching the parent's duplicated path bitwise — and
-      restored before the reverse gtp exchange. On the fused exchange this is
+      restored before the reverse gtp_remat exchange. On the fused exchange this is
       supported for single-axis domains only (tp_size == 1); a 2-D fused domain with
       padded params raises NotImplementedError (use the two-stage path there).
 
     ``step()`` runs, per param group:
 
     1. Momentum update on the local shard (elementwise, identical to base Muon).
-    2. Stage-1 all_to_all over ``gtp_group`` (dim 0): each param's GTP extent is
+    2. Stage-1 all_to_all over ``gtp_remat_group`` (dim 0): each param's GTP_remat extent is
        assembled on its assigned ``g_home`` column.
     3. Stage-2 all_to_all over ``tp_group`` (along ``partition_dim``): the full
        matrix is assembled on the ``(g_home, t_home)`` NS home. Params that are not
@@ -139,10 +139,11 @@ class LayerShardedMuon(TensorParallelMuon):
     Args:
         params: Parameters to optimize. Every rank in the domain must pass the same
             params in the same order (they hold different shards of the same weights).
-        gtp_group: GTP weight-shard process group (dim-0 sharding of the TP-local shard).
+        gtp_remat_group: GTP_remat weight-shard process group (dim-0 sharding of the
+            TP-local shard).
         tp_group: TP process group, or None when TP is not used.
-        fused_group: Optional flattened process group over the whole (GTP x TP)
-            domain, sized ``gtp_size * tp_size`` with group rank ``g * tp_size + t``
+        fused_group: Optional flattened process group over the whole (GTP_remat x TP)
+            domain, sized ``gtp_remat_size * tp_size`` with group rank ``g * tp_size + t``
             (TP innermost). When provided, one all_to_all per direction replaces the
             two-stage GTP-then-TP exchange — same blocks, same assembly order, so the
             NS input is bit-identical. None (default) keeps the two-stage path.
@@ -187,7 +188,7 @@ class LayerShardedMuon(TensorParallelMuon):
 
     Usage::
 
-        optimizer = LayerShardedMuon(params, lr=3e-4, gtp_group=gtp, tp_group=tp)
+        optimizer = LayerShardedMuon(params, lr=3e-4, gtp_remat_group=gtp, tp_group=tp)
         optimizer.set_param_ns_homes({id(p): (g_home, t_home) for ...})
         optimizer.step()
     """
@@ -205,7 +206,7 @@ class LayerShardedMuon(TensorParallelMuon):
         num_ns_steps: int = 5,
         scale_mode: MuonScaleT = "spectral",
         extra_scale_factor: float = 1.0,
-        gtp_group: "torch.distributed.ProcessGroup | None",
+        gtp_remat_group: "torch.distributed.ProcessGroup | None",
         tp_group: "torch.distributed.ProcessGroup | None" = None,
         fused_group: "torch.distributed.ProcessGroup | None" = None,
         ns_batch_size: int = 1,
@@ -216,7 +217,7 @@ class LayerShardedMuon(TensorParallelMuon):
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
     ) -> None:
         if split_qkv:
             # The layer-sharded exchange routes whole matrices to their NS homes
@@ -270,7 +271,7 @@ class LayerShardedMuon(TensorParallelMuon):
             tp_mode=tp_mode,
             use_syrk=use_syrk,
         )
-        self.gtp_group = gtp_group
+        self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group
         self.fused_group = fused_group
         self.ns_batch_size = max(1, ns_batch_size)
@@ -297,7 +298,7 @@ class LayerShardedMuon(TensorParallelMuon):
         self._group_streams: "list | None" = None
         # id(param) -> (g_home, t_home). Set via set_param_ns_homes().
         self._param_ns_homes: dict[int, tuple[int, int]] = {}
-        # param_group index -> (gtp_group, tp_group), overriding the constructor
+        # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
 
@@ -306,7 +307,7 @@ class LayerShardedMuon(TensorParallelMuon):
 
         Args:
             param_ns_homes: Maps ``id(param)`` -> ``(g_home, t_home)``: the rank in
-                ``gtp_group`` and in ``tp_group`` that runs NS for it. ``t_home`` is
+                ``gtp_remat_group`` and in ``tp_group`` that runs NS for it. ``t_home`` is
                 ignored for params that are not TP-sharded and when ``tp_group`` is None.
         """
         self._param_ns_homes = param_ns_homes
@@ -318,11 +319,11 @@ class LayerShardedMuon(TensorParallelMuon):
         Different param groups can be sharded over different domains — e.g. under
         MoE, expert weights are sharded over the *expert* GTP/TP groups while dense
         weights use the dense ones. Groups absent from the mapping fall back to the
-        ``gtp_group`` / ``tp_group`` passed to the constructor.
+        ``gtp_remat_group`` / ``tp_group`` passed to the constructor.
 
         Args:
             group_process_groups: Maps the index of a ``self.param_groups`` entry to
-                ``(gtp_group, tp_group)`` or ``(gtp_group, tp_group, fused_group)``.
+                ``(gtp_remat_group, tp_group)`` or ``(gtp_remat_group, tp_group, fused_group)``.
                 Any entry may be None (treated as size 1 / not available).
                 A 2-tuple selects the two-stage GTP-then-TP path for that group and
                 does **not** inherit the constructor's ``fused_group`` — pass an
@@ -457,11 +458,15 @@ class LayerShardedMuon(TensorParallelMuon):
                 torch.cuda.set_stream(streams[group_index])
             # Each param group may live in its own domain (dense vs expert).
             pgs = self._group_process_groups.get(
-                group_index, (self.gtp_group, self.tp_group, self.fused_group)
+                group_index, (self.gtp_remat_group, self.tp_group, self.fused_group)
             )
-            gtp_group, tp_group = pgs[0], pgs[1]
+            gtp_remat_group, tp_group = pgs[0], pgs[1]
             fused_group = pgs[2] if len(pgs) > 2 else None
-            gtp_size = torch.distributed.get_world_size(gtp_group) if gtp_group is not None else 1
+            gtp_remat_size = (
+                torch.distributed.get_world_size(gtp_remat_group)
+                if gtp_remat_group is not None
+                else 1
+            )
             tp_size = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
 
             self._init_group(group)
@@ -490,14 +495,16 @@ class LayerShardedMuon(TensorParallelMuon):
 
             # Degenerate domain: this rank's shard is the whole matrix it owns, so
             # run plain local NS exactly as base Muon would.
-            if gtp_size * tp_size <= 1:
+            if gtp_remat_size * tp_size <= 1:
                 group_kwargs = {k: v for k, v in group.items() if k != "params"}
                 with fp32_matmul_precision(self.fp32_matmul_prec):
                     for p, m in zip(params, moms):
                         self._apply_update(p, self.orthogonalize(p, m, **group_kwargs), lr)
                 continue
 
-            gtp_rank = torch.distributed.get_rank(gtp_group) if gtp_size > 1 else 0
+            gtp_remat_rank = (
+                torch.distributed.get_rank(gtp_remat_group) if gtp_remat_size > 1 else 0
+            )
             tp_rank = torch.distributed.get_rank(tp_group) if tp_size > 1 else 0
 
             def _partition_dim(p: torch.Tensor, _tp_size: int = tp_size) -> "int | None":
@@ -506,10 +513,10 @@ class LayerShardedMuon(TensorParallelMuon):
                 pd = getattr(p, "partition_dim", None)
                 return None if pd is None or pd == -1 else pd
 
-            def _gtp_sharded(p: torch.Tensor, _gtp_size: int = gtp_size) -> bool:
-                return _gtp_size > 1 and bool(getattr(p, "is_gtp_weight_remat", False))
+            def _gtp_remat_sharded(p: torch.Tensor, _gtp_remat_size: int = gtp_remat_size) -> bool:
+                return _gtp_remat_size > 1 and bool(getattr(p, "is_gtp_weight_remat", False))
 
-            # Params sharded by neither GTP nor TP already hold the whole matrix on
+            # Params sharded by neither GTP_remat nor TP already hold the whole matrix on
             # every rank of the domain (TE leaves the MoE router and the latent
             # projections unsharded). They join neither exchange: every rank runs the
             # same deterministic NS on its own copy, which is both correct and cheaper
@@ -517,22 +524,26 @@ class LayerShardedMuon(TensorParallelMuon):
             replicated, routed = [], []
             for i, p in enumerate(params):
                 # A TP-sharded param that is not GTP-sharded is REPLICATED across the
-                # GTP group; stage-1 would concatenate the G identical copies as if
+                # GTP_remat group; stage-1 would concatenate the G identical copies as if
                 # they were dim-0 shards and hand Newton-Schulz a (G*rows, cols)
                 # matrix. The reverse-path shape asserts come out numerically
                 # consistent, so this corrupts silently — reject it loudly instead.
-                if gtp_size > 1 and _partition_dim(p) is not None and not _gtp_sharded(p):
+                if (
+                    gtp_remat_size > 1
+                    and _partition_dim(p) is not None
+                    and not _gtp_remat_sharded(p)
+                ):
                     raise ValueError(
                         f"LayerShardedMuon: param of shape {tuple(p.shape)} is TP-sharded "
                         f"(partition_dim={getattr(p, 'partition_dim', None)}) but not GTP-sharded "
-                        f"(is_gtp_weight_remat absent/False) while gtp_size={gtp_size} > 1. "
-                        "The GTP exchange would concatenate replicated copies as shards and "
+                        f"(is_gtp_weight_remat absent/False) while "
+                        f"gtp_remat_size={gtp_remat_size} > 1. "
+                        "The GTP_remat exchange would concatenate replicated copies as shards and "
                         "silently corrupt the update. Tag the param with is_gtp_weight_remat "
                         "or run it in a domain without a GTP axis."
                     )
-                target = (
-                    routed if (_gtp_sharded(p) or _partition_dim(p) is not None) else replicated
-                )
+                sharded = _gtp_remat_sharded(p) or _partition_dim(p) is not None
+                target = routed if sharded else replicated
                 target.append(i)
 
             if replicated:
@@ -562,7 +573,7 @@ class LayerShardedMuon(TensorParallelMuon):
                     "balancing (LPT) is NOT in effect for these params.",
                 )
             homes = [
-                self._param_ns_homes.get(id(p), (routed[i] % gtp_size, 0))
+                self._param_ns_homes.get(id(p), (routed[i] % gtp_remat_size, 0))
                 for i, p in enumerate(params)
             ]
             g_home = {i: homes[i][0] for i in range(len(params))}
@@ -571,11 +582,11 @@ class LayerShardedMuon(TensorParallelMuon):
             # gtp-gathered, TP-LOCAL dim 0 — the same attribute the parent strips
             # in its duplicated path. Stripped before Newton-Schulz so the scale
             # factor sees the true dims (and parity with duplicated mode holds),
-            # restored before the reverse gtp exchange, whose split sizes derive
+            # restored before the reverse gtp_remat exchange, whose split sizes derive
             # from the padded momentum shards.
             pads = [getattr(p, 'pad_length', 0) for p in params]
 
-            # --- Fused path: one all_to_all over the flattened (GTP x TP) domain
+            # --- Fused path: one all_to_all over the flattened (GTP_remat x TP) domain
             # replaces the two stages in each direction. Moves the exact same shard
             # blocks and assembles them in the exact same order, so the NS input is
             # bit-identical to the two-stage path.
@@ -584,10 +595,11 @@ class LayerShardedMuon(TensorParallelMuon):
                 # A group built with any other rank order scatters blocks to the wrong
                 # coordinates — silently, since all split sizes still line up.
                 fused_rank = torch.distributed.get_rank(fused_group)
-                assert fused_rank == gtp_rank * tp_size + tp_rank, (
+                assert fused_rank == gtp_remat_rank * tp_size + tp_rank, (
                     f"LayerShardedMuon: fused_group rank {fused_rank} != "
-                    f"gtp_rank({gtp_rank}) * tp_size({tp_size}) + tp_rank({tp_rank}); the "
-                    "flattened (GTP x TP) group must be built with TP innermost."
+                    f"gtp_remat_rank({gtp_remat_rank}) * tp_size({tp_size}) + "
+                    f"tp_rank({tp_rank}); the "
+                    "flattened (GTP_remat x TP) group must be built with TP innermost."
                 )
                 pdims = [_partition_dim(p) for p in params]
                 if tp_size > 1 and any(pads):
@@ -601,7 +613,14 @@ class LayerShardedMuon(TensorParallelMuon):
                 with fp32_matmul_precision(self.fp32_matmul_prec):
                     with _phase("a2a_fwd"):
                         fulls, my_idx = layer_sharded_fused_fwd(
-                            moms, homes, pdims, gtp_rank, tp_rank, gtp_size, tp_size, fused_group
+                            moms,
+                            homes,
+                            pdims,
+                            gtp_remat_rank,
+                            tp_rank,
+                            gtp_remat_size,
+                            tp_size,
+                            fused_group,
                         )
                         # tp_size == 1 here whenever pads are present: the
                         # home-assembled matrix has a contiguous dim-0 pad tail.
@@ -620,9 +639,9 @@ class LayerShardedMuon(TensorParallelMuon):
                         moms,
                         homes,
                         pdims,
-                        gtp_rank,
+                        gtp_remat_rank,
                         tp_rank,
-                        gtp_size,
+                        gtp_remat_size,
                         tp_size,
                         fused_group,
                     )
@@ -634,9 +653,9 @@ class LayerShardedMuon(TensorParallelMuon):
 
             with fp32_matmul_precision(self.fp32_matmul_prec):
                 with _phase("a2a_fwd"):
-                    # 2. Stage-1 all_to_all over GTP (dim 0).
+                    # 2. Stage-1 all_to_all over GTP_remat (dim 0).
                     stage1, my_g = layer_sharded_all_to_all_fwd(
-                        moms, g_home, gtp_rank, gtp_size, gtp_group, 0
+                        moms, g_home, gtp_remat_group, 0
                     )
                     # Strip the GTP alignment padding at the stage-1 seam: the
                     # stage-1 output is the gtp-gathered TP-LOCAL tensor, where
@@ -661,7 +680,7 @@ class LayerShardedMuon(TensorParallelMuon):
                         templates = [stage1[k] for k in pos]
                         t_home = {n: homes[my_g[pos[n]]][1] for n in range(len(pos))}
                         fulls, my_sel = layer_sharded_all_to_all_fwd(
-                            templates, t_home, tp_rank, tp_size, tp_group, pd
+                            templates, t_home, tp_group, pd
                         )
                         stage2_ctx[pd] = (pos, templates, t_home, my_sel)
                         for n_sel, full in zip(my_sel, fulls):
@@ -680,14 +699,14 @@ class LayerShardedMuon(TensorParallelMuon):
                 for pd, (pos, templates, t_home, my_sel) in stage2_ctx.items():
                     ns_sub = [ns_by_k[pos[n]] for n in my_sel]
                     parts = layer_sharded_all_to_all_bwd(
-                        ns_sub, my_sel, templates, t_home, tp_rank, tp_size, tp_group, pd
+                        ns_sub, my_sel, templates, t_home, tp_group, pd
                     )
                     for n, part in enumerate(parts):
                         col_updates[pos[n]] = part
                 for k in sub_pos[None]:
                     col_updates[k] = ns_by_k[k]
 
-                # Restore the padding (zero rows) before the reverse gtp
+                # Restore the padding (zero rows) before the reverse gtp_remat
                 # exchange: its split sizes derive from the padded momentum
                 # shards, and every rank's shard slice must line up again.
                 col_updates = [
@@ -695,9 +714,9 @@ class LayerShardedMuon(TensorParallelMuon):
                     for k, t in enumerate(col_updates)
                 ]
 
-                # 6. Reverse stage-1 all_to_all: scatter column updates back to GTP shards.
+                # 6. Reverse stage-1 all_to_all: scatter column updates back to GTP_remat shards.
                 update_shards = layer_sharded_all_to_all_bwd(
-                    col_updates, my_g, moms, g_home, gtp_rank, gtp_size, gtp_group, 0
+                    col_updates, my_g, moms, g_home, gtp_remat_group, 0
                 )
 
             # 7. Weight update on the local shard.

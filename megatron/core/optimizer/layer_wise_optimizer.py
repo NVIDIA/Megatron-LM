@@ -458,18 +458,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @staticmethod
     def _assign_ns_homes(params: list, gtp_remat_group, tp_group) -> dict:
-        """Assign each param an NS home ``(g_home, t_home)`` in the GTP x TP domain.
+        """Assign each param an NS home ``(g_home, t_home)`` in the GTP_remat x TP domain.
 
-        Uses Longest Processing Time (LPT) bin-packing over ``gtp_size * tp_size``
+        Uses Longest Processing Time (LPT) bin-packing over ``gtp_remat_size * tp_size``
         bins: sorts params by NS compute cost descending and assigns each to the bin
         with the least accumulated cost.
 
         Args:
             params: List of parameters to assign.
-            gtp_remat_group: The GTP weight-shard process group.
+            gtp_remat_group: The GTP_remat weight-shard process group.
             tp_group: The TP process group (None when TP is unused).
 
-        Params sharded by neither GTP nor TP (e.g. the MoE router and latent
+        Params sharded by neither GTP_remat nor TP (e.g. the MoE router and latent
         projections) are omitted: they are whole on every rank of the domain, so
         every rank orthogonalizes its own copy instead of electing a home, and
         giving them a bin would charge one rank for work all of them do.
@@ -477,14 +477,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Returns:
             Dict mapping ``id(param)`` -> ``(g_home, t_home)``.
         """
-        gtp_size = get_pg_size(gtp_remat_group)
+        gtp_remat_size = get_pg_size(gtp_remat_group)
         tp_size = get_pg_size(tp_group) if tp_group is not None else 1
-        num_bins = gtp_size * tp_size
+        num_bins = gtp_remat_size * tp_size
         if num_bins <= 1:
             return {id(p): (0, 0) for p in params}
 
         def _is_sharded(p):
-            if gtp_size > 1 and getattr(p, 'is_gtp_weight_remat', False):
+            if gtp_remat_size > 1 and getattr(p, 'is_gtp_weight_remat', False):
                 return True
             return tp_size > 1 and getattr(p, 'partition_dim', -1) not in (None, -1)
 
@@ -496,7 +496,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 return p.data.nelement()
             m, n = p.data.shape
             if getattr(p, 'is_gtp_weight_remat', False):
-                m = m * getattr(p, 'gtp_remat_size', gtp_size)
+                m = m * getattr(p, 'gtp_remat_size', gtp_remat_size)
             big, small = max(m, n), min(m, n)
             return big * small * small
 
@@ -720,8 +720,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         except ImportError:
             return
 
-        def _fused_group(gtp_group, tp_group, combined):
-            """Pick the flat (GTP x TP) communicator for the single-all_to_all path.
+        def _fused_group(gtp_remat_group, tp_group, combined):
+            """Pick the flat (GTP_remat x TP) communicator — i.e. the full GTP
+            group (GTP = TP x GTP_remat) — for the single-all_to_all path.
 
             The combined group only exists when both axes are non-trivial; with one
             trivial axis the surviving axis group IS the flat domain (flat rank
@@ -729,27 +730,27 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             the two-stage exchange) only when a genuinely 2-D domain has no
             combined group or the sizes don't line up.
             """
-            g = get_pg_size(gtp_group)
+            g = get_pg_size(gtp_remat_group)
             t = get_pg_size(tp_group)
             if g > 1 and t > 1:
                 return combined if combined is not None and combined.size() == g * t else None
             if t > 1:
                 return tp_group
-            return gtp_group
+            return gtp_remat_group
 
-        dense_gtp = getattr(pg_collection, 'gtp_remat', None)
+        dense_gtp_remat = getattr(pg_collection, 'gtp_remat', None)
         dense_tp = getattr(pg_collection, 'tp', None)
         dense_pgs = (
-            dense_gtp,
+            dense_gtp_remat,
             dense_tp,
-            _fused_group(dense_gtp, dense_tp, getattr(pg_collection, 'tp_gtp_remat', None)),
+            _fused_group(dense_gtp_remat, dense_tp, getattr(pg_collection, 'gtp', None)),
         )
-        expert_gtp = getattr(pg_collection, 'expt_gtp_remat', None)
+        expert_gtp_remat = getattr(pg_collection, 'expt_gtp_remat', None)
         expert_tp = getattr(pg_collection, 'expt_tp', None)
         expert_pgs = (
-            expert_gtp,
+            expert_gtp_remat,
             expert_tp,
-            _fused_group(expert_gtp, expert_tp, getattr(pg_collection, 'expt_tp_gtp_remat', None)),
+            _fused_group(expert_gtp_remat, expert_tp, getattr(pg_collection, 'expt_gtp', None)),
         )
 
         for opt in optimizers:
@@ -768,41 +769,41 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 entry[2].extend(group['params'])
 
             assignment: Dict[int, Tuple[int, int]] = {}
-            for gtp_group, tp_group, domain_params in domains.values():
-                gtp_size = get_pg_size(gtp_group)
+            for gtp_remat_group, tp_group, domain_params in domains.values():
+                gtp_remat_size = get_pg_size(gtp_remat_group)
                 tp_size = get_pg_size(tp_group)
-                if not domain_params or gtp_size * tp_size <= 1:
+                if not domain_params or gtp_remat_size * tp_size <= 1:
                     continue
                 # Reject at wiring time what LayerShardedMuon.step() would reject on
                 # its first call (same condition): a TP-sharded param without the GTP
-                # tag is replicated across the GTP group, and the exchange would
+                # tag is replicated across the GTP_remat group, and the exchange would
                 # concatenate its copies as dim-0 shards. Failing here surfaces the
                 # misconfiguration at optimizer construction instead of after data
                 # loading and the first forward/backward; the step()-level check
                 # remains as the last line of defense for direct-API users.
-                if gtp_size > 1 and tp_size > 1:
+                if gtp_remat_size > 1 and tp_size > 1:
                     for p in domain_params:
                         pd = getattr(p, 'partition_dim', None)
                         if pd not in (None, -1) and not getattr(p, 'is_gtp_weight_remat', False):
                             raise ValueError(
                                 f"LayerShardedMuon wiring: param of shape {tuple(p.shape)} "
                                 f"is TP-sharded (partition_dim={pd}) but not GTP-sharded "
-                                f"(is_gtp_weight_remat absent/False) while gtp_size="
-                                f"{gtp_size} > 1. The GTP exchange would concatenate "
+                                f"(is_gtp_weight_remat absent/False) while gtp_remat_size="
+                                f"{gtp_remat_size} > 1. The GTP_remat exchange would concatenate "
                                 "replicated copies as shards and silently corrupt the "
                                 "update. Tag the param with is_gtp_weight_remat or run "
-                                "it in a domain without a GTP axis."
+                                "it in a domain without a GTP_remat axis."
                             )
                 assignment.update(
                     LayerWiseDistributedOptimizer._assign_ns_homes(
-                        domain_params, gtp_group, tp_group
+                        domain_params, gtp_remat_group, tp_group
                     )
                 )
                 log_single_rank(
                     logger,
                     logging.INFO,
                     f'LayerShardedMuon: assigned {len(domain_params)} params across '
-                    f'{gtp_size} x {tp_size} (GTP x TP) NS homes.',
+                    f'{gtp_remat_size} x {tp_size} (GTP x TP) NS homes.',
                 )
 
             if assignment:

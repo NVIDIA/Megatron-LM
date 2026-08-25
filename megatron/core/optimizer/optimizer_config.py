@@ -326,11 +326,12 @@ class OptimizerConfig:
 
     use_layer_sharding_muon: bool = False
     """If true, use LayerShardedMuon instead of TensorParallelMuon when optimizer is 'muon'.
-    Each 2D weight is assigned one NS home rank in the (GTP x TP) domain; all_to_all stages
-    over the gtp and tp groups assemble the complete (P, Q) momentum on the home, the exact
-    same full-matrix Newton-Schulz as duplicated mode runs there with zero communication and
-    zero redundancy, and reverse all_to_all stages scatter the result back to the original
-    shards. Requires the layer-wise distributed optimizer path. muon_tp_mode does not
+    Each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain; all_to_all
+    stages over the gtp_remat and tp groups assemble the complete (P, Q) momentum on the
+    home, the exact same full-matrix Newton-Schulz as duplicated mode runs there with zero
+    communication and zero redundancy, and reverse all_to_all stages scatter the result
+    back to the original shards. Requires the layer-wise distributed optimizer path.
+    muon_tp_mode does not
     affect the layer-sharded exchange itself; it only applies on the paths that delegate
     to TensorParallelMuon (the empty-homes fallback and degenerate single-rank domains).
     muon_split_qkv must be False (its default is True): LayerShardedMuon rejects
