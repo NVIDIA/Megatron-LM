@@ -552,5 +552,22 @@ def test_fast_builder(
             torch.distributed.barrier()
 
 
+def test_get_blend_from_list():
+    # Plain prefix lists (odd or even length, no parseable weights).
+    assert get_blend_from_list(["p1", "p2", "p3"]) == (["p1", "p2", "p3"], None)
+    assert get_blend_from_list(["p1", "p2"]) == (["p1", "p2"], None)
+
+    # Zipped [weight, prefix, ...] list.
+    assert get_blend_from_list(["30", "p1", "70", "p2"]) == (["p1", "p2"], [30.0, 70.0])
+
+    assert get_blend_from_list(None) is None
+
+    # A malformed even-length blend that mixes a parseable weight with an
+    # unparseable one must be rejected, not silently read as a prefix-only list.
+    with pytest.raises(AssertionError):
+        get_blend_from_list(["30", "p1", "not_a_weight", "p2"])
+
+
 if __name__ == "__main__":
     test_builder()
+    test_get_blend_from_list()
