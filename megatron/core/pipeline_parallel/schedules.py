@@ -1743,7 +1743,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                (input_tensor, output_tensor_grad) = (
+                input_tensor, output_tensor_grad = (
                     p2p_communicator.send_forward_backward_recv_forward_backward(
                         output_tensor,
                         input_tensor_grad,
@@ -1807,7 +1807,7 @@ def forward_backward_pipelining_with_interleaving(
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
 
-                (bwd_recv_buffer[-1], bwd_wait_handles) = (
+                bwd_recv_buffer[-1], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1960,7 +1960,7 @@ def forward_backward_pipelining_with_interleaving(
                     backward_k, forward=False
                 )
 
-                (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
+                bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -2033,7 +2033,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            (input_tensor, output_tensor_grad) = (
+            input_tensor, output_tensor_grad = (
                 p2p_communicator.send_forward_backward_recv_forward_backward(
                     output_tensor,
                     input_tensor_grad,
@@ -2271,6 +2271,25 @@ def get_tensor_shapes(
 
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    # Attention residuals: intermediate stages exchange all depth sources plus the
+    # running partial sum, concatenated along the sequence dimension. The slice
+    # count is static per boundary and derived from the pipeline layer layout.
+    if getattr(config, 'enable_attention_residuals', False) and pp_group is not None:
+        from megatron.core.transformer.attention_residual import attn_res_payload_slices_for_pp_rank
+
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
+        # The boundary is identified by the rank that RECEIVES the payload.
+        boundary_recv_rank = None
+        if is_recv and pp_rank > 0:
+            boundary_recv_rank = pp_rank
+        elif not is_recv and pp_rank < pp_size - 1:
+            boundary_recv_rank = pp_rank + 1
+        if boundary_recv_rank is not None:
+            effective_seq_length = effective_seq_length * attn_res_payload_slices_for_pp_rank(
+                config, boundary_recv_rank
+            )
 
     tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes

@@ -1315,6 +1315,24 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     ####################
+    # Attention Residuals (AttnRes) Configuration
+    ####################
+    enable_attention_residuals: bool = False
+    """Enable Attention Residuals (AttnRes, arXiv:2603.15031): replaces the fixed residual
+    accumulation with per-token softmax attention over depth sources (token embedding, completed
+    depth-block sums, and the running intra-block partial sum). Each self-attention and MLP
+    sublayer aggregates the sources with its own zero-initialized pseudo-query, and the final
+    output head aggregates all sources before the final layernorm. Mutually exclusive with
+    enable_hyper_connections."""
+
+    attn_res_block_layers: Optional[int] = None
+    """Block AttnRes: number of transformer layers per depth block (the paper's block size S
+    counted in sublayers is twice this value). Required when enable_attention_residuals=True.
+    The total number of depth sources at the network output is
+    floor((num_layers - 1) / attn_res_block_layers) + 2 (completed blocks + token embedding +
+    trailing partial block); the paper finds ~8-10 sources recover most of the quality gain."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
@@ -1520,6 +1538,85 @@ class TransformerConfig(ModelParallelConfig):
 
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
+
+    def _validate_attention_residuals(self):
+        """Validate the Attention Residuals (AttnRes) configuration.
+
+        The MVP supports: eager training with TP/SP/CP/EP, non-interleaved pipeline
+        parallelism (payload concatenated along the sequence dimension), selective
+        recompute of modules that live inside a sublayer (e.g. core_attn), MoE
+        (incl. shared-expert overlap), and MTP in the standard last-stage placement.
+        Everything rejected below either has no mechanism yet (CUDA graphs, VPP,
+        full recompute, EP-overlap fine-grained schedule, offloading) or would
+        silently bypass the AttnRes residual interception (fused residual norms,
+        fp32 residual connection).
+        """
+        if not self.enable_attention_residuals:
+            if self.attn_res_block_layers is not None:
+                raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
+            return
+
+        if self.enable_hyper_connections:
+            raise ValueError(
+                "enable_attention_residuals and enable_hyper_connections are mutually "
+                "exclusive residual-stream generalizations."
+            )
+        if (
+            not isinstance(self.attn_res_block_layers, int)
+            or isinstance(self.attn_res_block_layers, bool)
+            or self.attn_res_block_layers < 1
+        ):
+            raise ValueError(
+                "enable_attention_residuals requires attn_res_block_layers to be a "
+                f"positive integer, got {self.attn_res_block_layers!r}."
+            )
+        unsupported = []
+        if self.virtual_pipeline_model_parallel_size is not None:
+            unsupported.append("interleaved (virtual) pipeline parallelism")
+        if self.cuda_graph_impl != "none":
+            unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
+        if self.recompute_granularity == "full":
+            unsupported.append("recompute_granularity='full'")
+        if self.overlap_moe_expert_parallel_comm:
+            unsupported.append("overlap_moe_expert_parallel_comm")
+        if self.fused_residual_rmsnorm:
+            unsupported.append("fused_residual_rmsnorm (bypasses residual interception)")
+        if self.fp32_residual_connection:
+            unsupported.append("fp32_residual_connection")
+        if self.apply_residual_connection_post_layernorm:
+            unsupported.append("apply_residual_connection_post_layernorm")
+        if self.cpu_offloading:
+            unsupported.append(
+                "cpu_offloading (depth sources outlive the per-layer lifetime model)"
+            )
+        if self.offload_modules:
+            unsupported.append("fine-grained activation offloading (offload_modules)")
+        if self.heterogeneous_block_specs:
+            unsupported.append("heterogeneous_block_specs")
+        if self.pipeline_model_parallel_layout is not None:
+            unsupported.append("pipeline_model_parallel_layout (incl. standalone MTP stages)")
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ):
+            unsupported.append("num_layers_in_first/last_pipeline_stage")
+        if (
+            self.mtp_num_layers is not None
+            and self.pipeline_model_parallel_size > 1
+            and (
+                self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            )
+        ):
+            # With these splits the final-layernorm stage (which aggregates and
+            # consumes the depth sources) can differ from the post_process stage
+            # that runs MTP; the depth-source hand-off does not cross that
+            # boundary yet.
+            unsupported.append("MTP together with account_for_embedding/loss_in_pipeline_split")
+        if unsupported:
+            raise ValueError(
+                "enable_attention_residuals is not yet supported with: " + "; ".join(unsupported)
+            )
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -2511,6 +2608,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+
+        self._validate_attention_residuals()
 
         if self.fine_grained_activation_offloading:
             assert (

@@ -23,6 +23,13 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
+from megatron.core.transformer.attention_residual import (
+    AttentionResidual,
+    attn_res_num_payload_slices,
+    is_attn_res_block_start,
+    pack_attn_res_payload,
+    unpack_attn_res_payload,
+)
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
@@ -408,6 +415,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     setattr(self.hc_head_fn, 'sequence_parallel', True)
                     setattr(self.hc_head_base, 'sequence_parallel', True)
                     setattr(self.hc_head_scale, 'sequence_parallel', True)
+            if self.config.enable_attention_residuals:
+                # Final AttnRes output head: aggregates all depth sources plus the
+                # trailing partial block right before the final layernorm.
+                self.final_attn_res = AttentionResidual(self.config)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -487,6 +498,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         extract_layer_indices: Optional[Set[int]] = None,
         return_mhc_multistream: bool = False,
+        attn_res_sources: Optional[List[Tensor]] = None,
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
         """Apply TransformerBlock exit processing shared by normal and scheduled forward paths.
 
@@ -530,6 +542,36 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 self.config.num_residual_streams,
                 self.config.layernorm_epsilon,
             )
+
+        if self.config.enable_attention_residuals:
+            assert attn_res_sources is not None, (
+                "enable_attention_residuals requires the caller to thread the depth-source "
+                "list into postprocess_for_layer_schedule; this execution path does not."
+            )
+            if extract_layer_indices is not None:
+                # The per-layer carried state is the intra-block partial sum, not a
+                # baseline-equivalent hidden state — extraction would be misleading.
+                assert (
+                    len(extract_layer_indices) == 0
+                ), "Feature extraction is not supported with attention residuals."
+            # The network end is a block boundary: the trailing partial sum always
+            # holds the last (possibly incomplete) depth block and is never in the
+            # source list, so it must be aggregated (and shipped) alongside them.
+            attn_res_values = [*attn_res_sources, hidden_states]
+            if self.has_final_layernorm_in_this_stage():
+                if self.config.mtp_num_layers is not None:
+                    if extract_layer_indices is not None:
+                        assert (
+                            len(extract_layer_indices) == 0
+                        ), "Feature extraction is not supported with AttnRes + MTP."
+                    # Hand the full depth history to MTP through the same extra
+                    # output slot mHC uses for its multistream (mutually exclusive).
+                    mhc_multistream = tuple(attn_res_values)
+                hidden_states = self.final_attn_res(attn_res_values)
+            else:
+                # Not the final stage: pack sources + partial into the single
+                # pipeline payload tensor (concatenated along the sequence dim).
+                hidden_states = pack_attn_res_payload(attn_res_values)
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -925,6 +967,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
+        # Attention residuals: recover (depth sources, partial sum) for this stage.
+        # On the first stage the embedding output is the initial partial sum (it
+        # becomes depth source b_0 when layer 1 opens the first block); later
+        # stages unpack the seq-dim-concatenated payload from the previous stage.
+        attn_res_sources: Optional[List[Tensor]] = None
+        if self.config.enable_attention_residuals:
+            if self.pre_process:
+                attn_res_sources = []
+            else:
+                attn_res_sources, hidden_states = unpack_attn_res_payload(
+                    hidden_states,
+                    attn_res_num_payload_slices(layer_offset, self.config.attn_res_block_layers),
+                )
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -1011,6 +1067,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
+                    attn_res_kwargs = {}
+                    if attn_res_sources is not None:
+                        if is_attn_res_block_start(
+                            layer.layer_number, self.config.attn_res_block_layers
+                        ):
+                            # Block boundary: the completed partial sum becomes a
+                            # depth source; the layer starts a fresh partial sum.
+                            attn_res_sources.append(hidden_states)
+                        attn_res_kwargs["attn_res_sources"] = tuple(attn_res_sources)
+
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -1028,6 +1094,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                             mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
+                            **attn_res_kwargs,
                         )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
@@ -1047,7 +1114,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         intermediate_hidden_states.append(hidden_states)
 
         hidden_states, mhc_multistream = self.postprocess_for_layer_schedule(
-            hidden_states, extract_layer_indices=extract_layer_indices, return_mhc_multistream=True
+            hidden_states,
+            extract_layer_indices=extract_layer_indices,
+            return_mhc_multistream=True,
+            attn_res_sources=attn_res_sources,
         )
 
         if len(extract_layer_indices) > 0:
