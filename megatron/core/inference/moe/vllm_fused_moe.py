@@ -29,6 +29,8 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
+from megatron.core.inference.moe import batch_invariant
+from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
     _get_num_sms,
@@ -451,6 +453,8 @@ def _moe_sum_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
+    APPLY_WEIGHTS: tl.constexpr = True,
+    ACC_FP64: tl.constexpr = False,
 ):
     """Reduce topk dimension with routing weight application.
 
@@ -482,16 +486,25 @@ def _moe_sum_kernel(
             offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
 
-            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+            acc = tl.zeros([BLOCK_K], dtype=tl.float64 if ACC_FP64 else tl.float32)
             for t in range(topk):
                 eid = tl.load(routing_map_ptr + token_id * topk + t)
                 lid = eid - local_expert_start
                 if lid >= 0 and lid < num_local_experts:
                     v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                    w = tl.load(topk_weights_ptr + token_id * topk + t)
-                    acc += v.to(tl.float32) * w
+                    if APPLY_WEIGHTS:
+                        w = tl.load(topk_weights_ptr + token_id * topk + t)
+                        if ACC_FP64:
+                            acc += v.to(tl.float64) * w.to(tl.float64)
+                        else:
+                            acc += v.to(tl.float32) * w
+                    else:
+                        if ACC_FP64:
+                            acc += v.to(tl.float64)
+                        else:
+                            acc += v.to(tl.float32)
 
-            tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
+            tl.store(output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask)
 
 
 def _moe_sum(
@@ -505,17 +518,27 @@ def _moe_sum(
     local_expert_start: int,
     num_local_experts: int,
     out: Optional[torch.Tensor] = None,
+    apply_weights: bool = True,
+    acc_fp64: bool = False,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] bf16 → [max_tokens, K].
 
     Applies routing weights and reduces over topk in a single kernel.
-    Accumulates in fp32. When `out` is None, allocates and returns an fp32
+    Accumulates in fp32, or fp64 when `acc_fp64` is set (the output buffer
+    stays fp32 either way). When `out` is None, allocates and returns an fp32
     buffer. When `out` is provided (e.g. the RSV symmetric memory tensor),
     writes directly into it — tl.store handles the cast to the buffer's dtype.
     Only writes the first valid_tokens rows; rows beyond are left untouched
     (downstream RSV reads only the valid range). Only accumulates contributions
     from local experts; non-local topk slots are skipped (their values in
     `input` are undefined).
+
+    Args:
+        apply_weights: multiply each slot by its routing probability (default).
+            Pass False when the probabilities were already applied upstream
+            (e.g. at the activation in batch-invariant mode).
+        acc_fp64: accumulate the topk sum in fp64, making the reduction
+            order-independent by precision.
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
@@ -535,6 +558,8 @@ def _moe_sum(
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_K_BLOCKS=NUM_K_BLOCKS,
+        APPLY_WEIGHTS=apply_weights,
+        ACC_FP64=acc_fp64,
     )
     return out
 
@@ -595,7 +620,18 @@ def vllm_fused_moe(
     # Mirror upstream vLLM: pick the full launch config (tile sizes, warps,
     # stages) host-side from the token-count hint, not from the worst-case
     # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
+    batch_invariant_mode = batch_invariant.enabled()
     config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
+    if batch_invariant_mode:
+        # Batch-invariant mode: pin only the K-reduction recipe. The kernel
+        # accumulates in fp32 with no split-K, so bits depend solely on the
+        # K-loop grouping (BLOCK_SIZE_K); M/N tile shapes, tile grouping and
+        # pipeline depth reorder nothing in the accumulation (bf16 products
+        # are exact in fp32 — only the addition order matters). Keeping the
+        # M/N tiling adaptive preserves the decode-tuned configs; pinning
+        # BLOCK_SIZE_K removes the one field _get_default_config varies that
+        # could change the summation order across co-batch sizes.
+        config['BLOCK_SIZE_K'] = 64
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
         routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
@@ -621,7 +657,11 @@ def vllm_fused_moe(
     topk_weights_flat = probs.reshape(-1).contiguous()
 
     # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    assert activation_type == ActivationType.SQUARED_RELU
+    # SQUARED_RELU fuses into the GEMM epilogue (elementwise). SwiGLU pairs column c
+    # with c+N/2 across tiles and cannot, so FC1 runs unfused to the 2N-wide
+    # intermediate and gate/up is applied separately below.
+    assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
+    is_swiglu = activation_type == ActivationType.SWIGLU
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
@@ -637,8 +677,24 @@ def vllm_fused_moe(
         top_k=topk,
         config=config,
         grid_size=grid_size_fc1,
-        fuse_squared_relu=True,
+        fuse_squared_relu=not is_swiglu,
     )
+    if is_swiglu:
+        if batch_invariant_mode:
+            # Match training: routing probabilities multiply at the activation
+            # (before FC2), with the training kernel's exact rounding sequence
+            # (single bf16 round of fp32 silu(gate)*up*prob). The reduction
+            # below then sums with unit weights. Device-bounded to the live
+            # valid_tokens*topk prefix; CUDA-graph safe.
+            bound_elems = valid_tokens.to(torch.int64) * (topk * (intermediate1.shape[1] // 2))
+            intermediate1 = batch_invariant.weighted_silu_mul_bounded(
+                intermediate1, topk_weights_flat, bound_elems
+            )
+        else:
+            # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
+            # SiLU(gate) * up over the valid_tokens*topk live rows only.
+            n_rows = (valid_tokens * topk).to(torch.int32)
+            intermediate1 = bounded_silu_mul(intermediate1, n_rows)
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
     # Routing weights are applied in the reduction kernel to avoid an extra
@@ -677,4 +733,9 @@ def vllm_fused_moe(
         local_expert_start,
         num_local_experts,
         out=out,
+        # Batch-invariant mode: probs were already applied at the activation
+        # for SwiGLU (training parity), so the reduction uses unit weights;
+        # fp64 accumulation makes the topk sum order-independent by precision.
+        apply_weights=not (batch_invariant_mode and is_swiglu),
+        acc_fp64=batch_invariant_mode and is_swiglu,
     )

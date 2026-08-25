@@ -150,7 +150,6 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.no_save_optim = False
     args.no_save_rng = False
     args.ckpt_assume_constant_structure = False
-    args.stream_ckpt_dequant = True
     args.ckpt_load_validate_sharding_integrity = True
     args.log_progress = False
     args.auto_detect_ckpt_format = False
@@ -191,6 +190,8 @@ def setup_model_and_optimizer(
     ep=1,
     etp=1,
     use_megatron_fsdp=False,
+    ddp_num_buckets=None,
+    ddp_pad_buckets_for_high_nccl_busbw=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -211,6 +212,12 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        if ddp_num_buckets is not None:
+            # resolve_ddp_bucket_size() forces a single bucket unless grad reduction
+            # overlaps, so both knobs are needed to actually split the grad buffer.
+            mock_args.ddp_num_buckets = ddp_num_buckets
+            mock_args.overlap_grad_reduce = True
+        mock_args.ddp_pad_buckets_for_high_nccl_busbw = ddp_pad_buckets_for_high_nccl_busbw
         mock_args.context_parallel_size = cp
         mock_args.expert_model_parallel_size = ep
         mock_args.expert_tensor_parallel_size = etp

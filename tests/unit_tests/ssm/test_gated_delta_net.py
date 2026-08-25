@@ -13,13 +13,20 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import (
+    HAVE_FLA,
+    HAVE_FLA_GDN2,
+    GatedDeltaNet,
+    GatedDeltaNet2,
+    chunk_gdn2,
+    torch_chunk_gated_delta_rule,
+    torch_chunk_gdn2,
+)
 from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
-    torch_chunk_gated_delta_rule,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -29,13 +36,6 @@ from tests.unit_tests.transformer.test_multi_latent_attention import (
     make_test_packed_seq_params,
     make_test_packed_seq_params_with_padding,
 )
-
-try:
-    import fla
-
-    HAVE_FLA = True
-except ImportError:
-    HAVE_FLA = False
 
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
 # NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
@@ -54,6 +54,7 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
     return unpacked_x
 
 
+@pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn", "gdn2"])
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size"),
     [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
@@ -63,7 +64,10 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
 class TestGatedDeltaNet:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, tp_size, sp, cp_size):
+    def setup_method(self, tp_size, sp, cp_size, use_gdn2):
+        if use_gdn2 and not HAVE_FLA_GDN2:
+            pytest.skip("FLA with GDN2 support is not installed.")
+
         # Initialize parallel and random seed
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
@@ -74,6 +78,7 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
+        self.use_gdn2 = use_gdn2
 
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -99,17 +104,15 @@ class TestGatedDeltaNet:
             tensor_model_parallel_size=tp_size,
             sequence_parallel=sp,
             context_parallel_size=cp_size,
-            experimental_attention_variant="gated_delta_net",
+            experimental_attention_variant="gdn2" if use_gdn2 else "gated_delta_net",
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
         )
-        gdn_submodules = get_experimental_attention_variant_module_spec(
-            config=self.transformer_config
-        ).submodules
+        gdn_spec = get_experimental_attention_variant_module_spec(config=self.transformer_config)
 
-        self.gdn = GatedDeltaNet(
+        self.gdn = gdn_spec.module(
             self.transformer_config,
-            submodules=gdn_submodules,
+            submodules=gdn_spec.submodules,
             layer_number=1,
             bias=False,
             conv_bias=False,
@@ -158,12 +161,10 @@ class TestGatedDeltaNet:
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 
         def build_gdn(config):
-            gdn_submodules = get_experimental_attention_variant_module_spec(
-                config=config
-            ).submodules
-            gdn = GatedDeltaNet(
+            gdn_spec = get_experimental_attention_variant_module_spec(config=config)
+            gdn = gdn_spec.module(
                 config,
-                submodules=gdn_submodules,
+                submodules=gdn_spec.submodules,
                 layer_number=1,
                 bias=False,
                 conv_bias=False,
@@ -241,16 +242,14 @@ class TestGatedDeltaNet:
         det_config = copy.deepcopy(self.transformer_config)
         det_config.deterministic_mode = True
 
-        gdn_submodules = get_experimental_attention_variant_module_spec(
-            config=det_config
-        ).submodules
+        gdn_spec = get_experimental_attention_variant_module_spec(config=det_config)
 
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
         gdn = (
-            GatedDeltaNet(
+            gdn_spec.module(
                 det_config,
-                submodules=gdn_submodules,
+                submodules=gdn_spec.submodules,
                 layer_number=1,
                 bias=False,
                 conv_bias=False,
@@ -263,8 +262,13 @@ class TestGatedDeltaNet:
             .bfloat16()
         )
 
-        # deterministic_mode must select the torch-native kernel, not FLA.
-        assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
+        # deterministic_mode must select the variant's torch-native kernel, not FLA.
+        if self.use_gdn2:
+            assert isinstance(gdn, GatedDeltaNet2)
+            assert gdn.gated_delta_rule is torch_chunk_gdn2
+        else:
+            assert isinstance(gdn, GatedDeltaNet)
+            assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
 
         micro_batch_size = 2
         seq_length = 64
@@ -275,20 +279,20 @@ class TestGatedDeltaNet:
             dtype=torch.bfloat16,
         )
 
-        def run():
+        def run(module):
             hidden_states = base_input.clone().requires_grad_(True)
-            output, _ = gdn(hidden_states, None)
+            output, _ = module(hidden_states, None)
             output.float().sum().backward()
             grads = {
                 name: param.grad.detach().clone()
-                for name, param in gdn.named_parameters()
+                for name, param in module.named_parameters()
                 if param.grad is not None
             }
-            gdn.zero_grad(set_to_none=True)
+            module.zero_grad(set_to_none=True)
             return output.detach().clone(), grads, hidden_states.grad.detach().clone()
 
-        out1, grads1, input_grad1 = run()
-        out2, grads2, input_grad2 = run()
+        out1, grads1, input_grad1 = run(gdn)
+        out2, grads2, input_grad2 = run(gdn)
 
         rank = torch.distributed.get_rank()
         assert torch.equal(out1, out2), f"Output not reproducible ({rank=})"
@@ -301,9 +305,25 @@ class TestGatedDeltaNet:
 
     def test_module_construction(self):
         gdn = self.gdn
-        assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
-        assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
-        assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
+        if self.use_gdn2:
+            assert isinstance(gdn, GatedDeltaNet2)
+            assert gdn.gated_delta_rule is chunk_gdn2
+            assert gdn.in_proj_dim == 4 * gdn.qk_dim + 3 * gdn.v_dim
+            assert gdn.A_log.shape == (gdn.num_key_heads // self.tp_size,)
+            assert gdn.dt_bias.shape == (gdn.qk_dim // self.tp_size,)
+        else:
+            assert isinstance(gdn, GatedDeltaNet)
+            assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
+            assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
+            assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
+
+    def test_inference_state_shapes(self):
+        if self.use_gdn2:
+            pytest.skip("GDN2 inference is not supported.")
+        assert self.gdn.mamba_state_shapes_per_request() == (
+            (self.gdn.conv_dim_local_tp, self.gdn.conv_kernel_dim),
+            (self.gdn.num_v_heads_local_tp, self.gdn.key_head_dim, self.gdn.value_head_dim),
+        )
 
     def test_jit_compiled_helpers(self):
         import torch._dynamo
@@ -329,34 +349,72 @@ class TestGatedDeltaNet:
             device=device,
             dtype=torch.bfloat16,
         )
-        gate_feats = (
-            torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
-            torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
-        )  # beta, alpha
+        if self.use_gdn2:
+            gate_feats = (
+                torch.randn(batch, seq_len, qk_dim_local, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, seq_len, qk_dim_local, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, seq_len, v_dim_local, device=device, dtype=torch.bfloat16),
+            )  # f, b, w
+            A_log_mock = torch.randn(num_k_heads_local, device=device, dtype=torch.bfloat16)
+            dt_bias_mock = torch.randn(qk_dim_local, device=device, dtype=torch.bfloat16)
+            expected_keys = {"q", "k", "v", "g", "b", "w"}
+        else:
+            gate_feats = (
+                torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
+            )  # beta, alpha
+            A_log_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+            dt_bias_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+            expected_keys = {"q", "k", "v", "g", "beta"}
 
         # Disable dynamo so coverage.py can trace through the method bodies,
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
-            query, key, value, gate_out, *gate_feats_out = gdn._prepare_input_for_gated_delta_rule(
-                qkv, gate, batch, seq_len, *gate_feats
+            kernel_inputs = gdn._prepare_input_for_gated_delta_rule(
+                qkv, gate, A_log_mock, dt_bias_mock, batch, seq_len, *gate_feats
             )
 
+        # The output gate (z) rides along under "gate" and is popped by forward before
+        # the kernel call; everything else is passed straight through as kernel kwargs.
+        gate_out = kernel_inputs.pop("gate")
+        assert set(kernel_inputs) == expected_keys
+
+        query, key, value, g = (kernel_inputs[k] for k in ("q", "k", "v", "g"))
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-        for t in (query, key, value, gate_out, *gate_feats_out):
+        assert gate_out.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
+        for t in (query, key, value, gate_out, *kernel_inputs.values()):
             assert t.is_contiguous()
 
-        # The variant gate features (beta, alpha) pass through with shapes intact
-        beta_out, alpha_out = gate_feats_out
-        assert beta_out.shape == (batch, seq_len, num_v_heads_local)
-        assert alpha_out.shape == (batch, seq_len, num_v_heads_local)
+        if self.use_gdn2:
+            # Per-channel decay and erase/write gates squashed to [0, 1]
+            b, w = kernel_inputs["b"], kernel_inputs["w"]
+            assert g.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
+            assert b.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
+            assert w.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
+            assert (g <= 0).all()
+            assert (b >= 0).all() and (b <= 1).all()
+            assert (w >= 0).all() and (w <= 1).all()
+        else:
+            # Per-head decay and write strength beta
+            beta = kernel_inputs["beta"]
+            assert g.shape == (batch, seq_len, num_v_heads_local)
+            assert beta.shape == (batch, seq_len, num_v_heads_local)
+            assert (g <= 0).all()
+            assert (beta >= 0).all() and (beta <= 1).all()
 
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
 
-        atol, rtol = 3e-4, 3e-4
+        if self.use_gdn2:
+            # FLA uses different kernels for SBHD and THD:
+            # https://github.com/fla-org/flash-linear-attention/blob/ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0/fla/ops/gdn2/chunk_intra.py#L40-L53
+            # so we relax the error bound here
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 3e-4, 3e-4
 
         # Input shape
         sequence_length = 32
@@ -399,7 +457,12 @@ class TestGatedDeltaNet:
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
 
-        atol, rtol = 3e-4, 3e-4
+        if self.use_gdn2:
+            # See test_gpu_forward_thd_correctness: varlen vs batched kernel paths only
+            # match up to bf16 ULP-level differences for GDN2.
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 3e-4, 3e-4
         sequence_length = 32
         micro_batch_size = 4
 
@@ -555,8 +618,58 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
     )
 
 
+@pytest.mark.parametrize("sequence_packing", [False, True])
+@pytest.mark.parametrize(
+    ("tp", "sp", "cp"),
+    [(4, True, 1), (1, False, 2), (2, True, 2)],  # TP w/ SP  # CP  # TP w/ SP + CP
+)
+@pytest.mark.skipif(not HAVE_FLA_GDN2, reason="FLA with GDN2 support is not installed.")
+def test_parallel_gated_delta_net2_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+    transformer_config = TransformerConfig(
+        hidden_size=128,
+        linear_conv_kernel_dim=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        num_layers=1,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+        layernorm_zero_centered_gamma=True,
+        num_attention_heads=8,
+        activation_func=F.silu,
+        bf16=True,
+        experimental_attention_variant="gdn2",
+        linear_attention_freq=[1],
+        transformer_impl="transformer_engine",
+    )
+
+    transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+        config=transformer_config, vp_stage=None, pp_rank=0
+    )
+
+    atol = rtol = 3e-2 if cp > 1 else 2e-2
+    _test_parallel_attention_correctness(
+        transformer_config=transformer_config,
+        transformer_layer_spec=transformer_layer_spec,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=42,
+        sequence_length=512,
+        micro_batch_size=2,
+        sequence_packing=sequence_packing,
+    )
+
+
 @pytest.mark.parametrize("cp_size", [2, 4], scope="class")
 @pytest.mark.internal
+@pytest.mark.skip(
+    "Used to verify the correctness of the fused THD AllToAll implementation, locally validated thus no need to run on CI."
+)
 class TestFusedThdAllToAll:
     """Verify fused 1 AllToAll + permute matches the per-sequence, per-channel loop in GDN."""
 

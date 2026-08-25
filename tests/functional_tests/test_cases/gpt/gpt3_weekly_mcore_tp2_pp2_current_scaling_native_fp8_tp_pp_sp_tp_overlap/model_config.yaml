@@ -63,3 +63,4 @@ METRICS:
   - iteration-time
   - lm loss
   - "mem-allocated-bytes"
+LAUNCHER: ft_launcher
