@@ -416,8 +416,8 @@ class _GDNBase(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Kernels that support in-kernel normalization save only rstd for backward and
-        # recompute normalized q/k instead of materializing that activation here.
+        # Let a supporting kernel own normalization so caller autograd does not retain an
+        # additional pre-split, normalized query_key activation alongside the kernel q/k.
         if self.use_qk_l2norm and not use_qk_l2norm_in_kernel:
             query_key = l2norm(query_key.contiguous())
 

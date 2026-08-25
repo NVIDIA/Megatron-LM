@@ -460,8 +460,8 @@ def torch_chunk_gated_delta_rule(
     query, key, value = q, k, v
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
+        query = l2norm(query)
+        key = l2norm(key)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
