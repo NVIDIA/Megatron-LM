@@ -340,6 +340,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules_config = submodules
+        # GraphableMegatronModule may create a local CUDA graph manager during super().__init__().
+        # Dense layers need a default before that hook runs, while MoETransformerLayer sets this
+        # to True before entering this constructor.
+        self.is_moe_layer = getattr(self, "is_moe_layer", False)
         super().__init__(config=config, vp_stage=vp_stage)
 
         if pg_collection is None:
@@ -590,7 +594,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             CudaGraphModule.mlp in self.config.cuda_graph_modules
             and self.submodules_config.mlp != IdentityOp
         ):
-            # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
+            # Cudagraphing MoE layers is handled by MoETransformerLayer.
             assert not self.is_moe_layer
             self.cudagraph_manager = CudaGraphManager(config)
 
