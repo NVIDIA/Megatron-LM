@@ -45,6 +45,24 @@ def test_transformer_layer_uses_fp4_context():
     get_fp4_context.assert_called_once_with(config, 2)
 
 
+def test_mtp_layer_uses_global_fp8_context():
+    config = SimpleNamespace(fp8="e4m3", fp8_recipe=Fp8Recipe.tensorwise, fp4=None)
+    layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = config
+    layer.layer_number = 1
+    expected_context = nullcontext()
+
+    with patch(
+        "megatron.core.transformer.multi_token_prediction.get_fp8_context",
+        return_value=expected_context,
+    ) as get_fp8_context:
+        context = layer.get_inner_quantization_context()
+
+    assert context is expected_context
+    get_fp8_context.assert_called_once_with(config)
+
+
 def test_mtp_layer_does_not_use_fp4_context():
     config = SimpleNamespace(fp8=None, fp8_recipe=Fp8Recipe.delayed, fp4="e2m1")
     layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)

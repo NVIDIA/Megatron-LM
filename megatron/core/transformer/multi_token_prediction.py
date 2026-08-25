@@ -1254,7 +1254,7 @@ class MultiTokenPredictionLayer(MegatronModule):
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
-            return get_fp8_context(self.config, self.layer_number - 1)
+            return get_fp8_context(self.config)
 
         # FP4 in MTP layers still needs numerical validation.
         return nullcontext()
