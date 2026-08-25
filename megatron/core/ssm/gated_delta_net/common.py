@@ -389,6 +389,7 @@ class _GDNBase(MegatronModule):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        use_qk_l2norm_in_kernel: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -396,6 +397,8 @@ class _GDNBase(MegatronModule):
         Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
         contiguous operations. ``gate_feats`` holds the variant-specific in_proj
         sections, which ``_compute_gates`` turns into the decay and gating tensors.
+        When ``use_qk_l2norm_in_kernel`` is true, q/k normalization is deferred to
+        the gated delta rule kernel to avoid materializing normalized q/k here.
 
         Returns:
             (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
@@ -413,8 +416,9 @@ class _GDNBase(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Apply L2 norm to query and key
-        if self.use_qk_l2norm:
+        # Kernels that support in-kernel normalization save only rstd for backward and
+        # recompute normalized q/k instead of materializing that activation here.
+        if self.use_qk_l2norm and not use_qk_l2norm_in_kernel:
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key

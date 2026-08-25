@@ -248,7 +248,15 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
         kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
+            qkv,
+            gate,
+            A_log_local_cp,
+            dt_bias_local_cp,
+            batch,
+            seq_len,
+            beta,
+            alpha,
+            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
         )
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
@@ -258,7 +266,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             **kernel_inputs,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
