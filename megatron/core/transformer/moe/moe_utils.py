@@ -16,7 +16,10 @@ from megatron.core.tensor_parallel import (
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
 )
-from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_dynamic_cp_subgroup,
+    reduce_from_tensor_model_parallel_region,
+)
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import (
@@ -227,6 +230,7 @@ def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
     reduce_group: torch.distributed.ProcessGroup,
     reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
+    dynamic_cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
     topk: int = None,
     with_padding_mask: bool = False,
 ) -> Tuple[torch.Tensor, Union[int, torch.Tensor], Union[int, torch.Tensor]]:
@@ -239,10 +243,15 @@ def get_tokens_per_expert_and_token_count(
 
     global_tokens_per_expert = local_tokens_per_expert
     reduce_world_size = 1
-    for group in reduce_groups:
-        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-            global_tokens_per_expert, group
-        )
+    for group_index, group in enumerate(reduce_groups):
+        if group_index == 0 and dynamic_cp_parent_group is not None:
+            global_tokens_per_expert = reduce_from_dynamic_cp_subgroup(
+                global_tokens_per_expert, group, dynamic_cp_parent_group
+            )
+        else:
+            global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                global_tokens_per_expert, group
+            )
         reduce_world_size *= group.size()
 
     if with_padding_mask:
@@ -1479,6 +1488,7 @@ def get_default_pg_collection() -> ProcessGroupCollection:
     pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
         with_context_parallel=True
     )
+    pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
     return pg_collection
 
 
