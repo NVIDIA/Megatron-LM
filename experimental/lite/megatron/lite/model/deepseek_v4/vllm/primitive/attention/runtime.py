@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections import OrderedDict
 from copy import copy
-from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -273,73 +271,29 @@ class AttentionMetadataBuilder:
         self.layer_idx = layer_idx
         self.ratio = max(1, config.compress_ratios[layer_idx])
         self.cos_sin_cache = cos_sin_cache
-        self._workspace_cache: OrderedDict[
-            tuple[int, torch.device],
-            tuple[DS4CompressorMetadata | None, DS4CompressorMetadata | None],
-        ] = OrderedDict()
-        self._workspace_cache_max_entries = 8
-        self._workspace_cache_hits = 0
-        self._workspace_cache_misses = 0
 
-    def workspace_stats(self) -> dict[str, int]:
-        return {
-            "hits": self._workspace_cache_hits,
-            "misses": self._workspace_cache_misses,
-            "entries": len(self._workspace_cache),
-        }
-
-    def _compressor_workspaces(
-        self, positions: torch.Tensor
-    ) -> tuple[DS4CompressorMetadata | None, DS4CompressorMetadata | None]:
-        key = (positions.numel(), positions.device)
-        cached = self._workspace_cache.get(key)
-        if cached is not None:
-            self._workspace_cache_hits += 1
-            self._workspace_cache.move_to_end(key)
-            return cached
-        self._workspace_cache_misses += 1
-        record = getattr(torch.autograd.profiler, "record_function", None)
-        scope = (
-            record("mlite::attention_workspace_cache_miss")
-            if callable(record)
-            else nullcontext()
-        )
-        with scope:
-            cached = (
+    def build(self, positions: torch.Tensor, packed_seq_params: Any):
+        return AttentionKernelMetadata(
+            positions=positions,
+            cos_sin_cache=self.cos_sin_cache,
+            packed_seq_params=packed_seq_params,
+            compressor_metadata=_build_compressor_metadata(
+                self.config,
+                ratio=self.ratio,
+                rows=positions.numel(),
+                cos_sin_cache=self.cos_sin_cache,
+            ),
+            indexer_compressor_metadata=(
                 _build_compressor_metadata(
                     self.config,
                     ratio=self.ratio,
                     rows=positions.numel(),
                     cos_sin_cache=self.cos_sin_cache,
-                ),
-                (
-                    _build_compressor_metadata(
-                        self.config,
-                        ratio=self.ratio,
-                        rows=positions.numel(),
-                        cos_sin_cache=self.cos_sin_cache,
-                        head_dim=self.config.index_head_dim,
-                    )
-                    if self.ratio == 4
-                    else None
-                ),
-            )
-        self._workspace_cache[key] = cached
-        self._workspace_cache.move_to_end(key)
-        while len(self._workspace_cache) > self._workspace_cache_max_entries:
-            self._workspace_cache.popitem(last=False)
-        return cached
-
-    def build(self, positions: torch.Tensor, packed_seq_params: Any):
-        compressor_metadata, indexer_compressor_metadata = (
-            self._compressor_workspaces(positions)
-        )
-        return AttentionKernelMetadata(
-            positions=positions,
-            cos_sin_cache=self.cos_sin_cache,
-            packed_seq_params=packed_seq_params,
-            compressor_metadata=compressor_metadata,
-            indexer_compressor_metadata=indexer_compressor_metadata,
+                    head_dim=self.config.index_head_dim,
+                )
+                if self.ratio == 4
+                else None
+            ),
         )
 
 
@@ -678,67 +632,76 @@ def official_indexer_topk(
     if index_k_seq_major.shape[0] == 0:
         return output
     k_scale = k_scale.view(torch.float32).squeeze(-1)
-    # DeepGEMM's contiguous MQA ABI already accepts an independent K interval
-    # for every query row.  Keep all request K segments packed, and describe
-    # their ownership with absolute row_starts/row_ends instead of launching
-    # once per request.  Top-K returns packed indices; translate them back to
-    # request-local compressed coordinates below.
-    global_queries = torch.arange(
-        global_start,
-        global_start + rows,
-        dtype=cu_seqlens.dtype,
-        device=index_q.device,
-    )
-    request_ids = torch.searchsorted(
-        cu_seqlens[1:].contiguous(), global_queries, right=True
-    )
-    request_ids.clamp_max_(cu_seqlens.numel() - 2)
-    row_starts = cu_seqlens_compressed[:-1].index_select(
-        0, request_ids.to(torch.int64)
-    )
-    request_k_ends = cu_seqlens_compressed[1:].index_select(
-        0, request_ids.to(torch.int64)
-    )
-    visible_counts = torch.div(
-        positions + 1, ratio, rounding_mode="floor"
-    ).to(torch.int32)
-    row_ends = torch.minimum(row_starts + visible_counts, request_k_ends).contiguous()
-    row_starts = row_starts.to(torch.int32).contiguous()
+    local_end = global_start + rows
+    for seq_idx in range(cu_seqlens.numel() - 1):
+        seq_start = int(cu_seqlens[seq_idx].item())
+        seq_end = int(cu_seqlens[seq_idx + 1].item())
+        query_start = max(global_start, seq_start)
+        query_end = min(local_end, seq_end)
+        if query_end <= query_start:
+            continue
+        q_start = query_start - global_start
+        q_end = query_end - global_start
+        k_start = int(cu_seqlens_compressed[seq_idx].item())
+        k_end = int(cu_seqlens_compressed[seq_idx + 1].item())
+        if k_end <= k_start:
+            continue
 
-    padded_k_rows = ((k_quant.shape[0] + 127) // 128) * 128
-    if padded_k_rows != k_quant.shape[0]:
-        k_quant = torch.cat(
-            (
-                k_quant,
-                k_quant.new_zeros((padded_k_rows - k_quant.shape[0], k_quant.shape[1])),
-            ),
-            dim=0,
+        # vLLM prefill scores each request against its own compressed-K
+        # segment.  Keeping N and the logits stride request-local is required
+        # for deterministic Top-K tie resolution across packed batches.
+        segment_rows = q_end - q_start
+        row_starts = torch.zeros(
+            segment_rows, dtype=torch.int32, device=index_q.device
         )
-        k_scale = torch.cat(
-            (k_scale, k_scale.new_ones(padded_k_rows - k_scale.shape[0])),
-            dim=0,
+        row_ends = torch.div(
+            positions[q_start:q_end] + 1, ratio, rounding_mode="floor"
+        ).to(torch.int32)
+        row_ends.clamp_max_(k_end - k_start)
+        segment_k = k_quant[k_start:k_end].clone()
+        segment_k_scale = k_scale[k_start:k_end].clone()
+        padded_k_rows = ((segment_k.shape[0] + 127) // 128) * 128
+        if padded_k_rows != segment_k.shape[0]:
+            segment_k = torch.cat(
+                (
+                    segment_k,
+                    segment_k.new_zeros(
+                        (padded_k_rows - segment_k.shape[0], segment_k.shape[1])
+                    ),
+                ),
+                dim=0,
+            )
+            segment_k_scale = torch.cat(
+                (
+                    segment_k_scale,
+                    segment_k_scale.new_ones(
+                        padded_k_rows - segment_k_scale.shape[0]
+                    ),
+                ),
+                dim=0,
+            )
+        logits = fp8_fp4_mqa_logits(
+            (q_quant[q_start:q_end].clone(), None),
+            (segment_k, segment_k_scale),
+            weights[q_start:q_end].clone(),
+            row_starts,
+            row_ends.contiguous(),
+            clean_logits=False,
         )
-    logits = fp8_fp4_mqa_logits(
-        (q_quant, None),
-        (k_quant, k_scale),
-        weights,
-        row_starts,
-        row_ends,
-        clean_logits=False,
-    )
-    ops.top_k_per_row_prefill(
-        logits,
-        row_starts,
-        row_ends,
-        output,
-        rows,
-        logits.stride(0),
-        logits.stride(1),
-        topk,
-    )
-    valid = output >= 0
-    output.sub_(row_starts.unsqueeze(1))
-    output.masked_fill_(~valid, -1)
+        segment_output = torch.full(
+            (segment_rows, topk), -1, dtype=torch.int32, device=index_q.device
+        )
+        ops.top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            segment_output,
+            segment_rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk,
+        )
+        output[q_start:q_end] = segment_output
     return output
 
 

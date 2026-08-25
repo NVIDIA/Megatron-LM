@@ -103,15 +103,10 @@ def pack_grouped_block_fp8_weight(weights: Iterable[nn.Parameter]):
     if not weights:
         raise ValueError("grouped block-FP8 packing requires at least one expert")
     canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
-    # Requantization to UE8M0 is a 2-D in-place operation. Applying it after
-    # stacking experts passes a 3-D tensor through a 2-D kernel and corrupts
-    # synthetic/BF16-master scales. Process each expert first, then form the
-    # grouped DeepGEMM tensors. Checkpoint E8M0 scales take the same layout path.
-    processed = tuple(
-        _post_process(item.qweight, item.scales) for item in canonical
+    qweight, scales = _post_process(
+        torch.stack([item.qweight for item in canonical]),
+        torch.stack([item.scales for item in canonical]),
     )
-    qweight = torch.stack([item[0] for item in processed])
-    scales = torch.stack([item[1] for item in processed])
     return PackedBlockFP8Weight(
         qweight, scales, tuple(_key(weight) for weight in weights)
     )

@@ -419,14 +419,13 @@ def _scatter_deepep_routes_with_padding(
     if topk_weights.dtype != torch.float32:
         raise TypeError(f"DeepEP top-k weights must be FP32, got {topk_weights.dtype}")
 
-    if tokens_per_expert.device.type != "cpu":
-        raise RuntimeError(
-            "DeepEP scatter requires dispatcher-provided CPU expert counts"
+    if tokens_per_expert.device.type == "cpu":
+        count_values = tuple(
+            int(value) for value in tokens_per_expert.reshape(-1).tolist()
         )
-    count_values = tuple(
-        int(value) for value in tokens_per_expert.reshape(-1).tolist()
-    )
-    total_rows = sum(count_values)
+        total_rows = sum(count_values)
+    else:
+        count_values = None
 
     num_experts = tokens_per_expert.numel()
     valid = (topk_indices >= 0) & (topk_indices < num_experts)
@@ -457,6 +456,8 @@ def _scatter_deepep_routes_with_padding(
         "DeepEP real route count exceeds its aligned expert count",
     )
 
+    if count_values is None:
+        total_rows = int(counts.sum().item())
     permuted_probs = topk_weights.new_zeros((total_rows,))
     output_index = torch.full_like(topk_indices, -1)
     expert_offsets = torch.cumsum(counts, dim=0) - counts
@@ -576,11 +577,10 @@ class _VLLMEPGatherWithBF16Backward(torch.autograd.Function):
         return grad_hidden, None, grad_weights, None, None, None
 
 
-def _compact_route_dispatch_inputs(
+def _compact_route_preserving_metadata_inputs(
     hidden_states: torch.Tensor,
     topk_indices: torch.Tensor,
     topk_weights: torch.Tensor,
-    num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
         raise TypeError("Route metadata requires BF16 [tokens, hidden]")
@@ -595,36 +595,18 @@ def _compact_route_dispatch_inputs(
     if topk_weights.dtype != torch.float32:
         raise TypeError("Route weights must be FP32")
 
-    valid = (topk_indices >= 0) & (topk_indices < num_experts)
     flat_indices = topk_indices.reshape(-1)
-    flat_weights = topk_weights.reshape(-1)
-    if hidden_states.is_cuda:
-        # Production DS4 routing is dense top-k. Compacting invalid slots with
-        # torch.nonzero would introduce a data-dependent CPU fallback contract
-        # for DeepEP, so reject such routing asynchronously instead.
-        torch._assert_async(
-            torch.all(valid),
-            "CUDA DeepEP requires every DS4 top-k route to be valid",
-        )
-        compact_indices = flat_indices
-        compact_weights = flat_weights
-        route_hidden = hidden_states.repeat_interleave(topk_indices.shape[1], dim=0)
-        valid_positions = torch.arange(
-            flat_indices.numel(), device=flat_indices.device, dtype=torch.long
-        )
-        all_routes_valid = True
-    else:
-        # CPU is intentionally a unit-test/reference path.
-        valid_positions = torch.nonzero(valid.reshape(-1), as_tuple=False).reshape(-1)
-        compact_indices = flat_indices.index_select(0, valid_positions)
-        compact_weights = flat_weights.index_select(0, valid_positions)
-        token_rows = torch.div(
-            valid_positions, topk_indices.shape[1], rounding_mode="floor"
-        )
-        route_hidden = hidden_states.index_select(0, token_rows)
-        all_routes_valid = valid_positions.numel() == flat_indices.numel()
+    valid_positions = torch.nonzero(flat_indices >= 0, as_tuple=False).reshape(-1)
     if valid_positions.numel() == 0:
         raise RuntimeError("Route-preserving DeepEP received no valid expert routes")
+    compact_indices = flat_indices.index_select(0, valid_positions)
+    compact_weights = topk_weights.detach().reshape(-1).index_select(0, valid_positions)
+    token_rows = torch.div(
+        valid_positions, topk_indices.shape[1], rounding_mode="floor"
+    )
+    fingerprints = (
+        hidden_states.detach().narrow(1, 0, 16).index_select(0, token_rows).contiguous()
+    )
     output_index = torch.full_like(topk_indices, -1, dtype=torch.long)
     output_index.reshape(-1).index_copy_(
         0,
@@ -636,9 +618,9 @@ def _compact_route_dispatch_inputs(
     return (
         compact_indices.reshape(-1, 1).contiguous(),
         compact_weights.reshape(-1, 1).contiguous(),
-        route_hidden.contiguous(),
+        fingerprints,
         output_index,
-        all_routes_valid,
+        valid_positions.numel() == flat_indices.numel(),
     )
 
 
@@ -658,6 +640,116 @@ def _deepep_route_handle_received_rows(handle: tuple) -> int:
     if not isinstance(received_metadata, torch.Tensor) or received_metadata.ndim < 1:
         raise TypeError("DeepEP route handle has invalid received-source metadata")
     return received_metadata.shape[0]
+
+
+def _validate_and_order_route_preserving_outputs(
+    expert_outputs: torch.Tensor,
+    received_tokens: torch.Tensor,
+    received_topk_indices: torch.Tensor,
+    received_topk_weights: torch.Tensor,
+    output_index: torch.Tensor,
+    route_fingerprints: torch.Tensor,
+    route_indices: torch.Tensor,
+    route_weights: torch.Tensor,
+    *,
+    order_outputs: bool = True,
+    route_positions: torch.Tensor | None = None,
+    return_route_rows: bool = False,
+) -> torch.Tensor:
+    """Match primary rows to Slime fingerprints and expert IDs."""
+    if expert_outputs.ndim != 2 or received_tokens.ndim != 2:
+        raise ValueError("Route-preserving DeepEP expects 2D hidden tensors")
+    if received_topk_indices.shape != received_topk_weights.shape:
+        raise ValueError("Received DeepEP IDs and weights do not align")
+    if output_index.shape != received_topk_indices.shape:
+        raise ValueError("Received DeepEP route mapping does not align")
+
+    positions = (
+        torch.nonzero(output_index >= 0, as_tuple=False)
+        if route_positions is None
+        else route_positions
+    )
+    if positions.shape[0] != route_indices.numel():
+        raise RuntimeError(
+            "Route-preserving DeepEP route count mismatch: "
+            f"primary={positions.shape[0]} metadata={route_indices.numel()}"
+        )
+    token_rows = positions[:, 0]
+    topk_slots = positions[:, 1]
+    expected_indices = received_topk_indices[token_rows, topk_slots].reshape(-1)
+    expected_fingerprints = received_tokens.narrow(1, 0, 16).index_select(0, token_rows)
+    if route_fingerprints.shape != expected_fingerprints.shape:
+        raise RuntimeError(
+            "Route-preserving DeepEP fingerprint shape mismatch: "
+            f"{tuple(route_fingerprints.shape)} != {tuple(expected_fingerprints.shape)}"
+        )
+
+    expected_weights = received_topk_weights[token_rows, topk_slots].reshape(-1)
+    # The hidden-state and metadata dispatches are separate DeepEP operations.
+    # At full-model scale they may preserve the same routes while choosing a
+    # different arrival order within an expert. Match the two streams by a
+    # bitwise route fingerprint before validating and building combine rows.
+    def _route_hashes(
+        fingerprints: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        words = fingerprints.contiguous().view(torch.int16).reshape(
+            fingerprints.shape[0], -1
+        )
+        hashes = torch.full(
+            (words.shape[0],),
+            1469598103934665603,
+            dtype=torch.int64,
+            device=words.device,
+        )
+        for column in range(words.shape[1]):
+            hashes = (hashes ^ (words[:, column].to(torch.int64) & 0xFFFF)) * 1099511628211
+        hashes = (hashes ^ indices.to(torch.int64)) * 1099511628211
+        weight_bits = weights.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        return (hashes ^ weight_bits) * 1099511628211
+
+    expected_hashes = _route_hashes(
+        expected_fingerprints, expected_indices, expected_weights
+    )
+    route_hashes = _route_hashes(
+        route_fingerprints,
+        route_indices.to(dtype=expected_indices.dtype),
+        route_weights.to(dtype=expected_weights.dtype),
+    )
+    expected_order = torch.argsort(expected_hashes, stable=True)
+    route_order = torch.argsort(route_hashes, stable=True)
+    expected_for_route = torch.empty_like(expected_order)
+    expected_for_route.scatter_(0, route_order, expected_order)
+    expected_indices = expected_indices.index_select(0, expected_for_route)
+    expected_weights = expected_weights.index_select(0, expected_for_route)
+    expected_fingerprints = expected_fingerprints.index_select(0, expected_for_route)
+    torch._assert_async(
+        torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
+        "Route-preserving DeepEP metadata changed local expert order",
+    )
+    torch._assert_async(
+        torch.all(
+            expected_weights.contiguous().view(torch.int32)
+            == route_weights.to(dtype=expected_weights.dtype)
+            .contiguous()
+            .view(torch.int32)
+        ),
+        "Route-preserving DeepEP metadata changed route probability order",
+    )
+    torch._assert_async(
+        torch.all(expected_fingerprints == route_fingerprints),
+        "Route-preserving DeepEP metadata changed source-token order",
+    )
+    primary_route_rows = output_index[token_rows, topk_slots].to(
+        dtype=torch.long
+    ).index_select(0, expected_for_route)
+    route_rows = primary_route_rows
+    if return_route_rows:
+        return route_rows
+    if not order_outputs:
+        return expert_outputs
+    return expert_outputs.index_select(0, route_rows)
 
 
 _deepep_buffer = None
@@ -708,6 +800,33 @@ def _get_deepep_buffer(group: dist.ProcessGroup, hidden_bytes: int):
             explicitly_destroy=True,
         )
     return _deepep_buffer
+
+
+def _dispatch_route_metadata(
+    buffer,
+    fingerprints: torch.Tensor,
+    route_indices: torch.Tensor,
+    route_weights: torch.Tensor,
+    num_experts: int,
+):
+    layout = buffer.get_dispatch_layout(
+        route_indices,
+        num_experts=num_experts,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    )
+    return buffer.dispatch(
+        fingerprints.contiguous(),
+        topk_idx=route_indices.contiguous(),
+        topk_weights=route_weights.float().contiguous(),
+        num_tokens_per_rank=layout[0],
+        num_tokens_per_rdma_rank=layout[1],
+        num_tokens_per_expert=layout[2],
+        is_token_in_rank=layout[3],
+        previous_event=layout[4],
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    )
 
 
 class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
@@ -792,28 +911,27 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         (
             route_indices,
             route_weights,
-            route_hidden,
+            route_fingerprints,
             source_output_index,
             source_all_routes_valid,
-        ) = _compact_route_dispatch_inputs(
+        ) = _compact_route_preserving_metadata_inputs(
             hidden_states,
             topk_indices,
             topk_scores,
-            self.num_experts,
         )
         if self.ep_size > 1:
-            buffer = self._ensure_deepep_buffer(route_hidden)
+            buffer = self._ensure_deepep_buffer(hidden_states)
             (
                 received_hidden,
                 received_indices,
                 received_weights,
                 received_per_expert_cpu,
-                route_handle,
+                _,
             ) = _DeepEPDispatch.apply(
                 buffer,
-                route_hidden,
-                route_indices,
-                route_weights,
+                hidden_states,
+                topk_indices,
+                topk_scores,
                 self.num_experts,
                 False,
                 False,
@@ -821,30 +939,40 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             if received_per_expert_cpu.device.type != "cpu":
                 raise RuntimeError("DeepEP expert counts must remain CPU metadata")
             self._local_tpe_list = received_per_expert_cpu.tolist()
-            # _VLLMVisibleExperts consumes the dispatcher-provided host list;
-            # keep the tensor form on CPU as well. Uploading it serves no CUDA
-            # consumer and previously recreated the CPU -> GPU -> CPU roundtrip.
-            received_per_expert = received_per_expert_cpu
-            scatter_counts = received_per_expert_cpu
+            received_per_expert = received_per_expert_cpu.to(
+                device=received_hidden.device
+            )
+            (
+                received_fingerprints,
+                received_route_indices,
+                received_route_weights,
+                _,
+                route_handle,
+                _,
+            ) = _dispatch_route_metadata(
+                buffer,
+                route_fingerprints,
+                route_indices,
+                route_weights,
+                self.num_experts,
+            )
         else:
-            if hidden_states.is_cuda:
-                raise RuntimeError(
-                    "CUDA vLLM grouped MoE requires DeepEP host expert counts"
-                )
-            received_hidden = route_hidden
-            received_indices = route_indices
-            received_weights = route_weights
+            received_hidden = hidden_states
+            received_indices = topk_indices
+            received_weights = topk_scores
+            received_fingerprints = route_fingerprints
+            received_route_indices = route_indices
+            received_route_weights = route_weights
             route_handle = None
             received_per_expert = torch.bincount(
-                received_indices.reshape(-1).long(),
+                received_route_indices.reshape(-1).long(),
                 minlength=self.num_local_experts,
             )
             self._local_tpe_list = received_per_expert.tolist()
-            scatter_counts = received_per_expert
         expected_route_count = (
             _deepep_route_handle_received_rows(route_handle)
             if route_handle is not None
-            else received_hidden.shape[0]
+            else int((received_indices >= 0).sum().item())
         )
         (
             expert_hidden,
@@ -856,12 +984,21 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             received_hidden,
             received_indices,
             received_weights,
-            scatter_counts,
+            received_per_expert,
             expected_route_count=expected_route_count,
         )
-        self._metadata_route_rows = output_index[
-            positions[:, 0], positions[:, 1]
-        ].to(dtype=torch.long)
+        self._metadata_route_rows = _validate_and_order_route_preserving_outputs(
+            expert_hidden,
+            received_hidden,
+            sanitized_indices,
+            received_weights,
+            output_index,
+            received_fingerprints,
+            received_route_indices.reshape(-1),
+            received_route_weights.reshape(-1),
+            route_positions=positions,
+            return_route_rows=True,
+        )
         self._route_handle = route_handle
         self._source_indices = topk_indices
         self._source_weights = topk_scores

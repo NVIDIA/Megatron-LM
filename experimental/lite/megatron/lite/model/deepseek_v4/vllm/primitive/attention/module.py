@@ -64,36 +64,6 @@ def _fp32_linear(value: torch.Tensor, *weights: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _pack_request_local_indices(
-    request_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
-    *,
-    global_start: int,
-) -> torch.Tensor:
-    """Translate request-local sparse indices into one packed-K coordinate."""
-    rows = request_indices.shape[0]
-    global_queries = torch.arange(
-        global_start,
-        global_start + rows,
-        dtype=cu_seqlens.dtype,
-        device=cu_seqlens.device,
-    )
-    request_ids = torch.searchsorted(
-        cu_seqlens[1:].contiguous(), global_queries, right=True
-    )
-    request_ids.clamp_max_(cu_seqlens.numel() - 2)
-    request_offsets = (
-        cu_seqlens[:-1] + cu_seqlens_compressed[:-1]
-    ).index_select(0, request_ids.to(torch.int64))
-    return torch.where(
-        request_indices >= 0,
-        request_indices
-        + request_offsets.view((-1,) + (1,) * (request_indices.ndim - 1)),
-        request_indices,
-    ).contiguous()
-
-
 def insert_qkv(
     q: Tensor,
     kv: Tensor,
@@ -694,51 +664,62 @@ class VLLMAttention(CompressedSparseAttention):
                 d_window=d_window,
                 physical_workspace_rows=workspace.shape[0],
             )
-            valid_workspace_rows = workspace_row_map < workspace.shape[0]
-            request_workspace = workspace.index_select(
-                0,
-                workspace_row_map.clamp_max(workspace.shape[0] - 1).to(
-                    torch.int64
-                ),
+            sequence_boundaries = cu_seqlens.detach().cpu().tolist()
+            compressed_boundaries = (
+                cu_seqlens_compressed.detach().cpu().tolist()
             )
-            request_workspace.masked_fill_(
-                ~valid_workspace_rows.view((-1,) + (1,) * (workspace.ndim - 1)),
-                0,
-            )
-            # Sparse FlashMLA has no varlen/cu_seqlens entry point, but its
-            # indices address one flat KV tensor.  The request-local workspace
-            # is already packed as [request-0 rows | request-1 rows | ...].
-            # Convert each token's local indices to that packed coordinate so
-            # all requests share one launch without changing any visible set.
-            packed_indices = _pack_request_local_indices(
-                request_indices,
-                cu_seqlens,
-                cu_seqlens_compressed,
-                global_start=global_start,
-            )
-            packed_lengths = topk_length.contiguous()
-            output_buffer = torch.empty_like(q_visible)
+            result = torch.empty_like(q_visible)
+            for seq_idx in range(cu_seqlens.numel() - 1):
+                seq_start = int(sequence_boundaries[seq_idx])
+                seq_end = int(sequence_boundaries[seq_idx + 1])
+                token_start = max(0, seq_start - global_start)
+                token_end = min(l_local, seq_end - global_start)
+                if token_end <= token_start:
+                    continue
 
-            def visible_attention(q_value, kv_value):
-                return flash_mla_sparse_fwd(
-                    q=q_value,
-                    kv=kv_value,
-                    indices=packed_indices,
-                    sm_scale=scale,
-                    attn_sink=sink,
-                    topk_length=packed_lengths,
-                    out=output_buffer,
+                local_indices = request_indices[token_start:token_end].clone()
+                request_start = seq_start + int(compressed_boundaries[seq_idx])
+                request_end = seq_end + int(compressed_boundaries[seq_idx + 1])
+                local_row_map = workspace_row_map[request_start:request_end]
+                valid_workspace_rows = local_row_map < workspace.shape[0]
+                local_workspace = workspace.index_select(
+                    0,
+                    local_row_map.clamp_max(workspace.shape[0] - 1).to(
+                        torch.int64
+                    ),
                 )
+                local_workspace.masked_fill_(
+                    ~valid_workspace_rows.view(
+                        (-1,) + (1,) * (workspace.ndim - 1)
+                    ),
+                    0,
+                )
+                # The CuTe backward ABI requires every tensor data pointer to
+                # be 16-byte aligned.  An int32 slice starts at a potentially
+                # unaligned request offset, so give it request-owned storage.
+                local_lengths = topk_length[token_start:token_end].clone()
+                local_output = torch.empty_like(q_visible[token_start:token_end])
 
-            result = visible_sparse_attention(
-                visible_attention,
-                q_visible,
-                request_workspace,
-                packed_indices,
-                packed_lengths,
-                sink,
-                softmax_scale=scale,
-            )
+                def visible_attention(q_value, kv_value):
+                    return flash_mla_sparse_fwd(
+                        q=q_value,
+                        kv=kv_value,
+                        indices=local_indices,
+                        sm_scale=scale,
+                        attn_sink=sink,
+                        topk_length=local_lengths,
+                        out=local_output,
+                    )
+
+                result[token_start:token_end] = visible_sparse_attention(
+                    visible_attention,
+                    q_visible[token_start:token_end],
+                    local_workspace,
+                    local_indices,
+                    local_lengths,
+                    sink,
+                    softmax_scale=scale,
+                )
         else:
             output_buffer = torch.empty_like(q_visible)
 

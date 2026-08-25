@@ -488,11 +488,7 @@ class TokenDispatcher:
         recv_per_expert,
     ):
         if isinstance(recv_per_expert, torch.Tensor):
-            if recv_per_expert.device.type != "cpu":
-                raise RuntimeError(
-                    "DeepEP expert counts must remain dispatcher-provided CPU metadata"
-                )
-            recv_per_expert = [int(x) for x in recv_per_expert.tolist()]
+            recv_per_expert = [int(x) for x in recv_per_expert.detach().cpu().tolist()]
         local_tpe = torch.tensor(
             recv_per_expert[: self.num_local_experts], dtype=torch.int64, device=recv_hidden.device
         )
@@ -531,13 +527,12 @@ class TokenDispatcher:
                 f"recv_per_expert_len={len(recv_per_expert)} "
                 f"recv_per_expert_sum={sum(int(x) for x in recv_per_expert)} "
                 f"recv_per_expert_head={recv_per_expert[: self.num_local_experts]} "
-                f"local_tpe_sum={sum(self._local_tpe_list)}",
+                f"local_tpe_sum={int(local_tpe.sum().item())}",
                 flush=True,
             )
-        if (
-            os.environ.get("MEGATRON_LITE_DEEPEP_SKIP_DISPATCH_METADATA_CHECK") != "1"
-            and sum(self._local_tpe_list) != int(dispatched.shape[0])
-        ):
+        if os.environ.get("MEGATRON_LITE_DEEPEP_SKIP_DISPATCH_METADATA_CHECK") != "1" and int(
+            local_tpe.sum().item()
+        ) != int(dispatched.shape[0]):
             ep_rank = dist.get_rank(group=self.ps.ep_group)
             raise RuntimeError(
                 "DeepEP dispatch metadata mismatch: "

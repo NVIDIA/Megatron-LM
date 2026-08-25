@@ -40,7 +40,6 @@ class MegatronLiteEngineConfig(EngineConfig):
     router_replay_mode: str = "disabled"
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
-    profiling_proxy_mode: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -64,17 +63,6 @@ class MegatronLiteEngineConfig(EngineConfig):
         if not isinstance(self.qat, Mapping):
             raise TypeError("qat must be a mapping")
         object.__setattr__(self, "qat", dict(self.qat))
-        if self.profiling_proxy_mode:
-            if self.impl_cfg.get("offload"):
-                raise ValueError(
-                    "profiling_proxy_mode forbids activation offload in impl_cfg"
-                )
-            # A pure fwd/bwd proxy owns the GPU and has no colocated rollout
-            # consumer.  Silently honoring inherited VERL offload flags would
-            # add model-sized D2H/H2D traffic to the measured kernel path.
-            object.__setattr__(self, "param_offload", False)
-            object.__setattr__(self, "optimizer_offload", False)
-            object.__setattr__(self, "grad_offload", False)
         if self.resync_config and self.resync_format is None:
             raise ValueError("resync_config requires resync_format")
         if self.qat.get("enable", False) and self.resync_format is not None:
