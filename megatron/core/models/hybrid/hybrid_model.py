@@ -53,6 +53,27 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
     return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
 
 
+def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) -> int:
+    """Convert a leading hash-MoE count to a global hybrid layer-number threshold."""
+    if n_hash_layers <= 0:
+        return n_hash_layers
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    global_layer_pattern = (main_pattern or '').replace(Symbols.PIPE, '')
+    moe_layer_numbers = [
+        layer_number
+        for layer_number, layer_type in enumerate(global_layer_pattern, start=1)
+        if layer_type == Symbols.MOE
+    ]
+    if n_hash_layers > len(moe_layer_numbers):
+        raise ValueError(
+            f"moe_n_hash_layers={n_hash_layers} exceeds the {len(moe_layer_numbers)} "
+            "MoE layers in the main hybrid layer pattern."
+        )
+    return moe_layer_numbers[n_hash_layers - 1]
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -273,17 +294,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-        self.decoder = build_module(
-            hybrid_stack_spec,
-            self.config,
-            pre_process=self.pre_process,
-            layer_type_list=layer_type_list,
-            pp_layer_offset=layer_offset,
-            post_process=self.post_process,
-            dtype=config.params_dtype,
-            pg_collection=self.pg_collection,
-            name="decoder",
+        configured_n_hash_layers = self.config.moe_n_hash_layers
+        hash_layer_threshold = _get_hash_moe_layer_threshold(
+            parsed.main_pattern, configured_n_hash_layers
         )
+        # TopKRouter allocates all hash-specific state during construction. Temporarily expose
+        # the global Hybrid layer threshold, then restore the user-facing MoE count.
+        self.config.moe_n_hash_layers = hash_layer_threshold
+        try:
+            self.decoder = build_module(
+                hybrid_stack_spec,
+                self.config,
+                pre_process=self.pre_process,
+                layer_type_list=layer_type_list,
+                pp_layer_offset=layer_offset,
+                post_process=self.post_process,
+                dtype=config.params_dtype,
+                pg_collection=self.pg_collection,
+                name="decoder",
+            )
+        finally:
+            self.config.moe_n_hash_layers = configured_n_hash_layers
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:

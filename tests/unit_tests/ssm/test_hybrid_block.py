@@ -7,6 +7,7 @@ from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, GatedDeltaNet, KimiDeltaAttention
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -301,6 +302,44 @@ class TestHybridBlock:
         output.float().sum().backward()
         assert hidden_states.grad is not None
         assert torch.isfinite(hidden_states.grad).all()
+
+    def test_hash_moe_counts_only_moe_layers(self):
+        """Hash routing derives a global layer threshold from the MoE positions."""
+        layer_pattern = (Symbols.MLP + Symbols.MOE) * 4
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_pattern),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=64,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.0,
+            moe_router_dtype="fp32",
+            moe_n_hash_layers=3,
+            actual_vocab_size=128,
+            add_bias_linear=False,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern=layer_pattern,
+        )
+        block = model.decoder
+
+        moe_layers = [
+            layer
+            for layer_type, layer in zip(block.layer_type_list, block.layers)
+            if layer_type == Symbols.MOE
+        ]
+        routers = [layer.mlp.router for layer in moe_layers]
+
+        assert [layer.layer_number for layer in moe_layers] == [2, 4, 6, 8]
+        assert [router.is_hash_layer for router in routers] == [True, True, True, False]
+        assert model.config.moe_n_hash_layers == 3
 
     def test_layer_types(self):
         """
