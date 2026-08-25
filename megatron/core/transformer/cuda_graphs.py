@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -21,7 +21,7 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
-from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.num_microbatches_calculator import get_max_num_microbatches, get_num_microbatches
 from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -1636,6 +1636,11 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
+    # Chunk capture uses the complete TransformerBlock as the TE callable. The
+    # layer-wise module scopes below do not describe that outer callable.
+    if getattr(config, 'cuda_graph_granularity', 'layer') == 'chunk':
+        return bool(getattr(layer, 'is_cuda_graph_chunk_callable', False))
+
     # If cuda_graph_modules is not set, every layer is graphed.
     if not config.cuda_graph_modules:
         return True
@@ -1818,7 +1823,7 @@ class TECudaGraphHelper:
                     )
 
     def _discover_layers(self):
-        """Discover captureable layers from the model and populate internal data structures."""
+        """Discover captureable layers or decoder chunks and populate helper state."""
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
         self.callables_per_chunk = []
@@ -1842,24 +1847,39 @@ class TECudaGraphHelper:
                 )
             else:
                 num_decoder_layers = len(chunk_with_decoder.decoder.layers)
-                if hasattr(chunk_with_decoder, 'mtp'):
-                    num_mtp_layers = len(chunk_with_decoder.mtp.layers)
-                else:
+                if getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk":
+                    # MTP executes in GPTModel._postprocess and remains eager. The decoder block is
+                    # exactly the PP/VPP chunk boundary driven by the pipeline schedule.
                     num_mtp_layers = 0
-                num_graphable_layers = 0
-                callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
+                    callables = []
+                    callables_is_mtp = []
+                    if num_decoder_layers > 0 and _layer_is_graphable(
+                        chunk_with_decoder.decoder, self.config
+                    ):
+                        chunk_with_decoder.decoder._te_cuda_graph_vp_size = self.num_model_chunks
+                        chunk_with_decoder.decoder._te_cuda_graph_vp_stage = chunk_number
+                        callables.append(chunk_with_decoder.decoder)
                         callables_is_mtp.append(False)
-                for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    num_graphable_layers = len(callables)
+                else:
+                    if hasattr(chunk_with_decoder, 'mtp'):
+                        num_mtp_layers = len(chunk_with_decoder.mtp.layers)
+                    else:
+                        num_mtp_layers = 0
+                    num_graphable_layers = 0
+                    callables, callables_is_mtp = [], []
+                    for layer_number in range(num_decoder_layers):
+                        layer = chunk_with_decoder.decoder.layers[layer_number]
+                        if _layer_is_graphable(layer, self.config):
+                            num_graphable_layers += 1
+                            callables.append(layer)
+                            callables_is_mtp.append(False)
+                    for layer_number in range(num_mtp_layers):
+                        layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                        if _layer_is_graphable(layer, self.config):
+                            num_graphable_layers += 1
+                            callables.append(layer)
+                            callables_is_mtp.append(True)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -1910,6 +1930,213 @@ class TECudaGraphHelper:
         were found, and True if at least one graph was successfully created.
         """
         return self._graphs_created
+
+    @staticmethod
+    def _get_local_prewarm_order(num_model_chunks):
+        """Return one local forward/backward pair for every VPP chunk."""
+        assert num_model_chunks > 0
+        forward = list(range(1, num_model_chunks + 1))
+        return forward + [-chunk_id for chunk_id in reversed(forward)]
+
+    def _get_local_prewarm_arguments(self):
+        """Build one static THD sample per local graph callable."""
+        previous_num_microbatches = self.num_microbatches
+        try:
+            self.num_microbatches = 1
+            order = self._get_local_prewarm_order(self.num_model_chunks)
+            return self._get_sample_arguments(order)
+        finally:
+            self.num_microbatches = previous_num_microbatches
+
+    @staticmethod
+    def _collect_differentiable_tensors(value):
+        """Flatten differentiable tensors from a nested callable output."""
+        if torch.is_tensor(value):
+            return [value] if value.requires_grad else []
+        if isinstance(value, dict):
+            tensors = []
+            for item in value.values():
+                tensors.extend(TECudaGraphHelper._collect_differentiable_tensors(item))
+            return tensors
+        if isinstance(value, (tuple, list)):
+            tensors = []
+            for item in value:
+                tensors.extend(TECudaGraphHelper._collect_differentiable_tensors(item))
+            return tensors
+        return []
+
+    def parallel_prewarm_thd_chunks(self):
+        """Initialize lazy local kernels concurrently across PP ranks.
+
+        This deliberately bypasses the GPT model and pipeline schedule: each process invokes only
+        its local decoder chunks, while TP/CP/EP collectives remain matched within the process
+        groups belonging to that PP stage. Paged Stash is still disabled before the first training
+        iteration, and fine-grained activation offload is temporarily disabled just as it is for
+        TE's internal graph warmup.
+        """
+        assert self.config.cuda_graph_granularity == "chunk"
+        assert self.config.sequence_packing_scheduler is not None
+        assert not self._capture_finished
+
+        if getattr(self.config, 'moe_paged_stash', False):
+            from megatron.core.transformer.moe.paged_stash import PagedStashManager
+
+            assert not PagedStashManager.get_instance().enabled, (
+                "Parallel chunk prewarm must run before the first Paged Stash schedule."
+            )
+
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+        start_time = time.time()
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.INFO,
+            msg=(
+                f'Rank {torch.distributed.get_rank()}: starting parallel THD chunk prewarm for '
+                f'{len(self.flattened_callables)} local chunks.'
+            ),
+        )
+
+        sample_args = []
+        sample_kwargs = []
+        buffer_backups = []
+        first_microbatch_backups = []
+        input_tensor_backups = []
+        saved_fp8_tensors = None
+        offload_disabled = False
+
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+            DSAIndexerLossLoggingHelper,
+        )
+        from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+
+        dsa_tracker = DSAIndexerLossLoggingHelper.tracker
+        dsa_tracker_backup = {
+            key: value.clone() if torch.is_tensor(value) else value
+            for key, value in dsa_tracker.items()
+        }
+        loss_scale_backups = (
+            (DSAIndexerLossAutoScaler, DSAIndexerLossAutoScaler.main_loss_backward_scale),
+            (MoEAuxLossAutoScaler, MoEAuxLossAutoScaler.main_loss_backward_scale),
+        )
+
+        try:
+            sample_args, sample_kwargs = self._get_local_prewarm_arguments()
+            assert (
+                len(sample_args) == len(sample_kwargs) == len(self.flattened_callables)
+            ), (
+                "Parallel chunk prewarm requires exactly one forward sample for every local "
+                "chunk callable."
+            )
+
+            seen_buffers = set()
+            seen_modules = set()
+            for callable_module in self.flattened_callables:
+                input_tensor_backups.append(
+                    (callable_module, getattr(callable_module, 'input_tensor', None))
+                )
+                for module in callable_module.modules():
+                    module_id = id(module)
+                    if module_id not in seen_modules:
+                        seen_modules.add(module_id)
+                        if hasattr(module, 'is_first_microbatch'):
+                            first_microbatch_backups.append(
+                                (module, module.is_first_microbatch)
+                            )
+                            module.is_first_microbatch = True
+                    for buffer in module.buffers(recurse=False):
+                        buffer_id = id(buffer)
+                        if buffer_id not in seen_buffers:
+                            seen_buffers.add(buffer_id)
+                            buffer_backups.append((buffer, buffer.clone()))
+
+            if self.config.fp8:
+                from megatron.core.fp8_utils import get_fp8_recipe
+
+                recipe = get_fp8_recipe(self.config)
+                saved_fp8_tensors = save_fp8_tensors(self.flattened_callables, recipe)
+            elif self.config.fp4:
+                from megatron.core.fp4_utils import get_fp4_recipe
+
+                recipe = get_fp4_recipe(self.config)
+                saved_fp8_tensors = save_fp8_tensors(self.flattened_callables, recipe)
+
+            if self.config.fine_grained_activation_offloading:
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
+                )
+
+                off_interface.disable_offload()
+                offload_disabled = True
+
+            from megatron.core.tensor_parallel.random import _fork_rng
+
+            with ExitStack() as stack:
+                for model_chunk in self.model:
+                    no_sync = getattr(model_chunk, 'no_sync', None)
+                    if callable(no_sync):
+                        stack.enter_context(no_sync())
+
+                with _fork_rng():
+                    for callable_module, args, kwargs in zip(
+                        self.flattened_callables, sample_args, sample_kwargs
+                    ):
+                        args, kwargs = callable_module._prepare_pipeline_input_for_chunk_cuda_graph(
+                            args, kwargs
+                        )
+                        callable_module._reconstruct_packed_seq_params_from_kwargs(kwargs)
+                        kwargs.setdefault('attention_mask', None)
+                        outputs = callable_module.forward(*args, **kwargs)
+                        differentiable_outputs = self._collect_differentiable_tensors(outputs)
+                        assert differentiable_outputs, (
+                            "A training chunk prewarm must produce a differentiable tensor."
+                        )
+                        torch.autograd.backward(
+                            differentiable_outputs,
+                            grad_tensors=[
+                                torch.zeros_like(output) for output in differentiable_outputs
+                            ],
+                        )
+                        del outputs, differentiable_outputs
+
+            torch.cuda.synchronize()
+        finally:
+            if saved_fp8_tensors is not None:
+                restore_fp8_tensors(self.flattened_callables, saved_fp8_tensors)
+            with torch.no_grad():
+                for buffer, backup in buffer_backups:
+                    buffer.copy_(backup)
+            for module, is_first_microbatch in first_microbatch_backups:
+                module.is_first_microbatch = is_first_microbatch
+            for callable_module, input_tensor in input_tensor_backups:
+                callable_module.input_tensor = input_tensor
+            if offload_disabled:
+                off_interface.enable_offload()
+            self._reset_after_capture()
+            dsa_tracker.clear()
+            dsa_tracker.update(dsa_tracker_backup)
+            for loss_scaler, loss_scale in loss_scale_backups:
+                loss_scaler.main_loss_backward_scale = loss_scale
+
+            del sample_args, sample_kwargs, buffer_backups
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        elapsed = time.time() - start_time
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.INFO,
+            msg=(
+                f'Rank {torch.distributed.get_rank()}: parallel THD chunk prewarm completed '
+                f'{len(self.flattened_callables)} local chunks in {elapsed:.2f}s.'
+            ),
+        )
+        torch.distributed.barrier()
 
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """
@@ -1978,10 +2205,14 @@ class TECudaGraphHelper:
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
             """
-            Get the static inputs for a layer.
+            Get the static inputs for a layer or complete decoder chunk.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            is_chunk_callable = layer is getattr(chunk_of_the_layer, "decoder", None)
+            mtp_layers = getattr(getattr(chunk_of_the_layer, "mtp", None), "layers", [])
+            assert (
+                is_chunk_callable
+                or layer in chunk_of_the_layer.decoder.layers
+                or any(layer is mtp_layer.mtp_model_layer for mtp_layer in mtp_layers)
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
@@ -2011,7 +2242,7 @@ class TECudaGraphHelper:
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
-            contains_self_attn = (
+            layer_contains_self_attn = (
                 isinstance(layer, TransformerLayer)
                 and not isinstance(layer.self_attention, IdentityOp)
                 and (
@@ -2019,6 +2250,12 @@ class TECudaGraphHelper:
                     or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
+            chunk_contains_self_attn = is_chunk_callable and any(
+                isinstance(block_module, TransformerLayer)
+                and not isinstance(block_module.self_attention, IdentityOp)
+                for block_module in layer.modules()
+            )
+            contains_self_attn = layer_contains_self_attn or chunk_contains_self_attn
 
             _sample_kwargs = {}
             if is_te_min_version("1.10.0"):
@@ -2198,7 +2435,7 @@ class TECudaGraphHelper:
                 return self.pg_collection.tp
 
     def _should_use_dynamic_microbatch_slots(self) -> bool:
-        """Whether to capture a bounded number of graph slots and reuse them by modulo."""
+        """Whether to capture a bounded Nmax graph list for dynamic microbatch counts."""
         return bool(getattr(self.config, "cuda_graph_dynamic_microbatches", False))
 
     def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
@@ -2411,8 +2648,13 @@ class TECudaGraphHelper:
                 )
                 auto_num_slots = int(auto_num_slots_tensor.item())
             runtime_num_microbatches = get_num_microbatches()
+            schedule_max_num_microbatches = (
+                get_max_num_microbatches()
+                if self.config.cuda_graph_granularity == "chunk"
+                else runtime_num_microbatches
+            )
             max_num_microbatches, capture_mode = self._get_thd_varlen_max_num_microbatches(
-                runtime_num_microbatches, microbatch_group_size_per_vp_stage
+                schedule_max_num_microbatches, microbatch_group_size_per_vp_stage
             )
             if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
                 self.num_microbatches = runtime_num_microbatches
@@ -2433,6 +2675,7 @@ class TECudaGraphHelper:
                 level=logging.INFO,
                 msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots '
                 f'enabled. runtime_num_microbatches={runtime_num_microbatches}, '
+                f'schedule_max_num_microbatches={schedule_max_num_microbatches}, '
                 f'auto_num_slots={auto_num_slots}, '
                 f'max_num_microbatches={max_num_microbatches}, '
                 f'capture_num_microbatches={self.num_microbatches}, '
@@ -2542,6 +2785,11 @@ class TECudaGraphHelper:
                 # since TE currently uses fp8_autocast for both FP8 and FP4 quantization
 
                 def _get_fp8_enabled():
+                    if getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk":
+                        # Per-layer FP8/BF16 selection remains inside TransformerBlock.forward.
+                        # The outer TE context only needs to enable quantization bookkeeping for
+                        # each block callable.
+                        return tuple(True for _ in self.flattened_callables)
                     if is_te_min_version("2.8.0"):
                         from megatron.core.fp8_utils import is_first_last_bf16_layer
 
@@ -2649,8 +2897,17 @@ class TECudaGraphHelper:
 
     def create_cudagraphs(self):
         """
-        Capture CUDA Graphs per TransformerLayer per microbatch.
+        Capture CUDA Graphs per configured callable boundary and microbatch.
         """
+        if self.config.cuda_graph_granularity == 'chunk' and getattr(
+            self.config, 'moe_paged_stash', False
+        ):
+            from megatron.core.transformer.moe.paged_stash import (
+                paged_stash_prepare_for_cuda_graph_capture,
+            )
+
+            paged_stash_prepare_for_cuda_graph_capture(self.config)
+
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -2904,6 +3161,7 @@ def set_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
+        model_with_decoder.decoder.current_microbatch = microbatch_id
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
