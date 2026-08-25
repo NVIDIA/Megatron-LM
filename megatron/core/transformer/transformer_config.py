@@ -3182,6 +3182,9 @@ class TransformerConfig(ModelParallelConfig):
         if (
             use_mhc_recompute
             and not self.mhc_recompute_attn_cuda_graph_split
+            and not self.is_hybrid_model  # hybrid cannot take the switch this
+            # message recommends (rejected above); hybrid_block emits its own
+            # capture-scope warning instead
             and self.cuda_graph_impl == "transformer_engine"
             and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
             and list(self.recompute_modules) == ["mhc"]
@@ -3223,6 +3226,16 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if use_mhc_recompute and self.mhc_recompute_attn_cuda_graph_split:
+            if self.is_hybrid_model:
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split is not implemented for "
+                    "HybridStack mHC layers: HyperConnectionHybridLayer always "
+                    "captures the whole wrapper (mHC aggregate included) with an "
+                    "[s, b, n*C] static input and has no attention-consumer split "
+                    "path, so the switch would silently change nothing while the "
+                    "config claims the split is on. Keep the switch off for "
+                    "hybrid models."
+                )
             if self.cuda_graph_impl != "transformer_engine":
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "

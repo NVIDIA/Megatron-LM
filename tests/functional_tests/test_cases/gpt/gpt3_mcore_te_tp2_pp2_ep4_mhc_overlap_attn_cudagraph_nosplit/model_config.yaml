@@ -96,8 +96,9 @@ MODEL_ARGS:
   --recompute-modules: "[mhc]"
   --mhc-recompute-layer-num: 2
 
-  # Only the one-stream attention consumer is captured. mHC mapping,
-  # aggregation, post-processing, MLP, and recompute stay eager.
+  # No split switch: the whole _forward_attention range is captured,
+  # including the mHC aggregate and attention post-processing (static input
+  # [s, b, n*C]). MLP and the MLP-side recompute group stay eager.
   --cuda-graph-impl: transformer_engine
   --cuda-graph-modules: "[attn]"
   --cuda-graph-warmup-steps: 3

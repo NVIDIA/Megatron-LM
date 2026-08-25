@@ -1504,6 +1504,10 @@ class TestPartialCudaGraph:
             loss_list.append(loss.item())
 
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            # Keep the layer handles for post-run assertions: the helper is
+            # nulled below, but the layer objects (and attributes the replay
+            # tail set on them) outlive graph teardown.
+            self.last_flattened_callables = self.cuda_graph_helper.flattened_callables
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
 
@@ -1651,8 +1655,6 @@ class TestPartialCudaGraph:
 
         Utils.destroy_model_parallel()
 
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
@@ -1699,7 +1701,7 @@ class TestPartialCudaGraph:
         # group discards and replays nothing, bit-identically), so pin the
         # layer-side threading directly: the graphed replay tail must have
         # created the pre-MLP checkpoint against a live manager.
-        layers = self.cuda_graph_helper.flattened_callables
+        layers = self.last_flattened_callables
         assert any(
             getattr(layer, "pre_mlp_norm_checkpoint", None) is not None for layer in layers
         ), (
