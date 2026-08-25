@@ -62,7 +62,7 @@ def test_fwd_reconstructs_complete_matrix():
     shards = [m[r * (P // S) : (r + 1) * (P // S), :].clone() for m in full]
     homes = {i: i % S for i in range(N)}
 
-    complete, my_indices = layer_sharded_all_to_all_fwd(shards, homes, r, S, _world(), gtp_dim=0)
+    complete, my_indices = layer_sharded_all_to_all_fwd(shards, homes, _world(), shard_dim=0)
 
     assert my_indices == [i for i in range(N) if i % S == r]
     for got, idx in zip(complete, my_indices):
@@ -86,7 +86,7 @@ def test_bwd_distributes_shards_correctly():
     homes = {i: i % S for i in range(N)}
 
     shards = layer_sharded_all_to_all_bwd(
-        my_results, my_indices, templates, homes, r, S, _world(), gtp_dim=0
+        my_results, my_indices, templates, homes, _world(), shard_dim=0
     )
 
     assert len(shards) == N
@@ -113,10 +113,10 @@ def test_roundtrip_without_ns_is_identity():
     shards = [m[r * (m.size(0) // S) : (r + 1) * (m.size(0) // S), :].clone() for m in full]
     homes = {0: 0, 1: 0, 2: min(1, S - 1), 3: min(2, S - 1)}
 
-    complete, my_indices = layer_sharded_all_to_all_fwd(shards, homes, r, S, _world(), gtp_dim=0)
+    complete, my_indices = layer_sharded_all_to_all_fwd(shards, homes, _world(), shard_dim=0)
     identity = [m.clone() for m in complete]
     recovered = layer_sharded_all_to_all_bwd(
-        identity, my_indices, shards, homes, r, S, _world(), gtp_dim=0
+        identity, my_indices, shards, homes, _world(), shard_dim=0
     )
 
     for i, (orig, back) in enumerate(zip(shards, recovered)):
