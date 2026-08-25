@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from inspect import signature
@@ -6,8 +6,12 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing import load as load_dist_checkpoint
+from megatron.core.dist_checkpointing import save as save_dist_checkpoint
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
@@ -18,15 +22,17 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttention,
     MLASelfAttentionSubmodules,
     MultiLatentAttention,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
@@ -1611,6 +1617,238 @@ def test_parallel_multi_latent_attention_correctness(
 
     os.environ.clear()
     os.environ.update(_environ)
+
+
+_MLA_TP_GRADIENT_LENGTHS = (32, 8, 8, 8, 8)
+_MLA_TP_GRADIENT_HIDDEN_SIZE = 7168
+_MLA_TP_GRADIENT_KV_LORA_RANK = 512
+
+
+def _make_mla_tp_gradient_config(*, tp: int, cp: int) -> MLATransformerConfig:
+    """Build the production MLA shape used by the shared-key TP gradient regression."""
+
+    return MLATransformerConfig(
+        num_layers=1,
+        hidden_size=_MLA_TP_GRADIENT_HIDDEN_SIZE,
+        num_attention_heads=96,
+        num_query_groups=96,
+        kv_channels=128,
+        multi_latent_attention=True,
+        q_lora_rank=1536,
+        kv_lora_rank=_MLA_TP_GRADIENT_KV_LORA_RANK,
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=64,
+        v_head_dim=128,
+        add_bias_linear=False,
+        bf16=True,
+        fp16=False,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        layernorm_epsilon=1e-6,
+        normalization="RMSNorm",
+        qk_layernorm=True,
+        tensor_model_parallel_size=tp,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=cp,
+        sequence_parallel=False,
+        cp_comm_type="p2p",
+        cp_partition_mode="zigzag",
+        apply_rope_fusion=False,
+        rope_type="rope",
+        rotary_percent=1.0,
+        rotary_base=10000,
+        original_max_position_embeddings=4096,
+        attention_backend=AttnBackend.fused,
+        gradient_accumulation_fusion=False,
+        use_cpu_initialization=False,
+    )
+
+
+def _build_mla_tp_gradient_attention(config: MLATransformerConfig) -> MLASelfAttention:
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+    spec = get_gpt_layer_with_transformer_engine_spec(
+        qk_layernorm=True, multi_latent_attention=True
+    ).submodules.self_attention
+    return (
+        build_module(
+            spec, config=config, layer_number=1, cp_comm_type="p2p", pg_collection=pg_collection
+        )
+        .cuda()
+        .bfloat16()
+        .train()
+    )
+
+
+def _make_mla_tp_gradient_packed_params(cp_group) -> PackedSeqParams:
+    offsets = [0]
+    for length in _MLA_TP_GRADIENT_LENGTHS:
+        offsets.append(offsets[-1] + length)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens.clone(),
+        max_seqlen_q=max(_MLA_TP_GRADIENT_LENGTHS),
+        max_seqlen_kv=max(_MLA_TP_GRADIENT_LENGTHS),
+        cp_group=cp_group,
+        cp_partition_mode="zigzag",
+        pad_between_seqs=False,
+    )
+
+
+def _slice_mla_tp_gradient_for_cp(tensor: torch.Tensor, cp: int) -> torch.Tensor:
+    if cp == 1:
+        return tensor
+    cp_rank = parallel_state.get_context_parallel_rank()
+    indices: list[int] = []
+    offset = 0
+    for length in _MLA_TP_GRADIENT_LENGTHS:
+        assert length % (2 * cp) == 0
+        chunk = length // (2 * cp)
+        front = offset + cp_rank * chunk
+        back = offset + (2 * cp - 1 - cp_rank) * chunk
+        indices.extend(range(front, front + chunk))
+        indices.extend(range(back, back + chunk))
+        offset += length
+    index = torch.tensor(indices, dtype=torch.long, device=tensor.device)
+    return tensor.index_select(0, index)
+
+
+def _run_mla_tp_gradient_backward(attention, hidden_states, upstream, packed_seq_params):
+    hidden_states = hidden_states.detach().clone().requires_grad_(True)
+    output, bias = attention(
+        hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+    )
+    assert bias is None
+    input_grad, kv_down_grad = torch.autograd.grad(
+        output, (hidden_states, attention.linear_kv_down_proj.weight), grad_outputs=upstream
+    )
+    return output.detach(), input_grad.detach(), kv_down_grad.detach()
+
+
+def _assert_mla_tp_gradient_similarity(
+    actual: torch.Tensor, expected: torch.Tensor, *, name: str, eps: float = 1e-3
+) -> None:
+    actual = actual.double().reshape(-1)
+    expected = expected.double().reshape(-1)
+    assert torch.isfinite(actual).all(), f"{name} actual contains non-finite values"
+    assert torch.isfinite(expected).all(), f"{name} expected contains non-finite values"
+    cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=0).item()
+    denominator = (actual.square() + expected.square()).sum()
+    tensor_similarity = (
+        1.0 if denominator == 0 else (2.0 * (actual * expected).sum() / denominator).item()
+    )
+    assert 1.0 - cosine <= eps, f"{name} cosine similarity {cosine} exceeds error {eps}"
+    assert (
+        1.0 - tensor_similarity <= eps
+    ), f"{name} tensor similarity {tensor_similarity} exceeds error {eps}"
+
+
+@pytest.mark.experimental
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_parallel_multi_latent_attention_shared_k_rope_tp_gradient(tmp_path_dist_ckpt):
+    """Match TP2xCP2 backward to TP1xCP1 for the production MLA shape and random dO."""
+
+    if Utils.world_size < 4:
+        pytest.skip("requires four distributed ranks")
+    if not is_te_min_version("2.5.0", check_equality=True):
+        pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
+
+    saved_environment = os.environ.copy()
+    os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "1"
+    os.environ["NVTE_FUSED_ATTN"] = "1"
+    os.environ["NVTE_FLASH_ATTN"] = "0"
+    seed = 123
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+        )
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        baseline_attention = _build_mla_tp_gradient_attention(
+            _make_mla_tp_gradient_config(tp=1, cp=1)
+        )
+        torch.manual_seed(seed + 1)
+        total_tokens = sum(_MLA_TP_GRADIENT_LENGTHS)
+        full_hidden = torch.randn(
+            total_tokens, 1, _MLA_TP_GRADIENT_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
+        )
+        full_upstream = torch.randn_like(full_hidden)
+
+        with TempNamedDir(tmp_path_dist_ckpt / "mla_shared_k_rope_tp_grad", sync=True) as ckpt:
+            checkpoint_metadata = {
+                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+            }
+            save_dist_checkpoint(
+                baseline_attention.sharded_state_dict(prefix="", metadata=checkpoint_metadata), ckpt
+            )
+            baseline = _run_mla_tp_gradient_backward(
+                baseline_attention,
+                full_hidden,
+                full_upstream,
+                _make_mla_tp_gradient_packed_params(parallel_state.get_context_parallel_group()),
+            )
+            del baseline_attention
+            Utils.destroy_model_parallel()
+            torch.cuda.empty_cache()
+
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=2,
+                pipeline_model_parallel_size=1,
+                context_parallel_size=2,
+            )
+            torch.manual_seed(seed)
+            model_parallel_cuda_manual_seed(seed)
+            parallel_attention = _build_mla_tp_gradient_attention(
+                _make_mla_tp_gradient_config(tp=2, cp=2)
+            )
+            checkpoint_metadata = {
+                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+            }
+            state_dict, missing_keys, unexpected_keys = load_dist_checkpoint(
+                parallel_attention.sharded_state_dict(prefix="", metadata=checkpoint_metadata),
+                ckpt,
+                strict=StrictHandling.RETURN_ALL,
+            )
+            assert all("_extra_state" in key for key in missing_keys), missing_keys
+            assert all("_extra_state" in key for key in unexpected_keys), unexpected_keys
+            parallel_attention.load_state_dict(state_dict)
+
+            local_hidden = _slice_mla_tp_gradient_for_cp(full_hidden, cp=2)
+            local_upstream = _slice_mla_tp_gradient_for_cp(full_upstream, cp=2)
+            parallel = _run_mla_tp_gradient_backward(
+                parallel_attention,
+                local_hidden,
+                local_upstream,
+                _make_mla_tp_gradient_packed_params(parallel_state.get_context_parallel_group()),
+            )
+            expected_output = _slice_mla_tp_gradient_for_cp(baseline[0], cp=2)
+            expected_input_grad = _slice_mla_tp_gradient_for_cp(baseline[1], cp=2)
+            parallel_kv_down_grad = parallel[2].clone()
+            dist.all_reduce(
+                parallel_kv_down_grad, group=parallel_state.get_context_parallel_group()
+            )
+
+            _assert_mla_tp_gradient_similarity(parallel[0], expected_output, name="output")
+            _assert_mla_tp_gradient_similarity(
+                parallel[1], expected_input_grad, name="input gradient"
+            )
+            _assert_mla_tp_gradient_similarity(
+                parallel_kv_down_grad[:_MLA_TP_GRADIENT_KV_LORA_RANK],
+                baseline[2][:_MLA_TP_GRADIENT_KV_LORA_RANK],
+                name="latent KV down-projection gradient",
+            )
+            _assert_mla_tp_gradient_similarity(
+                parallel_kv_down_grad[_MLA_TP_GRADIENT_KV_LORA_RANK:],
+                baseline[2][_MLA_TP_GRADIENT_KV_LORA_RANK:],
+                name="shared K-RoPE down-projection gradient",
+            )
+    finally:
+        if parallel_state.model_parallel_is_initialized():
+            Utils.destroy_model_parallel()
+        os.environ.clear()
+        os.environ.update(saved_environment)
 
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))

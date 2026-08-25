@@ -31,6 +31,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -908,6 +909,10 @@ class MLASelfAttention(MultiLatentAttention):
                     cp_rank,
                     cp_size,
                 )
+                # The positional key is shared across TP ranks but each rank expands it over
+                # only its local attention heads. Keep the forward value replicated while
+                # summing those local-head gradient contributions during backward.
+                k_pos_emb = copy_to_tensor_model_parallel_region(k_pos_emb, group=self.tp_group)
                 key, value = fused_apply_mla_rope_for_kv(
                     kv,
                     k_pos_emb,
@@ -972,6 +977,10 @@ class MLASelfAttention(MultiLatentAttention):
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_max_seqlen_kv,
                 )
+                # The positional key is shared across TP ranks but each rank expands it over
+                # only its local attention heads. Keep the forward value replicated while
+                # summing those local-head gradient contributions during backward.
+                k_pos_emb = copy_to_tensor_model_parallel_region(k_pos_emb, group=self.tp_group)
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
