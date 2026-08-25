@@ -51,16 +51,6 @@ significant CPU launch overhead even though the expert path is host-device sync-
 The legacy multi-stream cuBLAS GroupedLinear path is not supported because it materializes split
 metadata on the host; paged stashing would not make that expert path sync-free.
 
-Paged stash identifies dynamic saved activations through Transformer Engine's
-`mark_grouped_tensor` utility. The non-op-fuser integration marks these tensors explicitly rather
-than inferring dynamic shapes from warmup iterations: shape sampling can misclassify a dynamic
-tensor as static and is therefore not a safe correctness contract.
-
-In this context, sync-free refers to the steady-state expert data path. The initial paged-stash
-capture performs host reads, and the runner reads reduced overflow/over-budget state at the end of
-a pass to decide whether to rerun; it does not imply that the complete iteration has no CPU-GPU
-synchronization at all.
-
 ## Tuning (paged stashing only)
 
 ```bash
