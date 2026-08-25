@@ -1,12 +1,11 @@
 ---
 name: update-golden-values
-description: Refresh golden values from a GitHub Actions workflow run (failing-only or all jobs), score the change with average normalized relative differences, and produce a PR-ready summary. Use when the user asks to update goldens for a CI run, refresh golden values from a workflow ID, or generate a golden-value diff summary for a PR description.
-when_to_use: User provides a GitHub Actions workflow run ID and asks to refresh golden values; user asks to update goldens for "failing tests only" or "all tests"; user asks for a per-metric relative-difference summary of the golden-value diff; user wants a PR description blurb after running download_golden_values.py.
+description: Refresh golden values from a GitHub Actions workflow run (failing-only or all jobs), calculate signed per-model percentage changes, and produce a PR-ready summary. Use when the user asks to update goldens for a CI run, refresh golden values from a workflow ID, or generate a golden-value diff summary for a PR description.
 ---
 
-# Update golden values + relative-diff summary
+# Update golden values + signed per-model percentage summary
 
-End-to-end workflow for refreshing golden values from a GitHub Actions workflow run, scoring the update with a per-metric average normalized relative difference, and writing a PR-ready summary.
+End-to-end workflow for refreshing golden values from a GitHub Actions workflow run, reporting signed percentage changes per test/model environment, and writing a PR-ready summary.
 
 The skill orchestrates two scripts that already live in the repo:
 
@@ -29,8 +28,8 @@ The skill orchestrates two scripts that already live in the repo:
 - [ ] Step 1: Set up env (token + venv with deps)
 - [ ] Step 2: Reset prior golden-value edits
 - [ ] Step 3: Download goldens (scope = only-failing | all)
-- [ ] Step 4: Run relative-diff comparison + capture CSV
-- [ ] Step 5: Produce summary blurb
+- [ ] Step 4: Run relative-diff comparison + generate per-model percentage table
+- [ ] Step 5: Produce PR-ready summary
 ```
 
 ### Step 1 — Environment
@@ -97,36 +96,64 @@ The CSV holds one row per `(file, metric)` with four columns:
 - `n_steps` — count of shared steps that contributed (steps where `|old| < 1e-12` are skipped to avoid div-by-zero; NaN/inf are dropped).
 - `avg_rel_diff` — `mean((old − new) / old)`. **Signed**: positive = the new run is smaller than the old run at the typical step (e.g. loss decreased), negative = larger.
 
-Then derive aggregates from the CSV (do this in Python; do not paste raw CSV into the summary):
+Convert the raw ratio to a percentage for the report:
+
+`avg_rel_diff_pct = 100 × avg_rel_diff`
+
+Always include the `%` symbol and preserve the sign. Do not take the absolute value, produce magnitude-only statistics, or combine models into magnitude buckets. Generate one row per test/model environment instead:
 
 ```python
-import csv, collections
+import collections
+import csv
+from pathlib import Path
+
 rows = list(csv.DictReader(open('/tmp/reldiff_summary.csv')))
 for r in rows:
-    r['n_steps']      = int(r['n_steps'])
-    r['avg_rel_diff'] = float(r['avg_rel_diff'])
-    r['abs']          = abs(r['avg_rel_diff'])
+    r['n_steps'] = int(r['n_steps'])
+    r['avg_rel_diff_pct'] = 100 * float(r['avg_rel_diff'])
 
-by_metric = collections.defaultdict(list)
+by_file = collections.defaultdict(dict)
 for r in rows:
-    by_metric[r['metric']].append(r['abs'])
+    by_file[r['file']][r['metric']] = {
+        'n_steps': r['n_steps'],
+        'pct': r['avg_rel_diff_pct'],
+    }
 
-# headline numbers per metric (using |avg_rel_diff|)
-for m, vs in sorted(by_metric.items()):
-    vs.sort()
-    print(m, len(vs), 'median', vs[len(vs)//2], 'max', vs[-1])
+preferred_metrics = [
+    'lm loss',
+    'mtp_1 loss',
+    'num-zeros',
+    'iteration-time',
+    'mem-allocated-bytes',
+    'mem-max-allocated-bytes',
+]
+present_metrics = {r['metric'] for r in rows}
+metrics = [m for m in preferred_metrics if m in present_metrics]
+metrics.extend(sorted(present_metrics - set(metrics)))
 
-# bucket counts across all rows, on |avg_rel_diff|
-buckets = [('==0',      lambda x: x == 0),
-           ('(0,1e-6)', lambda x: 0 < x < 1e-6),
-           ('[1e-6,1e-4)', lambda x: 1e-6 <= x < 1e-4),
-           ('[1e-4,1e-3)', lambda x: 1e-4 <= x < 1e-3),
-           ('[1e-3,1e-2)', lambda x: 1e-3 <= x < 1e-2),
-           ('[1e-2,1e-1)', lambda x: 1e-2 <= x < 1e-1),
-           ('>=1e-1',   lambda x: x >= 1e-1)]
-abs_all = [r['abs'] for r in rows]
-for label, pred in buckets:
-    print(label, sum(1 for v in abs_all if pred(v)))
+print('| Test / environment | Steps | ' + ' | '.join(f'`{m}` (%)' for m in metrics) + ' |')
+print('| --- | --: | ' + ' | '.join('--:' for _ in metrics) + ' |')
+
+for file_name in sorted(by_file):
+    path = Path(file_name)
+    test_name = path.parent.name
+    environment = path.stem.removeprefix('golden_values_')
+    values = by_file[file_name]
+    steps = max(v['n_steps'] for v in values.values())
+
+    cells = []
+    for metric in metrics:
+        if metric not in values:
+            cells.append('—')
+            continue
+        pct = values[metric]['pct']
+        cells.append('`0.000000%`' if pct == 0 else f'`{pct:+.6f}%`')
+
+    print(f'| `{test_name}` / {environment} | {steps} | ' + ' | '.join(cells) + ' |')
+
+print()
+print('`Steps` is the largest shared-step count for the row. State any metric-specific')
+print('difference, such as `iteration-time` having one fewer step after a leading NaN is filtered.')
 ```
 
 ### Step 5 — Summary blurb
@@ -150,54 +177,39 @@ Match the `download_golden_values.py` command in the bullet list to the scope us
 - Re-ran `tests/test_utils/python_scripts/download_golden_values.py --source github --pipeline-id <WORKFLOW_RUN_ID> <--only-failing if scope=only-failing>`.
 - Updated **<N> golden-value files** under `tests/functional_tests/test_cases/`.
 
-### Relative-difference summary
+### Signed per-model relative differences
 
-Comparison covers <FILES_WITH_BASELINE> files × <NUM_METRICS> metrics = **<TOTAL_ROWS> `(file, metric)` pairs**. Per row: `avg_rel_diff = mean((old − new) / old)` over shared steps.
+Comparison covers <FILES_WITH_BASELINE> files across <NUM_METRICS> distinct metrics = **<TOTAL_ROWS> `(file, metric)` pairs**. The reported percentage is `100 × mean((old − new) / old)` over shared steps.
 
-**Per-metric headline numbers** (over `|avg_rel_diff|`)
+Positive percentages mean the new run is lower; negative percentages mean it is higher.
 
-| metric                    |   n | median \|avg_rel_diff\| | max \|avg_rel_diff\| |
-| ------------------------- | --: | -----------------------: | -------------------: |
-| `lm loss`                 | <…> |                    <…>   |                <…>   |
-| `num-zeros`               | <…> |                    <…>   |                <…>   |
-| `iteration-time`          | <…> |                    <…>   |                <…>   |
-| `mem-allocated-bytes`     | <…> |                    <…>   |                <…>   |
-| `mem-max-allocated-bytes` | <…> |                    <…>   |                <…>   |
+<INSERT THE GENERATED PER-MODEL MARKDOWN TABLE HERE>
 
-**Distribution of `|avg_rel_diff|` across all <TOTAL_ROWS> rows**
+State when a metric uses fewer shared steps than the row's `Steps` value—for example, when a leading `iteration-time` NaN was filtered.
 
-| \|avg_rel_diff\| bucket | count |
-| ----------------------- | ----: |
-| `== 0`                  |  <…>  |
-| `(0, 1e-6)`             |  <…>  |
-| `[1e-6, 1e-4)`          |  <…>  |
-| `[1e-4, 1e-3)`          |  <…>  |
-| `[1e-3, 1e-2)`          |  <…>  |
-| `[1e-2, 1e-1)`          |  <…>  |
-| `>= 1e-1`               |  <…>  |
+**Interpretation** (apply only statements supported by the signed percentages)
 
-**Interpretation** (apply only the bullets that match the data)
-
-- `lm loss` max `|avg_rel_diff|` <X> / median <Y> — loss trajectories match old goldens to numerical noise (sub-1e-4 is within run-to-run variance).
-- `mem-*` metrics typically sit at `== 0` or `(0, 1e-6)`; flag any row that lands above `[1e-4, 1e-3)`.
-- `iteration-time` movement is dominated by warmup/scheduler noise; signed avg near zero means the run was simply jitterier, not slower or faster on average.
-- `num-zeros` shifts cluster on `<list of test patterns>`; within historical run-to-run variance.
+- `lm loss` changes between `-0.01%` and `+0.01%` generally match old goldens to numerical noise.
+- For `lm loss` or `num-zeros`, call out values below `-0.1%` or above `+0.1%` for review.
+- Negative `iteration-time` percentages mean the new run was slower; positive percentages mean it was faster. Treat timing changes as scheduler/warmup noise unless they repeat.
+- Describe large `num-zeros` changes per model; do not hide them in a cross-model magnitude aggregate.
 ````
 
 ## Reading the columns
 
-| column         | meaning                                                                                          |
-| -------------- | ------------------------------------------------------------------------------------------------ |
-| `n_steps`      | shared step indices used in the average (NaN/inf and steps with `\|old\| < 1e-12` are dropped). |
-| `avg_rel_diff` | `mean((old − new) / old)` over `n_steps`. Signed: positive = new < old, negative = new > old.    |
+| column             | meaning                                                                                               |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| `n_steps`          | shared step indices used in the average (NaN/inf and steps with `\|old\| < 1e-12` are dropped).      |
+| `avg_rel_diff`     | raw ratio: `mean((old − new) / old)` over `n_steps`; positive = new < old, negative = new > old.      |
+| `avg_rel_diff_pct` | report value: `100 × avg_rel_diff`; retain the sign and append `%` so the unit is unambiguous.         |
 
-When sorting / filtering, the script ranks by `|avg_rel_diff|`. Keep the sign in the printed table so reviewers can see direction.
+Keep the sign in every table cell and sort rows by test/model and environment. Do not rank or summarize the report using unsigned magnitudes.
 
 Triage rules of thumb:
 
-- `lm loss` / `num-zeros` rows with `|avg_rel_diff|` ≲ 1e-4 are run-to-run noise.
-- `iteration-time` divergences are usually warmup/scheduler noise; a small signed mean near zero says the run was jitterier, not systematically faster or slower.
-- Focus reviewer attention on `lm loss` and `num-zeros` rows with `|avg_rel_diff|` ≥ ~1e-3.
+- `lm loss` changes from `-0.01%` through `+0.01%` are generally run-to-run noise.
+- A negative `iteration-time` percentage means the new run was slower; a positive percentage means it was faster. Treat timing changes as scheduler/warmup noise unless they repeat.
+- Focus reviewer attention on `lm loss` and `num-zeros` values outside `-0.1%` through `+0.1%`.
 
 ## Notes & gotchas
 
