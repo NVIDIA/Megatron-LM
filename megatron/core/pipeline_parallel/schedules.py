@@ -2300,6 +2300,25 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
+    # Attention residuals: intermediate stages exchange all depth sources plus the
+    # running partial sum, concatenated along the sequence dimension. The slice
+    # count is static per boundary and derived from the pipeline layer layout.
+    if getattr(config, 'enable_attention_residuals', False) and pp_group is not None:
+        from megatron.core.transformer.attention_residual import attn_res_payload_slices_for_pp_rank
+
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
+        # The boundary is identified by the rank that RECEIVES the payload.
+        boundary_recv_rank = None
+        if is_recv and pp_rank > 0:
+            boundary_recv_rank = pp_rank
+        elif not is_recv and pp_rank < pp_size - 1:
+            boundary_recv_rank = pp_rank + 1
+        if boundary_recv_rank is not None:
+            effective_seq_length = effective_seq_length * attn_res_payload_slices_for_pp_rank(
+                config, boundary_recv_rank
+            )
+
     tensor_shapes.append(
         (effective_seq_length, effective_micro_batch_size, _get_pipeline_hidden_size(config))
     )
