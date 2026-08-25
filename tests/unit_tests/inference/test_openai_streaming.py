@@ -79,10 +79,11 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
         def __init__(self):
             self.return_log_probs = []
 
-        async def add_request(self, _prompt_tokens, sampling_params):
+        async def add_request(self, _prompt_tokens, sampling_params, multi_modal_data=None):
             self.return_log_probs.append(sampling_params.return_log_probs)
             generated_log_probs = [-0.25, -0.5] if sampling_params.return_log_probs else None
             return {
+                "uid": "request-1",
                 "status": "COMPLETED",
                 "generated_text": "ab",
                 "prompt_length": 2,
