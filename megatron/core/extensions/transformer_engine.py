@@ -571,7 +571,21 @@ def _init_gtp_remat_context(
         rng_via_kwarg=rng_via_kwarg,
         out_split_size=out_split_size,
     )
-    yield out_features
+    # Route super().__init__'s pre-sharded weight (native FP8/MXFP8 storage under
+    # --fp8-param-gather) into the registered symmetric pool -> NVLS-eligible GTP all-gather input.
+    # TODO: narrow this wrap (it also captures the high-precision init weight, biases, and FP8
+    # meta buffers). TE's replace_raw_data cannot re-home MXFP8 data+scales yet; when it can, or
+    # via meta-device init + a wrapped reset_parameters(), only the quantized storage needs this.
+    from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+        gtp_symm_pool_ctx,
+        is_gtp_symm_pool_registered,
+    )
+
+    if is_gtp_symm_pool_registered(gtp_remat_group, mode="ag"):
+        with gtp_symm_pool_ctx(gtp_remat_group):
+            yield out_features
+    else:
+        yield out_features
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
 
 

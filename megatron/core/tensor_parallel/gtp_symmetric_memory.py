@@ -11,11 +11,15 @@ ProcessGroupNCCL hook window-registers every allocation made inside
 ``gtp_symm_pool_ctx(group)``, which lets NCCL run its symmetric / NVLS kernels on
 those buffers.
 
-Two parts:
+Three parts:
   - Pool lifecycle: create, register, query, and tear down the per-group pools,
     plus the allocation context ``gtp_symm_pool_ctx``.
   - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
     send buffers for the wgrad reduce-scatter.
+  - DDP buffer registration: ``register_ddp_buffers_on_gtp_groups`` and its undo put
+    the DDP param buffer (the all-gather input under the distributed optimizer) in
+    the symmetric window; the pool itself is created by core DDP
+    (see param_and_grad_buffer.py).
 """
 
 from __future__ import annotations
@@ -276,3 +280,72 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     _registered.clear()
     _registered_modes.clear()
     _pools.clear()
+
+
+# ---------------------------------------------------------------------------
+# DDP param-buffer registration: put the GTP all-gather INPUT in the window
+# (the pool itself is created by core DDP; see param_and_grad_buffer.py)
+# ---------------------------------------------------------------------------
+
+
+def _ddp_buffers(ddp_module: torch.nn.Module) -> list:
+    """All param/grad buffers of a DDP-wrapped module (dense + expert-parallel)."""
+    return list(getattr(ddp_module, "buffers", [])) + list(
+        getattr(ddp_module, "expert_parallel_buffers", [])
+    )
+
+
+def _buffer_symm_groups(buf) -> list[dist.ProcessGroup]:
+    """Return the GTP groups this buffer's pool must be (de)registered on: the buffer has
+    a pool and a param_data section, and a param opted in via ``needs_nccl_mem``. Sorted
+    by name so all ranks walk groups in the same order (mismatched order can deadlock).
+    """
+    if getattr(buf, "nccl_mem_pool", None) is None or getattr(buf, "param_data", None) is None:
+        return []
+    groups = {}
+    for param in buf.params:
+        if not getattr(param, "needs_nccl_mem", False):
+            continue
+        group = getattr(param, "group", None)
+        if group is not None and group.size() > 1:
+            groups.setdefault(group.group_name, group)
+    return [group for _, group in sorted(groups.items())]
+
+
+def register_ddp_buffers_on_gtp_groups(ddp_module: torch.nn.Module) -> None:
+    """Register each DDP buffer's pool on its params' GTP groups. This puts the DDP param
+    buffer — the GTP all-gather input under the distributed optimizer — in the symmetric
+    window.
+
+    Always symmetric: --disable-symmetric-registration scopes to the DP-group
+    registration, not the GTP groups, which are opted into by
+    --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub.
+    """
+    for buf in _ddp_buffers(ddp_module):
+        for group in _buffer_symm_groups(buf):
+            # buf.nccl_mem_pool is non-None here (checked in _buffer_symm_groups).
+            _warmup_group_comm(group)
+            nccl_allocator.register_mem_pool(buf.nccl_mem_pool, group, symmetric=True)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][GTP] Registered DDP param/grad pool on GTP group "
+                f"{group.group_name} (size={group.size()})",
+            )
+
+
+def deregister_ddp_buffers_from_gtp_groups(ddp_module: torch.nn.Module) -> None:
+    """Undo ``register_ddp_buffers_on_gtp_groups`` at shutdown, before the process groups
+    are destroyed. (The DP-group registration from --use-nccl-ub is deregistered
+    separately by the training loop.)
+    """
+    for buf in _ddp_buffers(ddp_module):
+        for group in _buffer_symm_groups(buf):
+            # buf.nccl_mem_pool is non-None here (checked in _buffer_symm_groups).
+            nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, group)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][GTP] Deregistered DDP param/grad pool from GTP group "
+                f"{group.group_name} (size={group.size()})",
+            )

@@ -39,6 +39,8 @@ try:
     )
     from megatron.core.tensor_parallel.gtp_symmetric_memory import (
         deregister_and_clear_gtp_symm_pools,
+        deregister_ddp_buffers_from_gtp_groups,
+        register_ddp_buffers_on_gtp_groups,
         register_gtp_symm_pool,
     )
 
@@ -52,10 +54,16 @@ except ImportError:
         """No-op stub: shutdown calls this unconditionally, and without the GTP
         surface no pool can have been registered."""
 
+    def deregister_ddp_buffers_from_gtp_groups(ddp_module) -> None:
+        """No-op stub: shutdown calls this unconditionally, and without the GTP
+        surface no DDP buffer can have been registered on a GTP group."""
+
 
 __all__ = [
     "HAVE_GTP",
     "deregister_and_clear_gtp_symm_pools",
+    "deregister_ddp_buffers_from_gtp_groups",
+    "register_ddp_buffers_on_gtp_groups",
     "register_gtp_symm_pool",
     "GTP_CONFIG",
     "GTPChain",

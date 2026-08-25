@@ -46,6 +46,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     register_capture_wgrad_ring_slot,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+    gtp_symm_pool_ctx,
     is_gtp_symm_pool_registered,
     symmetric_wgrad_pool,
 )
@@ -453,6 +454,10 @@ class GTPRematConfig:
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
+    # True when the distributed optimizer re-homes params into the DDP param buffer. Decides
+    # where the all-gather input lives: in the DDP buffer (registered on the GTP groups as a
+    # whole) rather than in per-param storage cloned into the group's pool.
+    param_storage_in_ddp_buffer: bool = False
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -484,6 +489,7 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    use_distributed_optimizer=False,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
@@ -497,6 +503,7 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
         pad_for_alignment=resolve_gtp_pad_for_alignment(fp4=fp4, fp8_recipe=fp8_recipe, fp8=fp8),
+        param_storage_in_ddp_buffer=use_distributed_optimizer,
     )
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -593,7 +600,16 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
 
     shard_size = tensor.shape[0] // gtp_remat_size
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
-    gtp_shard = GTPShardedParam(shard.clone())
+    # Without the distributed optimizer the shard itself is the all-gather input, so clone
+    # it inside the group's registered pool. With it, the optimizer re-homes the param into
+    # the DDP buffer (registered as a whole) and this clone is freed.
+    if is_gtp_symm_pool_registered(
+        gtp_remat_group, mode="ag"
+    ) and not GTP_CONFIG.param_storage_in_ddp_buffer:
+        with gtp_symm_pool_ctx(gtp_remat_group):
+            gtp_shard = GTPShardedParam(shard.clone())
+    else:
+        gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
     # Preserve duplicate-filtering metadata dropped when wrapping into GTPShardedParam.
     from megatron.core.tensor_parallel import (
@@ -631,6 +647,10 @@ def _gtp_attach_attrs(
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+    # Ask DDP to back this param's buffer with ncclMemAlloc so the buffer can be
+    # window-registered on the GTP group (the all-gather input under the distributed
+    # optimizer). Derived from registration state, fixed before model construction.
+    gtp_shard.needs_nccl_mem = is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
     global _GTP_PARAMS
@@ -2390,7 +2410,15 @@ class GTPWeightCache:
             out_shape = param._unsharded_shape_padded
 
         chain_id = getattr(param, "chain_id", GTPChain.UNGRAPHED.value)
-        with cuda_graph_pool_allocation(_chain_is_graphed(chain_id)):
+        # All-gather outputs go into the group's registered pool so the gather runs on
+        # symmetric kernels; otherwise (reduce-scatter outputs, or no registration) keep
+        # the CUDA-graph pool routing. Tickets are persistent and first allocated during
+        # eager warmup, so a graphed chain replays stable pool addresses either way.
+        if not reduce_scatter and is_gtp_symm_pool_registered(param.group, mode="ag"):
+            alloc_ctx = gtp_symm_pool_ctx(param.group)
+        else:
+            alloc_ctx = cuda_graph_pool_allocation(_chain_is_graphed(chain_id))
+        with alloc_ctx:
             if not isinstance(dtype, torch.dtype):
                 # Use the gather quantizer copy: mutating the param's own quantizer usage
                 # would corrupt the optimizer's quantize_ update direction (frozen weights).

@@ -1214,6 +1214,18 @@ class _ParamAndGradBuffer:
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
+        elif self.ddp_config.use_distributed_optimizer and any(
+            getattr(p, 'needs_nccl_mem', False) for p in self.params
+        ):
+            # Params opted into ncclMemAlloc backing so the caller can window-register this
+            # buffer on other comm groups; it registers and warms them itself, so this branch
+            # only allocates. Distopt-gated: without it there is no param_data to back.
+            # Always symmetric: --disable-symmetric-registration is rejected in combination
+            # with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub at argument validation.
+            nccl_allocator.init()
+            pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+            self.nccl_mem_pool = pool
+            mem_alloc_context = functools.partial(torch.cuda.use_mem_pool, pool)
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
