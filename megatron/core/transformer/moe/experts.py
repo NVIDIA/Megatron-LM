@@ -1214,7 +1214,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
-            logical_dtypes = set()
+            logical_dtypes: set[torch.dtype | None] = set()
             for i in range(self.num_local_experts):
                 w = getattr(linear, f'weight{i}')
                 if isinstance(w, MXFP8Tensor):
@@ -1233,14 +1233,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
+            known_dtypes = logical_dtypes - {None}
+            if len(known_dtypes) > 1:
+                raise RuntimeError(
+                    f"Conflicting logical dtypes for {linear_name} expert weights: "
+                    f"{known_dtypes}."
+                )
+            logical_dtype = next(iter(known_dtypes), None)
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
-            if len(logical_dtypes) != 1:
-                raise RuntimeError(
-                    f"Expected one logical dtype for {linear_name} expert weights, "
-                    f"got {logical_dtypes}."
-                )
-            logical_dtype = next(iter(logical_dtypes))
 
             setattr(
                 self,

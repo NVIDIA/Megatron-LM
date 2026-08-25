@@ -334,18 +334,48 @@ class TestMXFP8Tensor:
             tensor.copy_(torch.randn(16, 128, device="cuda", dtype=torch.float16))
         assert tensor.dtype is None
 
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-    def test_copy_uses_explicit_logical_dtype(self, dtype):
-        source = torch.randn(16, 128, device="cuda", dtype=dtype)
+    def test_copy_does_not_downcast_update_to_logical_dtype(self):
+        source = torch.randn(16, 128, device="cuda", dtype=torch.float16)
         tensor = MXFP8Tensor.from_bf16(source, backend="triton")
-        update = torch.randn(16, 128, device="cuda", dtype=torch.float32)
-        expected = MXFP8Tensor.from_bf16(update.to(dtype), backend="triton")
+        update = torch.linspace(
+            -100_000, 100_000, steps=16 * 128, device="cuda", dtype=torch.float32
+        ).reshape(16, 128)
+        expected = MXFP8Tensor.from_bf16(update, backend="triton")
 
-        assert tensor.dtype == dtype
+        assert tensor.dtype == torch.float16
         tensor.copy_(update)
-        assert tensor.dtype == dtype
+        assert tensor.dtype == torch.float16
         assert torch.equal(tensor.data, expected.data)
-        assert torch.equal(tensor.scale, expected.scale)
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+
+    def test_copy_normalizes_flashinfer_fp32_input_to_bf16(self):
+        if not HAVE_FLASHINFER:
+            pytest.skip("FlashInfer not available")
+
+        source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+        tensor = MXFP8Tensor.from_bf16(source, backend="flashinfer")
+        update = torch.randn(16, 128, device="cuda", dtype=torch.float32)
+        expected = MXFP8Tensor.from_bf16(update.to(torch.bfloat16), backend="flashinfer")
+
+        tensor.copy_(update)
+
+        assert tensor.dtype == torch.bfloat16
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+
+    def test_copy_rejects_stacked_storage(self):
+        tensor = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        stacked = MXFP8Tensor(
+            data=torch.stack([tensor.data, tensor.data]),
+            scale=torch.stack([tensor.scale, tensor.scale]),
+            dtype=tensor.dtype,
+            backend=tensor.backend,
+        )
+
+        with pytest.raises(ValueError, match="require 2D destination storage"):
+            stacked.copy_(torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16))
 
     def test_reject_invalid_scale_dtype(self):
         from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype

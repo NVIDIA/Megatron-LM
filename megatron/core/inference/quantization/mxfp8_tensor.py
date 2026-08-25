@@ -123,12 +123,15 @@ class MXFP8Tensor:
     scale: torch.Tensor  # 1D swizzled or [M, K // 32] unswizzled scales
     backend: Optional[MXFP8Backend] = None  # quantization and GEMM backend
     # Keyword-only preserves the pre-existing third positional ``backend`` argument.
-    # Legacy direct constructors have unknown logical dtype until their next update.
+    # This metadata supports tensor-like conversion consumers such as Megatron
+    # Bridge; it does not constrain the precision accepted by ``quantize_``/``copy_``.
+    # Legacy direct constructors have unknown logical dtype until their next
+    # successful update.
     dtype: Optional[torch.dtype] = field(default=None, kw_only=True)
 
     @property
     def shape(self) -> torch.Size:
-        """Logical tensor shape."""
+        """Shape of the quantized data storage."""
         return self.data.shape
 
     @property
@@ -157,23 +160,34 @@ class MXFP8Tensor:
     def quantize_(self, value: torch.Tensor) -> "MXFP8Tensor":
         """Quantize a logical tensor into existing storage without changing pointers.
 
-        When this destination's logical dtype is known, the source is cast to it,
-        matching ``torch.Tensor.copy_`` dtype-conversion semantics. Legacy instances
-        with unknown dtype preserve the source dtype. Shape broadcasting is
-        unsupported because MXFP8 scale storage has fixed geometry.
+        The source dtype is preserved when supported by the configured backend so
+        the quantizer does not introduce an avoidable intermediate downcast.
+        FlashInfer FP32 inputs are converted to BF16 because that backend accepts
+        FP16/BF16 inputs only. For legacy instances with unknown logical dtype, the
+        first successful update records the dtype actually passed to the quantizer.
+        Shape broadcasting is unsupported because MXFP8 scale storage has fixed
+        geometry.
         """
+        if self.data.ndim != 2:
+            raise ValueError(
+                "In-place MXFP8 updates require 2D destination storage; "
+                f"got shape {tuple(self.data.shape)}."
+            )
         if value.shape != self.shape:
             raise ValueError(
                 f"MXFP8 shape mismatch: expected {tuple(self.shape)}, got {tuple(value.shape)}."
             )
         if self.backend is None:
             raise ValueError("Cannot update an MXFP8Tensor without a quantization backend.")
-        logical_dtype = self.dtype if self.dtype is not None else value.dtype
-        value = value.to(device=self.device, dtype=logical_dtype).contiguous()
+        value = value.to(device=self.device)
+        if self.backend == "flashinfer" and value.dtype == torch.float32:
+            value = value.to(dtype=torch.bfloat16)
+        value = value.contiguous()
         quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
         self.data.copy_(quantized.data)
         self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
-        self.dtype = logical_dtype
+        if self.dtype is None:
+            self.dtype = value.dtype
         return self
 
     def copy_(self, value: torch.Tensor) -> "MXFP8Tensor":
@@ -181,13 +195,19 @@ class MXFP8Tensor:
 
         Unlike ``torch.Tensor.copy_``, this method requires an exact shape and
         does not accept ``non_blocking``; quantization and storage updates are
-        ordered on the current CUDA stream.
+        ordered on the current CUDA stream. The alias lets external conversion
+        integrations such as Megatron Bridge treat plain and MXFP8 destinations
+        uniformly while ``quantize_`` remains available to existing callers.
         """
         return self.quantize_(value)
 
     @classmethod
     def from_bf16(cls, x: torch.Tensor, group_size: int = 32, backend: MXFP8Backend = "flashinfer"):
         """Quantize a floating-point CUDA tensor to MXFP8.
+
+        The historical method name is retained for compatibility. The Triton
+        backend accepts BF16, FP16, and FP32 inputs; FlashInfer accepts BF16 and
+        FP16 inputs.
 
         Args:
             x: [M, K] floating-point tensor on CUDA.

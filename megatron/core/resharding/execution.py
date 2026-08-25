@@ -23,8 +23,10 @@ def refresh_module_caches(
 ) -> None:
     """Refresh parameter-derived caches in the destination module(s).
 
-    Lists and tuples let external refit callers pass virtual-pipeline model
-    chunks directly. ``None`` is a no-op for send-only ranks.
+    Lists and tuples let external refit callers, including Megatron Bridge,
+    pass virtual-pipeline model chunks directly. ``None`` is a no-op for
+    send-only ranks. The ``dst_module`` parameter name remains stable for
+    callers that use keyword arguments.
     """
     if dst_module is None:
         return
