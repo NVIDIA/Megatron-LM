@@ -1214,6 +1214,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
+            logical_dtypes = set()
             for i in range(self.num_local_experts):
                 w = getattr(linear, f'weight{i}')
                 if isinstance(w, MXFP8Tensor):
@@ -1228,14 +1229,25 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 validate_mxfp8_tensor(
                     mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
                 )
+                logical_dtypes.add(mxfp8.dtype)
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
+            if len(logical_dtypes) != 1:
+                raise RuntimeError(
+                    f"Expected one logical dtype for {linear_name} expert weights, "
+                    f"got {logical_dtypes}."
+                )
+            logical_dtype = next(iter(logical_dtypes))
 
             setattr(
-                self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend)
+                self,
+                buf_name,
+                MXFP8Tensor(
+                    data=stacked_data, scale=stacked_scale, dtype=logical_dtype, backend=backend
+                ),
             )
 
             # Redirect per-expert weight .data to views into the stacked buffer,

@@ -294,6 +294,69 @@ class TestMXFP8Tensor:
         assert torch.equal(tensor.data, expected.data)
         assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
+    def test_copy_rejects_shape_mismatch(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        tensor = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        with pytest.raises(ValueError, match="shape mismatch"):
+            tensor.copy_(torch.randn(32, 128, device="cuda", dtype=torch.bfloat16))
+
+    def test_copy_requires_backend(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+        quantized = MXFP8Tensor.from_bf16(source, backend="triton")
+        backendless = MXFP8Tensor(data=quantized.data, scale=quantized.scale, dtype=source.dtype)
+        with pytest.raises(ValueError, match="without a quantization backend"):
+            backendless.copy_(source)
+
+    def test_copy_preserves_source_dtype_for_legacy_constructor(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        initial = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        tensor = MXFP8Tensor(initial.data.clone(), initial.scale.clone(), "triton")
+        source = torch.randn(16, 128, device="cuda", dtype=torch.float16)
+        expected = MXFP8Tensor.from_bf16(source, backend="triton")
+
+        assert tensor.dtype is None
+        tensor.copy_(source)
+        assert tensor.dtype == source.dtype
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale, expected.scale)
+
+    def test_failed_legacy_copy_keeps_dtype_unknown(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        initial = MXFP8Tensor.from_bf16(
+            torch.randn(16, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        tensor = MXFP8Tensor(
+            initial.data.clone(), initial.scale.clone(), "unsupported"  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(ValueError, match="Unknown MXFP8 quantization backend"):
+            tensor.copy_(torch.randn(16, 128, device="cuda", dtype=torch.float16))
+        assert tensor.dtype is None
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    def test_copy_uses_explicit_logical_dtype(self, dtype):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        source = torch.randn(16, 128, device="cuda", dtype=dtype)
+        tensor = MXFP8Tensor.from_bf16(source, backend="triton")
+        update = torch.randn(16, 128, device="cuda", dtype=torch.float32)
+        expected = MXFP8Tensor.from_bf16(update.to(dtype), backend="triton")
+
+        assert tensor.dtype == dtype
+        tensor.copy_(update)
+        assert tensor.dtype == dtype
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale, expected.scale)
+
     def test_reject_invalid_scale_dtype(self):
         from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype
 
@@ -309,9 +372,9 @@ class TestMXFP8Tensor:
         data = torch.empty((64, 128), dtype=torch.float8_e4m3fn, device="cuda")
         scale = torch.empty((64, 4), dtype=torch.uint8, device="cuda")
 
-        validate_mxfp8_tensor(MXFP8Tensor(data, scale, backend="flashinfer"))
+        validate_mxfp8_tensor(MXFP8Tensor(data, scale, dtype=torch.bfloat16, backend="flashinfer"))
 
-        invalid = MXFP8Tensor(data, scale[:63], backend="flashinfer")
+        invalid = MXFP8Tensor(data, scale[:63], dtype=torch.bfloat16, backend="flashinfer")
         with pytest.raises(ValueError, match="2D scale has shape"):
             validate_mxfp8_tensor(invalid)
 
@@ -325,7 +388,7 @@ class TestMXFP8Tensor:
         scale = torch.empty(512, dtype=torch.uint8, device="cuda")
 
         with pytest.raises(ValueError, match="backend= explicitly"):
-            validate_mxfp8_tensor(MXFP8Tensor(data, scale))
+            validate_mxfp8_tensor(MXFP8Tensor(data, scale, dtype=torch.bfloat16))
 
     @pytest.mark.parametrize("M,K", [(16, 128), (64, 256), (128, 2688)])
     def test_from_bf16_triton(self, M, K):
@@ -750,6 +813,7 @@ class TestPermuteAndQuantizeMxfp8:
             return MXFP8Tensor(
                 data=torch.stack([weight.data for weight in per_expert]),
                 scale=torch.stack([weight.scale for weight in per_expert]),
+                dtype=torch.bfloat16,
                 backend="triton",
             )
 

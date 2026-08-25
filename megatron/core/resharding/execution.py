@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 def refresh_module_caches(
     dst_module: torch.nn.Module | list[torch.nn.Module] | tuple[torch.nn.Module, ...] | None,
 ) -> None:
-    """Refresh parameter-derived caches in the destination module."""
+    """Refresh parameter-derived caches in the destination module(s).
+
+    Lists and tuples let external refit callers pass virtual-pipeline model
+    chunks directly. ``None`` is a no-op for send-only ranks.
+    """
     if dst_module is None:
         return
     roots = dst_module if isinstance(dst_module, (list, tuple)) else (dst_module,)

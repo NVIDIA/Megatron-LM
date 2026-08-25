@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -122,7 +122,9 @@ class MXFP8Tensor:
     data: torch.Tensor  # [M, K] fp8_e4m3fn
     scale: torch.Tensor  # 1D swizzled or [M, K // 32] unswizzled scales
     backend: Optional[MXFP8Backend] = None  # quantization and GEMM backend
-    dtype: torch.dtype = torch.bfloat16  # logical, unquantized dtype
+    # Keyword-only preserves the pre-existing third positional ``backend`` argument.
+    # Legacy direct constructors have unknown logical dtype until their next update.
+    dtype: Optional[torch.dtype] = field(default=None, kw_only=True)
 
     @property
     def shape(self) -> torch.Size:
@@ -153,29 +155,42 @@ class MXFP8Tensor:
         return self.scale.reshape(-1, padded_cols)
 
     def quantize_(self, value: torch.Tensor) -> "MXFP8Tensor":
-        """Quantize a logical tensor into the existing storage."""
+        """Quantize a logical tensor into existing storage without changing pointers.
+
+        When this destination's logical dtype is known, the source is cast to it,
+        matching ``torch.Tensor.copy_`` dtype-conversion semantics. Legacy instances
+        with unknown dtype preserve the source dtype. Shape broadcasting is
+        unsupported because MXFP8 scale storage has fixed geometry.
+        """
         if value.shape != self.shape:
             raise ValueError(
                 f"MXFP8 shape mismatch: expected {tuple(self.shape)}, got {tuple(value.shape)}."
             )
         if self.backend is None:
             raise ValueError("Cannot update an MXFP8Tensor without a quantization backend.")
-        value = value.to(device=self.device, dtype=self.dtype).contiguous()
+        logical_dtype = self.dtype if self.dtype is not None else value.dtype
+        value = value.to(device=self.device, dtype=logical_dtype).contiguous()
         quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
         self.data.copy_(quantized.data)
         self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+        self.dtype = logical_dtype
         return self
 
     def copy_(self, value: torch.Tensor) -> "MXFP8Tensor":
-        """Copy a logical tensor while retaining CUDA-graph-visible storage."""
+        """Tensor-compatible alias for :meth:`quantize_` used by generic writeback.
+
+        Unlike ``torch.Tensor.copy_``, this method requires an exact shape and
+        does not accept ``non_blocking``; quantization and storage updates are
+        ordered on the current CUDA stream.
+        """
         return self.quantize_(value)
 
     @classmethod
     def from_bf16(cls, x: torch.Tensor, group_size: int = 32, backend: MXFP8Backend = "flashinfer"):
-        """Quantize BF16 tensor to MXFP8.
+        """Quantize a floating-point CUDA tensor to MXFP8.
 
         Args:
-            x: [M, K] BF16 tensor on CUDA.
+            x: [M, K] floating-point tensor on CUDA.
             group_size: MXFP8 group size (default 32).
             backend: 'triton' (fused quantize + swizzle Triton kernel) or
                      'flashinfer' (single fused FlashInfer CUDA kernel).

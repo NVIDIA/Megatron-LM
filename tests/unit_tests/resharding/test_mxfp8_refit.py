@@ -188,6 +188,7 @@ class TestMXFP8ReshardTransform:
         flashinfer_buffer = MXFP8Tensor(
             data=triton_buffer.data.clone(),
             scale=triton_buffer.scale.view(torch.uint8).clone(),
+            dtype=torch.bfloat16,
             backend="flashinfer",
         )
 
