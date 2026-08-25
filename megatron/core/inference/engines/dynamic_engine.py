@@ -435,6 +435,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self._reset_pending_kv_imports()
         self.context.reset()
+        self.controller._async_sched_logits.clear()
 
         # Request state.
         self.request_counter = Counter()
@@ -988,6 +989,7 @@ class DynamicInferenceEngine(AbstractEngine):
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.controller._async_sched_logits.clear()
             recompute_active_ids = active_request_ids
 
             # Reset any partially prefilled requests so they recompute from the start
