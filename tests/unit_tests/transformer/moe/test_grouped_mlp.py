@@ -10,6 +10,8 @@ import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import squared_relu
+from megatron.core.extensions import transformer_engine as te_ext
+from megatron.core.fusions import fused_bias_geglu, fused_bias_swiglu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -133,14 +135,31 @@ def test_paged_stash_marking_delegates_to_transformer_engine(monkeypatch):
     module.config = SimpleNamespace(moe_paged_stash=True)
     tensors = (torch.zeros(2, 4), torch.ones(2, 1))
 
-    monkeypatch.setattr(
-        experts_module, "_te_mark_grouped_tensor", lambda *args: marked.append(args)
-    )
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
     module._mark_paged_stash_tensors(*tensors)
 
     assert len(marked) == 1
     assert marked[0][0] is tensors[0]
     assert marked[0][1] is tensors[1]
+
+
+@pytest.mark.parametrize(
+    "propagate_marker",
+    (
+        fused_bias_geglu._propagate_paged_stash_marker,
+        fused_bias_swiglu._propagate_paged_stash_marker,
+    ),
+)
+def test_fused_activation_marker_propagation_uses_te_adapter(monkeypatch, propagate_marker):
+    marked = []
+    source = torch.zeros(2, 4)
+    target = torch.ones(2, 4)
+    source.grouped_tensor_scale_inv = False
+
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
+
+    assert propagate_marker(source, target) is target
+    assert marked == [(target,)]
 
 
 def test_clamped_swiglu_allows_te_op_fuser():

@@ -19,7 +19,7 @@ from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, mark_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -64,11 +64,6 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
     try:
-        from transformer_engine.pytorch.utils import mark_grouped_tensor as _te_mark_grouped_tensor
-    except ImportError:
-        _te_mark_grouped_tensor = None
-
-    try:
         from transformer_engine.pytorch.ops.basic.grouped_linear import (
             GRAD_INPUT_BUFFER_KEY,
             OUTPUT_BUFFER_KEY,
@@ -78,7 +73,6 @@ if HAVE_TE:
 else:
     te = None  # type: ignore[assignment, misc]
     Fp8Padding, Fp8Unpadding = None, None
-    _te_mark_grouped_tensor = None
     GRAD_INPUT_BUFFER_KEY = OUTPUT_BUFFER_KEY = None
 
 try:
@@ -332,13 +326,9 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs, "grouped_tensor_scale_inv"
         )
         if paged_stash_marked:
-            if _te_mark_grouped_tensor is None:
-                raise RuntimeError(
-                    "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
-                )
             # The multiply below saves these two token-shaped operands. The additive output
             # operand is not saved by autograd and does not need a marker.
-            _te_mark_grouped_tensor(flat_probs)
+            mark_grouped_tensor(flat_probs)
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -357,7 +347,7 @@ class TEGroupedMLP(MegatronModule):
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
         if paged_stash_marked:
-            _te_mark_grouped_tensor(bias_per_token)
+            mark_grouped_tensor(bias_per_token)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
     @staticmethod
@@ -721,11 +711,7 @@ class TEGroupedMLP(MegatronModule):
         """Mark dynamic unfused activations for the paged-stash saved-tensor hook."""
         if not self.config.moe_paged_stash:
             return
-        if _te_mark_grouped_tensor is None:
-            raise RuntimeError(
-                "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
-            )
-        _te_mark_grouped_tensor(*tensors)
+        mark_grouped_tensor(*tensors)
 
     def _fused_forward(
         self,

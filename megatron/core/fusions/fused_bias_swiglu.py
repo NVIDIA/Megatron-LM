@@ -15,12 +15,9 @@ from megatron.core.utils import nvtx_decorator
 def _propagate_paged_stash_marker(source, target):
     """Preserve TE's dynamic-activation marker across view/cast operations."""
     if hasattr(source, "grouped_tensor_scale_inv"):
-        try:
-            from transformer_engine.pytorch.utils import mark_grouped_tensor
-        except ImportError as exc:
-            raise RuntimeError(
-                "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
-            ) from exc
+        # Lazy import avoids the transformer_engine extension -> MLP -> fusion import cycle.
+        from megatron.core.extensions.transformer_engine import mark_grouped_tensor
+
         mark_grouped_tensor(target)
     return target
 
