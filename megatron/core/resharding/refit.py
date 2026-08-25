@@ -280,9 +280,7 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
     grouped_gemm_backend = getattr(
-        lm.config.inference_grouped_gemm_backend,
-        "value",
-        lm.config.inference_grouped_gemm_backend,
+        lm.config.inference_grouped_gemm_backend, "value", lm.config.inference_grouped_gemm_backend
     )
     if grouped_gemm_backend == "flashinfer":
         raise ValueError(

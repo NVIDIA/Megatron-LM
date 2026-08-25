@@ -102,17 +102,10 @@ def prepare_routed_mxfp8_weights(weight: MXFP8Tensor) -> FlashInferRoutedMXFP8We
     scale_cols = padded_cols // 32
 
     routed_data = torch.empty(
-        experts,
-        padded_rows,
-        padded_cols,
-        dtype=weight.data.dtype,
-        device=weight.data.device,
+        experts, padded_rows, padded_cols, dtype=weight.data.dtype, device=weight.data.device
     )
     routed_scale = torch.empty(
-        experts,
-        padded_rows * scale_cols,
-        dtype=torch.uint8,
-        device=weight.data.device,
+        experts, padded_rows * scale_cols, dtype=torch.uint8, device=weight.data.device
     )
 
     for expert in range(experts):
@@ -170,8 +163,10 @@ def quantize_routed_mxfp8_input(
         )
     padded_hidden = F.pad(hidden_states, (0, hidden_padding)) if hidden_padding else hidden_states
     quantized_hidden, hidden_scale = mxfp8_quantize(padded_hidden, False)
-    hidden_scale = hidden_scale.contiguous().view(torch.uint8).reshape(
-        hidden_states.shape[0], padded_hidden.shape[1] // 32
+    hidden_scale = (
+        hidden_scale.contiguous()
+        .view(torch.uint8)
+        .reshape(hidden_states.shape[0], padded_hidden.shape[1] // 32)
     )
     return quantized_hidden, hidden_scale
 
@@ -198,8 +193,7 @@ def select_routed_mxfp8_active_rows(
         raise ValueError(f"token_capacity must be positive; got {token_capacity}")
     if decode_token_upper_bound is not None and decode_token_upper_bound <= 0:
         raise ValueError(
-            "decode_token_upper_bound must be positive; "
-            f"got {decode_token_upper_bound}"
+            "decode_token_upper_bound must be positive; " f"got {decode_token_upper_bound}"
         )
     if (
         decode_only
@@ -320,9 +314,7 @@ def flashinfer_routed_mxfp8_moe(
         quantized_hidden, hidden_scale = quantize_routed_mxfp8_input(
             selected_hidden_states, fc1_weight.padded_cols
         )
-        packed_routing = pack_routed_mxfp8_routing(
-            selected_routing_map, selected_probabilities
-        )
+        packed_routing = pack_routed_mxfp8_routing(selected_routing_map, selected_probabilities)
         return flashinfer_routed_mxfp8_moe_prequantized(
             quantized_hidden,
             hidden_scale,

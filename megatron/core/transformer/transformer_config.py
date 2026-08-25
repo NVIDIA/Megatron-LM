@@ -1729,8 +1729,7 @@ class TransformerConfig(ModelParallelConfig):
                         f"{self.inference_flashinfer_mxfp8_token_capacity}"
                     )
                 if (
-                    self.inference_grouped_gemm_backend
-                    != InferenceGroupedGemmBackend.FLASHINFER
+                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
                     or self.fp8_recipe != Fp8Recipe.mxfp8
                 ):
                     raise ValueError(

@@ -1170,9 +1170,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
-        self._flashinfer_mxfp8_token_capacity = (
-            config.inference_flashinfer_mxfp8_token_capacity
-        )
+        self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1252,11 +1250,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
-            stacked_weight = MXFP8Tensor(
-                data=stacked_data,
-                scale=stacked_scale,
-                backend=backend,
-            )
+            stacked_weight = MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend)
             if use_flashinfer_routed:
                 concatenated_weight = prepare_routed_mxfp8_weights(stacked_weight)
                 logger.info(
@@ -1346,11 +1340,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 num_experts=self.num_local_experts * self.ep_group.size(),
                 local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                 activation_type=self._flashinfer_activation_type.value,
-                out=(
-                    NVLSAllGatherVDispatcher._get_rsv_tensor()
-                    if self._nvls_dispatcher
-                    else None
-                ),
+                out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
                 token_capacity=self._flashinfer_mxfp8_token_capacity,
                 decode_only=InferenceMode.is_decode_only(),
                 decode_token_upper_bound=InferenceMode.decode_token_upper_bound(),
