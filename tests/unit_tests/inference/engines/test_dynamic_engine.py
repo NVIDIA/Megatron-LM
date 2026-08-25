@@ -188,6 +188,7 @@ class DynamicEngineTestConfig:
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
+    unified_memory_level: int = 0
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"

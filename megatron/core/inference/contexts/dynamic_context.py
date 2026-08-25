@@ -967,8 +967,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
+            and self.unified_memory_level == 0
         ):
-            assert self.unified_memory_level == 0
             self._offloadable_tensor_names.add("memory_buffer")
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
@@ -1044,8 +1044,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             if (
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
+                and self.unified_memory_level == 0
             ):
-                assert self.unified_memory_level == 0
                 self._offloadable_tensor_names.add("mamba_conv_states")
                 self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
                     self.mamba_conv_states, device="cpu"
@@ -2434,14 +2434,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions,
-            self.cuda_graph_batch_dimensions_list,
-            strict=self.is_hybrid_model,
-            ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
-            ep_zmq_communicator=self._ep_zmq_communicator,
-        )
+        best_graph = None
+        if self.cuda_graphs_available or construct_graph_dimensions is not None:
+            best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+                batch_dimensions,
+                self.cuda_graph_batch_dimensions_list,
+                strict=self.is_hybrid_model,
+                ep_group=self.expert_model_parallel_group,
+                match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+                ep_zmq_communicator=self._ep_zmq_communicator,
+            )
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:
