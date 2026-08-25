@@ -21,8 +21,9 @@ from typing import TypeAlias
 
 import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
 
-from .placement import Flat, Placement
+from .placement import Flat
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 

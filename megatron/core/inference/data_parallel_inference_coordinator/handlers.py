@@ -80,13 +80,22 @@ def handle_submit_request(coordinator, sender_identity, payload):
         return
     # this is a message from a client.
     # route it to a data parallel rank
-    client_request_id, prompt, sampling_params = payload[1:]
+    # Payload is [SUBMIT_REQUEST, client_request_id, prompt, sampling_params,
+    # multi_modal_data].
+    fields = payload[1:]
+    if len(fields) == 3:
+        client_request_id, prompt, sampling_params = fields
+        multi_modal_data = None
+    else:
+        client_request_id, prompt, sampling_params, multi_modal_data = fields[:4]
+
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
     request_id = coordinator.next_request_id
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Serialize prompt.
     if isinstance(prompt, (str, list)):
@@ -97,15 +106,24 @@ def handle_submit_request(coordinator, sender_identity, payload):
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
     engine_payload = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params], use_bin_type=True
+        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params, multi_modal_data],
+        use_bin_type=True,
     )
 
-    request_hashes = coordinator.compute_request_hashes(prompt)
-    if (
-        coordinator.prefix_caching_coordinator_policy
-        == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-    ):
-        request_hashes = request_hashes[:1]
+    # Skip prefix-aware routing for image-bearing requests. Prefix *caching*
+    # itself is disabled for these requests in _build_vlm_request, so cross-image
+    # cache reuse can't happen; clearing hashes here just prevents affinity
+    # routing that would concentrate multimodal requests onto whichever rank
+    # happened to serve a text-identical prompt first.
+    if multi_modal_data:
+        request_hashes = []
+    else:
+        request_hashes = coordinator.compute_request_hashes(prompt)
+        if (
+            coordinator.prefix_caching_coordinator_policy
+            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        ):
+            request_hashes = request_hashes[:1]
 
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
@@ -117,6 +135,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
         logging.error("Coordinator: no reachable engines for request %d", request_id)
         del coordinator.request_id_to_client_id[request_id]
         del coordinator.request_id_to_client_request_id[request_id]
+        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
         return True
 
     coordinator.request_id_to_rank[request_id] = next_identity
@@ -131,6 +150,69 @@ def handle_submit_request(coordinator, sender_identity, payload):
                 "num_hashes": len(request_hashes),
             }
         )
+
+
+@message_handler(Headers.SUBMIT_REQUEST_WITH_KV)
+def handle_submit_request_with_kv(coordinator, sender_identity, payload):
+    """Route a client-supplied KV handoff to a decode engine."""
+
+    if sender_identity not in coordinator.known_clients:
+        logging.info(
+            "Received SUBMIT_REQUEST_WITH_KV from unknown client %s; ignoring.", sender_identity
+        )
+        return
+    if len(payload) != 6:
+        logging.error(
+            "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload with %d fields", len(payload) - 1
+        )
+        return
+
+    client_request_id, prompt, sampling_params, kv_meta, src_block_ids = payload[1:]
+    request_id = coordinator.next_request_id
+    coordinator.next_request_id += 1
+    coordinator.request_id_to_client_id[request_id] = sender_identity
+    coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
+
+    if isinstance(prompt, torch.Tensor):
+        prompt = prompt.tolist()
+    elif not isinstance(prompt, (str, list)):
+        raise TypeError(f"unsupported prompt type {type(prompt).__name__}")
+    engine_payload = msgpack.packb(
+        [
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params,
+            kv_meta,
+            src_block_ids,
+        ],
+        use_bin_type=True,
+    )
+
+    for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
+        next_identity = coordinator.get_least_loaded_data_parallel_rank()
+        if coordinator._send_to_engine(next_identity, engine_payload):
+            break
+    else:
+        logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
+        del coordinator.request_id_to_client_id[request_id]
+        del coordinator.request_id_to_client_request_id[request_id]
+        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
+        return True
+
+    coordinator.request_id_to_rank[request_id] = next_identity
+    coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
+
+
+@message_handler(Headers.RELEASE_KV)
+def handle_release_kv(coordinator, sender_identity, payload):
+    """Broadcast release of prefill blocks retained for a completed handoff."""
+
+    if sender_identity not in coordinator.known_clients:
+        logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
+        return
+    coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, int(payload[1])])
 
 
 @message_handler(
@@ -183,16 +265,23 @@ def handle_cuda_profiler_signal(coordinator, sender_identity, payload):
 def handle_engine_reply(coordinator, sender_identity, payload):
     """Route completed requests from an engine back to their originating clients."""
     # This is the output of a single engine step on some data parallel rank.
-    assert sender_identity in coordinator.identities_of_data_parallel_ranks
+    if sender_identity not in coordinator.identities_of_data_parallel_ranks:
+        # A removed engine's final replies may still be queued up.
+        # Only exit with an assert if the sender was never connected to the coordinator.
+        assert (
+            sender_identity in coordinator.removed_engine_identities
+        ), f"ENGINE_REPLY from never-connected sender {sender_identity!r}"
+        logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
     finished_requests = payload[1]
 
     for finished_request in finished_requests:
         coordinator.detokenize(finished_request)
         fid = finished_request["request_id"]
         client_identity = coordinator.request_id_to_client_id[fid]
-        client_request_identity = coordinator.request_id_to_client_request_id[fid]
+        client_request_id = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
         del coordinator.request_id_to_client_request_id[fid]
+        del coordinator.client_request_to_request_id[(client_identity, client_request_id)]
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
         if assigned_rank is not None:
             idx = coordinator.identity_to_rank_index.get(assigned_rank)
@@ -204,10 +293,53 @@ def handle_engine_reply(coordinator, sender_identity, payload):
             [
                 client_identity,
                 msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, client_request_identity, finished_request],
+                    [Headers.ENGINE_REPLY.value, client_request_id, finished_request],
                     use_bin_type=True,
                 ),
             ]
+        )
+
+
+@message_handler(Headers.ENGINE_REPLY_PARTIAL)
+def handle_engine_reply_partial(coordinator, sender_identity, payload):
+    """Route incremental engine replies without releasing request routing state."""
+    if sender_identity not in coordinator.identities_of_data_parallel_ranks:
+        assert (
+            sender_identity in coordinator.removed_engine_identities
+        ), f"ENGINE_REPLY_PARTIAL from never-connected sender {sender_identity!r}"
+        logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
+        return
+    for partial in payload[1]:
+        request_id = partial["request_id"]
+        client_identity = coordinator.request_id_to_client_id[request_id]
+        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+        # Partial tokens are detokenized incrementally by the client-facing streaming layer.
+        coordinator.router_socket.send_multipart(
+            [
+                client_identity,
+                msgpack.packb(
+                    [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id, partial],
+                    use_bin_type=True,
+                ),
+            ]
+        )
+
+
+@message_handler(Headers.ABORT_REQUEST)
+def handle_abort_request(coordinator, sender_identity, payload):
+    """Forward a client cancellation to the engine serving that request."""
+    if sender_identity not in coordinator.known_clients:
+        logging.warning("Coordinator: ignoring abort from unknown client.")
+        return
+    client_request_id = int(payload[1])
+    request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
+    if request_id is None:
+        return
+    assigned_rank = coordinator.request_id_to_rank.get(request_id)
+    if assigned_rank is not None:
+        coordinator._send_to_engine(
+            assigned_rank,
+            msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True),
         )
 
 

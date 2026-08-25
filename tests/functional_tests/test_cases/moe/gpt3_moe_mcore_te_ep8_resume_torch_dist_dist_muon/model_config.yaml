@@ -68,3 +68,4 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --no-use-layer-wise-param-layout: true
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher
