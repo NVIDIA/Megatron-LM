@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import json
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -8,6 +9,8 @@ import torch
 from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text import MegatronTokenizerText
+from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
@@ -20,6 +23,10 @@ except Exception:
     HuggingFaceTokenizer = None
 
 from megatron.training.config.training_config import TokenizerConfig
+
+
+class CustomTokenizerClass(MegatronTokenizerText):
+    pass
 
 
 def get_conversation():
@@ -68,7 +75,7 @@ def test_sp_tokenizer():
     )
 
     # Load SP tokenizer with custom metadata
-    metadata = {"library": "sentencepiece", "model_type": "gpt"}
+    metadata = {"library": "sentencepiece"}
 
     chat_template = get_chat_template()
     tokenizer = MegatronTokenizer.from_pretrained(
@@ -195,7 +202,7 @@ def test_megatron_tokenizer():
     special_tokens = {}
     special_tokens['additional_special_tokens'] = [f'<extra_id_{i}>' for i in range(100)]
 
-    metadata = {"library": "megatron", "model_type": "gpt"}
+    metadata = {"library": "megatron"}
     vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
     merges_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
     tokenizer = MegatronTokenizer.from_pretrained(
@@ -223,7 +230,6 @@ def test_megatron_tokenizer():
     assert tokenizer.vocab_size == 50357
     assert tokenizer.eos_id == 50256
     assert tokenizer.eod == 50256
-    assert tokenizer.model_type == "gpt"
 
     assert tokenizer.vocab_file == vocab_file
     assert tokenizer.merges_file == merges_file
@@ -335,8 +341,11 @@ def test_bytelevel_tokenizer():
     assert tokenizer.detokenize([72, 101, 108, 108, 111]) == "Hello"
 
 
-def test_write_metadata():
-    tokenizer_path = "/opt/data/tokenizers/huggingface"
+def test_write_metadata_hf(tmp_path):
+    tokenizer_dir = tmp_path / "huggingface"
+    tokenizer_dir.mkdir()
+    tokenizer_path = str(tokenizer_dir)
+    metadata_path = f"{tokenizer_path}/tokenizer_metadata.json"
     chat_template = "test chat template"
     tokenizer_library = "huggingface"
     MegatronTokenizer.write_metadata(
@@ -346,15 +355,16 @@ def test_write_metadata():
         overwrite=True,
     )
 
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    assert metadata['chat_template'] == chat_template
+    assert metadata['library'] == tokenizer_library
+
     # When metadata already exists
     with pytest.raises(ValueError):
         MegatronTokenizer.write_metadata(
             tokenizer_path=tokenizer_path, tokenizer_library=tokenizer_library
         )
-
-    # Overwrite metadata
-    class CustomTokenizerClass:
-        pass
 
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
@@ -363,15 +373,75 @@ def test_write_metadata():
         overwrite=True,
     )
 
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    assert metadata['class_name'] == "CustomTokenizerClass"
+
     # Save metadata to specific path
-    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
         tokenizer_library=tokenizer_library,
-        model_type="gpt",
         overwrite=True,
     )
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    assert metadata['class_name'] == "MegatronTokenizerText"
+
+
+def test_write_metadata_sp(tmp_path):
+    path = "/opt/data/tokenizers/sentencepiece"
+    tokenizer_path = f"{path}/tokenizer.model"
+    metadata_path = str(tmp_path / "test_metadata.json")
+    tokenizer_library = "sentencepiece"
+    MegatronTokenizer.write_metadata(
+        tokenizer_path=tokenizer_path,
+        metadata_path=metadata_path,
+        tokenizer_library=tokenizer_library,
+        overwrite=True,
+    )
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+
+    assert metadata['class_name'] == "MegatronTokenizerText"
+
+
+def test_write_metadata_vision(tmp_path):
+    tokenizer_path = "/opt/data/tokenizers/multimodal"
+    metadata_path = str(tmp_path / "test_metadata.json")
+    MegatronTokenizer.write_metadata(
+        tokenizer_path=tokenizer_path,
+        metadata_path=metadata_path,
+        tokenizer_library="multimodal",
+        overwrite=True,
+    )
+    with open(metadata_path, "r") as f:
+        assert json.load(f)["class_name"] == "MegatronTokenizerVision"
+
+
+def test_own_metadata_class(tmp_path):
+    tokenizer_path = "/opt/data/tokenizers/huggingface"
+    chat_template = "test chat template"
+    tokenizer_library = "huggingface"
+
+    metadata_path = str(tmp_path / "test_metadata.json")
+    MegatronTokenizer.write_metadata(
+        tokenizer_path=tokenizer_path,
+        metadata_path=metadata_path,
+        tokenizer_library=tokenizer_library,
+        tokenizer_class=CustomTokenizerClass,
+        overwrite=True,
+    )
+
+    # Load tokenizer with custom class
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path=tokenizer_path, metadata_path=metadata_path
+    )
+
+    assert isinstance(tokenizer, CustomTokenizerClass)
 
 
 def test_multimodal_tokenizer():
@@ -533,6 +603,53 @@ class TestBuildTokenizer:
         assert tokenizer.chat_template == chat_template
         assert tokenizer._tokenizer.include_special_tokens == True
 
+    def test_build_hf_tokenizer_fast(self):
+        tokenizer_model = "/opt/data/tokenizers/huggingface"
+        tokenizer_type = "HuggingFaceTokenizer"
+        chat_template = get_chat_template()
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            pad_vocab_size=False,
+            chat_template=chat_template,
+            use_gigatoken=True,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "huggingface"
+        assert tokenizer.chat_template == chat_template
+        assert tokenizer._tokenizer.include_special_tokens == True
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            pad_vocab_size=False,
+            chat_template=chat_template,
+            use_gigatoken=False,
+        )
+
+        tokenizer_default = build_tokenizer(config)
+
+        # Verify gigatoken matches with default implementation
+        text = "Hi how are you? How was your day? :)"
+        ids = [128000, 13347, 1268, 527, 499, 30, 2650, 574, 701, 1938, 30, 27046]
+        assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
+        assert (
+            tokenizer.detokenize(ids)
+            == tokenizer_default.detokenize(ids)
+            == f"<|begin_of_text|>{text}"
+        )
+        assert (
+            tokenizer.additional_special_tokens_ids
+            == tokenizer_default.additional_special_tokens_ids
+        )
+        assert tokenizer.eod == tokenizer_default.eod
+        assert tokenizer.sep_id == tokenizer_default.sep_id
+        assert tokenizer.vocab_size == tokenizer_default.vocab_size
+        assert tokenizer.vocab == tokenizer_default.vocab
+
     def test_build_megatron_tokenizer(self):
         special_tokens = [f'<extra_id_{i}>' for i in range(100)]
         vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
@@ -551,14 +668,54 @@ class TestBuildTokenizer:
         assert tokenizer.library == "megatron"
         assert tokenizer.chat_template == None
 
+    def test_build_megatron_tokenizer_fast(self):
+        special_tokens = [f'<extra_id_{i}>' for i in range(100)]
+        vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
+        merges_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
+
+        config = TokenizerConfig(
+            tokenizer_type="GPT2BPETokenizer",
+            vocab_file=vocab_file,
+            merge_file=merges_file,
+            special_tokens=special_tokens,
+            pad_vocab_size=False,
+            use_gigatoken=True,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "megatron"
+        assert tokenizer.chat_template == None
+
+        config = TokenizerConfig(
+            tokenizer_type="GPT2BPETokenizer",
+            vocab_file=vocab_file,
+            merge_file=merges_file,
+            special_tokens=special_tokens,
+            pad_vocab_size=False,
+            use_gigatoken=False,
+        )
+
+        tokenizer_default = build_tokenizer(config)
+
+        # Verify gigatoken matches with default implemetation
+        text = "Hi how are you? How was your day? :)"
+        ids = [17250, 703, 389, 345, 30, 1374, 373, 534, 1110, 30, 14373]
+        assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
+        assert tokenizer.detokenize(ids) == tokenizer_default.detokenize(ids) == f"{text}"
+        assert (
+            tokenizer.additional_special_tokens_ids
+            == tokenizer_default.additional_special_tokens_ids
+        )
+        assert tokenizer.eod == tokenizer_default.eod
+        assert tokenizer.sep_id == tokenizer_default.sep_id
+        assert tokenizer.vocab_size == tokenizer_default.vocab_size
+        assert tokenizer.vocab == tokenizer_default.vocab
+
     def test_build_sp_tokenizer(self):
         tokenizer_model = "/opt/data/tokenizers/sentencepiece/tokenizer.model"
         chat_template = get_chat_template()
-        metadata_path = {
-            "library": "sentencepiece",
-            "model_type": "gpt",
-            "chat_template": chat_template,
-        }
+        metadata_path = {"library": "sentencepiece", "chat_template": chat_template}
 
         config = TokenizerConfig(
             tokenizer_type="SentencePieceTokenizer",
@@ -694,3 +851,30 @@ class TestExtractTokenIds:
     # --- 2D raw ndarray (1, seq_len) — the bug fixed in this PR ---
     def test_2d_ndarray_batch1(self):
         self._check(np.array([_IDS]))  # shape (1, 5)
+
+
+class TestAbstractTokenizerSpecialIdAliases:
+    """Regression tests for the special-id property aliases on
+    ``MegatronTokenizerTextAbstract`` (cls_id / sep_id / pad_id / bos_id / eos_id / mask_id).
+
+    Each alias previously checked ``hasattr(self, '<name>_id')`` and returned
+    ``self.<name>_id`` — i.e. it re-entered itself — so accessing an alias that a
+    subclass did not override raised ``RecursionError`` instead of returning the
+    backing short-name attribute (``self.cls`` ...) or a clean ``AttributeError``.
+    ``ByteLevelTokenizer`` overrides pad_id/bos_id/eos_id but not cls_id/sep_id/mask_id,
+    so those reach the base implementation and exercise the shared fix.
+    """
+
+    def test_unoverridden_alias_raises_attributeerror_not_recursion(self):
+        tok = ByteLevelTokenizer(vocab_size=512)
+        # No backing short-name attribute -> a clean AttributeError, not RecursionError.
+        for name in ("cls_id", "sep_id", "mask_id"):
+            with pytest.raises(AttributeError):
+                getattr(tok, name)
+
+    def test_alias_returns_backing_short_name_attribute(self):
+        tok = ByteLevelTokenizer(vocab_size=512)
+        tok.cls, tok.sep, tok.mask = 5, 6, 7
+        assert tok.cls_id == 5
+        assert tok.sep_id == 6
+        assert tok.mask_id == 7

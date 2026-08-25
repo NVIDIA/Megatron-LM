@@ -11,6 +11,7 @@ from megatron.core.models.bert.bert_layer_specs import (
     get_bert_layer_with_transformer_engine_spec,
     get_bert_layer_with_transformer_engine_submodules,
 )
+from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
@@ -91,6 +92,97 @@ class TestBertModel:
         assert logits[0].shape[0] == micro_batch_size
         assert logits[0].shape[1] == sequence_length
         assert logits[0].shape[2] == self.bert_model.vocab_size
+
+    @pytest.mark.internal
+    def test_apply_lm_head_default_creates_bert_lm_head(self):
+        assert isinstance(self.bert_model.lm_head, BertLMHead)
+
+    @pytest.mark.internal
+    def test_output_layer_bias_false_disables_bias(self):
+        bert_model = BertModel(
+            config=self.bert_model.config,
+            num_tokentypes=0,
+            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=self.bert_model.max_sequence_length,
+            apply_lm_head=False,
+            output_layer_bias=False,
+        )
+
+        assert bert_model.output_layer.bias is None
+
+    @pytest.mark.internal
+    def test_apply_lm_head_false_bypasses_head(self):
+        config: TransformerConfig = self.bert_model.config
+        sequence_length = self.bert_model.max_sequence_length
+        micro_batch_size = 2
+
+        bert_model = BertModel(
+            config=config,
+            num_tokentypes=0,
+            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=sequence_length,
+            apply_lm_head=False,
+        )
+        assert bert_model.lm_head is None
+        bert_model.cuda()
+
+        encoder_output = {}
+        bert_model.encoder.register_forward_hook(
+            lambda module, args, output: encoder_output.setdefault('hidden_states', output)
+        )
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).cuda()
+
+        logits = bert_model.forward(input_ids=input_ids, attention_mask=attention_mask)
+
+        assert logits[0].shape[0] == micro_batch_size
+        assert logits[0].shape[1] == sequence_length
+        assert logits[0].shape[2] == bert_model.vocab_size
+
+        # With apply_lm_head=False, the output_layer must be applied directly to the
+        # encoder's hidden states, without BertLMHead's dense+GeLU+LayerNorm transform.
+        expected_logits, _ = bert_model.output_layer(encoder_output['hidden_states'])
+        torch.testing.assert_close(logits[0], expected_logits.transpose(0, 1).contiguous())
+
+    @pytest.mark.internal
+    def test_qk_layernorm_submodules_are_none(self):
+        # The TE BERT spec leaves q_layernorm/k_layernorm unset (None) instead of hardcoding
+        # IdentityOp, so that TransformerConfig.qk_layernorm can select the default TENorm
+        # through the shared SelfAttention fallback (`submodules.q_layernorm or TENorm`).
+        spec = get_bert_layer_with_transformer_engine_spec()
+        assert spec.submodules.self_attention.submodules.q_layernorm is None
+        assert spec.submodules.self_attention.submodules.k_layernorm is None
+
+    @pytest.mark.internal
+    def test_qk_layernorm_from_config_fallback(self):
+        # With config.qk_layernorm=True and the spec's q_layernorm/k_layernorm left unset,
+        # SelfAttention should fall back to instantiating a real TE LayerNorm for Q and K.
+        te_pytorch = pytest.importorskip("transformer_engine.pytorch")
+
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            perform_initialization=True,
+            qk_layernorm=True,
+            pipeline_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.unfused,
+        )
+        bert_model = BertModel(
+            config=transformer_config,
+            num_tokentypes=0,
+            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+        )
+        attention = bert_model.encoder.layers[0].self_attention
+        assert isinstance(attention.q_layernorm, te_pytorch.LayerNorm)
+        assert isinstance(attention.k_layernorm, te_pytorch.LayerNorm)
 
 
 class TestBertModelAttentionDimensions:

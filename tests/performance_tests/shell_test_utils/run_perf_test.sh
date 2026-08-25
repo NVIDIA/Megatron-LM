@@ -88,6 +88,12 @@ NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
 # hybrid models should use 'gsm8k' — synthetic input gives misleading
 # perf because every token is identical (uniform expert routing, hot KV).
 DATASET=$("$YQ" '.DATASET // "synthetic"' "$CONFIG_PATH")
+# Async prefill scheduling for dynamic batching. When true, the server is
+# launched with --inference-dynamic-batching-async-sched-mode async (overlaps
+# the prefill scheduler with GPU compute). Requires greedy sampling / no
+# logprobs / no stop words — the static benchmark client already satisfies
+# these (temperature 0.0, ignore_eos, no stop tokens, no logprobs requested).
+ASYNC_SCHED=$("$YQ" '.ASYNC_SCHED // false' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
 # For MoE configs, expert-parallelism is orthogonal to DP and reshapes the
@@ -95,6 +101,9 @@ mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 # and MoE-with-DP=1 picks up EP correctly.
 GROUP_SIZE=$((DP > EP ? DP : EP))
 WORLD_SIZE=$((TP * PP * GROUP_SIZE))
+# The inference coordinator uses the dense-model DP group. EP-only configs
+# therefore expose GROUP_SIZE workers even when the YAML DP value is one.
+COORDINATOR_WORKERS=$GROUP_SIZE
 ARGS_FILE="$PERF_DIR/server/model_args/${MODEL}.args"
 if [[ ! -f "$ARGS_FILE" ]]; then
     echo "[run_perf_test] error: model args file $ARGS_FILE not found" >&2
@@ -102,6 +111,7 @@ if [[ ! -f "$ARGS_FILE" ]]; then
 fi
 
 echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WORLD_SIZE  dataset=$DATASET"
+echo "[run_perf_test] coordinator workers: $COORDINATOR_WORKERS"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
 
@@ -171,7 +181,7 @@ fi
 # ── Launch the inference server in the background ─────────────────────────────
 
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 SERVER_PORT=${SERVER_PORT:-5000}
 SERVER_LOG="$SERVER_LOG_DIR/server.log"
 
@@ -189,6 +199,20 @@ SERVER_COMMON_ARGS=(
     --port "$SERVER_PORT"
     --host 0.0.0.0
 )
+
+# Enable async prefill scheduling when the test case opts in. Async scheduling
+# requires materialize_only_last_token_logits=True. run_dynamic_text_generation_server
+# force-sets return_log_probs=True (for echo/loglikelihood support), which would
+# flip materialize_only_last_token_logits to False; passing --skip-prompt-log-probs
+# keeps it True (materialize = not(return_log_probs and not skip_prompt_log_probs)).
+# The perf client never requests prompt logprobs, so this is a no-op for the metrics.
+if [[ "$ASYNC_SCHED" == "true" ]]; then
+    echo "[run_perf_test] async scheduling enabled (--inference-dynamic-batching-async-sched-mode async --skip-prompt-log-probs)"
+    SERVER_COMMON_ARGS+=(
+        --inference-dynamic-batching-async-sched-mode async
+        --skip-prompt-log-probs
+    )
+fi
 
 (
     cd "$ROOT_DIR"
@@ -257,6 +281,7 @@ for BS in "${BATCH_SIZES[@]}"; do
         --num-input-tokens "$NUM_INPUT_TOKENS" \
         --num-output-tokens "$NUM_OUTPUT_TOKENS" \
         --num-warmup-iters "$NUM_WARMUP_ITERS" \
+        --data-parallel-size "$COORDINATOR_WORKERS" \
         --num-iters "$NUM_TIMED_ITERS" \
         --output-json "$RESULTS_JSON" \
         2>&1 | tee -a "$RESULTS_ROOT/benchmark.log"

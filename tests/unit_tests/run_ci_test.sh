@@ -130,7 +130,7 @@ done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
@@ -145,9 +145,6 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
-# Reduce memory usage by NCCL
-export NCCL_MAX_NCHANNELS=1
-export NCCL_NVLS_ENABLE=0
 export ONE_LOGGER_JOB_CATEGORY=test
 
 # Run a pytest command. On marker-driven platforms a bucket can legitimately

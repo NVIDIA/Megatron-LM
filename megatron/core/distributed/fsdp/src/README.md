@@ -208,4 +208,4 @@ with transformer_engine.pytorch.autocast(recipe=fp8_recipe):
     mfsdp_model(x).sum().backward()
 ```
 
-ℹ️ `TransformerEngine` kernels have various constraints related to quantized Tensors, such as using fused QKV parameters or defining activations and parameters with shapes compatible to CuBLAS kernels on supported hardware from NVIDIA. To properly initialize `TransformerLayer`, you can refer to the example model used in our unit tests: `Megatron-LM/tests/unit_tests/distributed/fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_te_quantized`.
+ℹ️ `TransformerEngine` kernels have various constraints related to quantized Tensors, such as using fused QKV parameters or defining activations and parameters with shapes compatible to CuBLAS kernels on supported hardware from NVIDIA. To properly initialize `TransformerLayer`, you can refer to the example model used in our unit tests: `Megatron-LM/tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_te_quantized`.

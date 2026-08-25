@@ -2,12 +2,15 @@
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+import pretrain_hybrid
 from megatron.core import mpu
+from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
@@ -683,6 +686,122 @@ def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
         assert torch.equal(result['max_seqlen'], max_seqlen)
 
 
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [16, 1024])
+def test_get_batch_on_this_cp_rank_contiguous_keeps_attention_mask_zigzag(cp_size, seq_length):
+    micro_batch_size = 2
+    tokens = torch.arange(micro_batch_size * seq_length, dtype=torch.int64).view(
+        micro_batch_size, seq_length
+    )
+    sequence_tensors = {
+        'tokens': tokens,
+        'labels': tokens + 1,
+        'loss_mask': torch.ones(micro_batch_size, seq_length),
+        'position_ids': torch.arange(seq_length, dtype=torch.int64).repeat(micro_batch_size, 1),
+    }
+    attention_mask = torch.arange(micro_batch_size * seq_length, dtype=torch.int64).view(
+        micro_batch_size, 1, seq_length, 1
+    )
+    cu_seqlens = torch.tensor([[0, seq_length // 2, seq_length]], dtype=torch.int32)
+    dataset_id = torch.tensor(7, dtype=torch.int64)
+
+    for cp_rank in range(cp_size):
+        batch = {
+            **{key: value.clone() for key, value in sequence_tensors.items()},
+            'attention_mask': attention_mask.clone(),
+            'cu_seqlens': cu_seqlens,
+            'dataset_id': dataset_id,
+        }
+        mock_group = MagicMock()
+        with (
+            patch('torch.distributed.get_world_size', return_value=cp_size),
+            patch('torch.distributed.get_rank', return_value=cp_rank),
+        ):
+            result = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=mock_group)
+
+        local_sequence_length = seq_length // cp_size
+        local_slice = slice(cp_rank * local_sequence_length, (cp_rank + 1) * local_sequence_length)
+        for key, value in sequence_tensors.items():
+            assert torch.equal(result[key], value[:, local_slice])
+            assert result[key].is_contiguous()
+
+        if cp_size == 1:
+            expected_mask = attention_mask
+        else:
+            segment_length = seq_length // (2 * cp_size)
+            expected_mask = torch.cat(
+                [
+                    attention_mask[:, :, cp_rank * segment_length : (cp_rank + 1) * segment_length],
+                    attention_mask[
+                        :,
+                        :,
+                        (2 * cp_size - cp_rank - 1)
+                        * segment_length : (2 * cp_size - cp_rank)
+                        * segment_length,
+                    ],
+                ],
+                dim=2,
+            )
+        assert torch.equal(result['attention_mask'], expected_mask)
+        assert result['cu_seqlens'] is cu_seqlens
+        assert result['dataset_id'] is dataset_id
+
+
+@pytest.mark.parametrize(
+    ("linear_cp_layout", "cp_size", "use_actual_lengths"),
+    [("zigzag", 2, False), ("contiguous", 1, False), ("contiguous", 2, True)],
+)
+def test_forward_step_exposes_actual_thd_lengths_for_contiguous_cp(
+    monkeypatch, linear_cp_layout, cp_size, use_actual_lengths
+):
+    actual_cu_seqlens = torch.tensor([[0, 3, 5]], dtype=torch.int32)
+    padded_cu_seqlens = torch.tensor([[0, 4, 8]], dtype=torch.int32)
+    max_seqlen = torch.tensor([4], dtype=torch.int32)
+    captured_kwargs = {}
+
+    monkeypatch.setattr(
+        pretrain_hybrid,
+        "args",
+        SimpleNamespace(
+            context_parallel_size=cp_size, linear_cp_layout=linear_cp_layout, seq_length=8
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(pretrain_hybrid, "stimer", MagicMock())
+    monkeypatch.setattr(pretrain_hybrid, "get_attr_wrapped_model", lambda *_args: None)
+    monkeypatch.setattr(pretrain_hybrid, "update_seqlen_stats_from_cu_seqlens", lambda *_: None)
+    monkeypatch.setattr(
+        pretrain_hybrid,
+        "get_batch",
+        lambda *_args: (
+            None,
+            actual_cu_seqlens,
+            padded_cu_seqlens,
+            None,
+            torch.zeros(1, 8),
+            None,
+            torch.ones(1, 8),
+            max_seqlen,
+            torch.arange(8).unsqueeze(0),
+            torch.zeros(1, 8),
+        ),
+    )
+
+    def model(*_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return torch.tensor(0.0)
+
+    pretrain_hybrid.forward_step(None, model)
+
+    packed_seq_params = captured_kwargs["packed_seq_params"]
+    expected_cu_seqlens = actual_cu_seqlens[0] if use_actual_lengths else padded_cu_seqlens[0]
+    assert torch.equal(packed_seq_params.cu_seqlens_q, expected_cu_seqlens)
+    assert torch.equal(packed_seq_params.cu_seqlens_kv, expected_cu_seqlens)
+    assert torch.equal(packed_seq_params.cu_seqlens_q_padded, padded_cu_seqlens[0])
+    assert packed_seq_params.total_tokens == 8
+
+
 def create_pretrain_data_iterator(
     seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False
 ):
@@ -1063,5 +1182,122 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     else:
         assert cu_seqlens_padded is None
         assert hybrid_cp_group is None
+
+    Utils.destroy_model_parallel()
+
+
+def create_inter_document_masking_data_iterator(seq_length: int = 1024, micro_batch_size: int = 2):
+    """Create a mock data iterator for inter-document masking with mbs > 1.
+
+    Mimics what default_collate produces from GPTDataset with
+    inter_document_masking=True: each sample has its own padded cu_seqlens
+    row, collated into (micro_batch_size, padded_len).
+    """
+    padded_len = seq_length + 1
+    cu_seqlens = torch.full((micro_batch_size, padded_len), seq_length, dtype=torch.int32)
+    max_seqlens = []
+
+    for i in range(micro_batch_size):
+        n_docs = torch.randint(2, 6, (1,)).item()
+        boundaries = sorted(torch.randint(1, seq_length, (n_docs - 1,)).tolist())
+        boundaries = [0] + boundaries + [seq_length]
+        for j, val in enumerate(boundaries):
+            cu_seqlens[i, j] = val
+        seg_lengths = [boundaries[k + 1] - boundaries[k] for k in range(len(boundaries) - 1)]
+        max_seqlens.append(max(seg_lengths))
+
+    max_seqlen = torch.tensor(max_seqlens, dtype=torch.int32)
+
+    tokens = torch.randint(0, 10000, (micro_batch_size, seq_length), dtype=torch.int64)
+    labels = torch.randint(0, 10000, (micro_batch_size, seq_length), dtype=torch.int64)
+    loss_mask = torch.ones(micro_batch_size, seq_length, dtype=torch.float32)
+    position_ids = (
+        torch.arange(seq_length, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(micro_batch_size, -1)
+        .clone()
+    )
+
+    batch = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+    }
+    return iter([batch])
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [1024])
+def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_length):
+    """Verify cu_seqlens is correctly broadcast and merged when mbs > 1 with TP > 1.
+
+    Regression test: the receiver in get_batch_on_this_tp_rank used to allocate
+    cu_seqlens as (1, numel) instead of (mbs, padded_len), which caused
+    flatten_batch_for_packed_sequences to silently drop all samples after the
+    first on non-zero TP ranks.
+    """
+    if tp_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because tp_size > torch.cuda.device_count() "
+            f"({tp_size} > {torch.cuda.device_count()})"
+        )
+
+    dp_size = int(os.environ.get("WORLD_SIZE", 1)) // tp_size
+    global_batch_size = micro_batch_size * dp_size
+    args = initialize_test_environment(
+        tp_size,
+        pp_size=1,
+        cp_size=1,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        global_batch_size=global_batch_size,
+        sft=False,
+    )
+    args.dataloader_inter_document_masking = True
+
+    data_iterator = None
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_iterator = create_inter_document_masking_data_iterator(
+            seq_length, micro_batch_size=micro_batch_size
+        )
+
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        tokens,
+    ) = get_batch(data_iterator)
+
+    total_tokens = micro_batch_size * seq_length
+
+    assert tokens is not None
+    assert tokens.shape == (1, total_tokens)
+    assert labels is not None
+    assert labels.shape == (1, total_tokens)
+    assert loss_mask is not None
+    assert loss_mask.shape == (1, total_tokens)
+    assert position_ids is not None
+    assert position_ids.shape == (1, total_tokens)
+
+    assert cu_seqlens is not None
+    assert cu_seqlens.dim() == 2
+    assert cu_seqlens.shape[0] == 1
+    assert cu_seqlens.dtype == torch.int32
+    assert cu_seqlens[0, 0].item() == 0
+    assert cu_seqlens[0, -1].item() == total_tokens
+    assert cu_seqlens.shape[1] >= micro_batch_size + 1
+
+    assert max_seqlen is not None
+    assert max_seqlen.numel() == 1
 
     Utils.destroy_model_parallel()

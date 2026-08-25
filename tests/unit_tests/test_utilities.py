@@ -43,7 +43,11 @@ def clear_nvte_env_vars():
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    rank = int(os.environ.get('LOCAL_RANK', '0'))
+    # Global rank, which LOCAL_RANK only matches when the launch is confined to one
+    # node. Reading LOCAL_RANK here makes every node claim ranks 0..local_size-1 of
+    # the rendezvous, so multi-node runs hang on duplicate check-ins.
+    rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
     store = None
 
@@ -59,10 +63,10 @@ class Utils:
                 f'Initializing torch.distributed with rank: {Utils.rank}, '
                 f'world_size: {Utils.world_size}'
             )
-            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+            torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
             init_method = 'tcp://'
             master_ip = os.getenv('MASTER_ADDR', 'localhost')
-            master_port = os.getenv('MASTER_PORT', '6000')
+            master_port = os.getenv('MASTER_PORT', '29500')
             init_method += master_ip + ':' + master_port
             rendezvous_iterator = rendezvous(
                 init_method, Utils.rank, Utils.world_size, timeout=timedelta(minutes=1)
@@ -92,7 +96,7 @@ class Utils:
             torch.distributed.destroy_process_group()
 
         if rank is None:
-            Utils.rank = int(os.environ['LOCAL_RANK'])
+            Utils.rank = int(os.environ.get('RANK', os.environ['LOCAL_RANK']))
             if Utils.rank >= Utils.world_size:
                 Utils.rank = -1
         else:
