@@ -65,14 +65,12 @@ logger = logging.getLogger(__name__)
 
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
     """Materialize and initialize one module's direct meta parameters."""
-    if not any(parameter.is_meta for parameter in module.parameters(recurse=False)):
-        return
-
-    materialization_device = device or torch.device("cuda", torch.cuda.current_device())
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
 
     def materialize_tensor(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.is_meta:
-            return torch.empty_like(tensor, device=materialization_device)
+            return torch.empty_like(tensor, device=device)
         return tensor
 
     reset_parameters = getattr(module, "reset_parameters", None)
