@@ -617,7 +617,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -874,7 +874,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output, context
 
     def _forward_pre_mlp_layernorm(
-        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
+        self, hidden_states: Tensor, mhc_recompute_manager: Optional['MHCCheckpointManager'] = None
     ):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
@@ -940,7 +940,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         padding_mask: Tensor | None = None,
         input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm + MLP/MoE and return the raw output before BDA."""
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(

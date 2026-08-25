@@ -74,6 +74,30 @@ def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) 
     return moe_layer_numbers[n_hash_layers - 1]
 
 
+def _validate_hash_moe_pipeline_placement(
+    main_pattern: str | None,
+    n_hash_layers: int,
+    pipeline_model_parallel_size: int,
+) -> None:
+    """Require all hybrid hash-MoE layers to share the embedding pipeline stage."""
+    if n_hash_layers <= 0 or pipeline_model_parallel_size <= 1:
+        return
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    assert main_pattern is not None and Symbols.PIPE in main_pattern, (
+        "hybrid_layer_pattern must contain pipe ('|') separators when using hash MoE layers "
+        "with pipeline parallelism (PP > 1)."
+    )
+    embedding_stage_pattern = main_pattern.split(Symbols.PIPE, 1)[0]
+    n_moe_layers_with_embedding = embedding_stage_pattern.count(Symbols.MOE)
+    assert n_hash_layers <= n_moe_layers_with_embedding, (
+        "Currently, all hash MoE layers must be in the same virtual pipeline stage as the "
+        f"embedding. The embedding stage has {n_moe_layers_with_embedding} MoE layers, but "
+        f"moe_n_hash_layers={n_hash_layers}."
+    )
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -222,6 +246,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
+        configured_n_hash_layers = self.config.moe_n_hash_layers
+        hash_layer_threshold = _get_hash_moe_layer_threshold(
+            parsed.main_pattern, configured_n_hash_layers
+        )
+        _validate_hash_moe_pipeline_placement(
+            parsed.main_pattern,
+            configured_n_hash_layers,
+            self.config.pipeline_model_parallel_size,
+        )
+
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
         layer_type_list, layer_offset = select_pipeline_segment(
@@ -294,10 +328,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-        configured_n_hash_layers = self.config.moe_n_hash_layers
-        hash_layer_threshold = _get_hash_moe_layer_threshold(
-            parsed.main_pattern, configured_n_hash_layers
-        )
         # TopKRouter allocates all hash-specific state during construction. Temporarily expose
         # the global Hybrid layer threshold, then restore the user-facing MoE count.
         self.config.moe_n_hash_layers = hash_layer_threshold

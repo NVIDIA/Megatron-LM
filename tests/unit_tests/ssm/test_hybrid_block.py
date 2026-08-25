@@ -341,6 +341,49 @@ class TestHybridBlock:
         assert [router.is_hash_layer for router in routers] == [True, True, True, False]
         assert model.config.moe_n_hash_layers == 3
 
+    @pytest.mark.parametrize(
+        ("layer_pattern", "error_match"),
+        [
+            (
+                Symbols.MAMBA + Symbols.PIPE + Symbols.MOE,
+                "same virtual pipeline stage as the embedding",
+            ),
+            (
+                Symbols.MAMBA + Symbols.MOE,
+                "must contain pipe",
+            ),
+        ],
+    )
+    def test_hash_moe_pipeline_placement_validation(self, layer_pattern, error_match):
+        """Hash MoE layers must remain on the embedding stage under pipeline parallelism."""
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_pattern.replace(Symbols.PIPE, '')),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+            is_hybrid_model=True,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=64,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.0,
+            moe_router_dtype="fp32",
+            moe_n_hash_layers=1,
+            actual_vocab_size=128,
+            add_bias_linear=False,
+        )
+
+        with pytest.raises(AssertionError, match=error_match):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern=layer_pattern,
+            )
+
     def test_layer_types(self):
         """
         Make sure that the layer types specified with layer_pattern

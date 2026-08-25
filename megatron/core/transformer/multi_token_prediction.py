@@ -2492,6 +2492,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
+            # This is the standard non-EP-overlap checkpoint path. Hybrid MTP with
+            # overlap_moe_expert_parallel_comm is not currently supported because the
+            # overlap scheduler does not expand the nested HybridStack.
             # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
             # Hybrid MTP instead owns a nested HybridStack, which consumes the global
             # recompute_num_layers setting to chunk its layer pattern. The outer MTP layer
