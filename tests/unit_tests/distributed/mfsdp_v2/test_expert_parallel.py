@@ -267,6 +267,5 @@ def test_ep_fsdp_matches_fullbatch_reference(
     )
 
     # Destroy the groups this test created; leave the default (world) group for later tests.
-    dist.barrier()
     for group in (one, ep_group, expert_dp_group):
         dist.destroy_process_group(group)

@@ -104,7 +104,7 @@ class DistributedDataParallelConfig:
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
 
-    expert_data_parallel_sharding_strategy: Optional[str] = None
+    expert_data_parallel_sharding_strategy: str | None = None
     """Optional expert-parameter sharding strategy for MFSDP v2. When unset, experts use
       ``data_parallel_sharding_strategy``."""
 

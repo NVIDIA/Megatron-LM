@@ -14,7 +14,7 @@
 
 import logging
 import random
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
 
@@ -31,6 +31,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor.placement_types import Placement
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -63,17 +64,29 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+class _AxisPlacements(NamedTuple):
+    """How one mesh axis places each of MFSDP's three buffers."""
+
+    parameter: Placement
+    gradient: Placement
+    optimizer: Placement
+
+
+_DATA_PARALLEL_PLACEMENTS = {
+    "no_shard": _AxisPlacements(Replicate(), Partial("avg"), Replicate()),  # DDP
+    "optim": _AxisPlacements(Replicate(), Partial("avg"), Shard(0)),  # ZeRO-1
+    "optim_grads": _AxisPlacements(Replicate(), Shard(0), Shard(0)),  # ZeRO-2
+    "optim_grads_params": _AxisPlacements(Shard(0), Shard(0), Shard(0)),  # ZeRO-3
+}
+
+
 def _placements_from_sharding_strategy(strategy: str) -> Placements:
     """Translate an MFSDP sharding strategy into parameter, gradient, and optimizer placements."""
-    if strategy == "no_shard":
-        return Placements([0], [Replicate()], [Partial("avg")], [Replicate()])
-    if strategy == "optim":
-        return Placements([0], [Replicate()], [Partial("avg")], [Shard(0)])
-    if strategy == "optim_grads":
-        return Placements([0], [Replicate()], [Shard(0)], [Shard(0)])
-    if strategy == "optim_grads_params":
-        return Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
-    raise ValueError(f"Unsupported MFSDP sharding strategy: {strategy}")
+    try:
+        placements = _DATA_PARALLEL_PLACEMENTS[strategy]
+    except KeyError as error:
+        raise ValueError(f"Unsupported MFSDP sharding strategy: {strategy}") from error
+    return Placements([0], [placements.parameter], [placements.gradient], [placements.optimizer])
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
