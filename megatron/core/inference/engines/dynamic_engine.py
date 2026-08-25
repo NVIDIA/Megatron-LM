@@ -1800,11 +1800,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 if request_id in finished_request_ids:
                     # Reconstruct routing from per-block storage before popping.
-                    if (
-                        finished_routing_block_ids
-                        and request_id in finished_routing_block_ids
-                        and len(self.requests[request_id].record.requests) == 1
-                    ):
+                    if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
                         request.routing_indices = (
