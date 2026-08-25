@@ -53,6 +53,7 @@ def _pg_collection(**sizes):
     return SimpleNamespace(
         tp=_ProcessGroup(sizes.get("tp", 1)),
         cp=_ProcessGroup(sizes.get("cp", 1)),
+        dp=_ProcessGroup(sizes.get("dp", 1)),
         expt_tp=_ProcessGroup(sizes.get("expert_tp", 1)),
         pp=_ProcessGroup(sizes.get("pp", 1)),
         ep=_ProcessGroup(sizes.get("ep", 1)),
@@ -349,24 +350,51 @@ def test_parameter_only_observation_scope_allows_gtp_topology():
         pass
 
 
-def test_forward_metrics_treat_gtp_as_an_activation_population_shard():
+def test_tensor_metric_process_groups_separate_forward_dp_from_optimizer_dp_cp():
+    pg_collection = _pg_collection(dp=2)
+
+    groups = observer_mod._tensor_metric_process_groups(pg_collection)
+
+    assert groups["dp"] is pg_collection.dp
+    assert groups["dp_cp"] is pg_collection.dp_cp
+
+
+@pytest.mark.parametrize(
+    ("sizes", "axis", "expected_placement"),
+    (
+        ({"tp": 2}, "tp", Shard(0)),
+        ({"cp": 2}, "cp", Shard(0)),
+        ({"gtp_remat": 2}, "gtp", Shard(1)),
+        ({"dp": 2}, "dp", Shard(1)),
+    ),
+)
+def test_forward_metrics_record_source_specific_shard_dimensions(sizes, axis, expected_placement):
     observer = build_tensor_metric_observer(
-        ["global-output-logits-l2:1"], result_sink=lambda *args: None
+        ["layer-residual-accumulator-l2:1"], result_sink=lambda *args: None
     )
     assert observer is not None
     model = _forward_model()
 
     with observer.observe_forward_backward(
-        model=[model], iteration=0, pg_collection=_pg_collection(gtp_remat=2)
+        model=[model], iteration=0, pg_collection=_pg_collection(**sizes)
     ):
         observe_tensor(
-            model.output_layer, "output_logits", "output_logits", torch.tensor([3.0, 4.0])
+            model.decoder.layers[0],
+            "residual_accumulator",
+            "residual_accumulator",
+            torch.ones(2, 3, 4),
+            tp_shard_dim=0,
+            sequence_dim=0,
+            batch_dim=1,
         )
 
     assert observer._prepared_forward_values is not None
     (prepared_value,) = next(iter(observer._prepared_forward_values.values()))
-    assert prepared_value.relation("gtp").placement == Shard(None)
-    assert prepared_value.relation("dp").placement == Replica()
+    assert prepared_value.relation(axis).placement == expected_placement
+    assert all(
+        relation.placement == (expected_placement if relation.axis == axis else Replica())
+        for relation in prepared_value.rank_relations
+    )
 
 
 def test_forward_metrics_reduce_gtp_and_dp_activation_populations_end_to_end():
@@ -405,7 +433,7 @@ def test_forward_metrics_reduce_gtp_and_dp_activation_populations_end_to_end():
     model = _forward_model()
     pg_collection = _pg_collection()
     pg_collection.gtp_remat = gtp_group
-    pg_collection.dp_cp = dp_group
+    pg_collection.dp = dp_group
     device = torch.device("cuda", torch.cuda.current_device())
 
     with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
@@ -413,7 +441,9 @@ def test_forward_metrics_reduce_gtp_and_dp_activation_populations_end_to_end():
             model.output_layer,
             "output_logits",
             "output_logits",
-            torch.tensor([rank + 1.0], device=device),
+            torch.tensor([[rank + 1.0]], device=device),
+            sequence_dim=0,
+            batch_dim=1,
         )
     observer(
         model=[model], optimizer=_fp32_optimizer(model), iteration=0, pg_collection=pg_collection
@@ -789,11 +819,16 @@ def test_router_metrics_reject_cuda_graphs_that_capture_router(specification):
 
 
 @pytest.mark.parametrize(
-    ("sizes", "tp_shard_dim", "expected_axis"),
-    (({"gtp_remat": 2}, None, "gtp"), ({"tp": 2}, 0, "tp"), ({"cp": 2, "dp": 2}, None, "dp")),
+    ("sizes", "tp_shard_dim", "sequence_dim", "batch_dim", "expected_axis"),
+    (
+        ({"gtp_remat": 2}, None, None, 0, "gtp"),
+        ({"tp": 2}, 0, None, 0, "tp"),
+        ({"cp": 2}, None, None, 0, "cp"),
+        ({"dp": 2}, None, None, 0, "dp"),
+    ),
 )
 def test_router_diagnostic_metrics_do_not_encode_parallel_axis_policy(
-    sizes, tp_shard_dim, expected_axis
+    sizes, tp_shard_dim, sequence_dim, batch_dim, expected_axis
 ):
     observer = build_tensor_metric_observer(
         ["layer-router-health:1"], result_sink=lambda *args: None
@@ -811,6 +846,8 @@ def test_router_diagnostic_metrics_do_not_encode_parallel_axis_policy(
             "router_diagnostics",
             diagnostics,
             tp_shard_dim=tp_shard_dim,
+            sequence_dim=sequence_dim,
+            batch_dim=batch_dim,
         )
 
     assert observer._prepared_forward_values is not None
