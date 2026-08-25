@@ -717,35 +717,6 @@ class TEGroupedMLP(MegatronModule):
         self._ensure_main_grad(self.linear_fc1)
         self._ensure_main_grad(self.linear_fc2)
 
-    def _start_paged_stash_group(
-        self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
-    ) -> tuple[torch.Tensor, object]:
-        """Start the grouped-MLP paged-stash scope when it is enabled."""
-        if not self.config.moe_paged_stash:
-            return permuted_local_hidden_states, nullcontext()
-
-        permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
-        max_num_tokens = permuted_local_hidden_states.shape[0]
-        # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
-        # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
-        cap_factor = self.config.moe_expert_rank_capacity_factor
-        avg_num_tokens = (
-            int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
-        )
-        stash_context = get_paged_stash_context(
-            name="grouped_mlp",
-            max_num_tokens=max_num_tokens,
-            num_tokens_tensor=tokens_per_expert.sum(),
-            avg_num_tokens=avg_num_tokens,
-        )
-        return permuted_local_hidden_states, stash_context
-
-    def _commit_paged_stash_group(self, output: torch.Tensor) -> torch.Tensor:
-        """Commit the grouped-MLP paged-stash scope when it is enabled."""
-        if self.config.moe_paged_stash:
-            output = paged_stash_group_commit(output, name="grouped_mlp")
-        return output
-
     def _mark_paged_stash_tensors(self, *tensors: Optional[torch.Tensor]) -> None:
         """Mark dynamic unfused activations for the paged-stash saved-tensor hook."""
         if not self.config.moe_paged_stash:
@@ -821,9 +792,25 @@ class TEGroupedMLP(MegatronModule):
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
-        permuted_local_hidden_states, stash_context = self._start_paged_stash_group(
-            permuted_local_hidden_states, tokens_per_expert
-        )
+        if self.config.moe_paged_stash:
+            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            max_num_tokens = permuted_local_hidden_states.shape[0]
+            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor)
+                if cap_factor is not None and cap_factor > 0
+                else None
+            )
+            stash_context = get_paged_stash_context(
+                name="grouped_mlp",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            )
+        else:
+            stash_context = nullcontext()
         fine_grained_activation_offloading = getattr(self, "offload_fused_group_mlp", False)
         offload_name = "fused_group_mlp"
         fused_group_mlp_manager = off_interface(
@@ -866,7 +853,9 @@ class TEGroupedMLP(MegatronModule):
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
-        return self._commit_paged_stash_group(output)
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
+        return output
 
     @staticmethod
     def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
@@ -1088,9 +1077,25 @@ class TEGroupedMLP(MegatronModule):
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 
-        permuted_local_hidden_states, stash_context = self._start_paged_stash_group(
-            permuted_local_hidden_states, tokens_per_expert
-        )
+        if self.config.moe_paged_stash:
+            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            max_num_tokens = permuted_local_hidden_states.shape[0]
+            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor)
+                if cap_factor is not None and cap_factor > 0
+                else None
+            )
+            stash_context = get_paged_stash_context(
+                name="grouped_mlp",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            )
+        else:
+            stash_context = nullcontext()
         with stash_context:
             output = self._unfused_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
@@ -1100,7 +1105,8 @@ class TEGroupedMLP(MegatronModule):
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
 
-        output = self._commit_paged_stash_group(output)
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         output_bias = None
 
         return output, output_bias
