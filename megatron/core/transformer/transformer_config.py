@@ -1438,14 +1438,6 @@ class TransformerConfig(ModelParallelConfig):
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
-        if (
-            self.linear_cp_layout == "contiguous"
-            and self.context_parallel_size > 1
-            and (self.mtp_num_layers or 0) > 0
-        ):
-            raise ValueError(
-                "linear_cp_layout='contiguous' with context parallelism does not yet support MTP."
-            )
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
