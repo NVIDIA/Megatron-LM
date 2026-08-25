@@ -322,6 +322,15 @@ class LayerShardedMuon(TensorParallelMuon):
         # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
+        # Cached a2a routing plans per param group. The routing metadata is a
+        # pure function of shapes, homes, pdims and group sizes, all static
+        # across steps; only the tensor packing is per-step. Keyed by the
+        # grad-filtered param identities so the wired path (persistent grad
+        # buffers, always fully populated) hits every step, while direct-API
+        # callers that drop a grad on some step safely trigger a rebuild.
+        # Metadata only, never buffers: persistent exchange buffers would
+        # raise steady-state memory between steps.
+        self._exchange_plans: dict[int, dict] = {}
 
     def set_param_ns_homes(self, param_ns_homes: dict[int, tuple[int, int]]) -> None:
         """Set the NS home for each param (by id).
@@ -333,6 +342,7 @@ class LayerShardedMuon(TensorParallelMuon):
         """
         self._param_ns_homes = param_ns_homes
         self._warned_missing_homes = False
+        self._exchange_plans.clear()
 
     def set_group_process_groups(self, group_process_groups: dict[int, tuple]) -> None:
         """Override the (GTP, TP) process groups per param group.
@@ -353,6 +363,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 uses a different (e.g. expert) domain whose flat communicator differs.
         """
         self._group_process_groups = group_process_groups
+        self._exchange_plans.clear()
 
     def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
         """Apply one weight update through the base-class hook points.
@@ -633,6 +644,17 @@ class LayerShardedMuon(TensorParallelMuon):
             # from the padded momentum shards.
             pads = [getattr(p, 'pad_length', 0) for p in params]
 
+            # Per-group routing-plan cache: the a2a metadata is static across
+            # steps for a fixed set of routed params (shapes/homes/pdims never
+            # change between calls to set_param_ns_homes). Key on the routed
+            # param identities so a direct-API caller dropping a grad on some
+            # step rebuilds instead of reusing a stale plan.
+            plan_key = tuple(id(p) for p in params)
+            plans = self._exchange_plans.get(group_index)
+            if plans is None or plans['key'] != plan_key:
+                plans = {'key': plan_key}
+                self._exchange_plans[group_index] = plans
+
             # --- Fused path: one all_to_all over the flattened (GTP_remat x TP) domain
             # replaces the two stages in each direction. Moves the exact same shard
             # blocks and assembles them in the exact same order, so the NS input is
@@ -668,6 +690,7 @@ class LayerShardedMuon(TensorParallelMuon):
                             gtp_remat_size,
                             tp_size,
                             fused_group,
+                            plan=plans.setdefault('ff', {}),
                         )
                         # tp_size == 1 here whenever pads are present: the
                         # home-assembled matrix has a contiguous dim-0 pad tail.
@@ -691,6 +714,7 @@ class LayerShardedMuon(TensorParallelMuon):
                         gtp_remat_size,
                         tp_size,
                         fused_group,
+                        plan=plans.setdefault('fb', {}),
                     )
                 with _phase("update"):
                     for p, shard in zip(params, update_shards):
@@ -702,7 +726,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 with _phase("a2a_fwd"):
                     # 2. Stage-1 all_to_all over GTP_remat (dim 0).
                     stage1, my_g = layer_sharded_all_to_all_fwd(
-                        moms, g_home, gtp_remat_group, 0
+                        moms, g_home, gtp_remat_group, 0, plan=plans.setdefault('s1f', {})
                     )
                     # Strip the GTP alignment padding at the stage-1 seam: the
                     # stage-1 output is the gtp-gathered TP-LOCAL tensor, where
@@ -727,7 +751,8 @@ class LayerShardedMuon(TensorParallelMuon):
                         templates = [stage1[k] for k in pos]
                         t_home = {n: homes[my_g[pos[n]]][1] for n in range(len(pos))}
                         fulls, my_sel = layer_sharded_all_to_all_fwd(
-                            templates, t_home, tp_group, pd
+                            templates, t_home, tp_group, pd,
+                            plan=plans.setdefault(('s2f', pd), {}),
                         )
                         stage2_ctx[pd] = (pos, templates, t_home, my_sel)
                         for n_sel, full in zip(my_sel, fulls):
@@ -760,7 +785,8 @@ class LayerShardedMuon(TensorParallelMuon):
                 for pd, (pos, templates, t_home, my_sel) in stage2_ctx.items():
                     ns_sub = [ns_by_k[pos[n]] for n in my_sel]
                     parts = layer_sharded_all_to_all_bwd(
-                        ns_sub, my_sel, templates, t_home, tp_group, pd
+                        ns_sub, my_sel, templates, t_home, tp_group, pd,
+                        plan=plans.setdefault(('s2b', pd), {}),
                     )
                     for n, part in enumerate(parts):
                         col_updates[pos[n]] = part
@@ -777,7 +803,8 @@ class LayerShardedMuon(TensorParallelMuon):
 
                 # 6. Reverse stage-1 all_to_all: scatter column updates back to GTP_remat shards.
                 update_shards = layer_sharded_all_to_all_bwd(
-                    col_updates, my_g, moms, g_home, gtp_remat_group, 0
+                    col_updates, my_g, moms, g_home, gtp_remat_group, 0,
+                    plan=plans.setdefault('s1b', {}),
                 )
 
             # 7. Weight update on the local shard.
