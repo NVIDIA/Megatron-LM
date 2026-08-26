@@ -114,6 +114,36 @@ def test_replica_hybridep_keeps_virtual_routes_compact():
     assert dense_probs[1, 3] == 0.6
 
 
+def test_replica_hybridep_rank_capacity_includes_per_expert_padding():
+    from megatron.core.transformer.moe.token_dispatcher import (
+        _get_replica_hybridep_rank_capacity,
+    )
+
+    common = {
+        "num_tokens": 8192,
+        "router_topk": 22,
+        "num_runtime_experts": 64,
+    }
+    assert (
+        _get_replica_hybridep_rank_capacity(
+            **common, capacity_factor=1.0, alignment=256
+        )
+        == 196608
+    )
+    assert (
+        _get_replica_hybridep_rank_capacity(
+            **common, capacity_factor=2.0, alignment=256
+        )
+        == 360448
+    )
+    assert (
+        _get_replica_hybridep_rank_capacity(
+            **common, capacity_factor=1.0, alignment=0
+        )
+        == 180224
+    )
+
+
 def test_hybridep_compact_router_gradient_is_gathered_from_dense_result(monkeypatch):
     dense_prob_grad = torch.tensor([[10.0, 11.0, 12.0, 13.0], [20.0, 21.0, 22.0, 23.0]])
 
@@ -228,6 +258,10 @@ def _set_main_grad(parameter, dtype=torch.float32):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) > 1,
+    reason="Process-local CUDA graph probe must run outside distributed parity tests",
+)
 def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
     """Keep replica reduction bound to bridge staging when GTP scratch changes."""
     device = torch.device("cuda", torch.cuda.current_device())
@@ -310,6 +344,10 @@ def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) > 1,
+    reason="Process-local CUDA graph probe must run outside distributed parity tests",
+)
 def test_replica_gtp_mxfp8_weights_bind_directly_during_capture():
     """Alias static GTP gather storage without capturing full-weight DtoD copies."""
     device = torch.device("cuda", torch.cuda.current_device())
@@ -597,7 +635,6 @@ def _run_replica_hybridep_full_layer_parity(
         raise ValueError(f"Unsupported reference dispatcher {reference_dispatcher!r}.")
     backend_config = {}
     if backend == "replica_hybridep":
-        backend_config["moe_expert_rank_capacity_factor"] = 2.0
         backend_config["replica_hybridep_grad_dtype"] = grad_dtype
     replica_config = TransformerConfig(
         **common,
@@ -638,6 +675,35 @@ def _run_replica_hybridep_full_layer_parity(
         if backend.startswith("replica_"):
             bridge = replica_layer.token_dispatcher._comm_manager._bridge
             assert bridge.workspace.grad_arena.dtype == grad_dtype
+            if mxfp8:
+                assert bridge.workspace.rowwise_arena is bridge.workspace.columnwise_arena
+                assert bridge.workspace.rowwise_handle is bridge.workspace.columnwise_handle
+                for projection in bridge.projections:
+                    for virtual in projection.virtual_weight:
+                        assert (
+                            virtual._rowwise_data.data_ptr()
+                            == virtual._columnwise_data.data_ptr()
+                        )
+            if gtp and mxfp8:
+                # GTP gather outputs replace these aliases before execution; no
+                # second full native row/column staging allocation is retained.
+                for projection in bridge.projections:
+                    if projection.gtp_leader is None:
+                        # Bare MoELayer construction does not install the DDP-time
+                        # GTP remat wrapper exercised by the full recipe.
+                        continue
+                    for source, virtual in zip(
+                        projection.source_tensors, projection.virtual_weight
+                    ):
+                        assert source is not virtual
+                        assert (
+                            source._rowwise_data.data_ptr()
+                            == virtual._rowwise_data.data_ptr()
+                        )
+                        assert (
+                            source._columnwise_data.data_ptr()
+                            == virtual._columnwise_data.data_ptr()
+                        )
             assert all(
                 projection.virtual_grad.dtype == grad_dtype
                 for projection in bridge.projections
@@ -768,6 +834,20 @@ def _run_replica_hybridep_full_layer_parity(
             fused_a2a.reset_hybrid_ep_buffer()
             torch.distributed.barrier()
         replica_values = run(replica_layer, replica_bridge=bridge)
+        if backend == "replica_hybridep":
+            manager = replica_layer.token_dispatcher._comm_manager
+            assert manager.moe_expert_rank_capacity_factor == 1.0
+            assert not manager.over_budget.item()
+            if mxfp8:
+                # This input has far fewer than 256 routes per runtime expert, so the
+                # comparison below exercises padding-heavy execution. Matching input,
+                # router, and expert-weight gradients proves padding is gradient-neutral.
+                assert torch.all(manager.tokens_per_expert % 256 == 0)
+                num_routes = test_input.shape[0] * test_input.shape[1] * 2
+                num_dispatched = manager.tokens_per_expert.sum().item()
+                assert num_dispatched > num_routes
+                dispatched_probs = manager.dispatched_probs[:num_dispatched]
+                assert torch.count_nonzero(dispatched_probs).item() == num_routes
         if reference_dispatcher == "hybridep":
             active_replica = torch.any(bridge.last_plan.experts_to_copy >= 0).to(
                 torch.int32
@@ -966,8 +1046,15 @@ def _run_replica_hybridep_full_layer_parity(
                     tuple(weight.data_ptr() for weight in runtime_weights) == pointers
                 )
     finally:
-        fused_a2a.reset_hybrid_ep_buffer()
+        # Replica bridges own CUDA work that can reference the HybridEP execution
+        # context. Finalize them first, then destroy the process-global buffer in
+        # lockstep across ranks.
         Utils.destroy_model_parallel()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        fused_a2a.reset_hybrid_ep_buffer()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         if gtp:
             update_gtp_config(
                 weight_prefetch=True,
@@ -1084,6 +1171,32 @@ def test_replica_hybridep_full_layer_squared_relu_matches_alltoall(monkeypatch, 
         None,
         640,
         mxfp8=mxfp8,
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fused_a2a.HAVE_HYBRIDEP,
+    reason="CUDA and HybridEP are required",
+)
+def test_replica_hybridep_gtp_mxfp8_squared_relu_matches_alltoall(monkeypatch):
+    """Cover the MXFP8, BF16-grad, GTP, and latent-MoE production combination."""
+    try:
+        from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
+    except ImportError:
+        pytest.skip("Transformer Engine ScaledSReLU is required")
+    _run_replica_hybridep_full_layer_parity(
+        monkeypatch,
+        "replica_hybridep",
+        squared_relu,
+        False,
+        True,
+        None,
+        640,
+        single_grouped_weight=False,
+        mxfp8=True,
+        gtp=True,
+        grad_dtype=torch.bfloat16,
     )
 
 

@@ -1499,6 +1499,26 @@ class _ReplicaPlannedManagerMixin:
             self._replica_plan_in_use = False
 
 
+def _get_replica_hybridep_rank_capacity(
+    *,
+    num_tokens: int,
+    router_topk: int,
+    capacity_factor: float,
+    num_runtime_experts: int,
+    alignment: int,
+) -> int:
+    """Return a static dropless rank capacity including per-expert padding."""
+    num_routes = num_tokens * router_topk
+    rank_capacity = int(num_routes * capacity_factor)
+    if alignment > 1:
+        # HybridEP rounds each runtime expert segment independently. At most
+        # ``alignment - 1`` rows are added per segment.
+        padded_capacity = num_routes + num_runtime_experts * (alignment - 1)
+        rank_capacity = max(rank_capacity, padded_capacity)
+        rank_capacity += -rank_capacity % alignment
+    return rank_capacity
+
+
 class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
     """Deterministically replica-planned routes transported by HybridEP."""
 
@@ -1569,15 +1589,21 @@ class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
         self.routing_map = None
         self._original_num_tokens = self.num_local_tokens
         self._padded_num_tokens = self.num_local_tokens
-        budget = int(
-            self.num_local_tokens
-            * self.router_topk
-            * self.moe_expert_rank_capacity_factor
+        alignment = (
+            get_align_size_for_quantization(self.config)
+            if self.config.fp8 or self.config.fp4
+            else 0
         )
-        alignment = get_align_size_for_quantization(self.config)
-        if alignment > 1:
-            budget += -budget % alignment
-        self.num_permuted_tokens = budget
+        # The planner makes the unpadded route total identical on every rank, but
+        # HybridEP pads every runtime expert segment independently. Include that
+        # aggregate padding in the fixed CUDA-graph shape so no real route is dropped.
+        self.num_permuted_tokens = _get_replica_hybridep_rank_capacity(
+            num_tokens=self.num_local_tokens,
+            router_topk=self.router_topk,
+            capacity_factor=self.moe_expert_rank_capacity_factor,
+            num_runtime_experts=self.num_local_experts,
+            alignment=alignment,
+        )
         hidden_states = self._wrap_replica_dispatch_input(hidden_states)
         dispatched_hidden = _HybridEPManager.dispatch(
             self,
