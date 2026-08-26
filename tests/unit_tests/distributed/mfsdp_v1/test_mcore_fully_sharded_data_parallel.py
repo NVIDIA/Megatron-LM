@@ -359,7 +359,6 @@ class TestFullyShardedDataParallel:
         from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
             FixedPoolAllocator,
         )
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_global_memory_buffer
 
         fsdp_config = DistributedDataParallelConfig(
             data_parallel_sharding_strategy="optim_grads_params",
@@ -426,7 +425,7 @@ class TestFullyShardedDataParallel:
         torch.cuda.synchronize()
         fsdp_model.stop_communication()
 
-        gmb_buffer = get_global_memory_buffer().buffer
+        gmb_buffer = pgb.persistent_memory_buffer.buffer
         for alloc_attr in ("weight_alloc", "main_grad_alloc"):
             alloc = getattr(pgb, alloc_attr)
             persistent_keys = [
