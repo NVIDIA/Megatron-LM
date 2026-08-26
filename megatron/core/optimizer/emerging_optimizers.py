@@ -109,7 +109,7 @@ class EmergingOptimizerEntry:
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
         config_to_cls: Optional ``(config) -> type`` callable. When provided, overrides
             ``optimizer_cls`` so the instantiated class can vary based on config (e.g.
-            selecting ``LayerShardedMuon`` when ``use_layer_sharding_muon`` is set).
+            selecting ``LayerShardedMuon`` when ``muon_tp_mode == 'layer_sharded'``).
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
     """
@@ -686,17 +686,19 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
     return kwargs
 
 
-def _use_layer_sharding_muon(config) -> bool:
-    return getattr(config, 'use_layer_sharding_muon', False)
+def _is_layer_sharded(config) -> bool:
+    """Whether the config selects layer sharding: ``muon_tp_mode='layer_sharded'``
+    is a registry-level class selector, not a TensorParallelMuon runtime mode."""
+    return getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded' 
 
 
 def _muon_config_to_cls(config) -> type:
     """Return the Muon optimizer class based on config.
 
-    Returns ``LayerShardedMuon`` when ``use_layer_sharding_muon`` is set;
+    Returns ``LayerShardedMuon`` when ``muon_tp_mode == 'layer_sharded'``;
     ``TensorParallelMuon`` otherwise.
     """
-    if _use_layer_sharding_muon(config):
+    if _is_layer_sharded(config):
         from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 
         return LayerShardedMuon
@@ -719,6 +721,11 @@ def _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection) ->
 
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
     kwargs.update(_kwargs_from_config(LayerShardedMuon, "muon", config))
+    # 'layer_sharded' is the registry-level selector that routed construction to
+    # this builder; it is NOT a TensorParallelMuon mode, so the tp_mode the
+    # constructor (and its fallback/degenerate paths) receives is the bitwise
+    # reference mode instead.
+    kwargs['tp_mode'] = 'duplicated'
     # Explicit injections: reflective matching cannot cover these (no config attr).
     kwargs['gtp_remat_group'] = (
         getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
@@ -730,7 +737,7 @@ def _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection) ->
 def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to TensorParallelMuon constructor kwargs.
 
-    Deliberately does NOT dispatch on ``use_layer_sharding_muon``: this helper is
+    Deliberately does NOT dispatch on ``muon_tp_mode='layer_sharded'``: this helper is
     shared by optimizers that do not support layer sharding (``adaptive_muon``
     layers :func:`_adaptive_muon_config_to_kwargs` on top of it), so it must stay
     a pure :class:`TensorParallelMuon` kwargs builder. Layer-sharding dispatch
@@ -748,11 +755,11 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     """``config_to_kwargs`` for the ``muon`` registry entry only.
 
     Dispatches to :func:`_layer_sharded_muon_config_to_kwargs` when
-    ``use_layer_sharding_muon`` is set (paired with :func:`_muon_config_to_cls`
+    ``muon_tp_mode == 'layer_sharded'`` (paired with :func:`_muon_config_to_cls`
     selecting ``LayerShardedMuon``); plain :class:`TensorParallelMuon` kwargs
     otherwise.
     """
-    if _use_layer_sharding_muon(config):
+    if _is_layer_sharded(config):
         return _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection)
     return _muon_config_to_kwargs(config, model_chunks, pg_collection)
 

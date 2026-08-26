@@ -240,6 +240,13 @@ class LayerShardedMuon(TensorParallelMuon):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
     ) -> None:
+        if tp_mode == "layer_sharded":
+            raise ValueError(
+                "LayerShardedMuon: 'layer_sharded' is a registry-level selector for "
+                "--muon-tp-mode, not a class mode. The layer-sharded exchange is always "
+                "active in this class; tp_mode selects the mode for the delegated "
+                "(fallback/degenerate) paths only."
+            )
         if split_qkv:
             # The layer-sharded exchange routes whole matrices to their NS homes
             # and never goes through TensorParallelMuon.orthogonalize, where
