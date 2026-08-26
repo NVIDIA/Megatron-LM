@@ -819,6 +819,7 @@ class TestMHCWithCudaGraph:
             cuda_graph_modules=[CudaGraphModule.attn],
             recompute_granularity="selective",
             recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
         )
 
         static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=2)
@@ -828,30 +829,30 @@ class TestMHCWithCudaGraph:
         assert layer.self_attention in graph_submodules
         assert layer.self_attention_hyper_connection not in graph_submodules
 
-    def test_mhc_recompute_attention_graph_accepts_packed_sequence(self):
-        """THD is not rejected by the split validator.
+    def test_mhc_split_config_rejects_packed_sequence(self):
+        """The split validator rejects packed (THD) sequences at config time.
 
-        An earlier revision rejected it on the grounds that THD changes which
-        tensors enter sample_kwargs. That is true -- padding_mask becomes a
-        capture-time argument there -- but it is handled: the generic replay
-        decomposes packed_seq_params into tensor kwargs and reconstructs it, and
-        the split shares that entry point. The validator now rejects only
-        cross-attention, whose captured context output the split's graph-output
-        arity genuinely cannot represent.
+        The split replay's kwargs assembly does not forward the THD captured
+        kwargs (cu_seqlens_*, padding_mask) to the graphed callable, and
+        Transformer Engine raises TypeError for a kwarg present at capture but
+        missing at replay -- so without this gate a THD split run is accepted
+        and then dies on the first replay. The gate keys on
+        sequence_packing_scheduler, the same signal _is_thd_cuda_graph() uses
+        to shape the THD static inputs.
         """
-        layer, _ = self._create_mhc_layer(
-            bf16=True,
-            cuda_graph_impl="transformer_engine",
-            cuda_graph_modules=[CudaGraphModule.attn],
-            recompute_granularity="selective",
-            recompute_modules=["mhc"],
-            sequence_packing_scheduler="dp_balanced",
-            max_seqlen_per_dp_cp_rank=32,
-            thd_max_packed_sequences=2,
-            pad_packed_seq_alignment="max",
-        )
-        assert layer._uses_mhc_recompute_attn_cuda_graph_split()
-        assert layer._is_thd_cuda_graph()
+        with pytest.raises(ValueError, match="does not support packed"):
+            self._create_mhc_layer(
+                bf16=True,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.attn],
+                recompute_granularity="selective",
+                recompute_modules=["mhc"],
+                mhc_recompute_attn_cuda_graph_split=True,
+                sequence_packing_scheduler="dp_balanced",
+                max_seqlen_per_dp_cp_rank=32,
+                thd_max_packed_sequences=2,
+                pad_packed_seq_alignment="max",
+            )
 
     @pytest.mark.parametrize(
         "offload_modules",
@@ -867,20 +868,25 @@ class TestMHCWithCudaGraph:
     def test_mhc_split_config_rejects_attention_scope_offloading(
         self, offload_modules, graph_modules
     ):
-        """The split must fail closed when captured attention modules are offloaded.
+        """Opting into the split rejects offloading a captured attention module.
+
+        This shape is not one the split inherited -- before the split existed it
+        went through the parent capture, which does plant the edges -- so the
+        rejection blocks nothing that used to run and fails closed on a race
+        whose only symptom is corrupted activations.
 
         The split replaces ``_te_cuda_graph_capture`` instead of extending it, so
         it never plants the parent's two offload synchronization edges. Both
-        cuda_graph_modules spellings are exercised because the check runs before
-        __post_init__ normalizes the field in bulk; comparing the string form raw
-        would silently disable the guard.
+        cuda_graph_modules spellings are exercised so the gate keeps comparing
+        normalized module forms rather than whatever spelling the caller used.
         """
-        with pytest.raises(ValueError, match="attention-only TE CUDA Graphs is incompatible"):
+        with pytest.raises(ValueError, match="incompatible with offload_modules"):
             _make_mhc_config(
                 cuda_graph_impl="transformer_engine",
                 cuda_graph_modules=graph_modules,
                 recompute_granularity="selective",
                 recompute_modules=["mhc"],
+                mhc_recompute_attn_cuda_graph_split=True,
                 fine_grained_activation_offloading=True,
                 offload_modules=offload_modules,
             )
@@ -888,9 +894,19 @@ class TestMHCWithCudaGraph:
     @pytest.mark.parametrize(
         "extra_config",
         [
-            # Not the split: offloading captured attention is the parent's job and
-            # the parent does plant the synchronization edges.
-            dict(cuda_graph_impl="none", cuda_graph_modules=[]),
+            # The default. Capture covers the whole attention range, so the parent
+            # plants the synchronization edges and there is nothing to reject --
+            # this is the shape that ran before the split existed.
+            dict(mhc_recompute_attn_cuda_graph_split=False),
+            # Not the split: no capture at all, so there is nothing to synchronize.
+            # The switch has to come off with it -- opting into a Transformer Engine
+            # split while disabling CUDA graphs is self-contradictory and is rejected
+            # on its own terms.
+            dict(
+                cuda_graph_impl="none",
+                cuda_graph_modules=[],
+                mhc_recompute_attn_cuda_graph_split=False,
+            ),
             # Not the split: mHC recompute is off, so no eager checkpoint feeds the
             # graph and the parent capture path runs unchanged.
             dict(recompute_granularity=None, recompute_modules=[]),
@@ -903,11 +919,21 @@ class TestMHCWithCudaGraph:
             cuda_graph_modules=[CudaGraphModule.attn],
             recompute_granularity="selective",
             recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
             fine_grained_activation_offloading=True,
             offload_modules=["core_attn"],
         )
         base.update(extra_config)
-        _make_mhc_config(**base)
+        if (
+            base.get("mhc_recompute_attn_cuda_graph_split") is False
+            and base["cuda_graph_impl"] == "transformer_engine"
+        ):
+            # The exact [attn]+[mhc] shape without the switch warns that the
+            # captured producer's checkpoint no longer pays; pin it.
+            with pytest.warns(UserWarning, match="capturing the whole attention range"):
+                _make_mhc_config(**base)
+        else:
+            _make_mhc_config(**base)
 
     def test_te_graph_static_hidden_input_tracks_runtime_microbatch_slot(self):
         """Static-input handles use the same modulo slot selection as TE graphs."""
@@ -950,6 +976,7 @@ class TestMHCWithCudaGraph:
             cuda_graph_modules=[CudaGraphModule.attn],
             recompute_granularity="selective",
             recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
         )
         assert layer._uses_mhc_recompute_attn_cuda_graph_split()
         return layer, config
