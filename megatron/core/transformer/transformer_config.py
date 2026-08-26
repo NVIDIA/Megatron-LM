@@ -771,11 +771,12 @@ class TransformerConfig(ModelParallelConfig):
     use_grouped_gemm_for_shared_expert is set.
     """
 
-    use_mok_megakernel: bool = False
-    """Experimental: replace MoE dispatch, routed/shared expert MLPs, and combine with
-    the external Mixture-of-Kittens megakernel. MCore still owns routing and trainable
-    parameters. This path currently requires TP=1 and a shared expert. Routed weights may
-    use BF16 or MXFP8; fused gradient accumulation supports FP32 and BF16 main gradients."""
+    moe_megakernel_backend: Optional[str] = None
+    """Optional backend that replaces MoE dispatch, expert computation, and combine.
+
+    MCore remains responsible for routing, trainable parameters, distributed-data-parallel
+    state, optimizer state, and checkpoints. Supported values: None and "mok".
+    """
 
     mok_fwd_num_comm_sms: int = 40
     """Number of communication SMs used by the MoK forward megakernel."""
@@ -794,19 +795,6 @@ class TransformerConfig(ModelParallelConfig):
 
     mok_all_gather_top_experts_chunk_bytes: int = 2048
     """Chunk size for MoK symmetric-memory expert-ID all-gather."""
-
-    mok_use_mxfp8_weights: bool = True
-    """Use MOK's MXFP8 routed-expert path; otherwise use BF16 routed weights."""
-
-    mok_scale_router_before_fc2: bool = False
-    """Apply router probabilities before routed FC2-input MXFP8 quantization to match
-    MCore GroupedMLP numerical ordering. This is ignored by the BF16 path."""
-
-    mok_source_mlp_glu_interleave_size: Optional[int] = None
-    """Optional GLU block size used to convert routed-FC1 initialization into MOK's
-    contiguous ``[gate; up]`` layout. This makes a MOK random initialization logically
-    identical to an MCore initialization whose FC1 is interpreted with the specified
-    interleave size. It does not yet convert interleaved checkpoints."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -2013,7 +2001,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight is currently supported with high-precision "
                     "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
                 )
-            if not self.use_transformer_engine_op_fuser and not self.use_mok_megakernel:
+            if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend != "mok":
                 raise ValueError(
                     "moe_single_grouped_weight requires "
                     "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
@@ -2088,30 +2076,38 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
-        if self.use_mok_megakernel:
+        if self.moe_megakernel_backend not in (None, "mok"):
+            raise ValueError(
+                "moe_megakernel_backend must be None or 'mok', got "
+                f"{self.moe_megakernel_backend!r}"
+            )
+
+        if self.moe_megakernel_backend == "mok":
             if self.moe_single_grouped_weight and not self.gradient_accumulation_fusion:
                 raise ValueError(
-                    "use_mok_megakernel with native grouped weights requires "
-                    "gradient_accumulation_fusion=True"
+                    "MOK with native grouped weights requires " "gradient_accumulation_fusion=True"
                 )
-            if self.mok_use_mxfp8_weights and (
-                not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8
-            ):
-                raise ValueError("use_mok_megakernel currently requires fp8_recipe=mxfp8")
-            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
-                raise ValueError("use_mok_megakernel currently requires TP=1 and expert TP=1")
-            if self.expert_model_parallel_size not in (4, 8, 16, 32, 64):
-                raise ValueError("use_mok_megakernel requires EP in {4, 8, 16, 32, 64}")
-            if self.moe_shared_expert_intermediate_size is None:
-                raise ValueError("use_mok_megakernel requires a shared expert")
-            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
+            mok_bf16 = self.fp8 is None and not self.fp8_param
+            mok_mxfp8 = (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            )
+            if not (mok_bf16 or mok_mxfp8):
                 raise ValueError(
-                    "use_mok_megakernel does not support the MCore shared-expert gate/overlap"
+                    "MOK routed experts require either BF16 parameters or MXFP8 with "
+                    "fp8_param=True"
                 )
+            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.expert_model_parallel_size not in (4, 8, 16, 32, 64):
+                raise ValueError("MOK requires EP in {4, 8, 16, 32, 64}")
+            if self.moe_shared_expert_intermediate_size is None:
+                raise ValueError("MOK requires a shared expert")
+            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
+                raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
             if self.moe_latent_size is not None:
-                raise ValueError("use_mok_megakernel does not support latent MoE")
+                raise ValueError("MOK does not support latent MoE")
             if not self.gated_linear_unit or self.activation_func != F.silu:
-                raise ValueError("use_mok_megakernel currently requires SwiGLU")
+                raise ValueError("MOK currently requires SwiGLU")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
@@ -3195,6 +3191,24 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 # The replay half of the same gap is fixed, not rejected: see
                 # _replay_mhc_attention_consumer.
+            if self.virtual_pipeline_model_parallel_size is not None:
+                # VPP is admitted only together with EP overlap. Interleaving used
+                # to diverge here (grad norms ~1e8 from the first iteration) on a
+                # caching-allocator use-after-free: mHC post-processing ran inside
+                # the communication-stream combine node, so the recompute subgraph
+                # was allocated on the compute stream and read from another, a
+                # window the allocator cannot track. The fix -- the post node owning
+                # a compute-stream schedule node -- lives in the overlap schedule,
+                # so the non-overlap VPP path has never carried it and stays
+                # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
+                # pre_process chunk carries a data iterator.
+                if not self.overlap_moe_expert_parallel_comm:
+                    raise ValueError(
+                        "mHC recompute supports interleaved pipeline (VPP) "
+                        "schedules only together with "
+                        "overlap_moe_expert_parallel_comm: the non-overlap VPP "
+                        "path is unvalidated."
+                    )
 
         if self.cuda_graph_impl != "none":
 

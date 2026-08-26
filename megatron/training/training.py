@@ -2968,15 +2968,6 @@ def train_step(
     if save_wgrads_in_this_iteration:
         _save_state_dict(attr_name="main_grad", label="wgrads")
 
-    if os.environ.get("MOK_DEBUG_TRAIN_FINGERPRINT_PATH"):
-        from megatron.core.mok_param_lifecycle_debug import record_training_fingerprint
-
-        record_training_fingerprint(
-            "after_backward",
-            [unwrap_model(model_chunk) for model_chunk in model],
-            iteration=iteration,
-        )
-
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return (
@@ -3006,15 +2997,6 @@ def train_step(
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-
-    if os.environ.get("MOK_DEBUG_TRAIN_FINGERPRINT_PATH"):
-        from megatron.core.mok_param_lifecycle_debug import record_training_fingerprint
-
-        record_training_fingerprint(
-            "after_optimizer",
-            [unwrap_model(model_chunk) for model_chunk in model],
-            iteration=iteration,
-        )
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -4257,15 +4239,6 @@ def train(
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
-
-    if os.environ.get("MOK_DEBUG_TRAIN_FINGERPRINT_PATH"):
-        from megatron.core.mok_param_lifecycle_debug import record_training_fingerprint
-
-        record_training_fingerprint(
-            "initial",
-            [unwrap_model(model_chunk) for model_chunk in model],
-            iteration=iteration,
-        )
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":

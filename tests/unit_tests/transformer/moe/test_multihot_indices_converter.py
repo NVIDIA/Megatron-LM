@@ -7,10 +7,8 @@ import pytest
 import torch
 
 from megatron.core import config
-from megatron.core.fusions.fused_indices_converter import (
-    fused_indices_to_multihot,
-    fused_routing_map_to_indices,
-)
+from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
+from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 
 
 class PytorchIndicesToMultihot:
@@ -94,8 +92,7 @@ class TestRoutingMapToIndices:
 
     @pytest.mark.experimental
     @pytest.mark.parametrize(
-        ("num_tokens", "num_experts", "topk"),
-        [(1, 7, 3), (17, 8, 4), (33, 31, 6), (4096, 384, 6)],
+        ("num_tokens", "num_experts", "topk"), [(1, 7, 3), (17, 8, 4), (33, 31, 6), (4096, 384, 6)]
     )
     def test_routing_map_to_indices(self, num_tokens, num_experts, topk):
         generator = torch.Generator(device="cpu").manual_seed(1234)
@@ -115,7 +112,7 @@ class TestRoutingMapToIndices:
         )
         probs_reference = probs.detach().clone().requires_grad_(True)
 
-        weights, indices = fused_routing_map_to_indices(probs, routing_map, topk)
+        weights, indices = routing_map_to_mok_inputs(probs, routing_map, topk)
 
         gather_indices = expected_indices.clamp_min(0).to(torch.int64)
         expected_weights = torch.gather(probs_reference, dim=1, index=gather_indices)

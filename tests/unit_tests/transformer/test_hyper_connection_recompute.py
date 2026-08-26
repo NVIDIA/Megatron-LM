@@ -596,33 +596,33 @@ class TestTransformerConfigRecomputeMhc:
                 )
             )
 
-    def test_config_accepts_full_iteration_mhc_recompute_with_vpp(self):
-        config = TransformerConfig(
-            **self._mhc_recompute_config_kwargs(
-                num_layers=4,
-                cuda_graph_impl="full_iteration",
-                cuda_graph_modules=[],
-                hidden_dropout=0.0,
-                attention_dropout=0.0,
-                pipeline_model_parallel_size=2,
-                virtual_pipeline_model_parallel_size=2,
-                pipeline_dtype=torch.bfloat16,
+    def test_config_rejects_full_iteration_mhc_recompute_with_vpp(self):
+        with pytest.raises(ValueError, match="interleaved pipeline"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    num_layers=4,
+                    cuda_graph_impl="full_iteration",
+                    cuda_graph_modules=[],
+                    hidden_dropout=0.0,
+                    attention_dropout=0.0,
+                    pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.bfloat16,
+                )
             )
-        )
-        assert config.virtual_pipeline_model_parallel_size == 2
 
-    def test_config_accepts_interleaved_pipeline_with_attention_split(self):
-        config = TransformerConfig(
-            **self._mhc_recompute_config_kwargs(
-                num_layers=4,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn],
-                pipeline_model_parallel_size=2,
-                virtual_pipeline_model_parallel_size=2,
-                pipeline_dtype=torch.bfloat16,
+    def test_config_rejects_interleaved_pipeline_with_attention_split(self):
+        with pytest.raises(ValueError, match="interleaved pipeline"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    num_layers=4,
+                    cuda_graph_impl="transformer_engine",
+                    cuda_graph_modules=[CudaGraphModule.attn],
+                    pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.bfloat16,
+                )
             )
-        )
-        assert config.virtual_pipeline_model_parallel_size == 2
 
     def test_config_accepts_vpp_attention_split_with_ep_overlap(self):
         """VPP + attn-only split + EP overlap is admitted. The PP4/VPP2

@@ -15,6 +15,11 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.megakernel import (
+    build_megakernel_backend,
+    megakernel_shared_expert_init_context,
+    prepare_megakernel_shared_expert_config,
+)
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -343,24 +348,22 @@ class MoELayer(BaseMoELayer):
             assert (
                 self.submodules.shared_experts is not None
             ), "Shared experts builder is not provided in the module spec."
-            self.shared_experts = self.submodules.shared_experts(
-                config=self.config,
-                pg_collection=pg_collection,
-                gate=self.config.moe_shared_expert_gate,
-                name=(name + ".shared_experts") if name is not None else None,
-            )
+            shared_expert_config = prepare_megakernel_shared_expert_config(self.config)
+            with megakernel_shared_expert_init_context(self.config):
+                self.shared_experts = self.submodules.shared_experts(
+                    config=shared_expert_config,
+                    pg_collection=pg_collection,
+                    gate=self.config.moe_shared_expert_gate,
+                    name=(name + ".shared_experts") if name is not None else None,
+                )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-        # Experimental E2E path: the native MCore expert modules remain the
-        # authoritative parameter, optimizer, DDP, and checkpoint owners. MOK
-        # registers aliases of those Parameters solely so its module pre-hook can
-        # participate in overlapped parameter gather; no weight payload is copied.
-        self.mok_experts = None
-        if self.config.use_mok_megakernel:
-            from megatron.core.transformer.moe.mok_megakernel import MoKMegakernel
-
-            self.mok_experts = MoKMegakernel(
+        # Native expert modules remain the authoritative parameter, optimizer,
+        # DDP, and checkpoint owners for every megakernel backend.
+        self.megakernel_experts = None
+        if self.config.moe_megakernel_backend is not None:
+            self.megakernel_experts = build_megakernel_backend(
                 config=self.config,
                 ep_group=self.ep_group,
                 routed_experts=self.experts,
@@ -752,16 +755,16 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
-        if self.config.use_mok_megakernel:
+        if self.config.moe_megakernel_backend is not None:
             if intermediate_tensors is not None:
                 raise RuntimeError(
-                    "MoK E2E integration does not support partial MoE CUDA-graph capture; "
-                    "remove moe_router/moe_preprocess from cuda_graph_modules"
+                    "The selected MoE megakernel backend does not support partial MoE "
+                    "CUDA-graph capture; remove moe_router/moe_preprocess from cuda_graph_modules"
                 )
             probs, routing_map = self.route(
                 hidden_states, padding_mask, input_ids, packed_seq_params
             )
-            output = apply_module(self.mok_experts)(hidden_states, probs, routing_map)
+            output = apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine

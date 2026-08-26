@@ -371,39 +371,6 @@ class _ParamAndGradBucketGroup:
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
-        for bucket in self.buckets:
-            for param in bucket.params:
-                if not hasattr(param, "_mok_lifecycle_name"):
-                    continue
-                from megatron.core.mok_param_lifecycle_debug import record
-
-                param_start, param_end = bucket.param_to_index[param]
-                param_slice = (
-                    None
-                    if bucket.param_data is None
-                    else bucket.param_data.view(-1)[param_start:param_end]
-                )
-                record(
-                    "ddp.after_param_all_gather",
-                    param,
-                    tensors={
-                        "whole_param_buffer_slice": param_slice,
-                        "bucket_param_data": bucket.param_data,
-                        "bucket_grad_data": bucket.grad_data,
-                        "main_grad": getattr(param, "main_grad", None),
-                    },
-                    metadata={
-                        "reuse_grad_buf_for_mxfp8_param_ag": (
-                            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                        ),
-                        "param_and_grad_share_storage": (
-                            bucket.param_data is not None
-                            and bucket.grad_data is not None
-                            and bucket.param_data.untyped_storage().data_ptr()
-                            == bucket.grad_data.untyped_storage().data_ptr()
-                        ),
-                    },
-                )
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
                 # Non-DistOpt LayerWise bucket has no param buffer (param_data is None); its weights
