@@ -70,6 +70,7 @@ __all__ = [
     'is_fused_mrope_available',
     'mrope_freqs_to_rotary_emb',
     'get_pos_emb_on_this_cp_rank',
+    'should_use_fused_mla_rope',
 ]
 
 
@@ -135,6 +136,26 @@ def _warn_rope_fusion_fallback_once(key: str, message: str) -> None:
         return
     _ROPE_FUSION_FALLBACK_WARNINGS.add(key)
     warnings.warn(message, stacklevel=2)
+
+
+def should_use_fused_mla_rope(config: TransformerConfig) -> bool:
+    """Return whether MLA's custom fused RoPE kernels support this configuration.
+
+    Standard RoPE can rotate only a prefix of the positional channels when
+    ``rotary_percent < 1``. The custom MLA kernels currently rotate the full
+    positional slice, so partial rotary embeddings must retain the unfused path
+    that preserves the trailing pass-through channels.
+    """
+    if not config.apply_rope_fusion:
+        return False
+    if config.rope_type == "rope" and config.rotary_percent < 1.0:
+        _warn_rope_fusion_fallback_once(
+            "mla-partial-standard-rope",
+            "MLA/DSA RoPE fusion requires rotary_percent=1.0 for standard RoPE; "
+            f"got rotary_percent={config.rotary_percent}. Falling back to the unfused path.",
+        )
+        return False
+    return True
 
 
 def _fused_mrope_unavailable_warning_key(reason: str, thd: bool = False) -> str:

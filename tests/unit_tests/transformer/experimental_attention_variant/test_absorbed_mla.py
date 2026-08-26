@@ -181,6 +181,7 @@ def get_mock_mla_config(
     fp4_recipe: str = "nvfp4",
     apply_rope_fusion: bool = False,
     rope_type: str = "yarn",
+    rotary_percent: float = 1.0,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -204,6 +205,7 @@ def get_mock_mla_config(
         context_parallel_size=context_parallel_size,
         apply_rope_fusion=apply_rope_fusion,
         rope_type=rope_type,
+        rotary_percent=rotary_percent,
         rotary_scaling_factor=40,
         mscale=1.0,
         mscale_all_dim=1.0,
@@ -537,8 +539,9 @@ def test_standard_rope_fusion_functionality(qkv_format):
 
 @pytest.mark.parametrize("attention_type", ["standard", "absorbed"])
 @pytest.mark.parametrize(("qkv_format", "cp_size"), [("sbhd", 1), ("thd", 1), ("thd", 2)])
-def test_standard_rope_fused_unfused_parity(attention_type, qkv_format, cp_size):
-    """Standard RoPE fusion must preserve module outputs and all gradients."""
+@pytest.mark.parametrize("rotary_percent", [1.0, 0.5], ids=["full", "partial-fallback"])
+def test_standard_rope_fused_unfused_parity(attention_type, qkv_format, cp_size, rotary_percent):
+    """Standard RoPE fusion or fallback must preserve outputs and all gradients."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     model_parallel_cuda_manual_seed(123)
 
@@ -550,6 +553,7 @@ def test_standard_rope_fused_unfused_parity(attention_type, qkv_format, cp_size)
             recompute_mla_up_proj=False,
             apply_rope_fusion=apply_rope_fusion,
             rope_type="rope",
+            rotary_percent=rotary_percent,
         )
         for apply_rope_fusion in (False, True)
     ]

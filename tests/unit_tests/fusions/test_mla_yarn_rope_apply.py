@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
+from megatron.core.models.common.embeddings import should_use_fused_mla_rope
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -27,6 +29,38 @@ except Exception:
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
     fused_mla_rope_out_of_place = None
+
+
+@pytest.mark.parametrize(
+    ("apply_rope_fusion", "rope_type", "rotary_percent", "expected"),
+    [
+        (False, "rope", 1.0, False),
+        (True, "rope", 1.0, True),
+        (True, "rope", 0.5, False),
+        (True, "yarn", 0.5, True),
+    ],
+)
+def test_mla_rope_fusion_selection(apply_rope_fusion, rope_type, rotary_percent, expected):
+    """Partial standard RoPE falls back while full RoPE and YaRN retain fusion."""
+    config = SimpleNamespace(
+        apply_rope_fusion=apply_rope_fusion, rope_type=rope_type, rotary_percent=rotary_percent
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert should_use_fused_mla_rope(config) is expected
+
+
+def test_partial_standard_rope_fallback_warns_once(monkeypatch):
+    """Partial standard RoPE reports its performance fallback only once."""
+    config = SimpleNamespace(apply_rope_fusion=True, rope_type="rope", rotary_percent=0.5)
+    monkeypatch.setattr(rope_utils_module, "_ROPE_FUSION_FALLBACK_WARNINGS", set())
+
+    with pytest.warns(UserWarning, match="Falling back to the unfused path"):
+        assert not should_use_fused_mla_rope(config)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        assert not should_use_fused_mla_rope(config)
+    assert not recorded
 
 
 def dtype_tols(dtype):
