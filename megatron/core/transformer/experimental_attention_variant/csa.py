@@ -49,7 +49,12 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    get_pg_size,
+    make_tp_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -1747,7 +1752,13 @@ class CompressedSparseAttention(MegatronModule):
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
-        self.n_local_heads = config.num_attention_heads
+        tp_size = get_pg_size(pg_collection.tp)
+        if config.num_attention_heads % tp_size != 0:
+            raise ValueError(
+                "CSA query heads must be divisible by tensor model parallel size: "
+                f"{config.num_attention_heads} % {tp_size} != 0"
+            )
+        self.n_local_heads = config.num_attention_heads // tp_size
 
         if softmax_scale is None:
             softmax_scale = config.v_head_dim**-0.5
@@ -1803,6 +1814,18 @@ class CompressedSparseAttention(MegatronModule):
             self.compressor.backward_dw()
         if self.indexer is not None:
             self.indexer.backward_dw()
+
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
+        """Shard the per-query-head attention sink along the TP head axis."""
+        state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        key = f"{prefix}attn_sink"
+        state_dict[key] = make_tp_sharded_tensor_for_checkpoint(
+            tensor=self.attn_sink,
+            key=key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+        )
+        return state_dict
 
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.

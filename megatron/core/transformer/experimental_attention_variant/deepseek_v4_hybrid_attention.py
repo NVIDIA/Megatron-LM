@@ -28,7 +28,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import get_pg_size, is_te_min_version
+from megatron.core.utils import get_pg_size, is_te_min_version, make_tp_sharded_tensor_for_checkpoint
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -87,9 +87,20 @@ class DSv4HybridAttention(Attention):
         )
         self.config: MLATransformerConfig
 
-        assert (
-            get_pg_size(self.pg_collection.tp) == 1
-        ), "DSv4 Hybrid Attention only supports TP size 1."
+        self.tp_size = get_pg_size(self.pg_collection.tp)
+        if self.tp_size > 1:
+            if not self.config.sequence_parallel:
+                raise ValueError("DSv4 Hybrid Attention with TP>1 requires sequence_parallel=True.")
+            if self.config.num_attention_heads % self.tp_size != 0:
+                raise ValueError(
+                    "num_attention_heads must be divisible by tensor model parallel size: "
+                    f"{self.config.num_attention_heads} % {self.tp_size} != 0"
+                )
+            if self.config.o_groups % self.tp_size != 0:
+                raise ValueError(
+                    "o_groups must be divisible by tensor model parallel size: "
+                    f"{self.config.o_groups} % {self.tp_size} != 0"
+                )
 
         assert (
             not self.checkpoint_core_attention
@@ -169,12 +180,14 @@ class DSv4HybridAttention(Attention):
         )
 
         # Output.
-        self.o_local_groups = self.config.o_groups
+        # Q heads are column-parallel. The manual grouped output projection
+        # therefore owns only the corresponding local groups on each TP rank.
+        self.o_local_groups = self.config.o_groups // self.tp_size
         assert (
             self.query_projection_size % self.config.o_groups == 0
         ), "num_attention_heads * v_head_dim must be divisible by o_groups"
         group_proj_in_size = self.query_projection_size // self.config.o_groups
-        group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
+        group_proj_out_size = self.o_local_groups * self.config.o_lora_rank
 
         _linear_o_group_proj = torch.empty(
             group_proj_out_size,
@@ -554,6 +567,18 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             name=(name + ".linear_q_up_proj") if name is not None else None,
         )
 
+        kv_proj_kwargs = {}
+        kv_proj_tp_group = pg_collection.tp
+        if submodules.linear_kv_proj is TELinear:
+            # DSv4 has one shared KV stream. Replicate it across TP ranks while
+            # query heads and grouped output weights are sharded by TP.
+            kv_proj_kwargs['parallel_mode'] = 'duplicated'
+            kv_proj_tp_group = None
+        else:
+            raise ValueError(
+                f"Unsupported linear_kv_proj for TP-aware DSv4: {submodules.linear_kv_proj}"
+            )
+
         self.linear_kv_proj = build_module(
             submodules.linear_kv_proj,
             self.config.hidden_size,
@@ -565,8 +590,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
-            tp_group=pg_collection.tp,
+            tp_group=kv_proj_tp_group,
             name=(name + ".linear_kv_proj") if name is not None else None,
+            **kv_proj_kwargs,
         )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
@@ -579,6 +605,22 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
+        """Add TP metadata for the manually-created grouped output projection."""
+        state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        # The Bridge replaces this Parameter with TE GroupedLinear for FP8
+        # parameter-gather mode; that module supplies its own sharding metadata.
+        if not isinstance(self.linear_o_group_proj, torch.Tensor):
+            return state_dict
+        key = f"{prefix}linear_o_group_proj"
+        state_dict[key] = make_tp_sharded_tensor_for_checkpoint(
+            tensor=self.linear_o_group_proj,
+            key=key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+        )
+        return state_dict
 
     def get_query_key_value_tensors(
         self,
