@@ -37,12 +37,10 @@ import torch
 from packaging.version import Version
 
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
-    allocate_graph_wgrad_rings,
-    clear_graph_wgrad_rings,
     cuda_graph_pool_allocation,
+    get_graph_persistent_buffer,
     register_capture_comm,
     register_capture_params_to_ensure_ready,
-    register_capture_wgrad_ring_slot,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     is_gtp_symm_pool_registered,
@@ -388,18 +386,6 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
     return _RS_STREAMS[key]
 
 
-def initialize_graph_wgrad_rings() -> None:
-    """Allocate persistent wgrad inputs before local CUDA-graph capture."""
-    allocate_graph_wgrad_rings(
-        _GTP_PARAMS,
-        full_iteration=_FULL_ITERATION,
-        async_reduction=GTP_CONFIG.async_reduction,
-        ring_size=GTP_CONFIG.graph_wgrad_ring_size,
-        graphed_chain_id=GTPChain.GRAPHED.value,
-        stream_key=_stream_key,
-    )
-
-
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
@@ -447,11 +433,6 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
-    # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
-    # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
-    # same-key writers may need more slots to keep all in-flight RS inputs distinct.
-    # TODO: Infer each domain's ring size automatically.
-    graph_wgrad_ring_size: int = 2
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -956,7 +937,10 @@ def _init_gtp_runtime_attrs(obj):
     obj.rs_event = torch.cuda.Event(external=True)
     obj._rs_ticket = None
     obj._rs_a2a_bufs = None  # all-to-all scratch held by an in-flight fp32-accum RS
-    # Symmetric wgrad slot
+    # Capture-time persistent wgrad parent and its logical view. During eager discovery the
+    # parent is None, which keeps the request count stable while using the normal eager path.
+    obj._gtp_graph_wgrad_workspace = None
+    # Eager symmetric-memory wgrad slot; graph capture uses its persistent arena instead.
     obj._wgrad_symm_slot = None
     # Padding
     obj.pad_length = 0
@@ -1791,22 +1775,47 @@ class GTPShardedParam(torch.nn.Parameter):
         return self.all_gather_and_prefetch(**kwargs)
 
     def use_zero_copy_wgrad(self, wgrad_dtype) -> bool:
-        """True when the wgrad GEMM should write straight into this weight's symmetric
-        RS send buffer (dtype permitting): direct writes keep the RS send out of the
-        copy-into-registered-memory path. Deliberately symm-only so behavior off the
-        --gtp*-remat-nccl-ub flags is unchanged; ring slots keep the copy fallback in
-        _prepare_wgrad_reduce_scatter_inputs."""
+        """Return whether native GEMM may write directly into the symmetric RS input.
+
+        Keeping this gate symmetric-only preserves the native eager behavior when NCCL user
+        buffers are disabled. Partial CUDA graphs still obtain stable storage through
+        ``get_wgrad_tensor`` when this path is selected.
+        """
         return self.main_grad.dtype == wgrad_dtype and is_gtp_symm_pool_registered(self.group)
 
     def get_wgrad_tensor(self):
-        """Return a logical-shape view of stable ring storage or ordinary scratch."""
-        ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)
-        if ring_slot is not None:
-            return self._gtp_graph_wgrad_ring_view
+        """Return wgrad scratch from the persistent graph layout or the eager pools."""
+        self._gtp_graph_wgrad_workspace = None
+        symmetric_group = self.group if is_gtp_symm_pool_registered(self.group) else None
+        if _chain_is_graphed(self.chain_id):
+            # Graph Capture path: eager discovery records this request and returns None; capture
+            # returns the fixed-address view assigned to this runner.
+            padded = get_graph_persistent_buffer(
+                self._unsharded_shape_padded, self.main_grad.dtype, symmetric_group=symmetric_group
+            )
+            if padded is not None:
+                # Graph Capture: let the GEMM write directly into the persistent RS input.
+                logical = (
+                    padded.narrow(0, 0, self._unsharded_shape[0]) if self.pad_length > 0 else padded
+                )
+                self._gtp_graph_wgrad_workspace = (padded, logical)
+                return logical
 
-        # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
-        if is_gtp_symm_pool_registered(self.group):
-            # Lifecycle invariant: get_wgrad_tensor -> GEMM -> _prepare consumes the slot -> RS.
+            if symmetric_group is None:
+                # Eager discovery with the default allocator: use temporary scratch
+                logical = torch.empty(
+                    self._unsharded_shape,
+                    dtype=self.main_grad.dtype,
+                    device=self.device,
+                    requires_grad=False,
+                )
+                self._gtp_graph_wgrad_workspace = (None, logical)
+                return logical
+
+        if symmetric_group is not None:
+            # Eager or Graph Capture discovery with symmetric memory: the GEMM must write into a
+            # registered RS input from the LIFO pool. _prepare_wgrad_reduce_scatter_inputs()
+            # consumes this exact slot.
             if self._wgrad_symm_slot is not None:
                 raise RuntimeError(
                     "[GTP] get_wgrad_tensor called again before the previous symmetric "
@@ -1814,9 +1823,17 @@ class GTPShardedParam(torch.nn.Parameter):
                     "either aborted between the wgrad GEMM and its reduce-scatter, or a "
                     "deferred-wgrad schedule skipped the reduce-scatter for this weight."
                 )
-            buf = _alloc_symmetric_wgrad_buffer(self, self.main_grad.dtype, self.device)
-            self._wgrad_symm_slot = buf
-            return buf[: self._unsharded_shape[0]]
+            padded = _alloc_symmetric_wgrad_buffer(self, self.main_grad.dtype, self.device)
+            self._wgrad_symm_slot = padded
+            logical = padded[: self._unsharded_shape[0]]
+            if _chain_is_graphed(self.chain_id):
+                # This workspace identifies the eager logical view whose persistent request was
+                # recorded above, preventing _prepare_wgrad_reduce_scatter_inputs() from
+                # recording it a second time.
+                self._gtp_graph_wgrad_workspace = (None, logical)
+            return logical
+
+        # Ordinary eager path: use the existing recyclable GEMM-output scratch pool.
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
     def register_grad_accum_hook(
@@ -1882,7 +1899,6 @@ class GTPShardedParam(torch.nn.Parameter):
             if self._wgrad_rs_handle is not None:
                 waited = True
                 self._wgrad_rs_handle.wait()
-                self._record_graph_wgrad_ring_slots_ready()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
                 if finalize_grad:
@@ -1906,7 +1922,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         Its wgrad inputs, and the fp32-accum all-to-all scratch (input to the deferred FP32 sum,
         so only free once the handle has been waited on). UNGRAPHED buffers go back to the pool;
-        GRAPHED just drops Python refs (addresses must stay stable for CG).
+        GRAPHED just drops Python refs because persistent views remain plan-owned.
         """
         for attr in attrs:
             bufs = getattr(self, attr, None)
@@ -1916,21 +1932,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 for buf in bufs:
                     _wgrad_pool_put(buf)
             for buf in bufs:
-                # Return symm pool buffers (tag-gated no-op for plain and ring buffers).
+                # Return symm pool buffers (tag-gated no-op for ordinary or persistent buffers).
                 # Unconditional on chain kind: free() is captured, so replayed reuse keeps
                 # the eager wait edges, and replays serialize on the launch stream.
                 symmetric_wgrad_pool.free(buf)
             setattr(self, attr, None)
-
-    def _record_graph_wgrad_ring_slots_ready(self) -> None:
-        """Publish that this RS has finished reading its persistent input slots."""
-        seen = set()
-        for weight in self._weights:
-            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
-            if slot is None or id(slot) in seen:
-                continue
-            seen.add(id(slot))
-            slot.ready_event.record()
 
     def _prescale_wgrads_for_mean_rs(self, wgrads):
         """Pre-scale wgrad by 1/gtp_remat so the SUM reduce-scatter yields the gtp_remat mean.
@@ -2085,57 +2091,82 @@ class GTPShardedParam(torch.nn.Parameter):
             return outputs, cm if async_op else None, release_bufs
 
     def _prepare_wgrad_reduce_scatter_inputs(self, wgrads):
-        """Split each wgrad into what the reduce-scatter sends and what to free once it
-        completes -> (send_bufs, release_bufs), both index-aligned with self._weights.
+        """Return RS send buffers and the eager buffers to release after communication.
 
-        Ring slots are sent but never released (their addresses must stay stable across
-        graph replays); the wgrad that fed them is released instead. A symmetric send
-        buffer is both sent and released (ownership transfer). Plain wgrads are sent
-        as-is (padded by copy if needed) and released themselves.
+        During graph capture, the send buffer is a plan-owned persistent view. Registered
+        groups allocate that view from their symmetric-memory domain; ordinary groups use the
+        default domain. Eager registered groups retain the symmetric wgrad pool's LIFO path. The
+        release list never owns a persistent view, so replay cannot accidentally return graph
+        storage to an eager free list.
         """
+        graphed = _chain_is_graphed(self.chain_id)
+        symmetric_group = self.group if is_gtp_symm_pool_registered(self.group) else None
         send_bufs = []
         release_bufs = []
         for weight, wgrad in zip(self._weights, wgrads):
-            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
+            workspace = getattr(weight, "_gtp_graph_wgrad_workspace", None) if graphed else None
+            if workspace is not None:
+                # get_wgrad_tensor already recorded the request and selected the eager/capture
+                # workspace, so do not issue the same persistent request again.
+                padded, logical_view = workspace
+            elif graphed:
+                # A foreign wgrad producer bypassed get_wgrad_tensor. Record during eager
+                # discovery, or obtain its fixed-address RS input during capture.
+                padded = get_graph_persistent_buffer(
+                    weight._unsharded_shape_padded, wgrad.dtype, symmetric_group=symmetric_group
+                )
+                logical_view = None
+            else:
+                padded = None
+                logical_view = None
 
-            if slot is None:
+            weight._gtp_graph_wgrad_workspace = None
 
-                # With symmetric memory registration, send the padded parent tensor of the
-                # logical view that get_wgrad_tensor handed the GEMM.
-                if is_gtp_symm_pool_registered(weight.group):
-                    symm_slot = weight._wgrad_symm_slot
-                    weight._wgrad_symm_slot = None
-                    if symm_slot is None:
-                        # wgrad.dtype on purpose: a foreign wgrad reduce-scatters in its own
-                        # dtype (upstream behavior); main_grad.add_ upcasts on mismatch.
-                        symm_slot = _alloc_symmetric_wgrad_buffer(weight, wgrad.dtype, wgrad.device)
-
-                    # Alias check and copy
-                    if wgrad.data_ptr() != symm_slot.data_ptr():
-                        symm_slot[: weight._unsharded_shape[0]].copy_(wgrad)
-                        if not _chain_is_graphed(self.chain_id):
-                            _wgrad_pool_put(wgrad)
-
-                    send_bufs.append(symm_slot)
-                    release_bufs.append(symm_slot)
-                    continue
-
-                release_bufs.append(wgrad)
+            if padded is not None:
+                # Local-CG capture: copy foreign wgrads when necessary, zero structural padding,
+                # and keep the plan-owned send buffer out of every eager release pool.
+                if logical_view is None:
+                    logical_view = (
+                        padded.narrow(0, 0, weight._unsharded_shape[0])
+                        if weight.pad_length > 0
+                        else padded
+                    )
+                if tuple(wgrad.shape) != tuple(logical_view.shape):
+                    raise RuntimeError(
+                        f"GTP wgrad shape {tuple(wgrad.shape)} does not match persistent view "
+                        f"{tuple(logical_view.shape)} for {weight._debug_name}"
+                    )
+                if wgrad.data_ptr() != logical_view.data_ptr():
+                    logical_view.copy_(wgrad)
                 if weight.pad_length > 0:
-                    wgrad = torch.nn.functional.pad(wgrad, (0, 0, 0, weight.pad_length))
-                send_bufs.append(wgrad)
+                    padded.narrow(0, weight._unsharded_shape[0], weight.pad_length).zero_()
+                send_bufs.append(padded)
                 continue
 
-            register_capture_wgrad_ring_slot(slot, weight)
-            logical_view = weight._gtp_graph_wgrad_ring_view
-            if tuple(wgrad.shape) != tuple(logical_view.shape):
-                raise RuntimeError(
-                    f"GTP wgrad shape {tuple(wgrad.shape)} does not match ring view "
-                    f"{tuple(logical_view.shape)} for {weight._debug_name}"
-                )
-            if wgrad.data_ptr() != logical_view.data_ptr():
-                logical_view.copy_(wgrad)
-            send_bufs.append(slot.tensor)
+            if symmetric_group is not None:
+                # Eager or local-CG discovery with symmetric memory: send the registered padded
+                # parent handed to the GEMM, or allocate one for a foreign producer. Capture
+                # never enters this LIFO path.
+                symm_slot = weight._wgrad_symm_slot
+                weight._wgrad_symm_slot = None
+                if symm_slot is None:
+                    # wgrad.dtype on purpose: a foreign wgrad reduce-scatters in its own dtype;
+                    # main_grad.add_ performs any required upcast.
+                    symm_slot = _alloc_symmetric_wgrad_buffer(weight, wgrad.dtype, wgrad.device)
+                if wgrad.data_ptr() != symm_slot.data_ptr():
+                    symm_slot[: weight._unsharded_shape[0]].copy_(wgrad)
+                    _wgrad_pool_put(wgrad)
+                send_bufs.append(symm_slot)
+                release_bufs.append(symm_slot)
+                continue
+
+            # Ordinary eager or discovery path: pad with a copy only when required, then return
+            # the original GEMM output to its owner after reduce-scatter completes.
+            if weight.pad_length > 0:
+                padded = torch.nn.functional.pad(wgrad, (0, 0, 0, weight.pad_length))
+                send_bufs.append(padded)
+            else:
+                send_bufs.append(wgrad)
             release_bufs.append(wgrad)
 
         return send_bufs, release_bufs
@@ -2637,7 +2668,6 @@ def reset_gtp_state():
     GTPShardedParam._link_tables_flushed = False
     GTPShardedParam._recompute_link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
-    clear_graph_wgrad_rings()
 
 
 # ------------------------------------------------------------------------
