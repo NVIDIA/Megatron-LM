@@ -54,6 +54,53 @@ def test_cp_more_local_than_gtp_remat_rank_layout():
     assert cp_stride < gtp_remat_stride
 
 
+def test_initialize_model_parallel_with_cp_and_gtp_remat():
+    """initialize_model_parallel(context_parallel_size>1, gtp_remat_size>1) together: the actual
+    group-construction path (cp, gtp_remat, dp, dp-cp, gtp_remat-dp-cp, tp-gtp_remat-pp), not
+    just RankGenerator math in isolation.
+    """
+    Utils.destroy_model_parallel()
+    actual_world_size = torch.cuda.device_count()
+    tp_size, cp_size, gtp_remat_size, pp_size = 1, 2, 2, 1
+    denom = tp_size * cp_size * gtp_remat_size * pp_size
+    if actual_world_size % denom != 0:
+        pytest.skip(f"Test requires world_size divisible by {denom}, but got {actual_world_size}")
+    dp_size = actual_world_size // denom
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        gtp_remat_size=gtp_remat_size,
+    )
+
+    order = ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp')
+    rank_generator = ps.RankGenerator(
+        tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order=order, gtp_remat=gtp_remat_size
+    )
+    my_rank = torch.distributed.get_rank()
+
+    def group_ranks(group):
+        return sorted(torch.distributed.get_process_group_ranks(group))
+
+    def expected_group(token):
+        for ranks in rank_generator.get_ranks(token):
+            if my_rank in ranks:
+                return sorted(ranks)
+        raise AssertionError(f"rank {my_rank} not found in any '{token}' group")
+
+    assert group_ranks(ps.get_context_parallel_group()) == expected_group('cp')
+    assert group_ranks(ps.get_gtp_weight_remat_group()) == expected_group('gtp_remat')
+    assert group_ranks(ps.get_data_parallel_group(with_gtp_remat=False)) == expected_group('dp')
+    assert group_ranks(
+        ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False)
+    ) == expected_group('dp-cp')
+    assert group_ranks(
+        ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=True)
+    ) == expected_group('gtp_remat-dp-cp')
+    assert group_ranks(ps.get_model_parallel_group()) == expected_group('tp-gtp_remat-pp')
+
+    Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev

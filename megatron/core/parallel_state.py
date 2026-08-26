@@ -476,7 +476,7 @@ class RankGenerator(object):
         rank_offset: int = 0,
         gtp_remat: int = 1,
     ) -> None:
-        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 are not allowed in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
