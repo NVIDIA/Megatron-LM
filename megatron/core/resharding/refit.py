@@ -279,10 +279,6 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     core = unwrap_model(lm)
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
-    grouped_gemm_backend = getattr(
-        lm.config.inference_grouped_gemm_backend, "value", lm.config.inference_grouped_gemm_backend
-    )
-
     # 1. Compute which parameters are eligible for MXFP8 conversion.
     #    Must be done while params are still visible as nn.Parameter (BF16).
     convertible: set[str] = set()
@@ -294,11 +290,7 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
     # representation. The reshard transform updates those canonical buffers, then
     # ``refresh_flashinfer_mxfp8_weights`` refreshes the derived buffers in place.
-    backend = (
-        "triton"
-        if grouped_gemm_backend == "flashinfer"
-        else resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
-    )
+    backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
     persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
     # 3. Build the transform and attach it to the plan.

@@ -112,19 +112,7 @@ def get_model_for_inference() -> MegatronModule:
     model.eval()
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
-        grouped_gemm_backend = getattr(
-            args.inference_grouped_gemm_backend,
-            "value",
-            args.inference_grouped_gemm_backend,
-        )
-        if grouped_gemm_backend == "flashinfer":
-            # The routed MoE path repacks expert weights from MCore's Triton/cublas
-            # representation. Keep non-MoE MXFP8 linears on that representation too:
-            # FlashInfer's generic mm_mxfp8 is not available on every architecture
-            # supported by its routed-MoE kernel.
-            quant_backend = "triton"
-        else:
-            quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
+        quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
         quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
 

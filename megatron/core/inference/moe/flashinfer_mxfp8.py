@@ -31,17 +31,17 @@ _LOGGED_TOKEN_POLICIES: set[tuple[str, int, int | None, int]] = set()
 
 
 def require_flashinfer_routed_mxfp8() -> None:
-    """Raise a precise error when routed MXFP8 APIs are unavailable."""
+    """Raise an error when routed MXFP8 APIs are unavailable."""
     if not HAVE_FLASHINFER_ROUTED_MXFP8:
         raise RuntimeError(
-            "FlashInfer routed MXFP8 MoE requires a FlashInfer release that provides "
+            "FlashInfer routed MXFP8 MoE requires FlashInfer >= 0.6.4 which provides "
             "mxfp8_quantize, shuffled Major-K weights, and "
             "trtllm_fp8_block_scale_routed_moe. Upgrade flashinfer-python or select a "
             "different inference_grouped_gemm_backend."
         ) from _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR
 
 
-@dataclass
+@dataclass(frozen=True)
 class FlashInferRoutedMXFP8Weight:
     """An expert-weight stack in TRT-LLM Major-K MXFP8 layout."""
 
@@ -102,6 +102,8 @@ def _block_scale_interleave(scale: torch.Tensor) -> torch.Tensor:
 def _shuffle_routed_scale(scale: torch.Tensor) -> torch.Tensor:
     """Convert a logical UE8M0 scale matrix to TRT-LLM Major-K byte layout."""
     scale_u8 = scale.contiguous().view(torch.uint8)
+    # Avoid FlashInfer's architecture-dispatched convenience wrapper: this
+    # permutation and interleave are architecture-independent.
     row_indices = get_shuffle_matrix_sf_a_row_indices(scale_u8, 128).to(scale.device)
     return _block_scale_interleave(scale_u8[row_indices]).contiguous().view(torch.uint8)
 
@@ -200,6 +202,7 @@ def pack_routed_mxfp8_routing(
 
 
 def _unwrap_output(output) -> torch.Tensor:
+    """Normalize FlashInfer's 0.6.x tensor/list return variants."""
     if isinstance(output, (list, tuple)):
         return output[0]
     return output
@@ -363,27 +366,24 @@ def flashinfer_routed_mxfp8_moe(
                 decode_token_upper_bound,
             )
 
-    def _invoke_rows(row_count: int) -> torch.Tensor:
-        selected_hidden_states = hidden_states[:row_count]
-        selected_routing_map = routing_map[:row_count]
-        selected_probabilities = probabilities[:row_count]
-        quantized_hidden, hidden_scale = quantize_routed_mxfp8_input(
-            selected_hidden_states, fc1_weight.padded_cols
-        )
-        packed_routing = pack_routed_mxfp8_routing(selected_routing_map, selected_probabilities)
-        return flashinfer_routed_mxfp8_moe_prequantized(
-            quantized_hidden,
-            hidden_scale,
-            packed_routing,
-            fc1_weight,
-            fc2_weight,
-            num_experts=num_experts,
-            local_expert_offset=local_expert_offset,
-            top_k=selected_routing_map.shape[1],
-            activation_type=activation_type,
-        )
-
-    output = _invoke_rows(active_rows)
+    selected_hidden_states = hidden_states[:active_rows]
+    selected_routing_map = routing_map[:active_rows]
+    selected_probabilities = probabilities[:active_rows]
+    quantized_hidden, hidden_scale = quantize_routed_mxfp8_input(
+        selected_hidden_states, fc1_weight.padded_cols
+    )
+    packed_routing = pack_routed_mxfp8_routing(selected_routing_map, selected_probabilities)
+    output = flashinfer_routed_mxfp8_moe_prequantized(
+        quantized_hidden,
+        hidden_scale,
+        packed_routing,
+        fc1_weight,
+        fc2_weight,
+        num_experts=num_experts,
+        local_expert_offset=local_expert_offset,
+        top_k=selected_routing_map.shape[1],
+        activation_type=activation_type,
+    )
 
     if out is not None:
         if out.shape[0] < output.shape[0] or out.shape[1:] != output.shape[1:]:
