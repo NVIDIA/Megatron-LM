@@ -450,6 +450,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             packed_seq_params=packed_seq_params,
             mhc_recompute_manager=mhc_recompute_manager,
         )
+        # This fast path bypasses TransformerLayer._forward_post_mlp(), which normally
+        # discards the selective pre-MLP layernorm checkpoint before MLP backward.
+        if layer.recompute_pre_mlp_layernorm or (
+            mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
+        ):
+            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                output_with_bias[0]
+            )
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]

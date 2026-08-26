@@ -1,9 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from copy import deepcopy
+
 import pytest
 import torch
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TEDotProductAttention,
+    TENorm,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -44,6 +50,22 @@ class TestHybridBlock:
 
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
+    @staticmethod
+    def _non_fused_norm_submodules():
+        """Un-fuse the TE layernorm+linear pairs so the explicit norm modules exist.
+
+        The default dense hybrid spec folds each norm into the following TE linear,
+        leaving IdentityOp placeholders that cannot exercise the norm checkpoints.
+        """
+        submodules = deepcopy(hybrid_stack_spec.submodules)
+        attention_submodules = submodules.attention_layer.submodules
+        attention_submodules.input_layernorm = TENorm
+        attention_submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+        mlp_submodules = submodules.mlp_layer.submodules
+        mlp_submodules.pre_mlp_layernorm = TENorm
+        mlp_submodules.mlp.keywords["submodules"].linear_fc1 = TEColumnParallelLinear
+        return submodules
 
     def get_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
@@ -475,6 +497,124 @@ class TestHybridBlock:
         assert len(managers) == len(block.layers)
         assert all(manager is not None for manager in managers)
         assert block_ends[-1] is True
+
+    @pytest.mark.timeout(60)
+    def test_hyper_connection_mhc_recompute_bitwise(self):
+        """mHC selective recompute is bitwise identical to the eager path."""
+        seed = 123
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        layer_type_list = validate_segment_layers(layer_pattern)
+        arch_kwargs = dict(
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+            add_bias_linear=False,
+        )
+
+        def build_block(**recompute_kwargs):
+            model_parallel_cuda_manual_seed(seed)
+            torch.manual_seed(seed)
+            config = TransformerConfig(
+                hidden_size=256,
+                num_layers=len(layer_type_list),
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                **arch_kwargs,
+                **recompute_kwargs,
+            )
+            return HybridStack(
+                config,
+                self._non_fused_norm_submodules(),
+                layer_type_list=layer_type_list,
+                pp_layer_offset=0,
+                pg_collection=self.get_pg_collection(),
+            ).cuda()
+
+        torch.manual_seed(seed)
+        hidden_states = torch.randn(32, 2, 256, device="cuda")
+        attention_mask = torch.ones((2, 1, 32, 32), dtype=bool, device="cuda")
+
+        def run(block, inputs):
+            block.train()
+            output = block(inputs, attention_mask=attention_mask)
+            output.float().sum().backward()
+            grads = {
+                name: param.grad.detach().float().cpu()
+                for name, param in block.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().float().cpu(), grads
+
+        baseline = build_block()
+        baseline_output, baseline_grads = run(
+            baseline, hidden_states.detach().clone().requires_grad_()
+        )
+        del baseline
+        torch.cuda.empty_cache()
+
+        recomputed = build_block(recompute_granularity="selective", recompute_modules=["mhc"])
+        attention_layer = recomputed.layers[1].inner_layer
+        mlp_layer = recomputed.layers[2].inner_layer
+        assert attention_layer.mhc_checkpoint_input_layernorm
+        assert mlp_layer.mhc_checkpoint_pre_mlp_layernorm
+
+        recomputed_output, recomputed_grads = run(
+            recomputed, hidden_states.detach().clone().requires_grad_()
+        )
+
+        assert torch.equal(recomputed_output, baseline_output)
+        assert set(recomputed_grads) == set(baseline_grads)
+        for name, baseline_grad in baseline_grads.items():
+            assert torch.equal(recomputed_grads[name], baseline_grad), name
+
+        for checkpoint in (
+            attention_layer.input_layernorm_checkpoint,
+            mlp_layer.pre_mlp_norm_checkpoint,
+        ):
+            assert checkpoint in checkpoint.ckpt_manager.checkpoints
+            assert checkpoint.ctx is None
+            assert checkpoint.outputs is None
+
+    @pytest.mark.timeout(60)
+    def test_hyper_connection_mlp_fast_path_discards_layernorm_checkpoint(self):
+        """The hybrid mHC MLP fast path releases selective layernorm activations."""
+        layer_type_list = validate_segment_layers(Symbols.MLP)
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
+        )
+        block = HybridStack(
+            config,
+            self._non_fused_norm_submodules(),
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        ).cuda()
+        block.train()
+
+        hidden_states = torch.randn(
+            8, 2, block.config.hidden_size, device="cuda", requires_grad=True
+        )
+        output = block(hidden_states, attention_mask=None)
+
+        layer = block.layers[0]
+        assert isinstance(layer, HyperConnectionHybridLayer)
+        inner_layer = layer.inner_layer
+        assert inner_layer.recompute_pre_mlp_layernorm
+        checkpoint = inner_layer.pre_mlp_norm_checkpoint
+        assert checkpoint.ckpt_manager is None
+        assert checkpoint.outputs[0].untyped_storage().nbytes() == 0
+
+        output.sum().backward()
+        assert checkpoint.ctx is None
+        assert checkpoint.outputs is None
 
     def test_hyper_connection_gpu_forward(self):
         """mHC-enabled HybridStack expands internally and contracts back at the output."""
