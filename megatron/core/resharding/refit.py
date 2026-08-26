@@ -286,10 +286,10 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
         if _should_quantize_param(param):
             convertible.add(f"decoder.{name}")
 
-    # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
+    # 2. Quantize decoder weights -> persistent MXFP8Tensor buffers.
     # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
     # representation. The reshard transform updates those canonical buffers, then
-    # ``refresh_flashinfer_mxfp8_weights`` refreshes the derived buffers in place.
+    # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
     backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
     persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
@@ -518,6 +518,6 @@ def reshard_model_weights(
                 refresh()
                 refreshed = True
         if refreshed:
-            # Refit is already a synchronized operation. Keep the derived-weight
-            # refresh complete before callers replay graphs on another stream.
+            # Repacking is asynchronous. Synchronize before another stream replays graphs
+            # that read these derived weight buffers.
             torch.cuda.synchronize()
