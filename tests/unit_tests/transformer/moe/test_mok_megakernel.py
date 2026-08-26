@@ -112,7 +112,7 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     module.is_first_microbatch = True
     module._prepared_routed_weight_cache = None
     module.routed_fc1_weight = object()
-    module.routed_down_weight = object()
+    module.routed_fc2_weight = object()
     module.num_local_experts = 2
     module.intermediate_size = 128
     module.hidden_size = 256
@@ -161,12 +161,12 @@ def _split_module(*, use_mxfp8_weights):
     module.intermediate_size = 4
     module.hidden_size = 8
     module._routed_fc1_parameter_names = ("routed_fc1_weight0", "routed_fc1_weight1")
-    module._routed_down_parameter_names = ("routed_down_weight0", "routed_down_weight1")
+    module._routed_fc2_parameter_names = ("routed_fc2_weight0", "routed_fc2_weight1")
     for name in module._routed_fc1_parameter_names:
         module.register_parameter(
             name, torch.nn.Parameter(torch.randn((8, 8), dtype=torch.bfloat16))
         )
-    for name in module._routed_down_parameter_names:
+    for name in module._routed_fc2_parameter_names:
         module.register_parameter(
             name, torch.nn.Parameter(torch.randn((8, 4), dtype=torch.bfloat16))
         )
@@ -400,12 +400,12 @@ def test_native_single_grouped_bf16_views_use_rowwise_storage(monkeypatch):
     ]
 
 
-def _shared_module(fc1_weight, down_weight):
+def _shared_module(fc1_weight, fc2_weight):
     shared = torch.nn.Module()
     shared.linear_fc1 = torch.nn.Module()
     shared.linear_fc2 = torch.nn.Module()
     shared.linear_fc1.register_parameter("weight", fc1_weight)
-    shared.linear_fc2.register_parameter("weight", down_weight)
+    shared.linear_fc2.register_parameter("weight", fc2_weight)
     return shared
 
 
@@ -427,7 +427,7 @@ def test_register_shared_weights_reuses_native_bf16_combined_parameters():
     gate, up, actual_down = module.shared_weight_views()
 
     assert module.shared_fc1_weight is fc1
-    assert module.shared_down_weight is down
+    assert module.shared_fc2_weight is down
     assert shared.linear_fc1.weight is fc1
     assert shared.linear_fc2.weight is down
     assert gate.untyped_storage().data_ptr() == fc1.untyped_storage().data_ptr()
@@ -457,7 +457,7 @@ def test_combined_shared_main_grad_is_split_into_zero_copy_mok_views(monkeypatch
     for param in module.autograd_routed_parameters:
         param.main_grad = torch.zeros_like(param, dtype=torch.float32)
     module.shared_fc1_weight = _parameter_with_main_grad((8, 8))
-    module.shared_down_weight = _parameter_with_main_grad((8, 4))
+    module.shared_fc2_weight = _parameter_with_main_grad((8, 4))
 
     monkeypatch.setattr(ops, "make_routed_d_weight_storage_table", lambda grads: tuple(grads))
     main_grads, _ = module.main_grad_arguments()
@@ -471,7 +471,7 @@ def test_combined_shared_main_grad_is_split_into_zero_copy_mok_views(monkeypatch
     )
     assert main_grads[0].storage_offset() == 0
     assert main_grads[2].storage_offset() == 4 * 8
-    assert main_grads[4] is module.shared_down_weight.main_grad
+    assert main_grads[4] is module.shared_fc2_weight.main_grad
 
 
 @pytest.mark.parametrize("single_grouped", [False, True])
@@ -490,26 +490,26 @@ def test_native_checkpoint_load_uses_only_canonical_weights(single_grouped):
     experts.linear_fc2 = torch.nn.Module()
     if single_grouped:
         routed_fc1 = torch.nn.Parameter(torch.zeros((2, 8, 8)))
-        routed_down = torch.nn.Parameter(torch.zeros((2, 8, 4)))
+        routed_fc2 = torch.nn.Parameter(torch.zeros((2, 8, 4)))
         experts.linear_fc1.register_parameter("weight", routed_fc1)
-        experts.linear_fc2.register_parameter("weight", routed_down)
+        experts.linear_fc2.register_parameter("weight", routed_fc2)
         routed_checkpoint = {
             "experts.linear_fc1.weight": torch.full_like(routed_fc1, 3.0),
-            "experts.linear_fc2.weight": torch.full_like(routed_down, 5.0),
+            "experts.linear_fc2.weight": torch.full_like(routed_fc2, 5.0),
         }
     else:
         routed_fc1 = torch.nn.Parameter(torch.zeros((8, 8)))
-        routed_down = torch.nn.Parameter(torch.zeros((8, 4)))
+        routed_fc2 = torch.nn.Parameter(torch.zeros((8, 4)))
         experts.linear_fc1.register_parameter("weight0", routed_fc1)
-        experts.linear_fc2.register_parameter("weight0", routed_down)
+        experts.linear_fc2.register_parameter("weight0", routed_fc2)
         routed_checkpoint = {
             "experts.linear_fc1.weight0": torch.full_like(routed_fc1, 3.0),
-            "experts.linear_fc2.weight0": torch.full_like(routed_down, 5.0),
+            "experts.linear_fc2.weight0": torch.full_like(routed_fc2, 5.0),
         }
 
     shared_fc1 = torch.nn.Parameter(torch.zeros((8, 8)))
-    shared_down = torch.nn.Parameter(torch.zeros((8, 4)))
-    shared = _shared_module(shared_fc1, shared_down)
+    shared_fc2 = torch.nn.Parameter(torch.zeros((8, 4)))
+    shared = _shared_module(shared_fc1, shared_fc2)
 
     mok = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
     torch.nn.Module.__init__(mok)
@@ -519,14 +519,14 @@ def test_native_checkpoint_load_uses_only_canonical_weights(single_grouped):
     mok.is_first_microbatch = False
     if single_grouped:
         mok.register_parameter("routed_fc1_weight", routed_fc1)
-        mok.register_parameter("routed_down_weight", routed_down)
+        mok.register_parameter("routed_fc2_weight", routed_fc2)
     else:
         mok._routed_fc1_parameter_names = ("routed_fc1_weight0",)
-        mok._routed_down_parameter_names = ("routed_down_weight0",)
+        mok._routed_fc2_parameter_names = ("routed_fc2_weight0",)
         mok.register_parameter("routed_fc1_weight0", routed_fc1)
-        mok.register_parameter("routed_down_weight0", routed_down)
+        mok.register_parameter("routed_fc2_weight0", routed_fc2)
     mok.register_parameter("shared_fc1_weight", shared_fc1)
-    mok.register_parameter("shared_down_weight", shared_down)
+    mok.register_parameter("shared_fc2_weight", shared_fc2)
 
     parent = torch.nn.Module()
     parent.add_module("experts", experts)
@@ -535,15 +535,15 @@ def test_native_checkpoint_load_uses_only_canonical_weights(single_grouped):
     checkpoint = {
         **routed_checkpoint,
         "shared_experts.linear_fc1.weight": torch.full_like(shared_fc1, 7.0),
-        "shared_experts.linear_fc2.weight": torch.full_like(shared_down, 11.0),
+        "shared_experts.linear_fc2.weight": torch.full_like(shared_fc2, 11.0),
     }
 
     parent.load_state_dict(checkpoint, strict=True)
 
     torch.testing.assert_close(routed_fc1, next(iter(routed_checkpoint.values())))
-    torch.testing.assert_close(routed_down, tuple(routed_checkpoint.values())[1])
+    torch.testing.assert_close(routed_fc2, tuple(routed_checkpoint.values())[1])
     torch.testing.assert_close(shared_fc1, checkpoint["shared_experts.linear_fc1.weight"])
-    torch.testing.assert_close(shared_down, checkpoint["shared_experts.linear_fc2.weight"])
+    torch.testing.assert_close(shared_fc2, checkpoint["shared_experts.linear_fc2.weight"])
     assert mok._prepared_routed_weight_cache is None
     assert mok._split_main_grad_descriptor_cache is None
     assert mok.is_first_microbatch

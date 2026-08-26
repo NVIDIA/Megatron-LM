@@ -36,8 +36,8 @@ class _MoKAutograd(torch.autograd.Function):
                 f"got {len(parameters)}, expected {num_routed_parameters + 2}"
             )
         routed_parameters = parameters[:num_routed_parameters]
-        shared_fc1, shared_down = parameters[num_routed_parameters:]
-        shared_gate, shared_up, shared_down = module.shared_weight_views(shared_fc1, shared_down)
+        shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
+        shared_gate, shared_up, shared_down = module.shared_weight_views(shared_fc1, shared_fc2)
 
         workspace = functional.get_workspace(
             module.mok_config,
@@ -79,7 +79,7 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.schedule = schedule
         ctx.forward_context = forward_context
         ctx.quantized_weights = (prepared_gate, prepared_up, prepared_down)
-        ctx.save_for_backward(x, router_weights, *routed_parameters, shared_fc1, shared_down)
+        ctx.save_for_backward(x, router_weights, *routed_parameters, shared_fc1, shared_fc2)
         return output
 
     @staticmethod
@@ -88,9 +88,9 @@ class _MoKAutograd(torch.autograd.Function):
 
         x, router_weights, *parameters = ctx.saved_tensors
         num_routed_parameters = len(ctx.module.autograd_routed_parameters)
-        shared_fc1, shared_down = parameters[num_routed_parameters:]
+        shared_fc1, shared_fc2 = parameters[num_routed_parameters:]
         shared_gate, shared_up, shared_down = ctx.module.shared_weight_views(
-            shared_fc1, shared_down
+            shared_fc1, shared_fc2
         )
         prepared_gate, prepared_up, prepared_down = ctx.quantized_weights
         if ctx.module.use_mxfp8_weights and ctx.module.native_single_grouped_weights:
@@ -137,12 +137,13 @@ class _MoKAutograd(torch.autograd.Function):
         if ctx.module.fuse_wgrad_accumulation:
             routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
             d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
-            d_shared_down = _finish_weight_gradient(ctx.module.shared_down_weight)
+            d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
         else:
             # Materialized routed gradients are only supported by the original
             # dense/single-grouped interface.
             routed_parameter_grads = (d_routed_gate, d_routed_down)
             d_shared_fc1 = torch.cat((d_shared_gate, d_shared_up), dim=0)
+            d_shared_fc2 = d_shared_down
 
         ctx.module = None
         ctx.workspace = None
@@ -156,5 +157,5 @@ class _MoKAutograd(torch.autograd.Function):
             None,
             *routed_parameter_grads,
             d_shared_fc1,
-            d_shared_down,
+            d_shared_fc2,
         )

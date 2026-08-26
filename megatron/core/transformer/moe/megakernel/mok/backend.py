@@ -111,7 +111,7 @@ class MoKMegakernel(MegakernelBackend):
             # pre-hook waits for their overlap-param-gather buckets. named_parameters
             # deduplicates them; no additional payload storage is allocated.
             self.register_parameter("routed_fc1_weight", fc1.weight)
-            self.register_parameter("routed_down_weight", fc2.weight)
+            self.register_parameter("routed_fc2_weight", fc2.weight)
         else:
             # Keep each native MCore expert parameter authoritative. MOK selects
             # its per-expert TMA descriptor inside the grouped-GEMM task, so no
@@ -119,24 +119,24 @@ class MoKMegakernel(MegakernelBackend):
             # required. The aliases let MOK participate in parameter-gather hooks;
             # the source expert module remains registered as the canonical owner.
             self._routed_fc1_parameter_names = []
-            self._routed_down_parameter_names = []
+            self._routed_fc2_parameter_names = []
             for expert_idx in range(self.num_local_experts):
                 fc1_param = _indexed_grouped_weight(fc1, expert_idx, self.num_local_experts)
-                down_param = _indexed_grouped_weight(fc2, expert_idx, self.num_local_experts)
+                fc2_param = _indexed_grouped_weight(fc2, expert_idx, self.num_local_experts)
                 if not isinstance(fc1_param, nn.Parameter) or not isinstance(
-                    down_param, nn.Parameter
+                    fc2_param, nn.Parameter
                 ):
                     raise RuntimeError(
                         "MOK non-single integration requires registered per-expert Parameters"
                     )
                 fc1_name = f"routed_fc1_weight{expert_idx}"
-                down_name = f"routed_down_weight{expert_idx}"
+                fc2_name = f"routed_fc2_weight{expert_idx}"
                 self.register_parameter(fc1_name, fc1_param)
-                self.register_parameter(down_name, down_param)
+                self.register_parameter(fc2_name, fc2_param)
                 self._routed_fc1_parameter_names.append(fc1_name)
-                self._routed_down_parameter_names.append(down_name)
+                self._routed_fc2_parameter_names.append(fc2_name)
             self._routed_fc1_parameter_names = tuple(self._routed_fc1_parameter_names)
-            self._routed_down_parameter_names = tuple(self._routed_down_parameter_names)
+            self._routed_fc2_parameter_names = tuple(self._routed_fc2_parameter_names)
 
         self._register_shared_weights(shared_experts)
 
@@ -153,40 +153,40 @@ class MoKMegakernel(MegakernelBackend):
         return tuple(getattr(self, name) for name in self._routed_fc1_parameter_names)
 
     @property
-    def routed_down_parameters(self) -> tuple[nn.Parameter, ...]:
+    def routed_fc2_parameters(self) -> tuple[nn.Parameter, ...]:
         if self.native_single_grouped_weights:
-            return (self.routed_down_weight,)
-        return tuple(getattr(self, name) for name in self._routed_down_parameter_names)
+            return (self.routed_fc2_weight,)
+        return tuple(getattr(self, name) for name in self._routed_fc2_parameter_names)
 
     @property
     def autograd_routed_parameters(self) -> tuple[nn.Parameter, ...]:
-        return self.routed_fc1_parameters + self.routed_down_parameters
+        return self.routed_fc1_parameters + self.routed_fc2_parameters
 
     def shared_weight_views(
-        self, fc1: torch.Tensor | None = None, down: torch.Tensor | None = None
+        self, fc1: torch.Tensor | None = None, fc2: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Split native combined FC1 into zero-copy gate/up views for MOK."""
         fc1 = self.shared_fc1_weight if fc1 is None else fc1
-        down = self.shared_down_weight if down is None else down
+        fc2 = self.shared_fc2_weight if fc2 is None else fc2
         i, h = self.intermediate_size, self.hidden_size
-        if tuple(fc1.shape) != (2 * i, h) or tuple(down.shape) != (h, i):
+        if tuple(fc1.shape) != (2 * i, h) or tuple(fc2.shape) != (h, i):
             raise RuntimeError(
                 "MOK shared weight shape mismatch: expected "
                 f"{(2 * i, h)} and {(h, i)}, got "
-                f"{tuple(fc1.shape)} and {tuple(down.shape)}"
+                f"{tuple(fc1.shape)} and {tuple(fc2.shape)}"
             )
-        if not fc1.is_contiguous() or not down.is_contiguous():
+        if not fc1.is_contiguous() or not fc2.is_contiguous():
             raise RuntimeError("MOK shared weights must use contiguous native storage")
-        return fc1.narrow(0, 0, i), fc1.narrow(0, i, i), down
+        return fc1.narrow(0, 0, i), fc1.narrow(0, i, i), fc2
 
     def main_grad_arguments(self):
         """Return MOK logical main grads and optional per-expert descriptors."""
         shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
         shared_gate_grad, shared_up_grad, shared_down_grad = self.shared_weight_views(
-            shared_fc1_grad, _main_grad_buffer(self.shared_down_weight)
+            shared_fc1_grad, _main_grad_buffer(self.shared_fc2_weight)
         )
         fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
-        down_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_down_parameters)
+        fc2_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc2_parameters)
         # MCore combines routed gate/up in one FC1 main-grad; MOK receives the same
         # representative twice and distinguishes them by row offset and expert descriptor.
         main_grads = (
@@ -195,7 +195,7 @@ class MoKMegakernel(MegakernelBackend):
             shared_up_grad,
             fc1_main_grads[0],
             shared_down_grad,
-            down_main_grads[0],
+            fc2_main_grads[0],
         )
         if self.native_single_grouped_weights:
             return main_grads, None
@@ -204,17 +204,17 @@ class MoKMegakernel(MegakernelBackend):
 
         fingerprint = tuple(
             (grad.data_ptr(), grad.dtype, tuple(grad.shape))
-            for grad in fc1_main_grads + down_main_grads
+            for grad in fc1_main_grads + fc2_main_grads
         )
         if (
             self._split_main_grad_descriptor_cache is None
             or self._split_main_grad_descriptor_cache[0] != fingerprint
         ):
             fc1_table = ops.make_routed_d_weight_storage_table(list(fc1_main_grads))
-            down_table = ops.make_routed_d_weight_storage_table(list(down_main_grads))
+            fc2_table = ops.make_routed_d_weight_storage_table(list(fc2_main_grads))
             self._split_main_grad_descriptor_cache = (
                 fingerprint,
-                (fc1_table, fc1_table, down_table),
+                (fc1_table, fc1_table, fc2_table),
             )
         return main_grads, self._split_main_grad_descriptor_cache[1]
 
@@ -225,34 +225,34 @@ class MoKMegakernel(MegakernelBackend):
     def _register_shared_weights(self, shared: nn.Module) -> None:
         """Validate and alias MCore-owned native BF16 shared weights."""
         fc1_ref = shared.linear_fc1.weight
-        down_ref = shared.linear_fc2.weight
+        fc2_ref = shared.linear_fc2.weight
         from megatron.core.fp8_utils import is_float8tensor
 
         i, h = self.intermediate_size, self.hidden_size
-        if not isinstance(fc1_ref, nn.Parameter) or not isinstance(down_ref, nn.Parameter):
+        if not isinstance(fc1_ref, nn.Parameter) or not isinstance(fc2_ref, nn.Parameter):
             raise RuntimeError("MOK shared FC1 and FC2 must be MCore-owned Parameters")
-        if tuple(fc1_ref.shape) != (2 * i, h) or tuple(down_ref.shape) != (h, i):
+        if tuple(fc1_ref.shape) != (2 * i, h) or tuple(fc2_ref.shape) != (h, i):
             raise RuntimeError(
                 "MOK requires native combined shared FC1/FC2 shapes "
                 f"{(2 * i, h)} and {(h, i)}, got "
-                f"{tuple(fc1_ref.shape)} and {tuple(down_ref.shape)}"
+                f"{tuple(fc1_ref.shape)} and {tuple(fc2_ref.shape)}"
             )
         if (
             is_float8tensor(fc1_ref)
-            or is_float8tensor(down_ref)
+            or is_float8tensor(fc2_ref)
             or fc1_ref.dtype != torch.bfloat16
-            or down_ref.dtype != torch.bfloat16
+            or fc2_ref.dtype != torch.bfloat16
         ):
             raise RuntimeError(
                 "MOK shared FC1 and FC2 must be constructed as native BF16 parameters"
             )
-        if not fc1_ref.is_contiguous() or not down_ref.is_contiguous():
+        if not fc1_ref.is_contiguous() or not fc2_ref.is_contiguous():
             raise RuntimeError("MOK shared FC1 and FC2 parameters must be contiguous")
 
         # These are aliases, not extra ownership. The native shared_experts
         # module remains registered and emits the canonical checkpoint entries.
         self.register_parameter("shared_fc1_weight", fc1_ref)
-        self.register_parameter("shared_down_weight", down_ref)
+        self.register_parameter("shared_fc2_weight", fc2_ref)
 
     @torch.no_grad()
     def quantized_routed_weights(self):
@@ -266,7 +266,7 @@ class MoKMegakernel(MegakernelBackend):
                     use_mxfp8=self.use_mxfp8_weights,
                 )
                 prepared_down = _native_split_weight_view(
-                    self.routed_down_parameters,
+                    self.routed_fc2_parameters,
                     rows=self.hidden_size,
                     columns=self.intermediate_size,
                     use_mxfp8=self.use_mxfp8_weights,
@@ -282,7 +282,7 @@ class MoKMegakernel(MegakernelBackend):
                 )
                 _refresh_native_split_weight_scales(
                     prepared_down,
-                    self.routed_down_parameters,
+                    self.routed_fc2_parameters,
                     rows=self.hidden_size,
                     columns=self.intermediate_size,
                 )
@@ -293,7 +293,7 @@ class MoKMegakernel(MegakernelBackend):
             self.is_first_microbatch = False
             return _native_single_grouped_weight_views(
                 self.routed_fc1_weight,
-                self.routed_down_weight,
+                self.routed_fc2_weight,
                 num_experts=self.num_local_experts,
                 intermediate_size=self.intermediate_size,
                 hidden_size=self.hidden_size,
@@ -303,7 +303,7 @@ class MoKMegakernel(MegakernelBackend):
         if self._prepared_routed_weight_cache is None or self.is_first_microbatch:
             native_gate, _, native_down = _native_single_grouped_weight_views(
                 self.routed_fc1_weight,
-                self.routed_down_weight,
+                self.routed_fc2_weight,
                 num_experts=self.num_local_experts,
                 intermediate_size=self.intermediate_size,
                 hidden_size=self.hidden_size,
@@ -360,6 +360,6 @@ class MoKMegakernel(MegakernelBackend):
             top_experts,
             *self.autograd_routed_parameters,
             self.shared_fc1_weight,
-            self.shared_down_weight,
+            self.shared_fc2_weight,
         )
         return output.view(original_shape)
