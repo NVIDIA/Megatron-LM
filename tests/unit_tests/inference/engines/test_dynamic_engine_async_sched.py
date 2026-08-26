@@ -1990,8 +1990,8 @@ def test_async_compaction_preserves_all_request_metadata():
     assert torch.equal(controller._async_sched_logits.token_row_indices, torch.tensor([0, 1, 4, 5]))
 
 
-def test_post_process_skips_logprobs_for_opted_out_request():
-    """A mixed async batch must not append step-level logprobs to an opted-out request."""
+def test_post_process_enforces_per_request_logprob_policy():
+    """Post-processing must honor opt-outs and require requested logprobs."""
     requests = []
     for request_id, return_log_probs in enumerate((True, False)):
         request = DynamicInferenceRequest(
@@ -2035,6 +2035,18 @@ def test_post_process_skips_logprobs_for_opted_out_request():
     assert requests[0].generated_log_probs == [-1.0]
     assert requests[1].prompt_log_probs is None
     assert requests[1].generated_log_probs is None
+
+    with pytest.raises(AssertionError, match="requested log probs, but none were produced"):
+        engine.post_process_requests(
+            request_ids=torch.tensor([0], dtype=torch.int64),
+            finished_request_ids=torch.empty(0, dtype=torch.int64),
+            evict_request_ids=None,
+            step_time=0.0,
+            sample=torch.tensor([33], dtype=torch.int64),
+            accepted_tokens=None,
+            log_probs=None,
+            consumed_chunked_prefill_request_id=-1,
+        )
 
 
 def test_async_negative_routing_replay():
