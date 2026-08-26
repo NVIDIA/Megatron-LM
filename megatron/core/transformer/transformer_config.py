@@ -403,12 +403,14 @@ class TransformerConfig(ModelParallelConfig):
     Eligibility is a RUN-LEVEL
     INVARIANT: enabling the flag requires the fused backend and the alignment condition at
     config validation, and a pack that violates per-sequence or tail divisibility raises at
-    data-prep/dispatch time instead of falling back — the fused kernel package silently
-    corrupts fused calls whose row shape differs from earlier calls, so balanced/reference
-    switching between microbatches is forbidden. The per-process fused-call row pin
-    additionally requires a fixed pack capacity (varying eager-varlen capacity raises).
-    Whether balancing is worthwhile for a workload is decided once, at recipe level, by
-    this flag.
+    data-prep/dispatch time instead of falling back. Pack capacity may vary between eager
+    microbatches — fused-call shape variation is verified safe below the kernel row limit.
+    The current fused kernel package silently corrupts any fused call above 32768 query
+    rows that is not the process's first fused call (verified on cudnn-frontend 1.26.0),
+    so calls above that limit are rejected: the balanced two-half-call path supports
+    per-rank capacities up to 2 * 32768 rows, and the reference full-row path falls back
+    to the unfused implementation above 32768 rows. Whether balancing is worthwhile for a
+    workload is decided once, at recipe level, by this flag.
     Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
     history sees fewer recordings than the reference during eval (training forwards identical).
     CUDA-graph support in this PR is scoped to STATIC pack compositions with

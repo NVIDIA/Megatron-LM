@@ -6,6 +6,7 @@ and indexer top-k metadata. It reuses MCore's fused MLA RoPE and calls the
 retained compaction kernel; ``csa.py`` calls final-index lowering directly.
 """
 
+import logging
 import math
 from typing import Optional, Tuple
 
@@ -301,6 +302,20 @@ def _build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
+# Verified defect in the fused indexer kernel package (measured on cudnn-frontend
+# 1.26.0, GB200; no known-good version demonstrated yet): a fused top-k call with
+# more than this many query rows is silently corrupted from row 32768 on unless it
+# is the process's FIRST fused call. The predecessor's shape is irrelevant (a
+# bit-identical predecessor also triggers it) and calls at or below the limit are
+# immune to process history entirely — see the WORKSPACE NOTE in
+# tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py for the
+# controlled matrix. Fail closed here until a fixed kernel package is verified;
+# non-CP call sites (dsa.py) need the same backend-wide guard as a follow-up.
+FUSED_INDEXER_MAX_SAFE_ROWS = 32768
+
+_ROW_LIMIT_FALLBACK_WARNED = False
+
+
 def compute_cp_indexer_topk(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -332,6 +347,32 @@ def compute_cp_indexer_topk(
     the tuple as metadata only — passing a synthetic layout that differs from that recomputation
     together with ``use_fused=False`` silently mis-masks and is unsupported.
     """
+    if use_fused and int(q_indexer_local.shape[0]) > FUSED_INDEXER_MAX_SAFE_ROWS:
+        # See FUSED_INDEXER_MAX_SAFE_ROWS: above the limit the fused kernel is only
+        # correct as the process's first fused call, which no caller can guarantee.
+        if prebuilt_layout is not None:
+            raise RuntimeError(
+                f"fused indexer top-k with {int(q_indexer_local.shape[0])} query rows "
+                f"exceeds the verified-safe limit of {FUSED_INDEXER_MAX_SAFE_ROWS} for "
+                "the current fused kernel package (silent corruption of rows >= 32768 "
+                "unless first-in-process; verified on cudnn-frontend 1.26.0, no "
+                "known-good version yet), and this synthetic prebuilt_layout cannot "
+                "take the unfused path (it treats layouts as metadata only). Reduce "
+                "per-call rows (higher CP degree or smaller pack capacity) or run the "
+                "indexer unfused."
+            )
+        global _ROW_LIMIT_FALLBACK_WARNED
+        if not _ROW_LIMIT_FALLBACK_WARNED:
+            _ROW_LIMIT_FALLBACK_WARNED = True
+            logging.getLogger(__name__).warning(
+                "fused indexer top-k call with %d query rows exceeds the verified-safe "
+                "limit of %d for the current fused kernel package; falling back to the "
+                "unfused implementation (correct, slower). See "
+                "FUSED_INDEXER_MAX_SAFE_ROWS in cp_utils.py.",
+                int(q_indexer_local.shape[0]),
+                FUSED_INDEXER_MAX_SAFE_ROWS,
+            )
+        use_fused = False
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None, None

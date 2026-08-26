@@ -14,12 +14,14 @@ packed fused-top-k calls against synthetic per-sequence layouts with explicit Ro
 Eligibility is a RUN-LEVEL INVARIANT: config validation requires the fused backend and a
 pack-tail alignment divisible by ``2 * cp_size``, and a pack that violates per-sequence or
 tail divisibility RAISES (at prebuild when prebuilt, else at dispatch) instead of falling
-back — the fused kernel package silently corrupts fused calls whose row shape differs from
-earlier calls in the process, so per-microbatch balanced/reference switching is forbidden.
-Fused calls issued by this module additionally pin the per-process row count
-(``_pin_fused_call_rows``), so a varying pack capacity raises as well. (The former
-chunk-pair folding fallback measured slower than the unbalanced baseline on unequal packs
-and was removed.)
+back. Pack capacity may vary between eager microbatches — shape variation between fused
+calls is verified safe below the kernel row limit — while CUDA graphs still require a
+static composition. The fused kernel package has one verified defect: a fused call with
+more than ``FUSED_INDEXER_MAX_SAFE_ROWS`` (32768) query rows is silently corrupted from
+row 32768 on unless it is the process's first fused call, so such calls are rejected at
+``compute_cp_indexer_topk`` and prebuild bounds ``l_local`` at twice that limit (the
+balanced path scores two half-row calls). (The former chunk-pair folding fallback measured
+slower than the unbalanced baseline on unequal packs and was removed.)
 
 ``balanced_compute_cp_indexer_topk`` is a drop-in replacement for
 ``csa_utils.cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
@@ -94,39 +96,6 @@ _ZZ_PACK_OK: dict = {}
 # from max_seqlen_q, and the gate/single-multi host branches), so a composition
 # change must fail loudly there too.
 _SEEN_CU: dict = {}
-
-# Fail-closed guard for the fused kernel package's cross-call hazard (see the
-# WORKSPACE NOTE in test_cp_balanced_indexer_layout.py): a fused call preceded by
-# fused calls of OTHER row counts in the same process can be silently corrupted,
-# and the falsified priming experiment shows no warmup scheme protects it. Every
-# fused indexer call issued by this module therefore pins the process to a single
-# row count; a call that would change it raises instead of risking wrong top-k
-# indices. Scope: calls issued by this module only — it cannot see fused indexer
-# calls made elsewhere in the process. Under CUDA graphs the composition is static
-# (enforced at prebuild), so the pin never trips there.
-_FUSED_CALL_ROWS: dict = {}
-
-
-def _pin_fused_call_rows(rows: int) -> None:
-    """Pin the per-process fused-call row count; raise on a transition."""
-    rows = int(rows)
-    prev = _FUSED_CALL_ROWS.get("rows")
-    if prev is None:
-        _FUSED_CALL_ROWS["rows"] = rows
-        return
-    if prev != rows:
-        raise RuntimeError(
-            f"balanced CP indexer: fused indexer call with {rows} rows after this "
-            f"process pinned {prev} rows. The fused kernel package carries cross-call "
-            "state that silently corrupts calls whose shape differs from earlier calls "
-            "(see the WORKSPACE NOTE in test_cp_balanced_indexer_layout.py), so this "
-            "fails closed. Keep one fused-call shape per run: use a fixed pack "
-            "capacity and make every (padded) sequence length divisible by "
-            "2 * cp_size so all packs stay on the zigzag path, or run the indexer "
-            "unfused (attention_backend=unfused / dsa_kernel_backend='none'), or "
-            "disable dsa_cp_balance_indexer."
-        )
-
 
 # Sentinel default for prebuild_balanced_layouts(pad_alignment=...): "the caller did
 # not supply the config's pad alignment" (build routes; the forward gate decides).
@@ -592,7 +561,6 @@ def balanced_compute_cp_indexer_topk(
     use_fused=True,
     dispatch_handle=None,
     layout_cache=None,
-    multi_seq=True,
 ):
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
@@ -637,27 +605,6 @@ def balanced_compute_cp_indexer_topk(
 
     layout = _layout_at(int(global_start), l_local)
 
-    # One full-pack sequence (the extreme long-context case): every chunk's rows belong to
-    # that sequence, so a chunk can score against a sliced K prefix with an exact synthetic
-    # layout (see _chunk_topk).
-    single_full_seq = not multi_seq
-
-    def _kslice_layout(gs_, rows_, kb_):
-        key = ("kslice", gs_, rows_, kb_)
-        if layout_cache is not None:
-            cached = layout_cache.get(key)
-            if cached is not None:
-                return cached
-        dt = cu_seqlens.dtype
-        built = (
-            torch.tensor([0, rows_, rows_], dtype=dt, device=dev),
-            torch.tensor([0, kb_, kb_], dtype=dt, device=dev),
-            torch.tensor([gs_, 0], dtype=dt, device=dev),
-        )
-        if layout_cache is not None:
-            layout_cache[key] = built
-        return built
-
     @torch.no_grad()
     def _chunk_topk(qr_rows, w_rows, gs, sz):
         # Project -> per-chunk RoPE at the chunk's true global positions (the real ``cu_seqlens`` is
@@ -667,8 +614,6 @@ def balanced_compute_cp_indexer_topk(
         # only on its own position and K, so scoring a chunk matches the same rows of a full call
         # (up to GEMM reduction order of the chunked projection: exact score ties may resolve
         # differently; the output is integer indices with no gradient path).
-        if use_fused:
-            _pin_fused_call_rows(sz)
         with _no_fp8_ctx():  # keep the loss path's FP8 amax stream reference-identical
             q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
@@ -703,35 +648,17 @@ def balanced_compute_cp_indexer_topk(
         bound = min(gkv, (gs + sz) // int(ratio))
         q_ = _KV_BOUND_QUANTUM
         bound_q = max(q_, (bound + q_ - 1) // q_ * q_)
-        # Beyond the tight-width ceiling, a single-full-pack sequence instead scores
-        # against a sliced K prefix with a synthetic [0, bound] layout, so width ==
-        # declared length (the reference call's contract shape) at any size;
-        # multi-sequence packs fall back to the full width. Fused-only: the unfused
-        # scorer recomputes masking from (cu_seqlens, gs) and treats the layout as
-        # metadata, and compute_cp_indexer_topk's contract declares synthetic
-        # layouts unsupported there — it takes the full width instead.
+        # Full width with the real layout beyond the tight-width ceiling: always
+        # safe (width == declared per-sequence length, the reference call's
+        # contract shape). The former single-full-pack K-prefix special case died
+        # with the folding fallback — _chunk_topk now only serves the degenerate
+        # exits, where the kernel either never runs or the pack is far below the
+        # ceiling.
         k_pass = k_seq_major
         layout_pass = _layout_at(gs, sz)
-        graphs_enabled = getattr(config, "cuda_graph_impl", "none") != "none"
         if bound_q <= _KV_TIGHT_WIDTH_CEILING:
             mkv = bound_q
-        elif single_full_seq and use_fused and not graphs_enabled and not _is_capturing():
-            mkv = min(bound_q, comp)
-            k_pass = k_seq_major[:mkv]
-            layout_pass = _kslice_layout(gs, sz, mkv)
         else:
-            # Multi-sequence packs — and ANY graphs-enabled run: the K-slice
-            # layouts live in the per-psp cache, which TE's capture-time cloning
-            # strips, and rebuilding them is an H2D copy that is illegal while
-            # capturing. The branch keys on the config switch (not just
-            # is_current_stream_capturing) so the eager warmup takes the SAME
-            # kernel shape the capture will record — the fused scorer
-            # JIT-compiles and allocates per (max_seqlen_q, max_seqlen_kv)
-            # shape, and a shape first seen inside stream capture would do that
-            # host-side work while capturing. Full width with the real layout
-            # is always safe (width == declared per-sequence length, the
-            # reference call's contract shape); the graph just carries a larger
-            # fp32 score buffer.
             mkv = gkv
         tk, _ = _cu.compute_cp_indexer_topk(
             q,
@@ -770,20 +697,15 @@ def balanced_compute_cp_indexer_topk(
         # Mirror the reference contract: (None, None) when nothing was selected.
         return tk, (layout if tk is not None else None)
 
-    # KNOWN KERNEL-PACKAGE HAZARD (no user-side mitigation; to be fixed by the
-    # kernel owners): the fused indexer package carries cross-call state that can
-    # corrupt a fused call whose shape differs from the calls that preceded it in
-    # the process (see the WORKSPACE NOTE in the unit tests, which records the
-    # measurements — including that a discarded same-shape priming call does NOT
-    # protect a subsequent call, so no warmup scheme here can help). Runs whose
-    # fused-call shapes are constant — every balanced call below scores
-    # ~l_local/2 rows per call, repeated identically across layers and
-    # microbatches for a fixed capacity, i.e. the CUDA-graph scope and every
-    # benchmarked configuration — are unaffected (end-to-end loss parity vs the
-    # reference). Regimes that would ALTERNATE fused-call shapes within one process
-    # are rejected by design until the kernel-side fix: eligibility is a run-level
-    # invariant (config validation plus the fail-fast pack check), and the
-    # per-process row pin (_pin_fused_call_rows) rejects a varying pack capacity.
+    # KNOWN KERNEL-PACKAGE DEFECT (verified on cudnn-frontend 1.26.0; no known-good
+    # version demonstrated yet): a fused indexer call with more than 32768 query rows
+    # is silently corrupted from row 32768 on unless it is the process's FIRST fused
+    # call. The predecessor's shape is irrelevant (a bit-identical predecessor also
+    # triggers it) and calls at or below the limit are immune to process history —
+    # shape VARIATION between calls is explicitly safe below the limit (controlled
+    # matrix in the WORKSPACE NOTE of the unit tests). compute_cp_indexer_topk rejects
+    # fused calls above the limit; prebuild bounds l_local at twice the limit because
+    # the balanced path scores two half-row calls per microbatch.
 
     # "kind" legend lives on dispatch_chunks_async: zzr/ag/ag2 are the three zigzag
     # transports (routed a2a / merged AllGather / split AllGather); a None handle means
@@ -818,7 +740,6 @@ def balanced_compute_cp_indexer_topk(
         # Integer top-k output only: no gradient flows through the balanced
         # scoring, so skip autograd tracking for the per-chunk projection/RoPE.
         sz = qr_rows.shape[0]
-        _pin_fused_call_rows(sz)
         with _no_fp8_ctx():  # see _chunk_topk: keep the FP8 amax stream untouched
             q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
@@ -1067,19 +988,22 @@ def prebuild_balanced_layouts(
             "split into an even per-rank row count. Check pad_packed_seq_alignment "
             "(config validation requires an integer multiple of 2 * cp_size)."
         )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+        FUSED_INDEXER_MAX_SAFE_ROWS,
+    )
 
-    # Multi-seq gate: one D2H probe here instead of in the first forward, using the
-    # forward probe's exact predicate (csa.py): "multi" means NOT a single sequence
-    # that fills the whole physical pack. For padded-cu frontends cu[-1] == total,
-    # so this reduces to the segment count; in the raw-cu ``capacity=`` branch the
-    # second conjunct matters — a single raw sequence with a capacity tail is NOT a
-    # full-pack sequence, exactly as the forward probe would decide.
-    seg_lens = cu[1:] - cu[:-1]
-    nseg_real = int((seg_lens > 0).sum().item())
-    multi_seq = not (nseg_real == 1 and int(cu[-1].item()) == total)
-    # Capacity-tagged like the pack verdict: prebuild may have seen a padded cu
-    # ending short of the physical pack, in which case the forward must re-probe.
-    packed_seq_params._dsa_cp_multi_seq = (l_local, multi_seq)
+    if l_local // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
+        # The balanced path scores two packed fused calls of l_local // 2 rows each;
+        # above this bound the fused kernel package silently corrupts rows >= 32768
+        # (see FUSED_INDEXER_MAX_SAFE_ROWS in cp_utils.py). Fail at data-prep time
+        # with the remedy rather than at the first forward.
+        raise RuntimeError(
+            f"balanced CP indexer: per-rank pack capacity {l_local} would issue fused "
+            f"indexer calls of {l_local // 2} rows, above the verified-safe limit of "
+            f"{FUSED_INDEXER_MAX_SAFE_ROWS} for the current fused kernel package. "
+            "Increase the CP degree or reduce the pack capacity, or run the indexer "
+            "unfused."
+        )
 
     cu_list = seen_cu[1]
     prev = _LAST_PLAN.get((_group_key(cp_group), r))
