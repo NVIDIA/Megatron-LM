@@ -14,6 +14,7 @@ import pytest
 import megatron.core.resharding.planner as planner
 from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
+    _build_tensor_reshard_specs,
     _finalize_dp_transfers,
     _plan_tp,
     build_plan_from_rosters,
@@ -460,3 +461,176 @@ def test_centralized_planner_compatibility_wrapper(monkeypatch):
         "args": ("src", "dst"),
         "kwargs": {"num_experts": 8, "group": "group", "src_rank_offset": 3, "dst_rank_offset": 7},
     }
+
+
+class TestTensorReshardSpecs:
+    """Whole-parameter metadata retained for native reshard backends."""
+
+    def test_tp_transition_uses_local_names_and_global_shape(self):
+        resolved_name = "decoder.layers.7.linear.weight"
+        src_mesh = [0, 1, 2, 3]
+        dst_mesh = [4, 5]
+        src = {
+            resolved_name: [
+                _meta(
+                    name="decoder.layers.3.linear.weight",
+                    resolved_name=resolved_name,
+                    shape=(64, 32),
+                    is_tp=True,
+                    partition_dim=1,
+                    owner_rank=rank,
+                    tp_ranks=src_mesh,
+                    dp_ranks=[rank],
+                )
+                for rank in src_mesh
+            ]
+        }
+        dst = {
+            rank: {
+                resolved_name: _meta(
+                    name="decoder.layers.1.linear.weight",
+                    resolved_name=resolved_name,
+                    shape=(64, 64),
+                    is_tp=True,
+                    partition_dim=1,
+                    owner_rank=rank,
+                    tp_ranks=dst_mesh,
+                    dp_ranks=[rank],
+                )
+            }
+            for rank in dst_mesh
+        }
+
+        src_specs, error = _build_tensor_reshard_specs(dst, src, my_global_rank=2)
+        dst_specs, dst_error = _build_tensor_reshard_specs(dst, src, my_global_rank=5)
+
+        assert error is None
+        assert dst_error is None
+        assert len(src_specs) == len(dst_specs) == 1
+        src_spec = src_specs[0]
+        dst_spec = dst_specs[0]
+        assert src_spec.global_shape == dst_spec.global_shape == (64, 128)
+        assert src_spec.src_ranks == dst_spec.src_ranks == tuple(src_mesh)
+        assert src_spec.dst_ranks == dst_spec.dst_ranks == tuple(dst_mesh)
+        assert src_spec.src_shard_dim == dst_spec.src_shard_dim == 1
+        assert src_spec.dst_shard_dim == dst_spec.dst_shard_dim == 1
+        assert src_spec.src_param_name == "decoder.layers.3.linear.weight"
+        assert src_spec.dst_param_name is None
+        assert dst_spec.src_param_name is None
+        assert dst_spec.dst_param_name == "decoder.layers.1.linear.weight"
+
+    def test_pp_stage_pairs_are_preserved_per_parameter(self):
+        src = {}
+        dst = {rank: {} for rank in range(4, 6)}
+        for name, src_mesh, dst_mesh in (
+            ("decoder.layers.0.weight", [0, 1], [4]),
+            ("decoder.layers.1.weight", [2, 3], [5]),
+        ):
+            src[name] = [
+                _meta(
+                    name=name,
+                    resolved_name=name,
+                    shape=(8, 4),
+                    is_tp=True,
+                    partition_dim=1,
+                    owner_rank=rank,
+                    tp_ranks=src_mesh,
+                    dp_ranks=[rank],
+                )
+                for rank in src_mesh
+            ]
+            for rank in dst_mesh:
+                dst[rank][name] = _meta(
+                    name=name,
+                    resolved_name=name,
+                    shape=(8, 8),
+                    owner_rank=rank,
+                    tp_ranks=dst_mesh,
+                    dp_ranks=[rank],
+                )
+
+        specs, error = _build_tensor_reshard_specs(dst, src, my_global_rank=0)
+
+        assert error is None
+        assert [(spec.src_ranks, spec.dst_ranks) for spec in specs] == [
+            ((0, 1), (4,)),
+            ((2, 3), (5,)),
+        ]
+
+    def test_strided_layout_records_reason(self):
+        src_metadata = _meta(
+            shape=(8, 4),
+            is_tp=True,
+            partition_dim=1,
+            partition_stride=2,
+            owner_rank=0,
+            tp_ranks=[0, 1],
+            dp_ranks=[0],
+        )
+        src_peer = _meta(
+            shape=(8, 4),
+            is_tp=True,
+            partition_dim=1,
+            partition_stride=2,
+            owner_rank=1,
+            tp_ranks=[0, 1],
+            dp_ranks=[1],
+        )
+        dst_metadata = _meta(shape=(8, 8), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        specs, error = _build_tensor_reshard_specs(
+            {2: {"weight": dst_metadata}}, {"weight": [src_metadata, src_peer]}, my_global_rank=0
+        )
+
+        assert specs is None
+        assert "partition_stride=2" in error
+
+    def test_block_interleaved_parameter_becomes_regular_component_specs(self):
+        src_mesh = [0, 1]
+        src = {
+            "weight": [
+                _meta(
+                    shape=(8, 4),
+                    is_tp=True,
+                    partition_dim=1,
+                    partition_sizes=[3, 1],
+                    owner_rank=rank,
+                    tp_ranks=src_mesh,
+                    dp_ranks=[rank],
+                )
+                for rank in src_mesh
+            ]
+        }
+        dst_metadata = _meta(shape=(8, 8), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        specs, error = _build_tensor_reshard_specs(
+            {2: {"weight": dst_metadata}}, src, my_global_rank=2
+        )
+
+        assert error is None
+        assert [spec.global_shape for spec in specs] == [(8, 6), (8, 2)]
+        assert [spec.src_local_shape for spec in specs] == [(8, 3), (8, 1)]
+        assert [spec.dst_local_shape for spec in specs] == [(8, 6), (8, 2)]
+        assert [spec.part_index for spec in specs] == [0, 1]
+        assert all(spec.part_count == 2 for spec in specs)
+        assert specs[0].src_slice[1] == slice(0, 3)
+        assert specs[1].src_slice[1] == slice(3, 4)
+        assert specs[0].dst_slice[1] == slice(0, 6)
+        assert specs[1].dst_slice[1] == slice(6, 8)
+
+    def test_data_parallel_replicas_get_independent_mesh_specs(self):
+        src = {
+            "weight": [
+                _meta(owner_rank=0, tp_ranks=[0], dp_ranks=[0]),
+                _meta(owner_rank=1, tp_ranks=[1], dp_ranks=[1]),
+            ]
+        }
+        dst = {
+            2: {"weight": _meta(owner_rank=2, tp_ranks=[2], dp_ranks=[2])},
+            3: {"weight": _meta(owner_rank=3, tp_ranks=[3], dp_ranks=[3])},
+        }
+
+        specs, error = _build_tensor_reshard_specs(dst, src, my_global_rank=0)
+
+        assert error is None
+        assert [(spec.src_ranks, spec.dst_ranks) for spec in specs] == [((0,), (2,)), ((1,), (3,))]

@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 
 import megatron.core.inference.apis._llm_base as base_mod
+import megatron.core.inference.apis.async_llm as async_llm_mod
+import megatron.core.inference.apis.llm as llm_mod
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
@@ -25,6 +27,11 @@ def mock_pipeline(monkeypatch):
     monkeypatch.setattr(base_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(base_mod, "TextGenerationController", MagicMock())
     monkeypatch.setattr(base_mod, "DynamicInferenceEngine", MagicMock())
+    # MegatronLLM / MegatronAsyncLLM default their inference_wrapper_cls to
+    # None and resolve to base_mod.GPTInferenceWrapper at call time, so the
+    # base_mod patch above is what steers them at construction time.
+    monkeypatch.setattr(llm_mod, "GPTInferenceWrapper", MagicMock())
+    monkeypatch.setattr(async_llm_mod, "GPTInferenceWrapper", MagicMock())
     # Bypass the EP-group initialization assert when no distributed setup
     # is in scope. Individual tests can override (e.g.,
     # ``test_ep_gt_1_requires_use_coordinator``).
@@ -170,10 +177,12 @@ class TestLifecycleGuards:
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
         monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
 
-        llm.serve(ServeConfig(port=1234), blocking=False)
+        sock = MagicMock()
+        llm.serve(ServeConfig(port=1234, sock=sock), blocking=False)
         assert llm._serve_started is True
         assert started["coordinator_addr"] == "tcp://coord:5555"
         assert started["server_port"] == 1234
+        assert started["sock"] is sock
 
 
 class TestNormalizePrompts:

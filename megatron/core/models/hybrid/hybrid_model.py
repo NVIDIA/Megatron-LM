@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -83,6 +84,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
+        logit_dtype (torch.dtype, optional): Dtype for the output-layer GEMM result.
+            Defaults to None, which uses the hidden-state dtype.
         parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
@@ -113,6 +116,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
@@ -144,6 +148,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
@@ -323,6 +328,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
                 pg_collection=self.pg_collection,
             )
 
@@ -428,12 +434,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        compute_mtp_loss: bool = True,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given or the final hidden units
+
+        Args:
+            compute_mtp_loss (bool): Whether to compute the non-inference MTP auxiliary
+                objective. Disabling it skips the MTP branch while leaving its parameters
+                loaded. This does not control speculative decoding. On post-process stages,
+                ``labels`` still determine whether the model returns loss or logits.
+                Defaults to True.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -537,7 +551,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
-        mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
+        mtp_forward_ran = (
+            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
+        )
         if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -569,7 +585,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     # Non-block scope: direct assignment; the controller will set
                     # this back to None after reading to allow GC.
                     inference_context.mtp_decoder_hidden_states = hidden_states
-            elif not in_inference_mode:
+            elif mtp_forward_ran:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
