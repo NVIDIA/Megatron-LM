@@ -732,6 +732,16 @@ class DistributedDataParallel(_BaseDataParallel):
             synchronize: Whether to call torch.cuda.synchronize() before freeing.
             empty_cache: Whether to call torch.cuda.empty_cache() after freeing.
         """
+        if any(
+            getattr(buffer, "nccl_mem_pool", None) is not None
+            for buffer in self.buffers + self.expert_parallel_buffers
+        ):
+            raise RuntimeError(
+                "Gradient-buffer offload is unsupported while a buffer owns an NCCL memory "
+                "pool: offload replaces the pool-allocated storage, and restore does not "
+                "perform the required deregister/reload/register transition."
+            )
+
         if synchronize:
             torch.cuda.synchronize()
 

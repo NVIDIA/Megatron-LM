@@ -294,6 +294,22 @@ def _normalize_cuda_graph_modules_args(args):
     args.cuda_graph_modules = normalized_scopes
 
 
+def _validate_nccl_ub_rl_offload(args):
+    """Reject RL gradient-buffer offload when those buffers use an NCCL memory pool."""
+    if (
+        args.perform_rl_step
+        and args.nccl_ub
+        and args.rl_offload_optimizer_during_inference
+        and not args.rl_training_cuda_graphs
+    ):
+        raise ValueError(
+            "--rl-offload-optimizer-during-inference is unsupported with --use-nccl-ub "
+            "when RL training CUDA graphs are disabled: gradient-buffer offload would replace "
+            "storage allocated from an active NCCL memory pool without a supported "
+            "deregister/reload/register transition."
+        )
+
+
 def _normalize_inference_cuda_graph_scope_arg(args):
     """Normalize inference_cuda_graph_scope and apply the impl-derived default."""
     args.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
@@ -1882,6 +1898,8 @@ def validate_args(args, defaults={}):
         assert False, \
             '--no-load-optim with --skip-train --perform-rl-step skips the optimizer; ' \
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
+
+    _validate_nccl_ub_rl_offload(args)
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
