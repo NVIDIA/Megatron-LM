@@ -5,12 +5,13 @@
 set -euo pipefail
 
 TRAIN_ITERS=${TRAIN_ITERS:-20}
+PRETRAIN_MODULE=${MIMO_PRETRAIN_MODULE:-examples.mimo.pretrain_mimo}
 NUM_MICROBATCHES=${NUM_MICROBATCHES:-4}
 EVAL_INTERVAL=${EVAL_INTERVAL:-1}
 EVAL_ITERS=${EVAL_ITERS:-0}
 MICRO_BATCH_SIZE=1
-LLM_DP=2
-GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP))
+LLM_DP=1
+GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP * 2))
 TORCHRUN_LOG_DIR=${TORCHRUN_LOG_DIR:-"${PWD}/logs/torchrun-$(date +%Y%m%d_%H%M%S)-$$"}
 mkdir -p "${TORCHRUN_LOG_DIR}"
 
@@ -24,7 +25,7 @@ TORCHRUN_ARGS=(
 
 uv run --extra ssm python -m torch.distributed.run \
   "${TORCHRUN_ARGS[@]}" \
-  -m examples.mimo.pretrain_mimo \
+  -m "${PRETRAIN_MODULE}" \
   --model-provider nemotron-moe-vlm \
   --dataset-provider mock \
   --image-token-id 511 \
@@ -78,8 +79,10 @@ uv run --extra ssm python -m torch.distributed.run \
   --llm-cp 1 \
   --llm-pp 1 \
   --llm-dp "${LLM_DP}" \
-  --llm-ep 4 \
+  --llm-ep 2 \
   --llm-expt-tp 1 \
+  --tensor-parallel-num-weight-shards 4 \
+  --expert-tensor-parallel-num-weight-shards 2 \
   --vocab-size 131072 \
   --micro-batch-size "${MICRO_BATCH_SIZE}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \

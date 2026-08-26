@@ -377,20 +377,44 @@ def get_ltor_masks_and_position_ids(data,
                                     reset_position_ids,
                                     reset_attention_mask,
                                     eod_mask_loss,
-                                    pad_mask_loss):
-    """Build masks and position id for left to right model."""
+                                    pad_mask_loss,
+                                    create_attention_mask=True):
+    """Build masks and position id for left to right model.
+
+    Args:
+        data: Token ids, shape [micro_batch_size, seq_length].
+        eod_token: End-of-document token id.
+        pad_token: Padding token id.
+        reset_position_ids: Restart position ids from 0 after each EOD token.
+        reset_attention_mask: Additionally mask attention across document boundaries,
+            turning the shared causal mask into a per-sample block-causal mask.
+            Requires create_attention_mask, since it modifies the materialized mask.
+        eod_mask_loss: Zero the loss mask at EOD tokens.
+        pad_mask_loss: Zero the loss mask at pad tokens.
+        create_attention_mask: Materialize the dense causal attention mask.
+            Can be disabled if the attention kernel generates the mask by itself
+            (e.g. from PackedSeqParams), in which case attention_mask is returned as None.
+
+    Returns:
+        Tuple of (attention_mask or None, loss_mask, position_ids).
+    """
+    assert create_attention_mask or not reset_attention_mask, \
+        "reset_attention_mask requires the attention mask to be created."
 
     # Extract batch size and sequence length.
     micro_batch_size, seq_length = data.size()
 
     # Attention mask (lower triangular).
-    if reset_attention_mask:
-        att_mask_batch = micro_batch_size
+    if create_attention_mask:
+        if reset_attention_mask:
+            att_mask_batch = micro_batch_size
+        else:
+            att_mask_batch = 1
+        attention_mask = torch.tril(
+            torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)
+        ).view(att_mask_batch, 1, seq_length, seq_length)
     else:
-        att_mask_batch = 1
-    attention_mask = torch.tril(
-        torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)
-    ).view(att_mask_batch, 1, seq_length, seq_length)
+        attention_mask = None
 
     # Loss mask.
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
@@ -429,7 +453,8 @@ def get_ltor_masks_and_position_ids(data,
                     prev_index = i + 1
 
     # Convert attention mask to binary:
-    attention_mask = attention_mask < 0.5
+    if create_attention_mask:
+        attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
 

@@ -10,6 +10,7 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
+from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
@@ -1138,8 +1139,9 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        if self.config.fp8 or self.config.fp4:
-            self.pad_multiple = get_align_size_for_quantization(self.config)
+        align_size = get_align_size_for_quantization(self.config)
+        if align_size > 0:
+            self.pad_multiple = align_size
         if self._padded_num_tokens is not None and hidden_states.shape[0] < self._padded_num_tokens:
             pad_rows = self._padded_num_tokens - hidden_states.shape[0]
             hidden_states = torch.cat(
@@ -1586,6 +1588,9 @@ class _NCCLEPManager(_DispatchManager):
                         "ragged per-expert counts on device)."
                     )
 
+        self.dispatch_fwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_dispatch_fwd_dtype)
+        self.combine_bwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_combine_bwd_dtype)
+
         # Fresh EpBuffer per dispatch, held until the matching combine consumes it. dispatch
         # and combine share one buffer: handle_mem is the routing table that dispatch writes
         # and combine reads. Safe because dispatch i / combine i strictly alternate.
@@ -1704,6 +1709,8 @@ class _NCCLEPManager(_DispatchManager):
             hidden_dim=self.hidden_dim,
             num_local_experts=self.num_local_experts,
             alignment=self.alignment,
+            dispatch_fwd_quant_recipe=self.dispatch_fwd_quant_recipe,
+            combine_bwd_quant_recipe=self.combine_bwd_quant_recipe,
         )
         # TE requires int64 indices and float32 weights.
         # token_indices/token_probs: [num_local_tokens, router_topk]

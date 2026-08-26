@@ -12,10 +12,9 @@ try:
 except ImportError:
     _HAVE_FLASHINFER = False
 
-pytestmark = [
-    pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)"),
-    pytest.mark.skipif(not _HAVE_FLASHINFER, reason="MXFP8 tests require FlashInfer"),
-]
+pytestmark = pytest.mark.skipif(
+    not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)"
+)
 
 
 # ===========================================================================
@@ -31,15 +30,7 @@ class TestMXFP8ReshardTransform:
     logic that avoids corrupting swizzled scales from partial updates.
     """
 
-    def _make_persistent_buffers(self, shapes):
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
-        buffers = {}
-        for name, (M, K) in shapes.items():
-            x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-            buffers[name] = MXFP8Tensor.from_bf16(x)
-        return buffers
-
+    @pytest.mark.skipif(not _HAVE_FLASHINFER, reason="test requires FlashInfer")
     def test_finalize_recv_bf16_2d_scale(self):
         """Receiver-side conversion with 2D scale: immediate per-slice quantization."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -65,6 +56,7 @@ class TestMXFP8ReshardTransform:
         assert torch.equal(buf.data, expected.data)
         assert torch.equal(buf.scale, expected.scale)
 
+    @pytest.mark.skipif(not _HAVE_FLASHINFER, reason="test requires FlashInfer")
     def test_finalize_recv_bf16_1d_scale_accumulation(self):
         """Receiver-side conversion with 1D scale: accumulate slices then quantize."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -98,6 +90,7 @@ class TestMXFP8ReshardTransform:
         assert torch.equal(buf.data, expected.data)
         assert torch.equal(buf.scale, expected.scale)
 
+    @pytest.mark.skipif(not _HAVE_FLASHINFER, reason="test requires FlashInfer")
     def test_finalize_recv_1d_scale_wrong_element_count(self):
         """1D accumulation should raise if total elements don't match (duplicate slices)."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -122,6 +115,141 @@ class TestMXFP8ReshardTransform:
             overlap = torch.randn(M // 2 + 1, K, dtype=torch.bfloat16, device="cuda")
             t.finalize_recv("decoder.weight", (slice(M // 2 - 1, M), slice(None)), [overlap])
 
+    def test_repeated_finalize_updates_persistent_buffer_outside_inference_mode(self):
+        """Persistent buffers created in inference mode remain mutable across refits."""
+        from megatron.core.inference.quantization import utils as quantization_utils
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        M, K = 64, 128
+        with torch.inference_mode():
+            model = torch.nn.Linear(K, M, bias=False).to(dtype=torch.bfloat16, device="cuda")
+            _pre_quantize_linear(model)
+            buffers = quantization_utils.quantize_params_to_mxfp8(model, backend="triton")
+        buf = buffers["weight"]
+        assert not torch.is_inference(buf.data)
+        assert not torch.is_inference(buf.scale)
+
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers=buffers,
+            buffer_key_prefix="decoder.",
+        )
+        data_ptr = buf.data.data_ptr()
+        scale_ptr = buf.scale.data_ptr()
+
+        for _ in range(2):
+            assert torch.is_grad_enabled()
+            assert not torch.is_inference_mode_enabled()
+            new_data = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+            transform.finalize_recv("decoder.weight", (slice(None), slice(None)), [new_data])
+            expected = MXFP8Tensor.from_bf16(new_data, backend="triton")
+            assert torch.equal(buf.data, expected.data)
+            assert torch.equal(buf.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+            assert buf.data.data_ptr() == data_ptr
+            assert buf.scale.data_ptr() == scale_ptr
+            assert buf.backend == "triton"
+            assert buf.scale.dtype == torch.float8_e8m0fnu
+
+    def test_sender_side_conversion_supports_explicit_triton_backend(self):
+        """A sender without persistent buffers can select the Triton wire format."""
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={},
+            convert_on_send=True,
+            backend="triton",
+        )
+        source = torch.nn.Parameter(
+            torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), requires_grad=False
+        )
+        data, scale = transform.prepare_send("decoder.weight", (slice(None), slice(None)), source)
+
+        assert data.dtype == torch.float8_e4m3fn
+        assert scale.dtype == torch.float8_e8m0fnu
+
+    def test_sender_side_conversion_requires_explicit_backend(self):
+        """A sender without persistent buffers cannot infer its wire format."""
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        with pytest.raises(AssertionError, match="backend is required for sender-side conversion"):
+            MXFP8ReshardTransform(
+                convertible_params={"decoder.weight"}, persistent_buffers={}, convert_on_send=True
+            )
+
+    def test_mixed_persistent_buffer_backends_are_rejected(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        triton_buffer = MXFP8Tensor.from_bf16(
+            torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), backend="triton"
+        )
+        flashinfer_buffer = MXFP8Tensor(
+            data=triton_buffer.data.clone(),
+            scale=triton_buffer.scale.view(torch.uint8).clone(),
+            dtype=torch.bfloat16,
+            backend="flashinfer",
+        )
+
+        with pytest.raises(ValueError, match="backend is 'flashinfer'; expected 'triton'"):
+            MXFP8ReshardTransform(
+                convertible_params={"first", "second"},
+                persistent_buffers={"first": triton_buffer, "second": flashinfer_buffer},
+            )
+
+    def test_concatenated_moe_buffers_remain_refittable(self):
+        """Lazy MoE stacking must not replace persistent storage with inference tensors."""
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        class Namespace:
+            pass
+
+        num_experts, M, K = 2, 64, 128
+        grouped_mlp = Namespace()
+        grouped_mlp.num_local_experts = num_experts
+        grouped_mlp.inference_grouped_gemm_backend = "torch"
+        buffers = {}
+        for linear_name in ("linear_fc1", "linear_fc2"):
+            linear = Namespace()
+            setattr(grouped_mlp, linear_name, linear)
+            for expert_idx in range(num_experts):
+                tensor = MXFP8Tensor.from_bf16(
+                    torch.randn(M, K, dtype=torch.bfloat16, device="cuda"), backend="triton"
+                )
+                if expert_idx == 0:
+                    tensor.dtype = None  # Simulate a legacy direct constructor.
+                setattr(linear, f"weight{expert_idx}", tensor)
+                buffers[f"{linear_name}.weight{expert_idx}"] = tensor
+
+        with torch.inference_mode():
+            InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped_mlp)
+
+        assert not torch.is_inference(grouped_mlp._fc1_weight.data)
+        assert not torch.is_inference(grouped_mlp._fc1_weight.scale)
+        assert not torch.is_inference(grouped_mlp._fc2_weight.data)
+        assert not torch.is_inference(grouped_mlp._fc2_weight.scale)
+        assert grouped_mlp._fc1_weight.dtype == torch.bfloat16
+        assert grouped_mlp._fc2_weight.dtype == torch.bfloat16
+
+        transform = MXFP8ReshardTransform(
+            convertible_params=set(buffers), persistent_buffers=buffers
+        )
+        for name, buf in buffers.items():
+            data_ptr = buf.data.data_ptr()
+            scale_ptr = buf.scale.data_ptr()
+            new_data = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+            transform.finalize_recv(name, (slice(None), slice(None)), [new_data])
+            expected = MXFP8Tensor.from_bf16(new_data, backend="triton")
+
+            assert torch.equal(buf.data, expected.data)
+            assert torch.equal(buf.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+            assert buf.data.data_ptr() == data_ptr
+            assert buf.scale.data_ptr() == scale_ptr
+            assert buf.backend == "triton"
+
 
 # ===========================================================================
 # quantize_params_to_mxfp8
@@ -145,6 +273,7 @@ def _pre_quantize_linear(model: torch.nn.Module) -> None:
             submodule.weight = torch.nn.Parameter(te_mxfp8, requires_grad=False)
 
 
+@pytest.mark.skipif(not _HAVE_FLASHINFER, reason="tests require FlashInfer")
 class TestQuantizeParamsToMXFP8:
     """Tests for persistent buffer quantization (quantization/utils.py).
 
@@ -182,6 +311,19 @@ class TestQuantizeParamsToMXFP8:
         assert buffers["weight"].data.data_ptr() == data_ptr
         assert buffers["weight"].scale.data_ptr() == scale_ptr
 
+    def test_persistent_buffer_reuse_rejects_backend_change(self):
+        """A refresh cannot reinterpret persistent scale bytes under a new backend."""
+        from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
+
+        model = torch.nn.Linear(128, 64, bias=False).to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model)
+        buffers = quantize_params_to_mxfp8(model, backend="flashinfer")
+
+        model2 = torch.nn.Linear(128, 64, bias=False).to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model2)
+        with pytest.raises(ValueError, match="expected 'triton'"):
+            quantize_params_to_mxfp8(model2, persistent_buffers=buffers, backend="triton")
+
     def test_nested_module_fqn(self):
         """Recursive quantization should produce correct fully-qualified names."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -202,6 +344,7 @@ class TestQuantizeParamsToMXFP8:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _HAVE_FLASHINFER, reason="tests require FlashInfer")
 class TestMXFP8RefitIntegration:
     """Integration tests simulating the full send→recv→finalize refit flow."""
 
