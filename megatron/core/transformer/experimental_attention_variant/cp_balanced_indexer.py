@@ -251,6 +251,9 @@ def dispatch_chunks_async(
     return {"kind": "ag2", "works": [wq, ww], "gq": gq, "gw": gw, "q_lora": q_lora}
 
 
+_FP8_AUTOCAST = None  # resolved once by _no_fp8_ctx: TE fp8_autocast, or False when TE absent
+
+
 def _no_fp8_ctx():
     """FP8-disabled context for the no-grad chunk projections.
 
@@ -1021,22 +1024,6 @@ def prebuild_balanced_layouts(
             "split into an even per-rank row count. Check pad_packed_seq_alignment "
             "(config validation requires an integer multiple of 2 * cp_size)."
         )
-    from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
-        FUSED_INDEXER_MAX_SAFE_ROWS,
-    )
-
-    if l_local // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
-        # The balanced path scores two packed fused calls of l_local // 2 rows each;
-        # above this bound the fused kernel package silently corrupts rows >= 32768
-        # (see FUSED_INDEXER_MAX_SAFE_ROWS in cp_utils.py). Fail at data-prep time
-        # with the remedy rather than at the first forward.
-        raise RuntimeError(
-            f"balanced CP indexer: per-rank pack capacity {l_local} would issue fused "
-            f"indexer calls of {l_local // 2} rows, above the verified-safe limit of "
-            f"{FUSED_INDEXER_MAX_SAFE_ROWS} for the current fused kernel package. "
-            "Increase the CP degree or reduce the pack capacity, or run the indexer "
-            "unfused."
-        )
 
     cu_list = seen_cu[1]
     prev = _LAST_PLAN.get((_group_key(cp_group), r))
@@ -1084,6 +1071,27 @@ def prebuild_balanced_layouts(
         # raw-cu middle stages and non-scheduler frontends can still produce one.
         _stash_verdict(False)
         return
+
+    # The balanced row-limit applies only when a plan will actually be built: an
+    # ineligible pack above the limit routes to the reference path (which goes
+    # unfused above the limit in the CSA integration) and must not be rejected
+    # here.
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+        FUSED_INDEXER_MAX_SAFE_ROWS,
+    )
+
+    if l_local // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
+        # The balanced path scores two packed fused calls of l_local // 2 rows each;
+        # above this bound the fused kernel package silently corrupts rows >= 32768
+        # (see FUSED_INDEXER_MAX_SAFE_ROWS in cp_utils.py). Fail at data-prep time
+        # with the remedy rather than at the first forward.
+        raise RuntimeError(
+            f"balanced CP indexer: per-rank pack capacity {l_local} would issue fused "
+            f"indexer calls of {l_local // 2} rows, above the verified-safe limit of "
+            f"{FUSED_INDEXER_MAX_SAFE_ROWS} for the current fused kernel package. "
+            "Increase the CP degree or reduce the pack capacity, or run the indexer "
+            "unfused."
+        )
 
     dev, dt = cu.device, cu.dtype
     half = l_local // 2

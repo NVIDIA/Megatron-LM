@@ -465,6 +465,105 @@ def test_prebuild_capacity_probe_for_raw_cu():
     assert psp2._dsa_cp_balance_layout_cache["zz_pack_ok"][0] == 3000 // 4
 
 
+def test_balanced_compute_smoke_runs_production_path(monkeypatch):
+    """Invoke the PRODUCTION balanced_compute_cp_indexer_topk (unfused, CPU): the
+    cp_size <= 1 exit still runs the real projection -> _no_fp8_ctx -> RoPE ->
+    reference-delegation pipeline, so module-level integration failures (e.g. a
+    missing global read inside _no_fp8_ctx) surface here rather than only on
+    GPU. Verified against the reference call on the same inputs."""
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer as M
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+
+    torch.manual_seed(3)
+    rows, q_lora, heads, dim, pos_dim, ratio, topk = 256, 16, 4, 8, 4, 4, 8
+    dev = torch.device("cpu")
+
+    class _Rotary:
+        def __init__(self):
+            self._rpe = torch.randn(rows, 1, 1, pos_dim, dtype=torch.float32)
+
+        def __call__(self, length, packed_seq=True):
+            return self._rpe
+
+    class _Indexer:
+        def __init__(self):
+            self._w = torch.randint(-2, 3, (heads * dim, q_lora)).to(torch.bfloat16)
+            self.rotary_pos_emb = _Rotary()
+            self.index_n_heads, self.index_head_dim = heads, dim
+            self.qk_pos_emb_head_dim = pos_dim
+
+        def linear_wq_b(self, x):
+            return x.reshape(-1, q_lora) @ self._w.t(), None
+
+    class _Cfg:
+        apply_rope_fusion = False
+        cuda_graph_impl = "none"
+        rotary_interleaved = False
+
+    # fast_hadamard_transform is GPU-only; the smoke targets the integration
+    # wiring (projection/_no_fp8_ctx/RoPE/delegation), so make rotation identity
+    # on BOTH the production call and the reference reproduction below.
+    monkeypatch.setattr(M, "rotate_activation", lambda x: x)
+    idx = _Indexer()
+    qr = torch.randint(-2, 3, (rows, 1, q_lora)).to(torch.bfloat16)
+    w = (torch.rand(rows, heads) + 0.5).to(torch.bfloat16)
+    cu = torch.tensor([0, rows], dtype=torch.int32)
+    cu_comp = torch.tensor([0, rows // ratio], dtype=torch.int32)
+    k = torch.randn(rows // ratio, dim).to(torch.bfloat16)
+
+    tk, layout = M.balanced_compute_cp_indexer_topk(
+        qr,
+        w,
+        idx,
+        k,
+        cu,
+        cu_comp,
+        _Cfg(),
+        _StubGroup(1, 0),
+        1,
+        rows,
+        0,
+        ratio,
+        topk,
+        dim**-0.5,
+        rows,
+        use_fused=False,
+    )
+    assert tk is not None and tk.shape == (rows, topk)
+    # The cp1 exit is the reference call over own rows: reproduce it directly.
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
+        apply_thd_cp_local_rope_unfused,
+    )
+
+    q_ref, _ = idx.linear_wq_b(qr)
+    q_ref = q_ref.reshape(rows, heads, dim)
+    q_ref = apply_thd_cp_local_rope_unfused(
+        q_ref, idx.rotary_pos_emb(rows), dim - pos_dim, pos_dim, cu, 0, _Cfg()
+    )
+    ref, _ = cp_utils.compute_cp_indexer_topk(
+        q_ref, w, k, cu, cu_comp, 0, ratio, topk, dim**-0.5, max_seqlen_q=rows, use_fused=False
+    )
+    fs, _ = torch.sort(tk, dim=-1)
+    rs, _ = torch.sort(ref, dim=-1)
+    assert torch.equal(fs, rs)
+
+
+def test_prebuild_routes_ineligible_above_limit_pack():
+    """An INELIGIBLE pack above the balanced row limit must route to the
+    reference path (verdict False), not raise: it never issues the two synthetic
+    half-row calls, so the balanced-only limit does not apply to it."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+
+    group = _StubGroup(4, 0)
+    cap = 4 * (cp_utils.FUSED_INDEXER_MAX_SAFE_ROWS + 2048) * 2  # l_local > 2 * limit
+    # First sequence length is odd -> not divisible by 2 * cp_size = 8.
+    psp = _packed_params([0, 100001, cap], cap)
+    prebuild_balanced_layouts(psp, cp_group=group, pad_alignment=8)
+    l_local = cap // 4
+    assert psp._dsa_cp_balance_layout_cache["zz_pack_ok"] == (l_local, False)
+    assert ("zigzag", 0) not in psp._dsa_cp_balance_layout_cache
+
+
 def test_prebuild_rejects_capacity_above_fused_row_limit():
     """The balanced path issues two fused calls of l_local // 2 rows; prebuild
     fails at data-prep time when that exceeds FUSED_INDEXER_MAX_SAFE_ROWS (the

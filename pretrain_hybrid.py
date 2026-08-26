@@ -37,6 +37,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
+    prebuild_balanced_layouts,
+)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -127,6 +130,17 @@ def get_batch(data_iterator, vp_stage=None):
             config=config,
         )
         finalize_packed_seq_params(packed_seq_params)
+        if getattr(args, "dsa_cp_balance_indexer", False):
+            # Same data-prep hook as pretrain_gpt.get_batch: prebuild the balanced
+            # indexer's zigzag plan/routes where host syncs are free, and record the
+            # composition observation the CUDA-graph static-composition gate compares
+            # against (skipping it would silently lose the routed A2A path in eager
+            # and bypass the composition-change raise under graphs).
+            prebuild_balanced_layouts(
+                packed_seq_params,
+                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
+                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+            )
         return (
             attention_mask,
             None,
@@ -331,6 +345,17 @@ def forward_step(data_iterator, model: HybridModel):
             tokens_per_sample=args.seq_length,
         )
         finalize_packed_seq_params(packed_seq_params)
+        if getattr(args, "dsa_cp_balance_indexer", False):
+            # Same data-prep hook as pretrain_gpt.get_batch: prebuild the balanced
+            # indexer's zigzag plan/routes where host syncs are free, and record the
+            # composition observation the CUDA-graph static-composition gate compares
+            # against (skipping it would silently lose the routed A2A path in eager
+            # and bypass the composition-change raise under graphs).
+            prebuild_balanced_layouts(
+                packed_seq_params,
+                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
+                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+            )
 
     timers('batch-generator').stop()
 

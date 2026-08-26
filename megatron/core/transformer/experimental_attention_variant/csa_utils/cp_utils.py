@@ -6,7 +6,6 @@ and indexer top-k metadata. It reuses MCore's fused MLA RoPE and calls the
 retained compaction kernel; ``csa.py`` calls final-index lowering directly.
 """
 
-import logging
 import math
 from typing import Optional, Tuple
 
@@ -17,7 +16,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inpla
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 
 from . import cp_layout_kernels
-from .fused_sparse_attention import indexer_topk
+from .fused_sparse_attention import FUSED_INDEXER_MAX_SAFE_ROWS, indexer_topk
 
 # =============================================================================
 # RoPE Wrappers
@@ -302,22 +301,13 @@ def _build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
-# Verified defect in the fused indexer kernel package (measured on cudnn-frontend
-# 1.26.0, GB200; no known-good version demonstrated yet): a fused top-k call with
-# more than this many query rows is silently corrupted from row 32768 on unless it
-# is the process's FIRST fused call. The predecessor's shape is irrelevant (a
-# bit-identical predecessor also triggers it) and calls at or below the limit are
-# immune to process history entirely — see the WORKSPACE NOTE in
-# tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py for the
-# controlled matrix. Policy: the balanced synthetic-layout path fails closed
-# above this limit; pre-existing callers keep their behavior and get a
-# once-per-process high-severity correctness warning instead (no rejection, no
-# silent rerouting). Do not add a version exemption until a fixed kernel package
-# is demonstrated against the reproducer. Non-CP call sites (dsa.py) need the
-# same warning backend-wide as a follow-up.
-FUSED_INDEXER_MAX_SAFE_ROWS = 32768
-
-_ROW_LIMIT_WARNED = False
+# Verified fused-kernel row-limit defect: see FUSED_INDEXER_MAX_SAFE_ROWS in
+# fused_sparse_attention.py (single source of truth; re-exported here for the
+# balanced-indexer prebuild and tests). Policy at THIS wrapper: the balanced
+# synthetic-layout path fails closed above the limit; ordinary reference calls
+# proceed unchanged — the once-per-process correctness warning fires inside
+# _indexer_topk_core, the shared funnel of every fused caller (SBHD/THD
+# inference, the CP reference path, and fused training Path B included).
 
 
 def compute_cp_indexer_topk(
@@ -370,11 +360,9 @@ def compute_cp_indexer_topk(
         #   verified-corrupt pattern, and a synthetic layout cannot take the unfused
         #   path (the unfused arm treats layouts as metadata only);
         # - pre-existing callers (reference CP path and non-CP paths) keep their
-        #   behavior: proceed fused, with a once-per-process high-severity
-        #   correctness warning. First-in-process calls were correct in the
-        #   reproduced environment, and unverified backend versions may already
-        #   carry the fix, so an unconditional rejection would break previously
-        #   supported workloads.
+        #   behavior and proceed fused; the once-per-process high-severity
+        #   correctness warning fires in _indexer_topk_core, the shared funnel
+        #   of every fused caller (so SBHD/non-CP paths are covered too).
         if synthetic_layout:
             raise RuntimeError(
                 f"fused indexer top-k with {int(q_indexer_local.shape[0])} query rows "
@@ -384,22 +372,6 @@ def compute_cp_indexer_topk(
                 "no known-good version yet), and this synthetic layout cannot take the "
                 "unfused path. Reduce per-call rows (higher CP degree or smaller pack "
                 "capacity) or run the indexer unfused."
-            )
-        global _ROW_LIMIT_WARNED
-        if not _ROW_LIMIT_WARNED:
-            _ROW_LIMIT_WARNED = True
-            logging.getLogger(__name__).error(
-                "CORRECTNESS WARNING: fused indexer top-k call with %d query rows "
-                "exceeds %d, the verified-safe limit of the current fused kernel "
-                "package. On the verified stack (GB200, cudnn-frontend 1.26.0) such a "
-                "call following ANY prior fused call silently returns incorrect top-k "
-                "indices for rows >= 32768. Upgrade to a backend verified against the "
-                "reproducer (see the WORKSPACE NOTE in tests/unit_tests/transformer/"
-                "test_cp_balanced_indexer_layout.py and cudnn-frontend PR #410), reduce "
-                "rows per call (higher CP degree / smaller pack capacity), or disable "
-                "the fused implementation. Proceeding with the fused call.",
-                int(q_indexer_local.shape[0]),
-                FUSED_INDEXER_MAX_SAFE_ROWS,
             )
 
     global_start = int(global_start)

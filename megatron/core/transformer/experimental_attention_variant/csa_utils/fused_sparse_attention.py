@@ -22,6 +22,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -834,6 +835,43 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+# Verified defect in the fused indexer kernel package (measured on GB200 with
+# cudnn-frontend 1.26.0; no known-good version demonstrated yet): a fused top-k
+# call with more than this many query rows is silently corrupted from row 32768
+# on unless it is the process's FIRST fused call. The predecessor's shape is
+# irrelevant (a bit-identical predecessor also triggers it) and calls at or
+# below the limit are immune to process history — see the WORKSPACE NOTE in
+# tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py for the
+# controlled matrix and reproducer, and cudnn-frontend PR #410 for a candidate
+# upstream fix. Policy: pre-existing callers keep their behavior and get the
+# once-per-process high-severity warning below; the balanced CP path fails
+# closed instead (see cp_utils.compute_cp_indexer_topk). Do not add a version
+# exemption until a fixed kernel package is demonstrated against the reproducer.
+FUSED_INDEXER_MAX_SAFE_ROWS = 32768
+
+_ROW_LIMIT_WARNED = False
+
+
+def _warn_fused_row_limit_once(total_q: int) -> None:
+    global _ROW_LIMIT_WARNED
+    if _ROW_LIMIT_WARNED:
+        return
+    _ROW_LIMIT_WARNED = True
+    logging.getLogger(__name__).error(
+        "CORRECTNESS WARNING: fused indexer top-k call with %d query rows exceeds "
+        "%d, the verified-safe limit of the current fused kernel package. On the "
+        "verified stack (GB200, cudnn-frontend 1.26.0) such a call following ANY "
+        "prior fused call silently returns incorrect top-k indices for rows >= "
+        "32768. Upgrade to a backend verified against the reproducer (see the "
+        "WORKSPACE NOTE in tests/unit_tests/transformer/"
+        "test_cp_balanced_indexer_layout.py and cudnn-frontend PR #410), reduce "
+        "rows per call (higher CP degree / smaller pack capacity), or disable the "
+        "fused implementation. Proceeding with the fused call.",
+        total_q,
+        FUSED_INDEXER_MAX_SAFE_ROWS,
+    )
+
+
 def _indexer_topk_core(
     q: Tensor,
     k: Tensor,
@@ -880,6 +918,9 @@ def _indexer_topk_core(
       so the SBHD→BSHD permute can be performed once and reused across
       the indexer forward and the score-recompute backward kernels.
     """
+    total_q_rows = int(q.shape[0]) if cu_seqlens_q is not None else int(q.shape[0] * q.shape[1])
+    if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+        _warn_fused_row_limit_once(total_q_rows)
     is_thd = cu_seqlens_q is not None
     device = q.device
 

@@ -1842,15 +1842,14 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.dsa_cp_balance_indexer:
-            # Balanced-indexer eligibility is a RUN-LEVEL INVARIANT, not a per-microbatch
-            # decision: the fused indexer package silently corrupts fused calls whose row
-            # shape differs from earlier calls in the process (see the WORKSPACE NOTE in
-            # test_cp_balanced_indexer_layout.py), so balanced/reference switching between
-            # microbatches is forbidden. Enforce the invariant's preconditions here and
-            # fail fast; nonconforming packs raise at data-prep/dispatch time instead of
-            # falling back. Evaluated after the deprecated apply_dsa_kernel_fusion switch
-            # is folded into dsa_kernel_backend above, so the predicate sees the final
-            # backend.
+            # Startup preconditions for the flag to be USEFUL (the per-pack verdict in
+            # cp_balanced_indexer does the actual routing; ineligible packs take the
+            # contiguous reference path per microbatch): the balanced zigzag scorer is
+            # fused-only, and with a pad alignment that is not an integer multiple of
+            # 2 * cp_size no padded-cu pack can ever be zigzag-representable — the flag
+            # would be a silent, costly no-op — so reject that as a configuration error.
+            # Evaluated after the deprecated apply_dsa_kernel_fusion switch is folded
+            # into dsa_kernel_backend above, so the predicate sees the final backend.
             from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
                 use_fused_dsa_kernels,
             )
@@ -1860,6 +1859,16 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_cp_balance_indexer requires the fused DSA indexer backend "
                     "(dsa_kernel_backend != 'none' and attention_backend != unfused): "
                     "the balanced zigzag scorer is fused-only."
+                )
+            ratios = self.csa_compress_ratios or []
+            if self.csa_dense_mode or 4 not in ratios:
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires a DSA indexer to exist: "
+                    "CompressedSparseAttention builds one only for compress-ratio-4 "
+                    "layers with csa_dense_mode=False "
+                    f"(csa_dense_mode={self.csa_dense_mode}, "
+                    f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
+                    "flag would only add per-microbatch prebuild work."
                 )
             cp = self.context_parallel_size
             pad = self.pad_packed_seq_alignment
