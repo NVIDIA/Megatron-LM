@@ -30,6 +30,7 @@ except ImportError:
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
@@ -42,13 +43,13 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
-from megatron.core.msc_utils import maybe_msc, MultiStorageClientFeature 
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
@@ -81,8 +82,6 @@ except ImportError:
 
 # [ModelOpt]: Import
 try:
-    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
-
     from megatron.post_training.utils import print_distributed_quant_summary
 
     has_nvidia_modelopt = True
@@ -98,6 +97,22 @@ _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
+
+
+def _maybe_compact_rollout_bank(iteration):
+    """Compact the rollout bank without making checkpointing depend eagerly on RL."""
+    from megatron.rl.rl_utils import maybe_compact_rollout_bank
+
+    maybe_compact_rollout_bank(iteration)
+
+
+def _register_rollout_bank_compaction(async_save_request, iteration):
+    """Compact the rollout bank after an asynchronous checkpoint becomes durable."""
+
+    def rollout_bank_finalize_fn(iteration=iteration):
+        _maybe_compact_rollout_bank(iteration)
+
+    async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
 
 
 def finalize_deletion_processes(blocking=False):
@@ -1212,6 +1227,14 @@ def save_checkpoint(
                 finalize_fns=logits_finalize_fns,
             )
 
+        if (
+            getattr(args, "rl_durable_rollout_bank", False)
+            and async_save_request is not None
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+        ):
+            # Compact the bank once this async checkpoint becomes durable, so the
+            # bank's compacted-through T tracks the model checkpoint. Rank-0 only.
+            _register_rollout_bank_compaction(async_save_request, iteration)
         if async_save_request is not None:
             schedule_async_save(async_save_request)
         if logits_saver is not None:
@@ -1229,6 +1252,13 @@ def save_checkpoint(
         # before returning from this function.
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+        # Durable rollout bank: compact at the checkpoint boundary so the bank's
+        # compacted-through T tracks this (now durable) checkpoint. Only on sync
+        # saves; async saves compact in their durability finalize callback above.
+        # Rank-0 no-op otherwise.
+        if getattr(args, "rl_durable_rollout_bank", False):
+            _maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
@@ -2347,13 +2377,22 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     """
     from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
     from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mimo.model.base import MimoModel
 
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
         # ``module`` but are intentionally not handled by the regular
-        # ``unwrap_model`` helper.
+        # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
+        # the language model under ``language_model`` instead.
         while module is not None:
             if isinstance(module, HybridModel):
+                return True
+            if isinstance(module, MimoModel):
+                language_module = module.mimo_config.language_model_spec.module
+                if isinstance(language_module, type) and issubclass(language_module, HybridModel):
+                    return True
+            inner = getattr(module, 'language_model', None)
+            if inner is not None and isinstance(inner, HybridModel):
                 return True
             module = getattr(module, 'module', None)
         return False

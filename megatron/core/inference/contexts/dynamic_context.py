@@ -12,6 +12,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -315,7 +316,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     """
 
     DEFAULT_MAX_TOKENS = 16384
-    TOKEN_ROUNDER = 64
+    TOKEN_ROUNDER = _TOKEN_ROUNDER
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
 
@@ -357,6 +358,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
         self.async_sched_step_count = 0
         self.async_sched_compaction_step_count = 0
+
+        # Per-request VLM data (empty when not using multimodal).
+        self._request_to_image_embeddings: Dict[int, Optional[Tensor]] = {}
+        self._request_to_image_token_mask: Dict[int, Optional[Tensor]] = {}
+        self._request_to_image_token_count: Dict[int, int] = {}
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -425,9 +431,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+            self.ssm_chunk_alignment = mamba_inference_state_config.ssm_chunk_alignment
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
+                # Gated Delta Product does not implement batch-invariant mode yet.
+                assert self.gdp_num_householder == 0, (
+                    "batch_invariant_mode does not support Gated Delta Product layers; "
+                    "set batch_invariant_mode=False."
+                )
                 assert not self.enable_prefix_caching, (
                     "batch_invariant_mode does not support Mamba prefix caching; "
                     "set enable_prefix_caching=False."
@@ -441,21 +453,22 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "boundaries are not rounded between decode chunks."
                 )
 
-            # For hybrid models, the layer map converts the global layer index to the
-            # corresponding attention layer index or Mamba layer index depending on the
-            # layer type.
-            attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
-                operator.itemgetter(
-                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
-                )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
-            )
-
-            if len(gdn_layer_map) > 0:
-                raise NotImplementedError("GDN layers are not supported for inference.")
+            # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
+            # one map in global layer order; independently generated per-symbol maps both
+            # start at zero and would alias if they were simply unioned.
+            attention_layer_map, dsa_layer_map = operator.itemgetter(
+                Symbols.ATTENTION, Symbols.DS_ATTENTION
+            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+            recurrent_layer_map = {}
+            for global_layer_idx, layer_type in enumerate(
+                mamba_inference_state_config.layer_type_list
+            ):
+                if layer_type in (Symbols.MAMBA, Symbols.GDN):
+                    recurrent_layer_map[global_layer_idx] = len(recurrent_layer_map)
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
-            self.num_mamba_layers = len(mamba_layer_map)
-            self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
+            self.num_mamba_layers = len(recurrent_layer_map)
+            self.layer_map = attention_layer_map | dsa_layer_map | recurrent_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -813,9 +826,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
             # A chunk plus its final token must fit in one step; otherwise a prompt
             # of that length can never advance without an invalid one-token tail.
-            assert self.max_tokens > self.mamba_chunk_size, (
-                "batch-invariant Mamba chunked prefill requires max_tokens > "
-                f"mamba_chunk_size ({self.mamba_chunk_size})."
+            assert self.max_tokens > self.ssm_chunk_alignment, (
+                "batch-invariant SSM chunked prefill requires max_tokens > "
+                f"ssm_chunk_alignment ({self.ssm_chunk_alignment})."
             )
 
         # FlashInfer.
@@ -1754,6 +1767,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
         self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
+    def _clear_input_id_padding(self) -> None:
+        """Restore zero-filled padding without touching active VLM ``-1`` placeholders."""
+        self.token_to_input_ids[self.padding_slice].zero_()
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
@@ -2330,6 +2347,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
+        # Dummy slots are active, so initialize their embedding IDs explicitly.
+        self.token_to_input_ids[0:T].zero_()
         self.token_to_block_idx[0:T] = dummy_block_idx
         # Compute per-request token positions: e.g. query_lengths [3,2] -> [0,1,2,0,1]
         query_lengths = self.request_query_lengths[0:N]
@@ -2461,6 +2480,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
+        self._clear_input_id_padding()
 
         self.build_active_slices(
             min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
@@ -2891,6 +2911,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+
+        # Reset VLM data.
+        # Guarded because tests can construct via __new__ and skip __init__.
+        getattr(self, "_request_to_image_embeddings", {}).clear()
+        getattr(self, "_request_to_image_token_mask", {}).clear()
+        getattr(self, "_request_to_image_token_count", {}).clear()
 
     def reset(
         self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
@@ -4756,3 +4782,185 @@ class DynamicInferenceContext(BaseInferenceContext):
             'total_request_count': int(total_request_count),
             'max_requests': int(self.max_requests),
         }
+
+    # ----- VLM per-request data management -----
+
+    def add_vlm_request_data(
+        self,
+        request_id: int,
+        image_embeddings: Optional[Tensor] = None,
+        image_token_mask: Optional[Tensor] = None,
+    ) -> None:
+        """Attach per-request image data to the context.
+
+        Called at add_request time when a multimodal request has images.
+        No-op overhead for text-only requests that never call this.
+
+        Args:
+            request_id: The request identifier.
+            image_embeddings: Tensor of shape [seq_img, 1, hidden] or None.
+            image_token_mask: 1-D tensor with -1 for text positions and
+                non-negative indices for image embedding positions; or None.
+        """
+        self._request_to_image_embeddings[request_id] = image_embeddings
+        self._request_to_image_token_mask[request_id] = image_token_mask
+        if image_embeddings is not None:
+            self._request_to_image_token_count[request_id] = int(
+                image_embeddings.shape[0] * image_embeddings.shape[1]
+            )
+        else:
+            self._request_to_image_token_count[request_id] = 0
+
+    def remove_vlm_request_data(self, request_id: int) -> None:
+        """Remove image data for a finished request."""
+        self._request_to_image_embeddings.pop(request_id, None)
+        self._request_to_image_token_mask.pop(request_id, None)
+        self._request_to_image_token_count.pop(request_id, None)
+
+    @property
+    def has_vlm_data(self) -> bool:
+        """True iff any active request has attached image data.
+
+        Used by callers on the hot path (``TextGenerationController._
+        dynamic_step_forward_logits``) to skip ``current_image_token_mask``
+        / ``current_image_embeddings`` entirely on text-only workloads.
+        """
+        return bool(self._request_to_image_token_mask)
+
+    def current_image_token_mask(self) -> Optional[Tensor]:
+        """Flattened image-token mask aligned with current_input_ids.
+
+        Returns a [1, padded_active_token_count] tensor with -1 for non-image
+        positions and non-negative indices into the concatenated image
+        embeddings, or None when there are no active tokens. During
+        decode-only steps (no image tokens consumed) returns all -1.
+        """
+        # Text-only workloads never populate the per-request VLM dicts; short-
+        # circuit so the decode hot path doesn't pay for .tolist() / torch.cat.
+        if not self._request_to_image_token_mask:
+            return None
+
+        if self.padded_active_token_count is None or self.padded_active_token_count == 0:
+            return None
+
+        if self.is_decode_only():
+            # Return the same [1, padded_active_token_count] shape the prefill
+            # branch does. Callers advanced-index a batch-first [b, seq, h]
+            # embedding tensor with this mask; the 2D form is the one that
+            # broadcasts correctly across the batch axis, a 1D mask would
+            # attempt to select along dim 0 and either error or silently
+            # index wrong.
+            return torch.full(
+                (1, self.padded_active_token_count),
+                -1,
+                dtype=torch.long,
+                device=torch.cuda.current_device(),
+            )
+
+        # Batch the three device→host copies into a single sync to keep the
+        # prefill hot path from stalling three separate times per step. A full
+        # vectorization (build the flat mask on-device via cumsum + gather)
+        # would remove even this remaining sync; TODO before this path takes
+        # heavy multimodal traffic.
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        _sync_batch = torch.stack(
+            [
+                self.request_ids[active_slice],
+                self.request_query_lengths[active_slice],
+                # KV offset — how far into the stored prompt this step begins.
+                # Non-zero under chunked prefill and after pause/resume, so
+                # slicing per_request_mask must start at kv_offset, not 0.
+                self.request_kv_length_offsets[active_slice],
+            ],
+            dim=0,
+        ).tolist()
+        active_request_ids, active_query_lengths, active_kv_offsets = (
+            _sync_batch[0],
+            _sync_batch[1],
+            _sync_batch[2],
+        )
+
+        segments: List[Tensor] = []
+        cumulative_offset = 0
+        for request_id, query_len, kv_offset in zip(
+            active_request_ids, active_query_lengths, active_kv_offsets
+        ):
+            per_request_mask = self._request_to_image_token_mask.get(request_id, None)
+            if per_request_mask is None or kv_offset >= per_request_mask.numel():
+                # Past the end of the stored prompt mask — decode step, or a
+                # text-only request. Return an all-text (-1) segment; the
+                # stored mask is prompt-length and doesn't cover generated
+                # positions.
+                seg = torch.full(
+                    (query_len,), -1, dtype=torch.long, device=torch.cuda.current_device()
+                )
+            else:
+                # kv_offset is normally 0 for a fresh prefill and grows with
+                # chunked prefill / pause-and-resume — slice into the stored
+                # mask from where this step actually resumes.
+                seg = per_request_mask[kv_offset : kv_offset + query_len].clone()
+                # Pad if the request is being prefilled beyond the mask (mixed
+                # prefill+decode chunk).
+                if seg.numel() < query_len:
+                    pad = torch.full(
+                        (query_len - seg.numel(),), -1, dtype=seg.dtype, device=seg.device
+                    )
+                    seg = torch.cat([seg, pad])
+                positive = seg >= 0
+                if positive.any():
+                    seg[positive] += cumulative_offset
+
+            segments.append(seg)
+            cumulative_offset += int(self._request_to_image_token_count.get(request_id, 0))
+
+        if len(segments) == 0:
+            return None
+
+        mask = torch.cat(segments, dim=0)
+        if mask.numel() < int(self.padded_active_token_count):
+            pad = torch.full(
+                (int(self.padded_active_token_count) - mask.numel(),),
+                -1,
+                dtype=torch.long,
+                device=mask.device,
+            )
+            mask = torch.cat([mask, pad], dim=0)
+        return mask.unsqueeze(0)
+
+    def current_image_embeddings(self) -> Optional[Tensor]:
+        """Concatenate image embeddings for active requests.
+
+        Each per-request embedding has shape [seq_img_i, 1, hidden] where
+        seq_img_i may vary across requests under dynamic resolution. Each is
+        flattened to [seq_img_i, hidden], concatenated along dim 0, and
+        unsqueezed to [sum(seq_img_i), 1, hidden]. The downstream consumer
+        does ``permute(1, 0, 2).reshape(-1, hidden)`` to yield the flat
+        [total_image_tokens, hidden] array indexed by
+        :meth:`current_image_token_mask`.
+
+        Returns tensor of shape [total_image_tokens, 1, hidden] or None.
+        """
+        # Text-only workloads never populate the per-request VLM dicts; short-
+        # circuit so the decode hot path doesn't pay for .tolist() / torch.cat.
+        if not self._request_to_image_embeddings:
+            return None
+
+        # Decode steps consume no image tokens, so the concatenated embedding
+        # is unused. Short-circuit before the .tolist() sync + torch.cat to
+        # keep the decode critical path free of the D2H stall that would
+        # otherwise fire on every step, mirroring the mask helper above.
+        if self.is_decode_only():
+            return None
+
+        active_request_ids = self.request_ids[
+            self.paused_request_count : self.total_request_count
+        ].tolist()
+
+        parts: List[Tensor] = []
+        for request_id in active_request_ids:
+            emb = self._request_to_image_embeddings.get(request_id, None)
+            if emb is not None:
+                parts.append(emb.reshape(-1, emb.shape[-1]))
+        if not parts:
+            return None
+        return torch.cat(parts, dim=0).unsqueeze(1)
