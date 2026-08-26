@@ -41,6 +41,8 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 if TYPE_CHECKING:
@@ -2317,7 +2319,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             ), "AttnRes MTP postprocess requires the trunk depth-source tuple."
             # Per-depth output head: this depth's partial sum joins the trunk
             # depth history for the final aggregation.
+            nvtx_range_push(msg="attn_res.mtp_final_aggregate")
             hidden_states = self.final_attn_res([*attn_res_sources, hidden_states])
+            nvtx_range_pop(msg="attn_res.mtp_final_aggregate")
 
         if self.mhc_enabled:
             hidden_states = learned_output_contract(

@@ -43,6 +43,7 @@ from torch import Tensor, nn
 
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def is_attn_res_block_start(global_layer_number: int, block_layers: int) -> bool:
@@ -181,6 +182,7 @@ class _AttnResAggregation(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        nvtx_range_push(msg=f"attn_res.aggregate_bwd_n{len(ctx.saved_tensors) - 5}")
         pseudo_query, key_norm_weight, alpha, dots, rstds, *values = ctx.saved_tensors
         q = (pseudo_query * key_norm_weight).float()  # [h]
         hidden_size = values[0].shape[-1]
@@ -209,6 +211,7 @@ class _AttnResAggregation(torch.autograd.Function):
 
         grad_query = (dq * key_norm_weight.float()).to(pseudo_query.dtype)
         grad_norm_weight = (dq * pseudo_query.float()).to(key_norm_weight.dtype)
+        nvtx_range_pop(msg=f"attn_res.aggregate_bwd_n{len(values)}")
         return (grad_query, grad_norm_weight, None, *grad_values)
 
 
@@ -240,4 +243,7 @@ class AttentionResidual(MegatronModule):
     def forward(self, values: Sequence[Tensor]) -> Tensor:
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
-        return _AttnResAggregation.apply(self.pseudo_query, self.key_norm_weight, self.eps, *values)
+        nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
+        out = _AttnResAggregation.apply(self.pseudo_query, self.key_norm_weight, self.eps, *values)
+        nvtx_range_pop(msg=f"attn_res.aggregate_n{len(values)}")
+        return out
