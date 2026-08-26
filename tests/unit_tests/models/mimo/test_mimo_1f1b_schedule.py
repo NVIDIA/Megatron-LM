@@ -214,6 +214,7 @@ def get_language_model_spec(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    share_embeddings_and_output_weights=False,
 ):
     """Get the language model spec.
 
@@ -263,6 +264,7 @@ def get_language_model_spec(
             "max_sequence_length": seq_len,
             "pre_process": (pp_rank == 0),
             "post_process": (pp_rank == pp_size - 1),
+            "share_embeddings_and_output_weights": share_embeddings_and_output_weights,
             "pg_collection": pg_collection,
         },
     )
@@ -381,6 +383,7 @@ def get_mimo_model(
     dropout=True,
     per_token_loss=False,
     use_layer_wise_distributed_optimizer=False,
+    share_embeddings_and_output_weights=False,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -402,6 +405,8 @@ def get_mimo_model(
             and LLM without relying on the per-DDP built-in scaling.
         use_layer_wise_distributed_optimizer: Whether to wrap active modules through the
             production MIMO LayerWise parameter-layout path.
+        share_embeddings_and_output_weights: If True, tie the LLM word embedding and
+            output-layer weights (GPTModel kwarg of the same name).
     """
     language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
     vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
@@ -417,6 +422,7 @@ def get_mimo_model(
         bias=bias,
         dropout=dropout,
         per_token_loss=per_token_loss,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
     )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
