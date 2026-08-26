@@ -728,6 +728,9 @@ def permute_and_quantize_mxfp8(
     )
 
     permuted_mxfp8 = MXFP8Tensor(
-        data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), backend="triton"
+        data=out_fp8,
+        scale=out_scale.view(torch.float8_e8m0fnu),
+        dtype=hidden_states.dtype,
+        backend="triton",
     )
     return permuted_mxfp8, permuted_probs, permutation_map, inclusive_expert_offsets

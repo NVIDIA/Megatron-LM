@@ -280,9 +280,7 @@ class MXFP8ReshardTransform(ReshardTransform):
                         f"1D-scale param {param_name!r}: received {written} elements, "
                         f"expected {buf.data.numel()} (duplicate or missing slices?)"
                     )
-                mxfp8 = MXFP8Tensor.from_bf16(accum, backend=buf.backend)
-                buf.data.copy_(mxfp8.data)
-                buf.scale.view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))
+                buf.copy_(accum)
                 del self._pending_1d[buf_key]
             else:
                 self._pending_1d[buf_key][1] = written

@@ -2,6 +2,8 @@
 
 """Communication-overlap tests for the minimal Megatron-FSDP path."""
 
+from itertools import chain
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -19,8 +21,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
-    collect_linked_kernels,
-    events_overlap,
+    collect_linked_event_groups,
+    event_groups_overlap,
 )
 
 
@@ -168,18 +170,17 @@ def test_overlaps_communication_and_compute(
         # drop the CUDA events.
         torch.cuda.synchronize(device)
 
-    gemm_kernels = collect_linked_kernels(prof, _GEMM_OP_NAME_SUBSTRING)
+    gemm_groups = collect_linked_event_groups(prof, _GEMM_OP_NAME_SUBSTRING)
     # Each child Linear runs one forward and two backward matmuls per microbatch.
     # aten::mm may also launch auxiliary kernels, so check only the matmul lower bound.
     expected_gemm_count = 6 * num_children
-    assert len(gemm_kernels) >= expected_gemm_count, (
-        f"Expected at least {expected_gemm_count} kernels linked to GEMMs, got "
-        f"{len(gemm_kernels)}: "
-        f"{[kernel.name for kernel in gemm_kernels]}"
+    assert len(gemm_groups) >= expected_gemm_count, (
+        f"Expected at least {expected_gemm_count} groups linked to GEMMs, got "
+        f"{len(gemm_groups)}: {gemm_groups}"
     )
 
-    allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
-    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
+    allgather_groups = collect_linked_event_groups(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
+    reduce_scatter_groups = collect_linked_event_groups(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
     # ZeRO-1/2 all-gather once per optimizer step. ZeRO-1 reduces only the second
     # microbatch, while ZeRO-2 reduces both. ZeRO-3 gathers for every forward and
     # backward and reduces every microbatch.
@@ -205,22 +206,22 @@ def test_overlaps_communication_and_compute(
         expected_reduce_scatter_overlap_count,
     ) = expected_collective_counts[placements_factory]
 
-    expected_allgather_kernel_count = 0 if use_symmetric_memory else expected_allgather_count
-    # Zero-CTA moves the all-gather to copy-engine memcpys, so it should not emit
-    # all-gather kernels.
-    assert len(allgather_kernels) == expected_allgather_kernel_count, (
-        f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
-        f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
+    assert len(allgather_groups) == expected_allgather_count, (
+        f"Expected {expected_allgather_count} all-gather groups, got "
+        f"{len(allgather_groups)}: {allgather_groups}"
     )
-    assert len(reduce_scatter_kernels) == expected_reduce_scatter_count, (
-        f"Expected {expected_reduce_scatter_count} reduce-scatter kernels, got "
-        f"{len(reduce_scatter_kernels)}: {[kernel.name for kernel in reduce_scatter_kernels]}"
+    assert len(reduce_scatter_groups) == expected_reduce_scatter_count, (
+        f"Expected {expected_reduce_scatter_count} reduce-scatter groups, got "
+        f"{len(reduce_scatter_groups)}: {reduce_scatter_groups}"
     )
 
-    allgather_streams = {kernel.device_resource_id for kernel in allgather_kernels}
-    reduce_scatter_streams = {kernel.device_resource_id for kernel in reduce_scatter_kernels}
-    gemm_streams = {kernel.device_resource_id for kernel in gemm_kernels}
-    if allgather_kernels:
+    allgather_events = list(chain.from_iterable(allgather_groups))
+    reduce_scatter_events = list(chain.from_iterable(reduce_scatter_groups))
+    gemm_events = list(chain.from_iterable(gemm_groups))
+    allgather_streams = {event.device_resource_id for event in allgather_events}
+    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
+    gemm_streams = {event.device_resource_id for event in gemm_events}
+    if allgather_events:
         assert len(allgather_streams) == 1
         if unify_communication_stream:
             assert allgather_streams == reduce_scatter_streams
@@ -231,20 +232,21 @@ def test_overlaps_communication_and_compute(
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
     allgather_overlap_count = sum(
-        any(events_overlap(kernel, gemm) for gemm in gemm_kernels) for kernel in allgather_kernels
+        any(event_groups_overlap(group, gemm_group) for gemm_group in gemm_groups)
+        for group in allgather_groups
     )
     reduce_scatter_overlap_count = sum(
-        any(events_overlap(kernel, gemm) for gemm in gemm_kernels)
-        for kernel in reduce_scatter_kernels
+        any(event_groups_overlap(group, gemm_group) for gemm_group in gemm_groups)
+        for group in reduce_scatter_groups
     )
     if not use_symmetric_memory:
         assert allgather_overlap_count == expected_allgather_overlap_count, (
             f"Expected exactly {expected_allgather_overlap_count} all-gathers to "
-            f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."
+            f"overlap compute, got {allgather_overlap_count}/{len(allgather_groups)}."
         )
     assert reduce_scatter_overlap_count == expected_reduce_scatter_overlap_count, (
         f"Expected exactly {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
-        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_kernels)}."
+        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_groups)}."
     )
 
     # Release the dedicated communicator so it does not leak into the shared session.
