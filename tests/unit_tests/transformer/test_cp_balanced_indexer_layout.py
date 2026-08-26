@@ -22,10 +22,8 @@ import torch
 from megatron.core.context_parallel_layout.routes import _build_thd_layout_segments
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
-    _FUSED_CALL_ROWS,
     _ZZ_PACK_OK,
     _ensure_pack_zigzag_ok,
-    _pin_fused_call_rows,
     _zigzag_plan,
     prebuild_balanced_layouts,
 )
@@ -149,11 +147,6 @@ def test_prebuild_matches_runtime_plan(name, cu_list, cp_size, capacity):
         psp = _packed_params(cu_list, capacity)
         prebuild_balanced_layouts(psp, cp_group=_StubGroup(cp_size, r))
         cu = psp.cu_seqlens_q_padded
-        # The gate mirrors the forward probe (csa.py), which sees the PADDED cu:
-        # a capacity tail merged into the last sequence counts as one sequence.
-        # The stored verdict is capacity-tagged (l_local, verdict).
-        expected_multi = int(((cu[1:] - cu[:-1]) > 0).sum()) != 1
-        assert psp._dsa_cp_multi_seq == (l_local, expected_multi)
         prebuilt = psp._dsa_cp_balance_layout_cache[("zigzag", r)]
         ref = _zigzag_plan(cu, _comp_cu(cu), cp_size, l_local, r, torch.device("cpu"), None)
         assert prebuilt["half"] == ref["half"]
@@ -166,10 +159,9 @@ def test_prebuild_matches_runtime_plan(name, cu_list, cp_size, capacity):
 
 def test_prebuild_single_full_seq_builds_unified_plan():
     """A single pack-spanning sequence is the nseg==1 case of the unified zigzag path:
-    the gate flag is informational (False) but the plan + routes are still built."""
+    the plan + routes are built like any other composition."""
     psp = _packed_params([0, _S], _S)
     prebuild_balanced_layouts(psp, cp_group=_StubGroup(16, 3))
-    assert psp._dsa_cp_multi_seq == (_S // 16, False)
     plan = psp._dsa_cp_balance_layout_cache[("zigzag", 3)]
     assert "disp_send_rows" in plan and "cmb_recv_rows" in plan
 
@@ -440,7 +432,6 @@ def test_prebuild_capacity_probe_for_raw_cu():
     plan = psp._dsa_cp_balance_layout_cache[("zigzag", 0)]
     assert plan["half"] * 2 == l_local
     assert psp._dsa_cp_balance_layout_cache["zz_pack_ok"] == (l_local, True)
-    assert psp._dsa_cp_multi_seq == (l_local, True)
     # [raw_total, capacity) is the zero-K pseudo-sequence: the compressed-K
     # geometry must match the K buffer the forward builds from the RAW cu
     # (1024//4 + 1976//4 = 750 physical rows) — merging the tail into the last
@@ -463,51 +454,84 @@ def test_prebuild_capacity_probe_for_raw_cu():
     assert psp2._dsa_cp_balance_layout_cache["zz_pack_ok"][0] == 3000 // 4
 
 
-def test_fused_call_row_pin_fails_closed():
-    """The first fused-call row count pins the process; a transition raises.
-
-    The fused kernel package silently corrupts a call preceded by fused calls of
-    other row counts (see the WORKSPACE NOTE below), and no warmup scheme protects
-    it, so the module fails closed rather than risk wrong top-k indices.
-    """
-    _FUSED_CALL_ROWS.clear()
-    try:
-        _pin_fused_call_rows(4096)
-        _pin_fused_call_rows(4096)  # same shape: allowed
-        with pytest.raises(RuntimeError, match="pinned 4096"):
-            _pin_fused_call_rows(8192)
-        with pytest.raises(RuntimeError, match="fails closed"):
-            _pin_fused_call_rows(2048)
-    finally:
-        _FUSED_CALL_ROWS.clear()
+def test_prebuild_rejects_capacity_above_fused_row_limit():
+    """The balanced path issues two fused calls of l_local // 2 rows; prebuild
+    fails at data-prep time when that exceeds FUSED_INDEXER_MAX_SAFE_ROWS (the
+    verified fused-kernel defect boundary, see the WORKSPACE NOTE below)."""
+    group = _StubGroup(4, 0)
+    cap = 4 * 4 * 32768  # l_local = 131072 -> half = 65536 > 32768
+    psp = _packed_params([0, cap], cap)
+    with pytest.raises(RuntimeError, match="verified-safe limit"):
+        prebuild_balanced_layouts(psp, cp_group=group, pad_alignment=8)
+    # At the boundary (half == 32768) the plan builds normally.
+    cap = 4 * 2 * 32768  # l_local = 65536 -> half = 32768
+    psp = _packed_params([0, cap], cap)
+    prebuild_balanced_layouts(psp, cp_group=group, pad_alignment=8)
+    assert ("zigzag", 0) in psp._dsa_cp_balance_layout_cache
 
 
-# WORKSPACE NOTE: the cuDNN indexer package carries cross-call state that
-# corrupts a fused call preceded by fused calls of OTHER shapes in the same
-# process (measured: a 1024-row call followed by an 8192-row call corrupts
-# ~100% of the larger call's rows; large-then-small is fine; sync/empty_cache
-# do not help; and a discarded 65536-row priming call did NOT protect an
-# identically-sized subsequent call — CI run 32712450771 — so this is NOT
-# simple capacity sizing). In shared-process CI lanes, other suites' tiny
-# fused calls run before this file (they don't trip the bug themselves: they
-# compare fused output against equally-degenerate references at sub-32 head
-# counts, where the kernel silently returns all-zero scores). The only defense
-# valid under every model of the bug is process isolation:
-# ``test_fused_kernel_suite_isolated`` below re-runs the five fused tests in a
-# fresh subprocess (clean CUDA context, clean kernel-package state), where the
-# in-file ordering — the multi-offset test's 65536-row call first — is
-# sufficient (pinned green standalone on GB200). In-process, those five tests
-# skip unless MCORE_DSA_FUSED_CHILD=1. Production exposure: per-layer call
-# shapes are constant within a run for a fixed capacity (proven by e2e loss
-# parity; the zigzag head and tail calls share one row count), and
-# shape-ALTERNATING regimes have no user-side mitigation — the falsified
-# priming experiment above shows warmup schemes cannot help — so production
-# fails closed until the kernel-side fix: balanced eligibility is a RUN-LEVEL
-# INVARIANT (config validation requires the fused backend and a compatible pack
-# alignment; nonconforming packs raise at prebuild/dispatch), and
-# ``cp_balanced_indexer`` pins the per-process fused-call row count, raising
-# on any transition (``test_fused_call_row_pin_fails_closed`` above). To be
-# raised with the kernel owners together with the sub-32-head silent-zero mode.
+def test_row_limit_guard_in_compute_cp_indexer_topk():
+    """Above FUSED_INDEXER_MAX_SAFE_ROWS: a synthetic prebuilt_layout raises (it
+    cannot take the unfused path), and a reference-layout call falls back to the
+    unfused implementation and completes (pure torch, runs on CPU)."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+
+    rows = cp_utils.FUSED_INDEXER_MAX_SAFE_ROWS + 4
+    heads, dim, ratio = 4, 8, 4
+    q = torch.zeros((rows, heads, dim), dtype=torch.bfloat16)
+    w = torch.ones((rows, heads), dtype=torch.bfloat16)
+    k = torch.zeros((rows // ratio, dim), dtype=torch.bfloat16)
+    cu = torch.tensor([0, rows], dtype=torch.int32)
+    cc = torch.tensor([0, rows // ratio], dtype=torch.int32)
+    fake_layout = (cu, cc, torch.tensor([0, 0], dtype=torch.int32))
+    with pytest.raises(RuntimeError, match="verified-safe limit"):
+        cp_utils.compute_cp_indexer_topk(
+            q,
+            w,
+            k,
+            cu,
+            cc,
+            0,
+            ratio,
+            8,
+            1.0,
+            max_seqlen_q=rows,
+            use_fused=True,
+            prebuilt_layout=fake_layout,
+        )
+    tk, layout = cp_utils.compute_cp_indexer_topk(
+        q, w, k, cu, cc, 0, ratio, 8, 1.0, max_seqlen_q=rows, use_fused=True
+    )
+    assert tk is not None and tk.shape[0] == rows  # unfused fallback ran
+
+
+# WORKSPACE NOTE — the fused kernel package's cross-call defect, fully
+# characterized on GB200 / cudnn-frontend 1.26.0 (three controlled matrices,
+# fresh process per scenario, fused output vs an in-process unfused torch
+# reference on tie-free signature data):
+#   * A fused call with total_q > 32768 rows is correct ONLY as the process's
+#     first fused call. After any fused call — of any shape, including a
+#     bit-identical one — every output row >= 32768 is silently wrong
+#     (deterministic; first bad row exactly 32768).
+#   * Calls with total_q <= 32768 are immune to process history entirely:
+#     row-count transitions, sequence count, max_seqlen_kv, causal offsets and
+#     the predecessor's shape were each varied and none is causal.
+#   * Discarded warmup/priming calls cannot help (a same-shape priming call is
+#     itself a predecessor — falsified in CI run 32712450771).
+# Production consequence: compute_cp_indexer_topk fails closed above the limit
+# (unfused fallback for reference layouts, raise for synthetic ones) and
+# prebuild bounds l_local at 2 * 32768. In shared-process CI lanes, other
+# suites' tiny fused calls run first (they don't observe the defect themselves:
+# they compare fused output against equally-degenerate references at sub-32
+# head counts, where the kernel silently returns all-zero scores), so the
+# 65536-row multi-offset test below would be corrupted in-process:
+# ``test_fused_kernel_suite_isolated`` re-runs the five fused tests in a fresh
+# subprocess (clean kernel-package state), where the in-file ordering — the
+# multi-offset test's 65536-row call first — is sufficient (pinned green
+# standalone on GB200). In-process those five tests skip unless
+# MCORE_DSA_FUSED_CHILD=1. To be raised with the kernel owners together with
+# the sub-32-head silent-zero mode; do not add a version exemption until a
+# fixed kernel package is demonstrated against the reproducer.
 _FUSED_ISOLATED_TESTS = (
     "test_fused_multi_offset_packed_layout",
     "test_fused_tight_width_smoke",
