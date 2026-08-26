@@ -850,29 +850,25 @@ try:
 
                         # Get the templated tokenization of just the previous generation.
                         if previous_media_slots:
-                            retokenized_previous_turn_token_ids = (
-                                await _tokenize_with_media_slots(
-                                    chat_tok,
-                                    messages_to_last_assistant_message,
-                                    previous_media_slots,
-                                    prompt_config,
-                                    tools=template_tools,
-                                    chat_template_kwargs=chat_template_kwargs,
-                                    add_generation_prompt=False,
-                                )
+                            retokenized_previous_turn_token_ids = await _tokenize_with_media_slots(
+                                chat_tok,
+                                messages_to_last_assistant_message,
+                                previous_media_slots,
+                                prompt_config,
+                                tools=template_tools,
+                                chat_template_kwargs=chat_template_kwargs,
+                                add_generation_prompt=False,
                             )
                         else:
-                            retokenized_previous_turn_token_ids = (
-                                _coerce_to_token_id_list(
-                                    await asyncio.to_thread(
-                                        functools.partial(
-                                            chat_tok.apply_chat_template,
-                                            messages_to_last_assistant_message,
-                                            tokenize=True,
-                                            add_generation_prompt=False,
-                                            tools=template_tools,
-                                            **chat_template_kwargs,
-                                        )
+                            retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
+                                await asyncio.to_thread(
+                                    functools.partial(
+                                        chat_tok.apply_chat_template,
+                                        messages_to_last_assistant_message,
+                                        tokenize=True,
+                                        add_generation_prompt=False,
+                                        tools=template_tools,
+                                        **chat_template_kwargs,
                                     )
                                 )
                             )

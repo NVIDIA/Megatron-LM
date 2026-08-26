@@ -28,7 +28,8 @@ def test_extract_media_data_url_rejects_decoded_payload_over_limit():
         _extract_media_url_bytes(url, max_bytes=4)
 
 
-def test_media_slot_uses_tokenizer_id_when_model_id_is_unspecified():
+@pytest.mark.asyncio
+async def test_media_slot_uses_tokenizer_id_when_model_id_is_unspecified():
     class _Tokenizer:
         unk_token_id = 0
 
@@ -45,7 +46,7 @@ def test_media_slot_uses_tokenizer_id_when_model_id_is_unspecified():
     spec = MediaPromptSpec(model_token="<image>")
     prompt_config = MultimodalPromptConfig(image_spec=spec, video_spec=spec)
 
-    tokens = _tokenize_with_media_slots(
+    tokens = await _tokenize_with_media_slots(
         _Tokenizer(),
         messages=[],
         media_slots=[("__MEDIA__", "image", 0)],
