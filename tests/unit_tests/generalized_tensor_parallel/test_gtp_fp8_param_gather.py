@@ -663,12 +663,7 @@ class TestGTPFp8ParamGather:
             ]
             torch.distributed.all_gather(gathered_trajectories, local_trajectories)
             trajectories = torch.stack(gathered_trajectories)
-            torch.testing.assert_close(
-                trajectories[:, 0],
-                trajectories[:, 1],
-                atol=1e-4,
-                rtol=1e-3,
-            )
+            torch.testing.assert_close(trajectories[:, 0], trajectories[:, 1], atol=1e-4, rtol=1e-3)
         finally:
             harness.teardown_method(None)
 
