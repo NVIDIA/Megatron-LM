@@ -22,8 +22,10 @@ import torch
 from megatron.core.context_parallel_layout.routes import _build_thd_layout_segments
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
+    _FUSED_CALL_ROWS,
     _ZZ_PACK_OK,
     _pack_zigzag_ok,
+    _pin_fused_call_rows,
     _use_zigzag,
     _zigzag_plan,
     prebuild_balanced_layouts,
@@ -478,6 +480,25 @@ def test_prebuild_capacity_probe_for_raw_cu():
     )
     prebuild_balanced_layouts(psp2, cp_group=_StubGroup(4, 0))
     assert psp2._dsa_cp_balance_layout_cache["zz_pack_ok"][0] == 3000 // 4
+
+
+def test_fused_call_row_pin_fails_closed():
+    """The first fused-call row count pins the process; a transition raises.
+
+    The fused kernel package silently corrupts a call preceded by fused calls of
+    other row counts (see the WORKSPACE NOTE below), and no warmup scheme protects
+    it, so the module fails closed rather than risk wrong top-k indices.
+    """
+    _FUSED_CALL_ROWS.clear()
+    try:
+        _pin_fused_call_rows(4096)
+        _pin_fused_call_rows(4096)  # same shape: allowed
+        with pytest.raises(RuntimeError, match="pinned 4096"):
+            _pin_fused_call_rows(8192)
+        with pytest.raises(RuntimeError, match="fails closed"):
+            _pin_fused_call_rows(2048)
+    finally:
+        _FUSED_CALL_ROWS.clear()
 
 
 _fused_kernel_test = pytest.mark.skipif(

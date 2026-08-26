@@ -93,6 +93,39 @@ _ZZ_PACK_OK: dict = {}
 # change must fail loudly there too.
 _SEEN_CU: dict = {}
 
+# Fail-closed guard for the fused kernel package's cross-call hazard (see the
+# WORKSPACE NOTE in test_cp_balanced_indexer_layout.py): a fused call preceded by
+# fused calls of OTHER row counts in the same process can be silently corrupted,
+# and the falsified priming experiment shows no warmup scheme protects it. Every
+# fused indexer call issued by this module therefore pins the process to a single
+# row count; a call that would change it raises instead of risking wrong top-k
+# indices. Scope: calls issued by this module only — it cannot see fused indexer
+# calls made elsewhere in the process. Under CUDA graphs the composition is static
+# (enforced at prebuild), so the pin never trips there.
+_FUSED_CALL_ROWS: dict = {}
+
+
+def _pin_fused_call_rows(rows: int) -> None:
+    """Pin the per-process fused-call row count; raise on a transition."""
+    rows = int(rows)
+    prev = _FUSED_CALL_ROWS.get("rows")
+    if prev is None:
+        _FUSED_CALL_ROWS["rows"] = rows
+        return
+    if prev != rows:
+        raise RuntimeError(
+            f"balanced CP indexer: fused indexer call with {rows} rows after this "
+            f"process pinned {prev} rows. The fused kernel package carries cross-call "
+            "state that silently corrupts calls whose shape differs from earlier calls "
+            "(see the WORKSPACE NOTE in test_cp_balanced_indexer_layout.py), so this "
+            "fails closed. Keep one fused-call shape per run: use a fixed pack "
+            "capacity and make every (padded) sequence length divisible by "
+            "2 * cp_size so all packs stay on the zigzag path, or run the indexer "
+            "unfused (attention_backend=unfused / dsa_kernel_backend='none'), or "
+            "disable dsa_cp_balance_indexer."
+        )
+
+
 # Sentinel default for prebuild_balanced_layouts(pad_alignment=...): "the caller did
 # not supply the config's pad alignment" (build routes; the forward gate decides).
 # Passing None explicitly means "the config HAS no packed-seq alignment", for which
@@ -657,6 +690,8 @@ def balanced_compute_cp_indexer_topk(
         # only on its own position and K, so scoring a chunk matches the same rows of a full call
         # (up to GEMM reduction order of the chunked projection: exact score ties may resolve
         # differently; the output is integer indices with no gradient path).
+        if use_fused:
+            _pin_fused_call_rows(sz)
         with _no_fp8_ctx():  # keep the loss path's FP8 amax stream reference-identical
             q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
@@ -810,6 +845,7 @@ def balanced_compute_cp_indexer_topk(
             # Integer top-k output only: no gradient flows through the balanced
             # scoring, so skip autograd tracking for the per-chunk projection/RoPE.
             sz = qr_rows.shape[0]
+            _pin_fused_call_rows(sz)
             with _no_fp8_ctx():  # see _chunk_topk: keep the FP8 amax stream untouched
                 q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
             q = q.reshape(sz, n_heads, head_dim)
