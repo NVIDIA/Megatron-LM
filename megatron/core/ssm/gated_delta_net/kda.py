@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -87,6 +88,16 @@ class KimiDeltaAttention(_GDNBase):
                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
             )
 
+        if config.fp8:
+            fp8_align_size = get_fp8_align_size(config.fp8_recipe)
+            for field_name in ("kda_f_lora_rank", "kda_gate_lora_rank"):
+                rank = getattr(config, field_name)
+                if rank is not None and rank % fp8_align_size != 0:
+                    raise ValueError(
+                        f"KDA requires {field_name} to be a multiple of "
+                        f"{fp8_align_size} under FP8, got {rank}."
+                    )
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -115,7 +126,7 @@ class KimiDeltaAttention(_GDNBase):
                     bias=False,
                     skip_bias_add=False,
                     is_expert=False,
-                    tp_comm_buffer_name="fc1",
+                    tp_comm_buffer_name="f_proj",
                     tp_group=self.pg_collection.tp,
                     name=(name + ".f_proj") if name is not None else None,
                 )
@@ -179,7 +190,7 @@ class KimiDeltaAttention(_GDNBase):
                     bias=False,
                     skip_bias_add=False,
                     is_expert=False,
-                    tp_comm_buffer_name="fc1",
+                    tp_comm_buffer_name="g_proj",
                     tp_group=self.pg_collection.tp,
                     name=(name + ".g_proj") if name is not None else None,
                 )

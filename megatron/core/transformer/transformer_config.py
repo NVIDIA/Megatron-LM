@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
@@ -1829,15 +1828,6 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "KDA requires kda_gate_lora_rank > 0, " f"got {self.kda_gate_lora_rank}."
                     )
-                if self.fp8:
-                    fp8_align_size = get_fp8_align_size(self.fp8_recipe)
-                    for field_name in ("kda_f_lora_rank", "kda_gate_lora_rank"):
-                        rank = getattr(self, field_name)
-                        if rank is not None and rank % fp8_align_size != 0:
-                            raise ValueError(
-                                f"KDA requires {field_name} to be a multiple of "
-                                f"{fp8_align_size} under FP8, got {rank}."
-                            )
                 if self.kda_safe_gate:
                     if self.kda_lower_bound is None:
                         raise ValueError("KDA requires kda_lower_bound when kda_safe_gate=True.")

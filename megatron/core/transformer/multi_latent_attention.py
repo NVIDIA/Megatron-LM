@@ -184,11 +184,18 @@ class MultiLatentAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
+        self.use_rope = (
+            not bool(self.config.no_rope_freq[self.layer_number - 1])
+            if self.config.no_rope_freq
+            else True
+        )
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
         self.cache_mla_latents = self.config.cache_mla_latents
 
-        if self.config.rope_type == "rope":
+        if not self.use_rope:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -809,17 +816,22 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
-        )
+        rotary_seq_len = None
+        if self.use_rope:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, None, hidden_states, self.config, packed_seq_params
+            )
 
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        use_fused_rope = should_use_fused_mla_rope(self.config)
-        if use_fused_rope:
+        use_fused_rope = self.use_rope and should_use_fused_mla_rope(self.config)
+        if not self.use_rope:
+            rotary_pos_emb = None
+        elif use_fused_rope:
+            assert rotary_seq_len is not None
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                 rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
             )
@@ -829,8 +841,10 @@ class MLASelfAttention(MultiLatentAttention):
                 fused_apply_mla_rope_for_q is not None and fused_apply_mla_rope_for_kv is not None
             ), "Fused MLA RoPE apply is not imported successfully"
         elif self.config.rope_type == "rope":
+            assert rotary_seq_len is not None
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
+            assert rotary_seq_len is not None
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -915,23 +929,24 @@ class MLASelfAttention(MultiLatentAttention):
                 q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
             )
 
-            # Dynamic batching: use inference context methods
-            q_pos_emb = inference_context.apply_rotary_emb_query(
-                q_pos_emb,
-                rotary_pos_emb,
-                config=self.config,
-                cu_seqlens_q=cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
-                mscale=mscale,
-            )
-            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = inference_context.apply_rotary_emb_key(
-                k_pos_emb,
-                rotary_pos_emb,
-                config=self.config,
-                cp_group=self.pg_collection.cp,
-                mscale=mscale,
-            )
+            if self.use_rope:
+                # Dynamic batching: use inference context methods
+                q_pos_emb = inference_context.apply_rotary_emb_query(
+                    q_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cp_group=self.pg_collection.cp,
+                    mscale=mscale,
+                )
+                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                k_pos_emb = inference_context.apply_rotary_emb_key(
+                    k_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cp_group=self.pg_collection.cp,
+                    mscale=mscale,
+                )
 
             # Create KV cache entry. It will the be the key vector in cache mla latents path
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
@@ -994,7 +1009,27 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             # todo add assert about fusions and caching
-            if use_fused_rope:
+            if not self.use_rope:
+                # q_no_pe: [num_tokens, n, qk_head_dim]
+                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                q_no_pe, q_pos_emb = torch.split(
+                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+                )
+
+                # k_no_pe: [num_tokens, n, qk_head_dim]
+                # value: [num_tokens, n, v_head_dim]
+                k_no_pe, value = torch.split(
+                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+                )
+
+                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+                if k_pos_emb.ndim == 4:
+                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                else:
+                    assert k_pos_emb.ndim == 3
+                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
+                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+            elif use_fused_rope:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_apply_mla_rope_for_q(
@@ -1020,6 +1055,7 @@ class MLASelfAttention(MultiLatentAttention):
                     cp_size,
                 )
             else:
+                # Apply unfused rope.
                 q_len = q.size()[0]
                 if inference_context is not None:
                     # add offset to the sequence start for inference
