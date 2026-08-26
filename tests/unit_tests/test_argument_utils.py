@@ -13,8 +13,10 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    core_transformer_config_from_args,
     pretrain_cfg_container_from_args,
 )
+from megatron.training.arguments import add_megatron_arguments
 from megatron.training.config import PretrainConfigContainer
 
 
@@ -39,6 +41,32 @@ class DummyConfig:
 
     enum_setting: signal.Signals = signal.SIGTERM
     """Setting with enum type to test enum handling"""
+
+
+@dataclass(init=False)
+class CapturingTransformerConfig:
+    """Minimal config that records kwargs produced by core_transformer_config_from_args."""
+
+    moe_use_norm_before_up_proj: bool = False
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def test_moe_norm_flag_reaches_transformer_config():
+    """The generated LatentMoE norm flag should populate the model config."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    default_args = parser.parse_args([])
+    assert default_args.moe_use_norm_before_up_proj is False
+
+    enabled_args = parser.parse_args(["--moe-use-norm-before-up-proj"])
+    config = core_transformer_config_from_args(
+        enabled_args, config_class=CapturingTransformerConfig
+    )
+
+    assert config.moe_use_norm_before_up_proj is True
 
 
 @dataclass
