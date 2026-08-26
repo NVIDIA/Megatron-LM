@@ -8,7 +8,10 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.pipeline_parallel.reusable_buffers import release_reusable_output_buffer
+from megatron.core.pipeline_parallel.reusable_buffers import (
+    is_reusable_output_buffer,
+    release_reusable_output_buffer,
+)
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -242,7 +245,7 @@ class ScheduleNode:
         if self.free_input:
             for input in inputs:
                 if input is not None:
-                    if not release_reusable_output_buffer(input, self.stream):
+                    if not is_reusable_output_buffer(input):
                         input.record_stream(self.stream)
                         input.untyped_storage().resize_(0)
 

@@ -5,11 +5,12 @@ import torch
 
 from megatron.core.pipeline_parallel.reusable_buffers import (
     ReusableOutputBufferPool,
+    is_reusable_output_buffer,
     release_reusable_output_buffer,
 )
 
 
-def test_reusable_output_buffer_release_is_idempotent_for_final_consumer(monkeypatch):
+def test_reusable_output_buffer_ownership_probe_does_not_release(monkeypatch):
     events = []
 
     class FakeEvent:
@@ -26,11 +27,31 @@ def test_reusable_output_buffer_release_is_idempotent_for_final_consumer(monkeyp
     tensor = pool.acquire((4, 8), torch.bfloat16, torch.device("cpu"))
     stream = object()
 
-    # The dispatcher releases at the true final consumer. ScheduleNode then sees the same
-    # persistent storage in its generic free-input path and must skip resize without failing.
-    assert release_reusable_output_buffer(tensor, stream)
+    assert is_reusable_output_buffer(tensor)
+    assert is_reusable_output_buffer(tensor.detach())
+    assert not events
     assert release_reusable_output_buffer(tensor, stream)
     assert events[0].recorded_streams == [stream]
+    pool.reset()
+    assert not is_reusable_output_buffer(tensor)
+
+
+def test_reusable_output_buffer_rejects_double_release(monkeypatch):
+    class FakeEvent:
+        def __init__(self, **_):
+            pass
+
+        def record(self, _stream):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    pool = ReusableOutputBufferPool("test")
+    pool.configure(1)
+    tensor = pool.acquire((4, 8), torch.bfloat16, torch.device("cpu"))
+
+    assert release_reusable_output_buffer(tensor, object())
+    with pytest.raises(RuntimeError, match="released more than once"):
+        release_reusable_output_buffer(tensor, object())
     pool.reset()
 
 
