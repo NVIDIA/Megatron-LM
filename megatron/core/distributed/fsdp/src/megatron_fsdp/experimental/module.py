@@ -29,6 +29,7 @@ from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
+from .schedule import SchedulePolicy
 
 
 def _is_in_backward() -> bool:
@@ -159,8 +160,7 @@ class FsdpModule:
     _trainable_parameter_countdown: Countdown
     _is_root: bool
     _num_trainable_parameters: int
-    _forward_prefetch_size: int | None
-    _backward_prefetch_size: int | None
+    _schedule_policy: SchedulePolicy
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
@@ -180,8 +180,7 @@ class FsdpModule:
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
-        forward_prefetch_size: int | None = None,
-        backward_prefetch_size: int | None = None,
+        schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
@@ -190,16 +189,7 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
-        if forward_prefetch_size is not None and forward_prefetch_size < 0:
-            raise ValueError(
-                f"forward_prefetch_size must be non-negative, got {forward_prefetch_size}."
-            )
-        if backward_prefetch_size is not None and backward_prefetch_size < 0:
-            raise ValueError(
-                f"backward_prefetch_size must be non-negative, got {backward_prefetch_size}."
-            )
-        self._forward_prefetch_size = forward_prefetch_size
-        self._backward_prefetch_size = backward_prefetch_size
+        self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -364,7 +354,9 @@ class FsdpModule:
         # prefetch the next module in forward order: its backward may already
         # be complete, so no later backward hook would reshard it.
         if not is_recomputing:
-            self._prefetch_parameter_groups(context.forward_order, self._forward_prefetch_size)
+            self._prefetch_parameter_groups(
+                context.forward_order, self._schedule_policy.forward_prefetch_size
+            )
 
     def _prefetch_parameter_groups(
         self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
@@ -450,7 +442,9 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        self._prefetch_parameter_groups(context.backward_order, self._backward_prefetch_size)
+        self._prefetch_parameter_groups(
+            context.backward_order, self._schedule_policy.backward_prefetch_size
+        )
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

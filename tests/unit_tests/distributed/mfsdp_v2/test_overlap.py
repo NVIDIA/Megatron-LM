@@ -14,6 +14,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -276,8 +277,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
                 mesh=mesh,
                 placements=placements,
                 mixed_precision_policy=policy,
-                forward_prefetch_size=0,
-                backward_prefetch_size=0,
+                schedule_policy=SchedulePolicy(forward_prefetch_size=0, backward_prefetch_size=0),
             )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
