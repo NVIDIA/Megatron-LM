@@ -693,7 +693,7 @@ def initialize_model_parallel(
             Shards model weights along ``out_features`` across this many ranks;
             each weight is rematerialized independently (per-weight, not per-
             layer) via async all-gather on every forward AND backward pass. A
-            first-class orthogonal axis (world_size = TP*GTP*CP*DP). Maps to the
+            first-class orthogonal axis (world_size = TP*CP*GTP*DP). Maps to the
             dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
             NOTE: "remat" here is NOT activation recomputation/checkpointing.
 
