@@ -5,6 +5,8 @@
 The numerical oracle is an independent standard-PyTorch port of the naive MLA path in
 ``deepseek-ai/DeepSeek-V3`` at commit
 ``9b4e9788e4a3a731f7567338ed15d3ec549ce03b``, file ``inference/model.py``.
+The no-RoPE branch is pinned to ``moonshotai/Kimi-K3`` at commit
+``c5d1dd4c428bd1ce8b88c5044f3b6ccde9e3b721``, file ``modeling_kimi_linear.py``.
 It does not import MCore projection, RoPE, attention, CP, FA4, cuDNN, or TE code.
 """
 
@@ -14,6 +16,7 @@ import gc
 import json
 import math
 import os
+import traceback
 import types
 import weakref
 from contextlib import contextmanager
@@ -37,6 +40,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import multi_latent_attention as base_mla
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
 from megatron.core.transformer.identity_op import IdentityOp
@@ -49,6 +53,9 @@ latent_cp = mla_with_latent_cp
 DEEPSEEK_V3_REFERENCE_REPO = "https://github.com/deepseek-ai/DeepSeek-V3"
 DEEPSEEK_V3_REFERENCE_COMMIT = "9b4e9788e4a3a731f7567338ed15d3ec549ce03b"
 DEEPSEEK_V3_REFERENCE_PATH = "inference/model.py"
+KIMI_K3_REFERENCE_REPO = "https://huggingface.co/moonshotai/Kimi-K3"
+KIMI_K3_REFERENCE_COMMIT = "c5d1dd4c428bd1ce8b88c5044f3b6ccde9e3b721"
+KIMI_K3_REFERENCE_PATH = "modeling_kimi_linear.py"
 EXPECTED_CUDNN_FRONTEND_SOURCE_REV = "0a14b7181d129d30e7bad34b8c3ed0a0c995e23d"
 EXPECTED_QUALIFIED_BACKEND_CONFIGS: tuple[latent_cp.QualifiedBackendTuple, ...] = (
     (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)),
@@ -135,6 +142,8 @@ def _cumulative(lengths: tuple[int, ...], device: str | torch.device = "cpu") ->
 def _zigzag_global_indices(
     lengths: tuple[int, ...], cp_size: int, cp_rank: int, device: str | torch.device = "cpu"
 ) -> torch.Tensor:
+    if cp_size == 1:
+        return torch.arange(sum(lengths), dtype=torch.long, device=device)
     indices: list[int] = []
     offset = 0
     for length in lengths:
@@ -157,6 +166,8 @@ def _sequence_parallel_slice(tensor: torch.Tensor, tp_group: dist.ProcessGroup) 
 
 
 def _zigzag_positions(lengths: tuple[int, ...], cp_size: int, cp_rank: int) -> torch.Tensor:
+    if cp_size == 1:
+        return torch.cat([torch.arange(length, dtype=torch.long) for length in lengths])
     positions: list[int] = []
     for length in lengths:
         chunk = length // (2 * cp_size)
@@ -188,6 +199,10 @@ def _make_config(
     backend: AttnBackend = AttnBackend.fused,
     rope_type: str = "rope",
     production_shape: bool = False,
+    attention_output_gate: bool = False,
+    gate_granularity: str = "elementwise",
+    no_rope: bool = False,
+    dynamic_cp: bool = False,
 ) -> MLATransformerConfig:
     hidden_size = _PRODUCTION_HIDDEN if production_shape else 32
     heads = _PRODUCTION_HEADS if production_shape else 4
@@ -202,6 +217,8 @@ def _make_config(
         kv_channels=128,
         multi_latent_attention=True,
         mla_latent_cp=True,
+        attention_output_gate=attention_output_gate,
+        gated_attention_proj_granularity=gate_granularity,
         q_lora_rank=q_lora,
         kv_lora_rank=kv_lora,
         qk_head_dim=_QK_CONTENT,
@@ -220,12 +237,15 @@ def _make_config(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=1,
         context_parallel_size=cp_size,
+        dynamic_context_parallel=dynamic_cp,
+        min_dynamic_context_parallel_size=1,
         expert_model_parallel_size=1,
         sequence_parallel=tp_size > 1,
         cp_comm_type="p2p",
         cp_partition_mode="zigzag",
         apply_rope_fusion=False,
         rope_type=rope_type,
+        no_rope_freq=[1] if no_rope else None,
         rotary_percent=1.0,
         rotary_scaling_factor=40.0 if yarn else 1.0,
         mscale=1.0,
@@ -292,6 +312,7 @@ def _make_packed(
     *,
     device: str | torch.device,
     cp_group=None,
+    local_cp_size: int | None = None,
     total_tokens: int | None = None,
 ) -> PackedSeqParams:
     cu = _cumulative(lengths, device)
@@ -302,6 +323,7 @@ def _make_packed(
         max_seqlen_q=max(lengths),
         max_seqlen_kv=max(lengths),
         cp_group=cp_group,
+        local_cp_size=local_cp_size,
         total_tokens=total_tokens,
         cp_partition_mode="zigzag",
         pad_between_seqs=False,
@@ -309,7 +331,7 @@ def _make_packed(
 
 
 @contextmanager
-def _model_parallel(tp_size: int, cp_size: int):
+def _model_parallel(tp_size: int, cp_size: int, *, dynamic_cp: bool = False):
     from tests.unit_tests.test_utilities import Utils
 
     required = tp_size * cp_size
@@ -317,16 +339,40 @@ def _model_parallel(tp_size: int, cp_size: int):
         pytest.skip("CUDA is required")
     if Utils.world_size < required or Utils.world_size % required:
         pytest.skip(f"test requires a world size divisible by TP{tp_size}xCP{cp_size}")
+    dynamic_kwargs = (
+        {"dynamic_context_parallel": True, "min_dynamic_context_parallel_size": 1}
+        if dynamic_cp
+        else {}
+    )
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=1,
         context_parallel_size=cp_size,
+        **dynamic_kwargs,
     )
     model_parallel_cuda_manual_seed(_SEED)
     try:
         yield ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp", "tp_cp"])
     finally:
         Utils.destroy_model_parallel()
+
+
+@contextmanager
+def _rank_common_assertions():
+    """Fail rank-local assertions collectively so peers never enter later collectives alone."""
+
+    local_failure = None
+    try:
+        yield
+    except AssertionError:
+        local_failure = traceback.format_exc()
+    failures = [None] * dist.get_world_size()
+    dist.all_gather_object(failures, local_failure)
+    formatted = [
+        f"rank {rank}:\n{failure}" for rank, failure in enumerate(failures) if failure is not None
+    ]
+    if formatted:
+        pytest.fail("rank-local assertion failure(s):\n" + "\n".join(formatted), pytrace=False)
 
 
 # Pinned from DeepSeek-V3 inference/model.py. Standard PyTorch only.
@@ -410,10 +456,19 @@ class NaiveMLA(nn.Module):
             bias=False,
             **factory,
         )
+        self.gate = None
+        if config.attention_output_gate:
+            gate_size = (
+                config.num_attention_heads * config.v_head_dim
+                if config.gated_attention_proj_granularity == "elementwise"
+                else config.num_attention_heads
+            )
+            self.gate = nn.Linear(config.hidden_size, gate_size, bias=False, **factory)
         self.config = config
         self.q_head_dim = q_head_dim
+        self.use_rope = not bool(config.no_rope_freq and config.no_rope_freq[0])
         scale = 1.0
-        if config.rotary_scaling_factor > 1:
+        if self.use_rope and config.rotary_scaling_factor > 1:
             # Pinned DeepSeek-V3 inference/model.py uses its sole ``mscale`` field.
             scale = 0.1 * config.mscale * math.log(config.rotary_scaling_factor) + 1.0
         self.softmax_scale = scale * scale / math.sqrt(q_head_dim)
@@ -442,22 +497,32 @@ class NaiveMLA(nn.Module):
             expanded, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
         )
 
-        frequencies = _official_freqs_cis(
-            dim=self.config.qk_pos_emb_head_dim,
-            max_seq_len=max(packed_lengths),
-            base=self.config.rotary_base,
-            factor=self.config.rotary_scaling_factor,
-            original_max_positions=self.config.original_max_position_embeddings,
-            beta_fast=self.config.beta_fast,
-            beta_slow=self.config.beta_slow,
-            device=x.device,
-        )
+        frequencies = None
+        if self.use_rope:
+            frequencies = _official_freqs_cis(
+                dim=self.config.qk_pos_emb_head_dim,
+                max_seq_len=max(packed_lengths),
+                base=self.config.rotary_base,
+                factor=self.config.rotary_scaling_factor,
+                original_max_positions=self.config.original_max_position_embeddings,
+                beta_fast=self.config.beta_fast,
+                beta_slow=self.config.beta_slow,
+                device=x.device,
+            )
         outputs: list[torch.Tensor] = []
         offset = 0
         for length in packed_lengths:
             token_slice = slice(offset, offset + length)
-            q_pe = _official_apply_rotary(q_rope[token_slice], frequencies[:length])
-            k_pe = _official_apply_rotary(k_rope[token_slice].unsqueeze(1), frequencies[:length])
+            if self.use_rope:
+                q_pe = _official_apply_rotary(q_rope[token_slice], frequencies[:length])
+                k_pe = _official_apply_rotary(
+                    k_rope[token_slice].unsqueeze(1), frequencies[:length]
+                )
+            else:
+                # Pinned Kimi-K3 MLA keeps the positional-width Q/K branches but
+                # concatenates them without constructing or applying RoPE.
+                q_pe = q_rope[token_slice]
+                k_pe = k_rope[token_slice].unsqueeze(1)
             q_seq = torch.cat((q_content[token_slice], q_pe), dim=-1)
             k_seq = torch.cat(
                 (k_content[token_slice], k_pe.expand(-1, self.config.num_attention_heads, -1)),
@@ -475,18 +540,29 @@ class NaiveMLA(nn.Module):
             outputs.append(output.to(torch.bfloat16))
             offset += length
         merged = torch.cat(outputs, dim=0).reshape(x.size(0), -1)
+        if self.gate is not None:
+            gate = torch.sigmoid(self.gate(x).float()).to(merged.dtype)
+            if self.config.gated_attention_proj_granularity == "headwise":
+                merged = merged.view(x.size(0), self.config.num_attention_heads, -1)
+                merged = (merged * gate.unsqueeze(-1)).reshape(x.size(0), -1)
+            else:
+                merged = merged * gate
         return self.wo(merged).unsqueeze(1)
 
 
-_PARAMETER_MAP = {
-    "wq_a.weight": ("linear_q_down_proj.weight", 0),
-    "q_norm.weight": ("q_layernorm.weight", None),
-    "wq_b.weight": ("linear_q_up_proj.weight", 0),
-    "wkv_a.weight": ("linear_kv_down_proj.weight", 0),
-    "kv_norm.weight": ("kv_layernorm.weight", None),
-    "wkv_b.weight": ("linear_kv_up_proj.weight", 0),
-    "wo.weight": ("linear_proj.weight", 1),
-}
+def _parameter_map(config: MLATransformerConfig) -> dict[str, tuple[str, int | None]]:
+    mapping = {
+        "wq_a.weight": ("linear_q_down_proj.weight", 0),
+        "q_norm.weight": ("q_layernorm.weight", None),
+        "wq_b.weight": ("linear_q_up_proj.weight", 0),
+        "wkv_a.weight": ("linear_kv_down_proj.weight", 0),
+        "kv_norm.weight": ("kv_layernorm.weight", None),
+        "wkv_b.weight": ("linear_kv_up_proj.weight", 0),
+        "wo.weight": ("linear_proj.weight", 1),
+    }
+    if config.attention_output_gate:
+        mapping["gate.weight"] = ("linear_gate.weight", 0)
+    return mapping
 
 
 def _copy_reference_parameters(
@@ -494,11 +570,12 @@ def _copy_reference_parameters(
 ) -> None:
     reference_params = dict(reference.named_parameters())
     real_params = dict(real_layer.named_parameters())
-    assert set(reference_params) == set(_PARAMETER_MAP)
-    assert set(real_params) == {real_name for real_name, _ in _PARAMETER_MAP.values()}
+    parameter_map = _parameter_map(reference.config)
+    assert set(reference_params) == set(parameter_map)
+    assert set(real_params) == {real_name for real_name, _ in parameter_map.values()}
     tp_size = dist.get_world_size(pg.tp)
     tp_rank = dist.get_rank(pg.tp)
-    for reference_name, (real_name, shard_dim) in _PARAMETER_MAP.items():
+    for reference_name, (real_name, shard_dim) in parameter_map.items():
         source = reference_params[reference_name]
         if shard_dim is None:
             expected = source
@@ -509,7 +586,7 @@ def _copy_reference_parameters(
         assert destination.shape == expected.shape
         destination.data.copy_(expected.data)
 
-    for reference_name, (real_name, shard_dim) in _PARAMETER_MAP.items():
+    for reference_name, (real_name, shard_dim) in parameter_map.items():
         real_parameter = real_params[real_name]
         gathered = [torch.empty_like(real_parameter) for _ in range(tp_size)]
         dist.all_gather(gathered, real_parameter, group=pg.tp)
@@ -522,17 +599,22 @@ def _copy_reference_parameters(
 
 
 def _reconstruct_real_parameter_gradients(
-    real_layer: latent_cp.MLAWithLatentCP, pg: ProcessGroupCollection
+    real_layer: latent_cp.MLAWithLatentCP,
+    pg: ProcessGroupCollection,
+    *,
+    cp_group: dist.ProcessGroup | None = None,
 ) -> dict[str, torch.Tensor]:
     real_params = dict(real_layer.named_parameters())
     reconstructed: dict[str, torch.Tensor] = {}
+    parameter_map = _parameter_map(real_layer.config)
     tp_size = dist.get_world_size(pg.tp)
-    for reference_name, (real_name, shard_dim) in _PARAMETER_MAP.items():
+    cp_group = pg.cp if cp_group is None else cp_group
+    for reference_name, (real_name, shard_dim) in parameter_map.items():
         parameter = real_params[real_name]
         assert parameter.grad is not None, f"missing real gradient {real_name}"
         grad = parameter.grad.detach().float().clone()
-        if dist.get_world_size(pg.cp) > 1:
-            dist.all_reduce(grad, group=pg.cp)
+        if dist.get_world_size(cp_group) > 1:
+            dist.all_reduce(grad, group=cp_group)
         if shard_dim is None:
             if tp_size > 1:
                 dist.all_reduce(grad, group=pg.tp)
@@ -779,8 +861,9 @@ def test_phase_plan_exact_causal_pair_coverage(cp_size: int):
         assert layout.cu_full.tolist() == [0] + [
             sum(lengths[: index + 1]) // cp_size for index in range(len(lengths))
         ]
+        half_divisor = cp_size if cp_size == 1 else 2 * cp_size
         assert layout.cu_half.tolist() == [0] + [
-            sum(lengths[: index + 1]) // (2 * cp_size) for index in range(len(lengths))
+            sum(lengths[: index + 1]) // half_divisor for index in range(len(lengths))
         ]
         expected_kinds = [
             "diagonal" if phase == 0 else "lower" if phase <= rank else "upper"
@@ -800,6 +883,42 @@ def test_phase_plan_exact_causal_pair_coverage(cp_size: int):
                         observed.append((sequence, q_global, k_global))
     assert len(observed) == len(set(observed))
     assert set(observed) == expected_pairs
+
+
+def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
+    lengths = (7, 5)
+    layout = latent_cp.build_zigzag_layout(
+        _cumulative(lengths), local_tokens=sum(lengths), cp_size=1, cp_rank=0
+    )
+    assert layout.cu_full.tolist() == [0, 7, 12]
+    assert layout.cu_half.tolist() == layout.cu_full.tolist()
+    assert torch.equal(layout.front_indices, torch.arange(sum(lengths)))
+    assert layout.back_indices.numel() == 0
+    assert len(layout.phases) == 1
+    phase = layout.phases[0]
+    assert (phase.phase, phase.owner, phase.kind, phase.causal) == (0, 0, "diagonal", True)
+    assert phase.q_indices is layout.front_indices
+    assert phase.kv_indices is layout.front_indices
+
+    cp_group = object()
+    payload = torch.randn(sum(lengths), 11, requires_grad=True)
+    with (
+        mock.patch.object(latent_cp.dist, "get_process_group_ranks", return_value=[17]),
+        mock.patch.object(latent_cp.dist, "get_rank", return_value=0),
+        mock.patch.object(latent_cp.dist, "get_world_size", return_value=1),
+        mock.patch.object(
+            latent_cp._LatentRingExchange,
+            "apply",
+            side_effect=AssertionError("CP=1 must not launch P2P"),
+        ) as exchange,
+    ):
+        leases = list(latent_cp.P2PRingTransport(cp_group).iter_payloads(payload, layout.phases))
+    assert len(leases) == 1
+    assert leases[0].owner == 0
+    assert leases[0].tensor is payload
+    exchange.assert_not_called()
+    leases[0].tensor.sum().backward()
+    torch.testing.assert_close(payload.grad, torch.ones_like(payload), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("rope_type", ["rope", "yarn"])
@@ -1021,6 +1140,8 @@ def test_spec_factory_is_non_mutating_and_bypasses_core_attention_wrapper():
     assert result.params is not base.params
     assert result.module is latent_cp.MLAWithLatentCP
     assert result.submodules.core_attention is IdentityOp
+    assert result.submodules.q_layernorm is latent_cp._build_local_latent_norm
+    assert result.submodules.kv_layernorm is latent_cp._build_local_latent_norm
 
 
 def test_factory_rejects_unsupported_projection_and_mask_specs():
@@ -1087,6 +1208,13 @@ def test_config_drives_gpt_specs_without_mutation():
 
     experimental_standard = _get_self_attention_module_spec(config)
     assert experimental_standard.module is latent_cp.MLAWithLatentCP
+
+    gate_config = _make_config(attention_output_gate=True, gate_granularity="headwise")
+    base_gate = _base_mla_spec().submodules.linear_gate
+    gated_attention = get_mla_latent_cp_self_attention_spec(gate_config)
+    assert gated_attention.module is latent_cp.MLAWithLatentCP
+    assert gated_attention.submodules.linear_gate is base_gate
+    assert _base_mla_spec().submodules.linear_gate is base_gate
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1232,7 +1360,6 @@ def test_real_backend_gate_skips_unqualified_before_adapter_construction():
         ):
             assert _qualified_real_backend_runtime_or_skip(runtime[0]) == runtime
         adapter_factory.assert_not_called()
-
 
 
 def test_fa4_adapter_uses_only_public_varlen_contract(monkeypatch):
@@ -1560,7 +1687,7 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
 
     good_adapter = FakeAdapter()
     monkeypatch.setattr(
-        latent_cp, "_grid_identity", lambda *_args: (((0, 1), (2, 3)), ((0, 2), (1, 3)))
+        latent_cp, "_grid_identity", lambda *_args, **_kwargs: (((0, 1), (2, 3)), ((0, 2), (1, 3)))
     )
     monkeypatch.setattr(latent_cp, "_runtime_backend_tuple", lambda _backend: runtime)
     monkeypatch.setattr(
@@ -1661,7 +1788,7 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
     )
     singleton_adapter = FakeAdapter()
     monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 1)
-    monkeypatch.setattr(latent_cp, "_grid_identity", lambda *_args: (((9,),), ((9,),)))
+    monkeypatch.setattr(latent_cp, "_grid_identity", lambda *_args, **_kwargs: (((9,),), ((9,),)))
     monkeypatch.setattr(latent_cp, "_runtime_backend_tuple", lambda _backend: singleton_runtime)
     monkeypatch.setattr(
         latent_cp,
@@ -1678,6 +1805,100 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
         ),
     )
     assert len(all_reduces) == all_reduce_count
+
+
+def test_dynamic_preflight_scope_reuses_one_rank_common_result_per_forward(monkeypatch):
+    class FakeAdapter:
+        def __init__(self):
+            self.prepare_calls = 0
+
+        def prepare(self, **_kwargs):
+            self.prepare_calls += 1
+
+    tp_group = object()
+    dynamic_cp_group = object()
+    runtime = (
+        AttnBackend.flash,
+        "dynamic-preflight-unique",
+        "flash-attn-4==dynamic-preflight-unique",
+        (10, 0),
+    )
+    layout = SimpleNamespace(
+        cu_global=torch.tensor([0, 5151], dtype=torch.int32), max_global=5151, phases=(object(),)
+    )
+    adapter = FakeAdapter()
+    grid_calls = []
+    runtime_calls = []
+    reductions = []
+    real_tensor = torch.tensor
+
+    def grid_identity(cp_group, incoming_tp_group, _device, *, use_cache=True):
+        assert cp_group is dynamic_cp_group
+        assert incoming_tp_group is tp_group
+        grid_calls.append(use_cache)
+        return ((0, 1), (2, 3)), ((0, 2), (1, 3))
+
+    def runtime_identity(backend):
+        runtime_calls.append(backend)
+        return runtime
+
+    def cpu_tensor(*args, **kwargs):
+        kwargs.pop("device", None)
+        return real_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(latent_cp, "_grid_identity", grid_identity)
+    monkeypatch.setattr(latent_cp, "_runtime_backend_tuple", runtime_identity)
+    monkeypatch.setattr(
+        latent_cp, "_qualified_backend_adapter", lambda _backend, _runtime=None: (adapter, runtime)
+    )
+    monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 2)
+    monkeypatch.setattr(
+        latent_cp.dist,
+        "all_reduce",
+        lambda tensor, op, group: reductions.append((tensor.item(), op, group)),
+    )
+    monkeypatch.setattr(latent_cp.torch, "tensor", cpu_tensor)
+    monkeypatch.setattr(latent_cp.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        latent_cp.torch.cuda,
+        "get_device_properties",
+        lambda _index: SimpleNamespace(name="dynamic-cache-device", total_memory=987654321),
+    )
+
+    with latent_cp.latent_cp_preflight_scope():
+        for _ in range(2):
+            harness = _preflight_dummy(AttnBackend.flash, tp_group, dynamic_cp_group)
+            assert (
+                latent_cp.MLAWithLatentCP._get_backend(
+                    harness, layout, dynamic_cp_group, dynamic_cp=True
+                )
+                is adapter
+            )
+    assert grid_calls == [False]
+    assert runtime_calls == [AttnBackend.flash]
+    assert reductions == [
+        (1, latent_cp.dist.ReduceOp.MIN, dynamic_cp_group),
+        (1, latent_cp.dist.ReduceOp.MIN, tp_group),
+    ]
+    assert adapter.prepare_calls == 1
+
+    with latent_cp.latent_cp_preflight_scope():
+        harness = _preflight_dummy(AttnBackend.flash, tp_group, dynamic_cp_group)
+        assert (
+            latent_cp.MLAWithLatentCP._get_backend(
+                harness, layout, dynamic_cp_group, dynamic_cp=True
+            )
+            is adapter
+        )
+    assert grid_calls == [False, False]
+    assert runtime_calls == [AttnBackend.flash, AttnBackend.flash]
+    assert reductions == [
+        (1, latent_cp.dist.ReduceOp.MIN, dynamic_cp_group),
+        (1, latent_cp.dist.ReduceOp.MIN, tp_group),
+        (1, latent_cp.dist.ReduceOp.MIN, dynamic_cp_group),
+        (1, latent_cp.dist.ReduceOp.MIN, tp_group),
+    ]
+    assert adapter.prepare_calls == 1
 
 
 def test_grid_identity_uses_ordered_injected_group_membership_once(monkeypatch):
@@ -1860,6 +2081,7 @@ def test_initial_config_negative_validation(monkeypatch, attribute, value, messa
         pg_collection=SimpleNamespace(tp=object(), cp=object()),
         attn_mask_type=AttnMaskType.causal,
         _cp_comm_type="p2p",
+        use_rope=True,
     )
     monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 1)
     with pytest.raises(ValueError, match=message):
@@ -1876,6 +2098,7 @@ def test_tp2_requires_sequence_parallel(monkeypatch):
         pg_collection=SimpleNamespace(tp=tp_group, cp=cp_group),
         attn_mask_type=AttnMaskType.causal,
         _cp_comm_type="p2p",
+        use_rope=True,
     )
     monkeypatch.setattr(
         latent_cp.dist, "get_world_size", lambda group: 2 if group is tp_group else 1
@@ -1909,6 +2132,7 @@ def test_precision_recompute_and_graph_negative_validation(monkeypatch, mutator)
         pg_collection=SimpleNamespace(tp=object(), cp=object()),
         attn_mask_type=AttnMaskType.causal,
         _cp_comm_type="p2p",
+        use_rope=True,
     )
     monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 1)
     with pytest.raises(ValueError):
@@ -1922,6 +2146,7 @@ def test_cp_mode_missing_groups_and_mtp_fail_early(monkeypatch):
         pg_collection=SimpleNamespace(tp=object(), cp=object()),
         attn_mask_type=AttnMaskType.causal,
         _cp_comm_type="a2a",
+        use_rope=True,
     )
     monkeypatch.setattr(
         latent_cp.dist, "get_world_size", lambda group: 2 if group is dummy.pg_collection.cp else 1
@@ -1945,8 +2170,14 @@ def test_cp_mode_missing_groups_and_mtp_fail_early(monkeypatch):
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 def test_planner_rejects_invalid_global_metadata(cp_size: int):
-    with pytest.raises(ValueError, match="divisible"):
-        latent_cp.build_zigzag_layout(torch.tensor([0, 7], dtype=torch.int32), 7, cp_size, 0)
+    if cp_size == 1:
+        layout = latent_cp.build_zigzag_layout(
+            torch.tensor([0, 7], dtype=torch.int32), 7, cp_size, 0
+        )
+        assert layout.local_tokens == 7
+    else:
+        with pytest.raises(ValueError, match="divisible"):
+            latent_cp.build_zigzag_layout(torch.tensor([0, 7], dtype=torch.int32), 7, cp_size, 0)
     with pytest.raises(ValueError, match="empty"):
         latent_cp.build_zigzag_layout(torch.tensor([0, 0], dtype=torch.int32), 0, cp_size, 0)
     valid_length = 2 * cp_size
@@ -1956,7 +2187,7 @@ def test_planner_rejects_invalid_global_metadata(cp_size: int):
         )
 
 
-def test_layout_adapter_rejects_format_layout_padding_and_dynamic_cp(monkeypatch):
+def test_layout_adapter_rejects_invalid_format_layout_and_dynamic_metadata(monkeypatch):
     adapter = latent_cp.AlreadyZigZagTHDAdapter()
     hidden = mock.Mock()
     cp_group = object()
@@ -1968,13 +2199,54 @@ def test_layout_adapter_rejects_format_layout_padding_and_dynamic_cp(monkeypatch
     for field, value, message in (
         ("qkv_format", "sbhd", "THD"),
         ("cp_partition_mode", "contiguous", "zigzag"),
-        ("local_cp_size", 2, "dynamic"),
+        ("local_cp_size", 0, "positive Python"),
         ("cp_group", object(), "different CP"),
     ):
         metadata = SimpleNamespace(**vars(base))
         setattr(metadata, field, value)
         with pytest.raises(ValueError, match=message):
             adapter.prepare(hidden, metadata, cp_group)
+
+    missing_dynamic_group = SimpleNamespace(**vars(base))
+    missing_dynamic_group.local_cp_size = 1
+    with pytest.raises(ValueError, match="effective CP process group"):
+        adapter.prepare(hidden, missing_dynamic_group, cp_group)
+
+    wrong_dynamic_size = SimpleNamespace(**vars(base))
+    wrong_dynamic_size.local_cp_size = 2
+    wrong_dynamic_size.cp_group = cp_group
+    with pytest.raises(ValueError, match="disagrees"):
+        adapter.prepare(hidden, wrong_dynamic_size, cp_group)
+
+
+def test_effective_dynamic_cp_group_resolution_is_per_forward_and_non_mutating(monkeypatch):
+    static_cp_group = object()
+    dynamic_cp_group = object()
+    module = SimpleNamespace(pg_collection=SimpleNamespace(cp=static_cp_group))
+    monkeypatch.setattr(
+        latent_cp.dist, "get_world_size", lambda group: 1 if group is dynamic_cp_group else 2
+    )
+
+    static_packed = SimpleNamespace(local_cp_size=None, cp_group=None)
+    assert latent_cp.MLAWithLatentCP._resolve_effective_cp_group(module, static_packed) == (
+        static_cp_group,
+        False,
+    )
+    dynamic_packed = SimpleNamespace(local_cp_size=1, cp_group=dynamic_cp_group)
+    assert latent_cp.MLAWithLatentCP._resolve_effective_cp_group(module, dynamic_packed) == (
+        dynamic_cp_group,
+        True,
+    )
+    assert module.pg_collection.cp is static_cp_group
+
+    with pytest.raises(ValueError, match="requires packed cp_group"):
+        latent_cp.MLAWithLatentCP._resolve_effective_cp_group(
+            module, SimpleNamespace(local_cp_size=1, cp_group=None)
+        )
+    with pytest.raises(ValueError, match="disagrees"):
+        latent_cp.MLAWithLatentCP._resolve_effective_cp_group(
+            module, SimpleNamespace(local_cp_size=2, cp_group=dynamic_cp_group)
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1983,7 +2255,7 @@ def test_cuda_metadata_and_forward_negative_validation():
         config = _make_config()
         layer = _build_layer(config, pg).cuda().bfloat16().train()
         layer._get_backend = types.MethodType(
-            lambda _self, _layout: _TorchPackedAttentionAdapter(), layer
+            lambda _self, _layout, *_args, **_kwargs: _TorchPackedAttentionAdapter(), layer
         )
         hidden = torch.randn(8, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda")
         good = _make_packed((8,), device="cuda", cp_group=pg.cp)
@@ -2116,7 +2388,9 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(rope_
         config = _make_config(cp_size=2, rope_type=rope_type)
         layer = _build_layer(config, pg).cuda().bfloat16().train()
         backend = _TorchPackedAttentionAdapter()
-        layer._get_backend = types.MethodType(lambda _self, _layout: backend, layer)
+        layer._get_backend = types.MethodType(
+            lambda _self, _layout, *_args, **_kwargs: backend, layer
+        )
         lengths = (16, 8)
         local_tokens = sum(lengths) // 2
         packed = _make_packed(lengths, device="cuda", total_tokens=local_tokens)
@@ -2175,42 +2449,44 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(rope_
             )
             for phase in layout.phases
         ]
+        # Checkpoint receives the full ring lease; phase KV slicing happens after up-projection.
         expected_latent_shapes = [
-            (phase.kv_indices.numel(), config.kv_lora_rank + _ROPE_DIM) for phase in layout.phases
+            (layout.local_tokens, config.kv_lora_rank + _ROPE_DIM) for _phase in layout.phases
         ]
         retained = _SavedTensorRecorder()
         handle = layer.linear_kv_up_proj.register_forward_hook(count_up_projection)
         try:
             with torch.autograd.graph.saved_tensors_hooks(retained.pack, retained.unpack):
                 output, bias = layer(hidden, None, packed_seq_params=packed)
-            retained_state = _classify_saved_attention_state(
-                retained.records,
-                expected_query_shapes=expected_query_shapes,
-                expected_latent_shapes=expected_latent_shapes,
-                heads=layer.num_attention_heads_per_partition,
-            )
-            assert all(record.numel == math.prod(record.shape) for record in retained_state)
-            assert all(
-                record.tensor_class.endswith((".Tensor", ".Parameter")) for record in retained_state
-            )
-            retained_classes = [record.state_class for record in retained_state]
-            assert retained_classes.count("checkpoint_query_input") == len(layout.phases)
-            assert retained_classes.count("checkpoint_latent_input") == len(layout.phases)
-            assert "partial_output_or_merge_state" in retained_classes
-            assert "partial_lse_or_merge_state" in retained_classes
-            assert "expanded_value" not in retained_classes
-            assert "expanded_key_or_uncheckpointed_query" not in retained_classes
-
-            assert bias is None
-            assert output.dtype == torch.bfloat16
-            assert backend.forward_calls == 2
-            assert backend.raw_output_dtypes == [torch.bfloat16, torch.bfloat16]
-            assert up_projection_calls == 2
-            torch.cuda.synchronize()
-            gc.collect()
-            assert all(reference() is None for reference in backend.expanded_refs)
-            assert any(reference() is not None for reference in backend.partial_refs)
-            assert any(reference() is not None for reference in backend.partial_lse_refs)
+            with _rank_common_assertions():
+                retained_state = _classify_saved_attention_state(
+                    retained.records,
+                    expected_query_shapes=expected_query_shapes,
+                    expected_latent_shapes=expected_latent_shapes,
+                    heads=layer.num_attention_heads_per_partition,
+                )
+                assert all(record.numel == math.prod(record.shape) for record in retained_state)
+                assert all(
+                    record.tensor_class.endswith((".Tensor", ".Parameter"))
+                    for record in retained_state
+                )
+                retained_classes = [record.state_class for record in retained_state]
+                assert retained_classes.count("checkpoint_query_input") == len(layout.phases)
+                assert retained_classes.count("checkpoint_latent_input") == len(layout.phases)
+                assert "partial_output_or_merge_state" in retained_classes
+                assert "partial_lse_or_merge_state" in retained_classes
+                assert "expanded_value" not in retained_classes
+                assert "expanded_key_or_uncheckpointed_query" not in retained_classes
+                assert bias is None
+                assert output.dtype == torch.bfloat16
+                assert backend.forward_calls == 2
+                assert backend.raw_output_dtypes == [torch.bfloat16, torch.bfloat16]
+                assert up_projection_calls == 2
+                torch.cuda.synchronize()
+                gc.collect()
+                assert all(reference() is None for reference in backend.expanded_refs)
+                assert any(reference() is not None for reference in backend.partial_refs)
+                assert any(reference() is not None for reference in backend.partial_lse_refs)
             output.backward(torch.randn_like(output))
             assert up_projection_calls == 4
             assert backend.forward_calls == 4
@@ -2224,7 +2500,9 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(rope_
             return function(*args)
 
         direct_backend = _TorchPackedAttentionAdapter()
-        layer._get_backend = types.MethodType(lambda _self, _layout: direct_backend, layer)
+        layer._get_backend = types.MethodType(
+            lambda _self, _layout, *_args, **_kwargs: direct_backend, layer
+        )
         uncheckpointed = _SavedTensorRecorder()
         direct_hidden = hidden.detach().clone().requires_grad_(True)
         with (
@@ -2246,11 +2524,56 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(rope_
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_kimi_no_rope_skips_rotary_construction_and_application():
+    with _model_parallel(1, 1) as pg:
+        config = _make_config(cp_size=1, rope_type="yarn", no_rope=True)
+        with (
+            mock.patch.object(
+                base_mla.RotaryEmbedding,
+                "__init__",
+                side_effect=AssertionError("no-RoPE must not initialize RotaryEmbedding"),
+            ) as rotary_init,
+            mock.patch.object(
+                base_mla.YarnRotaryEmbedding,
+                "__init__",
+                side_effect=AssertionError("no-RoPE must not initialize YarnRotaryEmbedding"),
+            ) as yarn_init,
+        ):
+            layer = _build_layer(config, pg).cuda().bfloat16().train()
+        rotary_init.assert_not_called()
+        yarn_init.assert_not_called()
+        assert layer.rotary_pos_emb is None
+        assert not layer.use_rope
+        assert layer.softmax_scale == pytest.approx(1.0 / math.sqrt(_QK_CONTENT + _ROPE_DIM))
+
+        lengths = (7, 5)
+        hidden = torch.randn(
+            sum(lengths), 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        packed = _make_packed(lengths, device="cuda", cp_group=pg.cp)
+        layout = layer._layout_adapter.prepare(hidden, packed, pg.cp)
+        with mock.patch.object(
+            latent_cp,
+            "apply_rotary_pos_emb",
+            side_effect=AssertionError("no-RoPE must not apply rotary embeddings"),
+        ) as apply_rope:
+            query, payload = layer._project_query_and_payload(hidden, packed, layout)
+        apply_rope.assert_not_called()
+        assert query.shape == (sum(lengths), config.num_attention_heads, 192)
+        assert payload.shape == (sum(lengths), config.kv_lora_rank + _ROPE_DIM)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_tp2_sequence_parallel_payload_and_explicit_mappings():
     with _model_parallel(2, 2) as pg:
         config = _make_config(tp_size=2, cp_size=2)
         assert config.sequence_parallel
         layer = _build_layer(config, pg).cuda().bfloat16().train()
+        assert config.sequence_parallel
+        for norm in (layer.q_layernorm, layer.kv_layernorm):
+            assert all(
+                getattr(parameter, "sequence_parallel", False) for parameter in norm.parameters()
+            )
         lengths = (16, 8)
         local_tokens = sum(lengths) // 2
         packed = _make_packed(lengths, device="cuda", cp_group=pg.cp)
@@ -2332,6 +2655,14 @@ def test_tp2_sequence_parallel_payload_and_explicit_mappings():
         q_phase = query.index_select(0, phase.q_indices)
         payload.retain_grad()
         real_sequence_gather = latent_cp.tp_mappings.gather_from_sequence_parallel_region
+        phase_latent_inputs: list[tuple[tuple[int, ...], bool]] = []
+
+        def capture_phase_latent(_module, inputs):
+            phase_latent_inputs.append((tuple(inputs[0].shape), inputs[0].is_contiguous()))
+
+        phase_latent_handle = layer.linear_kv_up_proj.register_forward_pre_hook(
+            capture_phase_latent
+        )
         with (
             mock.patch.object(
                 latent_cp.tp_mappings,
@@ -2344,11 +2675,16 @@ def test_tp2_sequence_parallel_payload_and_explicit_mappings():
                 side_effect=AssertionError("default TP group lookup is forbidden"),
             ),
         ):
-            output, lse = layer._phase_attention(
-                q_phase, payload, phase, _TorchPackedAttentionAdapter()
-            )
-            (output.square().mean() + lse.square().mean()).backward()
+            try:
+                output, lse = layer._phase_attention(
+                    q_phase, payload, phase, _TorchPackedAttentionAdapter()
+                )
+                (output.square().mean() + lse.square().mean()).backward()
+            finally:
+                phase_latent_handle.remove()
+        assert phase_latent_inputs == [((payload.size(0), config.kv_lora_rank), True)]
         sequence_gather_spy.assert_called_once()
+        assert sequence_gather_spy.call_args.args[0].is_contiguous()
         assert sequence_gather_spy.call_args.kwargs == {
             "tensor_parallel_output_grad": True,
             "group": pg.tp,
@@ -2364,6 +2700,94 @@ def test_tp2_sequence_parallel_payload_and_explicit_mappings():
             "linear_proj",
         ):
             assert getattr(layer, name).tp_group is pg.tp
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    ("local_cp_size", "lengths"),
+    [(1, (7, 5)), (2, (16, 8))],
+    ids=("dynamic-cp1-odd-packed", "dynamic-cp2-zigzag"),
+)
+def test_dynamic_cp1_cp2_full_chain_parity_without_static_group_mutation(
+    local_cp_size: int, lengths: tuple[int, ...]
+):
+    with _model_parallel(2, 2, dynamic_cp=True) as pg:
+        torch.manual_seed(_SEED + 40 + local_cp_size)
+        torch.cuda.manual_seed_all(_SEED + 40 + local_cp_size)
+        model_parallel_cuda_manual_seed(_SEED + 40 + local_cp_size)
+        config = _make_config(tp_size=2, cp_size=2, dynamic_cp=True)
+        layer = _build_layer(config, pg).cuda().bfloat16().train()
+        static_cp_group = layer.pg_collection.cp
+        effective_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=local_cp_size
+        )
+        assert dist.get_world_size(effective_cp_group) == local_cp_size
+        phase_backend = _TorchPackedAttentionAdapter()
+        layer._get_backend = types.MethodType(
+            lambda _self, _layout, *_args, **_kwargs: phase_backend, layer
+        )
+
+        reference = NaiveMLA(config, torch.device("cuda")).train()
+        _copy_reference_parameters(reference, layer, pg)
+        total_tokens = sum(lengths)
+        full_hidden = torch.randn(
+            total_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        full_upstream = torch.randn_like(full_hidden)
+        tp_cp_source = dist.get_process_group_ranks(pg.tp_cp)[0]
+        dist.broadcast(full_hidden, src=tp_cp_source, group=pg.tp_cp)
+        dist.broadcast(full_upstream, src=tp_cp_source, group=pg.tp_cp)
+
+        effective_cp_rank = dist.get_rank(effective_cp_group)
+        local_indices = _zigzag_global_indices(
+            lengths, local_cp_size, effective_cp_rank, device="cuda"
+        )
+        cp_local_hidden = full_hidden.index_select(0, local_indices)
+        local_hidden = (
+            _sequence_parallel_slice(cp_local_hidden, pg.tp).detach().clone().requires_grad_(True)
+        )
+        reference_hidden = full_hidden.detach().clone().requires_grad_(True)
+        packed = _make_packed(
+            lengths, device="cuda", cp_group=effective_cp_group, local_cp_size=local_cp_size
+        )
+
+        with _forbid_default_process_group_resolvers():
+            real_output, bias = layer(local_hidden, None, packed_seq_params=packed)
+        assert bias is None
+        assert layer.pg_collection.cp is static_cp_group
+        assert phase_backend.forward_calls == local_cp_size
+
+        reference_output = reference(reference_hidden, lengths)
+        expected_output = _sequence_parallel_slice(
+            reference_output.index_select(0, local_indices), pg.tp
+        )
+        _assert_similarity(real_output.detach(), expected_output.detach(), "dynamic CP output")
+
+        local_upstream = _sequence_parallel_slice(
+            full_upstream.index_select(0, local_indices), pg.tp
+        )
+        with _forbid_default_process_group_resolvers():
+            real_output.backward(local_upstream)
+        reference_output.backward(full_upstream)
+        expected_hidden_grad = _sequence_parallel_slice(
+            reference_hidden.grad.index_select(0, local_indices), pg.tp
+        )
+        _assert_similarity(local_hidden.grad, expected_hidden_grad, "dynamic CP input gradient")
+        assert phase_backend.forward_calls == 2 * local_cp_size
+
+        reconstructed = _reconstruct_real_parameter_gradients(
+            layer, pg, cp_group=effective_cp_group
+        )
+        reference_params = dict(reference.named_parameters())
+        assert set(reconstructed) == set(reference_params) == set(_parameter_map(config))
+        for name in sorted(reference_params):
+            assert reference_params[name].grad is not None
+            _assert_similarity(
+                reconstructed[name],
+                reference_params[name].grad.detach().float(),
+                f"dynamic CP parameter gradient {name}",
+            )
+        assert layer.pg_collection.cp is static_cp_group
 
 
 @contextmanager
@@ -2705,7 +3129,13 @@ def _run_cudnn_two_phase_merge_diagnostic() -> None:
 
 
 def _run_production_parity(
-    backend: AttnBackend, rope_type: str, *, torch_phase_backend: bool = False
+    backend: AttnBackend,
+    rope_type: str,
+    *,
+    torch_phase_backend: bool = False,
+    attention_output_gate: bool = False,
+    gate_granularity: str = "elementwise",
+    no_rope: bool = False,
 ) -> None:
     runtime: latent_cp.QualifiedBackendTuple | None = None
     assertion_eps = _PARITY_EPS_CEILING
@@ -2721,13 +3151,28 @@ def _run_production_parity(
         torch.cuda.manual_seed_all(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
         config = _make_config(
-            tp_size=2, cp_size=2, backend=backend, rope_type=rope_type, production_shape=True
+            tp_size=2,
+            cp_size=2,
+            backend=backend,
+            rope_type=rope_type,
+            production_shape=True,
+            attention_output_gate=attention_output_gate,
+            gate_granularity=gate_granularity,
+            no_rope=no_rope,
         )
         layer = _build_layer(config, pg).cuda().bfloat16().train()
+        assert (layer.linear_gate is not None) is attention_output_gate
+        assert (layer.rotary_pos_emb is None) is no_rope
         if torch_phase_backend:
             phase_backend = _TorchPackedAttentionAdapter()
-            layer._get_backend = types.MethodType(lambda _self, _layout: phase_backend, layer)
-            evidence_event = "mla_latent_cp_torch_full_chain_diagnostic"
+            layer._get_backend = types.MethodType(
+                lambda _self, _layout, *_args, **_kwargs: phase_backend, layer
+            )
+            evidence_event = (
+                "mla_latent_cp_torch_feature_parity"
+                if attention_output_gate or no_rope
+                else "mla_latent_cp_torch_full_chain_diagnostic"
+            )
             evidence_backend = "torch_packed_attention"
             runtime_payload: list[object] = [
                 "standard_pytorch",
@@ -2814,7 +3259,8 @@ def _run_production_parity(
 
         reconstructed = _reconstruct_real_parameter_gradients(layer, pg)
         reference_params = dict(reference.named_parameters())
-        assert set(reconstructed) == set(reference_params) == set(_PARAMETER_MAP)
+        parameter_map = _parameter_map(config)
+        assert set(reconstructed) == set(reference_params) == set(parameter_map)
         for name in sorted(reference_params):
             assert reference_params[name].grad is not None
             label = f"parameter_gradient/{name}"
@@ -2823,11 +3269,14 @@ def _run_production_parity(
                 reference_params[name].grad.detach().float(),
                 f"parameter gradient {name}",
             )
-        assert len(parity_metrics) == 2 + len(_PARAMETER_MAP)
+        assert len(parity_metrics) == 2 + len(parameter_map)
         metrics, candidate_eps = _aggregate_and_emit_metrics(
             event=evidence_event,
             metadata={
                 "backend": evidence_backend,
+                "attention_output_gate": attention_output_gate,
+                "gate_granularity": gate_granularity if attention_output_gate else None,
+                "no_rope": no_rope,
                 "rope": rope_type,
                 "runtime_tuple": runtime_payload,
                 "qualified_eps": assertion_eps,
@@ -2908,7 +3357,8 @@ def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
 
         latent_gradients = _reconstruct_real_parameter_gradients(latent_layer, pg)
         legacy_gradients = _reconstruct_real_parameter_gradients(legacy_layer, pg)
-        assert set(latent_gradients) == set(legacy_gradients) == set(_PARAMETER_MAP)
+        parameter_map = _parameter_map(config)
+        assert set(latent_gradients) == set(legacy_gradients) == set(parameter_map)
         for name in sorted(latent_gradients):
             label = f"parameter_gradient/{name}"
             parity_metrics[label] = _measure_similarity(
@@ -2916,7 +3366,7 @@ def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
                 legacy_gradients[name],
                 f"latent CP vs legacy full-KV CP parameter gradient {name}",
             )
-        assert len(parity_metrics) == 2 + len(_PARAMETER_MAP)
+        assert len(parity_metrics) == 2 + len(parameter_map)
 
         metrics, candidate_eps = _aggregate_and_emit_metrics(
             event="mla_latent_cp_legacy_full_kv_cp_parity",
@@ -2948,6 +3398,22 @@ def test_cudnn_two_phase_merged_backward_diagnostic():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_torch_phase_tp2_cp2_production_shape_full_chain_diagnostic():
     _run_production_parity(AttnBackend.fused, "rope", torch_phase_backend=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    ("gate_granularity", "no_rope"),
+    [("elementwise", False), ("headwise", False), ("headwise", True)],
+)
+def test_torch_phase_output_gate_and_kimi_no_rope_parity(gate_granularity: str, no_rope: bool):
+    _run_production_parity(
+        AttnBackend.fused,
+        "rope",
+        torch_phase_backend=True,
+        attention_output_gate=True,
+        gate_granularity=gate_granularity,
+        no_rope=no_rope,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -10,11 +10,14 @@ and RoPE implementation are reused.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import importlib.metadata
 import math
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import Any, Final, Iterator, Literal, Protocol, TypeAlias
@@ -187,19 +190,30 @@ def build_zigzag_layout(
 
     global_lengths = cu_global[1:] - cu_global[:-1]
     _require(bool(torch.all(global_lengths > 0).item()), "empty packed sequences are unsupported")
-    _require(
-        bool(torch.all(torch.remainder(global_lengths, 2 * cp_size) == 0).item()),
-        f"every global packed length must be divisible by 2*CP ({2 * cp_size})",
-    )
+    if cp_size > 1:
+        _require(
+            bool(torch.all(torch.remainder(global_lengths, 2 * cp_size) == 0).item()),
+            f"every global packed length must be divisible by 2*CP ({2 * cp_size})",
+        )
 
     local_lengths = torch.div(global_lengths, cp_size, rounding_mode="floor")
-    half_lengths = torch.div(global_lengths, 2 * cp_size, rounding_mode="floor")
+    # CP=1 is the exact no-ring degeneration. It has only a full/full diagonal
+    # phase, so no artificial half-sequence divisibility requirement is needed.
+    half_lengths = (
+        torch.div(global_lengths, 2 * cp_size, rounding_mode="floor")
+        if cp_size > 1
+        else local_lengths
+    )
     cu_full = _cu_from_lengths(local_lengths)
     cu_half = _cu_from_lengths(half_lengths)
     _require(int(cu_full[-1].item()) == local_tokens, "hidden token count disagrees with metadata")
 
     full_indices = torch.arange(local_tokens, dtype=torch.long, device=cu_global.device)
-    front_indices, back_indices = _packed_half_indices(local_lengths)
+    if cp_size > 1:
+        front_indices, back_indices = _packed_half_indices(local_lengths)
+    else:
+        front_indices = full_indices
+        back_indices = torch.empty(0, dtype=torch.long, device=cu_global.device)
     derived_max_global = int(global_lengths.max().item())
     if max_global is not None:
         _require(max_global == derived_max_global, "max_seqlen disagrees with cu_seqlens")
@@ -291,13 +305,26 @@ class AlreadyZigZagTHDAdapter:
             packed_seq_params.cp_partition_mode == "zigzag",
             "only an already-zigzag CP partition is supported",
         )
-        _require(
-            packed_seq_params.local_cp_size is None, "dynamic local_cp_size metadata is unsupported"
-        )
-        _require(
-            packed_seq_params.cp_group is None or packed_seq_params.cp_group is cp_group,
-            "packed metadata names a different CP process group",
-        )
+        if packed_seq_params.local_cp_size is None:
+            _require(
+                packed_seq_params.cp_group is None or packed_seq_params.cp_group is cp_group,
+                "packed metadata names a different CP process group",
+            )
+        else:
+            _require(
+                isinstance(packed_seq_params.local_cp_size, int)
+                and not isinstance(packed_seq_params.local_cp_size, bool)
+                and packed_seq_params.local_cp_size > 0,
+                "dynamic local_cp_size must be a positive Python integer",
+            )
+            _require(
+                packed_seq_params.cp_group is cp_group,
+                "dynamic packed metadata must name the effective CP process group",
+            )
+            _require(
+                packed_seq_params.local_cp_size == dist.get_world_size(cp_group),
+                "dynamic local_cp_size disagrees with the effective CP process group",
+            )
         cu_q = packed_seq_params.cu_seqlens_q
         cu_kv = packed_seq_params.cu_seqlens_kv
         _require(isinstance(cu_q, Tensor) and isinstance(cu_kv, Tensor), "missing cu_seqlens")
@@ -1229,6 +1256,52 @@ class _BackendPreflightSignature:
     backend: AttnBackend
 
 
+@dataclass(frozen=True)
+class _ForwardPreflightKey:
+    device_index: int
+    cp_group_id: int
+    tp_group_id: int
+    cu_global_id: int
+    max_global: int
+    tp_size: int
+    cp_size: int
+    heads: int
+    qk_dim: int
+    v_dim: int
+    scale: float
+    backend: AttnBackend
+
+
+@dataclass(frozen=True)
+class _ForwardPreflightResult:
+    cp_group: dist.ProcessGroup
+    tp_group: dist.ProcessGroup
+    cu_global: Tensor
+    adapter: DirectAttentionAdapter
+    runtime_identity: QualifiedBackendTuple
+
+
+@dataclass
+class _ForwardPreflightState:
+    results: dict[_ForwardPreflightKey, _ForwardPreflightResult]
+
+
+_LATENT_CP_PREFLIGHT_STATE: Final[ContextVar[_ForwardPreflightState | None]] = ContextVar(
+    "mla_latent_cp_preflight_state", default=None
+)
+
+
+@contextmanager
+def latent_cp_preflight_scope() -> Iterator[None]:
+    """Share one successful backend preflight across MLA layers in a model forward."""
+
+    token = _LATENT_CP_PREFLIGHT_STATE.set(_ForwardPreflightState(results={}))
+    try:
+        yield
+    finally:
+        _LATENT_CP_PREFLIGHT_STATE.reset(token)
+
+
 _BACKEND_PREFLIGHT_LOCK: Final[threading.Lock] = threading.Lock()
 _BACKEND_PREFLIGHT_SUCCESS: dict[
     tuple[int, int, _BackendPreflightSignature], DirectAttentionAdapter
@@ -1239,15 +1312,20 @@ _GRID_IDENTITY_CACHE: dict[
 
 
 def _grid_identity(
-    cp_group: dist.ProcessGroup, tp_group: dist.ProcessGroup, device: torch.device
+    cp_group: dist.ProcessGroup,
+    tp_group: dist.ProcessGroup,
+    device: torch.device,
+    *,
+    use_cache: bool = True,
 ) -> GridIdentity:
     """Resolve a rank-common ordered identity for the injected TP x CP grid once."""
 
     cache_key = (id(cp_group), id(tp_group))
-    with _BACKEND_PREFLIGHT_LOCK:
-        cached = _GRID_IDENTITY_CACHE.get(cache_key)
-        if cached is not None and cached[0] is cp_group and cached[1] is tp_group:
-            return cached[2]
+    if use_cache:
+        with _BACKEND_PREFLIGHT_LOCK:
+            cached = _GRID_IDENTITY_CACHE.get(cache_key)
+            if cached is not None and cached[0] is cp_group and cached[1] is tp_group:
+                return cached[2]
 
     cp_size = dist.get_world_size(cp_group)
     tp_size = dist.get_world_size(tp_group)
@@ -1278,8 +1356,9 @@ def _grid_identity(
         "injected TP/CP groups do not form one rectangular rank grid",
     )
     identity: GridIdentity = (tp_rows, cp_columns)
-    with _BACKEND_PREFLIGHT_LOCK:
-        _GRID_IDENTITY_CACHE[cache_key] = (cp_group, tp_group, identity)
+    if use_cache:
+        with _BACKEND_PREFLIGHT_LOCK:
+            _GRID_IDENTITY_CACHE[cache_key] = (cp_group, tp_group, identity)
     return identity
 
 
@@ -1330,6 +1409,20 @@ def _qualified_backend_adapter(
     raise BackendNotQualifiedError(f"unsupported backend {backend!r}")
 
 
+def _build_local_latent_norm(
+    *, config: MLATransformerConfig, hidden_size: int, eps: float
+) -> torch.nn.Module:
+    """Build a token-local norm while preserving SP parameter-gradient synchronization."""
+
+    norm_config = copy.copy(config)
+    norm_config.sequence_parallel = False
+    norm = WrappedTorchNorm(config=norm_config, hidden_size=hidden_size, eps=eps)
+    if config.sequence_parallel:
+        for parameter in norm.parameters():
+            setattr(parameter, "sequence_parallel", True)
+    return norm
+
+
 def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> None:
     expected_column = (
         "linear_q_proj",
@@ -1348,8 +1441,13 @@ def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> No
         "linear_proj must use the local MCore RowParallelLinear spec",
     )
     _require(
-        submodules.q_layernorm is WrappedTorchNorm and submodules.kv_layernorm is WrappedTorchNorm,
-        "Q/KV norms must use standalone local MCore WrappedTorchNorm",
+        submodules.linear_gate in (None, ColumnParallelLinear),
+        "linear_gate must use the local MCore ColumnParallelLinear spec",
+    )
+    _require(
+        submodules.q_layernorm is _build_local_latent_norm
+        and submodules.kv_layernorm is _build_local_latent_norm,
+        "Q/KV norms must use the local latent-CP norm builder",
     )
     _require(submodules.linear_qkv_down_proj is None, "fused MLA down projection is unsupported")
     _require(
@@ -1439,7 +1537,10 @@ class MLAWithLatentCP(MLASelfAttention):
             "v1 requires qk content/rope/value dimensions 128/64/128",
         )
         _require(config.rope_type in ("rope", "yarn"), "only rope and yarn are supported")
-        _require(not config.apply_rope_fusion, "fused RoPE is unsupported")
+        _require(
+            not self.use_rope or not config.apply_rope_fusion,
+            "fused RoPE is unsupported when this layer applies RoPE",
+        )
         _require(config.attention_dropout == 0.0, "attention dropout must be zero")
         _require(config.bf16 and not config.fp16, "v1 requires BF16 and rejects FP16")
         _require(config.fp8 is None and config.fp4 is None, "FP8 and FP4 are unsupported")
@@ -1479,6 +1580,23 @@ class MLAWithLatentCP(MLASelfAttention):
             _require(
                 getattr(module, "tp_group", None) is self.pg_collection.tp,
                 f"{name} does not retain the injected TP process group",
+            )
+
+        if self.linear_gate is not None:
+            _require(
+                isinstance(self.linear_gate, ColumnParallelLinear),
+                "linear_gate must be a local MCore ColumnParallelLinear",
+            )
+            _require(
+                self.linear_gate.tp_group is self.pg_collection.tp,
+                "linear_gate does not retain the injected TP process group",
+            )
+            _require(
+                not self.linear_gate.gather_output
+                and not self.linear_gate.skip_bias_add
+                and self.linear_gate.bias is None
+                and not self.linear_gate.explicit_expert_comm,
+                "linear_gate must be a bias-free non-expert sharded projection",
             )
 
         output_projection = self.linear_proj
@@ -1546,6 +1664,34 @@ class MLAWithLatentCP(MLASelfAttention):
             self._parameter_dtypes_validated = True
         return packed_seq_params
 
+    def _resolve_effective_cp_group(
+        self, packed_seq_params: PackedSeqParams
+    ) -> tuple[dist.ProcessGroup, bool]:
+        """Resolve one immutable per-forward CP group without mutating module state."""
+
+        dynamic_cp = packed_seq_params.local_cp_size is not None
+        if not dynamic_cp:
+            _require(
+                packed_seq_params.cp_group is None
+                or packed_seq_params.cp_group is self.pg_collection.cp,
+                "static packed metadata names a different CP process group",
+            )
+            return self.pg_collection.cp, False
+
+        _require(
+            isinstance(packed_seq_params.local_cp_size, int)
+            and not isinstance(packed_seq_params.local_cp_size, bool)
+            and packed_seq_params.local_cp_size > 0,
+            "dynamic local_cp_size must be a positive Python integer",
+        )
+        effective_cp_group = packed_seq_params.cp_group
+        _require(effective_cp_group is not None, "dynamic CP requires packed cp_group metadata")
+        _require(
+            dist.get_world_size(effective_cp_group) == packed_seq_params.local_cp_size,
+            "dynamic local_cp_size disagrees with packed cp_group",
+        )
+        return effective_cp_group, True
+
     def _explicit_output_projection(self, core_output: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the inherited row-sharded weight without an implicit TP-group lookup."""
 
@@ -1580,18 +1726,62 @@ class MLAWithLatentCP(MLASelfAttention):
             )
         return output, None
 
-    def _get_backend(self, layout: ZigZagLayout) -> DirectAttentionAdapter:
+    def _get_backend(
+        self,
+        layout: ZigZagLayout,
+        cp_group: dist.ProcessGroup | None = None,
+        *,
+        dynamic_cp: bool = False,
+    ) -> DirectAttentionAdapter:
+        if cp_group is None:
+            cp_group = self.pg_collection.cp
         device_index = torch.cuda.current_device()
         device = torch.device("cuda", device_index)
-        tp_size = dist.get_world_size(self.pg_collection.tp)
-        cp_size = dist.get_world_size(self.pg_collection.cp)
+        tp_group = self.pg_collection.tp
+        tp_size = dist.get_world_size(tp_group)
+        cp_size = dist.get_world_size(cp_group)
+        forward_scope = _LATENT_CP_PREFLIGHT_STATE.get()
+        scope_key: _ForwardPreflightKey | None = None
+        if forward_scope is not None:
+            scope_key = _ForwardPreflightKey(
+                device_index=device_index,
+                cp_group_id=id(cp_group),
+                tp_group_id=id(tp_group),
+                cu_global_id=id(layout.cu_global),
+                max_global=layout.max_global,
+                tp_size=tp_size,
+                cp_size=cp_size,
+                heads=self.num_attention_heads_per_partition,
+                qk_dim=self.q_head_dim,
+                v_dim=self.config.v_head_dim,
+                scale=float(self.softmax_scale),
+                backend=self.config.attention_backend,
+            )
+            scoped = forward_scope.results.get(scope_key)
+            if scoped is not None:
+                _require(
+                    scoped.cp_group is cp_group
+                    and scoped.tp_group is tp_group
+                    and scoped.cu_global is layout.cu_global,
+                    "forward preflight scope identity collision",
+                )
+                self._backend_adapter = scoped.adapter
+                self._backend_runtime_tuple = scoped.runtime_identity
+                return scoped.adapter
+
         local_error: Exception | None = None
         signature: _BackendPreflightSignature | None = None
         adapter: DirectAttentionAdapter | None = None
         current_tuple: QualifiedBackendTuple | None = None
+        cache_hit = False
         try:
             tp_rows, cp_columns = _grid_identity(
-                self.pg_collection.cp, self.pg_collection.tp, device
+                cp_group,
+                tp_group,
+                device,
+                # Dynamic subgroup members can have different process-local cache histories.
+                # Every invocation that reaches this gate must run the same collective graph.
+                use_cache=not dynamic_cp,
             )
             current_tuple = _runtime_backend_tuple(self.config.attention_backend)
             properties = torch.cuda.get_device_properties(device_index)
@@ -1619,29 +1809,43 @@ class MLAWithLatentCP(MLASelfAttention):
             success_key = (os.getpid(), device_index, signature)
             with _BACKEND_PREFLIGHT_LOCK:
                 adapter = _BACKEND_PREFLIGHT_SUCCESS.get(success_key)
-            if adapter is not None:
+                if adapter is not None:
+                    cache_hit = True
+            if adapter is not None and not dynamic_cp:
                 self._backend_adapter = adapter
                 self._backend_runtime_tuple = current_tuple
+                if forward_scope is not None and scope_key is not None:
+                    forward_scope.results[scope_key] = _ForwardPreflightResult(
+                        cp_group=cp_group,
+                        tp_group=tp_group,
+                        cu_global=layout.cu_global,
+                        adapter=adapter,
+                        runtime_identity=current_tuple,
+                    )
                 return adapter
 
-            if self._backend_adapter is None:
-                adapter, qualified_tuple = _qualified_backend_adapter(
-                    self.config.attention_backend, current_tuple
+            if not cache_hit:
+                if self._backend_adapter is None:
+                    adapter, qualified_tuple = _qualified_backend_adapter(
+                        self.config.attention_backend, current_tuple
+                    )
+                    self._backend_adapter = adapter
+                    self._backend_runtime_tuple = qualified_tuple
+                _require(
+                    self._backend_runtime_tuple == current_tuple,
+                    "backend package/runtime/device tuple changed after construction",
                 )
+                adapter = self._backend_adapter
+                adapter.prepare(
+                    num_heads=self.num_attention_heads_per_partition,
+                    qk_dim=self.q_head_dim,
+                    v_dim=self.config.v_head_dim,
+                    phases=layout.phases,
+                    scale=self.softmax_scale,
+                )
+            else:
                 self._backend_adapter = adapter
-                self._backend_runtime_tuple = qualified_tuple
-            _require(
-                self._backend_runtime_tuple == current_tuple,
-                "backend package/runtime/device tuple changed after construction",
-            )
-            adapter = self._backend_adapter
-            adapter.prepare(
-                num_heads=self.num_attention_heads_per_partition,
-                qk_dim=self.q_head_dim,
-                v_dim=self.config.v_head_dim,
-                phases=layout.phases,
-                scale=self.softmax_scale,
-            )
+                self._backend_runtime_tuple = current_tuple
         except Exception as error:
             local_error = error
 
@@ -1651,9 +1855,9 @@ class MLAWithLatentCP(MLASelfAttention):
         # CP-first then TP propagates any failure through the complete TP x CP grid.
         # Singleton dimensions are the trivial consensus and launch no collective.
         if cp_size > 1:
-            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=self.pg_collection.cp)
+            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=cp_group)
         if tp_size > 1:
-            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=self.pg_collection.tp)
+            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=tp_group)
         if int(backend_ok.item()) == 0:
             raise LatentCPError(
                 "backend qualification/availability/plan preflight failed on the TP x CP grid"
@@ -1667,6 +1871,14 @@ class MLAWithLatentCP(MLASelfAttention):
             _BACKEND_PREFLIGHT_SUCCESS[success_key] = adapter
         self._backend_adapter = adapter
         self._backend_runtime_tuple = current_tuple
+        if forward_scope is not None and scope_key is not None:
+            forward_scope.results[scope_key] = _ForwardPreflightResult(
+                cp_group=cp_group,
+                tp_group=tp_group,
+                cu_global=layout.cu_global,
+                adapter=adapter,
+                runtime_identity=current_tuple,
+            )
         return adapter
 
     def _latent_cp_down_projection(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
@@ -1693,8 +1905,14 @@ class MLAWithLatentCP(MLASelfAttention):
         return q_compressed, kv_combined
 
     def _project_query_and_payload(
-        self, hidden_states: Tensor, packed_seq_params: PackedSeqParams, layout: ZigZagLayout
+        self,
+        hidden_states: Tensor,
+        packed_seq_params: PackedSeqParams,
+        layout: ZigZagLayout,
+        cp_group: dist.ProcessGroup | None = None,
     ) -> tuple[Tensor, Tensor]:
+        if cp_group is None:
+            cp_group = self.pg_collection.cp
         q_compressed, kv_combined = self._latent_cp_down_projection(hidden_states)
         q_compressed = q_compressed.squeeze(1)
         kv_combined = kv_combined.squeeze(1)
@@ -1718,34 +1936,37 @@ class MLAWithLatentCP(MLASelfAttention):
         )
         k_rope = k_rope_raw.unsqueeze(1)
 
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            None, None, hidden_states, self.config, packed_seq_params
-        )
-        mscale = 1.0
-        if self.config.rope_type == "rope":
-            rotary = self.rotary_pos_emb(rotary_seq_len, packed_seq=True)
-        else:
-            rotary, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=True)
-        q_rope = apply_rotary_pos_emb(
-            q_rope,
-            rotary,
-            config=self.config,
-            cu_seqlens=layout.cu_global,
-            mscale=mscale,
-            cp_group=self.pg_collection.cp,
-            mla_rotary_interleaved=True,
-            max_seqlen=layout.max_global,
-        )
-        k_rope = apply_rotary_pos_emb(
-            k_rope,
-            rotary,
-            config=self.config,
-            cu_seqlens=layout.cu_global,
-            mscale=mscale,
-            cp_group=self.pg_collection.cp,
-            mla_rotary_interleaved=True,
-            max_seqlen=layout.max_global,
-        )
+        if self.use_rope:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                None, None, hidden_states, self.config, packed_seq_params
+            )
+            mscale = 1.0
+            if self.config.rope_type == "rope":
+                rotary = self.rotary_pos_emb(rotary_seq_len, packed_seq=True, cp_group=cp_group)
+            else:
+                rotary, mscale = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq=True, cp_group=cp_group
+                )
+            q_rope = apply_rotary_pos_emb(
+                q_rope,
+                rotary,
+                config=self.config,
+                cu_seqlens=layout.cu_global,
+                mscale=mscale,
+                cp_group=cp_group,
+                mla_rotary_interleaved=True,
+                max_seqlen=layout.max_global,
+            )
+            k_rope = apply_rotary_pos_emb(
+                k_rope,
+                rotary,
+                config=self.config,
+                cu_seqlens=layout.cu_global,
+                mscale=mscale,
+                cp_group=cp_group,
+                mla_rotary_interleaved=True,
+                max_seqlen=layout.max_global,
+            )
         if self.config.sequence_parallel:
             k_rope = tp_mappings.scatter_to_sequence_parallel_region(
                 k_rope, group=self.pg_collection.tp
@@ -1762,6 +1983,8 @@ class MLAWithLatentCP(MLASelfAttention):
         latent, k_rope = torch.split(
             payload, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
+        latent = latent.contiguous()
+        k_rope = k_rope.contiguous()
         expanded, _ = self.linear_kv_up_proj(latent)
         if self.config.sequence_parallel:
             k_rope = tp_mappings.gather_from_sequence_parallel_region(
@@ -1829,18 +2052,19 @@ class MLAWithLatentCP(MLASelfAttention):
             sequence_len_offset,
             inference_params,
         )
+        effective_cp_group, dynamic_cp = self._resolve_effective_cp_group(packed_seq_params)
         layout = self._layout_adapter.prepare(
             hidden_states,
             packed_seq_params,
-            self.pg_collection.cp,
+            effective_cp_group,
             tp_group=self.pg_collection.tp,
             sequence_parallel=self.config.sequence_parallel,
         )
-        backend = self._get_backend(layout)
+        backend = self._get_backend(layout, effective_cp_group, dynamic_cp=dynamic_cp)
         query, local_payload = self._project_query_and_payload(
-            hidden_states, packed_seq_params, layout
+            hidden_states, packed_seq_params, layout, effective_cp_group
         )
-        transport: LatentCPTransport = P2PRingTransport(self.pg_collection.cp)
+        transport: LatentCPTransport = P2PRingTransport(effective_cp_group)
 
         merged_output: Tensor | None = None
         merged_lse: Tensor | None = None
@@ -1885,6 +2109,8 @@ class MLAWithLatentCP(MLASelfAttention):
         core_output = merged_output.to(torch.bfloat16).reshape(
             layout.local_tokens, 1, self.num_attention_heads_per_partition * self.config.v_head_dim
         )
+        if self.linear_gate is not None:
+            core_output = self._project_and_apply_mla_output_gate(core_output, hidden_states)
         return self._explicit_output_projection(core_output)
 
 
@@ -1932,7 +2158,12 @@ def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
         "base MLA spec must be causal",
     )
 
-    latent_submodules = replace(original, core_attention=IdentityOp)
+    latent_submodules = replace(
+        original,
+        q_layernorm=_build_local_latent_norm,
+        kv_layernorm=_build_local_latent_norm,
+        core_attention=IdentityOp,
+    )
     return replace(
         base_mla_spec,
         module=MLAWithLatentCP,
