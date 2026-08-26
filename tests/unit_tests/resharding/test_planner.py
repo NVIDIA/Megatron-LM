@@ -449,6 +449,15 @@ class TestBuildPlanFromRosters:
         recv_batches = {op.task_id: op.batch_id for op in plans[1].recv_ops}
         assert send_batches == recv_batches == {0: 0, 1: 1}
 
+        dst_by_rank, src_by_name = index_metadata_rosters(gathered)
+        larger_limit_plans = {
+            rank: build_plan_from_rosters(
+                dst_by_rank, src_by_name, rank, execution_batch_bytes=400_000_000
+            )
+            for rank in dst_by_rank
+        }
+        assert {plan.num_batches for plan in larger_limit_plans.values()} == {1}
+
     def test_node_add_keeps_existing_task_ids_stable(self):
         """Appending a rank rebuilds locally without renumbering existing transfers."""
         base = [
@@ -497,6 +506,40 @@ def test_execution_batch_ids_keep_replicas_together():
     assert num_batches == 2
 
 
+def test_local_plan_uses_smallest_rank_execution_batch_bytes(monkeypatch):
+    """Heterogeneous ranks derive one deterministic, memory-safe limit."""
+    sentinel = object()
+    forwarded = {}
+
+    class FakeGroup:
+        def rank(self):
+            return 0
+
+        def size(self):
+            return 2
+
+    monkeypatch.setattr(planner, "_extract_module_metadata", lambda *_args: [])
+
+    def fake_all_gather_object(output, _local_entry, group):
+        assert isinstance(group, FakeGroup)
+        output[:] = [([], [], 200), ([], [], 100)]
+
+    def fake_build(dst_by_rank, src_by_name, rank, execution_batch_bytes):
+        forwarded["args"] = (dst_by_rank, src_by_name, rank)
+        forwarded["execution_batch_bytes"] = execution_batch_bytes
+        return sentinel
+
+    monkeypatch.setattr(planner.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(planner, "build_plan_from_rosters", fake_build)
+
+    result = planner.build_local_reshard_plan(
+        None, None, group=FakeGroup(), execution_batch_bytes=200
+    )
+
+    assert result is sentinel
+    assert forwarded == {"args": ({0: {}, 1: {}}, {}, 0), "execution_batch_bytes": 100}
+
+
 def test_centralized_planner_compatibility_wrapper(monkeypatch):
     """The previous public planner name warns and forwards every argument."""
     sentinel = object()
@@ -510,13 +553,25 @@ def test_centralized_planner_compatibility_wrapper(monkeypatch):
     monkeypatch.setattr(planner, "build_local_reshard_plan", fake_local)
     with pytest.warns(DeprecationWarning, match="build_local_reshard_plan"):
         result = planner.build_centralized_reshard_plan(
-            "src", "dst", num_experts=8, group="group", src_rank_offset=3, dst_rank_offset=7
+            "src",
+            "dst",
+            num_experts=8,
+            group="group",
+            src_rank_offset=3,
+            dst_rank_offset=7,
+            execution_batch_bytes=123,
         )
 
     assert result is sentinel
     assert forwarded == {
         "args": ("src", "dst"),
-        "kwargs": {"num_experts": 8, "group": "group", "src_rank_offset": 3, "dst_rank_offset": 7},
+        "kwargs": {
+            "num_experts": 8,
+            "group": "group",
+            "src_rank_offset": 3,
+            "dst_rank_offset": 7,
+            "execution_batch_bytes": 123,
+        },
     }
 
 

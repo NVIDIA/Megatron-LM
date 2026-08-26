@@ -6,6 +6,7 @@ Covers:
 - ``_PlanCacheKey`` separation across configurations that route to different
   global ranks (the rank-offset bug — two non-collocated configs with identical
   parallel sizes used to silently share a plan).
+- ``_PlanCacheKey`` separation across execution batch limits.
 - ``get_refit_tensor_dict`` / ``invalidate_refit_tensor_cache`` (module-level
   named_refit_tensors cache + invalidation when ``_harmonize_buffer_dtypes``
   replaces a buffer).
@@ -18,7 +19,11 @@ import torch.nn as nn
 import megatron.core.resharding.refit as refit
 from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.refit import _PlanCacheKey
-from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
+from megatron.core.resharding.utils import (
+    ReshardPlan,
+    get_refit_tensor_dict,
+    invalidate_refit_tensor_cache,
+)
 
 
 class TestPlanCacheKey:
@@ -94,6 +99,15 @@ class TestPlanCacheKey:
         k2 = _PlanCacheKey(rank=0, src_config=None, dst_config=None, num_experts=16)
         assert k1 != k2
 
+    def test_execution_batch_bytes_distinguishes(self):
+        k1 = _PlanCacheKey(
+            rank=0, src_config=None, dst_config=None, num_experts=None, execution_batch_bytes=128
+        )
+        k2 = _PlanCacheKey(
+            rank=0, src_config=None, dst_config=None, num_experts=None, execution_batch_bytes=256
+        )
+        assert k1 != k2
+
 
 class TestPlanCacheKeyNonCollocated:
     """Non-collocated ranks set src_config or dst_config to None.
@@ -145,6 +159,25 @@ class TestPlanCacheKeyNonCollocated:
             dst_rank_offset=8,
         )
         assert layout_a != layout_b
+
+
+def test_prepare_swap_threads_execution_batch_bytes(monkeypatch):
+    """The public preparation API must include the configured limit in planning."""
+    plan = ReshardPlan(send_ops=[], recv_ops=[])
+    forwarded = {}
+
+    monkeypatch.setattr(refit, "_unwrap_model_cores", lambda *_args: (None, None, None))
+
+    def fake_build(*args, **kwargs):
+        forwarded["args"] = args
+        forwarded["kwargs"] = kwargs
+        return plan
+
+    monkeypatch.setattr(refit, "_build_or_get_plan", fake_build)
+
+    refit.prepare_swap_model_weights(None, None, execution_batch_bytes=123)
+
+    assert forwarded["kwargs"] == {"execution_batch_bytes": 123}
 
 
 def test_service_cache_distinguishes_process_groups(monkeypatch):
