@@ -639,6 +639,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        prefetch_kwargs = {
+            "forward_prefetch_size": ddp_config.suggested_communication_unit_size,
+            "backward_prefetch_size": ddp_config.suggested_communication_unit_size,
+        }
         with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -654,6 +658,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
+                            **prefetch_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -668,6 +673,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mesh=dp_mesh,
                         placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
+                        **prefetch_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
@@ -676,6 +682,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 mesh=dp_mesh,
                 placements=dense_placements,
                 mixed_precision_policy=self.mp_policy,
+                **prefetch_kwargs,
             )
         super().__init__(config=config, module=module)
 
@@ -789,8 +796,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.delay_wgrad_compute:
             raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
-        if ddp_config.suggested_communication_unit_size is not None:
-            raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
         if ddp_config.num_buckets is not None:
             raise ValueError("MFSDP v2 does not support num_buckets.")
         if ddp_config.megatron_fsdp_use_decoupled_grad:
