@@ -29,6 +29,7 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_TELEMETRY_HANDLE = None
 
 
 def get_args():
@@ -84,6 +85,11 @@ def get_signal_handler():
     return _GLOBAL_SIGNAL_HANDLER
 
 
+def get_telemetry():
+    """Return the telemetry handle. It can be None so no need to check if initialized."""
+    return _GLOBAL_TELEMETRY_HANDLE
+
+
 def _set_signal_handler(exit_signal):
 
     global _GLOBAL_SIGNAL_HANDLER
@@ -98,6 +104,7 @@ def _graceful_shutdown(signum, frame):
     This handler attempts a best-effort graceful shutdown:
       - Logs a single termination message from rank 0
       - Synchronizes all ranks (barrier)
+      - Flushes and shuts down telemetry
       - Destroys the distributed process group
       - Exits the process cleanly
     """
@@ -115,6 +122,20 @@ def _graceful_shutdown(signum, frame):
                 pass
 
             torch.distributed.destroy_process_group()
+    except Exception:
+        pass
+
+    # Without this, any spans/metrics still sitting in the BatchSpanProcessor's
+    # queue (which only flushes on a timer or on shutdown(), never automatically
+    # on process exit) are silently dropped -- including the just-closed
+    # top-level job span on this exit path. sys.exit() below unwinds the call
+    # stack via SystemExit, so any span opened with `with managed_span(...)`/
+    # `@trace_fn` still gets its __exit__ run and end_time set correctly; this
+    # call is what makes sure that data actually reaches the exporter.
+    try:
+        _otel_handle = get_telemetry()
+        if _otel_handle is not None:
+            _otel_handle.shutdown()
     except Exception:
         pass
 
@@ -136,7 +157,8 @@ def set_global_variables(args, build_tokenizer=True):
         rank=args.rank,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
-        data_parallel_size=args.data_parallel_size,
+        # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
+        data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
         decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,
@@ -149,6 +171,7 @@ def set_global_variables(args, build_tokenizer=True):
     _set_adlr_autoresume(args)
     _set_timers(args)
     _set_energy_monitor(args)
+    _set_telemetry(args)
 
     if args.enable_experimental:
         set_experimental_flag(True)
@@ -180,6 +203,7 @@ def unset_global_variables():
     global _GLOBAL_TIMERS
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
+    global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -191,6 +215,7 @@ def unset_global_variables():
     _GLOBAL_TIMERS = None
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
+    _GLOBAL_TELEMETRY_HANDLE = None
 
     unset_num_microbatches_calculator()
 
@@ -374,3 +399,6 @@ def destroy_global_vars():
 
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
+
+    global _GLOBAL_TELEMETRY_HANDLE
+    _GLOBAL_TELEMETRY_HANDLE = None

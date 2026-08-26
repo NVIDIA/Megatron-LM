@@ -10,12 +10,12 @@ import torch.nn.functional as F
 from megatron.core.models.gpt import moe_module_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import shared_experts as shared_experts_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -50,6 +50,15 @@ class _FakeTEScaledSwiGLU(torch.nn.Module):
     def __init__(self, glu_interleave_size):
         super().__init__()
         self.glu_interleave_size = glu_interleave_size
+
+
+class _FakeTEScaledClampedQGeGLU(torch.nn.Module):
+    def __init__(self, glu_interleave_size, *, alpha, limit, glu_linear_offset):
+        super().__init__()
+        self.glu_interleave_size = glu_interleave_size
+        self.alpha = alpha
+        self.limit = limit
+        self.glu_linear_offset = glu_linear_offset
 
 
 class _FakeTESequential(torch.nn.Module):
@@ -90,6 +99,7 @@ def _fake_te_module(linear_cls=_FakeTELinear):
             ops=SimpleNamespace(
                 GroupedLinear=_FakeTEGroupedLinear,
                 ScaledSwiGLU=_FakeTEScaledSwiGLU,
+                ScaledClampedQGeGLU=_FakeTEScaledClampedQGeGLU,
                 Sequential=_FakeTESequential,
             ),
             fp8_autocast=_FakeFP8Autocast,
@@ -123,6 +133,7 @@ def _fake_shared_expert(**config_kwargs):
         add_bias_linear=False,
         gated_linear_unit=True,
         activation_func=F.silu,
+        activation_func_clamp_value=None,
         moe_shared_expert_glu_interleave_size=32,
         delay_wgrad_compute=False,
         sequence_parallel=False,
@@ -139,6 +150,8 @@ def _fake_shared_expert(**config_kwargs):
     shared_expert.tp_group = object()
     shared_expert._fused_grouped_swiglu_ops = None
     shared_expert._fused_grouped_swiglu_recipe = None
+    shared_expert._fused_grouped_swiglu_unit_scale = None
+    shared_expert._fused_grouped_swiglu_tokens_per_expert = {}
     return shared_expert
 
 
@@ -180,6 +193,21 @@ def test_validate_fused_grouped_swiglu_requires_te(monkeypatch):
     monkeypatch.setattr(shared_experts_module, "HAVE_TE", False)
 
     with pytest.raises(RuntimeError, match="requires Transformer Engine"):
+        shared_expert._validate_fused_grouped_swiglu()
+
+
+@pytest.mark.parametrize("has_clamped_op", [True, False])
+def test_validate_fused_grouped_swiglu_requires_clamped_te_support(monkeypatch, has_clamped_op):
+    fake_te = _patch_fake_shared_expert_te(monkeypatch)
+    if has_clamped_op:
+        monkeypatch.setattr(
+            shared_experts_module, "is_te_min_version", lambda version: version != "2.17.0.dev0"
+        )
+    else:
+        del fake_te.pytorch.ops.ScaledClampedQGeGLU
+    shared_expert = _fake_shared_expert(activation_func_clamp_value=7.0)
+
+    with pytest.raises(RuntimeError, match="ScaledClampedQGeGLU"):
         shared_expert._validate_fused_grouped_swiglu()
 
 
@@ -227,6 +255,7 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
 
     assert isinstance(activation_op, _FakeTEScaledSwiGLU)
     assert activation_op.glu_interleave_size == 32
+    assert activation_op._grouped_mlp_unit_activation_scale is True
 
     assert isinstance(fc2_op, _FakeTEGroupedLinear)
     assert fc2_op.kwargs["num_groups"] == 1
@@ -236,6 +265,22 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
     assert fc2_op.kwargs["bias"] is False
     assert fc2_op.kwargs["accumulate_into_main_grad"] is False
     assert fc2_op.weight0 is shared_expert.linear_fc2.weight
+
+
+def test_make_fused_grouped_swiglu_ops_builds_clamped_activation(monkeypatch):
+    _patch_fake_shared_expert_te(monkeypatch)
+    shared_expert = _fake_shared_expert(activation_func_clamp_value=7.0)
+
+    shared_expert._validate_fused_grouped_swiglu()
+    ops = shared_expert._make_fused_grouped_swiglu_ops()
+
+    activation_op = list(ops.children())[1]
+    assert isinstance(activation_op, _FakeTEScaledClampedQGeGLU)
+    assert activation_op.glu_interleave_size == 32
+    assert activation_op.alpha == 1.0
+    assert activation_op.limit == 7.0
+    assert activation_op.glu_linear_offset == 0.0
+    assert activation_op._grouped_mlp_unit_activation_scale is True
 
 
 def test_fused_grouped_swiglu_ops_replay_linear_pre_forward_hooks(monkeypatch):
@@ -279,12 +324,16 @@ def test_fused_grouped_swiglu_no_comm_flattens_and_caches_fused_ops(monkeypatch)
 
     (ops,) = shared_expert._fused_grouped_swiglu_ops
     hidden_states_2d, tokens_per_expert, scales, tokens_per_expert_again = ops.args
+    shared_expert._fused_grouped_swiglu_no_comm(torch.randn_like(hidden_states))
+    _, cached_tokens_per_expert, cached_scales, _ = ops.args
     assert output.shape == hidden_states.shape
     assert shared_expert._fused_grouped_swiglu_recipe.__class__ is _FakeMXFP8Recipe
     assert hidden_states_2d.shape == (6, 4)
     assert tokens_per_expert.tolist() == [6]
     assert tokens_per_expert_again is tokens_per_expert
-    torch.testing.assert_close(scales, torch.ones(6))
+    torch.testing.assert_close(scales, torch.ones(1))
+    assert cached_tokens_per_expert is tokens_per_expert
+    assert cached_scales is scales
 
 
 def test_backward_dw_dispatches_fused_children_and_original_reduce_hooks(monkeypatch):
@@ -353,13 +402,13 @@ class TestSharedExperts:
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
         )
         # Create MoE layer with shared expert overlap enabled.
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         moe_layer_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=True, moe_token_dispatcher_type=dispatcher_type
         ).to(dtype=torch.bfloat16)
 
         # Create MoE layer with shared expert overlap disabled.
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         moe_layer_no_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=False, moe_token_dispatcher_type=dispatcher_type
         ).to(dtype=torch.bfloat16)

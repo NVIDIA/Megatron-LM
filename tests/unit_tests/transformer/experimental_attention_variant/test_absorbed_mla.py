@@ -180,6 +180,7 @@ def get_mock_mla_config(
         params_dtype=torch.bfloat16,
         layernorm_epsilon=1e-5,
         normalization="RMSNorm",
+        qk_layernorm=qk_layernorm,
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
         tensor_model_parallel_size=tensor_model_parallel_size,
@@ -315,13 +316,13 @@ def test_functionality(
     )
     absorbed_submodules = get_absorbed_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
-        qk_layernorm=True,
+        qk_layernorm=qk_layernorm,
         rms_norm=True,
         combined_kv_up_projection=combined_kv_up_projection,
     )
     standard_submodules = get_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
-        qk_layernorm=True,
+        qk_layernorm=qk_layernorm,
         rms_norm=True,
     )
     absorbed_mla = AbsorbedMLASelfAttention(

@@ -59,6 +59,11 @@ class _SaveOutputForBackward(torch.autograd.Function):
         (saved_output,) = ctx.saved_tensors
         return saved_output
 
+    def test_missing_max_seqlen_preserves_legacy_packed_freq_mapping(self):
+        cp_group = FakeCPGroup(size=2, rank=0)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(8, 1, 1, 8)
 
 def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleaving=False):
     assert fused_mla_rope_inplace is not None
@@ -292,10 +297,14 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
-class TestFusedApplyMLARope:
+class TestFusedMLARope:
     @pytest.mark.flaky_in_dev
-    def test_forward_backward_for_q(self, input_format):
-        _test_fused_apply_mla_rope_for_q(input_format)
+    @pytest.mark.parametrize("inverse", [False, True])
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    def test_inplace_forward_backward(self, input_format, inverse, remove_interleaving):
+        _test_fused_mla_rope_inplace(
+            input_format, inverse=inverse, remove_interleaving=remove_interleaving
+        )
 
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):

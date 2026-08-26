@@ -24,7 +24,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
-_LANGUAGE_SEED_OFFSET = 20_000
+_LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
 _ENCODER_SEED_OFFSET = 10_000
 
@@ -123,11 +123,13 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool = True,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
+        if use_megatron_fsdp or use_torch_fsdp2:
+            raise NotImplementedError("MIMO training with FSDP/FSDP2 has not been tested yet.")
         if wrap_with_ddp and ddp_config is None:
             raise ValueError("ddp_config is required when wrap_with_ddp is True")
-
         topology = self._topology
         args = get_args()
         _, is_language, active_pg = _resolve_role(topology)
@@ -160,8 +162,10 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             args,
             mimo_model,
             topology,
-            data_parallel_random_init,
-            use_layer_wise_distributed_optimizer,
+            ddp_config=ddp_config,
+            data_parallel_random_init=data_parallel_random_init,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
         configure_grad_sync(args, mimo_model, topology)
         mimo_model.pg_collection = module_pg

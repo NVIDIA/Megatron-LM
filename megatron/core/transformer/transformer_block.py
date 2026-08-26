@@ -925,6 +925,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
+        # Expand hidden states for hyper connections at the start of the block
+        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
+        if self.config.enable_mhc_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.mhc_num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:

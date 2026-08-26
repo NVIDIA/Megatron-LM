@@ -21,6 +21,10 @@ from megatron.core.ssm.gated_delta_net import (
     KimiDeltaAttention,
     KimiDeltaAttentionSubmodules,
 )
+from megatron.core.ssm.gated_delta_product import (
+    GatedDeltaProductMixer,
+    GatedDeltaProductMixerSubmodules,
+)
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -95,6 +99,19 @@ _hybrid_mtp_block_spec = ModuleSpec(
         ]
     ),
 )
+
+
+def _get_gated_delta_product_mamba_layer_spec(in_proj, out_proj):
+    return ModuleSpec(
+        module=MambaLayer,
+        submodules=MambaLayerSubmodules(
+            mixer=ModuleSpec(
+                module=GatedDeltaProductMixer,
+                submodules=GatedDeltaProductMixerSubmodules(in_proj=in_proj, out_proj=out_proj),
+            ),
+            mamba_bda=get_bias_dropout_add,
+        ),
+    )
 
 
 hybrid_stack_spec = ModuleSpec(
@@ -244,6 +261,22 @@ hybrid_stack_spec = ModuleSpec(
 )
 
 
+gated_delta_product_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
+        mamba_layer=_get_gated_delta_product_mamba_layer_spec(
+            TELayerNormColumnParallelLinear, TERowParallelLinear
+        ),
+        gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
+        attention_layer=hybrid_stack_spec.submodules.attention_layer,
+        dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
+        mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
+        moe_layer=hybrid_stack_spec.submodules.moe_layer,
+        mtp_block_spec=hybrid_stack_spec.submodules.mtp_block_spec,
+    ),
+)
+
+
 hybrid_inference_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
@@ -258,6 +291,20 @@ hybrid_inference_stack_spec = ModuleSpec(
                     ),
                 ),
                 mamba_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
             ),
         ),
         # Started with spec from gpt_layer_specs.py (with MLP removed)
@@ -313,6 +360,28 @@ hybrid_inference_stack_spec = ModuleSpec(
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
+        mla_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=MLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=TEColumnParallelLinear,
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_down_proj=TELinear,
+                        linear_kv_up_proj=TEColumnParallelLinear,
+                        core_attention=TEDotProductAttention,
+                        linear_proj=InferenceRowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
         # Started with spec from gpt_layer_specs.py
         # Using the TE spec because we had problems getting the non-TE spec
         # working
@@ -357,6 +426,22 @@ hybrid_inference_stack_spec = ModuleSpec(
                 ]
             ),
         ),
+    ),
+)
+
+
+gated_delta_product_inference_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
+        mamba_layer=_get_gated_delta_product_mamba_layer_spec(
+            InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
+        ),
+        gdn_layer=hybrid_inference_stack_spec.submodules.gdn_layer,
+        attention_layer=hybrid_inference_stack_spec.submodules.attention_layer,
+        dsa_layer=hybrid_inference_stack_spec.submodules.dsa_layer,
+        mlp_layer=hybrid_inference_stack_spec.submodules.mlp_layer,
+        moe_layer=hybrid_inference_stack_spec.submodules.moe_layer,
+        mtp_block_spec=hybrid_inference_stack_spec.submodules.mtp_block_spec,
     ),
 )
 

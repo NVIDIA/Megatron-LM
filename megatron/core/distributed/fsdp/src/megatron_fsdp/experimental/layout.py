@@ -21,8 +21,9 @@ from typing import TypeAlias
 
 import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
 
-from .placement import Flat, Placement
+from .placement import Flat
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 
@@ -88,7 +89,7 @@ class GlobalLayout:
                 )
             chunk_size = math.lcm(chunk_size, row_size)
 
-        # chunk_size is the packing unit. Since every tensor row size divides it,
+        # chunk_size is the packing granularity. Since every tensor row size divides it,
         # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
         UNASSIGNED_OFFSET = -1
         tensor_to_offset: list[int] = [UNASSIGNED_OFFSET] * len(tensor_shapes)

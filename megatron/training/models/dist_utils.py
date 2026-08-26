@@ -14,6 +14,7 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
+from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -31,7 +32,7 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, get_pg_rank
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -217,7 +218,7 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
     """Print the number of parameters in the model on rank 0.
 
     Only prints on data parallel rank 0 to avoid duplicate output.
-    Shows parameter count per (tensor parallel, pipeline parallel) rank.
+    Shows parameter count per (tensor parallel, gtp_remat, pipeline parallel) rank.
 
     Args:
         model: List of model modules to count parameters from
@@ -225,8 +226,9 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
     """
     if (pg_collection.dp.rank() == 0) and (pg_collection.cp.rank() == 0):
         print(
-            " > number of parameters on (tensor, pipeline) model parallel rank ({}, {}): {}".format(
+            " > number of parameters on (tensor, gtp_remat, pipeline) model parallel rank ({}, {}, {}): {}".format(
                 pg_collection.tp.rank(),
+                get_pg_rank(pg_collection.gtp_remat),
                 pg_collection.pp.rank(),
                 sum(
                     [
@@ -331,11 +333,34 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    # DDP initialization is required to be on a side-stream for the full-iteration CUDA graph.
-    #  this side-stream may be nested if being called from within the get_model function, but it
-    #  is here in case someone wants to use this directly outside of get_model.
-    ddp_stream = torch.cuda.Stream()
+    # Argument validation converts --use-distributed-optimizer into
+    # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
+    # the layerwise optimizer needs the reduce-scatter and the shard-aligned param layout
+    # that the distributed-optimizer path provides. Mirrors wrap_model_chunks_with_ddp() in
+    # megatron/training/training.py, which handles the non-ModelBuilder path.
+    compute_full_param_layout = DistributedOptimizer.compute_full_param_layout
+    if (
+        DP is DistributedDataParallel
+        and use_layer_wise_distributed_optimizer
+        and use_layer_wise_param_layout
+    ):
+        ddp_config.use_distributed_optimizer = True
+        compute_full_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+        # Tag params so DDP buffer grouping routes LayerWise-managed matrices
+        # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
+        # everything else (embeddings, biases, layernorm) to a separate
+        # DistOpt-style buffer.
+        tag_params_for_buffer_routing(model)
+
+    if get_model_config(model[0]).cuda_graph_impl == "full_iteration":
+        # DDP initialization must use the full-iteration capture stream so its retained
+        # AccumulateGrad nodes do not reference a different, non-capturing stream.
+        ddp_stream = get_shared_capture_stream()
+    else:
+        # Preserve a dedicated initialization stream for all other implementations.
+        ddp_stream = torch.cuda.Stream()
     ddp_stream.wait_stream(torch.cuda.current_stream())
+
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
         if not use_torch_fsdp2:
@@ -372,7 +397,7 @@ def _ddp_wrap(
             wrapped_model.append(wrapped_chunk)
         model = wrapped_model
 
-    # Critical: ensure side-stream work completes before touching params on default stream
+    # Ensure initialization-stream work completes before touching params on the default stream.
     torch.cuda.current_stream().wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.

@@ -42,6 +42,14 @@ class MegatronModule(torch.nn.Module):
         super().__init__()
         self.config = config
 
+    def refresh_cache(self) -> None:
+        """Refresh state derived from parameters after an in-place weight refit.
+
+        Refit bypasses the normal checkpoint-load and train/eval lifecycles. Modules
+        that cache values derived from parameters can override this method; the refit
+        receiver calls it after all parameter and buffer transfers have completed.
+        """
+
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
         state dict for saving checkpoints.
@@ -247,12 +255,22 @@ class GraphableMegatronModule(MegatronModule):
         self._te_cuda_graph_static_hidden_input_ptrs = ()
 
     def init_backward_dw_wrapper(self):
-        """Initialize the backward_dw_wrapper."""
-        from megatron.core.models.gpt.fine_grained_callables import _BackwardDWWrapper
+        """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.
+
+        The wrapper coordinates the per-layer wgrad callables (attention
+        wgrad, optional shared-expert wgrad) with cuda-graph replay scope so
+        captured components are not re-run eagerly. The method is defined on
+        ``GraphableMegatronModule`` so any graphable subclass can opt in;
+        ``_BackwardDWWrapper`` itself currently asserts the underlying layer
+        is a ``TransformerLayer``, so MambaLayer-derived modules implement
+        ``backward_dw`` directly and skip this helper.
+        """
+        from megatron.core.models.common.utils import _BackwardDWWrapper
 
         config = getattr(self, 'config', None)
         assert config is not None, (
-            "TransformerLayer must be initialized before calling " "`init_backward_dw_wrapper`."
+            "Module must be fully constructed (config set) before calling "
+            "`init_backward_dw_wrapper`."
         )
         self.backward_dw_wrapper = _BackwardDWWrapper(self)
 

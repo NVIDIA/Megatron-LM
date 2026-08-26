@@ -18,8 +18,12 @@ from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
+    get_expert_gtp_weight_remat_rank,
+    get_expert_gtp_weight_remat_world_size,
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
+    get_gtp_weight_remat_rank,
+    get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
@@ -91,6 +95,10 @@ except ModuleNotFoundError:
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+# GTP_remat weight-init trackers: shards init per-rank, so each peer must draw DIFFERENT values;
+# registered only when the axis is active (see model_parallel_cuda_manual_seed).
+_GTP_REMAT_RNG_TRACKER_NAME = 'gtp-remat-rng'
+_EXPERT_GTP_REMAT_RNG_TRACKER_NAME = 'egtp-remat-rng'
 
 
 def _get_cuda_rng_state(
@@ -211,6 +219,11 @@ def get_data_parallel_rng_tracker_name():
     """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
     return _DATA_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_gtp_remat_rng_tracker_name(is_expert=False):
+    """Get the (E)GTP_remat weight-init rng tracker name (per-(E)GTP-rank distinct draws)."""
+    return _EXPERT_GTP_REMAT_RNG_TRACKER_NAME if is_expert else _GTP_REMAT_RNG_TRACKER_NAME
 
 
 class CudaRNGStatesTracker:
@@ -438,7 +451,11 @@ def model_parallel_cuda_manual_seed(
     tp_rank: Optional[int] = None,
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
+    gtp_remat_rank: Optional[int] = None,
+    egtp_remat_rank: Optional[int] = None,
     force_reset_rng: bool = False,
+    gtp_remat_world_size: Optional[int] = None,
+    egtp_remat_world_size: Optional[int] = None,
 ):
     """Initialize model parallel cuda seed.
 
@@ -463,6 +480,14 @@ def model_parallel_cuda_manual_seed(
         ep_rank = get_expert_model_parallel_rank()
     if etp_rank is None:
         etp_rank = get_expert_tensor_parallel_rank()
+    if gtp_remat_rank is None:
+        gtp_remat_rank = get_gtp_weight_remat_rank()
+    if egtp_remat_rank is None:
+        egtp_remat_rank = get_expert_gtp_weight_remat_rank()
+    if gtp_remat_world_size is None:
+        gtp_remat_world_size = get_gtp_weight_remat_world_size()
+    if egtp_remat_world_size is None:
+        egtp_remat_world_size = get_expert_gtp_weight_remat_world_size()
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + tp_rank
@@ -482,6 +507,17 @@ def model_parallel_cuda_manual_seed(
 
     expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
+
+    # GTP_remat weight-init states: shards are initialized per-rank (GTP-agnostic init), so peers
+    # must draw DIFFERENT values (everything above is identical across peers by design). The 65536
+    # stride keeps these disjoint from the tp/ep/etp seeds. Added only when the axis is active, so
+    # non-GTP runs keep a byte-identical tracker set (and checkpoint rng payload).
+    if gtp_remat_world_size > 1:
+        gtp_remat_seed = tensor_model_parallel_seed + 65536 * (1 + gtp_remat_rank)
+        _CUDA_RNG_STATE_TRACKER.add(_GTP_REMAT_RNG_TRACKER_NAME, gtp_remat_seed)
+    if egtp_remat_world_size > 1:
+        egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
+        _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)
 
 
 def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):
@@ -1050,6 +1086,11 @@ class CheckpointWithoutOutput(object):
         # per tracked state per checkpoint.
         self.rng_states = _get_all_rng_states()
 
+        if self.retain_input_tensors:
+            self._saved_input_ptrs = {
+                t.untyped_storage().data_ptr() for t in args if isinstance(t, torch.Tensor)
+            }
+
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
@@ -1133,6 +1174,19 @@ class CheckpointWithoutOutput(object):
         self.outputs = None
         self.ctx = None
 
+    def _discard_outputs(self):
+        """Release output storage, preserving outputs that alias retained inputs."""
+        if self.retain_input_tensors:
+            # Skip outputs whose storage is shared with a saved input — freeing those
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
+            # operations with MakeExtraOutput).
+            for output in self.outputs:
+                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
+                    output.untyped_storage().resize_(0)
+        else:
+            for output in self.outputs:
+                output.untyped_storage().resize_(0)
+
     def discard_output_and_register_recompute(self, hook_tensor):
         """
         Release the output tensor storages and register the recompute function as a grad hook of
@@ -1149,10 +1203,8 @@ class CheckpointWithoutOutput(object):
         if self.ckpt_manager is not None or is_graph_warmup():
             return
 
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
-        for output in self.outputs:
-            output.untyped_storage().resize_(0)
+        # Release output tensor memory while keeping metadata for backward.
+        self._discard_outputs()
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected
