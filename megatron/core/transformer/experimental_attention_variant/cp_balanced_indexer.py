@@ -11,20 +11,21 @@ light) and chunk ``2 * cp_size - 1 - r`` (a high-position "tail", heavy), so
 PER-SEQUENCE ZIGZAG: packs whose padded sequence lengths divide ``2 * cp_size`` gather each
 rank's head/tail chunks of every sequence via prebuilt A2A routes and score them with two
 packed fused-top-k calls against synthetic per-sequence layouts with explicit RoPE positions.
-Any other pack — and the unfused backend — takes the REFERENCE FALLBACK: this rank scores its
-own contiguous rows via ``compute_cp_indexer_topk`` exactly like the unbalanced path, keeping
-the original imbalance (the former chunk-pair folding fallback measured slower than that
-baseline on unequal packs and was removed). Fused calls issued by this module pin the
-per-process row count and raise on a transition (``_pin_fused_call_rows``); non-even per-rank
-lengths and multi-sequence packs follow the reference semantics.
+Eligibility is a RUN-LEVEL INVARIANT: config validation requires the fused backend and a
+pack-tail alignment divisible by ``2 * cp_size``, and a pack that violates per-sequence or
+tail divisibility RAISES (at prebuild when prebuilt, else at dispatch) instead of falling
+back — the fused kernel package silently corrupts fused calls whose row shape differs from
+earlier calls in the process, so per-microbatch balanced/reference switching is forbidden.
+Fused calls issued by this module additionally pin the per-process row count
+(``_pin_fused_call_rows``), so a varying pack capacity raises as well. (The former
+chunk-pair folding fallback measured slower than the unbalanced baseline on unequal packs
+and was removed.)
 
 ``balanced_compute_cp_indexer_topk`` is a drop-in replacement for
 ``csa_utils.cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
 ``[l_local, topk]`` layout, so the downstream index-building and sparse attention are unchanged.
 
-Triage/A-B switches: ``MCORE_DSA_CP_BAL_PACK_SCOPE=1`` forces the reference fallback
-(disables the per-sequence zigzag); ``MCORE_DSA_CP_BAL_DEBUG=1`` logs the gate decision once.
-Both must be set uniformly across CP ranks (they select the collective sequence).
+Triage switch: ``MCORE_DSA_CP_BAL_DEBUG=1`` logs the eligibility decision once.
 
 CUDA-graph contract: graph support is scoped to static pack compositions at PP=1 and is
 enforced through ``prebuild_balanced_layouts`` — under CUDA graphs it MUST be called every
@@ -44,7 +45,6 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 logger = logging.getLogger(__name__)
 
 # Run-constant A/B switches, read once at import (see the module docstring).
-_FORCE_REFERENCE = os.environ.get("MCORE_DSA_CP_BAL_PACK_SCOPE") == "1"
 _GATE_DEBUG = os.environ.get("MCORE_DSA_CP_BAL_DEBUG") == "1"
 
 # Score-buffer sizing contract for the fused cuDNN indexer kernel. Widths are
@@ -79,12 +79,11 @@ _A2A_BUF: dict = {}
 # re-validates capacity via plan["half"] * 2 == l_local.
 _LAST_PLAN: dict = {}
 
-# Per-(group, l_local) verdict from the last prebuild: does the CURRENT pack support the
-# per-sequence zigzag path (every padded sequence length divisible by 2 * cp_size)? The
-# config-level gate in ``_use_zigzag`` cannot see the actual pack; prebuild can, and
-# records it here so both eager and captured forwards fall back to the reference path for
-# packs the zigzag builders do not support (instead of consuming a stale plan or building
-# an out-of-range runtime plan).
+# Per-(group, l_local) OK verdict from the last prebuild or eager probe: the CURRENT
+# pack is zigzag-representable (every padded sequence length divisible by 2 * cp_size).
+# Only successes are recorded — a violating pack raises (eligibility is a run-level
+# invariant). Capture consults this registry because probing is impossible while
+# recording a graph.
 _ZZ_PACK_OK: dict = {}
 
 # Last OBSERVED (l_local, cu composition) per group, recorded on every prebuild
@@ -193,7 +192,6 @@ def dispatch_chunks_async(
     cp_size,
     l_local,
     config=None,
-    use_fused=True,
     layout_cache=None,
     cu_seqlens=None,
 ):
@@ -204,8 +202,9 @@ def dispatch_chunks_async(
     flight (and the local top-k preparation) instead of sitting on the critical path
     right before the top-k. ``balanced_compute_cp_indexer_topk(dispatch_handle=...)`` waits
     on it. When qr and weights share a dtype they ride one all_to_all (single launch).
-    ``cu_seqlens`` feeds the eager pack-eligibility probe (``_pack_zigzag_ok``); the
-    compute side follows the returned handle's kind, so both stay consistent.
+    ``cu_seqlens`` feeds the fail-fast pack-eligibility check
+    (``_ensure_pack_zigzag_ok``); the compute side follows the returned handle's kind,
+    so both stay consistent.
 
     Handle ``kind`` legend — which transport carried the (qr | weights) payload:
 
@@ -217,8 +216,7 @@ def dispatch_chunks_async(
       merged payload; row selection is deferred to consume time.
     - ``"ag2"``: same fallback, but qr/weights dtypes differ so the merged payload
       cannot carry both — two separate AllGathers.
-    - ``None``: zigzag ineligible — nothing to prefetch; the compute side takes the
-      reference fallback and scores this rank's own rows against the gathered K.
+    - ``None``: ``cp_size <= 1`` — nothing to balance, nothing to prefetch.
     """
     if cp_size <= 1:
         return None
@@ -227,72 +225,65 @@ def dispatch_chunks_async(
     # Detached: the dispatch feeds only the integer top-k; no gradient flows back.
     q2 = indexer_qr.detach().reshape(-1, q_lora)
     w2 = weights_indexer_cp.detach().reshape(-1, n_heads)
-    if (
-        config is not None
-        and _use_zigzag(cp_size, l_local, use_fused, config)
-        and _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
-    ):
-        plan = layout_cache.get(("zigzag", cp_group.rank())) if layout_cache else None
+    _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
+    plan = layout_cache.get(("zigzag", cp_group.rank())) if layout_cache else None
+    if plan is not None and plan.get("half", 0) * 2 != l_local:
+        # Plan built against different local row count (e.g. prebuild saw a
+        # padded cu ending short of the physical pack): unusable here.
+        plan = None
+    if plan is None and _is_capturing():
+        # TE graph capture clones PackedSeqParams and strips the per-microbatch
+        # cache; the module-level slot is the capture-time source of truth. In
+        # eager, a missing cache entry means prebuild did not vet THIS pack, so
+        # do not trust a slot left over from a previous one. (CUDA graphs with
+        # this flag require a static pack composition — enforced at data-prep
+        # time by prebuild_balanced_layouts — so under capture the slot always
+        # describes the pack being captured.)
+        plan = _LAST_PLAN.get((_group_key(cp_group), cp_group.rank()))
         if plan is not None and plan.get("half", 0) * 2 != l_local:
-            # Plan built against different local row count (e.g. prebuild saw a
-            # padded cu ending short of the physical pack): unusable here.
-            plan = None
-        if plan is None and _is_capturing():
-            # TE graph capture clones PackedSeqParams and strips the per-microbatch
-            # cache; the module-level slot is the capture-time source of truth. In
-            # eager, a missing cache entry means prebuild did not vet THIS pack, so
-            # do not trust a slot left over from a previous one. (CUDA graphs with
-            # this flag require a static pack composition — enforced at data-prep
-            # time by prebuild_balanced_layouts — so under capture the slot always
-            # describes the pack being captured.)
-            plan = _LAST_PLAN.get((_group_key(cp_group), cp_group.rank()))
-            if plan is not None and plan.get("half", 0) * 2 != l_local:
-                plan = None  # latest-slot plan built at a different capacity
-        if plan is not None and "disp_send_rows" in plan and q2.dtype == w2.dtype:
-            # Route-A2A dispatch (PR #5664-style prebuilt exchange): each rank sends and
-            # receives only ~l_local rows instead of the S-row AllGather. Splits are host
-            # ints prebuilt at data-prep time, so the exchange is CUDA-graph capturable.
-            width = q_lora + n_heads
-            payload = _a2a_buf("zzr_pay", l_local, width, q2.dtype, q2.device, cp_group)
-            payload[:, :q_lora].copy_(q2)
-            payload[:, q_lora:].copy_(w2)
-            send = _a2a_buf("zzr_send", l_local, width, q2.dtype, q2.device, cp_group)
-            # copy_(index_select(...)) instead of index_select(out=...): keeps the
-            # cached staging buffer as the destination without imposing out= dtype /
-            # autograd constraints. q2/w2 are detached; no gradient flows through
-            # the dispatch.
-            send.copy_(torch.index_select(payload, 0, plan["disp_send_rows"]))
-            recv = _a2a_buf("zzr_recv", l_local, width, q2.dtype, q2.device, cp_group)
-            work = dist.all_to_all_single(
-                recv,
-                send,
-                output_split_sizes=plan["disp_out_splits"],
-                input_split_sizes=plan["disp_in_splits"],
-                group=cp_group,
-                async_op=True,
-            )
-            return {"kind": "zzr", "works": [work], "recv": recv, "plan": plan, "q_lora": q_lora}
-        # Fallback: static-shape AllGather; row selection happens on device from
-        # cu_seqlens at consume time (CUDA-graph friendly with per-iteration packs).
-        if plan is not None and "disp_send_rows" in plan:
-            # Routed plan exists but qr/weights dtypes differ: the merged-payload
-            # exchange cannot carry both.
-            _warn_allgather_fallback("prebuilt routes unavailable for mixed qr/weights dtypes")
-        else:
-            _warn_allgather_fallback(_NO_PLAN_REASON)
-        if q2.dtype == w2.dtype:
-            width = q_lora + n_heads
-            payload = _a2a_buf("zz_qw", l_local, width, q2.dtype, q2.device, cp_group)
-            payload[:, :q_lora].copy_(q2)
-            payload[:, q_lora:].copy_(w2)
-            work, g = _all_gather_rows_buf(payload, l_local, cp_group, cp_size, "zz_qw")
-            return {"kind": "ag", "works": [work], "g": g, "q_lora": q_lora}
-        wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
-        ww, gw = _all_gather_rows_buf(w2, l_local, cp_group, cp_size, "zz_w")
-        return {"kind": "ag2", "works": [wq, ww], "gq": gq, "gw": gw, "q_lora": q_lora}
-    # Zigzag ineligible: the reference fallback scores this rank's own rows
-    # against the already-gathered K, so there is nothing to prefetch.
-    return None
+            plan = None  # latest-slot plan built at a different capacity
+    if plan is not None and "disp_send_rows" in plan and q2.dtype == w2.dtype:
+        # Route-A2A dispatch (PR #5664-style prebuilt exchange): each rank sends and
+        # receives only ~l_local rows instead of the S-row AllGather. Splits are host
+        # ints prebuilt at data-prep time, so the exchange is CUDA-graph capturable.
+        width = q_lora + n_heads
+        payload = _a2a_buf("zzr_pay", l_local, width, q2.dtype, q2.device, cp_group)
+        payload[:, :q_lora].copy_(q2)
+        payload[:, q_lora:].copy_(w2)
+        send = _a2a_buf("zzr_send", l_local, width, q2.dtype, q2.device, cp_group)
+        # copy_(index_select(...)) instead of index_select(out=...): keeps the
+        # cached staging buffer as the destination without imposing out= dtype /
+        # autograd constraints. q2/w2 are detached; no gradient flows through
+        # the dispatch.
+        send.copy_(torch.index_select(payload, 0, plan["disp_send_rows"]))
+        recv = _a2a_buf("zzr_recv", l_local, width, q2.dtype, q2.device, cp_group)
+        work = dist.all_to_all_single(
+            recv,
+            send,
+            output_split_sizes=plan["disp_out_splits"],
+            input_split_sizes=plan["disp_in_splits"],
+            group=cp_group,
+            async_op=True,
+        )
+        return {"kind": "zzr", "works": [work], "recv": recv, "plan": plan, "q_lora": q_lora}
+    # Fallback: static-shape AllGather; row selection happens on device from
+    # cu_seqlens at consume time (CUDA-graph friendly with per-iteration packs).
+    if plan is not None and "disp_send_rows" in plan:
+        # Routed plan exists but qr/weights dtypes differ: the merged-payload
+        # exchange cannot carry both.
+        _warn_allgather_fallback("prebuilt routes unavailable for mixed qr/weights dtypes")
+    else:
+        _warn_allgather_fallback(_NO_PLAN_REASON)
+    if q2.dtype == w2.dtype:
+        width = q_lora + n_heads
+        payload = _a2a_buf("zz_qw", l_local, width, q2.dtype, q2.device, cp_group)
+        payload[:, :q_lora].copy_(q2)
+        payload[:, q_lora:].copy_(w2)
+        work, g = _all_gather_rows_buf(payload, l_local, cp_group, cp_size, "zz_qw")
+        return {"kind": "ag", "works": [work], "g": g, "q_lora": q_lora}
+    wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
+    ww, gw = _all_gather_rows_buf(w2, l_local, cp_group, cp_size, "zz_w")
+    return {"kind": "ag2", "works": [wq, ww], "gq": gq, "gw": gw, "q_lora": q_lora}
 
 
 def _no_fp8_ctx():
@@ -379,63 +370,29 @@ def _excl_cumsum(x):
     return torch.cat((z, torch.cumsum(x, 0)[:-1]))
 
 
-def _use_zigzag(cp_size, l_local, use_fused, config):
-    """Config-level zigzag gate — a cheap PREFILTER, not a guarantee.
+def _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
+    """Fail fast unless the ACTUAL microbatch pack is zigzag-representable.
 
-    ``pad_packed_seq_alignment % (2 * cp_size) == 0`` makes per-sequence 2N-divisible
-    packs *possible* (the tail padding aligns only the pack length; per-sequence
-    divisibility comes from the data / dataset padding, and under CUDA graphs the
-    integer alignment is replaced by target-length padding entirely). Whether the
-    ACTUAL pack is representable is decided per microbatch by ``_pack_zigzag_ok``;
-    ineligible packs take the reference fallback (this rank scores its own rows).
-    ``MCORE_DSA_CP_BAL_PACK_SCOPE=1`` forces that fallback (A/B testing).
-    """
-    verdict = None
-    if _FORCE_REFERENCE:
-        verdict = False
-    elif not use_fused:
-        verdict = False
-    if verdict is None:
-        # Unified path: single-full-pack sequences are the nseg==1 special case of the
-        # per-sequence zigzag (the same chunks a global 2N-fold would produce), served by the same
-        # plan/route machinery with per-call tight compressed-K bounds (K-slice general).
-        pad = getattr(config, "pad_packed_seq_alignment", None)
-        verdict = isinstance(pad, int) and pad % (2 * cp_size) == 0 and (l_local % 2 == 0)
-    if _GATE_DEBUG and not getattr(_use_zigzag, "_logged", False):
-        _use_zigzag._logged = True
-        logger.info(
-            "[zz-gate] verdict=%s S=%s use_fused=%s pad=%r force_reference=%s",
-            verdict,
-            cp_size * l_local,
-            use_fused,
-            getattr(config, "pad_packed_seq_alignment", None),
-            _FORCE_REFERENCE,
-        )
-    return verdict
-
-
-def _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
-    """Pack-level zigzag admissibility for the ACTUAL microbatch (config gate said yes).
-
-    Verdict priority: this microbatch's cached verdict (written by prebuild, or by an
-    earlier probe of the same pack) -> the module registry keyed by (group, l_local)
-    (prebuild or a previous probe) -> an eager one-D2H probe of THIS pack's cu_seqlens,
-    cached back to both. Probing is impossible under capture, but capture replays the
-    eagerly warmed-up pack, whose probe already wrote the registry. Frontends that never
-    prebuild (e.g. the legacy varlen ``get_batch``) can hand over raw, non-2N-aligned
-    packs; without this gate they would reach ``_zigzag_plan``'s hard error instead of
-    the reference fallback.
+    Eligibility is a run-level invariant (config validation requires the fused backend
+    and a compatible ``pad_packed_seq_alignment``); this check enforces the per-pack
+    half of the contract — every (padded) sequence length, the capacity tail, and the
+    per-rank row count must divide ``2 * cp_size`` — and RAISES on violation instead of
+    falling back, because the fused kernel package silently corrupts fused calls whose
+    row shape differs from earlier calls. Success verdicts are cached on the microbatch
+    ``layout_cache`` (written by prebuild or an earlier probe of the same pack) and in
+    the module registry keyed by (group, l_local); probing is impossible under capture,
+    so capture requires a recorded verdict (eager warmup or prebuild).
     """
     if layout_cache is not None:
         cached = layout_cache.get("zz_pack_ok")
-        if cached is not None and cached[0] == l_local:
+        if cached is not None and cached[0] == l_local and cached[1]:
             # Verdicts are only valid for the capacity they were probed at: prebuild
             # may have seen a padded cu ending short of the physical pack.
-            return cached[1]
+            return
     key = (_group_key(cp_group), l_local)
     if _is_capturing():
-        if key in _ZZ_PACK_OK:
-            return _ZZ_PACK_OK[key]
+        if _ZZ_PACK_OK.get(key):
+            return
         # Probing is impossible here and guessing would bake an unverified branch.
         raise RuntimeError(
             "balanced CP indexer: no pack-eligibility verdict is available during "
@@ -443,9 +400,13 @@ def _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
             "before capturing."
         )
     if cu_seqlens is None:
-        # No pack to probe: only a recorded verdict can admit zigzag; default to the
-        # reference fallback.
-        return _ZZ_PACK_OK.get(key, False)
+        if _ZZ_PACK_OK.get(key):
+            return
+        raise RuntimeError(
+            "balanced CP indexer: cannot verify pack eligibility — no cu_seqlens to "
+            "probe and no recorded verdict for this (group, capacity). Run "
+            "prebuild_balanced_layouts at data-prep time."
+        )
     S = cp_size * l_local
     nch = 2 * cp_size
     cu = cu_seqlens.reshape(-1).cpu()
@@ -457,10 +418,22 @@ def _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
         and (S - total) % nch == 0
         and bool(((lens % nch) == 0).all())
     )
-    _ZZ_PACK_OK[key] = ok
+    if not ok:
+        raise ValueError(
+            "balanced CP indexer: this pack is not zigzag-representable "
+            f"(l_local={l_local}, total={total}, capacity={S}; every padded sequence "
+            f"length and the capacity tail must be divisible by 2 * cp_size = {nch}). "
+            "Balanced eligibility is a run-level invariant — fix the dataset padding / "
+            "pad_packed_seq_alignment so every pack conforms, or disable "
+            "dsa_cp_balance_indexer; there is no per-microbatch fallback because the "
+            "fused kernel package silently corrupts shape-alternating calls."
+        )
+    if _GATE_DEBUG and not getattr(_ensure_pack_zigzag_ok, "_logged", False):
+        _ensure_pack_zigzag_ok._logged = True
+        logger.info("[zz-gate] pack eligible: S=%s l_local=%s nch=%s", S, l_local, nch)
+    _ZZ_PACK_OK[key] = True
     if layout_cache is not None:
-        layout_cache["zz_pack_ok"] = (l_local, ok)
-    return ok
+        layout_cache["zz_pack_ok"] = (l_local, True)
 
 
 def _rope_positions(q, pos_ids, cu_q, nope_dim, pos_dim, indexer, config, table_len):
@@ -528,9 +501,9 @@ def _zigzag_plan(cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, la
         if bool((lens % nch != 0).any()):
             # One eager-only D2H check per plan build (rare): the ragged enumeration
             # below floors ``lens / 2N`` and would emit out-of-range gather indices
-            # for non-2N-aligned packs. The pack gate (``_pack_zigzag_ok``) routes
-            # such packs to the reference fallback before any dispatch is issued; reaching
-            # this error means a caller bypassed the gate.
+            # for non-2N-aligned packs. The fail-fast check (_ensure_pack_zigzag_ok)
+            # raises for such packs before any dispatch is issued; reaching this
+            # error means a caller bypassed it.
             raise ValueError(
                 "balanced CP indexer zigzag plan requires every packed sequence length "
                 f"(including capacity padding) to be divisible by 2 * cp_size = {nch}."
@@ -629,10 +602,11 @@ def balanced_compute_cp_indexer_topk(
     ``2 * cp_size - 1 - r`` (tail) of every sequence — one cheap and one expensive under
     the causal mask — via per-chunk calls that follow the reference (RoPE positions,
     causal offsets, packing, tight KV bounds), then combines the top-k back to contiguous
-    order. Packs the zigzag builders cannot represent (a sequence length not divisible by
-    ``2 * cp_size``) take the reference fallback instead: this rank scores its own
-    contiguous rows exactly like the unbalanced path (the former chunk-pair folding
-    fallback measured slower than that baseline on unequal packs and was removed).
+    order. Eligibility is a run-level invariant: a pack the zigzag builders cannot
+    represent (a sequence length not divisible by ``2 * cp_size``) RAISES — at prebuild
+    when prebuilt, else at the dispatch/compute check here — instead of falling back,
+    because the fused kernel package silently corrupts fused calls whose row shape
+    differs from earlier calls in the process.
     """
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
@@ -806,207 +780,194 @@ def balanced_compute_cp_indexer_topk(
     # ~l_local/2 rows per call, repeated identically across layers and
     # microbatches for a fixed capacity, i.e. the CUDA-graph scope and every
     # benchmarked configuration — are unaffected (end-to-end loss parity vs the
-    # reference). Regimes that ALTERNATE fused-call shapes within one process
-    # (``dsa_cp_balance_min_seqlen > 0`` mixing balanced half-row calls with
-    # full-row reference calls, pack-eligibility alternation doing the same through the
-    # reference fallback, or eager varlen whose l_local varies — the
-    # latter already mixes shapes with the flag off) await the kernel-side fix.
+    # reference). Regimes that would ALTERNATE fused-call shapes within one process
+    # are rejected by design until the kernel-side fix: eligibility is a run-level
+    # invariant (config validation plus the fail-fast pack check), and the
+    # per-process row pin (_pin_fused_call_rows) rejects a varying pack capacity.
 
     # "kind" legend lives on dispatch_chunks_async: zzr/ag/ag2 are the three zigzag
     # transports (routed a2a / merged AllGather / split AllGather); a None handle means
-    # zigzag was ineligible at dispatch time. The dispatch already committed the layout,
-    # so the compute side keys off the handle rather than re-deriving eligibility.
-    zz = dispatch_handle is not None or (
-        _use_zigzag(cp_size, l_local, use_fused, config)
-        and _pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
-    )
-    if zz:
-        # ---- Per-sequence zigzag: exact balance for any pack composition -------------
-        if dispatch_handle is not None and dispatch_handle.get("kind") == "zzr":
-            plan = dispatch_handle["plan"]
-        else:
-            plan = (layout_cache or {}).get(("zigzag", r))
+    # the caller skipped the early dispatch. Eligibility was already enforced by the
+    # dispatch (or prebuild); re-check here only when no dispatch ran.
+    if dispatch_handle is None:
+        _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
+    # ---- Per-sequence zigzag: exact balance for any pack composition -------------
+    if dispatch_handle is not None and dispatch_handle.get("kind") == "zzr":
+        plan = dispatch_handle["plan"]
+    else:
+        plan = (layout_cache or {}).get(("zigzag", r))
+        if plan is not None and plan.get("half", 0) * 2 != l_local:
+            plan = None  # see dispatch_chunks_async: wrong-capacity plan
+        if plan is None and _is_capturing():
+            # See dispatch_chunks_async: the module slot is only trustworthy
+            # under capture, where the static-composition contract (enforced by
+            # prebuild_balanced_layouts) guarantees it describes this pack.
+            plan = _LAST_PLAN.get((_group_key(cp_group), r))
             if plan is not None and plan.get("half", 0) * 2 != l_local:
-                plan = None  # see dispatch_chunks_async: wrong-capacity plan
-            if plan is None and _is_capturing():
-                # See dispatch_chunks_async: the module slot is only trustworthy
-                # under capture, where the static-composition contract (enforced by
-                # prebuild_balanced_layouts) guarantees it describes this pack.
-                plan = _LAST_PLAN.get((_group_key(cp_group), r))
-                if plan is not None and plan.get("half", 0) * 2 != l_local:
-                    plan = None  # latest-slot plan built at a different capacity
-            if plan is None:
-                plan = _zigzag_plan(
-                    cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache
-                )
-        half = plan["half"]
-        mq = max(1, min(int(max_seqlen_q), half))
-        gkv = max(1, int(max_seqlen_q) // int(ratio))
+                plan = None  # latest-slot plan built at a different capacity
+        if plan is None:
+            plan = _zigzag_plan(
+                cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache
+            )
+    half = plan["half"]
+    mq = max(1, min(int(max_seqlen_q), half))
+    gkv = max(1, int(max_seqlen_q) // int(ratio))
 
-        @torch.no_grad()
-        def _packed_topk(qr_rows, w_rows, layout3, pos_ids, kv_rows, mkv):
-            # Integer top-k output only: no gradient flows through the balanced
-            # scoring, so skip autograd tracking for the per-chunk projection/RoPE.
-            sz = qr_rows.shape[0]
-            _pin_fused_call_rows(sz)
-            with _no_fp8_ctx():  # see _chunk_topk: keep the FP8 amax stream untouched
-                q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
-            q = q.reshape(sz, n_heads, head_dim)
-            q = _rope_positions(
-                q, pos_ids, layout3[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
-            )
-            q = rotate_activation(q)
-            tk, _ = _cu.compute_cp_indexer_topk(
-                q,
-                w_rows.reshape(sz, n_heads),
-                kv_rows,
-                cu_seqlens,
-                cu_seqlens_compressed,
-                0,
-                ratio,
-                topk,
-                softmax_scale,
-                max_seqlen_q=mq,
-                use_fused=True,
-                max_seqlen_kv=mkv,
-                prebuilt_layout=layout3,
-            )
-            return tk
-
-        # Per-call tight compressed-K bounds (K-slice generalized per segment); the
-        # capture-safe fallback plan carries no bounds and keeps the full width.
-        # NOTE: this runtime fallback width (gkv = max_seqlen_q // ratio, the
-        # reference call's contract shape) is narrower than prebuild's
-        # _kv_bounds fallback (total // ratio): prebuild cannot trust
-        # max_seqlen_q (frontends may leave it unset/tensor-valued), so it stays
-        # conservative. Both exceed every row's causal need; only buffer size
-        # differs.
-        mkv_h = int(plan.get("mkv_head", gkv))
-        mkv_t = int(plan.get("mkv_tail", gkv))
-        k_rows_total = k_seq_major.shape[0]
-        # Host-int invariants (free): a plan's K-slice end can never exceed the
-        # physical K buffer of the pack it was built for, and a prebuilt plan must
-        # have been built for this compress ratio; a violation means a stale or
-        # foreign plan is being consumed. Real raises, not asserts: these guard
-        # silent corruption and must survive ``python -O``. (mkv_* is a rounded-up
-        # score-buffer CAPACITY — floored at the width quantum — not a need, so it
-        # has no such bound.)
-        if (
-            plan.get("k_end_head", 0) > k_rows_total
-            or plan.get("k_end_tail", 0) > k_rows_total
-            or plan.get("_ratio", ratio) != ratio
-        ):
-            # Complete any in-flight dispatch first: an orphaned NCCL work could
-            # see the persistent staging buffers rewritten during teardown. The
-            # inputs to this check are per-rank host ints, so the raise itself
-            # can be rank-divergent and peers may still block in their next
-            # collective until the NCCL watchdog fires — an extra per-layer
-            # collective to synchronize a should-never-fire verdict is not worth
-            # it (unlike _validate_hep_order, which runs once per key).
-            if dispatch_handle is not None:
-                for work in dispatch_handle["works"]:
-                    work.wait()
-            raise RuntimeError(
-                "balanced CP indexer: stale or foreign zigzag plan (K-slice ends "
-                f"{plan.get('k_end_head')}/{plan.get('k_end_tail')} vs {k_rows_total} "
-                f"K rows, plan ratio {plan.get('_ratio')} vs {ratio})."
-            )
-        # NOTE: k_h / k_t must stay prefix VIEWS of the full gathered buffer. The
-        # packed layouts may declare per-sequence K ranges past the slice end
-        # (mkv_* is a capacity, k_end_* the true causal need); reads past the
-        # slice land on valid full-buffer memory only while these are views — a
-        # .contiguous() here would turn them into real out-of-bounds reads.
-        k_h = (
-            k_seq_major[: plan["k_end_head"]]
-            if plan.get("k_end_head", k_rows_total) < k_rows_total
-            else k_seq_major
+    @torch.no_grad()
+    def _packed_topk(qr_rows, w_rows, layout3, pos_ids, kv_rows, mkv):
+        # Integer top-k output only: no gradient flows through the balanced
+        # scoring, so skip autograd tracking for the per-chunk projection/RoPE.
+        sz = qr_rows.shape[0]
+        _pin_fused_call_rows(sz)
+        with _no_fp8_ctx():  # see _chunk_topk: keep the FP8 amax stream untouched
+            q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
+        q = q.reshape(sz, n_heads, head_dim)
+        q = _rope_positions(
+            q, pos_ids, layout3[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
         )
-        k_t = (
-            k_seq_major[: plan["k_end_tail"]]
-            if plan.get("k_end_tail", k_rows_total) < k_rows_total
-            else k_seq_major
+        q = rotate_activation(q)
+        tk, _ = _cu.compute_cp_indexer_topk(
+            q,
+            w_rows.reshape(sz, n_heads),
+            kv_rows,
+            cu_seqlens,
+            cu_seqlens_compressed,
+            0,
+            ratio,
+            topk,
+            softmax_scale,
+            max_seqlen_q=mq,
+            use_fused=True,
+            max_seqlen_kv=mkv,
+            prebuilt_layout=layout3,
         )
+        return tk
 
-        nvtx_range_push("Bal_Dispatch")
+    # Per-call tight compressed-K bounds (K-slice generalized per segment); the
+    # capture-safe fallback plan carries no bounds and keeps the full width.
+    # NOTE: this runtime fallback width (gkv = max_seqlen_q // ratio, the
+    # reference call's contract shape) is narrower than prebuild's
+    # _kv_bounds fallback (total // ratio): prebuild cannot trust
+    # max_seqlen_q (frontends may leave it unset/tensor-valued), so it stays
+    # conservative. Both exceed every row's causal need; only buffer size
+    # differs.
+    mkv_h = int(plan.get("mkv_head", gkv))
+    mkv_t = int(plan.get("mkv_tail", gkv))
+    k_rows_total = k_seq_major.shape[0]
+    # Host-int invariants (free): a plan's K-slice end can never exceed the
+    # physical K buffer of the pack it was built for, and a prebuilt plan must
+    # have been built for this compress ratio; a violation means a stale or
+    # foreign plan is being consumed. Real raises, not asserts: these guard
+    # silent corruption and must survive ``python -O``. (mkv_* is a rounded-up
+    # score-buffer CAPACITY — floored at the width quantum — not a need, so it
+    # has no such bound.)
+    if (
+        plan.get("k_end_head", 0) > k_rows_total
+        or plan.get("k_end_tail", 0) > k_rows_total
+        or plan.get("_ratio", ratio) != ratio
+    ):
+        # Complete any in-flight dispatch first: an orphaned NCCL work could
+        # see the persistent staging buffers rewritten during teardown. The
+        # inputs to this check are per-rank host ints, so the raise itself
+        # can be rank-divergent and peers may still block in their next
+        # collective until the NCCL watchdog fires — an extra per-layer
+        # collective to synchronize a should-never-fire verdict is not worth
+        # it (unlike _validate_hep_order, which runs once per key).
         if dispatch_handle is not None:
             for work in dispatch_handle["works"]:
                 work.wait()
-            if dispatch_handle["kind"] == "zzr":
-                qlw = dispatch_handle["q_lora"]
-                recv = dispatch_handle["recv"]
-                rows = torch.empty_like(recv)
-                rows.index_copy_(0, plan["disp_recv_rows"], recv)
-                qr_h, w_h = rows[:half, :qlw].contiguous(), rows[:half, qlw:].contiguous()
-                qr_t, w_t = rows[half:, :qlw].contiguous(), rows[half:, qlw:].contiguous()
-            elif dispatch_handle["kind"] == "ag":
-                g = dispatch_handle["g"]
-                qlw = dispatch_handle["q_lora"]
-                rows = torch.index_select(g, 0, plan["gather_idx"])
-                qr_h, w_h = rows[:half, :qlw].contiguous(), rows[:half, qlw:].contiguous()
-                qr_t, w_t = rows[half:, :qlw].contiguous(), rows[half:, qlw:].contiguous()
-            else:
-                gq, gw = dispatch_handle["gq"], dispatch_handle["gw"]
-                qh = torch.index_select(gq, 0, plan["gather_idx"])
-                wh = torch.index_select(gw, 0, plan["gather_idx"])
-                qr_h, qr_t = qh[:half].contiguous(), qh[half:].contiguous()
-                w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
+        raise RuntimeError(
+            "balanced CP indexer: stale or foreign zigzag plan (K-slice ends "
+            f"{plan.get('k_end_head')}/{plan.get('k_end_tail')} vs {k_rows_total} "
+            f"K rows, plan ratio {plan.get('_ratio')} vs {ratio})."
+        )
+    # NOTE: k_h / k_t must stay prefix VIEWS of the full gathered buffer. The
+    # packed layouts may declare per-sequence K ranges past the slice end
+    # (mkv_* is a capacity, k_end_* the true causal need); reads past the
+    # slice land on valid full-buffer memory only while these are views — a
+    # .contiguous() here would turn them into real out-of-bounds reads.
+    k_h = (
+        k_seq_major[: plan["k_end_head"]]
+        if plan.get("k_end_head", k_rows_total) < k_rows_total
+        else k_seq_major
+    )
+    k_t = (
+        k_seq_major[: plan["k_end_tail"]]
+        if plan.get("k_end_tail", k_rows_total) < k_rows_total
+        else k_seq_major
+    )
+
+    nvtx_range_push("Bal_Dispatch")
+    if dispatch_handle is not None:
+        for work in dispatch_handle["works"]:
+            work.wait()
+        if dispatch_handle["kind"] == "zzr":
+            qlw = dispatch_handle["q_lora"]
+            recv = dispatch_handle["recv"]
+            rows = torch.empty_like(recv)
+            rows.index_copy_(0, plan["disp_recv_rows"], recv)
+            qr_h, w_h = rows[:half, :qlw].contiguous(), rows[:half, qlw:].contiguous()
+            qr_t, w_t = rows[half:, :qlw].contiguous(), rows[half:, qlw:].contiguous()
+        elif dispatch_handle["kind"] == "ag":
+            g = dispatch_handle["g"]
+            qlw = dispatch_handle["q_lora"]
+            rows = torch.index_select(g, 0, plan["gather_idx"])
+            qr_h, w_h = rows[:half, :qlw].contiguous(), rows[:half, qlw:].contiguous()
+            qr_t, w_t = rows[half:, :qlw].contiguous(), rows[half:, qlw:].contiguous()
         else:
-            _warn_allgather_fallback(_NO_PLAN_REASON)
-            q2 = indexer_qr.detach().reshape(l_local, q_lora)
-            w2 = weights_indexer_cp.detach().reshape(l_local, n_heads)
-            wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
-            ww, gw = _all_gather_rows_buf(w2, l_local, cp_group, cp_size, "zz_w")
-            wq.wait()
-            ww.wait()
+            gq, gw = dispatch_handle["gq"], dispatch_handle["gw"]
             qh = torch.index_select(gq, 0, plan["gather_idx"])
             wh = torch.index_select(gw, 0, plan["gather_idx"])
             qr_h, qr_t = qh[:half].contiguous(), qh[half:].contiguous()
             w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
-        nvtx_range_pop("Bal_Dispatch")
+    else:
+        _warn_allgather_fallback(_NO_PLAN_REASON)
+        q2 = indexer_qr.detach().reshape(l_local, q_lora)
+        w2 = weights_indexer_cp.detach().reshape(l_local, n_heads)
+        wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
+        ww, gw = _all_gather_rows_buf(w2, l_local, cp_group, cp_size, "zz_w")
+        wq.wait()
+        ww.wait()
+        qh = torch.index_select(gq, 0, plan["gather_idx"])
+        wh = torch.index_select(gw, 0, plan["gather_idx"])
+        qr_h, qr_t = qh[:half].contiguous(), qh[half:].contiguous()
+        w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
+    nvtx_range_pop("Bal_Dispatch")
 
-        nvtx_range_push("BalancedIndexerScore")
-        nvtx_range_push("Bal_Head")
-        tk_head = _packed_topk(qr_h, w_h, plan["head_layout"], plan["pos_head"], k_h, mkv_h)
-        nvtx_range_pop("Bal_Head")
-        nvtx_range_push("Bal_Tail")
-        tk_tail = _packed_topk(qr_t, w_t, plan["tail_layout"], plan["pos_tail"], k_t, mkv_t)
-        nvtx_range_pop("Bal_Tail")
-        nvtx_range_pop("BalancedIndexerScore")
+    nvtx_range_push("BalancedIndexerScore")
+    nvtx_range_push("Bal_Head")
+    tk_head = _packed_topk(qr_h, w_h, plan["head_layout"], plan["pos_head"], k_h, mkv_h)
+    nvtx_range_pop("Bal_Head")
+    nvtx_range_push("Bal_Tail")
+    tk_tail = _packed_topk(qr_t, w_t, plan["tail_layout"], plan["pos_tail"], k_t, mkv_t)
+    nvtx_range_pop("Bal_Tail")
+    nvtx_range_pop("BalancedIndexerScore")
 
-        nvtx_range_push("Bal_Combine")
-        tkw = tk_head.shape[-1]
-        ht = _a2a_buf("zz_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
-        ht[:half].copy_(tk_head)
-        ht[half:].copy_(tk_tail)
-        if "cmb_send_rows" in plan:
-            # Route-A2A combine: exact inverse exchange, ~l_local rows per rank.
-            send = _a2a_buf("zzr_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
-            send.copy_(torch.index_select(ht, 0, plan["cmb_send_rows"]))
-            recv = _a2a_buf("zzr_cmb_recv", l_local, tkw, tk_head.dtype, dev, cp_group)
-            dist.all_to_all_single(
-                recv,
-                send,
-                output_split_sizes=plan["disp_in_splits"],
-                input_split_sizes=plan["disp_out_splits"],
-                group=cp_group,
-            )
-            compressed_topk = torch.empty((l_local, tkw), dtype=tk_head.dtype, device=dev)
-            compressed_topk.index_copy_(0, plan["cmb_recv_rows"], recv)
-        else:
-            Z = _a2a_buf("zz_cmb_recv", S, tkw, tk_head.dtype, dev, cp_group, persistent=False)
-            dist.all_gather_into_tensor(Z, ht, group=cp_group)
-            compressed_topk = torch.index_select(Z, 0, plan["inv_idx"])
-        nvtx_range_pop("Bal_Combine")
-        return compressed_topk, layout
-
-    # ---- Reference fallback (zigzag ineligible) ----------------------------------
-    # Score this rank's own contiguous rows exactly like the unbalanced path — same
-    # projection, RoPE positions, tight KV bounds, and fused/unfused split as the
-    # reference call. The former chunk-pair folding fallback measured slower than
-    # this baseline on unequal packs and was removed; ineligible packs now pay the
-    # original imbalance rather than a regression.
-    tk = _chunk_topk(indexer_qr, weights_indexer_cp, int(global_start), l_local)
-    return tk, (layout if tk is not None else None)
+    nvtx_range_push("Bal_Combine")
+    tkw = tk_head.shape[-1]
+    ht = _a2a_buf("zz_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
+    ht[:half].copy_(tk_head)
+    ht[half:].copy_(tk_tail)
+    if "cmb_send_rows" in plan:
+        # Route-A2A combine: exact inverse exchange, ~l_local rows per rank.
+        send = _a2a_buf("zzr_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
+        send.copy_(torch.index_select(ht, 0, plan["cmb_send_rows"]))
+        recv = _a2a_buf("zzr_cmb_recv", l_local, tkw, tk_head.dtype, dev, cp_group)
+        dist.all_to_all_single(
+            recv,
+            send,
+            output_split_sizes=plan["disp_in_splits"],
+            input_split_sizes=plan["disp_out_splits"],
+            group=cp_group,
+        )
+        compressed_topk = torch.empty((l_local, tkw), dtype=tk_head.dtype, device=dev)
+        compressed_topk.index_copy_(0, plan["cmb_recv_rows"], recv)
+    else:
+        Z = _a2a_buf("zz_cmb_recv", S, tkw, tk_head.dtype, dev, cp_group, persistent=False)
+        dist.all_gather_into_tensor(Z, ht, group=cp_group)
+        compressed_topk = torch.index_select(Z, 0, plan["inv_idx"])
+    nvtx_range_pop("Bal_Combine")
+    return compressed_topk, layout
 
 
 def prebuild_balanced_layouts(
@@ -1014,7 +975,6 @@ def prebuild_balanced_layouts(
     cp_group=None,
     pad_alignment=_PAD_UNSPECIFIED,
     capacity=None,
-    min_seqlen=0,
     graphs_enabled=False,
 ):
     """Data-prep-time prebuild of the balanced-indexer zigzag plan and multi-seq gate.
@@ -1068,8 +1028,8 @@ def prebuild_balanced_layouts(
     gkey = (_group_key(cp_group), l_local)
 
     def _stash_verdict(ok):
-        # Per-pack verdict on the microbatch's own cache (consulted first by
-        # ``_pack_zigzag_ok``, so a prebuilt forward never re-probes) plus the
+        # Per-pack OK verdict on the microbatch's own cache (consulted first by
+        # ``_ensure_pack_zigzag_ok``, so a prebuilt forward never re-probes) plus the
         # module registry (the capture-time fallback, keyed by (group, l_local)).
         cache_ = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
         if cache_ is None:
@@ -1079,9 +1039,9 @@ def prebuild_balanced_layouts(
         _ZZ_PACK_OK[gkey] = ok
 
     # Static-composition observation: recorded UNCONDITIONALLY on every prebuild
-    # call, before EVERY early return (divisibility, pad, min_seqlen), so no pack
-    # — including ones that never build a plan, and all-empty packs — can slip
-    # past the contract unnoticed; a mixed flow whose eager warmup ran without
+    # call, before every early return or invariant raise, so no pack — including
+    # ones that never build a plan, and all-empty packs — can slip past the
+    # contract unnoticed; a mixed flow whose eager warmup ran without
     # graphs still contributes observations. The raise itself only applies when
     # CUDA graphs are enabled (eager varlen is ordinary operation).
     seen_key = _group_key(cp_group)
@@ -1097,12 +1057,16 @@ def prebuild_balanced_layouts(
         )
     _SEEN_CU[seen_key] = seen_cu
 
-    if total <= 0 or total % N != 0:
-        _stash_verdict(False)
+    if total <= 0:
+        # All-empty pack: nothing to score; the forward exits before any fused call.
         return
-    if l_local % 2 != 0:
-        _stash_verdict(False)
-        return
+    if total % N != 0 or l_local % 2 != 0:
+        raise ValueError(
+            "balanced CP indexer: pack capacity violates the run-level invariant "
+            f"(total={total}, cp_size={N}, l_local={l_local}): the physical pack must "
+            "split into an even per-rank row count. Check pad_packed_seq_alignment "
+            "(config validation requires an integer multiple of 2 * cp_size)."
+        )
 
     # Multi-seq gate: one D2H probe here instead of in the first forward, using the
     # forward probe's exact predicate (csa.py): "multi" means NOT a single sequence
@@ -1127,21 +1091,14 @@ def prebuild_balanced_layouts(
     if pad_alignment is not _PAD_UNSPECIFIED and not (
         isinstance(pad_alignment, int) and pad_alignment % (2 * N) == 0
     ):
-        # The config-level zigzag gate (_use_zigzag) can never open for this run:
-        # every pack takes the reference fallback, which needs only the verdicts
-        # recorded above. Skip the per-batch route construction entirely.
-        _stash_verdict(False)
-        return
-    if min_seqlen and getattr(packed_seq_params, "max_seqlen_q", None) is not None:
-        try:
-            below_gate = int(packed_seq_params.max_seqlen_q) < int(min_seqlen)
-        except (TypeError, ValueError):
-            below_gate = False
-        if below_gate:
-            # The forward's dsa_cp_balance_min_seqlen gate will keep the reference
-            # path for this microbatch; the verdicts above are enough.
-            _stash_verdict(False)
-            return
+        # Config validation already requires this when dsa_cp_balance_indexer is
+        # enabled; a mismatch here means the caller wired a different value.
+        raise ValueError(
+            "balanced CP indexer: prebuild received pad_alignment="
+            f"{pad_alignment!r}, which is not an integer multiple of 2 * cp_size "
+            f"= {2 * N}. Balanced eligibility is a run-level invariant; pass the "
+            "config's pad_packed_seq_alignment."
+        )
     # The unified zigzag path also serves single-full-sequence packs (the per-sequence
     # zigzag of one pack-spanning sequence is the plain 2N-fold of the whole pack), so the
     # plan and its A2A routes are built for every pack composition.
@@ -1163,14 +1120,17 @@ def prebuild_balanced_layouts(
     # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
     seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
     if any(sl % (2 * N) for sl in seq_lens_list):
-        # Record the verdict so eager forwards (and any capture recorded from here
-        # on) take the reference fallback: the zigzag builders cannot represent
-        # this pack. Under CUDA graphs an eligibility flip is a composition change
-        # and is already rejected by the static-composition gate above; in eager,
-        # the first fused fallback call after zigzag calls trips the row pin
-        # (fail-closed) rather than mixing fused-call shapes.
-        _stash_verdict(False)
-        return
+        # Fail fast at data-prep time — the best failure point. Balanced
+        # eligibility is a run-level invariant; there is no per-microbatch
+        # fallback because the fused kernel package silently corrupts
+        # shape-alternating calls.
+        raise ValueError(
+            "balanced CP indexer: this pack is not zigzag-representable — every "
+            "(padded) sequence length and the capacity tail must be divisible by "
+            f"2 * cp_size = {2 * N} (sequence lengths incl. tail: {seq_lens_list}). "
+            "Fix the dataset padding / pad_packed_seq_alignment so every pack "
+            "conforms, or disable dsa_cp_balance_indexer."
+        )
 
     dev, dt = cu.device, cu.dtype
     half = l_local // 2
