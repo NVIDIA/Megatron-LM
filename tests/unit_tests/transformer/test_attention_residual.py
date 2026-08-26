@@ -168,7 +168,10 @@ class TestAttnResCompileParity:
         torch.testing.assert_close(out_compiled, out_eager, rtol=1e-6, atol=1e-6)
         grads_compiled = torch.autograd.grad(out_compiled, [q_c, g_c, *v_c], grad_out)
         for got, want in zip(grads_compiled, grads_eager):
-            torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+            # Parameter grads are chained fp32 token reductions; inductor's
+            # reduction split (autotune-dependent) differs from the eager gemv
+            # by a few ulps. A real math bug is orders of magnitude larger.
+            torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
 class TestAttnResSchedule:
