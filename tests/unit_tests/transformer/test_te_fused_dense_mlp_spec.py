@@ -54,12 +54,12 @@ class TestTEFusedDenseMLPSpec:
 
     def test_wrong_activation_raises(self):
         config = _make_config(activation_func=F.gelu, gated_linear_unit=False)
-        with pytest.raises(ValueError, match="SwiGLU activation"):
+        with pytest.raises(ValueError, match="SwiGLU or SiTU-GLU activation"):
             TEFusedDenseMLP(config, _make_submodules())
 
     def test_gated_linear_unit_false_raises(self):
         config = _make_config(gated_linear_unit=False)
-        with pytest.raises(ValueError, match="SwiGLU activation"):
+        with pytest.raises(ValueError, match="SwiGLU or SiTU-GLU activation"):
             TEFusedDenseMLP(config, _make_submodules())
 
     def test_add_bias_linear_raises(self):
