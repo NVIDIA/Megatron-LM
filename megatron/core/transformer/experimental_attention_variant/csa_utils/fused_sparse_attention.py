@@ -122,6 +122,25 @@ def _get_topk_alignment() -> int:
     return 128
 
 
+@lru_cache(maxsize=8)
+def _get_head_padding(num_heads: int) -> int:
+    """Return a FlashMLA-supported query-head count for local TP heads."""
+    sm = torch.cuda.get_device_capability()
+    if sm[0] >= 10:
+        supported = (64, 128)
+    elif sm[0] >= 9:
+        supported = (64, )
+    else:
+        raise RuntimeError(f"fused DSA requires SM90+, got SM{sm[0]}{sm[1]}")
+    for padded_heads in supported:
+        if padded_heads % num_heads == 0:
+            return padded_heads
+    raise RuntimeError(
+        "FlashMLA sparse prefill requires local query heads to divide a supported "
+        f"head count, got h_q={num_heads}"
+    )
+
+
 def _csa_fwd_flash_mla(
     q: Tensor,
     kv: Tensor,
@@ -150,6 +169,17 @@ def _csa_fwd_flash_mla(
         pad_width = TopK_padded - TopK
         topk_idxs = torch.nn.functional.pad(topk_idxs, (0, pad_width), value=-1)
 
+    actual_num_heads = q.size(1)
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    if padded_num_heads != actual_num_heads:
+        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+        q_padded[:, :actual_num_heads, :] = q
+        q = q_padded
+        if attn_sink is not None:
+            attn_sink_padded = attn_sink.new_full((padded_num_heads,), float('-inf'))
+            attn_sink_padded[:actual_num_heads] = attn_sink
+            attn_sink = attn_sink_padded
+
     kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
 
@@ -170,6 +200,12 @@ def _csa_fwd_flash_mla(
             out, _max_logits, lse = res
             lse_indexer = None
 
+    if padded_num_heads != actual_num_heads:
+        out = out[:, :actual_num_heads, :]
+        lse = lse[:, :actual_num_heads]
+        if lse_indexer is not None:
+            lse_indexer = lse_indexer[:, :actual_num_heads]
+
     if indexer_topk > 0:
         # When indexer_topk == total TopK, lse_indexer should equal lse but
         # the kernel may not snapshot correctly; fall back to lse.
@@ -177,6 +213,31 @@ def _csa_fwd_flash_mla(
             return out, lse, lse.clone()
         return out, lse, lse_indexer
     return out, lse, None
+
+
+def _pad_sparse_backward_inputs(q, out, d_out, lse, attn_sink):
+    """Pad local TP query heads for the cuDNN sparse backward contract."""
+    actual_num_heads = q.shape[1]
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    if padded_num_heads == actual_num_heads:
+        return q, out, d_out, lse, attn_sink, actual_num_heads
+
+    q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+    q_padded[:, :actual_num_heads, :] = q
+    out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
+    out_padded[:, :actual_num_heads, :] = out
+    d_out_padded = d_out.new_zeros((d_out.size(0), padded_num_heads, d_out.size(2)))
+    d_out_padded[:, :actual_num_heads, :] = d_out
+    lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
+    lse_padded[:, :actual_num_heads] = lse
+    sink_padded = attn_sink.new_full((padded_num_heads,), float('-inf'))
+    sink_padded[:actual_num_heads] = attn_sink
+    return q_padded, out_padded, d_out_padded, lse_padded, sink_padded, actual_num_heads
+
+
+def _unpad_head_gradient(gradient, actual_num_heads):
+    """Remove FlashMLA-only query-head padding from a gradient tensor."""
+    return gradient[:, :actual_num_heads, :].contiguous()
 
 
 def _ensure_dsa_namespace():
@@ -739,19 +800,23 @@ class CSASparseAttnFunc(torch.autograd.Function):
         _ensure_dsa_namespace()
 
         q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
+        bwd_q, bwd_out, bwd_dO, bwd_lse, bwd_sink, actual_num_heads = _pad_sparse_backward_inputs(
+            q, out, dO, lse, attn_sink
+        )
 
         result = _DSA.sparse_attention_backward_wrapper(
-            q,
+            bwd_q,
             kv,
-            out,
-            dO,
-            lse,
-            attn_sink,
+            bwd_out,
+            bwd_dO,
+            bwd_lse,
+            bwd_sink,
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
         )
-        dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+        dq = _unpad_head_gradient(result["dq"], actual_num_heads)
+        dkv, d_sink = result["dkv"], result["d_sink"][:actual_num_heads]
         return dq, dkv, d_sink, None, None, None, None
 
 
@@ -1851,24 +1916,27 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
 
+        bwd_q, bwd_out, bwd_dO, bwd_lse, bwd_sink, actual_num_heads = _pad_sparse_backward_inputs(
+            q_flat, out_flat, dO_flat, lse, attn_sink
+        )
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
-            q_flat,
+            bwd_q,
             kv_flat,
-            out_flat,
-            dO_flat,
-            lse,
-            attn_sink,
+            bwd_out,
+            bwd_dO,
+            bwd_lse,
+            bwd_sink,
             global_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
         )
         if is_thd:
-            grad_query = attn_bwd["dq"]
+            grad_query = _unpad_head_gradient(attn_bwd["dq"], actual_num_heads)
             grad_kv_full = attn_bwd["dkv"]
         else:
-            grad_query = attn_bwd["dq"].reshape(sq, b, np_, d)
+            grad_query = _unpad_head_gradient(attn_bwd["dq"], actual_num_heads).reshape(sq, b, np_, d)
             grad_kv_full = attn_bwd["dkv"].reshape(skv, b, d)
-        d_sink = attn_bwd["d_sink"]
+        d_sink = attn_bwd["d_sink"][:actual_num_heads]
 
         # ---- 2. Scale pre-computed indexer grads by grad_loss. ---------------
         grad_q_indexer = precomputed_grad_q_indexer * grad_loss
@@ -2192,14 +2260,17 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         if ctx.q_padding_mask is not None:
             dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+        bwd_q, bwd_out, bwd_dO, bwd_lse, bwd_sink, actual_num_heads = _pad_sparse_backward_inputs(
+            query, out_flat, dO_flat, lse, attn_sink
+        )
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
-            query,
+            bwd_q,
             kv_full,
-            out_flat,
-            dO_flat,
-            lse,
-            attn_sink,
+            bwd_out,
+            bwd_dO,
+            bwd_lse,
+            bwd_sink,
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
@@ -2261,9 +2332,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             grad_k_indexer = None
 
         gradients = (
-            attn_bwd["dq"],
+            _unpad_head_gradient(attn_bwd["dq"], actual_num_heads),
             attn_bwd["dkv"],
-            attn_bwd["d_sink"],
+            attn_bwd["d_sink"][:actual_num_heads],
             None,
             grad_q_indexer,
             grad_k_indexer,
