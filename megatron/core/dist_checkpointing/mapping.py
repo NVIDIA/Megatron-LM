@@ -9,7 +9,6 @@ ShardedTensor class (mostly with the ShardedTensor.from_rank_offsets classmethod
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -26,9 +25,6 @@ StateDict = Dict[str, Any]
 CommonStateDict = Dict[str, Any]
 ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
-
-
-_logged_deprecations = {}
 
 
 class ShardedBase(ABC):
@@ -138,24 +134,6 @@ class ShardedTensor(ShardedBase):
         """Alias for having a regular sharding grid."""
         return self.axis_fragmentations is not None
 
-    def global_slice(self) -> Tuple[Union[int, slice], ...]:
-        """
-        Returns a tuple of int and slice objects representing a slice of the
-        global tensor that this ShardedTensor corresponds to.
-        """
-        assert len(self.global_offset) == len(self.local_shape) + self.prepend_axis_num
-        return tuple(
-            chain(
-                (off for off in self.global_offset[: self.prepend_axis_num]),
-                (
-                    slice(off, off + sh)
-                    for off, sh in zip(
-                        self.global_offset[self.prepend_axis_num :], self.local_shape
-                    )
-                ),
-            )
-        )
-
     def local_chunk_offset_in_global(self) -> Tuple[int, ...]:
         """Offset of a local chunk in a global array of chunks.
 
@@ -168,20 +146,6 @@ class ShardedTensor(ShardedBase):
             assert off % sh == 0, str(self)
             chunk_offset.append(off // sh)
         return tuple(chunk_offset)
-
-    def max_allowed_chunks(self) -> Tuple[int, ...]:
-        """
-        Returns the maximum allowed chunks for this ShardedTensor.
-        """
-        chunks = []
-        for axis_sh, axis_fragm in zip(self.global_shape, self.axis_fragmentations):
-            if not self.allow_shape_mismatch and axis_sh % axis_fragm != 0:
-                raise CheckpointingException(
-                    f"Axis shape ({axis_sh}) not divisible by axis fragmentation ({axis_fragm}"
-                )
-            axis_chunk_size = axis_sh // axis_fragm
-            chunks.append(axis_chunk_size)
-        return tuple(chunks)
 
     def without_data(self):
         return replace(self, data=None)

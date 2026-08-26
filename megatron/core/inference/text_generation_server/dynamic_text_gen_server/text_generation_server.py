@@ -49,6 +49,7 @@ async def _run_text_gen_server(
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
     hostname: Optional[str] = None,
+    chat_template: Optional[str] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -84,6 +85,7 @@ async def _run_text_gen_server(
         app.config['tokenizer'] = tokenizer
         app.config['parsers'] = parsers
         app.config['verbose'] = verbose
+        app.config['chat_template'] = chat_template
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
         # stalls every other request this replica owns, including delivery of responses
@@ -134,6 +136,7 @@ def _server_process_worker(
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
     hostname: Optional[str] = None,
+    chat_template: Optional[str] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -141,7 +144,14 @@ def _server_process_worker(
     try:
         loop.run_until_complete(
             _run_text_gen_server(
-                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, hostname
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                hostname,
+                chat_template,
             )
         )
     except KeyboardInterrupt:
@@ -197,6 +207,7 @@ def start_text_gen_server(
     num_replicas: int = 4,
     hostname: Optional[str] = None,
     sock: Optional[socket.socket] = None,
+    chat_template: Optional[str] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -218,6 +229,8 @@ def start_text_gen_server(
         sock: A socket the caller already bound, used only to fix the port.
             Replicas bind that port themselves, so it is closed here rather than
             shared with them.
+        chat_template: Chat template to apply, as a file path or an inline
+            template string. None falls back to the tokenizer's own template.
 
     Returns:
         The base URL this rank serves on, or None if the server was already
@@ -244,7 +257,16 @@ def start_text_gen_server(
     for i in range(num_replicas):
         p = mp.Process(
             target=_server_process_worker,
-            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, hostname),
+            args=(
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                hostname,
+                chat_template,
+            ),
             daemon=True,
         )
         p.start()
