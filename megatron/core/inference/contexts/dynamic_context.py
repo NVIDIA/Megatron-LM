@@ -3207,13 +3207,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
 
-        # Track prefix cache hits only after allocation succeeds. num_cached_tokens
-        # accumulates across successful prefill chunks; a failed admission can be
-        # retried and must not count the same cached prefix twice.
+        # Track prefix cache hits only after allocation succeeds. Matched blocks
+        # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
+        # actually skipped after Mamba and minimum-prefill backoff.
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
-            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
+            req.num_cached_tokens += prefix_skip_tokens
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again

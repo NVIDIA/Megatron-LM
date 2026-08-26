@@ -873,6 +873,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 2
         # all tokens processed (none skipped)
+        assert req2.num_cached_tokens == 0
+        assert ctx.prefix_cache_hits == 1
+        assert ctx.prefix_cache_blocks_matched == 3
         assert ctx.active_token_count - tokens_after == len(prompt)
         assert ctx.request_kv_length_offsets[1].item() == 0
 
@@ -1022,6 +1025,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2._mamba_num_matched_blocks = 1
         (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
+        ctx.add_request(req2)
+        assert req2.num_cached_tokens == prefix_skip
+        assert ctx.prefix_cache_hits == 1
+        assert ctx.prefix_cache_blocks_matched == 3
 
         # no mamba match means no skip
         ctx2 = self._mctx()
@@ -1032,7 +1039,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
-        # zero prefill for hybrid (mamba-cached, block-aligned)
+        # a full hybrid match backs off to one prefill block
         ctx3 = self._mctx()
         p3 = self._prompt(bs * 3)
         ctx3.add_request(self._req(ctx3, p3.clone()))
@@ -1041,6 +1048,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req3._mamba_num_matched_blocks = 3
         (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
+        ctx3.add_request(req3)
+        assert req3.num_cached_tokens == ps3
+        assert ctx3.prefix_cache_hits == 1
+        assert ctx3.prefix_cache_blocks_matched == 3
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
         # are skipped and only the trailing tokens remain for prefill.
