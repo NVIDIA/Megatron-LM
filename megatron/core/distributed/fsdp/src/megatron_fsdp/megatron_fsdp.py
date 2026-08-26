@@ -1261,7 +1261,7 @@ class MegatronFSDP(torch.nn.Module):
         finally:
             self.reset_mixed_precision_policy(mp_policy_backup)
 
-    def reset_mixed_precision_policy(self, mixed_precision_policy: MixedPrecisionPolicy):
+    def reset_mixed_precision_policy(self, mixed_precision_policy: MixedPrecisionPolicy) -> None:
         """
         Re-configure MixedPrecisionPolicy for MegatronFSDP / ParamAndGradBuffer.
         """
@@ -1269,13 +1269,12 @@ class MegatronFSDP(torch.nn.Module):
             # Preserve the original main parameter + gradient data-type.
             main_params_dtype=self.mp_policy.main_params_dtype,
             main_grads_dtype=self.mp_policy.main_grads_dtype,
-            # Gradient communication data-type can only be reset
-            # if symmetric buffers / NCCL UB are not used, because
-            # inflates FixedPoolAllocator memory & breaks NCCL UBR.
+            # Fixed double buffers and NCCL UBR retain their allocated communication dtype.
+            # Changing it would resize FixedPoolAllocator storage and invalidate registration.
             grad_comm_dtype=(
-                mixed_precision_policy.grad_comm_dtype
+                self.mp_policy.grad_comm_dtype
                 if self.ddp_config.nccl_ub or self.ddp_config.fsdp_double_buffer
-                else self.mp_policy.grad_comm_dtype
+                else mixed_precision_policy.grad_comm_dtype
             ),
         )
         self.mp_policy = mp_policy_reset
