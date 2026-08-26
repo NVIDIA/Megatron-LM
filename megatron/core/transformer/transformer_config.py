@@ -1848,6 +1848,29 @@ class TransformerConfig(ModelParallelConfig):
                 "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
+        if self.dsa_cp_balance_indexer and (self.dsa_cp_balance_min_seqlen or 0) > 0:
+            # A nonzero gate alternates balanced (half-row) and reference (full-row)
+            # fused indexer calls within one process. The fused kernel package carries
+            # cross-call state that silently corrupts calls whose shape differs from
+            # earlier calls (measured; see the WORKSPACE NOTE in
+            # test_cp_balanced_indexer_layout.py), and the falsified priming experiment
+            # there shows no user-side warmup can mitigate it — so fail closed until
+            # the kernel-side fix. The unfused indexer carries no such state. Evaluated
+            # after the deprecated apply_dsa_kernel_fusion switch is folded into
+            # dsa_kernel_backend above, so the predicate sees the final backend.
+            from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                use_fused_dsa_kernels,
+            )
+
+            if use_fused_dsa_kernels(self):
+                raise ValueError(
+                    "dsa_cp_balance_min_seqlen > 0 with the fused DSA indexer backend "
+                    "alternates fused-call shapes within one process, which the kernel "
+                    "package is known to silently corrupt. Set "
+                    "dsa_cp_balance_min_seqlen=0, or run the indexer unfused "
+                    "(attention_backend=unfused or dsa_kernel_backend='none')."
+                )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
