@@ -3415,19 +3415,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
         if num_matched_blocks > 0:
-            # Some of the tokens we are about to compute may land inside a block we
-            # just matched by hash. That block is shared with whatever request cached
-            # it and already holds the correct KV for exactly these tokens, so the
-            # recomputed values are redundant -- and writing them would perturb a
-            # concurrent reader's KV in the low bits, since the same math under a
-            # different batch shape reduces in a different order. Send those writes to
-            # the dummy block instead.
+            # Some tokens we are about to compute may land inside a block we matched
+            # by hash. That block already holds the correct KV for exactly these
+            # tokens and is shared with whoever cached it, so send those writes to the
+            # dummy block rather than perturb a concurrent reader's values.
             #
             # Only the write mapping moves. `request_to_kv_block_ids` still points at
             # the real block, so attention reads the cached KV through the block table,
             # and `token_to_block_idx` is rebuilt every step so nothing needs restoring.
             #
             # All positions below are absolute token positions within the request.
+            # A chunk resuming mid-block, with one fresh block past the match:
+            #
+            #   token      0     B     2B    3B    4B
+            #   blocks     |--0--|--1--|--2--|--3--|
+            #   matched    [=================]        blocks 0-2 were hash-matched
+            #   chunk               [==============]  tokens computed this step
+            #   redirect            [========]        the overlap -> dummy block
+            #   write                        [=====]  the rest -> real block 3
 
             # 1. The blocks matched here sit right after the blocks this request
             #    already owns. The partial block carried over from the previous

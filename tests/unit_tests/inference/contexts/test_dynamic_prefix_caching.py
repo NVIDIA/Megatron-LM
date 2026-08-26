@@ -1434,6 +1434,17 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         """Block ids this step will write KV to, for token slots [start, end)."""
         return ctx.token_to_block_idx[start:end].tolist()
 
+    def _mctx(self, **kwargs):
+        """Hybrid context with a Mamba state cache, so prefill skipping is possible."""
+        defaults = dict(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        defaults.update(kwargs)
+        return self._ctx(**defaults)
+
     def _add_chunk(self, ctx, req, chunk_length=None):
         """Admit one prefill chunk; return the token slots it claimed.
 
@@ -1534,6 +1545,34 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         assert ctx.request_kv_length_offsets[1].item() == 0
 
         assert self._write_targets(ctx, start, end) == [dummy] * (bs * 3)
+        assert self._block_ids(ctx, 1, 3) == cached_blocks
+
+    @pytest.mark.parametrize("mamba_cached_blocks", [1, 3])
+    @pytest.mark.internal
+    def test_mamba_skip_shorter_than_kv_match_redirects_remainder(self, mamba_cached_blocks):
+        """Mamba state, not the KV match, bounds the skip -- the rest is recomputed.
+
+        With 1 of 3 blocks holding Mamba state the skip stops after that block; with
+        all 3 it would leave a zero-token chunk, so it backs off to block 2. Either
+        way the recomputed tokens land in KV blocks that were matched.
+        """
+        ctx = self._mctx()
+        bs = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+        prompt = self._prompt(bs * 3)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        cached_blocks = self._block_ids(ctx, 0, 3)
+        self._mamba_allocate_and_register(ctx, cached_blocks[:mamba_cached_blocks])
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        start, end = self._add_chunk(ctx, req2)
+
+        skipped_blocks = 1 if mamba_cached_blocks == 1 else 2
+        assert ctx.request_kv_length_offsets[1].item() == skipped_blocks * bs
+        assert end - start == (3 - skipped_blocks) * bs
+
+        assert self._write_targets(ctx, start, end) == [dummy] * (end - start)
         assert self._block_ids(ctx, 1, 3) == cached_blocks
 
     @pytest.mark.internal
