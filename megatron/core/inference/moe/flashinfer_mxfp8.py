@@ -323,13 +323,13 @@ def flashinfer_routed_mxfp8_moe(
 ) -> torch.Tensor:
     """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel.
 
-    When ``token_capacity`` is set, only that fixed prefix is processed during
+    When token_capacity is set, only that fixed prefix is processed during
     decode-only steps whose EP-wide token upper bound fits within the capacity.
-    Prefill, mixed steps, and unsafe decode configurations process the full input.
+    Prefill, mixed steps, and too-large decode configurations process the full input.
     Invalid rows in the bounded prefix must already have expert ID -1.
 
-    The row choice is made while each CUDA graph is built, so graph replay sees
-    fixed shapes and addresses.
+    The row choice is made when each CUDA graph is built, so graph replay sees fixed
+    shapes/addresses.
     """
     if hidden_states.shape[-1] != fc1_weight.logical_cols:
         raise ValueError(

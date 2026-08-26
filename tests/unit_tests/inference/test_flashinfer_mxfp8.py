@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu
 from megatron.core.inference.moe.flashinfer_mxfp8 import select_routed_mxfp8_active_rows
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -78,6 +80,7 @@ def _make_bounded_mxfp8_config(**overrides):
         fp8="hybrid",
         fp8_recipe="mxfp8",
         fp8_param=True,
+        activation_func=squared_relu,
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
@@ -88,6 +91,12 @@ def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
 
     assert config.inference_moe_token_dispatcher_type == "nvls"
     assert config.expert_model_parallel_size == 2
+
+
+@pytest.mark.parametrize("activation_func", [F.gelu, F.silu, F.relu])
+def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func):
+    with pytest.raises(ValueError, match="supports only non-gated squared-ReLU experts"):
+        _make_bounded_mxfp8_config(activation_func=activation_func)
 
 
 @pytest.mark.parametrize(
