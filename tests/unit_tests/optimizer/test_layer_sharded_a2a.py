@@ -17,8 +17,8 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.optimizer.layer_sharded_a2a import (
-    layer_sharded_all_to_all_bwd,
-    layer_sharded_all_to_all_fwd,
+    route_from_ns_home,
+    route_to_ns_home,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -62,7 +62,7 @@ def test_fwd_reconstructs_complete_matrix():
     shards = [m[r * (P // S) : (r + 1) * (P // S), :].clone() for m in full]
     homes = {i: i % S for i in range(N)}
 
-    complete, my_indices = layer_sharded_all_to_all_fwd(shards, homes, _world(), shard_dim=0)
+    complete, my_indices = route_to_ns_home(shards, homes, _world(), shard_dim=0)
 
     assert my_indices == [i for i in range(N) if i % S == r]
     for got, idx in zip(complete, my_indices):
@@ -85,7 +85,7 @@ def test_bwd_distributes_shards_correctly():
     templates = [torch.empty(P // S, Q) for _ in range(N)]
     homes = {i: i % S for i in range(N)}
 
-    shards = layer_sharded_all_to_all_bwd(
+    shards = route_from_ns_home(
         my_results, my_indices, templates, homes, _world(), shard_dim=0
     )
 
@@ -113,9 +113,9 @@ def test_roundtrip_without_ns_is_identity():
     shards = [m[r * (m.size(0) // S) : (r + 1) * (m.size(0) // S), :].clone() for m in full]
     homes = {0: 0, 1: 0, 2: min(1, S - 1), 3: min(2, S - 1)}
 
-    complete, my_indices = layer_sharded_all_to_all_fwd(shards, homes, _world(), shard_dim=0)
+    complete, my_indices = route_to_ns_home(shards, homes, _world(), shard_dim=0)
     identity = [m.clone() for m in complete]
-    recovered = layer_sharded_all_to_all_bwd(
+    recovered = route_from_ns_home(
         identity, my_indices, shards, homes, _world(), shard_dim=0
     )
 

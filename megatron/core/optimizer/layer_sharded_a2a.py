@@ -10,16 +10,17 @@ orthogonalized result back to the original shards.
 
 Two equivalent exchange strategies are provided:
 
-- Two-stage (``layer_sharded_all_to_all_{fwd,bwd}``): one all_to_all over the
-  GTP_remat group (dim 0), then one over the TP group (along
+- Two-stage (``route_to_ns_home`` / ``route_from_ns_home``): one all_to_all
+  over the GTP_remat group (dim 0), then one over the TP group (along
   ``partition_dim``), reusing the existing process groups. These helpers are
   axis-generic — the caller invokes them once with the GTP_remat group and once
   with the TP group — so their arguments are named for the role (``group``,
   ``shard_dim``), not for a specific axis.
-- Fused (``layer_sharded_fused_{fwd,bwd}``): a single all_to_all per direction
-  over the flattened (GTP_remat x TP) domain group. It moves the exact same
-  shard blocks and assembles them in the exact same order, so the NS input is
-  bit-identical to the two-stage path.
+- Fused (``fused_route_to_ns_home`` / ``fused_route_from_ns_home``): a single
+  all_to_all per direction over the full GTP group (the flattened
+  GTP_remat x TP domain). It moves the exact same shard blocks and assembles
+  them in the exact same order, so the NS input is bit-identical to the
+  two-stage path.
 
 All functions support heterogeneous parameter shapes and uneven home
 assignments (ranks may own zero matrices in a given exchange, receiving
@@ -62,7 +63,7 @@ def _group_by_home(num_params: int, param_to_home_rank: dict, size: int) -> list
     return send_idx
 
 
-def layer_sharded_all_to_all_fwd(
+def route_to_ns_home(
     momentum_list: list[torch.Tensor],
     param_to_home_rank: dict,
     group: "torch.distributed.ProcessGroup | None",
@@ -182,7 +183,7 @@ def layer_sharded_all_to_all_fwd(
     return complete_momentums, list(my_param_indices)
 
 
-def layer_sharded_all_to_all_bwd(
+def route_from_ns_home(
     ns_results: list[torch.Tensor],
     my_param_indices: list[int],
     momentum_list: list[torch.Tensor],
@@ -239,7 +240,7 @@ def layer_sharded_all_to_all_bwd(
         for ns_r, idx in zip(ns_results, my_param_indices):
             expected = momentum_list[idx].shape[shard_dim] * size
             assert ns_r.shape[shard_dim] == expected, (
-                f"layer_sharded_all_to_all_bwd: full-matrix dim[{shard_dim}]="
+                f"route_from_ns_home: full-matrix dim[{shard_dim}]="
                 f"{ns_r.shape[shard_dim]} != shard_size="
                 f"{momentum_list[idx].shape[shard_dim]} × group size={size}; "
                 "all shards must be equal-sized (divisibility/padding invariant violated)."
@@ -301,7 +302,7 @@ def layer_sharded_all_to_all_bwd(
     return update_shards
 
 
-def layer_sharded_fused_fwd(
+def fused_route_to_ns_home(
     momentum_list: list[torch.Tensor],
     param_homes: list[tuple[int, int]],
     partition_dims: list["int | None"],
@@ -309,18 +310,18 @@ def layer_sharded_fused_fwd(
     tp_rank: int,
     gtp_remat_size: int,
     tp_size: int,
-    fused_group: "torch.distributed.ProcessGroup",
+    gtp_group: "torch.distributed.ProcessGroup",
     plan: "dict | None" = None,
 ) -> tuple[list[torch.Tensor], list[int]]:
     """Single fused all_to_all over the flattened (GTP_remat x TP) domain (forward).
 
-    Functionally identical to the two-stage ``layer_sharded_all_to_all_fwd``
+    Functionally identical to the two-stage ``route_to_ns_home``
     (over GTP_remat) followed by a second stage over TP: the exact same shard
     blocks travel to the same NS home and are concatenated in the exact same
     order, so the assembled full matrix is bit-identical. One collective
     replaces up to three (GTP_remat, then TP once per non-empty partition_dim).
 
-    Rank convention: the caller must construct ``fused_group`` so that its
+    Rank convention: the caller must construct ``gtp_group`` so that its
     group rank ``g * tp_size + t`` is the process with coordinates ``(g, t)``
     in (gtp_remat_group, tp_group) — i.e. TP innermost, matching Megatron's
     ``tp-gtp_remat-...`` order.
@@ -340,10 +341,10 @@ def layer_sharded_fused_fwd(
         param_homes: ``(g_home, t_home)`` per param.
         partition_dims: TP partition dim per param (0, 1, or None).
         gtp_remat_rank / tp_rank: This rank's coordinates. Not derivable from
-            ``fused_group`` alone, so they stay explicit parameters (unlike the
+            ``gtp_group`` alone, so they stay explicit parameters (unlike the
             two-stage helpers).
         gtp_remat_size / tp_size: Domain extents.
-        fused_group: Flattened process group of size
+        gtp_group: Flattened process group of size
             ``gtp_remat_size * tp_size``.
 
     Returns:
@@ -423,7 +424,7 @@ def layer_sharded_fused_fwd(
         send_buf,
         output_split_sizes=plan['output_split_sizes'],
         input_split_sizes=plan['input_split_sizes'],
-        group=fused_group,
+        group=gtp_group,
     )
 
     # --- unpack: every (source, param) piece at its precomputed offset.
@@ -452,7 +453,7 @@ def layer_sharded_fused_fwd(
     return full_mats, list(my_param_indices)
 
 
-def layer_sharded_fused_bwd(
+def fused_route_from_ns_home(
     ns_results: list[torch.Tensor],
     my_param_indices: list[int],
     momentum_list: list[torch.Tensor],
@@ -462,17 +463,17 @@ def layer_sharded_fused_bwd(
     tp_rank: int,
     gtp_remat_size: int,
     tp_size: int,
-    fused_group: "torch.distributed.ProcessGroup",
+    gtp_group: "torch.distributed.ProcessGroup",
     plan: "dict | None" = None,
 ) -> list["torch.Tensor | None"]:
     """Single fused all_to_all over the flattened (GTP_remat x TP) domain (backward).
 
-    Inverse of :func:`layer_sharded_fused_fwd`: each NS home slices its full-matrix
+    Inverse of :func:`fused_route_to_ns_home`: each NS home slices its full-matrix
     results into the per-source blocks defined there and scatters them back. Every
     rank receives exactly one update shard per param — including non-TP-sharded
     params, whose ``(P/G, Q)`` shard is sent to all T TP peers of each GTP_remat row.
 
-    Args / conventions: see :func:`layer_sharded_fused_fwd`.
+    Args / conventions: see :func:`fused_route_to_ns_home`.
 
     Returns:
         Update shards in ``momentum_list`` order (same shapes as the local shards).
@@ -497,17 +498,17 @@ def layer_sharded_fused_bwd(
             pd = partition_dims[i]
             if pd == 0:
                 assert ns_r.shape[0] == shape[0] * G * T, (
-                    f"layer_sharded_fused_bwd pd=0: ns_r.shape[0]={ns_r.shape[0]} != "
+                    f"fused_route_from_ns_home pd=0: ns_r.shape[0]={ns_r.shape[0]} != "
                     f"shard_rows={shape[0]} × G={G} × T={T}"
                 )
             elif pd == 1:
                 assert ns_r.shape[0] == shape[0] * G and ns_r.shape[1] == shape[1] * T, (
-                    f"layer_sharded_fused_bwd pd=1: ns_r shape {tuple(ns_r.shape)} != "
+                    f"fused_route_from_ns_home pd=1: ns_r shape {tuple(ns_r.shape)} != "
                     f"({shape[0]}×{G}, {shape[1]}×{T})"
                 )
             else:
                 assert ns_r.shape[0] == shape[0] * G, (
-                    f"layer_sharded_fused_bwd pd=None: ns_r.shape[0]={ns_r.shape[0]} != "
+                    f"fused_route_from_ns_home pd=None: ns_r.shape[0]={ns_r.shape[0]} != "
                     f"shard_rows={shape[0]} × G={G}"
                 )
 
@@ -561,7 +562,7 @@ def layer_sharded_fused_bwd(
         send_buf,
         output_split_sizes=output_split_sizes,
         input_split_sizes=plan['input_split_sizes'],
-        group=fused_group,
+        group=gtp_group,
     )
 
     update_shards: list["torch.Tensor | None"] = [None] * n
