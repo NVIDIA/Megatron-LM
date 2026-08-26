@@ -281,6 +281,7 @@ def test_language_model_spec_builds_mamba():
     args = _parse_validate(_build_argv(*_PRESET_20L))
     args.mimo_llm_ep = 2
     args.mimo_llm_expt_tp = 2
+    args.expert_tensor_parallel_num_weight_shards = args.mimo_llm_expt_tp
     spec = language_model_spec(args, pg_collection=None, llm_grid=None)
     assert spec.module is MambaModel
     assert spec.params["config"].num_layers == 20
