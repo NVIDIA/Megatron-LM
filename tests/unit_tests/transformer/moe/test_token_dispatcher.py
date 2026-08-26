@@ -161,23 +161,22 @@ def test_hybridep_dispatcher_acquires_expert_output_buffer(monkeypatch):
     assert calls == [(dispatched_input, 4)]
 
 
-def test_hybridep_expert_output_buffers_allow_regular_schedule():
-    transformer_config = TransformerConfig(
-        num_layers=1,
-        hidden_size=16,
-        num_attention_heads=4,
-        num_moe_experts=2,
-        moe_ffn_hidden_size=16,
-        moe_grouped_gemm=True,
-        use_transformer_engine_op_fuser=True,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="hybridep",
-        moe_expert_rank_capacity_factor=1.0,
-        moe_hybridep_num_expert_output_buffers=2,
-        overlap_moe_expert_parallel_comm=False,
-    )
-
-    assert transformer_config.moe_hybridep_num_expert_output_buffers == 2
+def test_hybridep_expert_output_buffers_reject_regular_schedule():
+    with pytest.raises(ValueError, match="requires overlap_moe_expert_parallel_comm"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_ffn_hidden_size=16,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_expert_rank_capacity_factor=1.0,
+            moe_hybridep_num_expert_output_buffers=2,
+            overlap_moe_expert_parallel_comm=False,
+        )
 
 
 class MoEModelTestContainer:

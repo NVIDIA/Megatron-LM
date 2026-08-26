@@ -1063,9 +1063,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of persistent caller-provided buffers for HybridEP expert FC2 outputs.
 
     The fused grouped MLP writes directly into these buffers and HybridEP combine releases each
-    slot after enqueueing its final read. This avoids allocator pending-free accumulation in both
-    combined-1F1B and regular schedules. Requires static HybridEP output shapes and Transformer
-    Engine GroupedLinear caller-output support. Zero disables reuse.
+    slot after enqueueing its final read. This avoids allocator pending-free accumulation in the
+    combined-1F1B overlap schedule. Requires static HybridEP output shapes and Transformer Engine
+    GroupedLinear caller-output support. Zero disables reuse.
     """
 
     moe_ncclep_static_shape: bool = False
@@ -2160,9 +2160,8 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_hybridep_num_dispatch_output_buffers requires FP8 or FP4 expert "
                     "GEMMs so the BF16 dispatch input is not saved for backward"
                 )
-            if (
-                self.fine_grained_activation_offloading
-                and "fused_group_mlp" in (self.offload_modules or [])
+            if self.fine_grained_activation_offloading and "fused_group_mlp" in (
+                self.offload_modules or []
             ):
                 raise ValueError(
                     "moe_hybridep_reuse_dispatch_output_buffers is incompatible with "
@@ -2181,6 +2180,12 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_hybridep_num_expert_output_buffers requires the HybridEP flex "
                     "dispatcher"
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires "
+                    "overlap_moe_expert_parallel_comm; the regular schedule does not expose "
+                    "a safe bound for the HybridEP consumer-command depth"
                 )
             if not self.use_transformer_engine_op_fuser:
                 raise ValueError(

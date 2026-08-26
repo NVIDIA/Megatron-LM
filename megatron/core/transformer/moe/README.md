@@ -326,9 +326,10 @@ offload path releases the grouped-MLP input storage.
 
 Setting `--moe-hybridep-num-expert-output-buffers N` additionally makes the fused grouped MLP
 write FC2 results directly into an `N`-slot persistent ring. HybridEP combine records the final
-consumer event before releasing each slot, so this works with both combined-1F1B overlap and the
-regular layer-by-layer schedule. It requires the same static HybridEP output bound, the Transformer
-Engine op fuser, and a Transformer Engine build with GroupedLinear caller-output support.
+consumer event before releasing each slot. It requires combined-1F1B HybridEP overlap, the same
+static HybridEP output bound, the Transformer Engine op fuser, and a Transformer Engine build with
+GroupedLinear caller-output support. The regular schedule currently has no backend API that exposes
+a safe bound for its consumer-command depth, so expert-output reuse fails fast in that mode.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
