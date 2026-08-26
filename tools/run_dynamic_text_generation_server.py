@@ -358,7 +358,7 @@ if __name__ == "__main__":
                     chat_template=chat_template,
                     default_top_p=args.default_top_p,
                     default_top_k=args.default_top_k,
-                    serving_mode=args.eval_mode,
+                    eval_mode=args.eval_mode,
                 )
             )
         except KeyboardInterrupt:
