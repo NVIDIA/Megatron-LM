@@ -2631,6 +2631,23 @@ class CompressedSparseAttention(MegatronModule):
                 # Switch 1: take the load-balanced CP path via config flag (a run-level
                 # invariant — see the config validation). CP<=1 has nothing to balance.
                 use_balance = self.config.dsa_cp_balance_indexer and cp_size > 1
+                if use_balance:
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    # Per-pack routing: a pack the zigzag builders cannot represent
+                    # (raw-cu middle stages and non-scheduler frontends can produce
+                    # one even under a conforming pad alignment) takes the original
+                    # contiguous reference path for this microbatch -- per-pack shape
+                    # variation between fused calls is verified safe below the kernel
+                    # row limit. The verdict comes from prebuild's cache (no probe),
+                    # the module registry under capture (raises without an eager
+                    # warmup), or one cached D2H probe for frontends that never
+                    # prebuild.
+                    use_balance = cp_balanced_indexer.pack_eligible_for_zigzag(
+                        packed_seq_params, cu_seqlens, cp_group, cp_size, l_local
+                    )
                 # Layout precondition (contiguous) is enforced module-wide above:
                 # CompressedSparseAttention raises for any CP run whose
                 # PackedSeqParams.cp_partition_mode is not "contiguous".
@@ -2753,7 +2770,6 @@ class CompressedSparseAttention(MegatronModule):
                         cp_group,
                         cp_size,
                         l_local,
-                        config=self.config,
                         layout_cache=getattr(
                             packed_seq_params, "_dsa_cp_balance_layout_cache", None
                         ),
@@ -2807,6 +2823,19 @@ class CompressedSparseAttention(MegatronModule):
                         )
                     )
                 else:
+                    # Inside a balanced run (flag on, this pack merely ineligible)
+                    # other fused calls have already been issued, so an above-limit
+                    # fused call here is the verified-corrupt pattern: take the
+                    # unfused path (ordinary layout, exact). With the flag off this
+                    # is the pre-existing path and keeps its behavior (the shared
+                    # guard warns once instead; see FUSED_INDEXER_MAX_SAFE_ROWS).
+                    ref_use_fused = self.use_fused_kernels
+                    if (
+                        self.config.dsa_cp_balance_indexer
+                        and cp_size > 1
+                        and l_local > cp_utils.FUSED_INDEXER_MAX_SAFE_ROWS
+                    ):
+                        ref_use_fused = False
                     compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
                         q_indexer_cp,
                         weights_indexer_cp,
@@ -2818,7 +2847,7 @@ class CompressedSparseAttention(MegatronModule):
                         indexer.index_topk,
                         indexer.softmax_scale,
                         max_seqlen_q=max_seqlen_q,
-                        use_fused=self.use_fused_kernels,
+                        use_fused=ref_use_fused,
                     )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 

@@ -11,17 +11,19 @@ light) and chunk ``2 * cp_size - 1 - r`` (a high-position "tail", heavy), so
 PER-SEQUENCE ZIGZAG: packs whose padded sequence lengths divide ``2 * cp_size`` gather each
 rank's head/tail chunks of every sequence via prebuilt A2A routes and score them with two
 packed fused-top-k calls against synthetic per-sequence layouts with explicit RoPE positions.
-Eligibility is a RUN-LEVEL INVARIANT: config validation requires the fused backend and a
-pack-tail alignment divisible by ``2 * cp_size``, and a pack that violates per-sequence or
-tail divisibility RAISES (at prebuild when prebuilt, else at dispatch) instead of falling
-back. Pack capacity may vary between eager microbatches — shape variation between fused
-calls is verified safe below the kernel row limit — while CUDA graphs still require a
-static composition. The fused kernel package has one verified defect: a fused call with
-more than ``FUSED_INDEXER_MAX_SAFE_ROWS`` (32768) query rows is silently corrupted from
-row 32768 on unless it is the process's first fused call, so such calls are rejected at
-``compute_cp_indexer_topk`` and prebuild bounds ``l_local`` at twice that limit (the
-balanced path scores two half-row calls). (The former chunk-pair folding fallback measured
-slower than the unbalanced baseline on unequal packs and was removed.)
+Config validation requires the fused backend and a pack-tail alignment divisible by
+``2 * cp_size`` (the run-level precondition); the ACTUAL pack decides per microbatch:
+an eager pack the zigzag builders cannot represent routes to the contiguous reference
+path (``pack_eligible_for_zigzag``) -- per-pack shape variation between fused calls is
+verified safe below the kernel row limit -- while CUDA graphs require a recorded verdict
+and a static composition. The fused kernel package has one verified defect: a fused call
+with more than ``FUSED_INDEXER_MAX_SAFE_ROWS`` (32768) query rows is silently corrupted
+from row 32768 on unless it is the process's first fused call; the balanced
+synthetic-layout calls therefore fail closed above the limit (prebuild bounds ``l_local``
+at twice it -- two half-row calls), while pre-existing reference callers keep their
+behavior and get a once-per-process correctness warning instead. (The former chunk-pair
+folding fallback measured slower than the unbalanced baseline on unequal packs and was
+removed.)
 
 ``balanced_compute_cp_indexer_topk`` is a drop-in replacement for
 ``csa_utils.cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
@@ -155,14 +157,7 @@ def _a2a_buf(tag, rows, width, dtype, dev, cp_group, persistent=True):
 
 
 def dispatch_chunks_async(
-    indexer_qr,
-    weights_indexer_cp,
-    cp_group,
-    cp_size,
-    l_local,
-    config=None,
-    layout_cache=None,
-    cu_seqlens=None,
+    indexer_qr, weights_indexer_cp, cp_group, cp_size, l_local, layout_cache=None, cu_seqlens=None
 ):
     """Issue the chunk dispatch as early as possible; returns an opaque handle.
 
@@ -171,9 +166,10 @@ def dispatch_chunks_async(
     flight (and the local top-k preparation) instead of sitting on the critical path
     right before the top-k. ``balanced_compute_cp_indexer_topk(dispatch_handle=...)`` waits
     on it. When qr and weights share a dtype they ride one all_to_all (single launch).
-    ``cu_seqlens`` feeds the fail-fast pack-eligibility check
-    (``_ensure_pack_zigzag_ok``); the compute side follows the returned handle's kind,
-    so both stay consistent.
+    ``cu_seqlens`` feeds the pack-eligibility consistency check
+    (``_ensure_pack_zigzag_ok`` -- the CSA caller routes ineligible packs to the
+    reference path before dispatching); the compute side follows the returned
+    handle's kind, so both stay consistent.
 
     Handle ``kind`` legend — which transport carried the (qr | weights) payload:
 
@@ -339,29 +335,29 @@ def _excl_cumsum(x):
     return torch.cat((z, torch.cumsum(x, 0)[:-1]))
 
 
-def _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
-    """Fail fast unless the ACTUAL microbatch pack is zigzag-representable.
+def _pack_zigzag_verdict(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
+    """Is the ACTUAL microbatch pack zigzag-representable? Returns a bool.
 
-    Eligibility is a run-level invariant (config validation requires the fused backend
-    and a compatible ``pad_packed_seq_alignment``); this check enforces the per-pack
-    half of the contract — every (padded) sequence length, the capacity tail, and the
-    per-rank row count must divide ``2 * cp_size`` — and RAISES on violation instead of
-    falling back, because the fused kernel package silently corrupts fused calls whose
-    row shape differs from earlier calls. Success verdicts are cached on the microbatch
-    ``layout_cache`` (written by prebuild or an earlier probe of the same pack) and in
-    the module registry keyed by (group, l_local); probing is impossible under capture,
-    so capture requires a recorded verdict (eager warmup or prebuild).
+    Structural requirement of the zigzag builders (nothing to do with the kernel
+    row-limit defect): every (padded) sequence length, the capacity tail, and the
+    per-rank row count must divide ``2 * cp_size``, else the ragged chunk
+    enumeration would emit out-of-range gather indices. Verdicts are cached on
+    the microbatch ``layout_cache`` (written by prebuild or an earlier probe of
+    the same pack, capacity-tagged) and in the module registry keyed by
+    (group, l_local). Probing needs a D2H read of ``cu_seqlens``, which is
+    impossible under capture — capture therefore requires a recorded verdict
+    (eager warmup or prebuild) and raises without one.
     """
     if layout_cache is not None:
         cached = layout_cache.get("zz_pack_ok")
-        if cached is not None and cached[0] == l_local and cached[1]:
+        if cached is not None and cached[0] == l_local:
             # Verdicts are only valid for the capacity they were probed at: prebuild
             # may have seen a padded cu ending short of the physical pack.
-            return
+            return cached[1]
     key = (_group_key(cp_group), l_local)
     if _is_capturing():
-        if _ZZ_PACK_OK.get(key):
-            return
+        if key in _ZZ_PACK_OK:
+            return _ZZ_PACK_OK[key]
         # Probing is impossible here and guessing would bake an unverified branch.
         raise RuntimeError(
             "balanced CP indexer: no pack-eligibility verdict is available during "
@@ -369,8 +365,8 @@ def _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
             "before capturing."
         )
     if cu_seqlens is None:
-        if _ZZ_PACK_OK.get(key):
-            return
+        if key in _ZZ_PACK_OK:
+            return _ZZ_PACK_OK[key]
         raise RuntimeError(
             "balanced CP indexer: cannot verify pack eligibility — no cu_seqlens to "
             "probe and no recorded verdict for this (group, capacity). Run "
@@ -387,22 +383,48 @@ def _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
         and (S - total) % nch == 0
         and bool(((lens % nch) == 0).all())
     )
-    if not ok:
+    if _GATE_DEBUG and not getattr(_pack_zigzag_verdict, "_logged", False):
+        _pack_zigzag_verdict._logged = True
+        logger.info("[zz-gate] pack verdict=%s: S=%s l_local=%s nch=%s", ok, S, l_local, nch)
+    _ZZ_PACK_OK[key] = ok
+    if layout_cache is not None:
+        layout_cache["zz_pack_ok"] = (l_local, ok)
+    return ok
+
+
+def pack_eligible_for_zigzag(packed_seq_params, cu_seqlens, cp_group, cp_size, l_local):
+    """Per-pack routing decision for the CSA forward (eager: bool; capture: recorded).
+
+    An ineligible pack takes the original contiguous ``compute_cp_indexer_topk``
+    path for that microbatch — per-pack shape variation between fused calls is
+    verified safe below the kernel row limit, so routing costs nothing beyond the
+    one cached D2H probe for frontends that never prebuild. Ensures the
+    per-microbatch layout cache exists so the verdict (and layer 1's plans) are
+    shared by every layer.
+    """
+    cache = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
+    if cache is None:
+        cache = {}
+        packed_seq_params._dsa_cp_balance_layout_cache = cache
+    return _pack_zigzag_verdict(cu_seqlens, cp_group, cp_size, l_local, cache)
+
+
+def _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
+    """Internal consistency check: callers must route ineligible packs away first.
+
+    The CSA integration routes ineligible packs to the contiguous reference path
+    (``pack_eligible_for_zigzag``) before dispatching, so reaching this raise
+    means a caller bypassed that routing; proceeding would emit out-of-range
+    gather indices (silent corruption), hence a real raise.
+    """
+    if not _pack_zigzag_verdict(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
         raise ValueError(
             "balanced CP indexer: this pack is not zigzag-representable "
-            f"(l_local={l_local}, total={total}, capacity={S}; every padded sequence "
-            f"length and the capacity tail must be divisible by 2 * cp_size = {nch}). "
-            "Balanced eligibility is a run-level invariant — fix the dataset padding / "
-            "pad_packed_seq_alignment so every pack conforms, or disable "
-            "dsa_cp_balance_indexer; there is no per-microbatch fallback because the "
-            "fused kernel package silently corrupts shape-alternating calls."
+            f"(l_local={l_local}, capacity={cp_size * l_local}; every padded sequence "
+            f"length and the capacity tail must be divisible by 2 * cp_size = "
+            f"{2 * cp_size}). Callers must route such packs to the contiguous "
+            "compute_cp_indexer_topk path, as the CSA integration does."
         )
-    if _GATE_DEBUG and not getattr(_ensure_pack_zigzag_ok, "_logged", False):
-        _ensure_pack_zigzag_ok._logged = True
-        logger.info("[zz-gate] pack eligible: S=%s l_local=%s nch=%s", S, l_local, nch)
-    _ZZ_PACK_OK[key] = True
-    if layout_cache is not None:
-        layout_cache["zz_pack_ok"] = (l_local, True)
 
 
 def _rope_positions(q, pos_ids, cu_q, nope_dim, pos_dim, indexer, config, table_len):
@@ -640,6 +662,14 @@ def balanced_compute_cp_indexer_topk(
         # lengths inside the chunk are ``<= sz``.
         mq = max(1, min(int(max_seqlen_q), sz))
         gkv = max(1, int(max_seqlen_q) // int(ratio))
+        # Balanced-feature policy for its own ordinary-layout calls: inside a
+        # balanced run other fused calls have already been issued, so an
+        # above-limit fused call here is the verified-corrupt pattern -- take the
+        # unfused path instead (this layout is an ordinary cached
+        # _build_cp_indexer_layout result, so unfused masking is valid). Legacy
+        # callers of compute_cp_indexer_topk are NOT rerouted (see the policy note
+        # on FUSED_INDEXER_MAX_SAFE_ROWS).
+        use_fused_here = use_fused and sz <= _cu.FUSED_INDEXER_MAX_SAFE_ROWS
         # Exact causal need for this chunk, rounded UP to the shared width quantum
         # (see _KV_BOUND_QUANTUM/_KV_TIGHT_WIDTH_CEILING at module scope for the
         # kernel contract). Rounding up is always safe: the kernel's block count is
@@ -671,7 +701,7 @@ def balanced_compute_cp_indexer_topk(
             topk,
             softmax_scale,
             max_seqlen_q=mq,
-            use_fused=use_fused,
+            use_fused=use_fused_here,
             max_seqlen_kv=mkv,
             prebuilt_layout=layout_pass,
         )
@@ -701,11 +731,13 @@ def balanced_compute_cp_indexer_topk(
     # version demonstrated yet): a fused indexer call with more than 32768 query rows
     # is silently corrupted from row 32768 on unless it is the process's FIRST fused
     # call. The predecessor's shape is irrelevant (a bit-identical predecessor also
-    # triggers it) and calls at or below the limit are immune to process history —
+    # triggers it) and calls at or below the limit are immune to process history --
     # shape VARIATION between calls is explicitly safe below the limit (controlled
-    # matrix in the WORKSPACE NOTE of the unit tests). compute_cp_indexer_topk rejects
-    # fused calls above the limit; prebuild bounds l_local at twice the limit because
-    # the balanced path scores two half-row calls per microbatch.
+    # matrix in the WORKSPACE NOTE of the unit tests). Policy: the balanced
+    # synthetic-layout calls fail closed above the limit (prebuild bounds l_local at
+    # twice it), balanced-internal ordinary-layout calls take the unfused path, and
+    # pre-existing reference/non-CP callers keep their behavior with a
+    # once-per-process correctness warning (see FUSED_INDEXER_MAX_SAFE_ROWS).
 
     # "kind" legend lives on dispatch_chunks_async: zzr/ag/ag2 are the three zigzag
     # transports (routed a2a / merged AllGather / split AllGather); a None handle means
@@ -761,6 +793,7 @@ def balanced_compute_cp_indexer_topk(
             use_fused=True,
             max_seqlen_kv=mkv,
             prebuilt_layout=layout3,
+            synthetic_layout=True,
         )
         return tk
 
@@ -1044,17 +1077,13 @@ def prebuild_balanced_layouts(
     # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
     seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
     if any(sl % (2 * N) for sl in seq_lens_list):
-        # Fail fast at data-prep time — the best failure point. Balanced
-        # eligibility is a run-level invariant; there is no per-microbatch
-        # fallback because the fused kernel package silently corrupts
-        # shape-alternating calls.
-        raise ValueError(
-            "balanced CP indexer: this pack is not zigzag-representable — every "
-            "(padded) sequence length and the capacity tail must be divisible by "
-            f"2 * cp_size = {2 * N} (sequence lengths incl. tail: {seq_lens_list}). "
-            "Fix the dataset padding / pad_packed_seq_alignment so every pack "
-            "conforms, or disable dsa_cp_balance_indexer."
-        )
+        # Not zigzag-representable: record the verdict so the forward routes this
+        # microbatch to the contiguous reference path (per-pack shape variation
+        # between fused calls is verified safe below the kernel row limit). A
+        # conforming pad alignment makes padded-cu packs always representable;
+        # raw-cu middle stages and non-scheduler frontends can still produce one.
+        _stash_verdict(False)
+        return
 
     dev, dt = cu.device, cu.dtype
     half = l_local // 2
