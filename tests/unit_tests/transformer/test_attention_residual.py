@@ -51,7 +51,7 @@ class TestAttnResAggregationMath:
 
         eps = 1e-6
         pseudo_query, key_norm_weight, values = self._make_inputs(n_sources)
-        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, eps, *values)
+        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, eps, False, *values)
         ref = _reference_attn_res(pseudo_query, key_norm_weight, eps, values)
         torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
 
@@ -63,7 +63,7 @@ class TestAttnResAggregationMath:
         pseudo_query, key_norm_weight, values = self._make_inputs(n_sources)
         grad_out = torch.randn(6, 2, 32)
 
-        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, eps, *values)
+        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, eps, False, *values)
         grads = torch.autograd.grad(out, [pseudo_query, key_norm_weight, *values], grad_out)
 
         ref = _reference_attn_res(pseudo_query, key_norm_weight, eps, values)
@@ -87,7 +87,9 @@ class TestAttnResAggregationMath:
 
         pseudo_query = torch.zeros(16, requires_grad=True)
         key_norm_weight = torch.ones(16, requires_grad=True)
-        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, config_like_eps, *values)
+        out = _AttnResAggregation.apply(
+            pseudo_query, key_norm_weight, config_like_eps, False, *values
+        )
         torch.testing.assert_close(out, torch.stack(values).mean(dim=0), rtol=1e-6, atol=1e-6)
 
     def test_zero_query_gradient_is_nonzero(self):
@@ -98,7 +100,7 @@ class TestAttnResAggregationMath:
         values = [torch.randn(4, 2, 16) for _ in range(3)]
         pseudo_query = torch.zeros(16, requires_grad=True)
         key_norm_weight = torch.ones(16, requires_grad=True)
-        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, 1e-6, *values)
+        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, 1e-6, False, *values)
         out.sum().backward()
         assert pseudo_query.grad is not None and pseudo_query.grad.abs().sum() > 0
 
@@ -110,7 +112,7 @@ class TestAttnResAggregationMath:
         values = [torch.randn(4, 2, 16, dtype=torch.bfloat16, requires_grad=True) for _ in range(4)]
         pseudo_query = torch.randn(16).mul(0.01).requires_grad_(True)
         key_norm_weight = torch.ones(16, requires_grad=True)
-        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, 1e-6, *values)
+        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, 1e-6, False, *values)
         assert out.dtype == torch.bfloat16
         out.float().sum().backward()
         for v in values:
@@ -124,9 +126,49 @@ class TestAttnResAggregationMath:
         values_3d = [torch.randn(8, 1, 16) for _ in range(3)]
         pseudo_query = torch.randn(16) * 0.1
         key_norm_weight = torch.ones(16)
-        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, 1e-6, *values_3d)
+        out = _AttnResAggregation.apply(pseudo_query, key_norm_weight, 1e-6, False, *values_3d)
         ref = _reference_attn_res(pseudo_query, key_norm_weight, 1e-6, values_3d)
         torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
+
+
+class TestAttnResCompileParity:
+    """attn_res_impl='compile' must match the eager math bit-for-bit-ish."""
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="torch.compile parity checked on CUDA"
+    )
+    @pytest.mark.parametrize("n_sources", [1, 3, 6])
+    def test_compile_matches_eager(self, n_sources):
+        from megatron.core.transformer.attention_residual import _AttnResAggregation
+
+        torch.manual_seed(21)
+        eps = 1e-6
+
+        def make_inputs():
+            values = [
+                (torch.randn(4, 2, 32, device='cuda') * (0.5 + i)).requires_grad_(True)
+                for i in range(n_sources)
+            ]
+            pseudo_query = torch.randn(32, device='cuda').mul(0.05).requires_grad_(True)
+            key_norm_weight = (
+                torch.ones(32, device='cuda') + torch.randn(32, device='cuda') * 0.1
+            ).requires_grad_(True)
+            return pseudo_query, key_norm_weight, values
+
+        torch.manual_seed(21)
+        q_e, g_e, v_e = make_inputs()
+        torch.manual_seed(21)
+        q_c, g_c, v_c = make_inputs()
+        grad_out = torch.randn(4, 2, 32, device='cuda')
+
+        out_eager = _AttnResAggregation.apply(q_e, g_e, eps, False, *v_e)
+        grads_eager = torch.autograd.grad(out_eager, [q_e, g_e, *v_e], grad_out)
+
+        out_compiled = _AttnResAggregation.apply(q_c, g_c, eps, True, *v_c)
+        torch.testing.assert_close(out_compiled, out_eager, rtol=1e-6, atol=1e-6)
+        grads_compiled = torch.autograd.grad(out_compiled, [q_c, g_c, *v_c], grad_out)
+        for got, want in zip(grads_compiled, grads_eager):
+            torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
 class TestAttnResSchedule:

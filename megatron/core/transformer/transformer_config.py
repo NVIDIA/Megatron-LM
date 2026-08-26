@@ -1332,6 +1332,13 @@ class TransformerConfig(ModelParallelConfig):
     floor((num_layers - 1) / attn_res_block_layers) + 2 (completed blocks + token embedding +
     trailing partial block); the paper finds ~8-10 sources recover most of the quality gain."""
 
+    attn_res_impl: str = "eager"
+    """Implementation of the AttnRes depth aggregation: 'eager' (plain torch ops) or 'compile'
+    (the forward/backward math bodies wrapped in torch.compile, one specialization per depth
+    arity; falls back to eager with a warning if compilation is unavailable). The eager loop is
+    CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200 at small hidden
+    sizes — so 'compile' is strongly recommended for training runs."""
+
     ####################
     # miscellaneous
     ####################
@@ -1569,6 +1576,10 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "enable_attention_residuals requires attn_res_block_layers to be a "
                 f"positive integer, got {self.attn_res_block_layers!r}."
+            )
+        if self.attn_res_impl not in ("eager", "compile"):
+            raise ValueError(
+                f"attn_res_impl must be 'eager' or 'compile', got {self.attn_res_impl!r}."
             )
         unsupported = []
         if self.virtual_pipeline_model_parallel_size is not None:

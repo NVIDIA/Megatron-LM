@@ -36,6 +36,7 @@ This module contains:
   along the sequence dimension: ``[num_slices * s, b, h]``.
 """
 
+import logging
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -138,6 +139,98 @@ def unpack_attn_res_payload(payload: Tensor, num_slices: int) -> Tuple[List[Tens
     return list(chunks[:-1]), chunks[-1]
 
 
+def _attn_res_fwd_math(pseudo_query, key_norm_weight, eps, values):
+    """Pure forward math: stats, fp32 depth softmax, weighted accumulation.
+
+    Kept as a standalone function so it can be wrapped by ``torch.compile``
+    (one specialization per source arity) without changing the custom
+    autograd Function's saved-tensor policy.
+    """
+    q = (pseudo_query * key_norm_weight).float()  # [h]
+
+    dots = []
+    rstds = []
+    for value in values:
+        v32 = value.float()
+        mean_sq = v32.pow(2).mean(dim=-1)  # [...]
+        rstds.append(torch.rsqrt(mean_sq + eps))
+        dots.append(torch.matmul(v32, q))
+    dots = torch.stack(dots)  # [n, ...]
+    rstds = torch.stack(rstds)  # [n, ...]
+    alpha = torch.softmax(dots * rstds, dim=0)  # [n, ...] fp32
+
+    out32 = None
+    for j, value in enumerate(values):
+        term = alpha[j].unsqueeze(-1) * value.float()
+        out32 = term if out32 is None else out32 + term
+    return out32.to(values[0].dtype), alpha, dots, rstds
+
+
+def _attn_res_bwd_math(pseudo_query, key_norm_weight, alpha, dots, rstds, grad_output, values):
+    """Pure backward math: value path, depth-softmax jacobian, key-RMSNorm path.
+
+    Recomputes the fp32 upcasts and normalized keys from the saved value
+    references plus per-token statistics. The dq reduction stays a gemv so the
+    parameter gradients are deterministic.
+    """
+    q = (pseudo_query * key_norm_weight).float()  # [h]
+    hidden_size = values[0].shape[-1]
+    g32 = grad_output.float()
+
+    # Value path + softmax backward. u_j = <g, V_j> per token.
+    u = torch.stack([(g32 * value.float()).sum(dim=-1) for value in values])  # [n, ...]
+    dlogits = alpha * (u - (alpha * u).sum(dim=0, keepdim=True))  # [n, ...]
+    ddots = dlogits * rstds
+    dmean_sq = dlogits * dots * (-0.5) * rstds.pow(3)
+
+    dq = torch.zeros_like(q)
+    grad_values = []
+    for j, value in enumerate(values):
+        v32 = value.float()
+        gv = (
+            alpha[j].unsqueeze(-1) * g32
+            + ddots[j].unsqueeze(-1) * q
+            + (dmean_sq[j] * (2.0 / hidden_size)).unsqueeze(-1) * v32
+        )
+        grad_values.append(gv.to(value.dtype))
+        # dq += sum over tokens of ddots_j * V_j (deterministic gemv reduction).
+        dq = dq + torch.matmul(v32.reshape(-1, hidden_size).transpose(0, 1), ddots[j].reshape(-1))
+
+    grad_query = (dq * key_norm_weight.float()).to(pseudo_query.dtype)
+    grad_norm_weight = (dq * pseudo_query.float()).to(key_norm_weight.dtype)
+    return grad_query, grad_norm_weight, grad_values
+
+
+_COMPILED_MATH: dict = {}
+_COMPILE_FAILED = False
+
+
+def _get_attn_res_math(use_compile: bool):
+    """Return (fwd_math, bwd_math), compiled when requested and available.
+
+    torch.compile specializes per source arity (the list length is a dynamo
+    guard), so the one-time compile cost is bounded by the number of distinct
+    depth arities (~N). Falls back to eager with a one-time warning if
+    compilation is unavailable or fails at wrap time; a runtime compile
+    failure inside the wrapped function is not caught.
+    """
+    global _COMPILE_FAILED
+    if not use_compile or _COMPILE_FAILED:
+        return _attn_res_fwd_math, _attn_res_bwd_math
+    if not _COMPILED_MATH:
+        try:
+            _COMPILED_MATH['fwd'] = torch.compile(_attn_res_fwd_math)
+            _COMPILED_MATH['bwd'] = torch.compile(_attn_res_bwd_math)
+        except Exception:  # pylint: disable=broad-except
+            _COMPILE_FAILED = True
+            logging.getLogger(__name__).warning(
+                "attn_res_impl='compile' unavailable (torch.compile failed to wrap); "
+                "falling back to the eager attention-residual aggregation."
+            )
+            return _attn_res_fwd_math, _attn_res_bwd_math
+    return _COMPILED_MATH['fwd'], _COMPILED_MATH['bwd']
+
+
 class _AttnResAggregation(torch.autograd.Function):
     """Depth-softmax aggregation with a memory-lean, recomputing backward.
 
@@ -149,70 +242,32 @@ class _AttnResAggregation(torch.autograd.Function):
 
     All statistics, the softmax, and the weighted accumulation run in fp32;
     the output is cast back to the values' dtype so no fp32 ever leaks into
-    the residual stream.
+    the residual stream. With ``use_compile`` the forward/backward math bodies
+    run as torch.compile-fused kernels (the eager loop is CPU-dispatch-bound:
+    ~30 python ops and a dozen small kernels per aggregation), while the
+    saved-tensor policy stays exactly the same.
     """
 
     @staticmethod
-    def forward(ctx, pseudo_query, key_norm_weight, eps, *values):
-        q = (pseudo_query * key_norm_weight).float()  # [h]
-
-        dots = []
-        rstds = []
-        out32 = None
-        for value in values:
-            v32 = value.float()
-            mean_sq = v32.pow(2).mean(dim=-1)  # [...]
-            rstd = torch.rsqrt(mean_sq + eps)  # [...]
-            dot = torch.matmul(v32, q)  # [...]
-            dots.append(dot)
-            rstds.append(rstd)
-        dots = torch.stack(dots)  # [n, ...]
-        rstds = torch.stack(rstds)  # [n, ...]
-        logits = dots * rstds
-        alpha = torch.softmax(logits, dim=0)  # [n, ...] fp32
-
-        for j, value in enumerate(values):
-            term = alpha[j].unsqueeze(-1) * value.float()
-            out32 = term if out32 is None else out32 + term
-        out = out32.to(values[0].dtype)
-
-        ctx.eps = eps
+    def forward(ctx, pseudo_query, key_norm_weight, eps, use_compile, *values):
+        """Aggregate depth sources and save compact state for backward."""
+        fwd_math, _ = _get_attn_res_math(use_compile)
+        out, alpha, dots, rstds = fwd_math(pseudo_query, key_norm_weight, eps, list(values))
+        ctx.use_compile = use_compile
         ctx.save_for_backward(pseudo_query, key_norm_weight, alpha, dots, rstds, *values)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Recompute aggregation intermediates and return input gradients."""
         nvtx_range_push(msg=f"attn_res.aggregate_bwd_n{len(ctx.saved_tensors) - 5}")
         pseudo_query, key_norm_weight, alpha, dots, rstds, *values = ctx.saved_tensors
-        q = (pseudo_query * key_norm_weight).float()  # [h]
-        hidden_size = values[0].shape[-1]
-        g32 = grad_output.float()
-
-        # Value path + softmax backward. u_j = <g, V_j> per token.
-        u = torch.stack([(g32 * value.float()).sum(dim=-1) for value in values])  # [n, ...]
-        dlogits = alpha * (u - (alpha * u).sum(dim=0, keepdim=True))  # [n, ...]
-        ddots = dlogits * rstds
-        dmean_sq = dlogits * dots * (-0.5) * rstds.pow(3)
-
-        dq = torch.zeros_like(q)
-        grad_values = []
-        for j, value in enumerate(values):
-            v32 = value.float()
-            gv = (
-                alpha[j].unsqueeze(-1) * g32
-                + ddots[j].unsqueeze(-1) * q
-                + (dmean_sq[j] * (2.0 / hidden_size)).unsqueeze(-1) * v32
-            )
-            grad_values.append(gv.to(value.dtype))
-            # dq += sum over tokens of ddots_j * V_j (deterministic gemv reduction).
-            dq = dq + torch.matmul(
-                v32.reshape(-1, hidden_size).transpose(0, 1), ddots[j].reshape(-1)
-            )
-
-        grad_query = (dq * key_norm_weight.float()).to(pseudo_query.dtype)
-        grad_norm_weight = (dq * pseudo_query.float()).to(key_norm_weight.dtype)
+        _, bwd_math = _get_attn_res_math(ctx.use_compile)
+        grad_query, grad_norm_weight, grad_values = bwd_math(
+            pseudo_query, key_norm_weight, alpha, dots, rstds, grad_output, list(values)
+        )
         nvtx_range_pop(msg=f"attn_res.aggregate_bwd_n{len(values)}")
-        return (grad_query, grad_norm_weight, None, *grad_values)
+        return (grad_query, grad_norm_weight, None, None, *grad_values)
 
 
 class AttentionResidual(MegatronModule):
@@ -233,6 +288,7 @@ class AttentionResidual(MegatronModule):
     def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
         super().__init__(config)
         self.eps = config.layernorm_epsilon
+        self.use_compile = getattr(config, 'attn_res_impl', 'eager') == 'compile'
         # Zero init is mandatory: uniform initial attention weights.
         self.pseudo_query = mark_keep_in_fp32(nn.Parameter(torch.zeros(config.hidden_size)))
         self.key_norm_weight = mark_keep_in_fp32(nn.Parameter(torch.ones(config.hidden_size)))
@@ -244,6 +300,8 @@ class AttentionResidual(MegatronModule):
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
         nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
-        out = _AttnResAggregation.apply(self.pseudo_query, self.key_norm_weight, self.eps, *values)
+        out = _AttnResAggregation.apply(
+            self.pseudo_query, self.key_norm_weight, self.eps, self.use_compile, *values
+        )
         nvtx_range_pop(msg=f"attn_res.aggregate_n{len(values)}")
         return out
