@@ -210,7 +210,8 @@ def test_get_param_groups_separates_only_exact_dsa_indexer_submodules(mock_get_w
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_excludes_frozen_dsa_indexer(mock_get_world_size):
     class ModelWithIndexer(nn.Module):
@@ -234,7 +235,8 @@ def test_get_param_groups_excludes_frozen_dsa_indexer(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_dsa_indexer_flag_is_preserved_across_weight_decay_groups(mock_get_world_size):
     class ModelWithIndexer(nn.Module):
@@ -457,7 +459,8 @@ def test_distributed_fused_adam_state_dict_preserves_indexer_clock(monkeypatch):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_default_overrides(mock_get_world_size):
     """Test that the default overrides are applied to the parameter groups."""
