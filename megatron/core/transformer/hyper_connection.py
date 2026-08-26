@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -261,11 +262,12 @@ class HyperConnectionModule(MegatronModule):
                 log_fused_mhc_backend_once,
             )
 
-            log_fused_mhc_backend_once()
-            self._sinkhorn_op = fused_sinkhorn
-            self._h_aggregate_op = fused_h_aggregate
-            self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_compute_h_op = fused_proj_rms_compute_h
+            backend = config.mhc_fused_backend
+            log_fused_mhc_backend_once(backend)
+            self._sinkhorn_op = partial(fused_sinkhorn, backend=backend)
+            self._h_aggregate_op = partial(fused_h_aggregate, backend=backend)
+            self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
+            self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate

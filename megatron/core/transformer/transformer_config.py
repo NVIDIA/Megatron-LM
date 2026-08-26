@@ -1164,8 +1164,18 @@ class TransformerConfig(ModelParallelConfig):
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
-    Backend selection is operation-specific, with native torch fallbacks that
-    preserve the same public behavior when Triton or cuTile is unavailable.
+    With the default ``auto`` backend policy, selection is operation-specific
+    and unavailable accelerated implementations fall back to native torch.
+    Set ``mhc_fused_backend`` to request an explicit backend policy.
+    """
+
+    mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
+    """Backend policy for fused mHC operations.
+
+    ``auto`` selects the fastest available implementation for each operation.
+    Explicit policies require the requested dependency and device support, and
+    never select a different accelerated backend. Operations without an
+    implementation in the selected backend retain their native implementation.
     """
 
     mhc_recompute_layer_num: Optional[int] = None
@@ -2130,6 +2140,15 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
 
+        valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
+        if self.mhc_fused_backend not in valid_mhc_fused_backends:
+            raise ValueError(
+                f"Unknown mhc_fused_backend {self.mhc_fused_backend!r}; expected one of "
+                f"{valid_mhc_fused_backends}."
+            )
+        if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
+            raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
+
         if self.enable_mhc_connections and self.recompute_granularity == "full":
             raise NotImplementedError(
                 "enable_mhc_connections is not yet compatible with full activation recompute. "
@@ -2152,7 +2171,7 @@ class TransformerConfig(ModelParallelConfig):
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
             # the stage holding the final layernorm, so every intermediate pipeline stage
             # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.
-            # Pipeline support lands in the follow-up mHC split, which lifts this guard.
+            # Pipeline support must resize the p2p buffers before this guard can be lifted.
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
                     "enable_mhc_connections does not support pipeline_model_parallel_size > 1 "

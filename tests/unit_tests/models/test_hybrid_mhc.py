@@ -134,6 +134,8 @@ class TestHybridStackMHC:
         stack = _get_stack(config, num_local_layers=3)
 
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in stack.layers)
+        assert all(layer.inner_layer.config is config for layer in stack.layers)
+        assert all(layer.inner_layer.config.enable_mhc_connections for layer in stack.layers)
         assert stack.hc_head_fn.shape == (
             config.mhc_num_residual_streams,
             config.hidden_size * config.mhc_num_residual_streams,
@@ -141,6 +143,19 @@ class TestHybridStackMHC:
         state = stack.sharded_state_dict(prefix="decoder.", metadata={})
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             assert f"decoder.{name}" in state
+
+    def test_fused_backend_policy_is_bound_per_wrapper(self):
+        config = _get_config(num_layers=1, use_fused_mhc=True, mhc_fused_backend="native")
+        stack = _get_stack(config, num_local_layers=1)
+        hyper_connection = stack.layers[0].hyper_connection
+
+        for op_name in (
+            "_sinkhorn_op",
+            "_h_aggregate_op",
+            "_h_post_bda_op",
+            "_proj_rms_compute_h_op",
+        ):
+            assert getattr(hyper_connection, op_name).keywords["backend"] == "native"
 
     def test_wrapped_gdn_preserves_dynamic_inference_state_shapes(self):
         config = _get_config(num_layers=1)

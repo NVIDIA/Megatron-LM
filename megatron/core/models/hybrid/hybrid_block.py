@@ -152,16 +152,6 @@ class HybridStack(MegatronModule):
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
 
-        # Final #4531 rejects mHC on a plain TransformerLayer because it cannot
-        # consume n-stream inputs directly. HybridStack's layer-boundary wrapper
-        # aggregates to a single stream before calling the inner layer, so build
-        # that inner layer with the mHC flag disabled and retain the original
-        # config on HyperConnectionHybridLayer itself.
-        inner_layer_config = self.config
-        if self.config.enable_mhc_connections:
-            inner_layer_config = copy.copy(self.config)
-            inner_layer_config.enable_mhc_connections = False
-
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
@@ -176,7 +166,7 @@ class HybridStack(MegatronModule):
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
-                        config=inner_layer_config,
+                        config=self.config,
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
@@ -185,7 +175,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
                         submodules.attention_layer,
-                        config=inner_layer_config,
+                        config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -196,7 +186,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
                         submodules.dsa_layer,
-                        config=inner_layer_config,
+                        config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -207,7 +197,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MLA:
                     layer = build_module(
                         submodules.mla_layer,
-                        config=inner_layer_config,
+                        config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -217,7 +207,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MLP:
                     layer = build_module(
                         submodules.mlp_layer,
-                        config=inner_layer_config,
+                        config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
@@ -226,7 +216,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
                         submodules.moe_layer,
-                        config=inner_layer_config,
+                        config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -244,7 +234,7 @@ class HybridStack(MegatronModule):
                         gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
                     layer = build_module(
                         gdn_layer_spec,
-                        config=inner_layer_config,
+                        config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.

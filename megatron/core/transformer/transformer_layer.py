@@ -306,6 +306,11 @@ class BaseTransformerLayer(ABC):
     implementation in `transformer_block.py` file for more details.
     """
 
+    #: Whether the layer accepts mHC n-stream hidden states ([s, b, n*C])
+    #: when owned directly by a TransformerBlock. Custom layer implementations
+    #: that implement this contract should override the marker with ``True``.
+    supports_mhc_connections: bool = False
+
     def __init__(self):
         pass
 
@@ -316,11 +321,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     Transformer layer takes input with size [s, b, h] and returns an
     output of the same size.
     """
-
-    #: Whether this layer class understands mHC n-stream hidden states
-    #: ([s, b, n*C]). Only HyperConnectionTransformerLayer sets this True;
-    #: __init__ rejects `enable_mhc_connections` on any layer that does not.
-    supports_mhc_connections: bool = False
 
     def __init__(
         self,
@@ -552,13 +552,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
-
-        if config.enable_mhc_connections and not self.supports_mhc_connections:
-            raise ValueError(
-                f"{type(self).__name__} does not implement mHC residual streams. Build the "
-                "decoder with HyperConnectionTransformerLayer when "
-                "enable_mhc_connections=True."
-            )
 
         # Resolve the legacy `_forward_post_mlp` override once instead of walking the MRO on
         # every MLP bias-dropout-add. See _apply_mlp_bda_step for the deprecation contract.
@@ -1852,28 +1845,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if CudaGraphModule.mlp in self.config.cuda_graph_modules:
             submodules.append(self.mlp_hyper_connection)
         return submodules
-
-    def forward(self, *args, **kwargs):
-        """Forward pass with MHC recompute manager support.
-
-        Inherits ``_forward_attention`` and ``_forward_mlp`` from base; the
-        mHC-specific behavior is contained in the ``_run_input_layernorm``,
-        ``_apply_self_attn_bda_step``, ``_pre_mlp_layernorm_and_residual``, and
-        ``_apply_mlp_bda_step`` overrides, which read the manager off
-        ``self`` and thread per-call intermediates through the
-        ``attn_state`` / ``mlp_state`` slots.
-
-        Override exists only to skip the ``enable_mhc_connections`` assert
-        on base ``TransformerLayer.forward``.
-        """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-            packed_seq_params=kwargs.get("packed_seq_params", None),
-        )
-        return output, context
 
     def _run_input_layernorm(self, hidden_states):
         """HC input layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.

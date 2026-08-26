@@ -180,6 +180,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_training_ssm_states_dtype": None,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
+    "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,

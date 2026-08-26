@@ -1503,12 +1503,7 @@ class TestFusedProjRmsComputeHKeepFp32:
         )
 
     def test_public_entry_point_native_branch(self, monkeypatch):
-        """The public op must also run natively — this is the forced-native path.
-
-        MHC_FORCE_BACKEND=native and an auto run on a cuTile-less container both
-        land here, and the module always calls the public op when
-        use_fused_mhc=True, so this branch is what a real training job hits.
-        """
+        """The public op must honor the explicit native backend policy."""
         from megatron.core.fusions import fused_mhc_kernels as fused_mod
 
         _info()
@@ -1521,9 +1516,139 @@ class TestFusedProjRmsComputeHKeepFp32:
         one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
         bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
 
-        outs = fused_mod.fused_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        outs = fused_mod.fused_proj_rms_compute_h(
+            x, w, one, one, one, bias, n, 1e-6, backend="native"
+        )
         for t in outs:
             assert torch.isfinite(t).all()
+
+
+class TestExplicitBackendDispatch:
+    """Configuration-driven dispatch must be strict and stable through backward."""
+
+    def test_backend_logging_is_once_per_policy(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        log_calls = []
+        warning_calls = []
+        monkeypatch.setattr(fused_mod, "_BACKEND_INFO_LOGGED", set())
+        monkeypatch.setattr(
+            fused_mod,
+            "_mhc_backend_status",
+            lambda backend: (f"policy={backend}; all native", True),
+        )
+        monkeypatch.setattr(fused_mod, "safe_get_rank", lambda: 0)
+        monkeypatch.setattr(fused_mod, "log_single_rank", lambda *args: log_calls.append(args))
+        monkeypatch.setattr(
+            fused_mod.warnings,
+            "warn",
+            lambda message, *args, **kwargs: warning_calls.append(message),
+        )
+
+        for backend in ("native", "native", "auto", "auto"):
+            fused_mod.log_fused_mhc_backend_once(backend)
+
+        assert len(log_calls) == 2
+        assert [call[1] for call in log_calls] == [
+            fused_mod.logging.INFO,
+            fused_mod.logging.WARNING,
+        ]
+        assert len(warning_calls) == 1
+        assert "falling back to native torch" in str(warning_calls[0])
+
+    @pytest.mark.parametrize("backend", ["triton", "cutile"])
+    def test_unavailable_explicit_backend_fails(self, monkeypatch, backend):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        if backend == "triton":
+            monkeypatch.setattr(fused_mod, "is_triton_available", lambda: False)
+        else:
+            monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: False)
+
+        logits = _rand(1, 1, 2, 2)
+        with pytest.raises(RuntimeError, match=backend):
+            fused_mod.fused_sinkhorn(logits, 2, backend=backend)
+
+    def test_h_aggregate_forward_backward_share_backend_policy(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        seen = []
+
+        def get_triton_forward(backend):
+            seen.append(("forward", backend))
+            return fused_mod.native_h_aggregate
+
+        def use_cutile(backend):
+            seen.append(("backward", backend))
+            return False
+
+        monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_fwd", get_triton_forward)
+        monkeypatch.setattr(fused_mod, "_backend_uses_cutile", use_cutile)
+
+        x = _rand(2, 2, 2, 8).requires_grad_(True)
+        h_pre = _rand(2, 2, 2).requires_grad_(True)
+        fused_mod.fused_h_aggregate(x, h_pre, backend="triton").sum().backward()
+
+        assert ("forward", "triton") in seen
+        assert ("backward", "triton") in seen
+        assert x.grad is not None
+        assert h_pre.grad is not None
+
+    def test_h_aggregate_auto_mixes_triton_forward_and_cutile_backward(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        seen = []
+
+        def get_triton_forward(backend):
+            seen.append(("forward", backend, "triton"))
+            return fused_mod.native_h_aggregate
+
+        def cutile_backward(grad_output, x, h_pre):
+            seen.append(("backward", "auto", "cutile"))
+            return fused_mod._torch_h_aggregate_bwd(grad_output, x, h_pre)
+
+        monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_fwd", get_triton_forward)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_bwd", cutile_backward, raising=False)
+
+        x = _rand(2, 2, 2, 8).requires_grad_(True)
+        h_pre = _rand(2, 2, 2).requires_grad_(True)
+        fused_mod.fused_h_aggregate(x, h_pre, backend="auto").sum().backward()
+
+        assert seen == [("forward", "auto", "triton"), ("backward", "auto", "cutile")]
+        assert x.grad is not None
+        assert h_pre.grad is not None
+
+    def test_h_post_bda_forward_backward_share_backend_policy(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        seen = []
+
+        def get_triton_forward(backend):
+            seen.append(("forward", backend))
+            return fused_mod.native_h_post_bda
+
+        def get_triton_backward(backend):
+            seen.append(("backward", backend))
+            return fused_mod._torch_h_post_bda_bwd
+
+        monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_post_bda_fwd", get_triton_forward)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_post_bda_bwd", get_triton_backward)
+
+        h_res = _rand(2, 2, 2, 2).requires_grad_(True)
+        residual = _rand(2, 2, 2, 8).requires_grad_(True)
+        h_post = _rand(2, 2, 2).requires_grad_(True)
+        x = _rand(2, 2, 8).requires_grad_(True)
+        bias = _rand(8).requires_grad_(True)
+        fused_mod.fused_h_post_bda(
+            h_res, residual, h_post, x, bias, backend="triton"
+        ).sum().backward()
+
+        assert seen == [("forward", "triton"), ("backward", "triton")]
+        assert all(tensor.grad is not None for tensor in (h_res, residual, h_post, x, bias))
 
 
 class TestCutileHAggregateBackwardReduction:
