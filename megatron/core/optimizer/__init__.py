@@ -375,8 +375,14 @@ def _get_param_groups(
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0], x[1], x[2])):
-        param_override_tuple, is_expert_parallel, is_dsa_indexer = key
+    # Keys gathered from other ranks or module domains may predate the is_dsa_indexer
+    # element; treat a missing element as False so ordering stays total either way.
+    def _key_order(key):
+        return (key[0] is not None, key[0], key[1], key[2] if len(key) > 2 else False)
+
+    for key in sorted(params_key, key=_key_order):
+        param_override_tuple, is_expert_parallel = key[0], key[1]
+        is_dsa_indexer = key[2] if len(key) > 2 else False
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
