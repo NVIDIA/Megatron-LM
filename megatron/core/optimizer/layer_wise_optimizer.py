@@ -88,7 +88,7 @@ def _build_gtp_group(gtp_remat_group, tp_group):
     initialize the MPU (e.g. multimodal) get the fused exchange from their own
     groups. For any affine grid — interleaved axes such as cp/ep included —
     the two axis groups through this rank determine the whole domain
-    additively: ``global(g, t) = gtp_ranks[g] + tp_ranks[t] - my``. Every
+    additively: ``global(g, t) = gtp_ranks[g] + tp_ranks[t] - my_rank``. Every
     member of a domain derives the SAME list, so deduplicating the gathered
     lists enumerates each domain exactly once.
 
@@ -108,15 +108,17 @@ def _build_gtp_group(gtp_remat_group, tp_group):
     if key in _GTP_GROUP_CACHE:
         return _GTP_GROUP_CACHE[key]
 
-    my = torch.distributed.get_rank()
+    my_rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    mine = [g + t - my for g in my_gtp_remat for t in my_tp]
-    grid_ok = len(set(mine)) == len(mine) and all(0 <= r < world_size for r in mine)
+    derived_domain_ranks = [g + t - my_rank for g in my_gtp_remat for t in my_tp]
+    is_affine_grid = len(set(derived_domain_ranks)) == len(derived_domain_ranks) and all(
+        0 <= r < world_size for r in derived_domain_ranks
+    )
 
     # new_subgroups_by_enumeration is collective over the world: gather every
     # rank's derived domain so all ranks create all domains in the same order.
     gathered: List = [None] * world_size
-    torch.distributed.all_gather_object(gathered, (mine, grid_ok))
+    torch.distributed.all_gather_object(gathered, (derived_domain_ranks, is_affine_grid))
     if not all(ok for _, ok in gathered):
         log_single_rank(
             logger,
@@ -132,7 +134,7 @@ def _build_gtp_group(gtp_remat_group, tp_group):
     _, subgroups = torch.distributed.new_subgroups_by_enumeration([list(d) for d in domains])
     result = None
     for domain, group in zip(domains, subgroups):
-        if my in domain:
+        if my_rank in domain:
             result = group
     _GTP_GROUP_CACHE[key] = result
     return result
@@ -373,8 +375,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             m, n = param.data.shape
             if getattr(param, 'is_gtp_weight_remat', False):
                 m = m * getattr(param, 'gtp_remat_size', 1)
-            big, small = max(m, n), min(m, n)
-            return big * small * small
+            small = min(m, n)
+            return m * n * small
 
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
@@ -598,8 +600,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     m = m * tp_size
                 elif pd == 1:
                     n = n * tp_size
-            big, small = max(m, n), min(m, n)
-            return big * small * small
+            small = min(m, n)
+            return m * n * small
 
         # LPT: assign each param (sorted by cost desc) to the bin with least
         # accumulated cost. Bin b -> (g_home, t_home) = (b // tp_size, b % tp_size).
@@ -901,7 +903,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     logger,
                     logging.INFO,
                     f'LayerShardedMuon: assigned {len(domain_params)} params across '
-                    f'{gtp_remat_size} x {tp_size} (GTP x TP) NS homes.',
+                    f'{tp_size} x {gtp_remat_size} (TP x GTP_remat) NS homes.',
                 )
 
             if assignment:
