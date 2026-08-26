@@ -996,6 +996,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.finished_chunk_token_count > 0:
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
+                    req.num_matched_prefix_blocks = 0
 
             # Reset the chunked prefill request id
             self.chunked_prefill_request_id = -1
