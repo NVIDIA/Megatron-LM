@@ -33,6 +33,11 @@ class TransferOp:
     # across ranks and can be used to build richer communication schedules.
     task_id: int | None = None
 
+    # Globally deterministic execution batch. All transfers for one logical
+    # parameter share a batch so quantized destinations can be finalized before
+    # transient receive buffers are released.
+    batch_id: int = 0
+
 
 @dataclass
 class ParameterMetadata:
@@ -147,6 +152,9 @@ class ReshardPlan:
     # accompanying error explains why.
     tensor_reshard_specs: list[TensorReshardSpec] | None = None
     tensor_reshard_error: str | None = None
+    # Number of globally coordinated batches in send_ops/recv_ops. Backends
+    # that require one stable model-wide registration can opt out at execution.
+    num_batches: int = 1
 
     def __str__(self):
         return f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"

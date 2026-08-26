@@ -24,6 +24,11 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# Bound transient source dequantization and destination staging in the generic
+# executor. This matches the native NCCL M2N service's default grouped-submission
+# limit. A single parameter is allowed to exceed the soft limit.
+_DEFAULT_EXECUTION_BATCH_BYTES = 256 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class _NativeParameterPart:
@@ -369,6 +374,71 @@ def _iter_global_transfer_ops(
                 yield task_id, dst_rank, src_rank, src_slice, dst_slice, src_metadata, dst_metadata
 
 
+def _build_execution_batch_ids(
+    dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
+    src_param_metadata: dict[str, list[ParameterMetadata]],
+    max_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+) -> tuple[dict[str, int], int]:
+    """Assign complete logical parameters to deterministic memory-bounded batches.
+
+    The planner is replayed from the same global metadata roster on every rank,
+    so these IDs let the generic executor call ``CopyService.run()`` in lockstep
+    without another collective. Source and destination bytes are accumulated per
+    rank; starting a new batch when any rank would cross the soft limit bounds
+    both sender-side dequantization and receiver-side staging. All replicas and
+    shards of one resolved parameter stay in one batch.
+    """
+    if max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be positive")
+
+    parameter_order: list[str] = []
+    destination_bytes: dict[str, dict[int, int]] = {}
+    for dst_rank in sorted(dst_param_metadata_by_rank):
+        for resolved_name, metadata in dst_param_metadata_by_rank[dst_rank].items():
+            if resolved_name not in destination_bytes:
+                parameter_order.append(resolved_name)
+                destination_bytes[resolved_name] = {}
+            # MXFP8 tensors are materialized/received as logical BF16 by the
+            # generic executor, so their one-byte physical element size would
+            # underestimate transient memory. Plain wider dtypes keep their
+            # actual element size.
+            rank_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            destination_bytes[resolved_name][metadata.owner_rank] = max(
+                destination_bytes[resolved_name].get(metadata.owner_rank, 0), rank_bytes
+            )
+
+    source_bytes: dict[str, dict[int, int]] = {}
+    for resolved_name in parameter_order:
+        rank_bytes: dict[int, int] = {}
+        for metadata in _find_source_metadata(src_param_metadata, resolved_name) or ():
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            rank_bytes[metadata.owner_rank] = max(
+                rank_bytes.get(metadata.owner_rank, 0), tensor_bytes
+            )
+        source_bytes[resolved_name] = rank_bytes
+
+    batch_ids: dict[str, int] = {}
+    batch_id = 0
+    current_rank_bytes: dict[int, int] = {}
+    for resolved_name in parameter_order:
+        parameter_rank_bytes = dict(source_bytes[resolved_name])
+        for rank, tensor_bytes in destination_bytes[resolved_name].items():
+            parameter_rank_bytes[rank] = parameter_rank_bytes.get(rank, 0) + tensor_bytes
+
+        if current_rank_bytes and any(
+            current_rank_bytes.get(rank, 0) + tensor_bytes > max_batch_bytes
+            for rank, tensor_bytes in parameter_rank_bytes.items()
+        ):
+            batch_id += 1
+            current_rank_bytes.clear()
+
+        batch_ids[resolved_name] = batch_id
+        for rank, tensor_bytes in parameter_rank_bytes.items():
+            current_rank_bytes[rank] = current_rank_bytes.get(rank, 0) + tensor_bytes
+
+    return batch_ids, batch_id + 1 if batch_ids else 1
+
+
 def _tensor_mesh(metadata: ParameterMetadata) -> tuple[int, ...]:
     """Return the TP mesh that owns a local parameter shard or replica."""
     ranks = metadata.tensor_parallel_group_ranks
@@ -671,7 +741,10 @@ def build_plan_from_rosters(
     rosters without touching the process group. Live membership orchestration
     is intentionally outside this module.
     """
-    my_plan = ReshardPlan([], [])
+    batch_ids, num_batches = _build_execution_batch_ids(
+        dst_param_metadata_by_rank, src_param_metadata
+    )
+    my_plan = ReshardPlan([], [], num_batches=num_batches)
     for (
         task_id,
         dst_rank,
@@ -690,6 +763,7 @@ def build_plan_from_rosters(
                     my_slice=dst_slice,
                     peer_slice=src_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
         if src_rank == my_global_rank:
@@ -701,6 +775,7 @@ def build_plan_from_rosters(
                     my_slice=src_slice,
                     peer_slice=dst_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
 

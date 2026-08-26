@@ -33,6 +33,7 @@ class MockCopyService(CopyService):
     def __init__(self):
         self.sends = []  # [(tensor, dest_rank, task_id)]
         self.recvs = []  # [(tensor, src_rank, task_id)]
+        self.runs = []  # [([send task_ids], [recv task_ids])]
         self.plan = None
         self.transform = None
 
@@ -48,6 +49,9 @@ class MockCopyService(CopyService):
 
     def run(self):
         """Match sends to recvs by task_id and copy data."""
+        self.runs.append(
+            ([task_id for _, _, task_id in self.sends], [task_id for _, _, task_id in self.recvs])
+        )
         sends_by_id = {tid: t for t, _, tid in self.sends if tid is not None}
         for recv_tensor, _, tid in self.recvs:
             if tid is not None and tid in sends_by_id:
@@ -70,6 +74,12 @@ class NativeMockCopyService(MockCopyService):
 
     def run(self):
         raise AssertionError("native plan execution must bypass submit/run")
+
+
+class SingleRunMockCopyService(MockCopyService):
+    """Service whose setup requires all tensors to be submitted at once."""
+
+    supports_incremental_runs = False
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +106,7 @@ def _full_slice(ndim):
     return tuple(slice(None) for _ in range(ndim))
 
 
-def _make_transfer_op(param_name, peer_rank, is_send, my_slice, peer_slice, task_id):
+def _make_transfer_op(param_name, peer_rank, is_send, my_slice, peer_slice, task_id, batch_id=0):
     return TransferOp(
         param_name=param_name,
         peer_rank=peer_rank,
@@ -104,6 +114,7 @@ def _make_transfer_op(param_name, peer_rank, is_send, my_slice, peer_slice, task
         my_slice=my_slice,
         peer_slice=peer_slice,
         task_id=task_id,
+        batch_id=batch_id,
     )
 
 
@@ -170,6 +181,82 @@ class TestExecuteReshard:
         _run(plan, src_module, dst_module, service)
 
         assert torch.equal(dict(dst_module.named_parameters())["weight"].data, src_data[:4])
+
+
+class TestExecutionBatches:
+    """Test bounded, globally coordinated executor batches."""
+
+    @staticmethod
+    def _two_parameter_plan():
+        full_slice = _full_slice(1)
+        return ReshardPlan(
+            send_ops=[
+                _make_transfer_op("first", 1, True, full_slice, full_slice, task_id=0, batch_id=0),
+                _make_transfer_op("second", 1, True, full_slice, full_slice, task_id=1, batch_id=1),
+            ],
+            recv_ops=[
+                _make_transfer_op("first", 0, False, full_slice, full_slice, task_id=0, batch_id=0),
+                _make_transfer_op(
+                    "second", 0, False, full_slice, full_slice, task_id=1, batch_id=1
+                ),
+            ],
+            num_batches=2,
+        )
+
+    def test_runs_and_finalizes_one_batch_at_a_time(self):
+        src_module = _make_module_with_params(
+            {
+                "first": torch.tensor([1.0, 2.0], device="cuda"),
+                "second": torch.tensor([3.0, 4.0], device="cuda"),
+            }
+        )
+        dst_module = _make_module_with_params(
+            {"first": torch.zeros(2, device="cuda"), "second": torch.zeros(2, device="cuda")}
+        )
+        service = MockCopyService()
+
+        _run(self._two_parameter_plan(), src_module, dst_module, service)
+
+        assert service.runs == [([0], [0]), ([1], [1])]
+        for name, src_param in src_module.named_parameters():
+            assert torch.equal(dict(dst_module.named_parameters())[name], src_param)
+
+    def test_backend_can_require_one_model_wide_run(self):
+        src_module = _make_module_with_params(
+            {
+                "first": torch.tensor([1.0, 2.0], device="cuda"),
+                "second": torch.tensor([3.0, 4.0], device="cuda"),
+            }
+        )
+        dst_module = _make_module_with_params(
+            {"first": torch.zeros(2, device="cuda"), "second": torch.zeros(2, device="cuda")}
+        )
+        service = SingleRunMockCopyService()
+
+        _run(self._two_parameter_plan(), src_module, dst_module, service)
+
+        assert service.runs == [([0, 1], [0, 1])]
+
+    def test_rejects_destination_parameter_split_across_batches(self):
+        full_slice = _full_slice(1)
+        plan = ReshardPlan(
+            send_ops=[],
+            recv_ops=[
+                _make_transfer_op(
+                    "weight", 0, False, full_slice, full_slice, task_id=0, batch_id=0
+                ),
+                _make_transfer_op(
+                    "weight", 1, False, full_slice, full_slice, task_id=1, batch_id=1
+                ),
+            ],
+            num_batches=2,
+        )
+        service = MockCopyService()
+
+        with pytest.raises(ValueError, match="complete parameters must stay together"):
+            _run(plan, None, None, service)
+
+        assert service.runs == []
 
 
 # ===========================================================================

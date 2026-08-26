@@ -59,6 +59,7 @@ class NixlCopyService(CopyService):
     """
 
     requires_process_group_barrier = False
+    supports_incremental_runs = False
 
     def __init__(self, group=None, agent_name: Optional[str] = None):
         super().__init__(group=group)

@@ -14,6 +14,7 @@ import pytest
 import megatron.core.resharding.planner as planner
 from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
+    _build_execution_batch_ids,
     _build_tensor_reshard_specs,
     _finalize_dp_transfers,
     _plan_tp,
@@ -417,6 +418,37 @@ class TestBuildPlanFromRosters:
         assert {(s, d) for _, s, d in sends} == {(0, 1), (0, 2)}
         assert len({tid for tid, _, _ in sends}) == 2
 
+    def test_execution_batches_match_across_ranks(self):
+        """Large complete parameters are split without separating their slices."""
+        num_elements = 40_000_000  # 160 MB at float32
+        gathered = [
+            (
+                [
+                    _meta(
+                        name=name, shape=(num_elements,), owner_rank=0, tp_ranks=[0], dp_ranks=[0]
+                    )
+                    for name in ("first", "second")
+                ],
+                [],
+            ),
+            (
+                [],
+                [
+                    _meta(
+                        name=name, shape=(num_elements,), owner_rank=1, tp_ranks=[1], dp_ranks=[1]
+                    )
+                    for name in ("first", "second")
+                ],
+            ),
+        ]
+
+        plans = _build_all(gathered)
+
+        assert {plan.num_batches for plan in plans.values()} == {2}
+        send_batches = {op.task_id: op.batch_id for op in plans[0].send_ops}
+        recv_batches = {op.task_id: op.batch_id for op in plans[1].recv_ops}
+        assert send_batches == recv_batches == {0: 0, 1: 1}
+
     def test_node_add_keeps_existing_task_ids_stable(self):
         """Appending a rank rebuilds locally without renumbering existing transfers."""
         base = [
@@ -438,6 +470,31 @@ class TestBuildPlanFromRosters:
         # The new rank added exactly one transfer with a fresh task_id.
         assert len(sends_after) == 3
         assert {(s, d) for _, s, d in sends_after} == {(0, 1), (0, 2), (0, 3)}
+
+
+def test_execution_batch_ids_keep_replicas_together():
+    """All replicas of a logical parameter receive one global batch ID."""
+    dst_by_rank = {
+        2: {
+            "first": _meta(name="first", shape=(2,), owner_rank=2),
+            "second": _meta(name="second", shape=(2,), owner_rank=2),
+        },
+        3: {"first": _meta(name="first", shape=(2,), owner_rank=3)},
+    }
+    src_by_name = {
+        "first": [
+            _meta(name="first", shape=(2,), owner_rank=0),
+            _meta(name="first", shape=(2,), owner_rank=1),
+        ],
+        "second": [_meta(name="second", shape=(2,), owner_rank=0)],
+    }
+
+    batch_ids, num_batches = _build_execution_batch_ids(
+        dst_by_rank, src_by_name, max_batch_bytes=12
+    )
+
+    assert batch_ids == {"first": 0, "second": 1}
+    assert num_batches == 2
 
 
 def test_centralized_planner_compatibility_wrapper(monkeypatch):
