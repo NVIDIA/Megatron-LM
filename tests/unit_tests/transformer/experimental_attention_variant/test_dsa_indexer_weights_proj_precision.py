@@ -9,6 +9,7 @@ the model-dtype projection parameter is consumed by an FP32 linear operation.
 
 import dataclasses
 from argparse import ArgumentParser
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ import torch.nn.functional as F
 import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
 from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear, TENorm
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -99,6 +101,27 @@ def _torch_weights_proj_output_dtype(weights_proj_output_dtype: str) -> torch.dt
     return torch.bfloat16 if weights_proj_output_dtype == "bf16" else torch.float32
 
 
+def test_fp32_weights_projection_ensures_weight_ready_before_direct_gemm(monkeypatch):
+    events = []
+    weight = SimpleNamespace(_ensure_param_ready_callback=lambda: events.append("ready"))
+    indexer = SimpleNamespace(linear_weights_proj=SimpleNamespace(weight=weight))
+    expected = object()
+
+    def fake_apply(x, actual_weight, linear, actual_indexer):
+        del x, linear
+        assert actual_weight is weight
+        assert actual_indexer is indexer
+        events.append("gemm")
+        return expected
+
+    monkeypatch.setattr(dsa_module._DSAWeightsProjection, "apply", fake_apply)
+
+    output = dsa_module._dsa_weights_projection_fp32(object(), indexer)
+
+    assert output is expected
+    assert events == ["ready", "gemm"]
+
+
 @pytest.fixture(autouse=True)
 def _model_parallel():
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
@@ -112,7 +135,6 @@ def _model_parallel():
     [
         pytest.param("bf16", True, "bf16", id="bf16-quantized-contract-bf16-output"),
         pytest.param("bf16", False, "bf16", id="bf16-unquantized-bf16-output"),
-        pytest.param("bf16", True, "fp32", id="bf16-quantized-contract-fp32-output"),
         pytest.param("bf16", False, "fp32", id="bf16-unquantized-fp32-output"),
         pytest.param("mxfp8", True, "bf16", id="mxfp8-quantized-bf16-output"),
         pytest.param("mxfp8", False, "bf16", id="mxfp8-unquantized-bf16-output"),
@@ -183,8 +205,6 @@ def test_precision_config_defaults_and_invalid_combinations():
     with pytest.raises(ValueError, match="requires.*use_quantization=False"):
         dataclasses.replace(
             default_config,
-            fp8="hybrid",
-            fp8_recipe="mxfp8",
             dsa_indexer_weights_proj_use_quantization=True,
             dsa_indexer_weights_proj_output_dtype="fp32",
         )
@@ -194,6 +214,40 @@ def test_precision_config_defaults_and_invalid_combinations():
             default_config,
             dsa_kernel_backend="cudnn",
             dsa_indexer_weights_proj_use_quantization=False,
+            dsa_indexer_weights_proj_output_dtype="fp32",
+        )
+
+
+@pytest.mark.internal
+def test_precision_config_rejects_fp32_output_with_matching_quant_recipe():
+    module_path = "decoder.layers.0.self_attention.core_attention.indexer.linear_weights_proj"
+    quant_recipe = RecipeConfig.from_config_dict(
+        {
+            "matchers": {
+                "dsa_weights_proj": {
+                    "type": "glob",
+                    "enabled": True,
+                    "pattern": "*indexer.linear_weights_proj",
+                    "config": "fp8",
+                }
+            },
+            "configs": {
+                "fp8": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": {"fp8_quantization_recipe": "tensorwise"},
+                }
+            },
+        }
+    )
+    assert quant_recipe.match(MatchContext(module_path=module_path, layer_number=0)) is not None
+
+    with pytest.raises(ValueError, match="requires.*use_quantization=False"):
+        dataclasses.replace(
+            _make_config(
+                use_sparse_loss=True, calculate_per_token_loss=False, dsa_kernel_backend="none"
+            ),
+            quant_recipe=quant_recipe,
+            dsa_indexer_weights_proj_use_quantization=True,
             dsa_indexer_weights_proj_output_dtype="fp32",
         )
 

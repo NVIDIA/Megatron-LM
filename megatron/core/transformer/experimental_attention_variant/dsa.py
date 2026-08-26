@@ -32,7 +32,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
@@ -1389,6 +1389,7 @@ def _dsa_weights_projection_fp32(x: torch.Tensor, indexer: torch.nn.Module) -> t
     weight = getattr(linear, "weight", None)
     if weight is None:
         raise RuntimeError("DSA indexer linear_weights_proj must expose a weight parameter.")
+    ensure_params_ready([weight])
     return _DSAWeightsProjection.apply(x, weight, linear, indexer)
 
 

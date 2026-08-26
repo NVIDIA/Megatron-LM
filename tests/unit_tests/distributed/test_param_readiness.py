@@ -11,6 +11,10 @@ from megatron.core.distributed.distributed_data_parallel import (
     DistributedDataParallel,
     _BucketParamReadyCallback,
 )
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
 
 
@@ -106,3 +110,30 @@ class TestBucketParamReadiness:
         _BucketParamReadyCallback(ddp, bucket_group)()
 
         assert bucket_group.finished == [True]
+
+
+class TestDSAFineGrainedReadiness:
+    def test_fp32_projection_gathers_at_called_dsattention_boundary(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=1,
+            dsa_kernel_backend="none",
+            dsa_indexer_weights_proj_use_quantization=False,
+            dsa_indexer_weights_proj_output_dtype="fp32",
+        )
+
+        recurse_types = FullyShardedDataParallel._fine_grained_recurse_module_types(
+            config, DistributedDataParallelConfig()
+        )
+
+        assert DSAttention in recurse_types
+
+    def test_bf16_projection_keeps_leaf_level_gather(self):
+        config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
+
+        recurse_types = FullyShardedDataParallel._fine_grained_recurse_module_types(
+            config, DistributedDataParallelConfig()
+        )
+
+        assert DSAttention not in recurse_types

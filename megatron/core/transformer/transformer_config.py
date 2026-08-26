@@ -1705,17 +1705,14 @@ class TransformerConfig(ModelParallelConfig):
                 "dsa_indexer_weights_proj_output_dtype must be either 'bf16' or 'fp32', got "
                 f"{self.dsa_indexer_weights_proj_output_dtype!r}."
             )
-        quantization_configured = bool(self.fp8 or self.fp4 or self.fp8_param or self.fp4_param)
         if (
             self.dsa_indexer_weights_proj_use_quantization
             and self.dsa_indexer_weights_proj_output_dtype == "fp32"
-            and quantization_configured
         ):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' requires "
-                "dsa_indexer_weights_proj_use_quantization=False when FP8/FP4 "
-                "quantization is configured. Quantized TELinear does not expose a "
-                "guaranteed true-FP32 output contract for this projection."
+                "dsa_indexer_weights_proj_use_quantization=False because quantized "
+                "TELinear does not guarantee a true-FP32 output for this projection."
             )
         if (
             self.dsa_indexer_weights_proj_output_dtype == "fp32"
