@@ -252,8 +252,8 @@ def test_ep_fsdp_matches_fullbatch_reference(
     target = torch.randn(global_batch, seq, vocab, device=device)
     shard = slice(rank * b_local, (rank + 1) * b_local)
 
-    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.02, foreach=False)
-    model_optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
+    reference_optimizer = torch.optim.Adam(reference.parameters(), lr=0.02)
+    model_optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     fully_shard_optimizer(model_optimizer)
     reference_losses = _train(reference, reference_optimizer, ids, pos, mask, target)
     model_losses = _train(
