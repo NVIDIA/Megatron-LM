@@ -834,7 +834,6 @@ def num_floating_point_operations(
         num_v_heads=16,
         conv_kernel_dim=4,
         f_lora_rank=None,
-        use_full_rank_gate=True,
         gate_lora_rank=None,
     ):
         """Calculate FLOPs for a Kimi K3-compatible Kimi Delta Attention layer."""
@@ -842,16 +841,17 @@ def num_floating_point_operations(
             raise ValueError(
                 "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
             )
-        if f_lora_rank is None:
-            f_lora_rank = qk_head_dim
-        if f_lora_rank <= 0:
-            raise ValueError(f"KDA F-decay projection rank must be positive, got {f_lora_rank=}.")
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
+        f_projection_flops = hidden_size * qk_dim
+        if f_lora_rank is not None:
+            if f_lora_rank <= 0:
+                raise ValueError(
+                    f"KDA F-decay projection rank must be positive, got {f_lora_rank=}."
+                )
+            f_projection_flops = hidden_size * f_lora_rank + f_lora_rank * qk_dim
         gate_projection_flops = hidden_size * v_dim
-        if not use_full_rank_gate:
-            if gate_lora_rank is None:
-                gate_lora_rank = v_head_dim
+        if gate_lora_rank is not None:
             if gate_lora_rank <= 0:
                 raise ValueError(
                     f"KDA output-gate projection rank must be positive, got {gate_lora_rank=}."
@@ -859,8 +859,7 @@ def num_floating_point_operations(
             gate_projection_flops = hidden_size * gate_lora_rank + gate_lora_rank * v_dim
         projection_flops = (
             hidden_size * (2 * qk_dim + v_dim + num_qk_heads)
-            + hidden_size * f_lora_rank
-            + f_lora_rank * qk_dim
+            + f_projection_flops
             + gate_projection_flops
             + hidden_size * v_dim
         )
@@ -907,7 +906,6 @@ def num_floating_point_operations(
         kda_num_v_heads=16,
         kda_conv_kernel_dim=4,
         kda_f_lora_rank=None,
-        kda_use_full_rank_gate=True,
         kda_gate_lora_rank=None,
         vocab_size=256000,
         mtp_num_layers=0,
@@ -996,7 +994,6 @@ def num_floating_point_operations(
                 kda_num_v_heads,
                 kda_conv_kernel_dim,
                 kda_f_lora_rank,
-                kda_use_full_rank_gate,
                 kda_gate_lora_rank,
             )
 
@@ -1264,7 +1261,6 @@ def num_floating_point_operations(
                     total_tokens=1,
                     hidden_size=args.hidden_size,
                     f_lora_rank=getattr(args, "kda_f_lora_rank", None),
-                    use_full_rank_gate=getattr(args, "kda_use_full_rank_gate", True),
                     gate_lora_rank=getattr(args, "kda_gate_lora_rank", None),
                     qk_head_dim=args.linear_key_head_dim,
                     v_head_dim=args.linear_value_head_dim,
@@ -1568,7 +1564,6 @@ def num_floating_point_operations(
             kda_num_v_heads=args.linear_num_value_heads or 16,
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             kda_f_lora_rank=getattr(args, "kda_f_lora_rank", None),
-            kda_use_full_rank_gate=getattr(args, "kda_use_full_rank_gate", True),
             kda_gate_lora_rank=getattr(args, "kda_gate_lora_rank", None),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
