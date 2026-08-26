@@ -41,7 +41,7 @@ from megatron.core.utils import get_pg_size, is_te_min_version
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
 else:
-    (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
+    TEColumnParallelLinear, TELinear, set_save_original_input = (None, None, None)
 
 
 @torch.compile
