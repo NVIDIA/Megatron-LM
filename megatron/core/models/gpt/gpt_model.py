@@ -118,14 +118,11 @@ class GPTModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        decoder_module: Any = TransformerBlock
         if config.mla_latent_cp:
             from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
 
-            decoder_module, transformer_layer_spec = (
-                mla_with_latent_cp.configure_mla_latent_cp_decoder(
-                    decoder_module, transformer_layer_spec
-                )
+            transformer_layer_spec = mla_with_latent_cp.configure_mla_latent_cp_decoder(
+                transformer_layer_spec
             )
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
@@ -238,7 +235,7 @@ class GPTModel(LanguageModule):
         self.rotary_pos_emb_cache = {}
 
         # Transformer.
-        self.decoder = decoder_module(
+        self.decoder = TransformerBlock(
             config=self.config,
             spec=transformer_layer_spec,
             pre_process=self.pre_process,

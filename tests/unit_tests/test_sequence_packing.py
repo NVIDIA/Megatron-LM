@@ -581,6 +581,8 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         torch.arange(global_start, global_start + local_target) >= total_tokens,
     )
     assert packed_seq_params.local_cp_size == local_cp_size
+    assert packed_seq_params.cp_group is dynamic_cp_group
+    assert packed_seq_params.cp_group.size() == local_cp_size
     assert packed_seq_params.cp_partition_mode == "contiguous"
     global_target = local_target * local_cp_size
     if tail_padding_policy == "append_dummy_seq":

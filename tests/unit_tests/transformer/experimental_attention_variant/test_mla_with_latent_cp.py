@@ -17,7 +17,6 @@ import json
 import math
 import os
 import traceback
-import types
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -285,9 +284,28 @@ def _base_mla_spec():
     ).submodules.self_attention
 
 
-def _build_layer(config: MLATransformerConfig, pg: ProcessGroupCollection):
+def _build_layer(
+    config: MLATransformerConfig,
+    pg: ProcessGroupCollection,
+    backend_adapter: latent_cp.DirectAttentionAdapter | None = None,
+):
     spec = latent_cp.make_mla_with_latent_cp_spec(_base_mla_spec())
-    return build_module(spec, config=config, layer_number=1, cp_comm_type="p2p", pg_collection=pg)
+    if backend_adapter is None:
+        return build_module(
+            spec, config=config, layer_number=1, cp_comm_type="p2p", pg_collection=pg
+        )
+    runtime = (
+        config.attention_backend,
+        "test-only",
+        "test-only",
+        torch.cuda.get_device_capability(),
+    )
+    with mock.patch.object(
+        latent_cp, "_qualified_backend_adapter", return_value=(backend_adapter, runtime)
+    ):
+        return build_module(
+            spec, config=config, layer_number=1, cp_comm_type="p2p", pg_collection=pg
+        )
 
 
 def _build_legacy_cp_layer(config: MLATransformerConfig, pg: ProcessGroupCollection):
@@ -1201,14 +1219,8 @@ def test_feature_configures_gpt_decoder_without_mutation():
         submodules=replace(base_layer.submodules, self_attention=ModuleSpec(module=object)),
     )
     block_spec = TransformerBlockSubmodules(layer_specs=[base_layer, untouched_layer])
-    decoder_module, configured = latent_cp.configure_mla_latent_cp_decoder(
-        TransformerBlock, block_spec
-    )
+    configured = latent_cp.configure_mla_latent_cp_decoder(block_spec)
 
-    assert (
-        decoder_module is latent_cp.configure_mla_latent_cp_decoder(TransformerBlock, block_spec)[0]
-    )
-    assert issubclass(decoder_module, TransformerBlock)
     assert configured is not block_spec
     assert configured.layer_specs[0] is not base_layer
     assert configured.layer_specs[0].submodules.self_attention.module is latent_cp.MLAWithLatentCP
@@ -1219,16 +1231,6 @@ def test_feature_configures_gpt_decoder_without_mutation():
     assert gated_attention.module is latent_cp.MLAWithLatentCP
     assert gated_attention.metainfo == {"fuse_input_layernorm": False}
     assert gated_attention.submodules.linear_gate is latent_cp.ColumnParallelLinear
-
-    class ProbeDecoder(nn.Module):
-        def forward(self):
-            assert latent_cp._LATENT_CP_PREFLIGHT_STATE.get() is not None
-            return "scoped"
-
-    scoped_probe, _ = latent_cp.configure_mla_latent_cp_decoder(ProbeDecoder, base_layer)
-    assert latent_cp._LATENT_CP_PREFLIGHT_STATE.get() is None
-    assert scoped_probe()() == "scoped"
-    assert latent_cp._LATENT_CP_PREFLIGHT_STATE.get() is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1241,8 +1243,7 @@ def test_feature_configures_hybrid_stack_without_mutation():
     latent_stack = latent_cp.configure_mla_latent_cp_hybrid_stack(hybrid_stack_spec)
     assert latent_stack is not hybrid_stack_spec
     assert latent_stack.submodules is not hybrid_stack_spec.submodules
-    assert latent_stack.module is not hybrid_stack_spec.module
-    assert issubclass(latent_stack.module, hybrid_stack_spec.module)
+    assert latent_stack.module is hybrid_stack_spec.module
     assert (
         latent_stack.submodules.attention_layer.submodules.self_attention.module
         is latent_cp.MLAWithLatentCP
@@ -1592,6 +1593,22 @@ def test_cudnn_canonical_rank4_ragged_metadata_contract():
         assert torch.equal(buffer.flatten(), torch.tensor(values, dtype=dtype))
 
 
+def test_cudnn_phase_execution_requires_prepared_plan():
+    adapter = object.__new__(latent_cp.CudnnFusedAttentionAdapter)
+    adapter._execution_lock = mock.MagicMock()
+    adapter._plans = {}
+    adapter._prepare_plan = mock.Mock(side_effect=AssertionError("phase execution must not build"))
+    key = mock.sentinel.plan_key
+
+    with pytest.raises(latent_cp.BackendPlanNotSupportedError, match="was not prepared"):
+        adapter._get_prepared_plan(key)
+    adapter._prepare_plan.assert_not_called()
+
+    prepared = mock.sentinel.plan
+    adapter._plans[key] = prepared
+    assert adapter._get_prepared_plan(key) is prepared
+
+
 def test_shared_cudnn_adapter_is_process_device_runtime_scoped(monkeypatch):
     created = []
 
@@ -1613,289 +1630,6 @@ def test_shared_cudnn_adapter_is_process_device_runtime_scoped(monkeypatch):
     assert first is second
     assert first is not third and first is not fourth
     assert len(created) == 3
-
-
-def _preflight_dummy(backend: AttnBackend, tp_group, cp_group):
-    return SimpleNamespace(
-        config=SimpleNamespace(attention_backend=backend, v_head_dim=128),
-        pg_collection=SimpleNamespace(tp=tp_group, cp=cp_group),
-        num_attention_heads_per_partition=48,
-        q_head_dim=192,
-        softmax_scale=0.125,
-        _backend_adapter=None,
-        _backend_runtime_tuple=None,
-    )
-
-
-def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeypatch):
-    class FakeAdapter:
-        def __init__(self, fail=False):
-            self.fail = fail
-            self.prepare_calls = 0
-
-        def prepare(self, **_kwargs):
-            self.prepare_calls += 1
-            if self.fail:
-                raise RuntimeError("plan failure")
-
-    tp_group = object()
-    cp_group = object()
-    runtime = (AttnBackend.flash, "preflight-unique", "flash-attn-4==preflight-unique", (10, 0))
-    layout = SimpleNamespace(
-        cu_global=torch.tensor([0, 4242], dtype=torch.int32), max_global=4242, phases=(object(),)
-    )
-    real_tensor = torch.tensor
-
-    def cpu_tensor(*args, **kwargs):
-        kwargs.pop("device", None)
-        return real_tensor(*args, **kwargs)
-
-    all_reduces = []
-
-    def record_reduce(tensor, op, group):
-        all_reduces.append((tensor.item(), op, group))
-
-    good_adapter = FakeAdapter()
-    monkeypatch.setattr(
-        latent_cp, "_grid_identity", lambda *_args, **_kwargs: (((0, 1), (2, 3)), ((0, 2), (1, 3)))
-    )
-    monkeypatch.setattr(latent_cp, "_runtime_backend_tuple", lambda _backend: runtime)
-    monkeypatch.setattr(
-        latent_cp,
-        "_qualified_backend_adapter",
-        lambda _backend, _runtime=None: (good_adapter, runtime),
-    )
-    monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(latent_cp.dist, "all_reduce", record_reduce)
-    monkeypatch.setattr(latent_cp.torch, "tensor", cpu_tensor)
-    monkeypatch.setattr(latent_cp.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        latent_cp.torch.cuda,
-        "get_device_properties",
-        lambda _index: SimpleNamespace(name="cache-test-device", total_memory=123456789),
-    )
-
-    first = _preflight_dummy(AttnBackend.flash, tp_group, cp_group)
-    second = _preflight_dummy(AttnBackend.flash, tp_group, cp_group)
-    assert latent_cp.MLAWithLatentCP._get_backend(first, layout) is good_adapter
-    assert latent_cp.MLAWithLatentCP._get_backend(second, layout) is good_adapter
-    assert all_reduces == [
-        (1, latent_cp.dist.ReduceOp.MIN, cp_group),
-        (1, latent_cp.dist.ReduceOp.MIN, tp_group),
-    ]
-    assert good_adapter.prepare_calls == 1
-
-    remote_failure_runtime = (
-        AttnBackend.flash,
-        "preflight-remote-failure-unique",
-        "flash-attn-4==preflight-remote-failure-unique",
-        (10, 0),
-    )
-    remote_adapter = FakeAdapter()
-    remote_reduces = []
-
-    def inject_remote_failure(tensor, op, group):
-        remote_reduces.append((tensor.item(), op, group))
-        if group is cp_group:
-            tensor.zero_()
-
-    monkeypatch.setattr(
-        latent_cp, "_runtime_backend_tuple", lambda _backend: remote_failure_runtime
-    )
-    monkeypatch.setattr(
-        latent_cp,
-        "_qualified_backend_adapter",
-        lambda _backend, _runtime=None: (remote_adapter, remote_failure_runtime),
-    )
-    monkeypatch.setattr(latent_cp.dist, "all_reduce", inject_remote_failure)
-    with pytest.raises(latent_cp.LatentCPError):
-        latent_cp.MLAWithLatentCP._get_backend(
-            _preflight_dummy(AttnBackend.flash, tp_group, cp_group), layout
-        )
-    assert remote_adapter.prepare_calls == 1
-    assert remote_reduces == [
-        (1, latent_cp.dist.ReduceOp.MIN, cp_group),
-        (0, latent_cp.dist.ReduceOp.MIN, tp_group),
-    ]
-    monkeypatch.setattr(latent_cp.dist, "all_reduce", record_reduce)
-    failure_runtime = (
-        AttnBackend.flash,
-        "preflight-failure-unique",
-        "flash-attn-4==preflight-failure-unique",
-        (10, 0),
-    )
-    monkeypatch.setattr(latent_cp, "_runtime_backend_tuple", lambda _backend: failure_runtime)
-    monkeypatch.setattr(
-        latent_cp,
-        "_qualified_backend_adapter",
-        lambda _backend, _runtime=None: (FakeAdapter(fail=True), failure_runtime),
-    )
-    with pytest.raises(latent_cp.LatentCPError):
-        latent_cp.MLAWithLatentCP._get_backend(
-            _preflight_dummy(AttnBackend.flash, tp_group, cp_group), layout
-        )
-    retry_adapter = FakeAdapter()
-    monkeypatch.setattr(
-        latent_cp,
-        "_qualified_backend_adapter",
-        lambda _backend, _runtime=None: (retry_adapter, failure_runtime),
-    )
-    assert (
-        latent_cp.MLAWithLatentCP._get_backend(
-            _preflight_dummy(AttnBackend.flash, tp_group, cp_group), layout
-        )
-        is retry_adapter
-    )
-    assert retry_adapter.prepare_calls == 1
-
-    singleton_tp = object()
-    singleton_cp = object()
-    singleton_runtime = (
-        AttnBackend.flash,
-        "preflight-singleton-unique",
-        "flash-attn-4==preflight-singleton-unique",
-        (10, 0),
-    )
-    singleton_adapter = FakeAdapter()
-    monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 1)
-    monkeypatch.setattr(latent_cp, "_grid_identity", lambda *_args, **_kwargs: (((9,),), ((9,),)))
-    monkeypatch.setattr(latent_cp, "_runtime_backend_tuple", lambda _backend: singleton_runtime)
-    monkeypatch.setattr(
-        latent_cp,
-        "_qualified_backend_adapter",
-        lambda _backend, _runtime=None: (singleton_adapter, singleton_runtime),
-    )
-    all_reduce_count = len(all_reduces)
-    latent_cp.MLAWithLatentCP._get_backend(
-        _preflight_dummy(AttnBackend.flash, singleton_tp, singleton_cp),
-        SimpleNamespace(
-            cu_global=torch.tensor([0, 4343], dtype=torch.int32),
-            max_global=4343,
-            phases=(object(),),
-        ),
-    )
-    assert len(all_reduces) == all_reduce_count
-
-
-def test_dynamic_preflight_scope_reuses_one_rank_common_result_per_forward(monkeypatch):
-    class FakeAdapter:
-        def __init__(self):
-            self.prepare_calls = 0
-
-        def prepare(self, **_kwargs):
-            self.prepare_calls += 1
-
-    tp_group = object()
-    dynamic_cp_group = object()
-    runtime = (
-        AttnBackend.flash,
-        "dynamic-preflight-unique",
-        "flash-attn-4==dynamic-preflight-unique",
-        (10, 0),
-    )
-    layout = SimpleNamespace(
-        cu_global=torch.tensor([0, 5151], dtype=torch.int32), max_global=5151, phases=(object(),)
-    )
-    adapter = FakeAdapter()
-    grid_calls = []
-    runtime_calls = []
-    reductions = []
-    real_tensor = torch.tensor
-
-    def grid_identity(cp_group, incoming_tp_group, _device, *, use_cache=True):
-        assert cp_group is dynamic_cp_group
-        assert incoming_tp_group is tp_group
-        grid_calls.append(use_cache)
-        return ((0, 1), (2, 3)), ((0, 2), (1, 3))
-
-    def runtime_identity(backend):
-        runtime_calls.append(backend)
-        return runtime
-
-    def cpu_tensor(*args, **kwargs):
-        kwargs.pop("device", None)
-        return real_tensor(*args, **kwargs)
-
-    monkeypatch.setattr(latent_cp, "_grid_identity", grid_identity)
-    monkeypatch.setattr(latent_cp, "_runtime_backend_tuple", runtime_identity)
-    monkeypatch.setattr(
-        latent_cp, "_qualified_backend_adapter", lambda _backend, _runtime=None: (adapter, runtime)
-    )
-    monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 2)
-    monkeypatch.setattr(
-        latent_cp.dist,
-        "all_reduce",
-        lambda tensor, op, group: reductions.append((tensor.item(), op, group)),
-    )
-    monkeypatch.setattr(latent_cp.torch, "tensor", cpu_tensor)
-    monkeypatch.setattr(latent_cp.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(
-        latent_cp.torch.cuda,
-        "get_device_properties",
-        lambda _index: SimpleNamespace(name="dynamic-cache-device", total_memory=987654321),
-    )
-
-    with latent_cp.latent_cp_preflight_scope():
-        for _ in range(2):
-            harness = _preflight_dummy(AttnBackend.flash, tp_group, dynamic_cp_group)
-            assert (
-                latent_cp.MLAWithLatentCP._get_backend(
-                    harness, layout, dynamic_cp_group, dynamic_cp=True
-                )
-                is adapter
-            )
-    assert grid_calls == [False]
-    assert runtime_calls == [AttnBackend.flash]
-    assert reductions == [
-        (1, latent_cp.dist.ReduceOp.MIN, dynamic_cp_group),
-        (1, latent_cp.dist.ReduceOp.MIN, tp_group),
-    ]
-    assert adapter.prepare_calls == 1
-
-    with latent_cp.latent_cp_preflight_scope():
-        harness = _preflight_dummy(AttnBackend.flash, tp_group, dynamic_cp_group)
-        assert (
-            latent_cp.MLAWithLatentCP._get_backend(
-                harness, layout, dynamic_cp_group, dynamic_cp=True
-            )
-            is adapter
-        )
-    assert grid_calls == [False, False]
-    assert runtime_calls == [AttnBackend.flash, AttnBackend.flash]
-    assert reductions == [
-        (1, latent_cp.dist.ReduceOp.MIN, dynamic_cp_group),
-        (1, latent_cp.dist.ReduceOp.MIN, tp_group),
-        (1, latent_cp.dist.ReduceOp.MIN, dynamic_cp_group),
-        (1, latent_cp.dist.ReduceOp.MIN, tp_group),
-    ]
-    assert adapter.prepare_calls == 1
-
-
-def test_grid_identity_uses_ordered_injected_group_membership_once(monkeypatch):
-    cp_group = object()
-    tp_group = object()
-    all_gathers = []
-
-    def get_world_size(group):
-        return 2
-
-    def get_ranks(group):
-        return [0, 2] if group is cp_group else [0, 1]
-
-    def all_gather(outputs, _local, group):
-        assert group is cp_group
-        all_gathers.append(group)
-        outputs[0].copy_(torch.tensor([0, 1]))
-        outputs[1].copy_(torch.tensor([2, 3]))
-
-    monkeypatch.setattr(latent_cp.dist, "get_world_size", get_world_size)
-    monkeypatch.setattr(latent_cp.dist, "get_process_group_ranks", get_ranks)
-    monkeypatch.setattr(latent_cp.dist, "all_gather", all_gather)
-    identity = latent_cp._grid_identity(cp_group, tp_group, torch.device("cpu"))
-    cached = latent_cp._grid_identity(cp_group, tp_group, torch.device("cpu"))
-    assert identity == (((0, 1), (2, 3)), ((0, 2), (1, 3)))
-    assert cached == identity
-    assert all_gathers == [cp_group]
 
 
 @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
@@ -2157,76 +1891,40 @@ def test_planner_rejects_invalid_global_metadata(cp_size: int):
         )
 
 
-def test_layout_adapter_rejects_invalid_format_layout_and_dynamic_metadata(monkeypatch):
+def test_layout_adapter_rejects_invalid_format_and_layout(monkeypatch):
     adapter = latent_cp.AlreadyZigZagTHDAdapter()
     hidden = mock.Mock()
     cp_group = object()
     monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 1)
     monkeypatch.setattr(latent_cp.dist, "get_rank", lambda _group: 0)
-    base = SimpleNamespace(
-        qkv_format="thd", cp_partition_mode="zigzag", local_cp_size=None, cp_group=None
-    )
+    base = SimpleNamespace(qkv_format="thd", cp_partition_mode="zigzag")
     for field, value, message in (
         ("qkv_format", "sbhd", "THD"),
         ("cp_partition_mode", "contiguous", "zigzag"),
-        ("local_cp_size", 0, "positive Python"),
-        ("cp_group", object(), "different CP"),
     ):
         metadata = SimpleNamespace(**vars(base))
         setattr(metadata, field, value)
         with pytest.raises(ValueError, match=message):
             adapter.prepare(hidden, metadata, cp_group)
 
-    missing_dynamic_group = SimpleNamespace(**vars(base))
-    missing_dynamic_group.local_cp_size = 1
-    with pytest.raises(ValueError, match="effective CP process group"):
-        adapter.prepare(hidden, missing_dynamic_group, cp_group)
 
-    wrong_dynamic_size = SimpleNamespace(**vars(base))
-    wrong_dynamic_size.local_cp_size = 2
-    wrong_dynamic_size.cp_group = cp_group
-    with pytest.raises(ValueError, match="disagrees"):
-        adapter.prepare(hidden, wrong_dynamic_size, cp_group)
+def test_block_preprocess_dispatches_only_to_latent_cp_layers():
+    hidden = torch.empty(1, 1, 1)
+    packed = PackedSeqParams()
+    latent_cp.preprocess_mla_latent_cp(nn.Sequential(nn.Identity()), hidden, None)
 
-
-def test_effective_dynamic_cp_group_resolution_is_per_forward_and_non_mutating(monkeypatch):
-    static_cp_group = object()
-    dynamic_cp_group = object()
-    module = SimpleNamespace(pg_collection=SimpleNamespace(cp=static_cp_group))
-    monkeypatch.setattr(
-        latent_cp.dist, "get_world_size", lambda group: 1 if group is dynamic_cp_group else 2
-    )
-
-    static_packed = SimpleNamespace(local_cp_size=None, cp_group=None)
-    assert latent_cp.MLAWithLatentCP._resolve_effective_cp_group(module, static_packed) == (
-        static_cp_group,
-        False,
-    )
-    dynamic_packed = SimpleNamespace(local_cp_size=1, cp_group=dynamic_cp_group)
-    assert latent_cp.MLAWithLatentCP._resolve_effective_cp_group(module, dynamic_packed) == (
-        dynamic_cp_group,
-        True,
-    )
-    assert module.pg_collection.cp is static_cp_group
-
-    with pytest.raises(ValueError, match="requires packed cp_group"):
-        latent_cp.MLAWithLatentCP._resolve_effective_cp_group(
-            module, SimpleNamespace(local_cp_size=1, cp_group=None)
-        )
-    with pytest.raises(ValueError, match="disagrees"):
-        latent_cp.MLAWithLatentCP._resolve_effective_cp_group(
-            module, SimpleNamespace(local_cp_size=2, cp_group=dynamic_cp_group)
-        )
+    layer = object.__new__(latent_cp.MLAWithLatentCP)
+    nn.Module.__init__(layer)
+    layer._preprocess_backend = mock.Mock()
+    latent_cp.preprocess_mla_latent_cp(nn.Sequential(layer), hidden, packed)
+    layer._preprocess_backend.assert_called_once_with(hidden, packed)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cuda_metadata_and_forward_negative_validation():
     with _model_parallel(1, 1) as pg:
         config = _make_config()
-        layer = _build_layer(config, pg).cuda().bfloat16().train()
-        layer._get_backend = types.MethodType(
-            lambda _self, _layout, *_args, **_kwargs: _TorchPackedAttentionAdapter(), layer
-        )
+        layer = _build_layer(config, pg, _TorchPackedAttentionAdapter()).cuda().bfloat16().train()
         hidden = torch.randn(8, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda")
         good = _make_packed((8,), device="cuda", cp_group=pg.cp)
         adapter = latent_cp.AlreadyZigZagTHDAdapter()
@@ -2356,11 +2054,8 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(cp_size,
 def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(rope_type, monkeypatch):
     with _model_parallel(1, 2) as pg:
         config = _make_config(cp_size=2, rope_type=rope_type)
-        layer = _build_layer(config, pg).cuda().bfloat16().train()
         backend = _TorchPackedAttentionAdapter()
-        layer._get_backend = types.MethodType(
-            lambda _self, _layout, *_args, **_kwargs: backend, layer
-        )
+        layer = _build_layer(config, pg, backend).cuda().bfloat16().train()
         lengths = (16, 8)
         local_tokens = sum(lengths) // 2
         packed = _make_packed(lengths, device="cuda", total_tokens=local_tokens)
@@ -2470,9 +2165,7 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(rope_
             return function(*args)
 
         direct_backend = _TorchPackedAttentionAdapter()
-        layer._get_backend = types.MethodType(
-            lambda _self, _layout, *_args, **_kwargs: direct_backend, layer
-        )
+        layer._backend_adapter = direct_backend
         uncheckpointed = _SavedTensorRecorder()
         direct_hidden = hidden.detach().clone().requires_grad_(True)
         with (
@@ -2686,16 +2379,13 @@ def test_dynamic_cp1_cp2_full_chain_parity_without_static_group_mutation(
         torch.cuda.manual_seed_all(_SEED + 40 + local_cp_size)
         model_parallel_cuda_manual_seed(_SEED + 40 + local_cp_size)
         config = _make_config(tp_size=2, cp_size=2, dynamic_cp=True)
-        layer = _build_layer(config, pg).cuda().bfloat16().train()
+        phase_backend = _TorchPackedAttentionAdapter()
+        layer = _build_layer(config, pg, phase_backend).cuda().bfloat16().train()
         static_cp_group = layer.pg_collection.cp
         effective_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
             group_size=local_cp_size
         )
         assert dist.get_world_size(effective_cp_group) == local_cp_size
-        phase_backend = _TorchPackedAttentionAdapter()
-        layer._get_backend = types.MethodType(
-            lambda _self, _layout, *_args, **_kwargs: phase_backend, layer
-        )
 
         reference = NaiveMLA(config, torch.device("cuda")).train()
         _copy_reference_parameters(reference, layer, pg)
@@ -2721,6 +2411,7 @@ def test_dynamic_cp1_cp2_full_chain_parity_without_static_group_mutation(
             lengths, device="cuda", cp_group=effective_cp_group, local_cp_size=local_cp_size
         )
 
+        latent_cp.preprocess_mla_latent_cp(layer, local_hidden, packed)
         with _forbid_default_process_group_resolvers():
             real_output, bias = layer(local_hidden, None, packed_seq_params=packed)
         assert bias is None
@@ -3130,14 +2821,12 @@ def _run_production_parity(
             gate_granularity=gate_granularity,
             no_rope=no_rope,
         )
-        layer = _build_layer(config, pg).cuda().bfloat16().train()
+        phase_backend = _TorchPackedAttentionAdapter() if torch_phase_backend else None
+        layer = _build_layer(config, pg, phase_backend).cuda().bfloat16().train()
         assert (layer.linear_gate is not None) is attention_output_gate
         assert (layer.rotary_pos_emb is None) is no_rope
         if torch_phase_backend:
-            phase_backend = _TorchPackedAttentionAdapter()
-            layer._get_backend = types.MethodType(
-                lambda _self, _layout, *_args, **_kwargs: phase_backend, layer
-            )
+            assert layer._backend_adapter is phase_backend
             evidence_event = (
                 "mla_latent_cp_torch_feature_parity"
                 if attention_output_gate or no_rope
@@ -3151,8 +2840,8 @@ def _run_production_parity(
             ]
         else:
             assert runtime is not None
-            assert layer._backend_adapter is None
-            assert layer._backend_runtime_tuple is None
+            assert layer._backend_runtime_tuple == runtime
+            assert layer._backend_adapter is not None
             evidence_event = "mla_latent_cp_parity"
             evidence_backend = backend.name
             runtime_payload = [runtime[0].name, runtime[1], runtime[2], list(runtime[3])]
@@ -3198,6 +2887,7 @@ def _run_production_parity(
         assert torch.equal(torch.cat(tp_inputs, dim=0), cp_local_hidden)
         del tp_inputs
 
+        latent_cp.preprocess_mla_latent_cp(layer, local_hidden, packed)
         with _forbid_default_process_group_resolvers():
             real_output, bias = layer(local_hidden, None, packed_seq_params=packed)
         assert bias is None
@@ -3300,6 +2990,7 @@ def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
         latent_packed = _make_packed(_PRODUCTION_PACKED_LENGTHS, device="cuda", cp_group=pg.cp)
         legacy_packed = _make_packed(_PRODUCTION_PACKED_LENGTHS, device="cuda", cp_group=pg.cp)
 
+        latent_cp.preprocess_mla_latent_cp(latent_layer, latent_hidden, latent_packed)
         with _forbid_default_process_group_resolvers():
             latent_output, latent_bias = latent_layer(
                 latent_hidden, None, packed_seq_params=latent_packed

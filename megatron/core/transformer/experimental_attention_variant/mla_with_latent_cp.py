@@ -4,9 +4,10 @@
 
 This module intentionally has no registration side effects. GPTModel and HybridModel opt in through
 ``TransformerConfig.mla_latent_cp`` and call the feature-owned, non-mutating decoder/stack
-configurators during initialization. The implementation
-bypasses MCore and Transformer Engine attention wrappers: only the existing MLA projection modules
-and RoPE implementation are reused.
+configurators during initialization. Transformer and hybrid blocks explicitly preprocess expensive
+microbatch-specific backend plans before entering their layer loops. The implementation bypasses
+MCore and Transformer Engine attention wrappers: only the existing MLA projection modules and RoPE
+implementation are reused.
 """
 
 from __future__ import annotations
@@ -17,11 +18,8 @@ import importlib.metadata
 import math
 import os
 import threading
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import IntEnum
-from functools import cache
 from typing import Any, Final, Iterator, Literal, Protocol, TypeAlias
 
 import torch
@@ -31,7 +29,7 @@ from torch.utils.checkpoint import checkpoint
 
 import megatron.core.tensor_parallel as mcore_tp
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import mappings as tp_mappings
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -58,6 +56,11 @@ QUALIFIED_BACKEND_CONFIGS: Final[tuple[QualifiedBackendTuple, ...]] = (
     (AttnBackend.fused, "1.26.0", "9.25.0", (10, 0)),
     (AttnBackend.flash, "4.0.0b11", "flash-attn-4==4.0.0b11", (10, 0)),
 )
+
+
+# -----------------------------------------------------------------------------
+# Contracts and shared metadata
+# -----------------------------------------------------------------------------
 
 
 class LatentCPError(RuntimeError):
@@ -144,6 +147,11 @@ class LatentCPTransport(Protocol):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(f"MLAWithLatentCP: {message}")
+
+
+# -----------------------------------------------------------------------------
+# Packed zigzag layout and phase planning
+# -----------------------------------------------------------------------------
 
 
 def _cu_from_lengths(lengths: Tensor) -> Tensor:
@@ -308,26 +316,6 @@ class AlreadyZigZagTHDAdapter:
             packed_seq_params.cp_partition_mode == "zigzag",
             "only an already-zigzag CP partition is supported",
         )
-        if packed_seq_params.local_cp_size is None:
-            _require(
-                packed_seq_params.cp_group is None or packed_seq_params.cp_group is cp_group,
-                "packed metadata names a different CP process group",
-            )
-        else:
-            _require(
-                isinstance(packed_seq_params.local_cp_size, int)
-                and not isinstance(packed_seq_params.local_cp_size, bool)
-                and packed_seq_params.local_cp_size > 0,
-                "dynamic local_cp_size must be a positive Python integer",
-            )
-            _require(
-                packed_seq_params.cp_group is cp_group,
-                "dynamic packed metadata must name the effective CP process group",
-            )
-            _require(
-                packed_seq_params.local_cp_size == dist.get_world_size(cp_group),
-                "dynamic local_cp_size disagrees with the effective CP process group",
-            )
         cu_q = packed_seq_params.cu_seqlens_q
         cu_kv = packed_seq_params.cu_seqlens_kv
         _require(isinstance(cu_q, Tensor) and isinstance(cu_kv, Tensor), "missing cu_seqlens")
@@ -371,6 +359,11 @@ class AlreadyZigZagTHDAdapter:
             _require(tp_group is not None, "sequence parallelism requires a TP group")
             local_tokens *= dist.get_world_size(tp_group)
         return build_zigzag_layout(cu_q, local_tokens, cp_size, cp_rank, max_global=max_q)
+
+
+# -----------------------------------------------------------------------------
+# Differentiable latent P2P transport
+# -----------------------------------------------------------------------------
 
 
 class _LatentRingExchange(torch.autograd.Function):
@@ -440,6 +433,11 @@ class P2PRingTransport:
                 )
 
 
+# -----------------------------------------------------------------------------
+# FP32 partial-output merge and backend-independent gradient correction
+# -----------------------------------------------------------------------------
+
+
 def scatter_upper_phase(
     output: Tensor, lse: Tensor, back_indices: Tensor, local_tokens: int
 ) -> tuple[Tensor, Tensor]:
@@ -492,6 +490,11 @@ def cudnn_backward_proxy(
     raw_correction = coefficient.unsqueeze(-1) * grad_output
     correction = torch.where(safe.unsqueeze(-1), raw_correction, torch.zeros_like(raw_correction))
     return partial_output - correction, grad_output
+
+
+# -----------------------------------------------------------------------------
+# Direct FA4 and cuDNN Frontend adapters
+# -----------------------------------------------------------------------------
 
 
 class DirectAttentionAdapter(Protocol):
@@ -1037,7 +1040,7 @@ class CudnnFusedAttentionAdapter:
         except self.cudnn.cudnnGraphNotSupportedError as error:
             raise BackendPlanNotSupportedError(str(error)) from error
 
-    def _get_plan(self, key: _CudnnPlanKey) -> _CudnnPlan:
+    def _prepare_plan(self, key: _CudnnPlanKey) -> _CudnnPlan:
         with self._execution_lock:
             plan = self._plans.get(key)
             if plan is None:
@@ -1048,6 +1051,15 @@ class CudnnFusedAttentionAdapter:
                 )
                 self._plans[key] = plan
             return plan
+
+    def _get_prepared_plan(self, key: _CudnnPlanKey) -> _CudnnPlan:
+        with self._execution_lock:
+            plan = self._plans.get(key)
+        if plan is None:
+            raise BackendPlanNotSupportedError(
+                "cuDNN phase plan was not prepared before transformer block execution"
+            )
+        return plan
 
     def prepare(
         self,
@@ -1074,7 +1086,7 @@ class CudnnFusedAttentionAdapter:
                 causal=phase.causal,
                 scale=scale,
             )
-            self._get_plan(key)
+            self._prepare_plan(key)
 
     def _execution_key(
         self,
@@ -1127,7 +1139,7 @@ class CudnnFusedAttentionAdapter:
         scale: float,
     ) -> tuple[Tensor, Tensor]:
         key = self._execution_key(q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale)
-        plan = self._get_plan(key)
+        plan = self._get_prepared_plan(key)
         metadata = self._metadata(cu_q, cu_kv, key.heads, key.qk_dim, key.v_dim)
         q_buffer = _pad_token_rows(q, key.capacity_q)
         k_buffer = _pad_token_rows(k, key.capacity_kv)
@@ -1172,7 +1184,7 @@ class CudnnFusedAttentionAdapter:
         scale: float,
     ) -> tuple[Tensor, Tensor, Tensor]:
         key = self._execution_key(q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale)
-        plan = self._get_plan(key)
+        plan = self._get_prepared_plan(key)
         metadata = self._metadata(cu_q, cu_kv, key.heads, key.qk_dim, key.v_dim)
         q_buffer = _pad_token_rows(q, key.capacity_q)
         k_buffer = _pad_token_rows(k, key.capacity_kv)
@@ -1237,160 +1249,9 @@ def _shared_cudnn_adapter(runtime_identity: QualifiedBackendTuple) -> CudnnFused
         return adapter
 
 
-GridIdentity: TypeAlias = tuple[tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...]]
-
-
-@dataclass(frozen=True)
-class _BackendPreflightSignature:
-    runtime_identity: QualifiedBackendTuple
-    device_name: str
-    device_total_memory: int
-    dtype: torch.dtype
-    global_lengths: tuple[int, ...]
-    max_global: int
-    tp_rows: tuple[tuple[int, ...], ...]
-    cp_columns: tuple[tuple[int, ...], ...]
-    tp_size: int
-    cp_size: int
-    heads: int
-    qk_dim: int
-    v_dim: int
-    scale: float
-    backend: AttnBackend
-
-
-@dataclass(frozen=True)
-class _ForwardPreflightKey:
-    device_index: int
-    cp_group_id: int
-    tp_group_id: int
-    cu_global_id: int
-    max_global: int
-    tp_size: int
-    cp_size: int
-    heads: int
-    qk_dim: int
-    v_dim: int
-    scale: float
-    backend: AttnBackend
-
-
-@dataclass(frozen=True)
-class _ForwardPreflightResult:
-    cp_group: dist.ProcessGroup
-    tp_group: dist.ProcessGroup
-    cu_global: Tensor
-    adapter: DirectAttentionAdapter
-    runtime_identity: QualifiedBackendTuple
-
-
-@dataclass
-class _ForwardPreflightState:
-    results: dict[_ForwardPreflightKey, _ForwardPreflightResult]
-
-
-_LATENT_CP_PREFLIGHT_STATE: Final[ContextVar[_ForwardPreflightState | None]] = ContextVar(
-    "mla_latent_cp_preflight_state", default=None
-)
-
-
-@contextmanager
-def latent_cp_preflight_scope() -> Iterator[None]:
-    """Share one successful backend preflight across MLA layers in a model forward."""
-
-    token = _LATENT_CP_PREFLIGHT_STATE.set(_ForwardPreflightState(results={}))
-    try:
-        yield
-    finally:
-        _LATENT_CP_PREFLIGHT_STATE.reset(token)
-
-
-class _LatentCPPreflightMixin:
-    """Open the feature-owned preflight scope around one decoder forward."""
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Delegate one decoder forward inside a fresh latent-CP preflight scope."""
-
-        with latent_cp_preflight_scope():
-            return super().forward(*args, **kwargs)  # type: ignore[misc]
-
-
-@cache
-def _preflight_scoped_module(module: type[torch.nn.Module]) -> type[torch.nn.Module]:
-    """Return a state-dict-neutral subclass that owns the decoder-forward scope."""
-
-    _require(
-        isinstance(module, type) and issubclass(module, torch.nn.Module),
-        "decoder module must be a torch.nn.Module class",
-    )
-    return type(
-        f"LatentCPPreflight{module.__name__}",
-        (_LatentCPPreflightMixin, module),
-        {
-            "__doc__": f"{module.__name__} with a feature-owned latent-CP preflight scope.",
-            "__module__": __name__,
-        },
-    )
-
-
-_BACKEND_PREFLIGHT_LOCK: Final[threading.Lock] = threading.Lock()
-_BACKEND_PREFLIGHT_SUCCESS: dict[
-    tuple[int, int, _BackendPreflightSignature], DirectAttentionAdapter
-] = {}
-_GRID_IDENTITY_CACHE: dict[
-    tuple[int, int], tuple[dist.ProcessGroup, dist.ProcessGroup, GridIdentity]
-] = {}
-
-
-def _grid_identity(
-    cp_group: dist.ProcessGroup,
-    tp_group: dist.ProcessGroup,
-    device: torch.device,
-    *,
-    use_cache: bool = True,
-) -> GridIdentity:
-    """Resolve a rank-common ordered identity for the injected TP x CP grid once."""
-
-    cache_key = (id(cp_group), id(tp_group))
-    if use_cache:
-        with _BACKEND_PREFLIGHT_LOCK:
-            cached = _GRID_IDENTITY_CACHE.get(cache_key)
-            if cached is not None and cached[0] is cp_group and cached[1] is tp_group:
-                return cached[2]
-
-    cp_size = dist.get_world_size(cp_group)
-    tp_size = dist.get_world_size(tp_group)
-    local_tp_ranks = tuple(dist.get_process_group_ranks(tp_group))
-    local_cp_ranks = tuple(dist.get_process_group_ranks(cp_group))
-    _require(len(local_tp_ranks) == tp_size, "invalid injected TP rank list")
-    _require(len(local_cp_ranks) == cp_size, "invalid injected CP rank list")
-
-    local_tp_tensor = torch.tensor(local_tp_ranks, dtype=torch.int64, device=device)
-    if cp_size > 1:
-        gathered_tp_tensors = [torch.empty_like(local_tp_tensor) for _ in range(cp_size)]
-        dist.all_gather(gathered_tp_tensors, local_tp_tensor, group=cp_group)
-        tp_rows = tuple(
-            tuple(int(rank) for rank in row.cpu().tolist()) for row in gathered_tp_tensors
-        )
-    else:
-        tp_rows = (local_tp_ranks,)
-
-    cp_columns = tuple(
-        tuple(tp_rows[cp_index][tp_index] for cp_index in range(cp_size))
-        for tp_index in range(tp_size)
-    )
-    _require(local_tp_ranks in tp_rows, "local TP group is absent from grid identity")
-    _require(local_cp_ranks in cp_columns, "local CP group is absent from grid identity")
-    flattened = tuple(rank for row in tp_rows for rank in row)
-    _require(
-        len(flattened) == cp_size * tp_size and len(set(flattened)) == len(flattened),
-        "injected TP/CP groups do not form one rectangular rank grid",
-    )
-    identity: GridIdentity = (tp_rows, cp_columns)
-    if use_cache:
-        with _BACKEND_PREFLIGHT_LOCK:
-            _GRID_IDENTITY_CACHE[cache_key] = (cp_group, tp_group, identity)
-    return identity
+# -----------------------------------------------------------------------------
+# Runtime qualification and shared backend construction
+# -----------------------------------------------------------------------------
 
 
 def _runtime_backend_tuple(backend: AttnBackend) -> QualifiedBackendTuple:
@@ -1487,6 +1348,11 @@ def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> No
     )
 
 
+# -----------------------------------------------------------------------------
+# Latent-CP MLA module
+# -----------------------------------------------------------------------------
+
+
 class MLAWithLatentCP(MLASelfAttention):
     """Training-only THD MLA whose P2P CP ring exchanges normalized latent KV."""
 
@@ -1525,11 +1391,14 @@ class MLAWithLatentCP(MLASelfAttention):
         )
         self._cp_comm_type = cp_comm_type if cp_comm_type is not None else config.cp_comm_type
         self._layout_adapter: LatentCPLayoutAdapter = AlreadyZigZagTHDAdapter()
-        self._backend_adapter: DirectAttentionAdapter | None = None
-        self._backend_runtime_tuple: QualifiedBackendTuple | None = None
         self._parameter_dtypes_validated = False
         self._validate_initial_config()
         self._validate_projection_groups()
+        self._backend_adapter: DirectAttentionAdapter
+        self._backend_runtime_tuple: QualifiedBackendTuple
+        self._backend_adapter, self._backend_runtime_tuple = _qualified_backend_adapter(
+            self.config.attention_backend
+        )
 
     def _validate_initial_config(self) -> None:
         config = self.config
@@ -1695,33 +1564,35 @@ class MLAWithLatentCP(MLASelfAttention):
             self._parameter_dtypes_validated = True
         return packed_seq_params
 
-    def _resolve_effective_cp_group(
-        self, packed_seq_params: PackedSeqParams
-    ) -> tuple[dist.ProcessGroup, bool]:
-        """Resolve one immutable per-forward CP group without mutating module state."""
+    def _microbatch_layout(
+        self, hidden_states: Tensor, packed_seq_params: PackedSeqParams
+    ) -> tuple[dist.ProcessGroup, ZigZagLayout]:
+        """Build the cheap per-microbatch layout using the scheduler-selected CP group."""
 
-        dynamic_cp = packed_seq_params.local_cp_size is not None
-        if not dynamic_cp:
-            _require(
-                packed_seq_params.cp_group is None
-                or packed_seq_params.cp_group is self.pg_collection.cp,
-                "static packed metadata names a different CP process group",
-            )
-            return self.pg_collection.cp, False
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        layout = self._layout_adapter.prepare(
+            hidden_states,
+            packed_seq_params,
+            cp_group,
+            tp_group=self.pg_collection.tp,
+            sequence_parallel=self.config.sequence_parallel,
+        )
+        return cp_group, layout
 
-        _require(
-            isinstance(packed_seq_params.local_cp_size, int)
-            and not isinstance(packed_seq_params.local_cp_size, bool)
-            and packed_seq_params.local_cp_size > 0,
-            "dynamic local_cp_size must be a positive Python integer",
+    def _preprocess_backend(
+        self, hidden_states: Tensor, packed_seq_params: PackedSeqParams
+    ) -> None:
+        """Prepare expensive backend plans before the transformer layer loop."""
+
+        _require(isinstance(packed_seq_params, PackedSeqParams), "PackedSeqParams is required")
+        _, layout = self._microbatch_layout(hidden_states, packed_seq_params)
+        self._backend_adapter.prepare(
+            num_heads=self.num_attention_heads_per_partition,
+            qk_dim=self.q_head_dim,
+            v_dim=self.config.v_head_dim,
+            phases=layout.phases,
+            scale=self.softmax_scale,
         )
-        effective_cp_group = packed_seq_params.cp_group
-        _require(effective_cp_group is not None, "dynamic CP requires packed cp_group metadata")
-        _require(
-            dist.get_world_size(effective_cp_group) == packed_seq_params.local_cp_size,
-            "dynamic local_cp_size disagrees with packed cp_group",
-        )
-        return effective_cp_group, True
 
     def _explicit_output_projection(self, core_output: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the inherited row-sharded weight without an implicit TP-group lookup."""
@@ -1756,161 +1627,6 @@ class MLAWithLatentCP(MLASelfAttention):
                 output_parallel, group=self.pg_collection.tp
             )
         return output, None
-
-    def _get_backend(
-        self,
-        layout: ZigZagLayout,
-        cp_group: dist.ProcessGroup | None = None,
-        *,
-        dynamic_cp: bool = False,
-    ) -> DirectAttentionAdapter:
-        if cp_group is None:
-            cp_group = self.pg_collection.cp
-        device_index = torch.cuda.current_device()
-        device = torch.device("cuda", device_index)
-        tp_group = self.pg_collection.tp
-        tp_size = dist.get_world_size(tp_group)
-        cp_size = dist.get_world_size(cp_group)
-        forward_scope = _LATENT_CP_PREFLIGHT_STATE.get()
-        scope_key: _ForwardPreflightKey | None = None
-        if forward_scope is not None:
-            scope_key = _ForwardPreflightKey(
-                device_index=device_index,
-                cp_group_id=id(cp_group),
-                tp_group_id=id(tp_group),
-                cu_global_id=id(layout.cu_global),
-                max_global=layout.max_global,
-                tp_size=tp_size,
-                cp_size=cp_size,
-                heads=self.num_attention_heads_per_partition,
-                qk_dim=self.q_head_dim,
-                v_dim=self.config.v_head_dim,
-                scale=float(self.softmax_scale),
-                backend=self.config.attention_backend,
-            )
-            scoped = forward_scope.results.get(scope_key)
-            if scoped is not None:
-                _require(
-                    scoped.cp_group is cp_group
-                    and scoped.tp_group is tp_group
-                    and scoped.cu_global is layout.cu_global,
-                    "forward preflight scope identity collision",
-                )
-                self._backend_adapter = scoped.adapter
-                self._backend_runtime_tuple = scoped.runtime_identity
-                return scoped.adapter
-
-        local_error: Exception | None = None
-        signature: _BackendPreflightSignature | None = None
-        adapter: DirectAttentionAdapter | None = None
-        current_tuple: QualifiedBackendTuple | None = None
-        cache_hit = False
-        try:
-            tp_rows, cp_columns = _grid_identity(
-                cp_group,
-                tp_group,
-                device,
-                # Dynamic subgroup members can have different process-local cache histories.
-                # Every invocation that reaches this gate must run the same collective graph.
-                use_cache=not dynamic_cp,
-            )
-            current_tuple = _runtime_backend_tuple(self.config.attention_backend)
-            properties = torch.cuda.get_device_properties(device_index)
-            global_lengths = tuple(
-                int(length)
-                for length in (layout.cu_global[1:] - layout.cu_global[:-1]).cpu().tolist()
-            )
-            signature = _BackendPreflightSignature(
-                runtime_identity=current_tuple,
-                device_name=str(properties.name),
-                device_total_memory=int(properties.total_memory),
-                dtype=torch.bfloat16,
-                global_lengths=global_lengths,
-                max_global=layout.max_global,
-                tp_rows=tp_rows,
-                cp_columns=cp_columns,
-                tp_size=tp_size,
-                cp_size=cp_size,
-                heads=self.num_attention_heads_per_partition,
-                qk_dim=self.q_head_dim,
-                v_dim=self.config.v_head_dim,
-                scale=float(self.softmax_scale),
-                backend=self.config.attention_backend,
-            )
-            success_key = (os.getpid(), device_index, signature)
-            with _BACKEND_PREFLIGHT_LOCK:
-                adapter = _BACKEND_PREFLIGHT_SUCCESS.get(success_key)
-                if adapter is not None:
-                    cache_hit = True
-            if adapter is not None and not dynamic_cp:
-                self._backend_adapter = adapter
-                self._backend_runtime_tuple = current_tuple
-                if forward_scope is not None and scope_key is not None:
-                    forward_scope.results[scope_key] = _ForwardPreflightResult(
-                        cp_group=cp_group,
-                        tp_group=tp_group,
-                        cu_global=layout.cu_global,
-                        adapter=adapter,
-                        runtime_identity=current_tuple,
-                    )
-                return adapter
-
-            if not cache_hit:
-                if self._backend_adapter is None:
-                    adapter, qualified_tuple = _qualified_backend_adapter(
-                        self.config.attention_backend, current_tuple
-                    )
-                    self._backend_adapter = adapter
-                    self._backend_runtime_tuple = qualified_tuple
-                _require(
-                    self._backend_runtime_tuple == current_tuple,
-                    "backend package/runtime/device tuple changed after construction",
-                )
-                adapter = self._backend_adapter
-                adapter.prepare(
-                    num_heads=self.num_attention_heads_per_partition,
-                    qk_dim=self.q_head_dim,
-                    v_dim=self.config.v_head_dim,
-                    phases=layout.phases,
-                    scale=self.softmax_scale,
-                )
-            else:
-                self._backend_adapter = adapter
-                self._backend_runtime_tuple = current_tuple
-        except Exception as error:
-            local_error = error
-
-        backend_ok = torch.tensor(
-            0 if local_error is not None else 1, dtype=torch.int32, device=device
-        )
-        # CP-first then TP propagates any failure through the complete TP x CP grid.
-        # Singleton dimensions are the trivial consensus and launch no collective.
-        if cp_size > 1:
-            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=cp_group)
-        if tp_size > 1:
-            dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=tp_group)
-        if int(backend_ok.item()) == 0:
-            raise LatentCPError(
-                "backend qualification/availability/plan preflight failed on the TP x CP grid"
-            ) from local_error
-        if signature is None or adapter is None or current_tuple is None:
-            raise LatentCPError("backend consensus succeeded without complete preflight state")
-
-        # No local attempt and no partial consensus can populate this cache.
-        success_key = (os.getpid(), device_index, signature)
-        with _BACKEND_PREFLIGHT_LOCK:
-            _BACKEND_PREFLIGHT_SUCCESS[success_key] = adapter
-        self._backend_adapter = adapter
-        self._backend_runtime_tuple = current_tuple
-        if forward_scope is not None and scope_key is not None:
-            forward_scope.results[scope_key] = _ForwardPreflightResult(
-                cp_group=cp_group,
-                tp_group=tp_group,
-                cu_global=layout.cu_global,
-                adapter=adapter,
-                runtime_identity=current_tuple,
-            )
-        return adapter
 
     def _latent_cp_down_projection(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
         """Run local projection modules and gather every shard with the injected TP group."""
@@ -2083,15 +1799,8 @@ class MLAWithLatentCP(MLASelfAttention):
             sequence_len_offset,
             inference_params,
         )
-        effective_cp_group, dynamic_cp = self._resolve_effective_cp_group(packed_seq_params)
-        layout = self._layout_adapter.prepare(
-            hidden_states,
-            packed_seq_params,
-            effective_cp_group,
-            tp_group=self.pg_collection.tp,
-            sequence_parallel=self.config.sequence_parallel,
-        )
-        backend = self._get_backend(layout, effective_cp_group, dynamic_cp=dynamic_cp)
+        effective_cp_group, layout = self._microbatch_layout(hidden_states, packed_seq_params)
+        backend = self._backend_adapter
         query, local_payload = self._project_query_and_payload(
             hidden_states, packed_seq_params, layout, effective_cp_group
         )
@@ -2143,6 +1852,30 @@ class MLAWithLatentCP(MLASelfAttention):
         if self.linear_gate is not None:
             core_output = self._project_and_apply_mla_output_gate(core_output, hidden_states)
         return self._explicit_output_projection(core_output)
+
+
+def preprocess_mla_latent_cp(
+    block: torch.nn.Module, hidden_states: Tensor, packed_seq_params: PackedSeqParams | None
+) -> None:
+    """Prepare every latent-CP attention layer before a block enters its layer loop.
+
+    Backend qualification is construction-time state. This hook owns only expensive,
+    microbatch-specific plan preparation; it does not cache forward state or run collectives.
+    """
+
+    latent_layers = tuple(
+        module for module in block.modules() if isinstance(module, MLAWithLatentCP)
+    )
+    if not latent_layers:
+        return
+    _require(isinstance(packed_seq_params, PackedSeqParams), "PackedSeqParams is required")
+    for layer in latent_layers:
+        layer._preprocess_backend(hidden_states, packed_seq_params)
+
+
+# -----------------------------------------------------------------------------
+# Non-mutating model-spec integration
+# -----------------------------------------------------------------------------
 
 
 def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
@@ -2251,9 +1984,9 @@ def _replace_transformer_layer_attention(layer_spec: ModuleSpec) -> tuple[Module
 
 
 def configure_mla_latent_cp_decoder(
-    decoder_module: type[torch.nn.Module], decoder_spec: ModuleSpec | TransformerBlockSubmodules
-) -> tuple[type[torch.nn.Module], ModuleSpec | TransformerBlockSubmodules]:
-    """Return a preflight-scoped decoder class and non-mutating latent-CP GPT spec."""
+    decoder_spec: ModuleSpec | TransformerBlockSubmodules,
+) -> ModuleSpec | TransformerBlockSubmodules:
+    """Return a non-mutating GPT decoder spec with latent CP attention."""
 
     replaced = 0
     if isinstance(decoder_spec, ModuleSpec):
@@ -2272,7 +2005,7 @@ def configure_mla_latent_cp_decoder(
             "latent CP requires a ModuleSpec or TransformerBlockSubmodules decoder spec"
         )
     _require(replaced > 0, "decoder spec contains no ordinary MLA attention slot")
-    return _preflight_scoped_module(decoder_module), configured_spec
+    return configured_spec
 
 
 def configure_mla_latent_cp_hybrid_stack(stack_spec: ModuleSpec) -> ModuleSpec:
@@ -2290,7 +2023,6 @@ def configure_mla_latent_cp_hybrid_stack(stack_spec: ModuleSpec) -> ModuleSpec:
     _require(replaced, "hybrid MLA layer template has no ordinary MLA attention slot")
     return replace(
         stack_spec,
-        module=_preflight_scoped_module(stack_spec.module),
         params=dict(stack_spec.params),
         metainfo=dict(stack_spec.metainfo),
         submodules=replace(stack_submodules, attention_layer=latent_layer),

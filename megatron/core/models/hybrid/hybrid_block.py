@@ -913,6 +913,11 @@ class HybridStack(MegatronModule):
                 hidden_states, self.config.num_residual_streams
             )
 
+        if self.config.mla_latent_cp:
+            from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
+
+            mla_with_latent_cp.preprocess_mla_latent_cp(self, hidden_states, packed_seq_params)
+
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,

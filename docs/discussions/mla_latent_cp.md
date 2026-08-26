@@ -18,11 +18,13 @@ orphan: true
 This document proposes a deliberately narrow first implementation. It is not a compatibility plan
 for the existing MLA attention path. The attention algorithm and all backend code remain isolated
 in the feature-owned module. That module also owns its local attention spec, non-mutating GPT and
-Hybrid spec rewrites, and the decoder-forward preflight wrapper. GPTModel and HybridModel each make
-one conditional initialization call; their layer-spec and training builders have no latent-CP
-branch. Transformer Engine (TE) and all existing MLA tests remain unchanged. One shared MLA file has
-a deliberately small compatibility change: it honors the existing per-layer `no_rope_freq` flag by
-not constructing or applying a rotary embedding for that layer. The latent-CP module owns all CP,
+Hybrid spec rewrites, and one explicit backend-plan preprocessing entry point. GPTModel and
+HybridModel each make one conditional spec-initialization call; ordinary `TransformerBlock` and
+`HybridStack` each make one guarded preprocessing call before their layer loop. Generic dynamic-CP
+metadata consistency belongs to the data scheduler rather than the attention feature. Transformer
+Engine (TE) and all existing MLA tests remain unchanged. One shared MLA file has a deliberately
+small compatibility change: it honors the existing per-layer `no_rope_freq` flag by not
+constructing or applying a rotary embedding for that layer. The latent-CP module owns all CP,
 backend, merge, and transport logic.
 
 P2P context parallelism (CP) circulates normalized MLA latent KV and the positional key component,
@@ -108,8 +110,10 @@ effective CP group with public `torch.distributed` APIs and an explicit group ar
 receives the same collection and constructs every accepted Column/RowParallel projection with
 `tp_group=pg_collection.tp`; v1 validates each projection's stored `tp_group` against that injected
 object before forward. Static forwards use `pg_collection.cp`. Dynamic forwards require
-`PackedSeqParams.local_cp_size` and an object-identical `PackedSeqParams.cp_group`, thread that
-effective group through layout, RoPE, preflight, and transport, and never mutate the module's stored
+scheduler-populated `PackedSeqParams.local_cp_size` and `PackedSeqParams.cp_group`. The data
+scheduler validates that the size is a positive Python integer, the group is present, and its size
+matches. The feature resolves that group with the shared `resolve_cp_group` helper, threads it
+through layout, RoPE, preprocessing, and transport, and never mutates the module's stored
 collection. Every collective names the injected TP or effective CP group; omission is a test
 failure, not a fallback.
 
@@ -323,7 +327,7 @@ THD packs sequences consecutively and each local sequence is `[F_r,B_r]`. Every 
 cumulative tensor is contiguous `torch.int32` on the same device as `cu_global`. The implementation
 passes `dtype=torch.int32` explicitly to `torch.cumsum`; integral `torch.cumsum` otherwise promotes
 the result to `torch.int64`, which the public FA4 varlen API rejects. Sequence lengths and tensor
-capacity validation bound the cumulative values before this derivation. The planner caches
+capacity validation bound the cumulative values before this derivation. The planner derives
 per-sequence front/back indices and uses:
 
 - diagonal: `cu_seqlens_q=cu_full`, `cu_seqlens_kv=cu_full`;
@@ -428,10 +432,11 @@ Gradient ownership is:
   The module does not add another parameter all-reduce.
 
 The constructor requires `pg_collection` and retains its `cp`/`tp` groups. Static forwards use the
-stored CP group. A dynamic forward resolves a per-microbatch effective group exclusively from the
-paired `PackedSeqParams.local_cp_size/cp_group` fields, validates their size, and passes that object
-to every layout, RoPE, preflight, and transport operation without assigning it back to
-`pg_collection`. Peers are resolved from the effective group with
+stored CP group. For dynamic CP, the data scheduler owns creation and generic consistency checks for
+the paired `PackedSeqParams.local_cp_size/cp_group` fields. A dynamic forward resolves the
+per-microbatch group through the shared helper and passes that object to every layout, RoPE,
+preprocessing, and transport operation without assigning it back to `pg_collection`. Peers are
+resolved from the effective group with
 `torch.distributed.get_process_group_ranks`. Consecutive microbatches may therefore use CP=1 or a
 larger initialized subgroup on one immutable module.
 
@@ -495,16 +500,15 @@ fresh tensor for the autograd node and is never overwritten before backward. Fix
 identical operation lists, and identical phase counts prevent mismatched-message and parity-order
 deadlocks.
 
-All config, metadata, dtype, peer, package, capability, and descriptor/plan checks complete before
-the first ring hop. Runtime-tuple resolution, direct-adapter creation, and preparation of every
-rank-local phase class execute inside one ordinary-`Exception`-to-status boundary. Every rank then
-performs CUDA-int32 `MIN` consensus first on the injected CP group and then on the injected TP group;
-singleton dimensions are the trivial consensus and launch no collective. Only after both reductions
-succeed may a rank proceed or populate the successful-preflight cache. If either reduction reports
-failure, all TP x CP peers raise before P2P and the locally failing rank chains its original error.
-A local failure or partial consensus never creates a success entry. Once P2P starts, the module makes
-no claim to recover from an arbitrary Python, CUDA, or NCCL exception; failures propagate through
-normal PyTorch/NCCL error handling.
+Feature-static config, package, runtime, and capability checks run in the layer constructor, using
+the configured maximum CP/TP groups where group properties are needed. Cheap dtype, metadata, and
+peer checks run in `forward`. Before the layer loop, block-level preprocessing enumerates the exact
+microbatch phase shapes and builds or reuses the expensive cuDNN Graph plans. It stores no
+microbatch result, performs no rank consensus, and introduces no decoder scope or wrapper class.
+During a phase, the cuDNN adapter only looks up a previously prepared plan; it cannot build one in
+the ring. A direct/custom layer call that bypasses block preprocessing therefore fails in phase zero
+before the first ring hop. Once P2P starts, the module makes no claim to recover from an arbitrary
+Python, CUDA, or NCCL exception; failures propagate through normal PyTorch/NCCL error handling.
 
 `LatentCPTransport` remains an extension seam. A later explicitly configured transport may return a
 `PayloadLease` plus readiness event from a communication stream, but no overlap setting or fallback
@@ -617,54 +621,42 @@ mapping keys, and no extra entry. The epsilon is a parity assertion threshold, n
 runtime knob.
 
 Qualified full-parity tests do not assign an adapter or mutate the allow-list. They resolve the
-installed tuple without constructing an adapter, require exact membership, construct the layer with
-empty backend state, and exercise the normal module `forward -> _get_backend` qualification and
-CP-then-TP preflight path. A real-backend test on an installed but unqualified tuple skips with the
-detected tuple and complete exact allow-list in its reason before any cuDNN Graph or FA4 kernel is
-constructed. Production itself remains fail-closed and raises; it never skips, probes numerically,
-or falls back. Direct cuDNN mathematical diagnostics use the same resolution gate before obtaining
-the public qualified adapter.
+installed tuple without constructing an adapter, require exact membership, construct the layer, and
+require its constructor-populated adapter and runtime tuple to match. They call the same explicit
+block preprocessing entry point before forward. A real-backend test on an installed but unqualified
+tuple skips with the detected tuple and complete exact allow-list in its reason before layer or
+backend construction. Production itself remains fail-closed and raises; it never skips, probes
+numerically, or falls back. Direct cuDNN mathematical diagnostics use the same resolution gate
+before obtaining the public qualified adapter.
 
 Sanitized qualification evidence records the source revision, exact distribution/runtime and
 compute capability, configuration/seed, per-tensor cosine and tensor-similarity minima, derived
 epsilon, and descriptor/plan status. Environment-specific paths, system names, and raw launch
 identifiers remain outside this document.
 
-Runtime constructs the same four-field tuple from the selected backend, exact installed
-frontend/package version, exact linked cuDNN runtime or FA4 distribution identity, and
-`torch.cuda.get_device_capability()`, then requires exact membership in
-`QUALIFIED_BACKEND_CONFIGS`. Missing version metadata fails closed. Runtime additionally checks
-dtype/head dimensions, public descriptor validation, support query, and execution-plan
-construction/cache lookup for the three phase classes. All plan classes are prepared before P2P.
+At `MLAWithLatentCP.__init__`, runtime constructs the four-field tuple from the selected backend,
+exact installed frontend/package version, exact linked cuDNN runtime or FA4 distribution identity,
+and `torch.cuda.get_device_capability()`. It requires exact membership in
+`QUALIFIED_BACKEND_CONFIGS`; missing metadata fails closed. The constructor immediately creates the
+qualified adapter. These checks are feature-specific and independent of a microbatch.
 
-A separate process-local **successful-preflight cache** removes steady-state consensus cost for
-static CP. Its
-rank-common signature contains the exact runtime tuple and device properties, global packed lengths
-and maximum, TP/CP sizes, heads/dimensions/scale/backend, and the complete ordered global-rank tuples
-for the injected TP rows and CP columns. PID and CUDA device ordinal scope the local entry but do not
-enter the cross-rank signature. The ordered grid is resolved once from the injected groups and is
-cached with strong group references. The first layer for a new signature prepares its local phase
-classes and completes CP-then-TP `MIN`; only that success stores the shared adapter. Later layers and
-steps with the same signature reuse its already-prepared process/device adapter with zero consensus
-collectives. Failure never writes an entry, and CP1 x TP1 performs neither consensus all-reduce.
-The feature-owned GPT and Hybrid configurators wrap each decoder root in a cached, state-dict-neutral
-subclass whose forward mixin establishes `latent_cp_preflight_scope()`. GPTModel and HybridModel
-select that configured root once during initialization; their forward methods remain ordinary
-decoder calls and contain no latent-CP context logic. The first latent-CP layer for a dynamic
-subgroup still resolves the ordered grid, prepares any missing plans, and completes CP-then-TP
-`MIN`. Only that rank-common success enters the forward-local scope. Later layers in the same
-forward reuse it before package resolution, GPU-to-CPU metadata conversion, grid discovery, or
-consensus. The scope key includes the effective CP/TP group identities, the original
-cumulative-length tensor identity, device, backend, head dimensions, scale, and maximum global
-length; strong references in the scoped result guard against identity reuse. Exiting the decoder
-forward discards the scope, so the next microbatch establishes its own rank-common result.
-Manual/custom module calls outside a configured GPTModel or HybridModel keep the conservative
-behavior: dynamic invocations bypass the process-local grid-identity early return and execute
-CP-then-TP `MIN` every time. No local cache history is used to infer a cross-rank hit.
+Cheap activation, dtype, head-dimension, packed-metadata, and effective-group checks stay in
+`forward`. `preprocess_mla_latent_cp(block, hidden_states, packed_seq_params)` is called by both
+`TransformerBlock` and `HybridStack` after input scheduling and before the layer loop. It finds the
+latent-CP layers, derives each exact microbatch phase layout with the effective CP group, and calls
+the adapter's `prepare` method. FA4 preparation is a no-op; the shared cuDNN adapter builds or reuses
+the public forward/backward Graph plans for every phase class.
 
-This cache records successful deterministic availability/plan preflight, not numerical qualification:
-runtime does not execute random/reference inputs, compare numbers, mutate the allow-list tuple, or
-provide an opt-in numerical probe.
+The preprocessing function stores no forward result, creates no context, wraps no decoder class,
+and launches no collective. `forward` cheaply derives the same deterministic layout for execution;
+cuDNN phase execution calls only `_get_prepared_plan` and never builds a Graph inside the ring. A
+custom caller that invokes a latent-CP layer outside a normal block must call the public
+preprocessing function first or fail before the first phase executes.
+
+The adapter's process/device plan cache contains only expensive deterministic Graph artifacts keyed
+by the exact runtime, shape, dtype, and descriptor contract. It is not a microbatch availability
+protocol and never runs reference inputs, compares numbers, mutates the allow-list, or provides an
+opt-in numerical probe.
 
 ## Feature-owned architecture and config-driven construction
 
@@ -677,13 +669,14 @@ tests/unit_tests/transformer/experimental_attention_variant/test_mla_with_latent
 
 The production file contains the module, phase planner, FP32 merger, direct adapters,
 differentiable synchronous ring transport, no-op zigzag layout adapter, and spec factory.
-Small integration changes add `TransformerConfig.mla_latent_cp` and one feature-initialization call
-in each of GPTModel and HybridModel. GPT/Hybrid layer-spec builders and training builders do not
-carry latent-CP branches. The feature initializer rewrites only compatible attention slots and
-installs the feature-owned preflight-scoped decoder root before module construction. The shared
-`multi_latent_attention.py` change is limited to the existing `no_rope_freq` contract: it avoids
-rotary construction/application and selects the standard scale on flagged layers. It contains no
-latent-CP algorithm.
+Small integration changes add `TransformerConfig.mla_latent_cp`, generic dynamic-group consistency
+checks in the data scheduler, and one feature-spec initialization call in each of GPTModel and
+HybridModel. GPT/Hybrid layer-spec builders and training builders do not carry latent-CP branches.
+The feature initializer rewrites only compatible attention slots and preserves the ordinary block
+class. `TransformerBlock` and `HybridStack` each call the feature-owned preprocessing function once
+before their layer loop. The shared `multi_latent_attention.py` change is limited to the existing
+`no_rope_freq` contract: it avoids rotary construction/application and selects the standard scale
+on flagged layers. It contains no latent-CP algorithm.
 
 `get_gpt_layer_local_spec(...)` returns a whole transformer-layer `ModuleSpec`; the attention
 factory does not accept that outer object. `make_mla_with_latent_cp_spec(base_mla_spec)` accepts
@@ -724,12 +717,13 @@ The factory internally uses the same `dataclasses.replace` pattern for `base_mla
 uses the feature-owned `get_mla_with_latent_cp_spec()` directly rather than importing a GPT layer
 factory. `configure_mla_latent_cp_decoder()` accepts either one transformer-layer `ModuleSpec` or a
 `TransformerBlockSubmodules`, replaces only exact ordinary `MLASelfAttention` slots, and leaves GDN,
-KDA, DSA/CSA/HCA, Mamba, MLP, and MoE slots untouched. It returns a fresh spec plus the
-preflight-scoped decoder class. `configure_mla_latent_cp_hybrid_stack()` derives its ordinary
-attention slot from the Hybrid stack's own `mla_layer` template, replaces that template's attention,
-and returns a fresh root spec whose module owns the same preflight scope. Neither path mutates its
-input spec, nests the decoder under a wrapper module, changes state-dict keys, or imports GPT code
-from the Hybrid layer-spec file.
+KDA, DSA/CSA/HCA, Mamba, MLP, and MoE slots untouched, and returns only the fresh spec.
+`configure_mla_latent_cp_hybrid_stack()` derives its ordinary attention slot from the Hybrid stack's
+own `mla_layer` template, replaces that template's attention, and returns a fresh root spec while
+preserving the original stack module. Neither path mutates its input spec, nests the decoder under a
+wrapper module, changes state-dict keys, or imports GPT code from the Hybrid layer-spec file.
+Ordinary `TransformerBlock` and `HybridStack` call `preprocess_mla_latent_cp` before entering their
+layer loop; the feature does not synthesize a decoder subclass or maintain forward-scoped state.
 
 Model construction opts in through configuration:
 
@@ -752,17 +746,25 @@ factory above remains useful to developers building custom specs.
 The reused projection state-dict names stay compatible, while unsupported specs fail during factory
 construction rather than halfway through forward.
 
-## Validation and early errors
+## Validation placement and early errors
 
-Construction or pre-collective validation requires:
+Responsibility follows ownership and cost:
+
+- the DCP data scheduler validates that dynamic `local_cp_size` is positive, its `cp_group` exists,
+  and the group size matches before publishing `PackedSeqParams`;
+- `MLAWithLatentCP.__init__` validates feature-static config, projection/group wiring, package and
+  runtime versions, hardware capability, and exact allow-list membership;
+- `forward` validates cheap activation, metadata, layout, dtype, and effective-group properties for
+  the current microbatch; and
+- block preprocessing owns only expensive microbatch-specific cuDNN descriptor and plan creation.
+
+The supported contract is:
 
 - `mla_latent_cp == multi_latent_attention == True` when selected through model configuration;
-- explicit `ProcessGroupCollection` with usable `cp` and `tp` groups;
+- explicit `ProcessGroupCollection` with usable maximum `cp` and `tp` groups;
 - `cp_comm_type == "p2p"` for CP greater than one;
 - the exact local-MCore projection/norm spec and nonzero Q LoRA described above;
 - `PackedSeqParams`, `qkv_format == "thd"`, and `cp_partition_mode == "zigzag"`;
-- static CP: no different packed `cp_group`; dynamic CP: a positive Python `local_cp_size`, an
-  object-identical effective `cp_group`, and group size equal to that value;
 - equal CUDA-int32 Q/K cumulative lengths, monotonic self-attention metadata, original global max
   lengths, and every physical sequence divisible by `2P` when `P>1`; CP=1 accepts arbitrary
   positive lengths;
@@ -781,7 +783,7 @@ Construction or pre-collective validation requires:
   `elementwise` or `headwise` granularity;
 - heads divisible by TP, `H_q=H_kv`, `D_c+D_r=192`, and `D_v=128`;
 - backend exactly `AttnBackend.fused` or `AttnBackend.flash`; and
-- a deterministic qualified package/hardware allow-list match and valid descriptors/plans.
+- valid public descriptors and prepared cuDNN plans before phase execution.
 
 `AttnBackend.auto`, `unfused`, and `local` are not remapped. `AttnBackend.flash` means FA4, not
 FA2/FA3, and is rejected below SM100. Any installed tuple outside the exact matrix remains
@@ -918,8 +920,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
 5. **Independent multi-rank parity.** Run the pinned `NaiveMLA` reference against TP=2 x CP=2 with
    `H=96,D_qk=192,D_v=128`. Compare output, input gradient, and every mapped parameter gradient with
    both similarity metrics after explicit CP reduction/TP reconstruction. The H100/SM90 fused and
-   SM100 fused/FA4 cases use normal production qualification/preflight, assert the exact tuple
-   epsilon for every metric, and require the newly observed candidate epsilon not to exceed it.
+   SM100 fused/FA4 cases use constructor qualification plus explicit block preprocessing, assert the
+   exact tuple epsilon for every metric, and require the candidate epsilon not to exceed it.
    Separately construct the unchanged `MLASelfAttention + TEDotProductAttention` P2P CP path with
    identical TP=2 x CP=2 SP-sharded input, weights, and upstream gradient. For rope and YARN, compare
    latent-CP and legacy full-KV-CP output and SP-sharded input gradient directly, then compare every
@@ -930,23 +932,19 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    (including odd lengths) and CP=2 forwards/backwards against the same reference. It requires the
    module's static group object to remain unchanged and reconstructs parameter gradients over the
    effective group.
-6. **Backend dispatch, qualification, and preflight caches.** Assert fused creates only the direct
-   shared cuDNN adapter and flash only FA4; TE `DotProductAttention` is neither built nor called.
-   The fake public FA4 callable receives the exact planner-owned int32 tensors by identity; invalid
-   Q or KV dtype, contiguity, or device colocation fails before that callable without conversion.
+6. **Backend dispatch, qualification, and preprocessing ownership.** Assert fused construction
+   creates only the shared direct cuDNN adapter and flash only FA4; TE `DotProductAttention` is
+   neither built nor called. The fake public FA4 callable receives exact planner-owned int32 tensors
+   by identity; invalid Q or KV dtype, contiguity, or device colocation fails without conversion.
    Assert the production source pin and immutable allow-list equal the independently spelled
-   evidence tuples exactly, and assert the independently spelled epsilon mapping has exactly the
-   same keys and no extras. An installed unqualified tuple must skip a real-backend test before
-   adapter/Graph construction with an exact-tuple reason; a qualified full parity must start with
-   empty adapter state and populate it only through normal production preflight. The remote-only
-   case begins locally successful,
-   injects failure into CP `MIN`, still requires the following TP `MIN`, and asserts exact
-   `[CP, TP]` group/op order.
-   Feature-initialization tests require non-mutating GPT/Hybrid spec rewrites and a
-   state-dict-neutral scoped decoder root. Dynamic signatures prove the complementary scope rule:
-   two matching layers in one decoder forward perform one uncached grid discovery and one
-   CP-then-TP consensus, while a new forward repeats that rank-common gate without rebuilding an
-   already prepared adapter.
+   evidence tuples exactly, and that the epsilon mapping has the same keys and no extras. An
+   installed unqualified tuple skips a real-backend test before layer/adapter/Graph construction.
+   A qualified layer must hold its matching adapter/runtime immediately after construction, and the
+   explicit block function must dispatch preprocessing only to latent-CP layers. Fake cuDNN tests
+   build plans through `prepare` and prove phase execution only looks up prepared plans.
+   Feature-initialization tests require non-mutating GPT/Hybrid spec rewrites that preserve ordinary
+   block classes. Existing data-scheduler tests own dynamic `local_cp_size/cp_group` consistency;
+   full dynamic parity owns per-microbatch effective-group behavior.
 7. **cuDNN merge backward.** Compare all phase shapes against standard PyTorch, including `G_i`,
    `gE_i`, `O_corr`, zero/tiny norm rows, extreme phase weights/LSE, and BF16 boundary casts.
 8. **Dtype and functional merge.** Assert raw BF16 backend output, canonical/merged FP32 output+LSE,
@@ -974,7 +972,7 @@ All tests live in the new experimental test file; existing MLA tests remain unto
 2. Assert the source revision, exact three-entry production allow-list, independently spelled test
    tuple list, and independently spelled tuple-to-epsilon mapping remain equal with no extras.
 3. On H100/SM90 with Frontend `1.22.1` and cuDNN `9.21.0`, run both gated direct-cuDNN backward
-   diagnostics and fused `rope`/`yarn` TP=2 x CP=2 full parity through normal production preflight.
+   diagnostics and fused `rope`/`yarn` TP=2 x CP=2 full parity through construction and preprocessing.
 4. On SM100, run fused Frontend `1.26.0` with cuDNN `9.25.0` and FA4
    `flash-attn-4==4.0.0b11`, for both `rope` and `yarn`, then run the complete new test file.
 5. For every qualified full parity, archive the stable JSON line, require every per-tensor metric
