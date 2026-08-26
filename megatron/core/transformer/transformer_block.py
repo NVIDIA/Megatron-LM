@@ -59,6 +59,8 @@ from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 try:
@@ -567,11 +569,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Hand the full depth history to MTP through the same extra
                     # output slot mHC uses for its multistream (mutually exclusive).
                     mhc_multistream = tuple(attn_res_values)
+                nvtx_range_push(msg="attn_res.final_aggregate")
                 hidden_states = self.final_attn_res(attn_res_values)
+                nvtx_range_pop(msg="attn_res.final_aggregate")
             else:
                 # Not the final stage: pack sources + partial into the single
-                # pipeline payload tensor (concatenated along the sequence dim).
+                # pipeline payload tensor (concatenated along the seq dim).
+                nvtx_range_push(msg="attn_res.pack_payload")
                 hidden_states = pack_attn_res_payload(attn_res_values)
+                nvtx_range_pop(msg="attn_res.pack_payload")
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -976,10 +982,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if self.pre_process:
                 attn_res_sources = []
             else:
+                nvtx_range_push(msg="attn_res.unpack_payload")
                 attn_res_sources, hidden_states = unpack_attn_res_payload(
                     hidden_states,
                     attn_res_num_payload_slices(layer_offset, self.config.attn_res_block_layers),
                 )
+                nvtx_range_pop(msg="attn_res.unpack_payload")
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
