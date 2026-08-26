@@ -36,6 +36,7 @@ After its one-time distributed shape check, the hot path performs no tensor
 allocation and can be captured in a CUDA graph.
 """
 
+import gc
 import math
 import weakref
 from collections.abc import Callable
@@ -555,28 +556,24 @@ class _ReplicaCuTeDSLWorkspace:
                     raise ValueError(
                         "MXFP8 replica weights require rowwise and columnwise scales."
                     )
-                rowwise_arena_numel = self.num_local_experts * sum(
-                    member + scale
-                    for member, scale in zip(
-                        self.member_numels, self.rowwise_scale_numels
-                    )
-                )
-                columnwise_arena_numel = self.num_local_experts * sum(
-                    member + scale
-                    for member, scale in zip(
-                        self.member_numels, self.columnwise_scale_numels
+                # Forward consumes rowwise MXFP8 storage and backward consumes
+                # columnwise storage only after an explicit orientation prefetch.
+                # Retaining both would double the constant weight buffer despite
+                # their disjoint lifetimes.
+                shared_arena_numel = self.num_local_experts * sum(
+                    member + max(rowwise_scale, columnwise_scale)
+                    for member, rowwise_scale, columnwise_scale in zip(
+                        self.member_numels,
+                        self.rowwise_scale_numels,
+                        self.columnwise_scale_numels,
                     )
                 )
                 self.rowwise_arena = symm_mem.empty(
-                    rowwise_arena_numel, dtype=torch.uint8, device=device
+                    shared_arena_numel, dtype=torch.uint8, device=device
                 )
                 self.rowwise_handle = symm_mem.rendezvous(self.rowwise_arena, group)
-                self.columnwise_arena = symm_mem.empty(
-                    columnwise_arena_numel, dtype=torch.uint8, device=device
-                )
-                self.columnwise_handle = symm_mem.rendezvous(
-                    self.columnwise_arena, group
-                )
+                self.columnwise_arena = self.rowwise_arena
+                self.columnwise_handle = self.rowwise_handle
                 self.weight_arena = None
                 self.weight_handle = None
             else:
@@ -597,7 +594,10 @@ class _ReplicaCuTeDSLWorkspace:
             self.weight_arena.zero_()
         if self.rowwise_arena is not None:
             self.rowwise_arena.zero_()
-        if self.columnwise_arena is not None:
+        if (
+            self.columnwise_arena is not None
+            and self.columnwise_arena is not self.rowwise_arena
+        ):
             self.columnwise_arena.zero_()
         self.grad_arena.zero_()
         self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
@@ -612,15 +612,12 @@ class _ReplicaCuTeDSLWorkspace:
         self.resident_bridge = None
         self.resident_plan = None
         self.resident_orientation = None
-        # GTP materializes one layer's native expert weights at a time. Keep one
-        # workspace-owned full-weight staging area so every layer can expose stable
-        # native runtime pointers without retaining an unsharded copy per layer.
-        self._gtp_native_projection_storage = {}
         self._gtp_native_projection_grad_storage = {}
         # TE's discrete BF16 grouped GEMM accepts at most 64 pointer-list
         # members. Large expert configurations use one packed runtime
         # GroupedTensor over this workspace-owned storage instead.
         self._packed_bf16_projection_storage = {}
+        self._destroyed = False
 
         device_index = device.index
         if device_index is None:
@@ -718,34 +715,28 @@ class _ReplicaCuTeDSLWorkspace:
 
         rowwise_scale_numel = self.rowwise_scale_numels[projection_index]
         columnwise_scale_numel = self.columnwise_scale_numels[projection_index]
-        rowwise_projection_offset = self.num_local_experts * sum(
-            member + scale
-            for member, scale in zip(
+        projection_offset = self.num_local_experts * sum(
+            member + max(rowwise_scale, columnwise_scale)
+            for member, rowwise_scale, columnwise_scale in zip(
                 self.member_numels[:projection_index],
                 self.rowwise_scale_numels[:projection_index],
-            )
-        )
-        columnwise_projection_offset = self.num_local_experts * sum(
-            member + scale
-            for member, scale in zip(
-                self.member_numels[:projection_index],
                 self.columnwise_scale_numels[:projection_index],
             )
         )
         rowwise_data = self.rowwise_arena.narrow(
-            0, rowwise_projection_offset, self.num_local_experts * member_numel
+            0, projection_offset, self.num_local_experts * member_numel
         ).view(self.num_local_experts, *member_shape)
         rowwise_scale = self.rowwise_arena.narrow(
             0,
-            rowwise_projection_offset + self.num_local_experts * member_numel,
+            projection_offset + self.num_local_experts * member_numel,
             self.num_local_experts * rowwise_scale_numel,
         ).view(self.num_local_experts, *self.rowwise_scale_shapes[projection_index])
         columnwise_data = self.columnwise_arena.narrow(
-            0, columnwise_projection_offset, self.num_local_experts * member_numel
+            0, projection_offset, self.num_local_experts * member_numel
         ).view(self.num_local_experts, *member_shape)
         columnwise_scale = self.columnwise_arena.narrow(
             0,
-            columnwise_projection_offset + self.num_local_experts * member_numel,
+            projection_offset + self.num_local_experts * member_numel,
             self.num_local_experts * columnwise_scale_numel,
         ).view(self.num_local_experts, *self.columnwise_scale_shapes[projection_index])
         # The bridge wraps these raw views with source-matching TE metadata.
@@ -761,51 +752,6 @@ class _ReplicaCuTeDSLWorkspace:
             ),
             virtual_grad,
         )
-
-    def gtp_native_projection_views(self, projection_index: int) -> tuple:
-        """Return stable full-weight staging views for one GTP projection."""
-        cached = self._gtp_native_projection_storage.get(projection_index)
-        if cached is not None:
-            return cached
-
-        member_shape = self.member_shapes[projection_index]
-        if self.weight_format == "bf16":
-            storage = torch.empty(
-                (self.num_local_experts, *member_shape),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            cached = tuple(storage)
-        else:
-            rowwise_scale_shape = self.rowwise_scale_shapes[projection_index]
-            columnwise_scale_shape = self.columnwise_scale_shapes[projection_index]
-            rowwise_data = torch.empty(
-                (self.num_local_experts, *member_shape),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            rowwise_scale = torch.empty(
-                (self.num_local_experts, *rowwise_scale_shape),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            columnwise_data = torch.empty_like(rowwise_data)
-            columnwise_scale = torch.empty(
-                (self.num_local_experts, *columnwise_scale_shape),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            cached = tuple(
-                (
-                    rowwise_data[index],
-                    rowwise_scale[index],
-                    columnwise_data[index],
-                    columnwise_scale[index],
-                )
-                for index in range(self.num_local_experts)
-            )
-        self._gtp_native_projection_storage[projection_index] = cached
-        return cached
 
     def packed_bf16_projection_views(
         self, projection_index: int
@@ -834,6 +780,28 @@ class _ReplicaCuTeDSLWorkspace:
             )
             self._gtp_native_projection_grad_storage[projection_index] = cached
         return cached
+
+    def destroy(self) -> None:
+        """Release symmetric registrations while their NCCL group is still alive."""
+        if self._destroyed:
+            return
+        torch.cuda.synchronize(self.device)
+        self.resident_bridge = None
+        self.resident_plan = None
+        self.resident_orientation = None
+        self._gtp_native_projection_grad_storage.clear()
+        self._packed_bf16_projection_storage.clear()
+        # Handles own NCCL window registrations. Drop them before their backing
+        # tensors and, critically, before model-parallel process-group teardown.
+        self.weight_handle = None
+        self.rowwise_handle = None
+        self.columnwise_handle = None
+        self.grad_handle = None
+        self.weight_arena = None
+        self.rowwise_arena = None
+        self.columnwise_arena = None
+        self.grad_arena = None
+        self._destroyed = True
 
 
 _replica_cutedsl_workspaces = weakref.WeakValueDictionary()
@@ -1003,11 +971,10 @@ class ReplicaCuTeDSLWeightBridge:
                     packed_runtime_weight[: self.num_local_experts]
                 )
             else:
-                native_storage = (
-                    self.workspace.gtp_native_projection_views(projection_index)
-                    if spec.gtp_leader is not None
-                    else None
-                )
+                # GTP MXFP8 gather storage is stable and is bound directly before
+                # runtime construction. Bootstrap distinct native wrappers over
+                # the replica views instead of retaining an unused full weight copy.
+                native_storage = virtual_storage if spec.gtp_leader is not None else None
                 if spec.gtp_leader is not None:
                     gtp_native_grad = self.workspace.gtp_native_projection_grad_view(
                         projection_index
@@ -1882,9 +1849,15 @@ HybridEPReplicaWeightBridge = ReplicaCuTeDSLWeightBridge
 
 def finalize_replica_weight_bridges() -> None:
     """Release replica weight contexts before their process group is destroyed."""
+    workspaces = list(_replica_cutedsl_workspaces.values())
     for bridge in list(_replica_cutedsl_bridges):
         bridge.destroy()
+    for workspace in workspaces:
+        workspace.destroy()
     _replica_cutedsl_workspaces.clear()
+    # NCCLSymmetricMemory handles contain Python reference cycles. Collect them
+    # now so their window deregistration runs before the process group is gone.
+    gc.collect()
 
 
 class _ReplicaStartWeightPrefetch(torch.autograd.Function):
