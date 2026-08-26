@@ -264,7 +264,7 @@ class TestMXFP8ReshardTransform:
         from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
         class Namespace:
-            pass
+            _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
         num_experts, rows, cols = 2, 96, 128
         grouped_mlp = Namespace()
