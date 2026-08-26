@@ -216,8 +216,7 @@ def test_prebuild_records_pack_verdicts_for_routing():
     """Prebuild records the per-pack verdict (microbatch cache + module registry):
     conforming packs are eligible; a pack that violates per-sequence 2N divisibility
     records False so the forward routes that microbatch to the contiguous reference
-    path (per-pack fused-call shape variation is verified safe below the kernel row
-    limit)."""
+    path."""
     group = _StubGroup(4, 0)
     g = getattr(group, "group_name", None) or id(group)  # mirrors _group_key
 
@@ -242,6 +241,43 @@ def test_prebuild_records_pack_verdicts_for_routing():
 
     prebuild_balanced_layouts(aligned, cp_group=group)
     assert _ZZ_PACK_OK[(g, 1024)] is True
+
+
+def test_eager_prebuild_switches_paths_at_the_same_capacity():
+    """Eligibility is a property of the current pack, not its row capacity."""
+    group = _StubGroup(4, 0)
+    gkey = group.group_name
+
+    eligible_a = _packed_params([0, 1024, 4096], 4096)
+    prebuild_balanced_layouts(eligible_a, cp_group=group, pad_alignment=8)
+    assert eligible_a._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1024, True)
+
+    ineligible = _packed_params([0, 1001, 4096], 4096)
+    prebuild_balanced_layouts(ineligible, cp_group=group, pad_alignment=8)
+    assert ineligible._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1024, False)
+    assert ("zigzag", 0) not in ineligible._dsa_cp_balance_layout_cache
+    assert _ZZ_PACK_OK[(gkey, 1024)] is False
+
+    eligible_b = _packed_params([0, 2048, 4096], 4096)
+    prebuild_balanced_layouts(eligible_b, cp_group=group, pad_alignment=8)
+    assert eligible_b._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1024, True)
+    assert ("zigzag", 0) in eligible_b._dsa_cp_balance_layout_cache
+    assert _ZZ_PACK_OK[(gkey, 1024)] is True
+
+
+def test_eager_prebuild_accepts_capacity_changes():
+    """Two eligible eager packs may build different per-rank capacities."""
+    group = _StubGroup(4, 0)
+    short = _packed_params([0, 1024, 4096], 4096)
+    long = _packed_params([0, 2048, 6144], 6144)
+
+    prebuild_balanced_layouts(short, cp_group=group, pad_alignment=8)
+    prebuild_balanced_layouts(long, cp_group=group, pad_alignment=8)
+
+    assert short._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1024, True)
+    assert long._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1536, True)
+    assert short._dsa_cp_balance_layout_cache[("zigzag", 0)]["half"] == 512
+    assert long._dsa_cp_balance_layout_cache[("zigzag", 0)]["half"] == 768
 
 
 def test_eager_probe_routes_unprebuilt_packs():
@@ -558,7 +594,7 @@ def test_prebuild_routes_ineligible_above_limit_pack():
     cap = 4 * (cp_utils.FUSED_INDEXER_MAX_SAFE_ROWS + 2048) * 2  # l_local > 2 * limit
     # First sequence length is odd -> not divisible by 2 * cp_size = 8.
     psp = _packed_params([0, 100001, cap], cap)
-    prebuild_balanced_layouts(psp, cp_group=group, pad_alignment=8)
+    prebuild_balanced_layouts(psp, cp_group=group, pad_alignment="max")
     l_local = cap // 4
     assert psp._dsa_cp_balance_layout_cache["zz_pack_ok"] == (l_local, False)
     assert ("zigzag", 0) not in psp._dsa_cp_balance_layout_cache
@@ -946,23 +982,134 @@ def test_zigzag_plan_rejects_wrong_capacity_cache():
     assert cache[("zigzag", 0)] is plan
 
 
-def test_prebuild_rejects_ineligible_pad_alignment():
-    """Balanced eligibility is a run-level invariant: prebuild refuses pad
-    alignments the zigzag gate can never accept (config validation enforces the
-    same thing at startup; a mismatch here means the caller wired a different
-    value). There is no planless balanced run any more — ineligible
-    configurations take the reference path — so every graphs-enabled balanced
-    run builds plans and the static-composition gate always has one to compare
-    against (pinned by test_prebuild_refresh_preserves_old_plan_objects)."""
-    group = _StubGroup(4, 0)
-    for bad in (None, "max", 12):  # 12 % (2 * 4) != 0
+def test_prebuild_uses_actual_pack_instead_of_alignment_for_eligibility():
+    """Alignment is a capacity-rounding hint, not a zigzag contract.
+
+    Every supported alignment spelling builds an eligible actual pack, while an
+    ineligible actual pack records False even when its configured alignment is a
+    multiple of ``2 * cp_size``.
+    """
+    for alignment in (None, "max", 12, 8):
+        group = _StubGroup(4, 0)
         pack = _packed_params([0, 1024, 4096], 4096)
-        with pytest.raises(ValueError, match="run-level invariant"):
-            prebuild_balanced_layouts(pack, cp_group=group, pad_alignment=bad, graphs_enabled=True)
-    # An eligible alignment builds the plan as usual.
-    pack = _packed_params([0, 1024, 4096], 4096)
-    prebuild_balanced_layouts(pack, cp_group=group, pad_alignment=8, graphs_enabled=True)
-    assert ("zigzag", 0) in pack._dsa_cp_balance_layout_cache
+        prebuild_balanced_layouts(
+            pack, cp_group=group, pad_alignment=alignment, graphs_enabled=True
+        )
+        assert pack._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1024, True)
+        assert ("zigzag", 0) in pack._dsa_cp_balance_layout_cache
+
+    group = _StubGroup(4, 0)
+    pack = _packed_params([0, 500, 1008], 1008)
+    prebuild_balanced_layouts(pack, cp_group=group, pad_alignment=8)
+    assert pack._dsa_cp_balance_layout_cache["zz_pack_ok"] == (252, False)
+    assert ("zigzag", 0) not in pack._dsa_cp_balance_layout_cache
+
+
+def test_prebuild_routes_odd_local_capacity_to_reference():
+    """A capacity divisible by CP can still leave an odd number of rows per rank.
+
+    That pack is merely ineligible for two equal synthetic half calls; it is not a
+    malformed physical partition and must route to the contiguous reference path.
+    """
+    group = _StubGroup(4, 0)
+    pack = _packed_params([0, 500, 1004], 1004)  # l_local = 251 (odd)
+    prebuild_balanced_layouts(pack, cp_group=group, pad_alignment=None)
+    assert pack._dsa_cp_balance_layout_cache["zz_pack_ok"] == (251, False)
+    assert ("zigzag", 0) not in pack._dsa_cp_balance_layout_cache
+
+
+def test_prebuild_rejects_capacity_not_divisible_by_cp():
+    """A physical capacity that CP cannot partition evenly remains a hard error."""
+    pack = _packed_params([0, 500, 1003], 1003)
+    with pytest.raises(ValueError, match="physical pack capacity must be divisible"):
+        prebuild_balanced_layouts(pack, cp_group=_StubGroup(4, 0))
+
+
+def _make_balanced_transformer_config(monkeypatch, **overrides):
+    """Construct the minimal DSv4 config while isolating optional backend probes."""
+    from megatron.core.transformer import transformer_config as transformer_config_module
+    from megatron.core.transformer.experimental_attention_variant import dsa_kernels
+    from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
+        _make_config,
+    )
+
+    monkeypatch.setattr(dsa_kernels, "use_fused_dsa_kernels", lambda _config: True)
+    monkeypatch.setattr(transformer_config_module, "HAVE_PACKAGING", True)
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+    kwargs = dict(
+        context_parallel_size=4,
+        cp_partition_mode="contiguous",
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=4096,
+        csa_compress_ratios=[4, 4, 4, 4],
+        csa_dense_mode=False,
+        dsa_kernel_backend="none",
+        dsa_cp_balance_indexer=True,
+    )
+    kwargs.update(overrides)
+    return _make_config(**kwargs)
+
+
+@pytest.mark.parametrize("alignment", [None, "max", 12, 8])
+def test_balanced_config_accepts_all_supported_alignment_policies(monkeypatch, alignment):
+    """Startup validation must not pretend alignment proves per-pack eligibility."""
+    config = _make_balanced_transformer_config(monkeypatch, pad_packed_seq_alignment=alignment)
+    assert config.pad_packed_seq_alignment == alignment
+
+
+def test_balanced_config_requires_active_context_parallelism(monkeypatch):
+    with pytest.raises(ValueError, match="requires active context parallelism"):
+        _make_balanced_transformer_config(monkeypatch, context_parallel_size=1)
+
+
+def test_balanced_config_accepts_dynamic_context_parallelism(monkeypatch):
+    config = _make_balanced_transformer_config(
+        monkeypatch,
+        context_parallel_size=1,
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+    )
+    assert config.dynamic_context_parallel
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"csa_dense_mode": True}, "requires a DSA indexer to exist"),
+        ({"csa_compress_ratios": [128, 128, 128, 128]}, "requires a DSA indexer to exist"),
+    ],
+)
+def test_balanced_config_requires_ratio4_indexer(monkeypatch, overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _make_balanced_transformer_config(monkeypatch, **overrides)
+
+
+def test_balanced_ratio4_layer_rejects_custom_spec_without_indexer(monkeypatch):
+    """A custom module spec cannot silently turn the enabled feature into a no-op."""
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.experimental_attention_variant.csa import (
+        CompressedSparseAttention,
+        CompressedSparseAttentionSubmodules,
+    )
+
+    config = _make_balanced_transformer_config(monkeypatch, csa_compress_ratios=[4, 128, 4, 128])
+    submodules = CompressedSparseAttentionSubmodules(compressor=None, indexer=None)
+    kwargs = dict(
+        config=config,
+        submodules=submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        pg_collection=object(),
+        rotary_pos_emb=None,
+    )
+    with pytest.raises(ValueError, match="selected module spec provides none"):
+        CompressedSparseAttention(**kwargs, compress_ratio=4)
+
+    # Ratio-128 layers legitimately have no indexer even when another layer in
+    # the same model uses the balanced ratio-4 path.
+    csa = CompressedSparseAttention(**kwargs, compress_ratio=128)
+    assert csa.indexer is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="indexer scoring runs on device")
