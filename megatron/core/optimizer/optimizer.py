@@ -168,9 +168,10 @@ def get_param_group_identifier_value(param_group: Dict, key: str):
 def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
     """Return the tuple used to match optimizer parameter groups across checkpoints."""
     return tuple(
-        get_param_group_identifier_value(param_group, key)
-        for key in param_group_identifier_keys
+        get_param_group_identifier_value(param_group, key) for key in param_group_identifier_keys
     )
+
+
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -262,6 +263,7 @@ class MegatronOptimizer(ABC):
                 )
                 target_params.extend(param_group['params'])
         return indexer_params, non_indexer_params
+
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage optimizer-owned model params before an explicit DDP param sync."""
         return
@@ -357,6 +359,7 @@ class MegatronOptimizer(ABC):
             )
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
+
     @torch.no_grad()
     def get_dsa_split_grad_norms(self) -> Tuple[float, float]:
         """Compute pre-clip grad norms for DSA indexer and non-indexer buckets."""
@@ -487,8 +490,7 @@ class MegatronOptimizer(ABC):
         if not hasattr(self.optimizer, 'param_groups'):
             return
         if any(
-            param_group.get('is_dsa_indexer', False)
-            for param_group in self.optimizer.param_groups
+            param_group.get('is_dsa_indexer', False) for param_group in self.optimizer.param_groups
         ):
             self._last_dsa_split_grad_norms = self.get_dsa_split_grad_norms()
 
@@ -505,17 +507,11 @@ class MegatronOptimizer(ABC):
         use_decoupled_grad = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
         if non_indexer_params and clip_grad > 0.0:
             clip_grad_by_total_norm_fp32(
-                non_indexer_params,
-                clip_grad,
-                non_indexer_grad_norm,
-                use_decoupled_grad,
+                non_indexer_params, clip_grad, non_indexer_grad_norm, use_decoupled_grad
             )
         if indexer_params and indexer_clip_grad > 0.0:
             clip_grad_by_total_norm_fp32(
-                indexer_params,
-                indexer_clip_grad,
-                indexer_grad_norm,
-                use_decoupled_grad,
+                indexer_params, indexer_clip_grad, indexer_grad_norm, use_decoupled_grad
             )
 
         return math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
@@ -738,7 +734,6 @@ class MegatronOptimizer(ABC):
         Raises:
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
-
 
         def _identifier_for(group: dict) -> tuple:
             out = []

@@ -42,7 +42,6 @@ except ImportError:
         _DSA = None
 
 
-
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
     """Return whether a 1-indexed layer reuses a previous DSA top-k result."""
     if layer_number < 1:
@@ -422,8 +421,6 @@ class DSAIndexerLossLoggingHelper:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
 
-
-
 def compute_dsa_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -634,16 +631,15 @@ def fused_qk_topk_naive(
         # Permute to batch-first; give K an explicit H_kv=1 dim (MQA)
         sq, b, _, d_idx = q.shape
         sk = k.size(0)
-        q_bf = q.permute(1, 0, 2, 3).contiguous()            # (B, S_q, H_idx, D_idx)
+        q_bf = q.permute(1, 0, 2, 3).contiguous()  # (B, S_q, H_idx, D_idx)
         k_bf = k.permute(1, 0, 2).unsqueeze(2).contiguous()  # (B, S_k, 1, D_idx)
-        w_bf = weights.permute(1, 0, 2).contiguous()         # (B, S_q, H_idx)
+        w_bf = weights.permute(1, 0, 2).contiguous()  # (B, S_q, H_idx)
         with torch.cuda.nvtx.range("dsa_indexer_forward_cudnn"):
             index_scores = _DSA.indexer_forward_wrapper(
-                q_bf, k_bf, w_bf,
-                ratio=1,
-                sm_scale=1.0,
-                stream=None,
-            )["scores"]  # (B, S_q, S_k) FP32
+                q_bf, k_bf, w_bf, ratio=1, sm_scale=1.0, stream=None
+            )[
+                "scores"
+            ]  # (B, S_q, S_k) FP32
         if mask is not None:
             index_scores = index_scores + mask.float()
         # =========================================
@@ -653,8 +649,7 @@ def fused_qk_topk_naive(
         seq_lens = torch.full((b * sq,), sk, dtype=torch.int32, device=flat.device)
         with torch.cuda.nvtx.range("dsa_indexer_top_k_cudnn"):
             topk_indices = _DSA.indexer_top_k_wrapper(
-                flat, seq_lens, top_k=topk_k, return_val=False,
-                stream=None,
+                flat, seq_lens, top_k=topk_k, return_val=False, stream=None
             )["indices"].reshape(b, sq, topk_k)
         return index_scores, topk_indices
 
@@ -732,7 +727,9 @@ def fused_qk_topk_chunked(
     sk = k.size(0)
     topk_k = min(index_topk, sk)
     if key_chunk_size is None or key_chunk_size <= 0 or key_chunk_size >= sk:
-        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, index_topk, mask, use_cudnn=use_cudnn)
+        index_scores, topk_indices = fused_qk_topk_naive(
+            q, k, weights, index_topk, mask, use_cudnn=use_cudnn
+        )
         topk_scores = torch.gather(index_scores, -1, topk_indices)
         return topk_scores, topk_indices
 
@@ -743,7 +740,9 @@ def fused_qk_topk_chunked(
         block_scores = _compute_index_scores(q, weights, k[k_start:k_end])
         if mask is not None:
             block_mask = mask[..., k_start:k_end]
-            assert block_mask.dtype == block_scores.dtype, "Mask dtype must match index scores dtype"
+            assert (
+                block_mask.dtype == block_scores.dtype
+            ), "Mask dtype must match index scores dtype"
             block_scores = block_scores + block_mask
 
         block_topk_k = min(topk_k, k_end - k_start)
@@ -1210,8 +1209,6 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
             DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
         else:
             DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
-
-
 
 
 @dataclass
@@ -2102,8 +2099,10 @@ class DSAttention(MegatronModule):
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
 
-        if self.training and torch.is_grad_enabled() and getattr(
-            self.config, "dsa_train_main_only", False
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and getattr(self.config, "dsa_train_main_only", False)
         ):
             # Train the main attention only: skip the indexer loss entirely and route
             # with detached top-k indices.

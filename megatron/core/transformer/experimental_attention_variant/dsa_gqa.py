@@ -8,7 +8,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core.extensions.transformer_engine import TELinear, TENorm
+from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -24,7 +24,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossLoggingHelper,
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
-    rotate_activation,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
@@ -50,10 +49,6 @@ def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_
     key = key.repeat_interleave(repeat_factor, dim=2)
     value = value.repeat_interleave(repeat_factor, dim=2)
     return key, value
-
-
-
-
 
 
 @dataclass(frozen=True)
@@ -83,8 +78,7 @@ def _indexer_input_norm_spec(
 
 
 def _normalized_indexer_input(
-    hidden_states: torch.Tensor,
-    norm_spec: Optional[_DSAIndexerInputNormSpec],
+    hidden_states: torch.Tensor, norm_spec: Optional[_DSAIndexerInputNormSpec]
 ) -> torch.Tensor:
     """Return the detached activation seen by the main Q projection.
 
@@ -108,9 +102,7 @@ def _normalized_indexer_input(
             inv_rms = torch.rsqrt(hidden_float.square().mean(dim=-1, keepdim=True) + eps)
             return (hidden_float * inv_rms * norm_weight.float()).to(hidden_states.dtype)
         if norm_spec.normalization == "LayerNorm":
-            return F.layer_norm(
-                hidden_states, normalized_shape, norm_weight, norm_spec.bias, eps
-            )
+            return F.layer_norm(hidden_states, normalized_shape, norm_weight, norm_spec.bias, eps)
     raise NotImplementedError(
         "DSA cannot reproduce the fused main-Q input normalization "
         f"for normalization={norm_spec.normalization!r}."
@@ -181,15 +173,15 @@ def compute_gqa_dsa_indexer_loss(
         assert sq == index_scores.size(1), "Query sequence length must match index_scores."
         assert sk == index_scores.size(2), "Key sequence length must match index_scores."
     if selected_index_scores is not None:
-        assert sparse_loss and sparse_loss_use_topk_only, (
-            "selected_index_scores is only supported for topk-only sparse loss."
-        )
-        assert sq == selected_index_scores.size(1), (
-            "Query sequence length must match selected_index_scores."
-        )
-        assert topk_indices.size(-1) == selected_index_scores.size(-1), (
-            "selected_index_scores and topk_indices must have matching top-k dimension."
-        )
+        assert (
+            sparse_loss and sparse_loss_use_topk_only
+        ), "selected_index_scores is only supported for topk-only sparse loss."
+        assert sq == selected_index_scores.size(
+            1
+        ), "Query sequence length must match selected_index_scores."
+        assert topk_indices.size(-1) == selected_index_scores.size(
+            -1
+        ), "selected_index_scores and topk_indices must have matching top-k dimension."
 
     if np != ng:
         assert np % ng == 0, f"num_query_heads ({np}) must be divisible by num_query_groups ({ng})."
@@ -219,9 +211,7 @@ def compute_gqa_dsa_indexer_loss(
                 b, np, chunk_len, topk, hn
             )
             selected_key = torch.gather(
-                key[:, :, None, :, :].expand(b, np, chunk_len, sk, hn),
-                3,
-                gather_index,
+                key[:, :, None, :, :].expand(b, np, chunk_len, sk, hn), 3, gather_index
             )
             selected_causal_mask = _build_selected_causal_mask(
                 topk_indices_chunk, query_start_position=q_start
@@ -245,7 +235,9 @@ def compute_gqa_dsa_indexer_loss(
                 safe_chunk, padded_chunk = _split_topk_padding(topk_indices_chunk)
                 student_logits = index_scores[:, q_start:q_end, :].gather(-1, safe_chunk)
                 student_logits = student_logits.masked_fill(padded_chunk, float("-inf"))
-            student_scores = torch.nn.functional.softmax(student_logits, dim=-1, dtype=torch.float32)
+            student_scores = torch.nn.functional.softmax(
+                student_logits, dim=-1, dtype=torch.float32
+            )
             kl_per_element = teacher_scores * (
                 torch.log(teacher_scores + 1e-10) - torch.log(student_scores + 1e-10)
             )
@@ -260,13 +252,13 @@ def compute_gqa_dsa_indexer_loss(
         safe_topk, padded_topk = _split_topk_padding(topk_indices)
         gather_index = safe_topk[:, None, :, :, None].expand(b, np, sq, topk, hn)
         selected_key = torch.gather(
-            key[:, :, None, :, :].expand(b, np, sq, sk, hn),
-            3,
-            gather_index,
+            key[:, :, None, :, :].expand(b, np, sq, sk, hn), 3, gather_index
         )
-        selected_causal_mask = _build_selected_causal_mask(safe_topk).masked_fill(
-            padded_topk, float("-inf")
-        ).unsqueeze(1)
+        selected_causal_mask = (
+            _build_selected_causal_mask(safe_topk)
+            .masked_fill(padded_topk, float("-inf"))
+            .unsqueeze(1)
+        )
         attention_scores = (
             torch.einsum("bnsh,bnskh->bnsk", query.float(), selected_key.float()) * softmax_scale
         )
@@ -292,7 +284,9 @@ def compute_gqa_dsa_indexer_loss(
         attention_scores = attention_scores.reshape(b, np, sq, sk)
 
         causal_mask = torch.triu(
-            torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
+            torch.full(
+                (sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device
+            ),
             diagonal=1,
         )
         # Route the indexer's -1 padding into a sink column that is dropped, so
@@ -309,7 +303,9 @@ def compute_gqa_dsa_indexer_loss(
             attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
             index_scores = index_scores + index_mask
 
-        attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+        attention_scores = torch.nn.functional.softmax(
+            attention_scores, dim=-1, dtype=torch.float32
+        )
         index_scores = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
 
         attention_scores = attention_scores.sum(dim=1)
@@ -343,9 +339,7 @@ def _dense_grouped_dsa_fn(
     attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
     attention_scores = attention_scores.reshape(b, np, sq, skv)
 
-    sink_indices = torch.where(
-        topk_indices < 0, torch.full_like(topk_indices, skv), topk_indices
-    )
+    sink_indices = torch.where(topk_indices < 0, torch.full_like(topk_indices, skv), topk_indices)
     index_mask = torch.full((b, sq, skv + 1), float("-inf"), device=attention_scores.device)
     index_mask = index_mask.scatter_(-1, sink_indices, 0)[..., :skv]
     if mask is None:
@@ -354,11 +348,9 @@ def _dense_grouped_dsa_fn(
             diagonal=1,
         )
     elif mask.dtype == torch.bool:
-        mask = torch.zeros(
-            mask.shape,
-            dtype=torch.float32,
-            device=mask.device,
-        ).masked_fill(mask, float("-inf"))
+        mask = torch.zeros(mask.shape, dtype=torch.float32, device=mask.device).masked_fill(
+            mask, float("-inf")
+        )
     else:
         mask = mask.to(dtype=torch.float32, device=index_mask.device)
     if mask.dim() == 2:
@@ -389,9 +381,9 @@ def _sparse_grouped_dsa_fn(
     sq, b, np, hn = query.size()
     skv = key.size(0)
     num_query_groups = key.size(2)
-    assert np % num_query_groups == 0, (
-        f"num_query_heads ({np}) must be divisible by num_query_groups ({num_query_groups})."
-    )
+    assert (
+        np % num_query_groups == 0
+    ), f"num_query_heads ({np}) must be divisible by num_query_groups ({num_query_groups})."
     repeat_factor = np // num_query_groups
     topk = topk_indices.size(-1)
     if query_chunk_size is None or query_chunk_size <= 0:
@@ -420,16 +412,19 @@ def _sparse_grouped_dsa_fn(
                 topk_indices_chunk, query_start_position=q_start
             )
         elif mask.dim() == 2:
-            selected_mask = mask[q_start:q_end].unsqueeze(0).expand(b, chunk_len, skv).gather(2, topk_indices_chunk)
+            selected_mask = (
+                mask[q_start:q_end]
+                .unsqueeze(0)
+                .expand(b, chunk_len, skv)
+                .gather(2, topk_indices_chunk)
+            )
         else:
             selected_mask = mask[:, q_start:q_end, :].gather(2, topk_indices_chunk)
         if padded_slots.any():
             selected_mask = selected_mask.masked_fill(padded_slots, float("-inf"))
         if selected_mask.dtype == torch.bool:
             selected_mask = torch.zeros(
-                selected_mask.shape,
-                dtype=torch.float32,
-                device=selected_mask.device,
+                selected_mask.shape, dtype=torch.float32, device=selected_mask.device
             ).masked_fill(selected_mask, float("-inf"))
         selected_mask = selected_mask.unsqueeze(1)
 
@@ -440,14 +435,10 @@ def _sparse_grouped_dsa_fn(
             key_group = key[:, group_idx, :, :]
             value_group = value[:, group_idx, :, :]
             gathered_key = torch.gather(
-                key_group[:, None, :, :].expand(b, chunk_len, skv, hn),
-                2,
-                key_gather_index,
+                key_group[:, None, :, :].expand(b, chunk_len, skv, hn), 2, key_gather_index
             )
             gathered_value = torch.gather(
-                value_group[:, None, :, :].expand(b, chunk_len, skv, hnv),
-                2,
-                value_gather_index,
+                value_group[:, None, :, :].expand(b, chunk_len, skv, hnv), 2, value_gather_index
             )
             query_group = query[:, group_idx, :, q_start:q_end, :]
             attention_scores = (
@@ -455,7 +446,9 @@ def _sparse_grouped_dsa_fn(
                 * softmax_scale
             )
             attention_scores = attention_scores + selected_mask
-            attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+            attention_probs = torch.nn.functional.softmax(
+                attention_scores, dim=-1, dtype=torch.float32
+            )
             output[:, group_idx, :, q_start:q_end, :] = torch.einsum(
                 "brsk,bskd->brsd", attention_probs.to(gathered_value.dtype), gathered_value
             )
@@ -485,16 +478,7 @@ def unfused_grouped_dsa_fn(
             mask=mask,
             query_chunk_size=query_chunk_size,
         )
-    return _dense_grouped_dsa_fn(
-        query,
-        key,
-        value,
-        topk_indices,
-        softmax_scale,
-        mask=mask,
-    )
-
-
+    return _dense_grouped_dsa_fn(query, key, value, topk_indices, softmax_scale, mask=mask)
 
 
 @dataclass
@@ -507,9 +491,6 @@ class SimplifiedDSGQAIndexerSubmodules:
 class DSGQAAttentionSubmodules:
     indexer: Union[ModuleSpec, type] = None
     dense_core_attention: Union[ModuleSpec, type] = None
-
-
-
 
 
 class SimplifiedDSGQAIndexer(MegatronModule):
@@ -621,8 +602,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         )
         return torch.cat([q_nope, q_pe], dim=-1)
 
-
-
     def forward_q(
         self,
         hidden_states: torch.Tensor,
@@ -637,7 +616,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         q, _ = self.linear_q(hidden_states)
         q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
         return self._apply_rope(q, use_rope=use_rope, packed_seq_params=packed_seq_params)
-
 
     def forward_qk(
         self,
@@ -662,7 +640,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         )
 
 
-
 class _DSAZeroParamDependency(torch.autograd.Function):
     """Attach zero indexer grads without reading overlap-gathered parameter storage."""
 
@@ -681,15 +658,14 @@ class _DSAZeroParamDependency(torch.autograd.Function):
 
 
 def _simplified_index_scores(
-    q_index: torch.Tensor,
-    main_key: torch.Tensor,
-    softmax_scale: float,
+    q_index: torch.Tensor, main_key: torch.Tensor, softmax_scale: float
 ) -> torch.Tensor:
     """Return token scores [B,Q,K] for the one-KV-group simplified router."""
     assert q_index.size(2) == 1 and main_key.size(2) == 1
-    return torch.einsum(
-        "qbd,kbd->bqk", q_index[:, :, 0, :].float(), main_key[:, :, 0, :].float()
-    ) * softmax_scale
+    return (
+        torch.einsum("qbd,kbd->bqk", q_index[:, :, 0, :].float(), main_key[:, :, 0, :].float())
+        * softmax_scale
+    )
 
 
 def _simplified_qk_topk_naive(
@@ -717,9 +693,7 @@ def _simplified_qk_topk_chunked(
     running_indices = None
     for k_start in range(0, main_key.size(0), key_chunk_size):
         k_end = min(k_start + key_chunk_size, main_key.size(0))
-        block_scores = _simplified_index_scores(
-            q_index, main_key[k_start:k_end], softmax_scale
-        )
+        block_scores = _simplified_index_scores(q_index, main_key[k_start:k_end], softmax_scale)
         if mask is not None:
             block_scores = block_scores + mask[..., k_start:k_end]
         block_topk = min(topk, block_scores.size(-1))
@@ -755,16 +729,12 @@ class DSGQACoreAttention(MegatronModule):
     ):
         super().__init__(config=config)
         self.layer_number = layer_number
-        self.indexer = build_module(
-            submodules.indexer, config=config, pg_collection=pg_collection
-        )
+        self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
         self.dense_core_attention = None
         if (
             getattr(config, "dsa_fwd_use_dense_attn", False)
             or getattr(config, "dsa_fwd_skip_dsa", False)
-        ) and (
-            submodules.dense_core_attention is not None
-        ):
+        ) and (submodules.dense_core_attention is not None):
             self.dense_core_attention = build_module(
                 submodules.dense_core_attention,
                 config=config,
@@ -848,17 +818,15 @@ class DSGQACoreAttention(MegatronModule):
         else:
             assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
             sparse_attention_mask = attention_mask.squeeze(1)
-            routing_mask = torch.zeros_like(
-                sparse_attention_mask, dtype=torch.float32
-            ).masked_fill(sparse_attention_mask, float('-inf'))
+            routing_mask = torch.zeros_like(sparse_attention_mask, dtype=torch.float32).masked_fill(
+                sparse_attention_mask, float('-inf')
+            )
             if not sparse_attention_use_gather:
                 sparse_attention_mask = routing_mask
 
         train_main_only = getattr(self.config, "dsa_train_main_only", False)
         indexer_loss_coeff = (
-            0.0
-            if train_main_only
-            else (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0)
+            0.0 if train_main_only else (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0)
         )
         if self.training and torch.is_grad_enabled():
             sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
@@ -894,6 +862,7 @@ class DSGQACoreAttention(MegatronModule):
                 )
             )
             if use_chunked_topk:
+
                 def _compute_chunked_topk(
                     q_index_tensor: torch.Tensor,
                     k_index_tensor: torch.Tensor,
@@ -909,17 +878,21 @@ class DSGQACoreAttention(MegatronModule):
                             key_chunk_size,
                         )
                     return fused_qk_topk_chunked(
-                        q_index_tensor, k_index_tensor, weights_tensor,
-                        self.indexer.index_topk, routing_mask, key_chunk_size,
+                        q_index_tensor,
+                        k_index_tensor,
+                        weights_tensor,
+                        self.indexer.index_topk,
+                        routing_mask,
+                        key_chunk_size,
                     )
 
-                routing_inputs_require_grad = q_index.requires_grad or k_index.requires_grad or (
-                    weights is not None and weights.requires_grad
+                routing_inputs_require_grad = (
+                    q_index.requires_grad
+                    or k_index.requires_grad
+                    or (weights is not None and weights.requires_grad)
                 )
                 topk_scores, topk_indices = _compute_chunked_topk(
-                    q_index,
-                    k_index,
-                    weights if weights is not None else q_index.new_empty((0,)),
+                    q_index, k_index, weights if weights is not None else q_index.new_empty((0,))
                 )
                 index_scores = None
             else:
@@ -943,6 +916,7 @@ class DSGQACoreAttention(MegatronModule):
                 key_detached = key.detach()
 
                 if use_chunked_topk and sparse_indexer_loss and sparse_indexer_loss_use_topk_only:
+
                     def _compute_sparse_topk_only_indexer_loss(
                         selected_scores_tensor: torch.Tensor,
                     ) -> torch.Tensor:
@@ -962,6 +936,7 @@ class DSGQACoreAttention(MegatronModule):
 
                     indexer_loss = _compute_sparse_topk_only_indexer_loss(topk_scores)
                 else:
+
                     def _compute_indexer_loss(index_scores_tensor: torch.Tensor) -> torch.Tensor:
                         return compute_gqa_dsa_indexer_loss(
                             index_scores_tensor,
@@ -1004,23 +979,15 @@ class DSGQACoreAttention(MegatronModule):
         if simplified_indexer:
             if simplified_learned_k:
                 q_index, k_index = self.indexer.forward_qk(
-                    hidden_states,
-                    use_rope=use_indexer_rope,
-                    packed_seq_params=packed_seq_params,
+                    hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
                 )
             else:
                 q_index = self.indexer.forward_q(
-                    hidden_states,
-                    use_rope=use_indexer_rope,
-                    packed_seq_params=packed_seq_params,
+                    hidden_states, use_rope=use_indexer_rope, packed_seq_params=packed_seq_params
                 )
                 k_index = key.detach()
             _, topk_indices = _simplified_qk_topk_naive(
-                q_index,
-                k_index,
-                self.indexer.index_topk,
-                self.indexer.softmax_scale,
-                routing_mask,
+                q_index, k_index, self.indexer.index_topk, self.indexer.softmax_scale, routing_mask
             )
         else:
             _, topk_indices = self.indexer.forward_with_scores(
@@ -1060,10 +1027,7 @@ class DSGQACoreAttention(MegatronModule):
         train_main_only = getattr(self.config, "dsa_train_main_only", False)
         sparse_indexer_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
         sparse_fwd_dense_loss = (
-            not train_main_only
-            and not skip_dsa
-            and not dense_warmup
-            and not sparse_indexer_loss
+            not train_main_only and not skip_dsa and not dense_warmup and not sparse_indexer_loss
         )
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
         if simplified_indexer and not _simplified_indexer_uses_main_input_norm(self.config):
@@ -1134,23 +1098,21 @@ class DSGQACoreAttention(MegatronModule):
                 "Sparse-forward dense-loss mode has no selected-score sparse loss; do not set "
                 "dsa_kernel_cache_selected_scores."
             )
-        if train_main_only and getattr(
-            self.config, "dsa_kernel_cache_selected_scores", False
-        ):
+        if train_main_only and getattr(self.config, "dsa_kernel_cache_selected_scores", False):
             raise NotImplementedError(
                 "dsa_train_main_only has no selected-score KL backward; do not set "
                 "dsa_kernel_cache_selected_scores."
             )
         if train_main_only and (skip_dsa or dense_warmup):
-            raise NotImplementedError(
-                "dsa_train_main_only requires sparse DSA forward attention."
-            )
+            raise NotImplementedError("dsa_train_main_only requires sparse DSA forward attention.")
         if not simplified_indexer and not getattr(self.config, "dsa_indexer_use_hadamard", False):
             raise NotImplementedError(
                 f"dsa_min_memory_backend='{dsa_min_memory_backend}' requires dsa_indexer_use_hadamard."
             )
-        if self.config.fp8 is not None or self.config.fp8_param or is_using_quantization_scales(
-            self.config
+        if (
+            self.config.fp8 is not None
+            or self.config.fp8_param
+            or is_using_quantization_scales(self.config)
         ):
             raise NotImplementedError(
                 f"dsa_min_memory_backend='{dsa_min_memory_backend}' does not yet support quantized/FP8 "
@@ -1163,7 +1125,9 @@ class DSGQACoreAttention(MegatronModule):
             )
         if dense_warmup:
             if self.dense_core_attention is None:
-                raise RuntimeError("Dense DSA warmup requires an original dense core attention spec.")
+                raise RuntimeError(
+                    "Dense DSA warmup requires an original dense core attention spec."
+                )
             if not torch.is_grad_enabled():
                 return self.dense_core_attention(
                     query,
@@ -1244,9 +1208,7 @@ class DSGQACoreAttention(MegatronModule):
                 f"dsa_min_memory_backend='{dsa_min_memory_backend}' currently supports training only."
             )
 
-        configured_indexer_loss_coeff = (
-            getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
-        )
+        configured_indexer_loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0) or 0.0
         if not train_main_only and configured_indexer_loss_coeff <= 0:
             raise NotImplementedError(
                 f"dsa_min_memory_backend='{dsa_min_memory_backend}' expects dsa_indexer_loss_coeff > 0 "
@@ -1269,9 +1231,7 @@ class DSGQACoreAttention(MegatronModule):
             simplified_input_norm=indexer_input_norm,
             cache_routing=getattr(self.config, "dsa_kernel_cache_routing", False),
             cache_indexer_k=getattr(self.config, "dsa_kernel_cache_indexer_k", False),
-            cache_selected_scores=getattr(
-                self.config, "dsa_kernel_cache_selected_scores", False
-            ),
+            cache_selected_scores=getattr(self.config, "dsa_kernel_cache_selected_scores", False),
             profile_enabled=getattr(self.config, "dsa_min_memory_profile", False),
             profile_rank=getattr(self.config, "dsa_min_memory_profile_rank", 0),
             profile_label=f"layer={self.layer_number}",
@@ -1307,7 +1267,6 @@ class DSGQACoreAttention(MegatronModule):
         return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
 
-
 class DSGroupedSelfAttention(SelfAttention):
     """Self-attention that swaps in token-level DSA for grouped-query attention."""
 
@@ -1326,19 +1285,18 @@ class DSGroupedSelfAttention(SelfAttention):
         if config.experimental_attention_variant == "dsa":
             submodules = copy.copy(submodules)
             dense_core_attention = submodules.core_attention
-            if getattr(config, "dsa_indexer_mode", "standard") == "simplified":
-                indexer_spec = ModuleSpec(
-                    module=SimplifiedDSGQAIndexer,
-                    submodules=SimplifiedDSGQAIndexerSubmodules(
-                        linear_q=ModuleSpec(module=TELinear),
-                        linear_k=ModuleSpec(module=TELinear),
-                    ),
-                )
+            # DSA over GQA implements only the simplified indexer; TransformerConfig
+            # enforces dsa_indexer_mode='simplified' for the non-MLA path.
+            indexer_spec = ModuleSpec(
+                module=SimplifiedDSGQAIndexer,
+                submodules=SimplifiedDSGQAIndexerSubmodules(
+                    linear_q=ModuleSpec(module=TELinear), linear_k=ModuleSpec(module=TELinear)
+                ),
+            )
             submodules.core_attention = ModuleSpec(
                 module=DSGQACoreAttention,
                 submodules=DSGQAAttentionSubmodules(
-                    indexer=indexer_spec,
-                    dense_core_attention=dense_core_attention,
+                    indexer=indexer_spec, dense_core_attention=dense_core_attention
                 ),
             )
         super().__init__(
@@ -1352,7 +1310,9 @@ class DSGroupedSelfAttention(SelfAttention):
             name=name,
         )
 
-    def _use_indexer_rope(self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin) -> bool:
+    def _use_indexer_rope(
+        self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
+    ) -> bool:
         no_rope = (
             self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
         )
@@ -1387,13 +1347,11 @@ class DSGroupedSelfAttention(SelfAttention):
         indexer_input_norm = None
         simplified_indexer = getattr(self.config, "dsa_indexer_mode", "standard") == "simplified"
         normalized_simplified_indexer = _simplified_indexer_uses_main_input_norm(self.config)
-        normalized_standard_indexer = (
-            not simplified_indexer
-            and getattr(self.config, "dsa_standard_indexer_use_main_input_norm", False)
+        normalized_standard_indexer = not simplified_indexer and getattr(
+            self.config, "dsa_standard_indexer_use_main_input_norm", False
         )
-        if (
-            (normalized_simplified_indexer or normalized_standard_indexer)
-            and not getattr(self.config, "dsa_fwd_skip_dsa", False)
+        if (normalized_simplified_indexer or normalized_standard_indexer) and not getattr(
+            self.config, "dsa_fwd_skip_dsa", False
         ):
             indexer_input_norm = _indexer_input_norm_spec(self.linear_qkv, self.config)
         return {
@@ -1403,4 +1361,3 @@ class DSGroupedSelfAttention(SelfAttention):
             ),
             "indexer_input_norm": indexer_input_norm,
         }
-
