@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.profiler import ProfilerActivity, profile
 
@@ -265,7 +265,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     dtype = torch.bfloat16
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
-    mesh = DeviceMesh.from_group(dist.group.WORLD, device.type)
+    mesh = init_device_mesh(device.type, (world_size,))
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     placements = _flat_placements()
