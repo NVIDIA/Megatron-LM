@@ -14,6 +14,19 @@ world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
+def test_inject_gtp_remat_axis():
+    # Decoder/dense axis: GTP_remat is injected after 'cp', so CP keeps the more-local
+    # (smaller-stride) placement and GTP_remat sits one step further out.
+    assert ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp') == 'tp-cp-gtp_remat-ep-dp-pp'
+    # Expert axis: EGTP is injected after 'ep' so EP (heavier all-to-all) stays more local.
+    assert ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='ep') == 'tp-cp-ep-gtp_remat-dp-pp'
+    # Idempotent: an order string that already contains 'gtp_remat' is returned unchanged.
+    already_injected = 'tp-cp-gtp_remat-ep-dp-pp'
+    assert ps._inject_gtp_remat_axis(already_injected, after='cp') == already_injected
+    # Falls back to 'tp' as anchor when the requested anchor token isn't present in the order.
+    assert ps._inject_gtp_remat_axis('tp-dp-pp', after='cp') == 'tp-gtp_remat-dp-pp'
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev

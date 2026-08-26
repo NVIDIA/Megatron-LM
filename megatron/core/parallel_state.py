@@ -579,11 +579,12 @@ def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
     nccl_comm_cfgs[pg_name][key_value_pair[0]] = key_value_pair[1]
 
 
-def _inject_gtp_remat_axis(order_str: str, after: str = "tp") -> str:
+def _inject_gtp_remat_axis(order_str: str, after: str = "cp") -> str:
     """Inject the 'gtp_remat' axis into a RankGenerator order string for NCCL locality.
 
     Position controls locality (leftmost token = smallest stride = most adjacent ranks):
-      - dense/decoder: inject after 'tp' -> 'tp-gtp_remat-cp-ep-dp-pp' (GTP_remat local).
+      - dense/decoder: inject after 'cp' -> 'tp-cp-gtp_remat-ep-dp-pp' (CP kept more local than
+        GTP_remat).
       - expert: inject after 'ep' -> 'tp-cp-ep-gtp_remat-dp-pp' so EP keeps more-local placement
         than EGTP (the MoE EP all-to-all is the heavier expert-side collective).
     When gtp_remat/egtp_remat size is 1 the injected axis is a no-op (singleton groups).
@@ -854,7 +855,7 @@ def initialize_model_parallel(
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
-    decoder_order = _inject_gtp_remat_axis(order, after="tp")
+    decoder_order = _inject_gtp_remat_axis(order, after="cp")
 
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
@@ -1633,7 +1634,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         pp=pp_size,
         cp=cp_size,
         gtp_remat=gtp_remat_size,
-        order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='tp'),
+        order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp'),
         rank_offset=0,
     )
 
