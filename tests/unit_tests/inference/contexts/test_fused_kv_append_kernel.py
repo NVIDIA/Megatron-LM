@@ -83,6 +83,7 @@ class TestKVAppendLargeBlockIdx:
             padded_active_token_count=n_tokens,
             token_to_block_idx=block_indices,
             token_to_local_position_within_kv_block=local_positions,
+            dummy_block_idx=-1,
         )
 
         try:
@@ -108,3 +109,95 @@ class TestKVAppendLargeBlockIdx:
         assert torch.equal(
             actual_value, expected_value
         ), f"Value not at expected cache position (block {target_block})."
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAVE_TRITON, reason="Triton required")
+class TestKVAppendDummyBlockSkip:
+    """Tokens routed to the dummy block must not reach the cache.
+
+    ``add_request`` points recomputed prefix tokens at ``dummy_block_idx`` so they
+    do not overwrite a shared, already-populated block. The kernel drops those
+    stores instead of writing the scratch block nobody reads.
+    """
+
+    @pytest.mark.internal
+    def test_dummy_block_tokens_are_not_written(self):
+        device = "cuda"
+        total_blocks = 4
+        block_size = 8
+        num_heads = 2
+        h_dim = 16
+        layer = 0
+        dummy_block = total_blocks - 1
+        real_block = 1
+
+        view = ContextGPUView(max_requests=4, max_tokens=32, max_kv_blocks=4, device=device)
+        block_idx_dtype = view.token_to_block_idx.dtype
+
+        memory_buffer = torch.full(
+            (2, 1, total_blocks, block_size, num_heads, h_dim),
+            7.0,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        untouched = memory_buffer.clone()
+
+        # Two tokens: the first is a normal write, the second is redirected.
+        key = torch.randn(2, 1, num_heads, h_dim, dtype=torch.bfloat16, device=device)
+        value = torch.randn(2, 1, num_heads, h_dim, dtype=torch.bfloat16, device=device)
+        block_indices = torch.tensor(
+            [real_block, dummy_block], dtype=block_idx_dtype, device=device
+        )
+        local_positions = torch.tensor([0, 3], dtype=torch.int32, device=device)
+
+        triton_append_key_value_cache(
+            layer_number=layer,
+            key=key,
+            value=value,
+            memory_buffer=memory_buffer,
+            padded_active_token_count=2,
+            token_to_block_idx=block_indices,
+            token_to_local_position_within_kv_block=local_positions,
+            dummy_block_idx=dummy_block,
+        )
+        torch.cuda.synchronize()
+
+        # The real token landed.
+        assert torch.equal(memory_buffer[0, layer, real_block, 0], key.squeeze(1)[0])
+        assert torch.equal(memory_buffer[1, layer, real_block, 0], value.squeeze(1)[0])
+
+        # The dummy block is byte-for-byte unchanged.
+        assert torch.equal(memory_buffer[:, :, dummy_block], untouched[:, :, dummy_block])
+
+    @pytest.mark.internal
+    def test_writes_proceed_when_no_token_is_redirected(self):
+        """Control: an out-of-range sentinel masks nothing."""
+        device = "cuda"
+        block_size, num_heads, h_dim, layer = 8, 2, 16, 0
+
+        view = ContextGPUView(max_requests=4, max_tokens=32, max_kv_blocks=4, device=device)
+        memory_buffer = torch.zeros(
+            (2, 1, 4, block_size, num_heads, h_dim), dtype=torch.bfloat16, device=device
+        )
+        key = torch.randn(1, 1, num_heads, h_dim, dtype=torch.bfloat16, device=device)
+        value = torch.randn(1, 1, num_heads, h_dim, dtype=torch.bfloat16, device=device)
+
+        triton_append_key_value_cache(
+            layer_number=layer,
+            key=key,
+            value=value,
+            memory_buffer=memory_buffer,
+            padded_active_token_count=1,
+            token_to_block_idx=torch.tensor(
+                [2], dtype=view.token_to_block_idx.dtype, device=device
+            ),
+            token_to_local_position_within_kv_block=torch.zeros(
+                1, dtype=torch.int32, device=device
+            ),
+            dummy_block_idx=-1,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(memory_buffer[0, layer, 2, 0], key.squeeze(1)[0])
+        assert torch.equal(memory_buffer[1, layer, 2, 0], value.squeeze(1)[0])

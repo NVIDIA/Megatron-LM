@@ -1791,6 +1791,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.gpu_view.token_to_block_idx,
                 token_to_local_position_within_kv_block=self.gpu_view.token_to_local_position_within_kv_block,
+                dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
             )
 
         block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
