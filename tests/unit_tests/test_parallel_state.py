@@ -27,6 +27,33 @@ def test_inject_gtp_remat_axis():
     assert ps._inject_gtp_remat_axis('tp-dp-pp', after='cp') == 'tp-gtp_remat-dp-pp'
 
 
+def test_cp_more_local_than_gtp_remat_rank_layout():
+    """With cp>1 and gtp_remat>1, CP ranks must have a smaller stride (more local) than
+    GTP_remat ranks. Unlike test_inject_gtp_remat_axis, this checks actual rank placement,
+    not just the order string.
+    """
+    tp_size, cp_size, gtp_remat_size, dp_size = 2, 2, 2, 2
+    order = ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp')
+    rank_generator = ps.RankGenerator(
+        tp=tp_size, ep=1, dp=dp_size, pp=1, cp=cp_size, order=order, gtp_remat=gtp_remat_size
+    )
+
+    def stride(groups):
+        strides = {sorted(g)[1] - sorted(g)[0] for g in groups}
+        assert len(strides) == 1, f"non-uniform stride across groups: {groups}"
+        return strides.pop()
+
+    cp_stride = stride(rank_generator.get_ranks('cp'))
+    gtp_remat_stride = stride(rank_generator.get_gtp_ranks(gtp_remat_size))
+
+    # CP is the second axis (after tp) -> stride == tp_size.
+    assert cp_stride == tp_size
+    # GTP_remat is the third axis (after tp, cp) -> stride == tp_size * cp_size.
+    assert gtp_remat_stride == tp_size * cp_size
+    # The property this whole change is about: CP ranks are more adjacent than GTP_remat ranks.
+    assert cp_stride < gtp_remat_stride
+
+
 @pytest.mark.parametrize('order', test_parallel_order)
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
