@@ -20,6 +20,7 @@ Coverage:
 
 from __future__ import annotations
 
+import logging
 import math
 import sys
 import types
@@ -70,11 +71,14 @@ def reset_lazy_kernel_state():
     """
     saved_flash = dk._flash_mla_sparse_fwd
     saved_dsa = dk._DSA
+    saved_row_limit_warned = dk._ROW_LIMIT_WARNED
     dk._flash_mla_sparse_fwd = None
     dk._DSA = None
+    dk._ROW_LIMIT_WARNED = False
     yield
     dk._flash_mla_sparse_fwd = saved_flash
     dk._DSA = saved_dsa
+    dk._ROW_LIMIT_WARNED = saved_row_limit_warned
 
 
 def _make_local_idxs(b: int, sq: int, topk: int, *, with_invalid: bool = False) -> torch.Tensor:
@@ -1264,6 +1268,145 @@ class TestIndexerTopk:
         assert torch.allclose(
             captured_w['w'].float(), expected_w.float(), atol=1e-2, rtol=1e-2
         ), "(c) weights were not pre-scaled by indexer_softmax_scale"
+
+
+def _install_row_limit_dsa_stub():
+    """Install a CPU stub that preserves THD/BSHD score shapes."""
+    fake_dsa = MagicMock(name="_DSA_row_limit_stub")
+
+    def fake_indexer_forward(q, _k, _w, ratio, **_kwargs):
+        del ratio
+        shape = (q.shape[0], 1) if q.ndim == 3 else (q.shape[0], q.shape[1], 1)
+        return {"scores": torch.zeros(shape, dtype=torch.float32, device=q.device)}
+
+    def fake_topk(scores, _seq_lens, top_k, **_kwargs):
+        return {
+            "indices": torch.zeros(scores.shape[0], top_k, dtype=torch.int32, device=scores.device)
+        }
+
+    fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
+    fake_dsa.indexer_top_k_wrapper.side_effect = fake_topk
+    dk._DSA = fake_dsa
+    return fake_dsa
+
+
+@pytest.mark.parametrize("layout", ["thd", "sbhd"])
+def test_fused_row_limit_warning_is_shared_and_once(layout, caplog, reset_lazy_kernel_state):
+    """Every fused layout warns above the verified limit, at most once per process."""
+    rows = dk.FUSED_INDEXER_MAX_SAFE_ROWS + 1
+    fake_dsa = _install_row_limit_dsa_stub()
+
+    with caplog.at_level(logging.WARNING, logger=dk.__name__):
+        for _ in range(2):
+            if layout == "thd":
+                cu_q = torch.tensor([0, rows], dtype=torch.int32)
+                cu_k = torch.tensor([0, 1], dtype=torch.int32)
+                indexer_topk(
+                    torch.zeros(rows, 1, 1, dtype=torch.bfloat16),
+                    torch.zeros(1, 1, dtype=torch.bfloat16),
+                    torch.ones(rows, 1, dtype=torch.bfloat16),
+                    topk=1,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_kv=cu_k,
+                    max_seqlen_q=rows,
+                    max_seqlen_kv=1,
+                )
+            else:
+                indexer_topk(
+                    torch.zeros(rows, 1, 1, 1, dtype=torch.bfloat16),
+                    torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+                    torch.ones(rows, 1, 1, dtype=torch.bfloat16),
+                    topk=1,
+                )
+
+    warnings = [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
+    assert len(warnings) == 1
+    assert fake_dsa.indexer_forward_wrapper.call_count == 2
+
+
+@pytest.mark.parametrize("layout", ["thd", "sbhd"])
+def test_fused_row_limit_does_not_warn_at_boundary(layout, caplog, reset_lazy_kernel_state):
+    """The exact 32768-row boundary is verified safe and emits no warning."""
+    rows = dk.FUSED_INDEXER_MAX_SAFE_ROWS
+    _install_row_limit_dsa_stub()
+
+    with caplog.at_level(logging.WARNING, logger=dk.__name__):
+        if layout == "thd":
+            indexer_topk(
+                torch.zeros(rows, 1, 1, dtype=torch.bfloat16),
+                torch.zeros(1, 1, dtype=torch.bfloat16),
+                torch.ones(rows, 1, dtype=torch.bfloat16),
+                topk=1,
+                cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32),
+                cu_seqlens_kv=torch.tensor([0, 1], dtype=torch.int32),
+                max_seqlen_q=rows,
+                max_seqlen_kv=1,
+            )
+        else:
+            indexer_topk(
+                torch.zeros(rows, 1, 1, 1, dtype=torch.bfloat16),
+                torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+                torch.ones(rows, 1, 1, dtype=torch.bfloat16),
+                topk=1,
+            )
+
+    assert not [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
+
+
+def test_fused_row_limit_warns_only_for_launched_calls(
+    monkeypatch, caplog, reset_lazy_kernel_state
+):
+    """Invalid inputs and backend-resolution failures must not consume the warning."""
+    rows = dk.FUSED_INDEXER_MAX_SAFE_ROWS + 1
+    q = torch.zeros(rows, 1, 1, dtype=torch.bfloat16)
+    w = torch.ones(rows, 1, dtype=torch.bfloat16)
+    cu_q = torch.tensor([0, rows], dtype=torch.int32)
+    cu_k = torch.tensor([0, 1], dtype=torch.int32)
+
+    with caplog.at_level(logging.WARNING, logger=dk.__name__):
+        _install_row_limit_dsa_stub()
+        with pytest.raises(ValueError, match="THD q must be"):
+            dk._indexer_topk_core(
+                q.unsqueeze(1),
+                torch.zeros(1, 1, dtype=torch.bfloat16),
+                w,
+                topk=1,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_k,
+                max_seqlen_q=rows,
+                max_seqlen_kv=1,
+            )
+
+        with pytest.raises(ValueError, match="at least one K row"):
+            dk._indexer_topk_core(
+                q,
+                torch.zeros(0, 1, dtype=torch.bfloat16),
+                w,
+                topk=1,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=torch.tensor([0, 0], dtype=torch.int32),
+                max_seqlen_q=rows,
+                max_seqlen_kv=0,
+            )
+
+        dk._DSA = None
+        monkeypatch.setattr(
+            dk, "_ensure_dsa_namespace", MagicMock(side_effect=ImportError("backend unavailable"))
+        )
+        with pytest.raises(ImportError, match="backend unavailable"):
+            dk._indexer_topk_core(
+                q,
+                torch.zeros(1, 1, dtype=torch.bfloat16),
+                w,
+                topk=1,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_k,
+                max_seqlen_q=rows,
+                max_seqlen_kv=1,
+            )
+
+    assert not [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
+    assert dk._ROW_LIMIT_WARNED is False
 
 
 # ---------------------------------------------------------------------------

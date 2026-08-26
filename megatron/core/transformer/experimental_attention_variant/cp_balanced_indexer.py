@@ -11,12 +11,12 @@ light) and chunk ``2 * cp_size - 1 - r`` (a high-position "tail", heavy), so
 PER-SEQUENCE ZIGZAG: packs whose padded sequence lengths divide ``2 * cp_size`` gather each
 rank's head/tail chunks of every sequence via prebuilt A2A routes and score them with two
 packed fused-top-k calls against synthetic per-sequence layouts with explicit RoPE positions.
-Config validation requires the fused backend and a pack-tail alignment divisible by
-``2 * cp_size`` (the run-level precondition); the ACTUAL pack decides per microbatch:
+Config validation requires the fused backend; the ACTUAL pack decides per microbatch:
 an eager pack the zigzag builders cannot represent routes to the contiguous reference
-path (``pack_eligible_for_zigzag``) -- per-pack shape variation between fused calls is
-verified safe below the kernel row limit -- while CUDA graphs require a recorded verdict
-and a static composition. The fused kernel package has one verified defect: a fused call
+path (``pack_eligible_for_zigzag``), while CUDA graphs require a recorded verdict and a
+static composition. ``pad_packed_seq_alignment`` remains a capacity-rounding hint, not
+an eligibility contract: ``None``, ``"max"``, and integer alignments are all accepted.
+The fused kernel package has one verified defect: a fused call
 with more than ``FUSED_INDEXER_MAX_SAFE_ROWS`` (32768) query rows is silently corrupted
 from row 32768 on unless it is the process's first fused call; the balanced
 synthetic-layout calls therefore fail closed above the limit (prebuild bounds ``l_local``
@@ -83,11 +83,11 @@ _A2A_BUF: dict = {}
 # re-validates capacity via plan["half"] * 2 == l_local.
 _LAST_PLAN: dict = {}
 
-# Per-(group, l_local) OK verdict from the last prebuild or eager probe: the CURRENT
+# Per-(group, l_local) verdict from the last prebuild or eager probe: the CURRENT
 # pack is zigzag-representable (every padded sequence length divisible by 2 * cp_size).
-# Only successes are recorded — a violating pack raises (eligibility is a run-level
-# invariant). Capture consults this registry because probing is impossible while
-# recording a graph.
+# Both outcomes are recorded because eager execution may switch between the balanced and
+# contiguous paths from one pack to the next. Capture consults this registry because
+# probing is impossible while recording a graph.
 _ZZ_PACK_OK: dict = {}
 
 # Last OBSERVED (l_local, cu composition) per group, recorded on every prebuild
@@ -98,12 +98,6 @@ _ZZ_PACK_OK: dict = {}
 # from max_seqlen_q, and the gate/single-multi host branches), so a composition
 # change must fail loudly there too.
 _SEEN_CU: dict = {}
-
-# Sentinel default for prebuild_balanced_layouts(pad_alignment=...): "the caller did
-# not supply the config's pad alignment" (build routes; the forward gate decides).
-# Passing None explicitly means "the config HAS no packed-seq alignment", for which
-# the zigzag gate can never open and route construction is skipped.
-_PAD_UNSPECIFIED = object()
 
 
 def _is_capturing() -> bool:
@@ -342,9 +336,10 @@ def _pack_zigzag_verdict(cu_seqlens, cp_group, cp_size, l_local, layout_cache):
     """Is the ACTUAL microbatch pack zigzag-representable? Returns a bool.
 
     Structural requirement of the zigzag builders (nothing to do with the kernel
-    row-limit defect): every (padded) sequence length, the capacity tail, and the
-    per-rank row count must divide ``2 * cp_size``, else the ragged chunk
-    enumeration would emit out-of-range gather indices. Verdicts are cached on
+    row-limit defect): every (padded) sequence length and the capacity tail must
+    be divisible by ``2 * cp_size``, and the per-rank row count must be even;
+    otherwise the two-half ragged chunk enumeration would emit out-of-range gather
+    indices. Verdicts are cached on
     the microbatch ``layout_cache`` (written by prebuild or an earlier probe of
     the same pack, capacity-tagged) and in the module registry keyed by
     (group, l_local). Probing needs a D2H read of ``cu_seqlens``, which is
@@ -399,9 +394,8 @@ def pack_eligible_for_zigzag(packed_seq_params, cu_seqlens, cp_group, cp_size, l
     """Per-pack routing decision for the CSA forward (eager: bool; capture: recorded).
 
     An ineligible pack takes the original contiguous ``compute_cp_indexer_topk``
-    path for that microbatch — per-pack shape variation between fused calls is
-    verified safe below the kernel row limit, so routing costs nothing beyond the
-    one cached D2H probe for frontends that never prebuild. Ensures the
+    path for that microbatch. Routing costs nothing beyond the one cached D2H probe
+    for frontends that never prebuild. Ensures the
     per-microbatch layout cache exists so the verdict (and layer 1's plans) are
     shared by every layer.
     """
@@ -469,7 +463,7 @@ def _zigzag_plan(cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, la
     """Per-sequence zigzag plan for this microbatch (cached on the layout cache).
 
     Requires every (padded) sequence length — including the capacity-padding pseudo-sequence —
-    to be divisible by ``2 * cp_size`` (guaranteed by ``pad_packed_seq_alignment`` >= 2*cp).
+    to be divisible by ``2 * cp_size`` (verified by the per-pack routing gate).
     Rank ``r`` computes, for EVERY sequence, its intra-sequence chunks ``r`` (head) and
     ``2N-1-r`` (tail), so per-rank causal work is exactly constant for any pack composition.
     All indices/layouts are computed on device from ``cu_seqlens`` (no host sync); shapes are
@@ -595,11 +589,10 @@ def balanced_compute_cp_indexer_topk(
     ``2 * cp_size - 1 - r`` (tail) of every sequence — one cheap and one expensive under
     the causal mask — via per-chunk calls that follow the reference (RoPE positions,
     causal offsets, packing, tight KV bounds), then combines the top-k back to contiguous
-    order. Eligibility is a run-level invariant: a pack the zigzag builders cannot
-    represent (a sequence length not divisible by ``2 * cp_size``) RAISES — at prebuild
-    when prebuilt, else at the dispatch/compute check here — instead of falling back,
-    because the fused kernel package silently corrupts fused calls whose row shape
-    differs from earlier calls in the process.
+    order. Eligibility is decided independently for every pack. The CSA integration
+    routes a pack with a sequence length not divisible by ``2 * cp_size`` to the
+    contiguous reference path before dispatch; the internal check here still raises if
+    a caller bypasses that routing and reaches the zigzag builders with an invalid pack.
     """
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
@@ -928,11 +921,7 @@ def balanced_compute_cp_indexer_topk(
 
 
 def prebuild_balanced_layouts(
-    packed_seq_params,
-    cp_group=None,
-    pad_alignment=_PAD_UNSPECIFIED,
-    capacity=None,
-    graphs_enabled=False,
+    packed_seq_params, cp_group=None, pad_alignment=None, capacity=None, graphs_enabled=False
 ):
     """Data-prep-time prebuild of the balanced-indexer zigzag plan and multi-seq gate.
 
@@ -1017,35 +1006,33 @@ def prebuild_balanced_layouts(
     if total <= 0:
         # All-empty pack: nothing to score; the forward exits before any fused call.
         return
-    if total % N != 0 or l_local % 2 != 0:
+    if total % N != 0:
         raise ValueError(
-            "balanced CP indexer: pack capacity violates the run-level invariant "
-            f"(total={total}, cp_size={N}, l_local={l_local}): the physical pack must "
-            "split into an even per-rank row count. Check pad_packed_seq_alignment "
-            "(config validation requires an integer multiple of 2 * cp_size)."
+            "balanced CP indexer: physical pack capacity must be divisible by "
+            f"cp_size (total={total}, cp_size={N})."
         )
 
     cu_list = seen_cu[1]
+    # Same sequence enumeration as _zigzag_plan: real segments plus the
+    # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
+    seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
+    if l_local % 2 != 0 or any(sl % (2 * N) for sl in seq_lens_list):
+        # Not zigzag-representable: record the verdict so the forward routes this
+        # microbatch to the contiguous reference path. The configured alignment is
+        # deliberately not part of this decision: only the physical capacity and
+        # actual sequence boundaries determine whether the zigzag layout is legal.
+        _stash_verdict(False)
+        return
+
     prev = _LAST_PLAN.get((_group_key(cp_group), r))
     if prev is not None and prev.get("half", 0) * 2 != l_local:
         # Latest-slot plan was built at a different capacity (e.g. a raw middle-stage
         # cu probed with a different capacity hint): not reusable for idempotency.
         prev = None
 
-    if pad_alignment is not _PAD_UNSPECIFIED and not (
-        isinstance(pad_alignment, int) and pad_alignment % (2 * N) == 0
-    ):
-        # Config validation already requires this when dsa_cp_balance_indexer is
-        # enabled; a mismatch here means the caller wired a different value.
-        raise ValueError(
-            "balanced CP indexer: prebuild received pad_alignment="
-            f"{pad_alignment!r}, which is not an integer multiple of 2 * cp_size "
-            f"= {2 * N}. Balanced eligibility is a run-level invariant; pass the "
-            "config's pad_packed_seq_alignment."
-        )
     # The unified zigzag path also serves single-full-sequence packs (the per-sequence
     # zigzag of one pack-spanning sequence is the plain 2N-fold of the whole pack), so the
-    # plan and its A2A routes are built for every pack composition.
+    # plan and its A2A routes are built for every eligible pack composition.
 
     # Idempotent prebuild: for static pack compositions (every CUDA-graph run, and
     # any fixed-length workload) the plan content is identical each microbatch.
@@ -1060,22 +1047,11 @@ def prebuild_balanced_layouts(
         cache[("zigzag", r)] = prev
         _stash_verdict(True)
         return
-    # Same sequence enumeration as _zigzag_plan: real segments plus the
-    # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
-    seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
-    if any(sl % (2 * N) for sl in seq_lens_list):
-        # Not zigzag-representable: record the verdict so the forward routes this
-        # microbatch to the contiguous reference path (per-pack shape variation
-        # between fused calls is verified safe below the kernel row limit). A
-        # conforming pad alignment makes padded-cu packs always representable;
-        # raw-cu middle stages and non-scheduler frontends can still produce one.
-        _stash_verdict(False)
-        return
 
     # The balanced row-limit applies only when a plan will actually be built: an
-    # ineligible pack above the limit routes to the reference path (which goes
-    # unfused above the limit in the CSA integration) and must not be rejected
-    # here.
+    # ineligible pack above the limit routes to the reference path. That legacy
+    # path preserves its fused behavior and emits the shared backend warning, so
+    # this balanced-only prebuild must not reject it here.
     from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
         FUSED_INDEXER_MAX_SAFE_ROWS,
     )

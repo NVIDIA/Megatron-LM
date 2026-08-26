@@ -395,16 +395,13 @@ class TransformerConfig(ModelParallelConfig):
     causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
     each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
     existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
-    contiguous order. Balancing requires the per-sequence zigzag: the fused indexer kernel backend
-    active, ``pad_packed_seq_alignment`` an integer divisible by ``2 * cp_size``
-    (``None``/``"max"`` disqualify), and every (padded) sequence length in the pack divisible
-    by ``2 * cp_size`` (the alignment condition is a prefilter: per-microbatch pack
-    divisibility decides; prebuilt A2A routes come from ``prebuild_balanced_layouts``).
-    Enabling the flag requires the fused backend and the alignment condition at config
-    validation (the run-level precondition); the actual pack decides per microbatch: an
-    eager pack the zigzag builders cannot represent takes the contiguous reference path for
-    that microbatch, and pack capacity may vary between eager microbatches (per-pack
-    fused-call shape variation is verified safe below the kernel row limit). The current
+    contiguous order. Balancing requires the per-sequence zigzag and the fused indexer kernel
+    backend. Eligibility is decided from the actual microbatch: its per-rank row count must be
+    even, and every padded sequence length (including any capacity tail) must be divisible by
+    ``2 * cp_size``. ``pad_packed_seq_alignment`` only controls capacity rounding and may be
+    ``None``, ``"max"``, or an integer; it is not an eligibility guarantee. An ineligible eager
+    pack takes the contiguous reference path for that microbatch, so eager runs may switch paths
+    and capacities between packs. The current
     fused kernel package silently corrupts any fused call above 32768 query rows that is
     not the process's first fused call (verified on GB200, cudnn-frontend 1.26.0): the
     balanced two-half-call path therefore fails closed above per-rank capacities of
@@ -1842,12 +1839,11 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.dsa_cp_balance_indexer:
-            # Startup preconditions for the flag to be USEFUL (the per-pack verdict in
+            # Startup preconditions for the flag to be meaningful. The per-pack verdict in
             # cp_balanced_indexer does the actual routing; ineligible packs take the
-            # contiguous reference path per microbatch): the balanced zigzag scorer is
-            # fused-only, and with a pad alignment that is not an integer multiple of
-            # 2 * cp_size no padded-cu pack can ever be zigzag-representable — the flag
-            # would be a silent, costly no-op — so reject that as a configuration error.
+            # contiguous reference path. The alignment setting is intentionally absent
+            # here because it is only a capacity-rounding policy, not proof that the
+            # current pack's sequence boundaries are zigzag-representable.
             # Evaluated after the deprecated apply_dsa_kernel_fusion switch is folded
             # into dsa_kernel_backend above, so the predicate sees the final backend.
             from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
@@ -1860,6 +1856,11 @@ class TransformerConfig(ModelParallelConfig):
                     "(dsa_kernel_backend != 'none' and attention_backend != unfused): "
                     "the balanced zigzag scorer is fused-only."
                 )
+            if not (self.context_parallel_size > 1 or self.dynamic_context_parallel):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires active context parallelism "
+                    "(context_parallel_size > 1 or dynamic_context_parallel=True)."
+                )
             ratios = self.csa_compress_ratios or []
             if self.csa_dense_mode or 4 not in ratios:
                 raise ValueError(
@@ -1870,16 +1871,6 @@ class TransformerConfig(ModelParallelConfig):
                     f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
                     "flag would only add per-microbatch prebuild work."
                 )
-            cp = self.context_parallel_size
-            pad = self.pad_packed_seq_alignment
-            if cp > 1 and not (isinstance(pad, int) and pad > 0 and pad % (2 * cp) == 0):
-                raise ValueError(
-                    "dsa_cp_balance_indexer requires pad_packed_seq_alignment to be a "
-                    f"positive integer multiple of 2 * context_parallel_size = {2 * cp} "
-                    f"(got {pad!r}), so every pack is zigzag-representable and the "
-                    "balanced call shape stays fixed for the whole run."
-                )
-
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (

@@ -130,7 +130,7 @@ def get_batch(data_iterator, vp_stage=None):
             config=config,
         )
         finalize_packed_seq_params(packed_seq_params)
-        if getattr(args, "dsa_cp_balance_indexer", False):
+        if config.dsa_cp_balance_indexer:
             # Same data-prep hook as pretrain_gpt.get_batch: prebuild the balanced
             # indexer's zigzag plan/routes where host syncs are free, and record the
             # composition observation the CUDA-graph static-composition gate compares
@@ -138,8 +138,8 @@ def get_batch(data_iterator, vp_stage=None):
             # and bypass the composition-change raise under graphs).
             prebuild_balanced_layouts(
                 packed_seq_params,
-                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
-                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+                pad_alignment=config.pad_packed_seq_alignment,
+                graphs_enabled=config.cuda_graph_impl != "none",
             )
         return (
             attention_mask,
@@ -318,6 +318,7 @@ def forward_step(data_iterator, model: HybridModel):
             packed_seq_params,
         ) = get_batch(data_iterator, vp_stage)
 
+    build_packed_seq_params_in_forward = packed_seq_params is None and cu_seqlens is not None
     if packed_seq_params is not None:
         if packed_seq_params.cu_seqlens_q is not None:
             update_seqlen_stats_from_cu_seqlens(packed_seq_params.cu_seqlens_q)
@@ -345,16 +346,18 @@ def forward_step(data_iterator, model: HybridModel):
             tokens_per_sample=args.seq_length,
         )
         finalize_packed_seq_params(packed_seq_params)
-        if getattr(args, "dsa_cp_balance_indexer", False):
-            # Same data-prep hook as pretrain_gpt.get_batch: prebuild the balanced
-            # indexer's zigzag plan/routes where host syncs are free, and record the
-            # composition observation the CUDA-graph static-composition gate compares
-            # against (skipping it would silently lose the routed A2A path in eager
-            # and bypass the composition-change raise under graphs).
+
+    if build_packed_seq_params_in_forward:
+        # The sequence-packing scheduler prebuilds in get_batch(), where its
+        # PackedSeqParams already exists. Legacy SFT/inter-document-mask paths
+        # expose raw cu_seqlens instead, so their params are first constructed
+        # here and need the same hook exactly once.
+        config = get_attr_wrapped_model(model, "config")
+        if config.dsa_cp_balance_indexer:
             prebuild_balanced_layouts(
                 packed_seq_params,
-                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
-                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+                pad_alignment=config.pad_packed_seq_alignment,
+                graphs_enabled=config.cuda_graph_impl != "none",
             )
 
     timers('batch-generator').stop()

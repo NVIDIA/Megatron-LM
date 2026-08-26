@@ -145,11 +145,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             config=config,
         )
         finalize_packed_seq_params(batch[5])
-        if getattr(args, "dsa_cp_balance_indexer", False):
+        if config.dsa_cp_balance_indexer:
             prebuild_balanced_layouts(
                 batch[5],
-                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
-                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+                pad_alignment=config.pad_packed_seq_alignment,
+                graphs_enabled=config.cuda_graph_impl != "none",
             )
         return batch
 
@@ -194,18 +194,16 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             qkv_format='thd',
         )
         finalize_packed_seq_params(packed_seq_params)
-        if getattr(args, "dsa_cp_balance_indexer", False):
+        if config.dsa_cp_balance_indexer:
             # Middle-stage PackedSeqParams carry the raw cu; the hidden states are
-            # padded, so probe/build at the physical capacity. NOTE: with the flag
-            # on, config validation forces the sequence-packing scheduler (which
-            # broadcasts the padded cu to every stage), so in-tree this branch only
-            # runs at CP<=1 where prebuild no-ops; the capacity machinery serves
-            # non-scheduler frontends and is pinned by unit tests.
+            # padded, so probe/build at the physical capacity. Eligibility still
+            # comes from the actual sequence boundaries plus that capacity tail;
+            # an unrepresentable pack records False and uses the reference path.
             prebuild_balanced_layouts(
                 packed_seq_params,
-                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
+                pad_alignment=config.pad_packed_seq_alignment,
                 capacity=args.seq_length,
-                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+                graphs_enabled=config.cuda_graph_impl != "none",
             )
         return (None, None, None, None, None, packed_seq_params, None)
 
@@ -259,11 +257,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['position_ids'] = position_ids
 
     finalize_packed_seq_params(packed_seq_params)
-    if getattr(args, "dsa_cp_balance_indexer", False):
+    if config.dsa_cp_balance_indexer:
         prebuild_balanced_layouts(
             packed_seq_params,
-            pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
-            graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+            pad_alignment=config.pad_packed_seq_alignment,
+            graphs_enabled=config.cuda_graph_impl != "none",
         )
 
     # Unpack explicitly to avoid relying on dict insertion order.

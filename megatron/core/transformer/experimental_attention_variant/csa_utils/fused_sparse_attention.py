@@ -857,7 +857,7 @@ def _warn_fused_row_limit_once(total_q: int) -> None:
     if _ROW_LIMIT_WARNED:
         return
     _ROW_LIMIT_WARNED = True
-    logging.getLogger(__name__).error(
+    logging.getLogger(__name__).warning(
         "CORRECTNESS WARNING: fused indexer top-k call with %d query rows exceeds "
         "%d, the verified-safe limit of the current fused kernel package. On the "
         "verified stack (GB200, cudnn-frontend 1.26.0) such a call following ANY "
@@ -918,9 +918,6 @@ def _indexer_topk_core(
       so the SBHD→BSHD permute can be performed once and reused across
       the indexer forward and the score-recompute backward kernels.
     """
-    total_q_rows = int(q.shape[0]) if cu_seqlens_q is not None else int(q.shape[0] * q.shape[1])
-    if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
-        _warn_fused_row_limit_once(total_q_rows)
     is_thd = cu_seqlens_q is not None
     device = q.device
 
@@ -945,6 +942,12 @@ def _indexer_topk_core(
         )
         if q_causal_offsets is not None:
             forward_kwargs["q_causal_offsets"] = q_causal_offsets
+        total_q_rows = int(q.shape[0])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            # Warn only after validation and backend resolution, immediately before
+            # an affected fused invocation. Invalid/no-op calls must not consume the
+            # process-wide warning or imply that the kernel actually ran.
+            _warn_fused_row_limit_once(total_q_rows)
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(1), w, ratio=ratio, **forward_kwargs)[
             "scores"
         ]  # (total_q, max_seqlen_kv) fp32, -inf on masked positions
@@ -971,6 +974,9 @@ def _indexer_topk_core(
 
         _ensure_dsa_namespace()
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
+        total_q_rows = int(q.shape[0] * q.shape[1])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            _warn_fused_row_limit_once(total_q_rows)
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
             "scores"
         ]  # (b, sq, sk) fp32, -inf on masked positions
