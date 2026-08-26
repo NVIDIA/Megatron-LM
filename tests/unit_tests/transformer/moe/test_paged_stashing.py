@@ -19,6 +19,7 @@ from megatron.core.transformer.moe.paged_stash import (
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
+    paged_stash_te_graph_capture,
 )
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -43,6 +44,11 @@ def _make_schedule_manager(recorded_schedule, vp_size=1):
     manager.current_vp_stage = 0
     manager.current_schedule_index = len(manager._pp_schedule)
     manager._te_graph_capture = False
+    manager.stash_buffers = {}
+    manager.overflow = torch.zeros(1, dtype=torch.int64)
+    manager.host_spill = torch.zeros(1, dtype=torch.int64)
+    manager.paged_tensors_to_stash = []
+    manager.paged_tensors_stash_in_progress = []
     return manager
 
 
@@ -90,6 +96,62 @@ def test_te_graph_capture_uses_capture_order_then_restores_runtime_schedule():
     assert manager.current_layer is runtime_current_layer
     assert manager.current_microbatch is runtime_current_microbatch
     assert manager.current_vp_stage == runtime_current_vp_stage
+
+
+def test_te_graph_capture_after_eval_restores_disabled_state_on_failure(monkeypatch):
+    runtime_schedule = [1_001_000, -1_001_000]
+    manager = _make_schedule_manager(runtime_schedule)
+    manager.enabled = False
+    runtime_current_layer = manager.current_layer
+    runtime_current_microbatch = manager.current_microbatch
+    monkeypatch.setattr(PagedStashManager, "STASH_MGR", manager)
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        with paged_stash_te_graph_capture(True, order=[1, -1]):
+            assert manager.enabled
+            assert manager._te_graph_capture
+            raise RuntimeError("capture failed")
+
+    assert not manager.enabled
+    assert not manager._te_graph_capture
+    assert manager._pp_schedule is runtime_schedule
+    assert manager.current_layer is runtime_current_layer
+    assert manager.current_microbatch is runtime_current_microbatch
+
+
+def test_te_graph_capture_reallocates_buffers_released_by_warmup_fallback(monkeypatch):
+    manager = _make_schedule_manager([1_001_000, -1_001_000])
+    manager.stash_buffers = None
+    reset_calls = []
+
+    class FakeStashBuffer:
+        def reset(self):
+            reset_calls.append("reset")
+
+    allocation_args = []
+
+    def fake_allocate_stash_buffers(
+        moe_paged_stash_buffer_size_factor_cuda, moe_paged_stash_buffer_size_factor_cpu
+    ):
+        allocation_args.append(
+            (moe_paged_stash_buffer_size_factor_cuda, moe_paged_stash_buffer_size_factor_cpu)
+        )
+        manager.stash_buffers = {"dtype": {128: FakeStashBuffer()}}
+        manager.overflow.fill_(1)
+        manager.host_spill.fill_(1)
+
+    monkeypatch.setattr(manager, "allocate_stash_buffers", fake_allocate_stash_buffers)
+    config = SimpleNamespace(
+        moe_paged_stash_buffer_size_factor_cuda=1.25, moe_paged_stash_buffer_size_factor_cpu=0.5
+    )
+
+    runtime_state = manager.start_te_graph_capture([1, -1], config=config)
+
+    assert allocation_args == [(1.25, 0.5)]
+    assert reset_calls == ["reset"]
+    assert manager.overflow.item() == 0
+    assert manager.host_spill.item() == 0
+    manager.finish_te_graph_capture(runtime_state)
 
 
 def test_paged_stash_schedule_supports_distinct_vp_layer_templates():
