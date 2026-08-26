@@ -56,7 +56,7 @@ class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
 
 
 class KimiDeltaAttention(_GDNBase):
-    """Channel-wise Gated DeltaNet variant matching Kimi K3's KDA projections.
+    """Channel-wise Gated DeltaNet variant with configurable KDA projections.
 
     KDA supports full-rank or bias-free low-rank F-decay and output-gate
     projections. When neither low-rank projection is enabled, the historical
@@ -120,7 +120,7 @@ class KimiDeltaAttention(_GDNBase):
                     name=(name + ".f_proj") if name is not None else None,
                 )
             else:
-                # Preserve Kimi K3's two distinct, bias-free F-decay weights. The down
+                # Preserve two distinct, bias-free F-decay weights. The down
                 # projection is replicated across TP and the up projection is sharded by head.
                 self.f_a_proj = build_module(
                     submodules.f_a_proj,
@@ -330,7 +330,7 @@ class KimiDeltaAttention(_GDNBase):
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the Kimi K3-compatible KDA training path."""
+        """Run the configurable-projection KDA training path."""
 
         del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)

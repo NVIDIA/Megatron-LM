@@ -836,7 +836,7 @@ def num_floating_point_operations(
         f_lora_rank=None,
         gate_lora_rank=None,
     ):
-        """Calculate FLOPs for a Kimi K3-compatible Kimi Delta Attention layer."""
+        """Calculate projection FLOPs for a Kimi Delta Attention layer."""
         if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
             raise ValueError(
                 "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."

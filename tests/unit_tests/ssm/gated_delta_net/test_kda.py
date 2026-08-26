@@ -31,6 +31,11 @@ _KDA_INPUT_GRAD_ATOL = 3.2e-2
 _KDA_INPUT_GRAD_RELATIVE_L2 = 5e-3
 
 
+def _assert_bias_disabled(module):
+    bias = getattr(module, "bias", None)
+    assert bias is None or bias.numel() == 0
+
+
 def _make_config(
     tp_size: int = 1,
     cp_size: int = 1,
@@ -221,14 +226,14 @@ def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
             projection_input = hidden_states.detach()
             if f_lora_rank is None:
                 assert "f_proj.weight" in state_keys
-                assert getattr(kda.f_proj, "bias", None) is None
+                _assert_bias_disabled(kda.f_proj)
                 f_actual, _ = kda.f_proj(projection_input)
                 f_expected = F.linear(projection_input, kda.f_proj.weight)
             else:
                 assert kda.f_a_proj.weight.shape == (f_lora_rank, config.hidden_size)
                 assert kda.f_b_proj.weight.shape == (kda.qk_dim, f_lora_rank)
-                assert getattr(kda.f_a_proj, "bias", None) is None
-                assert getattr(kda.f_b_proj, "bias", None) is None
+                _assert_bias_disabled(kda.f_a_proj)
+                _assert_bias_disabled(kda.f_b_proj)
                 f_latent, _ = kda.f_a_proj(projection_input)
                 f_actual, _ = kda.f_b_proj(f_latent)
                 f_expected = F.linear(
@@ -245,14 +250,14 @@ def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
             assert not gate_weight_keys
         elif gate_lora_rank is None:
             assert gate_weight_keys == {"g_proj.weight"}
-            assert getattr(kda.g_proj, "bias", None) is None
+            _assert_bias_disabled(kda.g_proj)
             gate_actual, _ = kda.g_proj(projection_input)
             gate_expected = F.linear(projection_input, kda.g_proj.weight)
             torch.testing.assert_close(gate_actual, gate_expected, atol=1e-2, rtol=1e-2)
         else:
             assert gate_weight_keys == {"g_a_proj.weight", "g_b_proj.weight"}
-            assert getattr(kda.g_a_proj, "bias", None) is None
-            assert getattr(kda.g_b_proj, "bias", None) is None
+            _assert_bias_disabled(kda.g_a_proj)
+            _assert_bias_disabled(kda.g_b_proj)
             gate_latent, _ = kda.g_a_proj(projection_input)
             gate_actual, _ = kda.g_b_proj(gate_latent)
             gate_expected = F.linear(
