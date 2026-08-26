@@ -44,10 +44,11 @@ class CopyService(ABC):
     # Point-to-point transports tolerate ranks with no local operations. Collective
     # transports whose mesh must cover the whole process group can opt out.
     supports_idle_ranks = True
-    # Most transports release submitted tensor references after each run().
-    # Backends whose setup requires one stable model-wide registration can opt out
-    # and retain the executor's single-run behavior.
-    supports_incremental_runs = True
+    # Multiple runs per plan are opt-in so existing third-party services retain
+    # the historical model-wide run(). Supporting them requires run() to release
+    # submitted tensor references and establish current-stream ordering for all
+    # submitted sends and recvs before returning.
+    supports_multiple_runs_per_plan = False
 
     def __init__(self, group=None):
         self.group = group

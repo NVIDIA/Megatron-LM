@@ -389,10 +389,7 @@ def _build_all(gathered_pairs, execution_batch_bytes=None):
     dst_by_rank, src_by_name = index_metadata_rosters(gathered_pairs)
     return {
         rank: build_plan_from_rosters(
-            dst_by_rank,
-            src_by_name,
-            rank,
-            execution_batch_bytes=execution_batch_bytes,
+            dst_by_rank, src_by_name, rank, execution_batch_bytes=execution_batch_bytes
         )
         for rank in dst_by_rank
     }
@@ -519,11 +516,7 @@ def test_execution_batch_ids_keep_replicas_together():
 
 @pytest.mark.parametrize(
     ("gathered_limits", "local_limit", "expected_limit"),
-    [
-        ([200, 100], 200, 100),
-        ([None, None], None, None),
-        ([None, 100], None, 100),
-    ],
+    [([200, 100], 200, 100), ([None, None], None, None), ([None, 100], None, 100)],
 )
 def test_local_plan_resolves_rank_execution_batch_bytes(
     monkeypatch, gathered_limits, local_limit, expected_limit
@@ -558,10 +551,7 @@ def test_local_plan_resolves_rank_execution_batch_bytes(
     )
 
     assert result is sentinel
-    assert forwarded == {
-        "args": ({0: {}, 1: {}}, {}, 0),
-        "execution_batch_bytes": expected_limit,
-    }
+    assert forwarded == {"args": ({0: {}, 1: {}}, {}, 0), "execution_batch_bytes": expected_limit}
 
 
 def test_centralized_planner_compatibility_wrapper(monkeypatch):

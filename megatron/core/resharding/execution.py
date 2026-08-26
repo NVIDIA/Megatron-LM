@@ -126,6 +126,11 @@ def _execute_batch(
 
     if mxfp8_param_names:
         assert prefetch_stream is not None
+        # Dequantized buffers are allocated on the prefetch stream and consumed
+        # on the current stream. Order the next allocation round behind those
+        # consumers so the caching allocator cannot recycle storage too early.
+        # This is a device-side stream dependency, not a host synchronization.
+        prefetch_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(prefetch_stream):
             for param_name in mxfp8_param_names:
                 sendable_cache[param_name] = _ensure_sendable(src_params[param_name])
@@ -296,7 +301,7 @@ def execute_reshard_plan(
         return
 
     batches: list[tuple[int | None, list[TransferOp], list[TransferOp]]]
-    if service.supports_incremental_runs:
+    if service.supports_multiple_runs_per_plan:
         _validate_execution_batches(plan)
         send_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
         recv_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
@@ -335,6 +340,9 @@ def execute_reshard_plan(
             send_ops, recv_ops, src_params, dst_params, service, transform, prefetch_stream
         )
 
+    # Multiple-run services make each run visible to subsequent work on the
+    # current stream. Keep the device-wide synchronization outside the loop so
+    # each staging batch avoids a host sync.
     torch.cuda.synchronize()
     if service.requires_process_group_barrier:
         dist.barrier(group=group)

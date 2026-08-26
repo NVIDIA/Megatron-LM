@@ -30,6 +30,8 @@ pytestmark = pytest.mark.skipif(not _HAS_CUDA, reason="CUDA required")
 class MockCopyService(CopyService):
     """CopyService that records submitted ops and copies send→recv on run()."""
 
+    supports_multiple_runs_per_plan = True
+
     def __init__(self):
         self.sends = []  # [(tensor, dest_rank, task_id)]
         self.recvs = []  # [(tensor, src_rank, task_id)]
@@ -79,7 +81,7 @@ class NativeMockCopyService(MockCopyService):
 class SingleRunMockCopyService(MockCopyService):
     """Service whose setup requires all tensors to be submitted at once."""
 
-    supports_incremental_runs = False
+    supports_multiple_runs_per_plan = False
 
 
 # ---------------------------------------------------------------------------

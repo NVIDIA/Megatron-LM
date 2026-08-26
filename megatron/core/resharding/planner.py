@@ -24,6 +24,7 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass(frozen=True)
 class _NativeParameterPart:
     global_shape: tuple[int, ...]
@@ -394,9 +395,9 @@ def _build_execution_batch_ids(
             # generic executor, so their one-byte physical element size would
             # underestimate transient memory. Plain wider dtypes keep their
             # actual element size.
-            rank_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
             destination_bytes[resolved_name][metadata.owner_rank] = max(
-                destination_bytes[resolved_name].get(metadata.owner_rank, 0), rank_bytes
+                destination_bytes[resolved_name].get(metadata.owner_rank, 0), tensor_bytes
             )
 
     if max_batch_bytes is None:
