@@ -601,9 +601,6 @@ cached with strong group references. The first layer for a new signature prepare
 classes and completes CP-then-TP `MIN`; only that success stores the shared adapter. Later layers and
 steps with the same signature reuse its already-prepared process/device adapter with zero consensus
 collectives. Failure never writes an entry, and CP1 x TP1 performs neither consensus all-reduce.
-Read-only counter snapshots expose first-use, hit, success, failure, group-consensus, and grid-identity
-counts for tests; production exposes no reset or mutable override.
-
 This cache records successful deterministic availability/plan preflight, not numerical qualification:
 runtime does not execute random/reference inputs, compare numbers, mutate the allow-list tuple, or
 provide an opt-in numerical probe.
@@ -838,10 +835,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    evidence tuples exactly, and assert the independently spelled epsilon mapping has exactly the
    same keys and no extras. An installed unqualified tuple must skip a real-backend test before
    adapter/Graph construction with an exact-tuple reason; a qualified full parity must start with
-   empty adapter state and populate it only through normal production preflight. Counter deltas prove
-   first-signature CP-then-TP consensus, same-signature zero-collective
-   hits, local and remote-only failure-without-insertion, successful retry, custom-group grid
-   identity, and no CP1 x TP1 consensus collective. The remote-only case begins locally successful,
+   empty adapter state and populate it only through normal production preflight. The remote-only
+   case begins locally successful,
    injects failure into CP `MIN`, still requires the following TP `MIN`, and asserts exact
    `[CP, TP]` group/op order.
 7. **cuDNN merge backward.** Compare all phase shapes against standard PyTorch, including `G_i`,

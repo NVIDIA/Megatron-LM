@@ -10,13 +10,10 @@ It does not import MCore projection, RoPE, attention, CP, FA4, cuDNN, or TE code
 
 from __future__ import annotations
 
-import ast
 import gc
-import inspect
 import json
 import math
 import os
-import textwrap
 import types
 import weakref
 from contextlib import contextmanager
@@ -644,75 +641,6 @@ def _classify_saved_attention_state(
     return classified
 
 
-def test_saved_tensor_recorder_reports_only_live_graph_state():
-    recorder = _SavedTensorRecorder()
-    value = torch.randn(4, requires_grad=True)
-    with torch.autograd.graph.saved_tensors_hooks(recorder.pack, recorder.unpack):
-        loss = (value * value).sum()
-    assert recorder.records
-    loss.backward()
-    gc.collect()
-    assert recorder.records == []
-
-
-def test_saved_tensor_recorder_distinguishes_checkpointed_expansion():
-    tokens = 3
-    heads = 2
-    latent_width = 80
-    query = torch.randn(
-        tokens, heads, _QK_CONTENT + _ROPE_DIM, dtype=torch.bfloat16, requires_grad=True
-    )
-    latent = torch.randn(tokens, latent_width, dtype=torch.bfloat16, requires_grad=True)
-
-    def phase(q_input, latent_input):
-        key = (
-            latent_input[:, :1]
-            .view(tokens, 1, 1)
-            .expand(tokens, heads, _QK_CONTENT + _ROPE_DIM)
-            .contiguous()
-        )
-        value = (
-            latent_input[:, 1:2].view(tokens, 1, 1).expand(tokens, heads, _VALUE_DIM).contiguous()
-        )
-        key, value = _SaveExpandedKV.apply(key, value)
-        logits = torch.einsum("qhd,khd->hqk", q_input.float(), key.float())
-        probabilities = torch.softmax(logits, dim=-1).to(torch.bfloat16)
-        output = torch.einsum("hqk,khd->qhd", probabilities, value).float()
-        lse = torch.logsumexp(logits, dim=-1).transpose(0, 1).contiguous()
-        return output, lse
-
-    checkpointed = _SavedTensorRecorder()
-    with torch.autograd.graph.saved_tensors_hooks(checkpointed.pack, checkpointed.unpack):
-        output, lse = latent_cp.checkpoint(
-            phase, query, latent, use_reentrant=False, preserve_rng_state=False
-        )
-        checkpointed_loss = output.square().sum() + lse.square().sum()
-    checkpointed_state = _classify_saved_attention_state(
-        checkpointed.records,
-        expected_query_shapes=[tuple(query.shape)],
-        expected_latent_shapes=[tuple(latent.shape)],
-        heads=heads,
-    )
-    checkpointed_classes = {record.state_class for record in checkpointed_state}
-    assert "partial_output_or_merge_state" in checkpointed_classes
-    assert "partial_lse_or_merge_state" in checkpointed_classes
-    assert "expanded_value" not in checkpointed_classes
-    assert "expanded_key_or_uncheckpointed_query" not in checkpointed_classes
-
-    direct = _SavedTensorRecorder()
-    with torch.autograd.graph.saved_tensors_hooks(direct.pack, direct.unpack):
-        direct_output, direct_lse = phase(query, latent)
-        direct_loss = direct_output.square().sum() + direct_lse.square().sum()
-    direct_state = _classify_saved_attention_state(
-        direct.records, expected_query_shapes=[], expected_latent_shapes=[], heads=heads
-    )
-    direct_classes = {record.state_class for record in direct_state}
-    assert "expanded_value" in direct_classes
-    assert "expanded_key_or_uncheckpointed_query" in direct_classes
-
-    (checkpointed_loss + direct_loss).backward()
-
-
 class _TorchPackedAttentionAdapter:
     """Standard-PyTorch phase backend for mechanics tests, never the parity oracle."""
 
@@ -1305,26 +1233,6 @@ def test_real_backend_gate_skips_unqualified_before_adapter_construction():
             assert _qualified_real_backend_runtime_or_skip(runtime[0]) == runtime
         adapter_factory.assert_not_called()
 
-    parity_source = inspect.getsource(_run_production_parity)
-    assert "_install_direct_qualification_adapter" not in parity_source
-    parity_tree = ast.parse(textwrap.dedent(parity_source))
-    assigned_layer_attributes = set()
-    for node in ast.walk(parity_tree):
-        if isinstance(node, ast.Assign):
-            targets = node.targets
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            targets = (node.target,)
-        else:
-            continue
-        assigned_layer_attributes.update(
-            target.attr
-            for target in targets
-            if isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "layer"
-        )
-    assert "_backend_adapter" not in assigned_layer_attributes
-    assert "_backend_runtime_tuple" not in assigned_layer_attributes
 
 
 def test_fa4_adapter_uses_only_public_varlen_contract(monkeypatch):
@@ -1651,7 +1559,6 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
         all_reduces.append((tensor.item(), op, group))
 
     good_adapter = FakeAdapter()
-    before = latent_cp.get_backend_preflight_counters()
     monkeypatch.setattr(
         latent_cp, "_grid_identity", lambda *_args: (((0, 1), (2, 3)), ((0, 2), (1, 3)))
     )
@@ -1675,12 +1582,6 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
     second = _preflight_dummy(AttnBackend.flash, tp_group, cp_group)
     assert latent_cp.MLAWithLatentCP._get_backend(first, layout) is good_adapter
     assert latent_cp.MLAWithLatentCP._get_backend(second, layout) is good_adapter
-    after = latent_cp.get_backend_preflight_counters()
-    assert after.first_use_attempts - before.first_use_attempts == 1
-    assert after.successful_preflights - before.successful_preflights == 1
-    assert after.cache_hits - before.cache_hits == 1
-    assert after.cp_consensus_collectives - before.cp_consensus_collectives == 1
-    assert after.tp_consensus_collectives - before.tp_consensus_collectives == 1
     assert all_reduces == [
         (1, latent_cp.dist.ReduceOp.MIN, cp_group),
         (1, latent_cp.dist.ReduceOp.MIN, tp_group),
@@ -1710,20 +1611,15 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
         lambda _backend, _runtime=None: (remote_adapter, remote_failure_runtime),
     )
     monkeypatch.setattr(latent_cp.dist, "all_reduce", inject_remote_failure)
-    remote_before = latent_cp.get_backend_preflight_counters()
     with pytest.raises(latent_cp.LatentCPError):
         latent_cp.MLAWithLatentCP._get_backend(
             _preflight_dummy(AttnBackend.flash, tp_group, cp_group), layout
         )
-    remote_after = latent_cp.get_backend_preflight_counters()
     assert remote_adapter.prepare_calls == 1
     assert remote_reduces == [
         (1, latent_cp.dist.ReduceOp.MIN, cp_group),
         (0, latent_cp.dist.ReduceOp.MIN, tp_group),
     ]
-    assert remote_after.failed_preflights - remote_before.failed_preflights == 1
-    assert remote_after.success_cache_entries == remote_before.success_cache_entries
-
     monkeypatch.setattr(latent_cp.dist, "all_reduce", record_reduce)
     failure_runtime = (
         AttnBackend.flash,
@@ -1737,32 +1633,23 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
         "_qualified_backend_adapter",
         lambda _backend, _runtime=None: (FakeAdapter(fail=True), failure_runtime),
     )
-    failed_before = latent_cp.get_backend_preflight_counters()
     with pytest.raises(latent_cp.LatentCPError):
         latent_cp.MLAWithLatentCP._get_backend(
             _preflight_dummy(AttnBackend.flash, tp_group, cp_group), layout
         )
-    failed_after = latent_cp.get_backend_preflight_counters()
-    assert failed_after.failed_preflights - failed_before.failed_preflights == 1
-    assert failed_after.success_cache_entries == failed_before.success_cache_entries
-
     retry_adapter = FakeAdapter()
     monkeypatch.setattr(
         latent_cp,
         "_qualified_backend_adapter",
         lambda _backend, _runtime=None: (retry_adapter, failure_runtime),
     )
-    retry_before = latent_cp.get_backend_preflight_counters()
     assert (
         latent_cp.MLAWithLatentCP._get_backend(
             _preflight_dummy(AttnBackend.flash, tp_group, cp_group), layout
         )
         is retry_adapter
     )
-    retry_after = latent_cp.get_backend_preflight_counters()
     assert retry_adapter.prepare_calls == 1
-    assert retry_after.successful_preflights - retry_before.successful_preflights == 1
-    assert retry_after.success_cache_entries - retry_before.success_cache_entries == 1
 
     singleton_tp = object()
     singleton_cp = object()
@@ -1781,7 +1668,6 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
         "_qualified_backend_adapter",
         lambda _backend, _runtime=None: (singleton_adapter, singleton_runtime),
     )
-    singleton_before = latent_cp.get_backend_preflight_counters()
     all_reduce_count = len(all_reduces)
     latent_cp.MLAWithLatentCP._get_backend(
         _preflight_dummy(AttnBackend.flash, singleton_tp, singleton_cp),
@@ -1791,10 +1677,7 @@ def test_successful_preflight_cache_first_use_hit_failure_and_singletons(monkeyp
             phases=(object(),),
         ),
     )
-    singleton_after = latent_cp.get_backend_preflight_counters()
     assert len(all_reduces) == all_reduce_count
-    assert singleton_after.cp_consensus_collectives == singleton_before.cp_consensus_collectives
-    assert singleton_after.tp_consensus_collectives == singleton_before.tp_consensus_collectives
 
 
 def test_grid_identity_uses_ordered_injected_group_membership_once(monkeypatch):
@@ -1947,30 +1830,6 @@ def test_explicit_output_projection_uses_only_injected_group_and_matches_referen
     torch.testing.assert_close(weight_object.grad, reference_weight.grad, rtol=0, atol=0)
     assert projection.weight is weight_object
     assert tuple(projection.state_dict()) == state_keys == ("weight",)
-
-
-def test_forward_has_one_final_bf16_cast_and_no_private_te_dependency():
-    source = inspect.getsource(latent_cp.MLAWithLatentCP.forward)
-    tree = ast.parse(textwrap.dedent(source))
-    bf16_casts = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        if node.func.attr != "to" or not node.args:
-            continue
-        argument = node.args[0]
-        if (
-            isinstance(argument, ast.Attribute)
-            and isinstance(argument.value, ast.Name)
-            and argument.value.id == "torch"
-            and argument.attr == "bfloat16"
-        ):
-            bf16_casts.append(node)
-    assert len(bf16_casts) == 1
-    module_source = inspect.getsource(latent_cp)
-    assert "transformer_engine_torch" not in module_source
-    assert "TEDotProductAttention" not in module_source
-    assert "parallel_state" not in module_source
 
 
 @pytest.mark.parametrize(

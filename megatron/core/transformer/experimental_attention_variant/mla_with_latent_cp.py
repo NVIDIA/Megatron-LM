@@ -1229,50 +1229,13 @@ class _BackendPreflightSignature:
     backend: AttnBackend
 
 
-@dataclass(frozen=True)
-class BackendPreflightCounters:
-    """Read-only process-local preflight counter snapshot for unit tests."""
-
-    first_use_attempts: int
-    cache_hits: int
-    successful_preflights: int
-    failed_preflights: int
-    cp_consensus_collectives: int
-    tp_consensus_collectives: int
-    grid_identity_collectives: int
-    success_cache_entries: int
-
-
 _BACKEND_PREFLIGHT_LOCK: Final[threading.Lock] = threading.Lock()
-_BACKEND_PREFLIGHT_COUNTS: dict[str, int] = {
-    "first_use_attempts": 0,
-    "cache_hits": 0,
-    "successful_preflights": 0,
-    "failed_preflights": 0,
-    "cp_consensus_collectives": 0,
-    "tp_consensus_collectives": 0,
-    "grid_identity_collectives": 0,
-}
 _BACKEND_PREFLIGHT_SUCCESS: dict[
     tuple[int, int, _BackendPreflightSignature], DirectAttentionAdapter
 ] = {}
 _GRID_IDENTITY_CACHE: dict[
     tuple[int, int], tuple[dist.ProcessGroup, dist.ProcessGroup, GridIdentity]
 ] = {}
-
-
-def _increment_preflight_counter(name: str) -> None:
-    with _BACKEND_PREFLIGHT_LOCK:
-        _BACKEND_PREFLIGHT_COUNTS[name] += 1
-
-
-def get_backend_preflight_counters() -> BackendPreflightCounters:
-    """Return a snapshot; no runtime cache/counter reset or override is exposed."""
-
-    with _BACKEND_PREFLIGHT_LOCK:
-        return BackendPreflightCounters(
-            **_BACKEND_PREFLIGHT_COUNTS, success_cache_entries=len(_BACKEND_PREFLIGHT_SUCCESS)
-        )
 
 
 def _grid_identity(
@@ -1297,7 +1260,6 @@ def _grid_identity(
     if cp_size > 1:
         gathered_tp_tensors = [torch.empty_like(local_tp_tensor) for _ in range(cp_size)]
         dist.all_gather(gathered_tp_tensors, local_tp_tensor, group=cp_group)
-        _increment_preflight_counter("grid_identity_collectives")
         tp_rows = tuple(
             tuple(int(rank) for rank in row.cpu().tolist()) for row in gathered_tp_tensors
         )
@@ -1657,14 +1619,11 @@ class MLAWithLatentCP(MLASelfAttention):
             success_key = (os.getpid(), device_index, signature)
             with _BACKEND_PREFLIGHT_LOCK:
                 adapter = _BACKEND_PREFLIGHT_SUCCESS.get(success_key)
-                if adapter is not None:
-                    _BACKEND_PREFLIGHT_COUNTS["cache_hits"] += 1
             if adapter is not None:
                 self._backend_adapter = adapter
                 self._backend_runtime_tuple = current_tuple
                 return adapter
 
-            _increment_preflight_counter("first_use_attempts")
             if self._backend_adapter is None:
                 adapter, qualified_tuple = _qualified_backend_adapter(
                     self.config.attention_backend, current_tuple
@@ -1693,24 +1652,19 @@ class MLAWithLatentCP(MLASelfAttention):
         # Singleton dimensions are the trivial consensus and launch no collective.
         if cp_size > 1:
             dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=self.pg_collection.cp)
-            _increment_preflight_counter("cp_consensus_collectives")
         if tp_size > 1:
             dist.all_reduce(backend_ok, op=dist.ReduceOp.MIN, group=self.pg_collection.tp)
-            _increment_preflight_counter("tp_consensus_collectives")
         if int(backend_ok.item()) == 0:
-            _increment_preflight_counter("failed_preflights")
             raise LatentCPError(
                 "backend qualification/availability/plan preflight failed on the TP x CP grid"
             ) from local_error
         if signature is None or adapter is None or current_tuple is None:
-            _increment_preflight_counter("failed_preflights")
             raise LatentCPError("backend consensus succeeded without complete preflight state")
 
         # No local attempt and no partial consensus can populate this cache.
         success_key = (os.getpid(), device_index, signature)
         with _BACKEND_PREFLIGHT_LOCK:
             _BACKEND_PREFLIGHT_SUCCESS[success_key] = adapter
-            _BACKEND_PREFLIGHT_COUNTS["successful_preflights"] += 1
         self._backend_adapter = adapter
         self._backend_runtime_tuple = current_tuple
         return adapter
