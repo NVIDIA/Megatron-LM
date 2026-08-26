@@ -597,53 +597,54 @@ class TestMcoreAdapterHybrid:
     @staticmethod
     def _train(config, instances, outer_strategy, steps=3):
         """Build a model over `instances` DP instances and return its per-step losses."""
+        # Each call needs its own DP topology, and initialize_model_parallel cannot
+        # run twice, so clear whatever a previous call left. teardown_method covers
+        # the final one.
+        Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=instances)
-        try:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-            model_parallel_cuda_manual_seed(1234)
-            model = FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    num_distributed_optimizer_instances=instances,
-                    outer_dp_sharding_strategy=outer_strategy,
-                ),
-                module=_build_block(config),
-                pg_collection=pg_collection,
-            )
-            optimizer = get_megatron_optimizer(
-                OptimizerConfig(
-                    optimizer="sgd",
-                    lr=1.0e-2,
-                    weight_decay=0.0,
-                    bf16=True,
-                    params_dtype=torch.bfloat16,
-                    use_distributed_optimizer=False,
-                    clip_grad=0.0,
-                ),
-                [model],
-                pg_collection=pg_collection,
-                use_gloo_process_groups=False,
-            )
-            losses = []
-            for step in range(steps):
-                optimizer.zero_grad(set_to_none=True)
-                # Rank-dependent but step-deterministic input, so every configuration
-                # sees the same global batch however the domain is split.
-                hidden = torch.arange(
-                    1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
-                ).view(1, 1, -1).expand(8, 2, -1) * (torch.distributed.get_rank() + 1 + step)
-                loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
-                loss.backward()
-                success, _, _ = optimizer.step()
-                assert success
-                losses.append(loss.detach())
-            return torch.stack(losses)
-        finally:
-            Utils.destroy_model_parallel()
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                num_distributed_optimizer_instances=instances,
+                outer_dp_sharding_strategy=outer_strategy,
+            ),
+            module=_build_block(config),
+            pg_collection=pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="sgd",
+                lr=1.0e-2,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            pg_collection=pg_collection,
+            use_gloo_process_groups=False,
+        )
+        losses = []
+        for step in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            # Rank-dependent but step-deterministic input, so every configuration
+            # sees the same global batch however the domain is split.
+            hidden = torch.arange(
+                1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
+            ).view(1, 1, -1).expand(8, 2, -1) * (torch.distributed.get_rank() + 1 + step)
+            loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
+            loss.backward()
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(loss.detach())
+        return torch.stack(losses)
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
     def test_hybrid_placements(self, outer_strategy):
