@@ -12,10 +12,10 @@ from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import maybe_msc
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -37,6 +37,7 @@ except ImportError:
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -50,7 +51,6 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
-
 
 
 def _compute_norm_2(params_list):
@@ -93,7 +93,7 @@ def calc_params_l2_norm(
         model = [model]
 
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
-        return _calc_multi_module_params_l2_norm(
+        return _calc_mimo_params_l2_norm(
             model,
             pg_collection,
             force_create_fp32_copy=force_create_fp32_copy,
@@ -252,55 +252,41 @@ def calc_params_l2_norm(
     return norm_2.item() ** 0.5
 
 
+def _get_mimo_module(model_chunk, module_name):
+    """Get a MIMO module by its topology name."""
+    if module_name == MIMO_LANGUAGE_MODULE_KEY:
+        return model_chunk.language_model
+    return model_chunk.modality_submodules[module_name]
+
+
 @torch.no_grad()
-def _calc_multi_module_params_l2_norm(
+def _calc_mimo_params_l2_norm(
     model,
     pg_collection: MultiModuleProcessGroupCollection,
     *,
     force_create_fp32_copy=False,
     return_squared_tensor=False,
 ):
-    """Calculate a combined parameter L2 norm across multi-module model grids."""
-    mimo_models = [unwrap_model(model_chunk) for model_chunk in model]
-    grid_map = getattr(getattr(mimo_models[0], 'mimo_config', None), 'module_to_grid_map', None)
-    if not grid_map:
-        raise RuntimeError("Multi-module parameter norm requires a model module_to_grid_map")
-
-    module_names = sorted(grid_map)
-    module_indices = {name: index for index, name in enumerate(module_names)}
+    """Calculate a combined parameter L2 norm across MIMO model grids."""
+    model_chunks = [unwrap_model(model_chunk) for model_chunk in model]
+    module_names = sorted(model_chunks[0].mimo_config.module_to_grid_map)
     norm_sq = torch.zeros(len(module_names), device='cuda', dtype=torch.float32)
 
-    for name, module_pg_collection in pg_collection.items():
-        if name not in module_indices:
-            raise RuntimeError(f"Process groups provided for unknown model module '{name}'")
-
-        module_chunks = []
-        for mimo_model in mimo_models:
-            if name == pg_collection.language_model_module_name:
-                module = mimo_model.language_model
-            elif name in mimo_model.modality_submodules:
-                module = mimo_model.modality_submodules[name]
-            else:
-                module = None
-            if module is not None:
-                module_chunks.append(module)
-
-        if not module_chunks:
-            raise RuntimeError(f"No local model found for active module '{name}'")
+    for index, name in enumerate(module_names):
+        if name not in pg_collection.keys():
+            continue
 
         module_norm_sq = calc_params_l2_norm(
-            module_chunks,
+            [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks],
             force_create_fp32_copy,
-            pg_collection=module_pg_collection,
+            pg_collection=pg_collection[name],
             return_squared_tensor=True,
         )
-        norm_sq[module_indices[name]].copy_(module_norm_sq.reshape(()))
+        norm_sq[index].copy_(module_norm_sq.reshape(()))
 
     torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
     total_norm_sq = norm_sq.sum()
-    if return_squared_tensor:
-        return total_norm_sq
-    return torch.sqrt(total_norm_sq).item()
+    return total_norm_sq if return_squared_tensor else total_norm_sq.sqrt().item()
 
 
 def calc_dtensor_params_l2_norm(params, return_squared_tensor=False):
