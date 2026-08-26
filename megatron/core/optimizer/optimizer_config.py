@@ -284,7 +284,16 @@ class OptimizerConfig:
     each shard independently, which makes the update rule depend on the parallelism config;
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
     change as TP changes. "auto" select between duplicated and distributed mode per-weight for
-    dense weights. Defaults to "duplicated"."""
+    dense weights. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
+    each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain — i.e. the
+    GTP domain — all_to_all stages over the gtp_remat and tp groups assemble the complete
+    (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
+    mode runs there with zero communication and zero redundancy, and reverse all_to_all
+    stages scatter the result back to the original shards. layer_sharded requires the
+    layer-wise distributed optimizer path and muon_split_qkv=False (its default is True:
+    split-QKV Newton-Schulz is not implemented on the layer-sharded path, so
+    LayerShardedMuon rejects it at construction; the training path surfaces it earlier
+    via validate_args). Defaults to "duplicated"."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
@@ -312,7 +321,7 @@ class OptimizerConfig:
     transient stack of this many matrices for far fewer launches. Batches of more than
     one use baddbmm instead of addmm, so results differ from the per-matrix path by
     kernel-level floating point rounding and bitwise parity with duplicated mode is
-    lost. Only used when use_layer_sharding_muon is set. The value is an upper
+    lost. Only used when muon_tp_mode='layer_sharded'. The value is an upper
     bound per same-shape bucket: a home owning fewer matrices of a shape simply
     forms a smaller (or single-matrix, bit-exact) batch, so oversizing it is
     harmless. Defaults to 1 (bit-exact per-matrix path); raise (e.g. to 32) to
@@ -320,28 +329,12 @@ class OptimizerConfig:
     > 1 require emerging-optimizers >= 0.3.0 (batched 3-D Newton-Schulz); the
     default runs on any version with the newton_schulz API."""
 
-    use_layer_sharding_muon: bool = False
-    """If true, use LayerShardedMuon instead of TensorParallelMuon when optimizer is 'muon'.
-    Each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain; all_to_all
-    stages over the gtp_remat and tp groups assemble the complete (P, Q) momentum on the
-    home, the exact same full-matrix Newton-Schulz as duplicated mode runs there with zero
-    communication and zero redundancy, and reverse all_to_all stages scatter the result
-    back to the original shards. Requires the layer-wise distributed optimizer path.
-    muon_tp_mode does not
-    affect the layer-sharded exchange itself; it only applies on the paths that delegate
-    to TensorParallelMuon (the empty-homes fallback and degenerate single-rank domains).
-    muon_split_qkv must be False (its default is True): LayerShardedMuon rejects
-    split_qkv at construction because split-QKV Newton-Schulz is not implemented on the
-    layer-sharded path, so a config with only this flag flipped raises at optimizer
-    construction — the training path surfaces it earlier via validate_args.
-    Defaults to False."""
-
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
     on its own CUDA stream so one group's compute fills another group's all_to_all stall.
     Bitwise-neutral (op order within a group is unchanged), but the transient buffers of
     all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
-    tight. Only used when use_layer_sharding_muon is set. Defaults to True."""
+    tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
 
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.

@@ -145,6 +145,14 @@ class TestConstructorGuards:
         opt = LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, use_syrk=True)
         assert opt.use_syrk is False
 
+    def test_tp_mode_layer_sharded_is_rejected(self):
+        """'layer_sharded' is the registry selector, not a class mode; direct-API
+        misuse would otherwise fall silently into the parent's distributed
+        branch — reject at construction like the other guards."""
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="registry-level selector"):
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, tp_mode="layer_sharded")
+
     def test_split_qkv_is_rejected(self):
         """split_qkv would only apply on the fallback/degenerate paths, making
         the update rule depend on whether homes are set — reject at the class."""
