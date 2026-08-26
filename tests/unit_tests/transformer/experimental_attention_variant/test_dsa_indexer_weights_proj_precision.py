@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import megatron.core.transformer.experimental_attention_variant.dsa as dsa_module
 from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear, TENorm
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -178,7 +179,6 @@ def _model_parallel():
     [
         pytest.param("bf16", True, "bf16", id="bf16-quantized-contract-bf16-output"),
         pytest.param("bf16", False, "bf16", id="bf16-unquantized-bf16-output"),
-        pytest.param("bf16", True, "fp32", id="bf16-quantized-contract-fp32-output"),
         pytest.param("bf16", False, "fp32", id="bf16-unquantized-fp32-output"),
         pytest.param("mxfp8", True, "bf16", id="mxfp8-quantized-bf16-output"),
         pytest.param("mxfp8", False, "bf16", id="mxfp8-unquantized-bf16-output"),
@@ -249,8 +249,6 @@ def test_precision_config_defaults_and_invalid_combinations():
     with pytest.raises(ValueError, match="requires.*use_quantization=False"):
         dataclasses.replace(
             default_config,
-            fp8="hybrid",
-            fp8_recipe="mxfp8",
             dsa_indexer_weights_proj_use_quantization=True,
             dsa_indexer_weights_proj_output_dtype="fp32",
         )
@@ -260,6 +258,40 @@ def test_precision_config_defaults_and_invalid_combinations():
             default_config,
             dsa_kernel_backend="cudnn",
             dsa_indexer_weights_proj_use_quantization=False,
+            dsa_indexer_weights_proj_output_dtype="fp32",
+        )
+
+
+@pytest.mark.internal
+def test_precision_config_rejects_fp32_output_with_matching_quant_recipe():
+    module_path = "decoder.layers.0.self_attention.core_attention.indexer.linear_weights_proj"
+    quant_recipe = RecipeConfig.from_config_dict(
+        {
+            "matchers": {
+                "dsa_weights_proj": {
+                    "type": "glob",
+                    "enabled": True,
+                    "pattern": "*indexer.linear_weights_proj",
+                    "config": "fp8",
+                }
+            },
+            "configs": {
+                "fp8": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": {"fp8_quantization_recipe": "tensorwise"},
+                }
+            },
+        }
+    )
+    assert quant_recipe.match(MatchContext(module_path=module_path, layer_number=0)) is not None
+
+    with pytest.raises(ValueError, match="requires.*use_quantization=False"):
+        dataclasses.replace(
+            _make_config(
+                use_sparse_loss=True, calculate_per_token_loss=False, dsa_kernel_backend="none"
+            ),
+            quant_recipe=quant_recipe,
+            dsa_indexer_weights_proj_use_quantization=True,
             dsa_indexer_weights_proj_output_dtype="fp32",
         )
 

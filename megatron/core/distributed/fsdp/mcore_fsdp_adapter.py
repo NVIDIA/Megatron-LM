@@ -99,6 +99,16 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
         """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
+        recurse_types: List[Type[nn.Module]] = []
+
+        if config.dsa_indexer_weights_proj_output_dtype == "fp32":
+            # DSAttention calls DSAIndexer.forward_before_topk directly, bypassing the indexer's
+            # module hooks and the weights projection's module call. Gather its nested parameters
+            # at the DSAttention boundary for both forward and backward.
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+            recurse_types.append(DSAttention)
+
         if (
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
@@ -107,8 +117,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             from megatron.core.transformer.moe.experts import TEGroupedMLP
             from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
-            return (TEGroupedMLP, SharedExpertMLP)
-        return ()
+            recurse_types.extend((TEGroupedMLP, SharedExpertMLP))
+        return tuple(recurse_types)
 
     def __init__(
         self,
