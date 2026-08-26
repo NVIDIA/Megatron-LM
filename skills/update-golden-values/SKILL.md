@@ -191,6 +191,7 @@ State when a metric uses fewer shared steps than the row's `Steps` value—for e
 
 - `lm loss` changes between `-0.01%` and `+0.01%` generally match old goldens to numerical noise.
 - For `lm loss` or `num-zeros`, call out values below `-0.1%` or above `+0.1%` for review.
+- For `mem-allocated-bytes` or `mem-max-allocated-bytes`, call out values below `-0.01%` or above `+0.01%`; these metrics should normally remain close to `0%`.
 - Negative `iteration-time` percentages mean the new run was slower; positive percentages mean it was faster. Treat timing changes as scheduler/warmup noise unless they repeat.
 - Describe large `num-zeros` changes per model; do not hide them in a cross-model magnitude aggregate.
 ````
@@ -208,6 +209,7 @@ Keep the sign in every table cell and sort rows by test/model and environment. D
 Triage rules of thumb:
 
 - `lm loss` changes from `-0.01%` through `+0.01%` are generally run-to-run noise.
+- Treat `mem-allocated-bytes` and `mem-max-allocated-bytes` values outside `-0.01%` through `+0.01%` as changes that require review.
 - A negative `iteration-time` percentage means the new run was slower; a positive percentage means it was faster. Treat timing changes as scheduler/warmup noise unless they repeat.
 - Focus reviewer attention on `lm loss` and `num-zeros` values outside `-0.1%` through `+0.1%`.
 
