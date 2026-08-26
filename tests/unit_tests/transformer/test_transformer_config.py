@@ -85,15 +85,17 @@ def _make_replica_hybridep_config(**overrides):
 
 
 def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
-    config = _make_replica_hybridep_config(
-        cuda_graph_impl="local",
-        cuda_graph_modules=["moe"],
-    )
+    config = _make_replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
 
     assert config.moe_flex_dispatcher_backend == "replica_hybridep"
     assert config.moe_expert_rank_capacity_factor == 1.0
     assert config.moe_single_grouped_weight is False
     assert config.grad_reduce_in_bf16 is False
+
+
+def test_replica_hybridep_rejects_single_grouped_weight():
+    with pytest.raises(ValueError, match="moe_single_grouped_weight=False"):
+        _make_replica_hybridep_config(moe_single_grouped_weight=True)
 
 
 def test_replica_hybridep_bf16_grad_reduce_requires_ddp_fp32_accumulation():

@@ -312,18 +312,17 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **FlexDispatcher with deterministic replica HybridEP** | Balances overloaded experts with runtime replica slots and asynchronously transfers only selected weights/gradients | Fixed-shape NVLink HybridEP training | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend replica_hybridep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 
-The `replica_hybridep` backend requires fixed local token counts across its EP group, BF16
-expert weights, grouped GEMM with the Transformer Engine op fuser, and FP32 router
-probabilities. If `moe_expert_rank_capacity_factor` is omitted, it defaults to `1.0` for this
-backend. It retains the standard HybridEP activation semantics while using a deterministic
-planner to map routes to native or replica expert slots; replica slots are populated
-asynchronously from the optimizer-owned weights and reduced back into their owners after expert
-backward. Both TE's single grouped parameter (`moe_single_grouped_weight=True`) and its normal
-per-expert `weight0..weightN` parameters are supported. Replica gradients use FP32 transport and
-storage by default. With `--grad-reduce-in-bf16`, they remain BF16 in their symmetric-memory
-transport arena, are summed with the owner's BF16 gradient locally in FP32, and are downcast to
-BF16 once. This mode requires `--ddp-reduce-scatter-with-fp32-accumulation` and, when expert GTP is
-enabled, `--gtp-remat-reduce-scatter-with-fp32-accumulation` for the subsequent reductions.
+The `replica_hybridep` backend requires fixed local token counts across its EP group, per-expert
+`weight0..weightN` parameters in BF16 or native MXFP8 storage, grouped GEMM with the Transformer
+Engine op fuser, and FP32 router probabilities. If `moe_expert_rank_capacity_factor` is omitted,
+it defaults to `1.0` for this backend. It retains the standard HybridEP activation semantics while
+using a deterministic planner to map routes to native or replica expert slots; replica slots are
+populated asynchronously from the optimizer-owned weights and reduced back into their owners
+after expert backward. Replica gradients use FP32 transport and storage by default. With
+`--grad-reduce-in-bf16`, they remain BF16 in their symmetric-memory transport arena, are summed
+with the owner's BF16 gradient locally in FP32, and are downcast to BF16 once. This mode requires
+`--ddp-reduce-scatter-with-fp32-accumulation` and, when expert GTP is enabled,
+`--gtp-remat-reduce-scatter-with-fp32-accumulation` for the subsequent reductions.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.

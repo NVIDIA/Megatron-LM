@@ -4,6 +4,7 @@ import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -47,6 +48,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.replica_planner import (
     HybridEPReplicaWeightBridge,
+    ReplicaPlan,
     ReplicaPlannerWorkspace,
     map_replica_plan_to_hybridep,
     plan_replica_routes,
@@ -1266,22 +1268,33 @@ class _ReplicaPlanLifetime(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hidden_states, token_probs, *args):
-        manager = args[-1]
-        ctx.source_parameter_count = len(args) - 1
+        manager, slot = args[-2:]
+        ctx.source_parameter_count = len(args) - 2
         del token_probs
         ctx.manager = manager
+        ctx.slot = slot
         return hidden_states
 
     @staticmethod
     def backward(ctx, grad_hidden_states):
-        ctx.manager._replica_plan_in_use = False
-        ctx.manager._replica_lifetime_tracked = False
+        ctx.manager._release_replica_plan_slot(ctx.slot)
         return (
             grad_hidden_states,
             None,
             *([None] * ctx.source_parameter_count),
             None,
+            None,
         )
+
+
+@dataclass
+class _ReplicaPlanSlot:
+    """One planner workspace whose outputs stay private to an outstanding forward."""
+
+    workspace: ReplicaPlannerWorkspace
+    plan: Optional[ReplicaPlan] = None
+    in_use: bool = False
+    lifetime_tracked: bool = False
 
 
 class _ReplicaPlannedManagerMixin:
@@ -1311,10 +1324,9 @@ class _ReplicaPlannedManagerMixin:
         self.semantic_tokens_per_expert: Optional[torch.Tensor] = None
         self._bridge: Optional[HybridEPReplicaWeightBridge] = None
         self._planner_num_tokens: Optional[int] = None
-        self._replica_planner_workspace: Optional[ReplicaPlannerWorkspace] = None
+        self._replica_plan_slots: list[_ReplicaPlanSlot] = []
+        self._active_replica_plan_slot: Optional[_ReplicaPlanSlot] = None
         self._plan = None
-        self._replica_plan_in_use = False
-        self._replica_lifetime_tracked = False
 
     def bind_experts(self, experts) -> None:
         """Bind the dispatcher-independent runtime weights to the expert MLP."""
@@ -1358,13 +1370,43 @@ class _ReplicaPlannedManagerMixin:
         self._bridge.last_plan = plan
         self._bridge.start_prefetch(plan)
 
-    def _prepare_replica_plan(self, hidden_states: torch.Tensor):
-        if self._replica_plan_in_use:
+    def _acquire_replica_plan_slot(self) -> _ReplicaPlanSlot:
+        """Reserve stable planner outputs for one forward-through-backward lifetime."""
+        for slot in self._replica_plan_slots:
+            if not slot.in_use:
+                slot.in_use = True
+                slot.lifetime_tracked = False
+                return slot
+
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"{self._replica_backend_name}'s fixed planner workspace is retained by an "
-                "outstanding forward. This path supports one in-flight forward per layer."
+                f"{self._replica_backend_name} needs another in-flight planner slot during "
+                "CUDA graph capture. Warm up the same number of outstanding forwards before "
+                "capture so all fixed-address planner workspaces are allocated."
             )
-        if self._plan is not None:
+        slot = _ReplicaPlanSlot(
+            workspace=ReplicaPlannerWorkspace.allocate(
+                num_tokens=int(self.semantic_token_indices.shape[0]),
+                router_topk=int(self.semantic_token_indices.shape[1]),
+                num_experts=self.semantic_num_experts,
+                ep_size=torch.distributed.get_world_size(group=self.group),
+                device=self.semantic_token_indices.device,
+            ),
+            in_use=True,
+        )
+        self._replica_plan_slots.append(slot)
+        return slot
+
+    def _release_replica_plan_slot(self, slot: _ReplicaPlanSlot) -> None:
+        """Return a planner slot after every consumer of its plan has completed."""
+        if not slot.in_use:
+            raise RuntimeError(f"{self._replica_backend_name} planner slot was released twice.")
+        slot.plan = None
+        slot.in_use = False
+        slot.lifetime_tracked = False
+
+    def _prepare_replica_plan(self, hidden_states: torch.Tensor):
+        if self._active_replica_plan_slot is not None or self._plan is not None:
             raise RuntimeError(
                 f"{self._replica_backend_name} dispatch requires the previous dispatch to "
                 "be combined first."
@@ -1374,23 +1416,21 @@ class _ReplicaPlannedManagerMixin:
                 f"{self._replica_backend_name} routing metadata was not initialized."
             )
         self._ensure_replica_planner_shape(hidden_states)
-        if self._replica_planner_workspace is None:
-            self._replica_planner_workspace = ReplicaPlannerWorkspace.allocate(
-                num_tokens=int(self.semantic_token_indices.shape[0]),
-                router_topk=int(self.semantic_token_indices.shape[1]),
-                num_experts=self.semantic_num_experts,
-                ep_size=torch.distributed.get_world_size(group=self.group),
-                device=self.semantic_token_indices.device,
+        slot = self._acquire_replica_plan_slot()
+        self._active_replica_plan_slot = slot
+        try:
+            self._plan = plan_replica_routes(
+                self.semantic_token_indices,
+                self.semantic_tokens_per_expert,
+                self.group,
+                slot.workspace,
+                on_placement_ready=self._start_replica_weight_prefetch,
             )
-        self._plan = plan_replica_routes(
-            self.semantic_token_indices,
-            self.semantic_tokens_per_expert,
-            self.group,
-            self._replica_planner_workspace,
-            on_placement_ready=self._start_replica_weight_prefetch,
-        )
-        self._replica_plan_in_use = True
-        self._replica_lifetime_tracked = False
+        except Exception:
+            self._active_replica_plan_slot = None
+            self._release_replica_plan_slot(slot)
+            raise
+        slot.plan = self._plan
         return self._plan
 
     def _wrap_replica_dispatch_output(self, dispatched_hidden: torch.Tensor) -> torch.Tensor:
@@ -1401,13 +1441,17 @@ class _ReplicaPlannedManagerMixin:
     def _wrap_replica_dispatch_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not torch.is_grad_enabled():
             return hidden_states
+        slot = self._active_replica_plan_slot
+        if slot is None or slot.plan is not self._plan:
+            raise RuntimeError(f"{self._replica_backend_name} lost its active planner slot.")
         hidden_states = _ReplicaPlanLifetime.apply(
             hidden_states,
             self.semantic_token_probs,
             *self._bridge.source_parameters,
             self,
+            slot,
         )
-        self._replica_lifetime_tracked = hidden_states.requires_grad
+        slot.lifetime_tracked = hidden_states.requires_grad
         return wait_replica_grad_reduce_after_dispatch_backward(
             hidden_states, self._bridge, self._plan
         )
@@ -1429,9 +1473,13 @@ class _ReplicaPlannedManagerMixin:
         )
 
     def _finish_replica_plan(self) -> None:
+        slot = self._active_replica_plan_slot
+        if slot is None or slot.plan is not self._plan:
+            raise RuntimeError(f"{self._replica_backend_name} combine lost its planner slot.")
+        self._active_replica_plan_slot = None
         self._plan = None
-        if not self._replica_lifetime_tracked:
-            self._replica_plan_in_use = False
+        if not slot.lifetime_tracked:
+            self._release_replica_plan_slot(slot)
 
 
 def _get_replica_hybridep_rank_capacity(
