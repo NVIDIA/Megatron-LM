@@ -2663,6 +2663,7 @@ def get_batch_on_this_cp_rank(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
+    use_contiguous_cp: bool = False,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2677,6 +2678,7 @@ def get_batch_on_this_cp_rank(
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
         and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
+      - **Contiguous CP**: Keeps the hybrid residual stream in causal rank order.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
@@ -2691,13 +2693,18 @@ def get_batch_on_this_cp_rank(
             even when ``cu_seqlens`` is present (e.g., for inter-document
             masking where document lengths are not divisible by
             ``2 * cp_size``).
+        use_contiguous_cp (bool): Use contiguous sequence shards for the linear CP layout.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
 
-    if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
+    if use_contiguous_cp:
+        from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
+
+        batch = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=cp_group)
+    elif use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
     elif is_hybrid_cp:
         assert (
