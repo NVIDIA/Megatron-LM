@@ -2,6 +2,8 @@
 
 """Unit tests for experimental FSDP symmetric-memory staging."""
 
+from itertools import chain
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -16,7 +18,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
-from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_kernels
+from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
 # Each sharded Linear's collective must be large enough that NCCL selects its
 # symmetric-memory (ncclSymk*) kernels over ring. Sub-KB collectives fall back to
@@ -112,44 +114,51 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
         msg="Symmetric-memory FSDP losses did not match default FSDP losses.",
     )
 
-    allgather_kernels_without_symm_mem = collect_linked_kernels(
+    allgather_groups_without_symm_mem = collect_linked_event_groups(
         prof_without_symm_mem, _ALL_GATHER_OP_NAME_SUBSTRING
     )
-    reduce_scatter_kernels_without_symm_mem = collect_linked_kernels(
+    reduce_scatter_groups_without_symm_mem = collect_linked_event_groups(
         prof_without_symm_mem, _REDUCE_SCATTER_OP_NAME_SUBSTRING
     )
-    assert all("ncclSymk" not in kernel.name for kernel in allgather_kernels_without_symm_mem)
-    assert all("ncclSymk" not in kernel.name for kernel in reduce_scatter_kernels_without_symm_mem)
+    assert all(
+        "ncclSymk" not in event.name
+        for event in chain.from_iterable(allgather_groups_without_symm_mem)
+    )
+    assert all(
+        "ncclSymk" not in event.name
+        for event in chain.from_iterable(reduce_scatter_groups_without_symm_mem)
+    )
 
-    allgather_kernels_with_symm_mem = collect_linked_kernels(
+    allgather_groups_with_symm_mem = collect_linked_event_groups(
         prof_with_symm_mem, _ALL_GATHER_OP_NAME_SUBSTRING
     )
-    reduce_scatter_kernels_with_symm_mem = collect_linked_kernels(
+    reduce_scatter_groups_with_symm_mem = collect_linked_event_groups(
         prof_with_symm_mem, _REDUCE_SCATTER_OP_NAME_SUBSTRING
     )
     # 2 sharded modules (fc1, fc2), one reduce-scatter each per microbatch step.
-    expected_reduce_scatter_kernel_count = num_training_steps * num_microbatches * 2
-    assert len(reduce_scatter_kernels_with_symm_mem) == expected_reduce_scatter_kernel_count, (
-        "Unexpected NCCL symmetric-memory reduce-scatter kernel count. "
-        f"Observed reduce-scatter kernels: "
-        f"{[kernel.name for kernel in reduce_scatter_kernels_with_symm_mem[:20]]}"
+    expected_reduce_scatter_group_count = num_training_steps * num_microbatches * 2
+    assert len(reduce_scatter_groups_with_symm_mem) == expected_reduce_scatter_group_count, (
+        "Unexpected NCCL symmetric-memory reduce-scatter group count. "
+        f"Observed reduce-scatter events: {reduce_scatter_groups_with_symm_mem[:20]}"
     )
-    assert all("ncclSymk" in kernel.name for kernel in reduce_scatter_kernels_with_symm_mem), (
-        "Expected all symmetric-memory reduce-scatter kernels to be ncclSymk kernels. "
-        f"Observed reduce-scatter kernels: "
-        f"{[kernel.name for kernel in reduce_scatter_kernels_with_symm_mem[:20]]}"
+    assert all(
+        "ncclSymk" in event.name
+        for event in chain.from_iterable(reduce_scatter_groups_with_symm_mem)
+    ), (
+        "Expected all symmetric-memory reduce-scatter events to be ncclSymk kernels. "
+        f"Observed reduce-scatter events: {reduce_scatter_groups_with_symm_mem[:20]}"
     )
 
-    expected_allgather_kernel_count = 2 * expected_reduce_scatter_kernel_count
-    assert len(allgather_kernels_with_symm_mem) == expected_allgather_kernel_count, (
-        "Unexpected NCCL symmetric-memory all-gather kernel count. "
-        f"Observed all-gather kernels: "
-        f"{[kernel.name for kernel in allgather_kernels_with_symm_mem[:20]]}"
+    expected_allgather_group_count = 2 * expected_reduce_scatter_group_count
+    assert len(allgather_groups_with_symm_mem) == expected_allgather_group_count, (
+        "Unexpected NCCL symmetric-memory all-gather group count. "
+        f"Observed all-gather events: {allgather_groups_with_symm_mem[:20]}"
     )
-    assert all("ncclSymk" in kernel.name for kernel in allgather_kernels_with_symm_mem), (
-        "Expected all symmetric-memory all-gather kernels to be ncclSymk kernels. "
-        f"Observed all-gather kernels: "
-        f"{[kernel.name for kernel in allgather_kernels_with_symm_mem[:20]]}"
+    assert all(
+        "ncclSymk" in event.name for event in chain.from_iterable(allgather_groups_with_symm_mem)
+    ), (
+        "Expected all symmetric-memory all-gather events to be ncclSymk kernels. "
+        f"Observed all-gather events: {allgather_groups_with_symm_mem[:20]}"
     )
 
 
@@ -210,25 +219,24 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
             optimizer.step()
         torch.cuda.synchronize()
 
-    allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
-    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # Zero-CTA moves the all-gather to the copy engine: no symmetric-memory all-gather kernel.
-    assert not allgather_kernels, (
-        f"Expected no symmetric-memory all-gather kernel under zero-CTA. "
-        f"Observed all-gather kernels: {[kernel.name for kernel in allgather_kernels[:20]]}"
+    allgather_groups = collect_linked_event_groups(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
+    reduce_scatter_groups = collect_linked_event_groups(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
+    # Two sharded modules each all-gather in forward and backward on every training step.
+    assert len(allgather_groups) == num_training_steps * 2 * 2, (
+        "Expected zero-CTA all-gather groups. "
+        f"Observed all-gather events: {allgather_groups[:20]}"
     )
     # The reduce-scatter's reduction cannot run on the copy engine, so it stays a
     # symmetric-memory kernel (an SM-launched NVLS multicast reduce): one per sharded
     # module (fc1, fc2) per training step.
-    expected_reduce_scatter_kernel_count = num_training_steps * 2
-    assert len(reduce_scatter_kernels) == expected_reduce_scatter_kernel_count, (
-        f"Expected {expected_reduce_scatter_kernel_count} symmetric-memory reduce-scatter "
-        f"kernels under zero-CTA. Observed reduce-scatter kernels: "
-        f"{[kernel.name for kernel in reduce_scatter_kernels[:20]]}"
+    expected_reduce_scatter_group_count = num_training_steps * 2
+    assert len(reduce_scatter_groups) == expected_reduce_scatter_group_count, (
+        f"Expected {expected_reduce_scatter_group_count} symmetric-memory reduce-scatter "
+        f"groups under zero-CTA. Observed reduce-scatter events: {reduce_scatter_groups[:20]}"
     )
-    assert all("ncclSymk" in kernel.name for kernel in reduce_scatter_kernels), (
-        "Expected all zero-CTA reduce-scatter kernels to be ncclSymk kernels. "
-        f"Observed reduce-scatter kernels: {[kernel.name for kernel in reduce_scatter_kernels[:20]]}"
+    assert all("ncclSymk" in event.name for event in chain.from_iterable(reduce_scatter_groups)), (
+        "Expected all zero-CTA reduce-scatter events to be ncclSymk kernels. "
+        f"Observed reduce-scatter events: {reduce_scatter_groups[:20]}"
     )
 
     # Release the dedicated communicator (leaks only on a test failure above, which is fine).
