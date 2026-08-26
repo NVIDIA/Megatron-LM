@@ -110,19 +110,27 @@ class HybridStack(MegatronModule):
         if (layer_type_list is None) == (layer_config_list is None):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
         if layer_type_list is not None:
-            warnings.warn(
-                "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
             if any(
                 not isinstance(layer_symbol, str) or len(layer_symbol) != 1
                 for layer_symbol in layer_type_list
             ):
                 raise ValueError("Each entry in layer_type_list must be a single layer symbol")
             segment = ''.join(layer_type_list)
-            layer_utils.normalize_tp_comm_overlap(config, segment)
+            layer_utils.validate_tp_comm_overlap(config, segment, has_mtp=is_mtp_layer)
+            warnings.warn(
+                "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             layer_config_list = validate_segment_layers(segment, config)
+        else:
+            assert layer_config_list is not None
+            for layer_config in layer_config_list:
+                layer_utils.validate_tp_comm_overlap(
+                    layer_config,
+                    layer_utils.get_layer_symbol_from_config(layer_config),
+                    has_mtp=is_mtp_layer,
+                )
 
         super().__init__(config=config)
         self.pre_process = pre_process

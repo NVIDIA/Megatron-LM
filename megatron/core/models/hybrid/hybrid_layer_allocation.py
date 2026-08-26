@@ -295,8 +295,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Tra
     This is used after the main pattern has been split by '|' into segments.
     Each segment should contain only valid layer symbols (no '|').
 
-    The source config is expected to be normalized before this function is called.
-    Each layer config is created from that state without running ``__post_init__``
+    Each layer config is copied from the source config without running ``__post_init__``
     a second time.
 
     Args:
@@ -436,7 +435,7 @@ def select_pipeline_segment(
             count = layers_per_rank
 
         selected_pattern = full_pattern[offset : offset + count]
-        layer_utils.normalize_tp_comm_overlap(config, selected_pattern)
+        layer_utils.validate_tp_comm_overlap(config, selected_pattern)
         selected = validate_segment_layers(selected_pattern, config)
         log_on_each_pipeline_stage(
             logger,
@@ -471,7 +470,7 @@ def select_pipeline_segment(
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
-    layer_utils.normalize_tp_comm_overlap(config, my_segment)
+    layer_utils.validate_tp_comm_overlap(config, my_segment)
     layer_config_list = validate_segment_layers(my_segment, config)
 
     log_on_each_pipeline_stage(

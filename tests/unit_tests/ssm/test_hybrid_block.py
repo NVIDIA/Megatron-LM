@@ -194,8 +194,55 @@ def test_hybrid_stack_accepts_layer_config_subclasses(monkeypatch):
     assert block.layers[0].config is layer_config
 
 
-def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatch):
-    """The positional layer-type API normalizes the root config before conversion."""
+def test_layer_type_list_rejects_unsupported_tp_overlap():
+    """The positional layer-type API rejects unsupported TP overlap before conversion."""
+    config = MLATransformerConfig(
+        num_layers=3, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
+    )
+    with pytest.raises(
+        ValueError, match="TP communication overlap is not supported with hybrid MLA layers"
+    ):
+        HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            False,
+            [Symbols.MAMBA, Symbols.MLA, Symbols.MLP],
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=_make_pg_collection(),
+        )
+
+    assert config.tp_comm_overlap is True
+
+
+def test_layer_config_list_rejects_unsupported_tp_overlap():
+    """Explicit per-layer configs are validated using their own overlap setting."""
+    root_config = MLATransformerConfig(
+        num_layers=1, hidden_size=64, num_attention_heads=4, tp_comm_overlap=False
+    )
+    layer_config = MLALayerConfig(
+        num_layers=1, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
+    )
+
+    with pytest.raises(
+        ValueError, match="TP communication overlap is not supported with hybrid MLA layers"
+    ):
+        HybridStack(
+            config=root_config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_config_list=[layer_config],
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=_make_pg_collection(),
+        )
+
+    assert root_config.tp_comm_overlap is False
+    assert layer_config.tp_comm_overlap is True
+
+
+def test_layer_type_list_configs_follow_root_sequence_parallel_mutations(monkeypatch):
+    """Legacy layer symbols still create configs tracked by sequence-parallel utilities."""
 
     class BuiltLayer(torch.nn.Module):
 
@@ -211,10 +258,11 @@ def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatc
 
     monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
 
-    config = MLATransformerConfig(
-        num_layers=3, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
-    )
-    with pytest.warns((DeprecationWarning, UserWarning)) as warning_records:
+    config = MLATransformerConfig(num_layers=3, hidden_size=64, num_attention_heads=4)
+    with pytest.warns(
+        DeprecationWarning,
+        match=r"DEPRECATED\(layer_type_list\): please use `layer_config_list` instead",
+    ):
         block = HybridStack(
             config,
             submodules,
@@ -224,15 +272,6 @@ def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatc
             post_process=False,
             pg_collection=_make_pg_collection(),
         )
-    emitted_warnings = {(warning.category, str(warning.message)) for warning in warning_records}
-    assert (
-        DeprecationWarning,
-        "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
-    ) in emitted_warnings
-    assert any(
-        category is UserWarning and "Disabling tp_comm_overlap" in message
-        for category, message in emitted_warnings
-    )
     layer_config_list = block.layer_config_list
 
     assert "layer_type_list" not in block.__dict__
@@ -248,8 +287,6 @@ def test_layer_type_list_normalizes_tp_overlap_before_copying_configs(monkeypatc
     assert all(
         layer.config is layer_config for layer, layer_config in zip(block.layers, layer_config_list)
     )
-    assert config.tp_comm_overlap is False
-    assert all(layer_config.tp_comm_overlap is False for layer_config in layer_config_list)
 
     block.position_embedding_type = "rope"
     config.sequence_parallel = True
@@ -277,14 +314,12 @@ def test_explicit_layer_config_mutations_are_isolated(monkeypatch):
 
     def fake_build_module(module_spec, **kwargs):
         if module_spec is submodules.mla_layer:
-            kwargs["config"].tp_comm_overlap = False
+            kwargs["config"].add_bias_linear = False
         return BuiltLayer(kwargs["config"], kwargs["layer_number"])
 
     monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
 
-    root_config = MLATransformerConfig(
-        num_layers=2, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
-    )
+    root_config = MLATransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
     layer_configs = validate_segment_layers(Symbols.MLA + Symbols.MLP, root_config)
     HybridStack(
         config=root_config,
@@ -297,8 +332,8 @@ def test_explicit_layer_config_mutations_are_isolated(monkeypatch):
     )
 
     assert type(layer_configs) is list
-    assert root_config.tp_comm_overlap is True
-    assert [layer_config.tp_comm_overlap for layer_config in layer_configs] == [False, True]
+    assert root_config.add_bias_linear is True
+    assert [layer_config.add_bias_linear for layer_config in layer_configs] == [False, True]
 
 
 @pytest.mark.parametrize(
@@ -335,20 +370,16 @@ def test_hybrid_stack_rejects_multi_character_layer_type():
     """The legacy list treats each entry as one layer symbol."""
     config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
 
-    with pytest.warns(
-        DeprecationWarning,
-        match=r"DEPRECATED\(layer_type_list\): please use `layer_config_list` instead",
-    ):
-        with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
-            HybridStack(
-                config=config,
-                submodules=hybrid_stack_spec.submodules,
-                layer_type_list=[Symbols.MAMBA + Symbols.ATTENTION],
-                pre_process=False,
-                post_layer_norm=False,
-                post_process=False,
-                pg_collection=_make_pg_collection(),
-            )
+    with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
+        HybridStack(
+            config=config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_type_list=[Symbols.MAMBA + Symbols.ATTENTION],
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=_make_pg_collection(),
+        )
 
 
 def test_mamba_state_shapes_are_selected_by_layer_config_type():

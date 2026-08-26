@@ -606,19 +606,18 @@ class TestSelectPipelineSegment:
 
     @pytest.mark.parametrize("layer_symbol", [Symbols.MLA, Symbols.DS_ATTENTION])
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
-    def test_normalizes_tp_overlap_before_copying_selected_segment(self, mock_log, layer_symbol):
+    def test_rejects_tp_overlap_for_selected_segment(self, mock_log, layer_symbol):
         self.config.tp_comm_overlap = True
 
-        with pytest.warns(UserWarning, match="Disabling tp_comm_overlap"):
-            layer_configs, _ = select_pipeline_segment(
-                layer_symbol, self.config, pp_group=None, vp_stage=None
-            )
+        with pytest.raises(
+            ValueError, match="TP communication overlap is not supported with hybrid"
+        ):
+            select_pipeline_segment(layer_symbol, self.config, pp_group=None, vp_stage=None)
 
-        assert self.config.tp_comm_overlap is False
-        assert all(layer_config.tp_comm_overlap is False for layer_config in layer_configs)
+        assert self.config.tp_comm_overlap is True
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
-    def test_does_not_normalize_tp_overlap_for_unselected_mla_segment(self, mock_log):
+    def test_does_not_reject_tp_overlap_for_unselected_mla_segment(self, mock_log):
         self.config.tp_comm_overlap = True
 
         layer_configs, _ = select_pipeline_segment(

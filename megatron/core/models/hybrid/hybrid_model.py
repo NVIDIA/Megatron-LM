@@ -221,11 +221,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
         )
 
-        # Pipeline segment selection intentionally follows the MTP decision. It now creates
-        # independent per-layer config copies, so normalize the root config first to ensure
-        # MTP's required tp_comm_overlap disablement is inherited by every decoder-layer config.
-        # Previously, decoder layers shared the root config and observed the mutation directly.
-        layer_utils.normalize_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
+        # Validate TP communication overlap after determining whether this rank builds MTP,
+        # before constructing the decoder or MTP modules.
+        layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
