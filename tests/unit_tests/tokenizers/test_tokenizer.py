@@ -436,9 +436,26 @@ def test_own_metadata_class(tmp_path):
         overwrite=True,
     )
 
-    # Load tokenizer with custom class
+    # Loading untrusted metadata must not execute its module import.
+    untrusted_path = tmp_path / "untrusted_metadata.json"
+    untrusted_path.write_text(
+        json.dumps(
+            {
+                "library": tokenizer_library,
+                "class_name": "SystemExit",
+                "class_path": "sys",
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="trust_custom_tokenizer=True"):
+        MegatronTokenizer.from_pretrained(
+            tokenizer_path=tokenizer_path, metadata_path=untrusted_path
+        )
+
     tokenizer = MegatronTokenizer.from_pretrained(
-        tokenizer_path=tokenizer_path, metadata_path=metadata_path
+        tokenizer_path=tokenizer_path,
+        metadata_path=metadata_path,
+        trust_custom_tokenizer=True,
     )
 
     assert isinstance(tokenizer, CustomTokenizerClass)

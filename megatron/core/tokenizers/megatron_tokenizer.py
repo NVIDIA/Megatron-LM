@@ -32,13 +32,18 @@ class MegatronTokenizer:
         )
 
     def from_pretrained(
-        tokenizer_path: str = None, metadata_path: Optional[Union[str, dict]] = None, **kwargs
+        tokenizer_path: str = None,
+        metadata_path: Optional[Union[str, dict]] = None,
+        trust_custom_tokenizer: bool = False,
+        **kwargs,
     ) -> MegatronTokenizerBase:
         """
         Args:
             path (str): path to tokenizer file with metadata.json in folder.
             metadata_path (Optional[str]): path to the tokenizer metadata.
                 Must be specified when loading the tokenizer from HF.
+            trust_custom_tokenizer (bool): allow metadata to import a custom tokenizer class.
+                Only enable this for trusted metadata because importing a module executes code.
 
         Returns:
             MegatronTokenizerBase: tokenizer object.
@@ -82,7 +87,9 @@ class MegatronTokenizer:
             ), "Image tag type (`image_tag_type`) must be specified."
 
         # Initialize tokenizer object
-        tokenizer_cls = _get_tokenizer_model_class(tokenizer_library, metadata)
+        tokenizer_cls = _get_tokenizer_model_class(
+            tokenizer_library, metadata, trust_custom_tokenizer=trust_custom_tokenizer
+        )
 
         metadata['metadata_path'] = metadata_path
         tokenizer = tokenizer_cls(path=tokenizer_path, config=metadata, **kwargs)
@@ -168,21 +175,41 @@ def _get_metadata_path(tokenizer_path: str) -> str:
     return metadata_path
 
 
-def _get_tokenizer_model_class(library: str, metadata: dict) -> MegatronTokenizerBase:
+def _get_tokenizer_model_class(
+    library: str, metadata: dict, *, trust_custom_tokenizer: bool = False
+) -> MegatronTokenizerBase:
     """
     Returns a class which corresponds to choosen tokenizer model type.
 
     Args:
         library (str): tokenizer library.
         metadata (dict): tokenizer metadata.
+        trust_custom_tokenizer (bool): allow loading a metadata-selected custom class.
 
     Returns:
         MegatronTokenizerBase: class for choosen tokenizer model type.
     """
     # Return tokenizer class if it was specified in metadata.
     if metadata.get('class_name', None):
-        module = importlib.import_module(metadata['class_path'])
-        return getattr(module, metadata['class_name'])
+        class_path = metadata.get('class_path')
+        tokenizer_type = 'text' if library in TEXT_LIBRARIES else 'vision'
+        default_class_path = f"megatron.core.tokenizers.{tokenizer_type}"
+        default_class_name = f"MegatronTokenizer{tokenizer_type.capitalize()}"
+        is_default_class = (
+            class_path == default_class_path and metadata['class_name'] == default_class_name
+        )
+        if not is_default_class and not trust_custom_tokenizer:
+            raise ValueError(
+                "Tokenizer metadata selects a custom class. Pass trust_custom_tokenizer=True "
+                "only after verifying the metadata and module source."
+            )
+        module = importlib.import_module(class_path)
+        tokenizer_cls = getattr(module, metadata['class_name'])
+        if not isinstance(tokenizer_cls, type) or not issubclass(
+            tokenizer_cls, MegatronTokenizerBase
+        ):
+            raise TypeError("Tokenizer metadata class must inherit MegatronTokenizerBase")
+        return tokenizer_cls
 
     # Define tokenizer type
     tokenizer_type = 'text' if library in TEXT_LIBRARIES else 'vision'

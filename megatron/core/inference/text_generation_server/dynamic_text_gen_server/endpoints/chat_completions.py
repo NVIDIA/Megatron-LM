@@ -2,15 +2,15 @@
 
 import asyncio
 import base64
+import binascii
+import http.client
 import ipaddress
 import json
 import logging
 import socket
 import time
 import traceback
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 import warnings
 
@@ -244,59 +244,125 @@ def _coerce_arguments_mapping(arguments):
     return {}
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Reject HTTP redirects so a 3xx to a private address can't bypass the
-    pre-fetch allowlist check."""
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection that uses an already validated numeric address."""
 
-    def http_error_301(self, req, fp, code, msg, headers):
-        """Turn a 3xx redirect into an HTTPError so the fetch fails closed."""
-        raise urllib.error.HTTPError(
-            req.full_url, code, "redirects disabled for image_url fetches", headers, fp
+    def __init__(self, hostname: str, port: int, sockaddr, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self._sockaddr = sockaddr
+
+    def connect(self) -> None:
+        """Connect without resolving the attacker-controlled hostname again."""
+        self.sock = socket.create_connection(self._sockaddr, self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection pinned to an address while retaining hostname verification."""
+
+    def __init__(self, hostname: str, port: int, sockaddr, timeout: float):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self._sockaddr = sockaddr
+
+    def connect(self) -> None:
+        """Connect to the validated address and authenticate the original hostname."""
+        sock = socket.create_connection(self._sockaddr, self.timeout, self.source_address)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _resolve_public_addresses(hostname: str, port: int) -> list[tuple]:
+    """Resolve a host once and return only globally routable TCP addresses."""
+    try:
+        addrinfo = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve image_url host: {hostname}") from exc
+
+    addresses = []
+    for family, _, _, _, sockaddr in addrinfo:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not ip.is_global:
+            raise ValueError(f"Refusing to fetch image from non-public address: {hostname}")
+        pinned_sockaddr = (str(ip), sockaddr[1])
+        if pinned_sockaddr not in addresses:
+            addresses.append(pinned_sockaddr)
+    if not addresses:
+        raise ValueError(f"Cannot resolve image_url host: {hostname}")
+    return addresses
+
+
+def _fetch_remote_image(parsed: urllib.parse.ParseResult) -> bytes:
+    """Fetch an HTTP(S) image through a validated, DNS-pinned connection."""
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"Invalid image_url: {parsed.geturl()[:40]!r}")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(f"Invalid image_url: {parsed.geturl()[:40]!r}") from exc
+
+    addresses = _resolve_public_addresses(parsed.hostname, port)
+    connection_type = (
+        _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
+    )
+    target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    host_header = parsed.hostname
+    if ":" in host_header:
+        host_header = f"[{host_header}]"
+    if port != (443 if parsed.scheme == "https" else 80):
+        host_header = f"{host_header}:{port}"
+
+    last_error = None
+    for sockaddr in addresses:
+        connection = connection_type(
+            parsed.hostname, port, sockaddr, _IMAGE_FETCH_TIMEOUT_S
         )
-
-    http_error_302 = http_error_301
-    http_error_303 = http_error_301
-    http_error_307 = http_error_301
-    http_error_308 = http_error_301
-
-
-_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
+        try:
+            connection.request(
+                "GET",
+                target,
+                headers={"Host": host_header, "User-Agent": _IMAGE_FETCH_USER_AGENT},
+            )
+            response = connection.getresponse()
+            if not 200 <= response.status < 300:
+                raise ValueError(f"Image fetch returned HTTP {response.status}")
+            data = response.read(_MAX_IMAGE_BYTES + 1)
+            if len(data) > _MAX_IMAGE_BYTES:
+                raise ValueError(
+                    f"Image at {parsed.hostname} exceeds {_MAX_IMAGE_BYTES} byte limit"
+                )
+            return data
+        except (OSError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            connection.close()
+    raise ValueError(f"Failed to fetch image from {parsed.hostname}") from last_error
 
 
 def _extract_image_url_bytes(url: str) -> bytes:
-    """Extract raw bytes from an OpenAI-style image_url value.
+    """Extract size-limited bytes from an OpenAI-style image_url value.
 
     Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
     plain ``http(s)://`` URLs.
     """
     if url.startswith("data:"):
-        _, b64_data = url.split(",", 1)
-        return base64.b64decode(b64_data)
-    if url.startswith(("http://", "https://")):
-        parsed = urllib.parse.urlparse(url)
-        if not parsed.hostname:
-            raise ValueError(f"Invalid image_url: {url[:40]!r}")
         try:
-            ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
-        except (socket.gaierror, ValueError) as exc:
-            raise ValueError(f"Cannot resolve image_url host: {parsed.hostname}") from exc
-        # Refuse SSRF-prone destinations (loopback, RFC1918, link-local,
-        # multicast, reserved, unspecified). Public addresses only.
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise ValueError(f"Refusing to fetch image from non-public address: {parsed.hostname}")
-        req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_FETCH_USER_AGENT})
-        with _no_redirect_opener.open(req, timeout=_IMAGE_FETCH_TIMEOUT_S) as response:
-            data = response.read(_MAX_IMAGE_BYTES + 1)
+            metadata, b64_data = url.split(",", 1)
+        except ValueError as exc:
+            raise ValueError("Malformed image data URL") from exc
+        if not metadata.startswith("data:image/") or not metadata.endswith(";base64"):
+            raise ValueError("Image data URL must contain base64-encoded image data")
+        max_encoded_bytes = 4 * ((_MAX_IMAGE_BYTES + 2) // 3)
+        if len(b64_data) > max_encoded_bytes:
+            raise ValueError(f"Data image exceeds {_MAX_IMAGE_BYTES} byte limit")
+        try:
+            data = base64.b64decode(b64_data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Invalid base64 image data") from exc
         if len(data) > _MAX_IMAGE_BYTES:
-            raise ValueError(f"Image at {parsed.hostname} exceeds {_MAX_IMAGE_BYTES} byte limit")
+            raise ValueError(f"Data image exceeds {_MAX_IMAGE_BYTES} byte limit")
         return data
+    if url.startswith(("http://", "https://")):
+        return _fetch_remote_image(urllib.parse.urlparse(url))
     raise ValueError(f"Unsupported image_url scheme: {url[:40]!r}")
 
 

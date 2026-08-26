@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import base64
 import builtins
 import json
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +11,13 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+    chat_completions,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+    _extract_image_url_bytes,
+    _fetch_remote_image,
+    _resolve_public_addresses,
     _sanitize_messages_for_template,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
@@ -446,3 +454,69 @@ def test_incremental_detokenizer_rejects_unsupported_tokenizer():
         ValueError, match="Streaming is currently supported only for Hugging Face fast tokenizers"
     ):
         HuggingFaceFastIncrementalDetokenizer(_Tokenizer(), [])
+
+
+def test_data_image_rejects_decoded_content_over_limit(monkeypatch):
+    monkeypatch.setattr(chat_completions, "_MAX_IMAGE_BYTES", 3)
+    encoded = base64.b64encode(b"four").decode()
+
+    with pytest.raises(ValueError, match="exceeds 3 byte limit"):
+        _extract_image_url_bytes(f"data:image/png;base64,{encoded}")
+
+
+def test_data_image_rejects_malformed_payload():
+    with pytest.raises(ValueError, match="base64-encoded image data"):
+        _extract_image_url_bytes("data:text/plain;base64,YWJj")
+    with pytest.raises(ValueError, match="Invalid base64 image data"):
+        _extract_image_url_bytes("data:image/png;base64,not-base64!")
+
+
+def test_resolve_public_addresses_rejects_mixed_private_result(monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80)),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="non-public address"):
+        _resolve_public_addresses("attacker.example", 80)
+
+
+def test_remote_image_fetch_uses_validated_numeric_address(monkeypatch):
+    observed = {}
+
+    class FakeResponse:
+        status = 200
+
+        @staticmethod
+        def read(_size):
+            return b"image"
+
+    class FakeConnection:
+        def __init__(self, hostname, port, sockaddr, timeout):
+            observed.update(hostname=hostname, port=port, sockaddr=sockaddr, timeout=timeout)
+
+        def request(self, method, target, headers):
+            observed.update(method=method, target=target, headers=headers)
+
+        @staticmethod
+        def getresponse():
+            return FakeResponse()
+
+        @staticmethod
+        def close():
+            pass
+
+    monkeypatch.setattr(chat_completions, "_resolve_public_addresses", lambda *_: [("93.184.216.34", 80)])
+    monkeypatch.setattr(chat_completions, "_PinnedHTTPConnection", FakeConnection)
+
+    assert (
+        _fetch_remote_image(chat_completions.urllib.parse.urlparse("http://example.com/image.png"))
+        == b"image"
+    )
+    assert observed["hostname"] == "example.com"
+    assert observed["sockaddr"] == ("93.184.216.34", 80)
+    assert observed["headers"]["Host"] == "example.com"

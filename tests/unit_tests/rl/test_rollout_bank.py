@@ -16,6 +16,7 @@ from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.rollout_bank import (
     _CONSUMED,
     _FORMAT_VERSION,
+    _GENERATION_OWNER,
     _GENERATIONS,
     _LEDGER,
     _MANIFEST,
@@ -357,3 +358,39 @@ def test_multiple_envs_require_env_ids_for_restore_routing():
 
     with pytest.raises(ValueError, match="configuring multiple active agents"):
         agent.set_restored_groups([])
+
+
+def test_startup_refuses_unowned_stale_generation(tmp_path):
+    bank = RolloutBank(str(tmp_path))
+    bank.close()
+    stale = tmp_path / _GENERATIONS / "generation-unowned"
+    stale.mkdir()
+
+    with pytest.raises(ValueError, match="owner marker"):
+        RolloutBank(str(tmp_path))
+
+    assert stale.exists()
+
+
+def test_startup_refuses_generation_symlink(tmp_path):
+    bank = RolloutBank(str(tmp_path))
+    bank.close()
+    target = tmp_path / "outside-bank"
+    target.mkdir()
+    stale = tmp_path / _GENERATIONS / "generation-symlink"
+    stale.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="untrusted rollout-bank entry"):
+        RolloutBank(str(tmp_path))
+
+    assert target.exists()
+
+
+def test_generation_directories_have_owner_markers(tmp_path):
+    bank = RolloutBank(str(tmp_path))
+    marker = _active_generation(tmp_path) / _GENERATION_OWNER
+
+    assert marker.read_text() == f"{_FORMAT_VERSION}\n"
+
+    bank.checkpoint(1)
+    assert (_active_generation(tmp_path) / _GENERATION_OWNER).read_text() == f"{_FORMAT_VERSION}\n"

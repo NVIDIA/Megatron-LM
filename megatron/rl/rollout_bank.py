@@ -74,7 +74,7 @@ _MASK_DTYPE = np.uint8
 
 # Bump whenever the manifest/ledger schema or any sidecar dtype/layout changes.
 # Readers intentionally fail closed; cross-version migration must be explicit.
-_FORMAT_VERSION = 2
+_FORMAT_VERSION = 3
 _MANIFEST = "MANIFEST.json"
 _GENERATIONS = "generations"
 _LEDGER = "ledger.log"
@@ -82,6 +82,7 @@ _CONSUMED = "consumed.log"
 _TOKENS_BIN = "tokens.bin"
 _LOGPROBS_BIN = "logprobs.bin"
 _MASKS_BIN = "masks.bin"
+_GENERATION_OWNER = ".rollout-bank-generation"
 
 
 class SidecarMeta(TypedDict):
@@ -270,6 +271,7 @@ class RolloutBank:
         generation = _generation_name()
         generation_dir = os.path.join(self._generations_dir, generation)
         os.makedirs(generation_dir)
+        _write_generation_owner(generation_dir)
         consumed_path = os.path.join(generation_dir, _CONSUMED)
         with open(consumed_path, "w") as f:
             f.flush()
@@ -286,9 +288,12 @@ class RolloutBank:
             path = os.path.join(self._generations_dir, name)
             is_generation = name.startswith("generation-")
             is_staging = name.startswith(".generation-") and name.endswith(".tmp")
-            if name != active and os.path.isdir(path) and (is_generation or is_staging):
-                _rmtree(path)
-                removed = True
+            if name == active or not (is_generation or is_staging):
+                continue
+            if os.path.islink(path) or not os.path.isdir(path):
+                raise ValueError(f"Refusing to remove untrusted rollout-bank entry: {path}")
+            _remove_owned_generation(path)
+            removed = True
         if removed:
             _fsync_directory(self._generations_dir)
 
@@ -873,6 +878,7 @@ class RolloutBank:
         staging = os.path.join(self._generations_dir, f".{generation}.tmp")
         final_dir = os.path.join(self._generations_dir, generation)
         os.makedirs(staging)
+        _write_generation_owner(staging)
         _fsync_directory(self._generations_dir)
 
         new_seg = _segment_name(iteration)
@@ -908,7 +914,7 @@ class RolloutBank:
 
         # The old generation remains a valid crash-recovery target until the
         # manifest flip is durable. It is safe to reclaim only afterward.
-        _rmtree(os.path.join(self._generations_dir, old_generation))
+        _remove_owned_generation(os.path.join(self._generations_dir, old_generation))
         _fsync_directory(self._generations_dir)
         self._collection_iter = None
         self._seg_dir = None
@@ -978,7 +984,27 @@ class RolloutBank:
             self._warned_over_cap = True
 
 
-def _rmtree(path: str) -> None:
+def _write_generation_owner(generation_dir: str) -> None:
+    """Mark a generation directory as owned by RolloutBank before publishing it."""
+    marker = os.path.join(generation_dir, _GENERATION_OWNER)
+    with open(marker, "x") as f:
+        f.write(f"{_FORMAT_VERSION}\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _fsync_directory(generation_dir)
+
+
+def _remove_owned_generation(path: str) -> None:
+    """Remove one ordinary generation directory after validating its owner marker."""
     import shutil
 
-    shutil.rmtree(path, ignore_errors=True)
+    if os.path.islink(path) or not os.path.isdir(path):
+        raise ValueError(f"Refusing to remove untrusted rollout-bank entry: {path}")
+    marker = os.path.join(path, _GENERATION_OWNER)
+    if os.path.islink(marker) or not os.path.isfile(marker):
+        raise ValueError(f"RolloutBank generation owner marker is missing or invalid: {path}")
+    with open(marker) as f:
+        owner_version = f.read().strip()
+    if owner_version != str(_FORMAT_VERSION):
+        raise ValueError(f"Invalid rollout-bank generation owner marker in {path}")
+    shutil.rmtree(path)
