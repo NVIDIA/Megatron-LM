@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+import os
 from copy import copy
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
 import torch
+from vllm import envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.models.deepseek_v4.common.ops import save_partial_states
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
@@ -24,6 +26,53 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
 
 def _round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def _top_k_per_row_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    output: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    topk: int,
+) -> None:
+    """Use deterministic score-order Top-K whenever BI is enabled."""
+    if envs.VLLM_BATCH_INVARIANT:
+        if not hasattr(torch.ops.ds4_bi, "top_k_per_row_prefill"):
+            library = os.environ.get("DS4_BI_TOPK_LIB")
+            if library:
+                torch.ops.load_library(library)
+        if not hasattr(torch.ops.ds4_bi, "top_k_per_row_prefill"):
+            raise RuntimeError(
+                "VLLM_BATCH_INVARIANT requires the loaded DS4 deterministic "
+                "Top-K extension"
+            )
+        torch.ops.ds4_bi.top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            output,
+            num_rows,
+            stride0,
+            stride1,
+            topk,
+        )
+        return
+
+    from vllm import _custom_ops as ops
+
+    ops.top_k_per_row_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        output,
+        num_rows,
+        stride0,
+        stride1,
+        topk,
+    )
 
 
 @dataclass(frozen=True)
@@ -604,7 +653,6 @@ def official_indexer_topk(
     ratio: int,
     topk: int,
 ) -> torch.Tensor:
-    from vllm import _custom_ops as ops
     from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
         fused_indexer_q_rope_quant,
     )
@@ -691,7 +739,7 @@ def official_indexer_topk(
         segment_output = torch.full(
             (segment_rows, topk), -1, dtype=torch.int32, device=index_q.device
         )
-        ops.top_k_per_row_prefill(
+        _top_k_per_row_prefill(
             logits,
             row_starts,
             row_ends,

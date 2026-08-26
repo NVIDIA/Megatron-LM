@@ -34,11 +34,11 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
     from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
         _build_compressor_metadata,
         _dequantize_indexer_k_cache,
+        _top_k_per_row_prefill,
         compressor_operation,
         official_compact_compressed_visible,
         official_indexer_topk,
     )
-    from vllm import _custom_ops as ops
     from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
         fused_indexer_q_rope_quant,
     )
@@ -169,7 +169,7 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
     direct_topk = torch.full(
         (4, 512), -1, dtype=torch.int32, device=device
     )
-    ops.top_k_per_row_prefill(
+    _top_k_per_row_prefill(
         logits,
         row_starts,
         row_ends,
