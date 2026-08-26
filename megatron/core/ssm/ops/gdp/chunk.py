@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_product/chunk.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file in the repository root.
 
 """Chunked Gated Delta Product prefill.
 
@@ -48,6 +48,11 @@ def chunk_gated_delta_product_varlen(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_indices_dp: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    state: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Variable-length chunked Gated Delta Product forward pass.
 
@@ -63,11 +68,33 @@ def chunk_gated_delta_product_varlen(
         initial_state: Starting state `[N, H, K, V]`, or `None` for zeros.
         output_final_state: Whether to return the final state.
         use_qk_l2norm_in_kernel: Whether to L2-normalize `q` and `k` first.
+        chunk_indices: Chunk descriptors for the token stream as written.
+        chunk_indices_dp: The same for the Householder-expanded stream, whose
+            sequences are `M` times longer. Not a rescaling of `chunk_indices`:
+            `ceil(L*M/64) != M*ceil(L/64)` in general.
+        chunk_offsets: Per-sequence prefix sum of unexpanded chunk counts.
+        state: `[S, H, K, V]` per-request state cache for dynamic batching,
+            written in place at `state_indices` rather than returned densely.
+        state_indices: `[N]` cache slot per sequence; `-1` marks padding.
 
     Returns `(o, final_state)` with `o` shaped `[1, T, H, V]`.
+
+    Passing the three descriptor arguments is what makes this capturable in a
+    CUDA graph: deriving them here reads a device tensor on the host and yields
+    a data-dependent length, which also sizes every launch grid below. Built
+    once per step and padded to a fixed length by `metadata`, they keep the grids
+    constant for a captured batch shape.
     """
     B, T, H, K = q.shape
     V = v.shape[-1]
+    # Slot-indexed state is the dynamic-batching path, which is also the only
+    # caller that can be captured in a CUDA graph -- and capture additionally
+    # requires the precomputed descriptors. Deriving them below would silently
+    # fall back to a host sync and a data-dependent grid, so reject the
+    # half-configured call rather than run a graph-unsafe kernel.
+    assert (state_indices is None) or (
+        chunk_indices is not None and chunk_indices_dp is not None and chunk_offsets is not None
+    ), "slot-indexed state requires the precomputed chunk descriptors"
     assert q.dtype != torch.float32, "the chunked GDP kernels require bf16/fp16 inputs"
     assert B == 1, f"varlen prefill expects a single packed sequence, got batch {B}"
     assert k.shape == (B, T * num_householder, H, K), f"unexpected key shape {tuple(k.shape)}"
@@ -95,11 +122,15 @@ def chunk_gated_delta_product_varlen(
         q = l2norm_fwd(q)
         k = l2norm_fwd(k)
 
+    # A device-side multiply of a fixed-size buffer: no sync, no shape change.
     cu_seqlens_dp = cu_seqlens * num_householder
-    # Both chunkings are derived here, once, and threaded through every stage
-    # so the sub-kernels do not each re-derive (and re-synchronize on) them.
-    chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-    chunk_indices_dp = prepare_chunk_indices(cu_seqlens_dp, CHUNK_SIZE)
+    # Both chunkings are threaded through every stage so the sub-kernels do not
+    # each re-derive (and re-synchronize on) them. The caller supplies them for
+    # graph capture; otherwise they are derived here, once.
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+    if chunk_indices_dp is None:
+        chunk_indices_dp = prepare_chunk_indices(cu_seqlens_dp, CHUNK_SIZE)
 
     if g is not None:
         # The decay applies to the first Householder copy of each token; the
@@ -162,6 +193,9 @@ def chunk_gated_delta_product_varlen(
         num_householder=num_householder,
         chunk_size=CHUNK_SIZE,
         chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        state=state,
+        state_indices=state_indices,
     )
     o = chunk_gated_delta_product_fwd_o(
         q=q,
