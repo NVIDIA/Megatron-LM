@@ -108,6 +108,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/dist_checkpointing/test_layer_wise_optimizer_common_state_dict.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/dist_checkpointing/**/*.py]
     products:
       - environment: [lts, dev]
@@ -129,6 +136,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsa_tilelang_kernels.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/**/*.py]
     products:
       - environment: [lts, dev]
@@ -140,6 +154,13 @@ products:
     products:
       - environment: [lts, dev]
         tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/engines/test_dynamic_engine_parallel_and_chunked_prefill.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
@@ -224,6 +245,13 @@ products:
     products:
       - environment: [lts, dev]
         tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]

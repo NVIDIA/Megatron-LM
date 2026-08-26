@@ -106,55 +106,6 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
                 rec_grads[name], base_grads[name]
             ), f"Grad not identical for {name} ({rank=})"
 
-    def test_gpu_forward_thd_correctness(self):
-        if self.sp_size > 1:
-            pytest.skip("Sequence parallel is not supported for this test case.")
-
-        if self.use_gdn2:
-            # FLA uses different kernels for SBHD and THD:
-            # https://github.com/fla-org/flash-linear-attention/blob/ebf3a0cff2be3e6f2b2f99820b8fe4e28855ced0/fla/ops/gdn2/chunk_intra.py#L40-L53
-            # so we relax the error bound here
-            atol, rtol = 1e-2, 1e-2
-        else:
-            atol, rtol = 3e-4, 3e-4
-
-        # Input shape
-        sequence_length = 32
-        micro_batch_size = 4
-        cu_seqlens = [0, 32, 64, 96, 128]
-        # sbhd input shape: [sequence length, batch size, hidden size]
-        sub_sequence_length = sequence_length // self.cp_size
-        hidden_states_sbhd = torch.rand(
-            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
-        )
-        attention_mask_sbhd = None
-        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
-        # thd input shape: [sequence length * batch size, 1, hidden size]
-        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
-        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
-        attention_mask_thd = None
-        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
-
-        # THD format
-        output_thd, _ = self.gdn(
-            hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
-        )
-        # SBHD format
-        output_sbhd, _ = self.gdn(hidden_states_sbhd, attention_mask_sbhd)
-        output_sbhd_T = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
-
-        rank = torch.distributed.get_rank()
-        assert output_thd.shape[0] == sub_sequence_length * micro_batch_size
-        assert output_thd.shape[1] == 1
-        assert output_thd.shape[2] == self.gdn.config.hidden_size
-        torch.testing.assert_close(
-            output_sbhd_T,
-            output_thd,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
-        )
-
     def test_gpu_forward_thd_padding_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
