@@ -957,8 +957,8 @@ class TransformerConfig(ModelParallelConfig):
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
     moe_use_norm_before_up_proj: bool = False
-    """Apply normalization before the latent-to-hidden MoE projection. Only effective when
-    ``moe_latent_size`` is set."""
+    """Apply normalization before the latent-to-hidden MoE projection. Requires
+    ``moe_latent_size`` to be set."""
 
     gtp_remat_opt_in_modules: list[str] = field(default_factory=list)
     """Extra modules to apply GTP_remat weight sharding to, beyond the default set (attention,
