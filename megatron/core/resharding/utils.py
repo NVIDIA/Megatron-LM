@@ -383,7 +383,7 @@ def extract_param_metadata(
 
     # GTP parameters carry their actual dense/expert rematerialization group
     # directly. Prefer that over selecting a group by parameter name or model
-    # type: it is authoritative for both GTP and expert GTP.
+    # type because it is authoritative for both GTP and expert GTP.
     is_gtp = bool(getattr(param, 'is_gtp_weight_remat', False))
     gtp_pad_length = int(getattr(param, 'pad_length', 0)) if is_gtp else 0
 
