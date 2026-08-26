@@ -225,6 +225,35 @@ class TestParallelMLAAttention:
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
 
+    def test_gpu_forward_no_rope(self):
+        if is_te_min_version("1.10.0"):
+            self.transformer_config.no_rope_freq = [1, 0]
+            no_rope_attention = MLASelfAttention(
+                self.transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            config = no_rope_attention.config
+            sequence_length = 32
+            micro_batch_size = 2
+
+            assert not no_rope_attention.use_rope
+            assert no_rope_attention.rotary_pos_emb is None
+
+            no_rope_attention.cuda()
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, config.hidden_size), device="cuda"
+            )
+            attention_mask = torch.ones(
+                (1, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+            )
+
+            output, bias = no_rope_attention(hidden_states, attention_mask)
+
+            assert output.shape == hidden_states.shape
+            assert bias.shape == (config.hidden_size,)
+
     @pytest.mark.experimental
     def test_gpu_forward_with_yarn_rope_fusion(self):
         if self.transformer_config.rope_type == "rope":
