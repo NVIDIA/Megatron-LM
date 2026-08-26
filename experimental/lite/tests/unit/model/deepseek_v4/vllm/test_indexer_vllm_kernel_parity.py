@@ -4,7 +4,10 @@ import pytest
 import torch
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.gpus(1),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+]
 
 
 def _config():
