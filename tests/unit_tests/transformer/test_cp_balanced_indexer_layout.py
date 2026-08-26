@@ -25,6 +25,7 @@ from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexe
     _ZZ_PACK_OK,
     _ensure_pack_zigzag_ok,
     _zigzag_plan,
+    pack_eligible_for_zigzag,
     prebuild_balanced_layouts,
 )
 
@@ -211,10 +212,12 @@ def test_route_a2a_roundtrip(name, cu_list, cp_size, capacity):
         assert torch.equal(out.squeeze(1), mine), (name, r)
 
 
-def test_prebuild_enforces_pack_invariant():
-    """Prebuild records OK verdicts for conforming packs (microbatch cache + module
-    registry) and RAISES for a pack that violates per-sequence 2N divisibility —
-    eligibility is a run-level invariant, with no per-microbatch fallback."""
+def test_prebuild_records_pack_verdicts_for_routing():
+    """Prebuild records the per-pack verdict (microbatch cache + module registry):
+    conforming packs are eligible; a pack that violates per-sequence 2N divisibility
+    records False so the forward routes that microbatch to the contiguous reference
+    path (per-pack fused-call shape variation is verified safe below the kernel row
+    limit)."""
     group = _StubGroup(4, 0)
     g = getattr(group, "group_name", None) or id(group)  # mirrors _group_key
 
@@ -222,33 +225,41 @@ def test_prebuild_enforces_pack_invariant():
     prebuild_balanced_layouts(aligned, cp_group=group)
     assert _ZZ_PACK_OK[(g, 1024)] is True
     assert aligned._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1024, True)
+    assert pack_eligible_for_zigzag(aligned, None, group, 4, 1024)
     _ensure_pack_zigzag_ok(None, group, 4, 1024, aligned._dsa_cp_balance_layout_cache)
 
-    # Sequence lengths 500/508 are not divisible by 2 * cp_size = 8: fail fast at
-    # data-prep time, before any dispatch could mix fused-call shapes.
+    # Sequence lengths 500/508 are not divisible by 2 * cp_size = 8: verdict False,
+    # no plan, and the router sends the microbatch to the reference path.
     unaligned = _packed_params([0, 500, 1008], 1008)
+    prebuild_balanced_layouts(unaligned, cp_group=group)
+    assert unaligned._dsa_cp_balance_layout_cache["zz_pack_ok"] == (252, False)
+    assert ("zigzag", 0) not in unaligned._dsa_cp_balance_layout_cache
+    assert not pack_eligible_for_zigzag(unaligned, None, group, 4, 252)
     with pytest.raises(ValueError, match="not zigzag-representable"):
-        prebuild_balanced_layouts(unaligned, cp_group=group)
-    # The violating pack records no OK verdict; the aligned capacity is untouched.
-    assert (g, 252) not in _ZZ_PACK_OK
+        _ensure_pack_zigzag_ok(None, group, 4, 252, unaligned._dsa_cp_balance_layout_cache)
+    # The aligned capacity's verdict is untouched.
     assert _ZZ_PACK_OK[(g, 1024)] is True
 
     prebuild_balanced_layouts(aligned, cp_group=group)
     assert _ZZ_PACK_OK[(g, 1024)] is True
 
 
-def test_eager_probe_enforces_pack_invariant():
+def test_eager_probe_routes_unprebuilt_packs():
     """A frontend that never prebuilds (legacy varlen ``get_batch``) can hand the
-    dispatch a raw, non-2N-aligned pack. The eager fail-fast check must RAISE for
-    it (no per-microbatch fallback) and cache OK verdicts for conforming packs."""
+    router a raw, non-2N-aligned pack: the eager probe records a False verdict (the
+    microbatch routes to the reference path), while the internal consistency check
+    still raises if a caller bypasses that routing."""
     group = _StubGroup(4, 0)
     cache = {}
 
-    # 500 % (2 * 4) != 0 -> run-level invariant violation. l_local = 252 (raw pack).
+    # 500 % (2 * 4) != 0 -> not zigzag-representable. l_local = 252 (raw pack).
     cu = torch.tensor([0, 500, 1008], dtype=torch.int32)
+    psp = _packed_params([0, 500, 1008], 1008)
+    psp._dsa_cp_balance_layout_cache = cache
+    assert not pack_eligible_for_zigzag(psp, cu, group, 4, 252)
+    assert cache["zz_pack_ok"] == (252, False)
     with pytest.raises(ValueError, match="not zigzag-representable"):
         _ensure_pack_zigzag_ok(cu, group, 4, 252, cache)
-    assert "zz_pack_ok" not in cache
 
     # Aligned pack with a capacity-padding tail (both 2N-aligned) -> zigzag OK.
     cu2 = torch.tensor([0, 1024, 3072], dtype=torch.int32)
@@ -471,9 +482,11 @@ def test_prebuild_rejects_capacity_above_fused_row_limit():
 
 
 def test_row_limit_guard_in_compute_cp_indexer_topk():
-    """Above FUSED_INDEXER_MAX_SAFE_ROWS: a synthetic prebuilt_layout raises (it
-    cannot take the unfused path), and a reference-layout call falls back to the
-    unfused implementation and completes (pure torch, runs on CPU)."""
+    """Above FUSED_INDEXER_MAX_SAFE_ROWS the policy splits: a synthetic layout
+    (balanced path) fails closed, while zero-work exits still run first so no-op
+    calls never trip the guard. Legacy above-limit calls proceed fused with a
+    once-per-process correctness warning (exercised by the GPU suite), so they
+    are not run here on CPU."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 
     rows = cp_utils.FUSED_INDEXER_MAX_SAFE_ROWS + 4
@@ -498,11 +511,26 @@ def test_row_limit_guard_in_compute_cp_indexer_topk():
             max_seqlen_q=rows,
             use_fused=True,
             prebuilt_layout=fake_layout,
+            synthetic_layout=True,
         )
+    # Zero-work exits run before the guard: a no-op call never raises even with
+    # the synthetic flag set (topk_width == 0 -> (None, None)).
     tk, layout = cp_utils.compute_cp_indexer_topk(
-        q, w, k, cu, cc, 0, ratio, 8, 1.0, max_seqlen_q=rows, use_fused=True
+        q,
+        w,
+        k,
+        cu,
+        cc,
+        0,
+        ratio,
+        0,
+        1.0,
+        max_seqlen_q=rows,
+        use_fused=True,
+        prebuilt_layout=fake_layout,
+        synthetic_layout=True,
     )
-    assert tk is not None and tk.shape[0] == rows  # unfused fallback ran
+    assert tk is None and layout is None
 
 
 # WORKSPACE NOTE — the fused kernel package's cross-call defect, fully
@@ -518,9 +546,11 @@ def test_row_limit_guard_in_compute_cp_indexer_topk():
 #     the predecessor's shape were each varied and none is causal.
 #   * Discarded warmup/priming calls cannot help (a same-shape priming call is
 #     itself a predecessor — falsified in CI run 32712450771).
-# Production consequence: compute_cp_indexer_topk fails closed above the limit
-# (unfused fallback for reference layouts, raise for synthetic ones) and
-# prebuild bounds l_local at 2 * 32768. In shared-process CI lanes, other
+# Production consequence: the balanced synthetic-layout calls fail closed above
+# the limit (prebuild bounds l_local at 2 * 32768), balanced-internal
+# ordinary-layout calls take the unfused path, and pre-existing callers keep
+# their behavior with a once-per-process correctness warning (no rejection, no
+# silent rerouting). In shared-process CI lanes, other
 # suites' tiny fused calls run first (they don't observe the defect themselves:
 # they compare fused output against equally-degenerate references at sub-32
 # head counts, where the kernel silently returns all-zero scores), so the
