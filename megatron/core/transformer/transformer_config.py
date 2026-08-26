@@ -1838,9 +1838,18 @@ class TransformerConfig(ModelParallelConfig):
             assert all(
                 ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
             ), "csa_compress_ratios must be 0, 4, or 128"
-            assert (
-                self.tensor_model_parallel_size == 1
-            ), "DSv4 Hybrid Attention only supports TP size 1."
+            if self.tensor_model_parallel_size > 1:
+                assert self.sequence_parallel, (
+                    "DSv4 Hybrid Attention with TP>1 requires sequence_parallel=True."
+                )
+                assert self.num_attention_heads % self.tensor_model_parallel_size == 0, (
+                    "DSv4 Hybrid Attention requires num_attention_heads divisible by TP: "
+                    f"{self.num_attention_heads=} {self.tensor_model_parallel_size=}"
+                )
+                assert self.o_groups % self.tensor_model_parallel_size == 0, (
+                    "DSv4 Hybrid Attention requires o_groups divisible by TP: "
+                    f"{self.o_groups=} {self.tensor_model_parallel_size=}"
+                )
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
