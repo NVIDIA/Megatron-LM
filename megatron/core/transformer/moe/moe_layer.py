@@ -348,14 +348,22 @@ class MoELayer(BaseMoELayer):
             assert (
                 self.submodules.shared_experts is not None
             ), "Shared experts builder is not provided in the module spec."
-            shared_expert_config = prepare_megakernel_shared_expert_config(self.config)
-            with megakernel_shared_expert_init_context(self.config):
+            if self.config.moe_megakernel_backend is None:
                 self.shared_experts = self.submodules.shared_experts(
-                    config=shared_expert_config,
+                    config=self.config,
                     pg_collection=pg_collection,
                     gate=self.config.moe_shared_expert_gate,
                     name=(name + ".shared_experts") if name is not None else None,
                 )
+            else:
+                shared_expert_config = prepare_megakernel_shared_expert_config(self.config)
+                with megakernel_shared_expert_init_context(self.config):
+                    self.shared_experts = self.submodules.shared_experts(
+                        config=shared_expert_config,
+                        pg_collection=pg_collection,
+                        gate=self.config.moe_shared_expert_gate,
+                        name=(name + ".shared_experts") if name is not None else None,
+                    )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 

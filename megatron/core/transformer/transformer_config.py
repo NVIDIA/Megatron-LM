@@ -2106,6 +2106,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
             if self.moe_latent_size is not None:
                 raise ValueError("MOK does not support latent MoE")
+            if self.moe_layer_recompute or (
+                self.recompute_granularity == "selective"
+                and self.recompute_modules is not None
+                and "moe" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "MOK does not yet support whole-MoE activation recomputation; "
+                    "disable moe_layer_recompute and remove moe from recompute_modules"
+                )
             if not self.gated_linear_unit or self.activation_func != F.silu:
                 raise ValueError("MOK currently requires SwiGLU")
 
