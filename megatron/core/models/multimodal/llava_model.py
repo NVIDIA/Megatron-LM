@@ -155,29 +155,41 @@ class LLaVAModel(MegatronModule):
             "LLaVA is work in progress. Features are missing and methods can change.",
         )
 
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        language_model_type = getattr(language_transformer_config, "language_model_type", "")
+
+        # Constructor configuration and initial module state.
         self.pre_process = pre_process
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
         self.vp_stage = vp_stage
-        self._dynamic_resolution = dynamic_resolution
-        self.patch_dim = patch_dim
-        self._conv_merging = conv_merging
-
-        self.encoder_hidden_state = None
-        self.vision_model = None
-        self.vision_projection = None
-        self.language_model = None
-        self._vision_projection_input_size = None
-
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
-
-        language_model_type = getattr(language_transformer_config, "language_model_type", "")
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
         self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
         self.context_parallel_lm = language_transformer_config.context_parallel_size
+        self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
+        # Used by finalize_model_grads._allreduce_word_embedding_grads.
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+
+        # Audio/video/image attributes.
+        self.image_token_index = image_token_index
+        self.patch_dim = patch_dim
+        self._pixel_shuffle = pixel_shuffle
+        self._conv_merging = conv_merging
+        self._tile_tags = tile_tags
+        self._max_num_tiles = max_num_tiles
+        self.sound_token_index = sound_token_index
+        self.dynamic_resolution = dynamic_resolution
+        self.radio_force_eval_mode = radio_force_eval_mode
+        self.radio_force_cpe_eval_mode = radio_force_cpe_eval_mode
+        self.radio_interpolate_only_cpe = radio_interpolate_only_cpe
+        self.radio_cpe_aspect_ratio_select = radio_cpe_aspect_ratio_select
+        self.radio_disable_cpe = radio_disable_cpe
+        self.temporal_patch_dim = temporal_patch_dim
+        self.separate_video_embedder = separate_video_embedder
+        self.temporal_ckpt_compat = temporal_ckpt_compat
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
             if not (
                 language_model_type.startswith('nemotron5-hybrid')
@@ -206,12 +218,10 @@ class LLaVAModel(MegatronModule):
                 ), "Context Parallelism in LLaVA requires TE v1.10 or higher"
             else:
                 self.cp_group = None
-        self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
 
-        # This attribute is needed to check if an all-reduce is required
-        # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
-        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-
+        self.language_model = None
+        self.sound_model = sound_model
+        self.sound_projection = sound_projection
         if self.add_decoder:
             if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
                 from megatron.core.models.huggingface.module import build_hf_model
@@ -273,6 +283,9 @@ class LLaVAModel(MegatronModule):
         # Save the constructor arg before local reassignment shadows it.
         _class_token_len_override = class_token_len
         class_token_len = 1
+        self.vision_model = None
+        self.vision_projection = None
+        self._vision_projection_input_size = None
         if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
             add_class_token = True
@@ -493,6 +506,7 @@ class LLaVAModel(MegatronModule):
                 _load_state_dict_hook_ignore_extra_state
             )
 
+        # Finalize derived image attributes after resolving the vision backbone.
         self.img_seq_len = get_num_image_embeddings(
             img_h,
             img_w,
@@ -506,20 +520,8 @@ class LLaVAModel(MegatronModule):
             tokenizer_type,
         )
 
-        self.image_token_index = image_token_index
-        self._pixel_shuffle = pixel_shuffle
-        self._tile_tags = tile_tags
-        self._max_num_tiles = max_num_tiles
-        self.patch_dim = patch_dim
         self._class_token_len = class_token_len
-
-        # Audio/video attributes.
-        self.sound_model = sound_model
-        self.sound_projection = sound_projection
-        self.sound_token_index = sound_token_index
-        self.temporal_patch_dim = temporal_patch_dim
-        self.separate_video_embedder = separate_video_embedder
-        self.temporal_ckpt_compat = temporal_ckpt_compat
+        self.encoder_hidden_state = None
 
     @property
     def decoder(self):
@@ -681,10 +683,14 @@ class LLaVAModel(MegatronModule):
             return language_embeddings, labels, loss_mask, input_ids, position_ids
 
         # Temporal media count index for the number of frame/tubelet embeddings only per "video".
+        if num_image_tiles is None:
+            num_image_tiles = torch.empty((0,), dtype=torch.int32, device=input_ids.device)
         if media_token_counts is not None:
             media_token_counts = media_token_counts.to(device=input_ids.device)
         media_counts = media_token_counts if media_token_counts is not None else num_image_tiles
-        if media_counts.numel() == 0:
+        has_sound_embeddings = sound_embeddings is not None and sound_embeddings.numel() > 0
+        if media_counts.numel() == 0 and not has_sound_embeddings:
+            # No multimodal embeddings. Just return the text embeddings early.
             final_embedding = None
             if self.pre_process:
                 final_embedding = language_embeddings
@@ -697,7 +703,7 @@ class LLaVAModel(MegatronModule):
             return final_embedding, labels, loss_mask, input_ids, position_ids
 
         img_seq_len = self.img_seq_len
-        if self._dynamic_resolution and imgs_sizes is not None and media_token_counts is None:
+        if self.dynamic_resolution and imgs_sizes is not None and media_token_counts is None:
             # Per-tile token counts for dynamic resolution.
             img_seq_len = torch.prod(imgs_sizes // self.patch_dim, dim=-1, dtype=torch.int32) + (
                 0 if self._drop_vision_class_token else self.vision_model.class_token_len
@@ -747,7 +753,7 @@ class LLaVAModel(MegatronModule):
                     [counts.sum() for counts in media_token_counts_batch]
                 )
                 seq_lens = media_tokens_per_batch - num_images_per_sample + text_seq_len
-            elif self._dynamic_resolution and imgs_sizes is not None:
+            elif self.dynamic_resolution and imgs_sizes is not None:
                 packed_length_per_batch = torch.sum(img_seq_len, dim=-1)
                 seq_lens = packed_length_per_batch - num_images_per_sample + text_seq_len
             else:
@@ -777,7 +783,7 @@ class LLaVAModel(MegatronModule):
             # -1 is for the removed image token index.
             if media_token_counts is not None:
                 image_token_mask_lens[image_token_mask] = media_token_counts - 1
-            elif self._dynamic_resolution and imgs_sizes is not None:
+            elif self.dynamic_resolution and imgs_sizes is not None:
                 image_token_mask_lens[image_token_mask] = img_seq_len - 1
             else:
                 image_token_mask_lens[image_token_mask] = num_image_tiles * img_seq_len - 1
@@ -860,12 +866,45 @@ class LLaVAModel(MegatronModule):
             # NOTE: DDP/FSDP can hang with text-only samples because vision projection
             # params have no gradient path. Workaround: add a zero-contribution from
             # image_embeddings so they participate in the backward graph.
-            if media_counts.shape[0] == 0 and image_embeddings.shape[0] > 0:
-                final_embedding[:1, :1, :1] += 0 * image_embeddings[:1, :1, :1]
+            if media_counts.shape[0] == 0:
+                if image_embeddings is not None and image_embeddings.numel() > 0:
+                    final_embedding[:1, :1, :1] += 0 * image_embeddings[:1, :1, :1]
             else:
                 final_embedding[images_mask] = (
                     image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
                 )
+
+            # Replace sound-token positions after image expansion has established
+            # their positions in the combined sequence.
+            if sound_embeddings is not None:
+                sound_mask = input_ids == self.sound_token_index
+                if sound_mask.any():
+                    sound_batch_indices, sound_token_indices = torch.where(sound_mask)
+                    sound_new_position_ids = new_position_ids[
+                        sound_batch_indices, sound_token_indices
+                    ]
+                    if self.sound_model is not None and getattr(
+                        getattr(self.sound_model, "config", None),
+                        "sound_pad_to_clip_duration",
+                        False,
+                    ):
+                        flat_sound = sound_embeddings.permute(1, 0, 2).reshape(-1, embed_dim)
+                    else:
+                        flat_sound = torch.cat(
+                            [
+                                embeddings[:length]
+                                for embeddings, length in zip(
+                                    sound_embeddings.permute(1, 0, 2), sound_embeddings_len
+                                )
+                            ],
+                            dim=0,
+                        )
+                    final_embedding[sound_batch_indices, sound_new_position_ids] = (
+                        flat_sound.reshape(-1, embed_dim)
+                    )
+                    # Keep model-internal sound sentinels out of downstream token consumers
+                    # (for example MTP); decoder_input carries the actual sound embeddings.
+                    final_input_ids[sound_batch_indices, sound_new_position_ids] = 0
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -1118,8 +1157,7 @@ class LLaVAModel(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         imgs_sizes: Optional[torch.Tensor] = None,
         vision_packed_seq_params: Optional[PackedSeqParams] = None,
-        # Audio remains unsupported by this implementation. Video uses RADIO's
-        # temporal tubelet path when temporal_patch_dim > 1.
+        # Audio and video inputs.
         sound_clips: Optional[torch.Tensor] = None,
         sound_length: Optional[torch.Tensor] = None,
         sound_timestamps: Optional[torch.Tensor] = None,
@@ -1158,20 +1196,13 @@ class LLaVAModel(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        if (
-            sound_clips is not None
-            or sound_length is not None
-            or sound_timestamps is not None
-            or num_sound_clips is not None
-        ):
-            raise NotImplementedError(
-                "LLaVAModel.forward: audio (sound_*) inputs are not supported."
-            )
-
         use_inference_kv_cache = (
             inference_context is not None
             and hasattr(inference_context, 'key_value_memory_dict')
-            and "image_tokens_count" in inference_context.key_value_memory_dict
+            and (
+                "image_tokens_count" in inference_context.key_value_memory_dict
+                or "sound_tokens_count" in inference_context.key_value_memory_dict
+            )
         )
         has_images = images is not None and images.shape[0] > 0
         media_token_counts = None
@@ -1418,6 +1449,36 @@ class LLaVAModel(MegatronModule):
         else:
             image_embeddings = self.encoder_hidden_state
 
+        # The data path uses a [1, 1] zero tensor as a no-sound sentinel.
+        has_sounds = sound_clips is not None and sound_clips.numel() > 0
+        if has_sounds and sound_clips.shape == torch.Size([1, 1]):
+            has_sounds = sound_clips[0, 0].item() != 0
+
+        if use_inference_kv_cache:
+            sound_embeddings = None
+            sound_embeddings_len = None
+        elif self.add_encoder and not has_sounds:
+            device = sound_clips.device if sound_clips is not None else input_ids.device
+            dtype = sound_clips.dtype if sound_clips is not None else torch.float32
+            sound_embeddings = torch.empty((0, 0, 0), dtype=dtype, device=device)
+            sound_embeddings_len = torch.empty((0,), dtype=torch.long, device=device)
+        elif self.add_encoder and has_sounds:
+            if self.sound_model is None or self.sound_projection is None:
+                raise ValueError("Sound inputs require both sound_model and sound_projection.")
+            sound_embeddings, sound_embeddings_len = self.sound_model(sound_clips, sound_length)
+            sound_embeddings = sound_embeddings.permute(1, 0, 2).contiguous()
+            sound_embeddings = self.sound_projection(sound_embeddings).contiguous()
+
+            if inference_context is not None and hasattr(
+                inference_context, 'key_value_memory_dict'
+            ):
+                inference_context.key_value_memory_dict["sound_tokens_count"] = (
+                    sound_embeddings.shape[1]
+                )
+        else:
+            sound_embeddings = self.encoder_hidden_state
+            sound_embeddings_len = None
+
         if not self.add_decoder:
             return image_embeddings, loss_mask
 
@@ -1425,6 +1486,7 @@ class LLaVAModel(MegatronModule):
         if self.pre_process:
             input_ids_text = input_ids.clone()
             input_ids_text[input_ids_text == self.image_token_index] = 0
+            input_ids_text[input_ids_text == self.sound_token_index] = 0
             # Note: This adds absolute position embedding but not RoPE.
             # Each image is counted as one position.
             # RoPE is added in language_model forward. Each image embedding is one position.
@@ -1462,6 +1524,9 @@ class LLaVAModel(MegatronModule):
             num_image_tiles,
             imgs_sizes=imgs_sizes,
             position_ids=position_ids,
+            sound_embeddings=sound_embeddings,
+            sound_embeddings_len=sound_embeddings_len,
+            sound_timestamps=sound_timestamps,
             media_token_counts=media_token_counts,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 

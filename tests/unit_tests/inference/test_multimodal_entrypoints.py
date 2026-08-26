@@ -86,7 +86,6 @@ def _build_toy_wrapper(wrapper_cls):
     model = SimpleNamespace(
         image_token_index=-200,
         dynamic_resolution=True,
-        _dynamic_resolution=True,
         patch_dim=2,
         _pixel_shuffle=False,
         _conv_merging=False,

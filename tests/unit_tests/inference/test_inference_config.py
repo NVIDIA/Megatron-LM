@@ -9,9 +9,13 @@ import torch
 
 from megatron.core.inference.config import (
     AsyncScheduleMode,
+    ImageProcessingConfig,
     InferenceConfig,
     MambaInferenceStateConfig,
     MediaCacheCoordinatorPolicy,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
+    VideoProcessingConfig,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
@@ -105,6 +109,32 @@ class TestInferenceConfig:
         assert (
             InferenceConfig().media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
         )
+
+    def test_multimodal_prompt_config_builds_independent_specs_from_dict(self):
+        config = MultimodalPromptConfig.from_dict(
+            {
+                "image_spec": {"model_token": "<image>", "prefix": "<img>"},
+                "video_spec": {"model_token": "<video>", "suffix": "</video>"},
+            }
+        )
+
+        assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
+        assert config.get_spec("video") == MediaPromptSpec(model_token="<video>", suffix="</video>")
+        with pytest.raises(ValueError, match="Unsupported media modality"):
+            config.get_spec("audio")
+
+    def test_video_processing_config_preserves_image_contract_and_defaults(self):
+        image_config = ImageProcessingConfig(
+            patch_dim=14, dynamic_resolution=True, pixel_shuffle=True
+        )
+
+        video_config = VideoProcessingConfig(image_config=image_config)
+
+        assert video_config.image_config is image_config
+        assert video_config.num_frames == 8
+        assert video_config.temporal_patch_size == 1
+        assert video_config.video_maintain_aspect_ratio is True
+        assert video_config.frame_manifest_magic is None
 
     def test_async_sched_argparse_plumbing(self):
         """Ensure the CLI exposes async scheduling mode."""

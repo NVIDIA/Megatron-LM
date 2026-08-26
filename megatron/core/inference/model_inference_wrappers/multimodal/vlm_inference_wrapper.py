@@ -180,19 +180,17 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         img_embeddings_per_tile = 0  # set below in the static-resolution branch
 
         # Reject dynamic-resolution requests when the model does not expose
-        # the required attributes. Upstream LLaVAModel sets neither
-        # _dynamic_resolution nor patch_dim / _class_token_len; without those,
-        # falling through to the static path would silently miscount tokens.
-        if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
+        # the required attributes; falling through to the static path would
+        # silently miscount tokens.
+        if imgs_sizes is not None and not getattr(module, 'dynamic_resolution', False):
             raise NotImplementedError(
                 "Dynamic-resolution image expansion requires LLaVAModel "
-                "attributes (_dynamic_resolution, patch_dim, _class_token_len) "
-                "not yet available upstream. Use num_tiles (static resolution) "
-                "or wait for the companion LLaVAModel changes."
+                "with dynamic_resolution enabled and patch_dim/_class_token_len "
+                "available. Use num_tiles for static-resolution inputs."
             )
 
         # Compute per-image embedding counts
-        if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
+        if imgs_sizes is not None and getattr(module, 'dynamic_resolution', False):
             frame_embedding_counts = dynamic_media_embedding_counts(
                 imgs_sizes,
                 module.patch_dim,
@@ -329,20 +327,22 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         from megatron.core.packed_seq_params import PackedSeqParams
 
         module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        target_dtype = module.vision_model.config.params_dtype
+        if images.dtype != target_dtype:
+            images = images.to(dtype=target_dtype)
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes (see expand_image_tokens for context).
-        if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
+        if imgs_sizes is not None and not getattr(module, 'dynamic_resolution', False):
             raise NotImplementedError(
-                "Dynamic-resolution vision-encoder forward requires "
-                "LLaVAModel._dynamic_resolution/patch_dim, not yet available "
-                "upstream. Use num_tiles (static resolution) or wait for the "
-                "companion LLaVAModel changes."
+                "Dynamic-resolution vision-encoder forward requires LLaVAModel "
+                "with dynamic_resolution enabled and patch_dim available. "
+                "Use num_tiles for static-resolution inputs."
             )
 
         # Build vision_packed_seq_params for dynamic resolution
         vision_packed_seq_params = None
-        if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
+        if imgs_sizes is not None and getattr(module, 'dynamic_resolution', False):
             patch_dim = module.patch_dim
             seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
             cu_seqlens = torch.cat(
@@ -363,11 +363,12 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         old_add_decoder = module.add_decoder
         module.add_decoder = False
         media_kind = "video" if num_frames is not None else "image"
+        empty_input_ids = torch.empty((1, 0), dtype=torch.long, device=images.device)
         try:
             with torch.cuda.nvtx.range(f"megatron.multimodal.{media_kind}_encoder"):
                 output = self.model(
                     images,
-                    [],
+                    empty_input_ids,
                     position_ids=None,
                     attention_mask=None,
                     inference_context=self.inference_context,

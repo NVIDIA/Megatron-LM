@@ -104,6 +104,45 @@ def test_vlm_dynamic_forward_sanitizes_preexpanded_media_sentinel():
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("is_video", [False, True])
+def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
+    module = SimpleNamespace(
+        image_token_index=-200,
+        vision_model=SimpleNamespace(config=SimpleNamespace(params_dtype=torch.bfloat16)),
+        dynamic_resolution=False,
+        add_decoder=True,
+    )
+
+    class WrappedVisionModel:
+        def __init__(self):
+            self.module = module
+            self.call_args = None
+
+        def __call__(self, *args, **kwargs):
+            self.call_args = (args, kwargs)
+            return torch.zeros(2, 1, 4, dtype=torch.bfloat16), None
+
+    model = WrappedVisionModel()
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = model
+    wrapper.inference_context = None
+
+    output = wrapper._forward_vision_encoder(
+        torch.ones(1, 3, 2, 2, dtype=torch.float32),
+        num_image_tiles=torch.tensor([1]),
+        num_frames=torch.tensor([1]) if is_video else None,
+    )
+
+    args, _ = model.call_args
+    assert args[0].dtype == torch.bfloat16
+    assert isinstance(args[1], torch.Tensor)
+    assert args[1].shape == (1, 0)
+    assert args[1].device == args[0].device
+    assert module.add_decoder is True
+    assert output.dtype == torch.bfloat16
+
+
+@pytest.mark.internal
 def test_dynamic_video_embedding_counts_group_one_placeholder_per_video():
     frame_counts = dynamic_media_embedding_counts(
         torch.tensor([[448, 576]] * 4), patch_dim=16, pixel_shuffle=True
@@ -129,7 +168,7 @@ def test_vlm_wrapper_expands_one_video_marker_to_all_tubelet_embeddings():
     wrapper.model = SimpleNamespace()
     wrapper.model.module = SimpleNamespace(
         image_token_index=-200,
-        _dynamic_resolution=True,
+        dynamic_resolution=True,
         patch_dim=16,
         _pixel_shuffle=True,
         _conv_merging=False,
@@ -156,7 +195,7 @@ def test_vlm_wrapper_rejects_multiple_compact_markers_for_one_video():
     wrapper.model = SimpleNamespace()
     wrapper.model.module = SimpleNamespace(
         image_token_index=-200,
-        _dynamic_resolution=True,
+        dynamic_resolution=True,
         patch_dim=16,
         _pixel_shuffle=True,
         _conv_merging=False,
@@ -177,7 +216,6 @@ def test_vlm_wrapper_rejects_multiple_compact_markers_for_one_video():
 def test_vlm_and_omni_wrappers_expand_video_markers_consistently():
     model = SimpleNamespace(
         image_token_index=-200,
-        _dynamic_resolution=True,
         dynamic_resolution=True,
         patch_dim=16,
         _pixel_shuffle=True,
