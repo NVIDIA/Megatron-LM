@@ -106,17 +106,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             raise ValueError(
                 "MFSDP v2 does not currently support layer-wise distributed optimizer."
             )
-        if config.clip_grad > 0.0:
-            # The shared gradient-norm path unwraps MFSDP v2's DTensor gradients and sums
-            # the local shards over the grad-stats group, with no notion of the layout they
-            # carry. That is wrong wherever a mesh axis is replicated -- HSDP's outer axis
-            # most obviously, which would inflate the norm by the outer-DP size -- so
-            # clipping stays unsupported until the norm is computed from the placements.
-            raise ValueError(
-                "MFSDP v2 does not currently support gradient clipping; the norm has to be "
-                "computed from the gradients' DTensor placements first "
-                "(https://github.com/NVIDIA/Megatron-LM/pull/6489). Set clip_grad=0.0."
-            )
 
     @override
     def state_dict(self):

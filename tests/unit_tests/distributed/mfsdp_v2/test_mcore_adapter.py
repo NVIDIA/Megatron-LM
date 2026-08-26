@@ -596,12 +596,11 @@ class TestMcoreAdapterHybrid:
 
     @staticmethod
     def _train(config, instances, outer_strategy, steps=3):
-        """Build a model over `instances` DP instances and return its per-step losses."""
-        # Each call needs its own DP topology, and initialize_model_parallel cannot
-        # run twice, so clear whatever a previous call left. teardown_method covers
-        # the final one.
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=instances)
+        """Train over the already-initialized DP topology and return per-step losses.
+
+        ``instances`` must match what initialize_model_parallel was given: it selects the
+        adapter's mesh, while the process groups it maps onto come from the caller.
+        """
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model_parallel_cuda_manual_seed(1234)
         model = FullyShardedDataParallel(
@@ -685,7 +684,13 @@ class TestMcoreAdapterHybrid:
     def test_hybrid_matches_single_instance(self, outer_strategy):
         """Splitting the DP domain must not change the math: same losses as one instance."""
         config = self._config()
+        # The instance count is fixed by initialize_model_parallel, so comparing two
+        # topologies means initializing twice. teardown_method destroys the second.
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
         reference = self._train(config, instances=1, outer_strategy="no_shard")
+        Utils.destroy_model_parallel()
+
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
         hybrid = self._train(config, instances=2, outer_strategy=outer_strategy)
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
