@@ -107,6 +107,32 @@ def test_load_args_restores_quantile_balancing_from_checkpoint():
     assert restored_args.moe_router_qb_num_bins == 257
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_args", "expected_mode"),
+    [
+        (SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "bool"),
+        (SimpleNamespace(), "indices"),
+    ],
+)
+def test_load_args_restores_hybridep_routing_map_mode(checkpoint_args, expected_mode):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_hybridep_routing_map_mode="indices",
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_hybridep_routing_map_mode == expected_mode
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
