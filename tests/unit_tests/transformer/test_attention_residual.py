@@ -301,7 +301,10 @@ class TestAttnResInitEquivalence:
             hidden_dropout=0.0,
             attention_dropout=0.0,
             add_bias_linear=False,
-            normalization="RMSNorm",
+            # LayerNorm (not RMSNorm): apex's FusedLayerNorm — selected by the
+            # local spec when apex is present — rejects RMSNorm, and LayerNorm
+            # is equally scale-invariant so the equivalence oracle is unchanged.
+            normalization="LayerNorm",
             layernorm_epsilon=1e-12,
             init_method_std=0.2,
             pipeline_dtype=torch.float32,
