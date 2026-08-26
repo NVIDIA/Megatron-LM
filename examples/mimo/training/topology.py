@@ -121,8 +121,8 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
 def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
     """Create a dense grid plus its expert view and the process groups MIMO needs."""
     grid = HyperCommGrid(
-        shape=[spec.tp, spec.gtp_remat, spec.cp, spec.dp, spec.pp],
-        dim_names=["tp", "gtp_remat", "cp", "dp", "pp"],
+        shape=[spec.tp, spec.cp, spec.gtp_remat, spec.dp, spec.pp],
+        dim_names=["tp", "cp", "gtp_remat", "dp", "pp"],
         rank_offset=spec.rank_offset,
         backend="nccl",
     )
@@ -142,12 +142,12 @@ def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
             ["pp"],
             ["dp"],
             ["dp", "cp"],
-            ["gtp_remat", "dp", "cp"],
+            ["cp", "gtp_remat", "dp"],
             ["tp", "cp"],
             ["tp", "gtp_remat", "pp"],
             ["tp", "gtp_remat", "dp"],
-            ["tp", "gtp_remat", "dp", "cp"],
-            ["tp", "gtp_remat", "cp", "dp", "pp"],
+            ["tp", "cp", "gtp_remat", "dp"],
+            ["tp", "cp", "gtp_remat", "dp", "pp"],
         ):
             grid.create_pg(dims)
         for dims in (
@@ -214,14 +214,14 @@ def pg_collection_from_grid(
     pgc.pp = grid.get_pg("pp")
     pgc.dp = grid.get_pg("dp")
     pgc.dp_cp = grid.get_pg(["dp", "cp"])
-    pgc.dp_cp_gtp_remat = grid.get_pg(["gtp_remat", "dp", "cp"])
+    pgc.dp_cp_gtp_remat = grid.get_pg(["cp", "gtp_remat", "dp"])
     pgc.intra_dp_cp = pgc.dp_cp
     pgc.gtp_remat = grid.get_pg("gtp_remat")
     pgc.tp_cp = grid.get_pg(["tp", "cp"])
     pgc.tp_dp = grid.get_pg(["tp", "gtp_remat", "dp"])
-    pgc.tp_dp_cp = grid.get_pg(["tp", "gtp_remat", "dp", "cp"])
+    pgc.tp_dp_cp = grid.get_pg(["tp", "cp", "gtp_remat", "dp"])
     pgc.mp = grid.get_pg(["tp", "gtp_remat", "pp"])
-    pgc.intra_dist_opt = grid.get_pg(["tp", "gtp_remat", "cp", "dp", "pp"])
+    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "gtp_remat", "dp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
     pgc.expt_gtp_remat = grid.get_pg("expt_gtp_remat", view=_EXPERT_VIEW)
