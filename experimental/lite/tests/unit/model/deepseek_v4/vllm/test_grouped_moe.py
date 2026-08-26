@@ -209,9 +209,9 @@ def test_visible_experts_forward_preserves_model_clamp(monkeypatch) -> None:
 
     hidden = torch.randn(2, 4)
     counts = torch.tensor([2], dtype=torch.int32)
-    assert experts(hidden, counts) is hidden
+    assert experts(hidden, counts, tokens_per_expert_list=[2]) is hidden
     assert len(calls) == 1
-    assert calls[0][0] is counts
+    assert calls[0][0] == (2,)
     assert calls[0][1] == 10.0
 
 
