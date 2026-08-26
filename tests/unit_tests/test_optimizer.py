@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -27,7 +28,11 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
+from megatron.core.optimizer.optimizer import (
+    MegatronOptimizer,
+    copy_optimizer_param_metadata,
+    get_param_group_identifier_tuple,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -147,6 +152,7 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
         'wd_mult',
         'lr_mult',
         'is_decoupled_lr',
+        'is_dsa_indexer',
         'max_lr',
         'min_lr',
     }
@@ -156,8 +162,285 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
     assert pg0['wd_mult'] == 1.0
     assert pg0['lr_mult'] == 1.0
     assert pg0['is_decoupled_lr'] == False
+    assert pg0['is_dsa_indexer'] == False
     assert pg0['max_lr'] == 0.01  # from the optimizer config default for lr
     assert pg0['min_lr'] is None  # from the optimizer config default.
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
+)
+def test_get_param_groups_separates_only_exact_dsa_indexer_submodules(mock_get_world_size):
+    class ModelWithIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Linear(4, 4)
+            self.block = nn.Module()
+            self.block.indexer = nn.Linear(4, 3)
+            self.indexer_aux = nn.Linear(4, 2)
+            self.not_an_indexer = nn.Linear(4, 2)
+
+    model = ModelWithIndexer()
+    groups = _get_param_groups(
+        [model], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides={}
+    )
+    assert len(groups) == 2
+
+    names_by_id = {id(param): name for name, param in model.named_parameters()}
+    indexer_names = {
+        names_by_id[id(param)]
+        for group in groups
+        if group['is_dsa_indexer']
+        for param in group['params']
+    }
+    non_indexer_names = {
+        names_by_id[id(param)]
+        for group in groups
+        if not group['is_dsa_indexer']
+        for param in group['params']
+    }
+
+    assert indexer_names == {'block.indexer.weight', 'block.indexer.bias'}
+    assert 'indexer_aux.weight' in non_indexer_names
+    assert 'not_an_indexer.weight' in non_indexer_names
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
+)
+def test_get_param_groups_excludes_frozen_dsa_indexer(mock_get_world_size):
+    class ModelWithIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Linear(4, 4)
+            self.indexer = nn.Linear(4, 3)
+
+    model = ModelWithIndexer()
+    for param in model.indexer.parameters():
+        param.requires_grad_(False)
+
+    groups = _get_param_groups(
+        [model], OptimizerConfig(optimizer='adam', lr=0.01), config_overrides={}
+    )
+
+    assert all(not group['is_dsa_indexer'] for group in groups)
+    grouped_params = {param for group in groups for param in group['params']}
+    assert grouped_params == set(model.backbone.parameters())
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
+)
+def test_dsa_indexer_flag_is_preserved_across_weight_decay_groups(mock_get_world_size):
+    class ModelWithIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Linear(4, 4)
+            self.indexer = nn.Sequential(nn.Linear(4, 3), nn.LayerNorm(3))
+
+    model = ModelWithIndexer()
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    groups = _get_param_groups([model], config, get_standard_config_overrides(config))
+    indexer_groups = [group for group in groups if group['is_dsa_indexer']]
+
+    assert {group['wd_mult'] for group in indexer_groups} == {0.0, 1.0}
+    indexer_params = {param for group in indexer_groups for param in group['params']}
+    assert indexer_params == {
+        param for name, param in model.named_parameters() if name.startswith('indexer.')
+    }
+
+
+def test_separate_dsa_clipping_uses_independent_norms_and_thresholds(monkeypatch):
+    import megatron.core.optimizer.optimizer as optimizer_module
+
+    main_param = torch.nn.Parameter(torch.ones(2))
+    indexer_param = torch.nn.Parameter(torch.ones(3))
+    calls = []
+    monkeypatch.setattr(
+        optimizer_module,
+        'clip_grad_by_total_norm_fp32',
+        lambda params, max_norm, total_norm, use_decoupled_grad: calls.append(
+            (list(params), max_norm, total_norm, use_decoupled_grad)
+        ),
+    )
+    optimizer = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'get_dsa_split_parameters': lambda self: ([indexer_param], [main_param]),
+            'get_dsa_split_grad_norms': lambda self: (4.0, 2.0),
+            'config': type(
+                '_Config',
+                (),
+                {
+                    'dsa_indexer_clip_grad': 0.5,
+                    'use_precision_aware_optimizer_no_fp8_or_ds_fp8': False,
+                },
+            )(),
+            '_last_dsa_split_grad_norms': None,
+        },
+    )()
+
+    combined_norm = MegatronOptimizer.clip_grad_norm_separate_dsa_indexer(optimizer, clip_grad=1.0)
+
+    assert combined_norm == pytest.approx((4.0**2 + 2.0**2) ** 0.5)
+    assert optimizer._last_dsa_split_grad_norms == (4.0, 2.0)
+    assert len(calls) == 2
+    assert calls[0][0][0] is main_param
+    assert calls[0][1:] == (1.0, 2.0, False)
+    assert calls[1][0][0] is indexer_param
+    assert calls[1][1:] == (0.5, 4.0, False)
+
+
+def test_dsa_split_parameters_follow_param_group_metadata():
+    main_param = torch.nn.Parameter(torch.ones(2))
+    indexer_weight = torch.nn.Parameter(torch.ones(3))
+    indexer_bias = torch.nn.Parameter(torch.ones(1))
+    harness = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'optimizer': type(
+                '_TorchOptimizer',
+                (),
+                {
+                    'param_groups': [
+                        {'params': [main_param], 'is_dsa_indexer': False},
+                        {'params': [indexer_weight], 'is_dsa_indexer': True, 'wd_mult': 1.0},
+                        {'params': [indexer_bias], 'is_dsa_indexer': True, 'wd_mult': 0.0},
+                    ]
+                },
+            )()
+        },
+    )()
+
+    indexer_params, non_indexer_params = MegatronOptimizer.get_dsa_split_parameters(harness)
+    assert indexer_params == [indexer_weight, indexer_bias]
+    assert non_indexer_params == [main_param]
+
+
+def test_global_clipping_path_records_preclip_dsa_split_norms_for_logging():
+    harness = type(
+        '_OptimizerHarness',
+        (),
+        {
+            'optimizer': type(
+                '_TorchOptimizer', (), {'param_groups': [{'params': [], 'is_dsa_indexer': True}]}
+            )(),
+            'get_dsa_split_grad_norms': lambda self: (3.0, 4.0),
+            '_last_dsa_split_grad_norms': None,
+        },
+    )()
+
+    MegatronOptimizer._maybe_store_dsa_split_grad_norms(harness)
+    assert harness._last_dsa_split_grad_norms == (3.0, 4.0)
+
+
+def test_old_optimizer_param_group_metadata_defaults_to_non_indexer():
+    old_group = {
+        'wd_mult': 1.0,
+        'lr_mult': 1.0,
+        'is_expert_parallel': False,
+        'is_decoupled_lr': False,
+    }
+    new_non_indexer_group = {**old_group, 'is_dsa_indexer': False}
+    new_indexer_group = {**old_group, 'is_dsa_indexer': True}
+
+    assert get_param_group_identifier_tuple(old_group) == get_param_group_identifier_tuple(
+        new_non_indexer_group
+    )
+    assert get_param_group_identifier_tuple(old_group) != get_param_group_identifier_tuple(
+        new_indexer_group
+    )
+
+
+def test_sharded_optimizer_steps_round_trip_per_dsa_bucket():
+    state_dict = {
+        'state': {
+            0: {'step': torch.tensor(123.0), 'exp_avg': torch.ones(2)},
+            1: {'step': torch.tensor(0.0), 'exp_avg': torch.ones(3)},
+            2: {'step': torch.tensor(0.0), 'exp_avg': torch.ones(1)},
+        },
+        'param_groups': [
+            {'params': [0], 'is_dsa_indexer': False},
+            {'params': [1], 'is_dsa_indexer': True, 'wd_mult': 1.0},
+            {'params': [2], 'is_dsa_indexer': True, 'wd_mult': 0.0},
+        ],
+    }
+
+    MegatronOptimizer._move_per_param_steps_to_param_groups(state_dict)
+    assert state_dict['param_groups'][0]['step'].item() == 123.0
+    assert state_dict['param_groups'][1]['step'].item() == 0.0
+    assert state_dict['param_groups'][2]['step'].item() == 0.0
+
+    for param_state in state_dict['state'].values():
+        param_state.pop('step')
+    MegatronOptimizer._restore_param_group_steps(state_dict)
+
+    assert state_dict['state'][0]['step'].item() == 123.0
+    assert state_dict['state'][1]['step'].item() == 0.0
+    assert state_dict['state'][2]['step'].item() == 0.0
+
+
+def test_chained_optimizer_synchronizes_backbone_and_indexer_steps_independently():
+    child_a = SimpleNamespace(
+        optimizer=SimpleNamespace(
+            param_groups=[
+                {'params': [object()], 'is_dsa_indexer': False, 'step': 123},
+                {'params': [object()], 'is_dsa_indexer': True, 'step': 0},
+                {'params': [], 'is_dsa_indexer': True, 'step': 99},
+            ]
+        )
+    )
+    child_b = SimpleNamespace(
+        optimizer=SimpleNamespace(
+            param_groups=[
+                {'params': [object()], 'is_dsa_indexer': False, 'step': 123},
+                {'params': [object()], 'is_dsa_indexer': True, 'step': 0},
+                {'params': [], 'is_dsa_indexer': True},
+            ]
+        )
+    )
+    harness = SimpleNamespace(chained_optimizers=[child_a, child_b])
+
+    steps = ChainedOptimizer._synchronize_steps(harness)
+
+    assert steps == {False: 123, True: 0}
+    for child in harness.chained_optimizers:
+        assert child.optimizer.param_groups[0]['step'] == 123
+        assert child.optimizer.param_groups[1]['step'] == 0
+        assert child.optimizer.param_groups[2]['step'] == 0
+
+
+def test_distributed_fused_adam_state_dict_preserves_indexer_clock(monkeypatch):
+    import megatron.core.optimizer.distrib_optimizer as distrib_optimizer_module
+
+    monkeypatch.setattr(distrib_optimizer_module, 'HAVE_APEX_OR_TE', True)
+    monkeypatch.setattr(distrib_optimizer_module, 'USING_TE_OPTIMIZER', True)
+    monkeypatch.setattr(distrib_optimizer_module, 'USING_APEX_OPTIMIZER', False)
+    inner_state_dict = {
+        'state': {},
+        'param_groups': [
+            {'params': [0], 'is_dsa_indexer': False, 'step': 123},
+            {'params': [1], 'is_dsa_indexer': True, 'step': 0},
+            {'params': [], 'is_dsa_indexer': True, 'step': 99},
+        ],
+    }
+    harness = SimpleNamespace(
+        optimizer=SimpleNamespace(state_dict=lambda: inner_state_dict), grad_scaler=None
+    )
+
+    state_dict = DistributedOptimizer.state_dict(harness)
+
+    assert state_dict['optimizer']['param_groups'][0]['step'] == 123
+    assert state_dict['optimizer']['param_groups'][1]['step'] == 0
+    assert state_dict['optimizer']['param_groups'][2]['step'] == 0
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
@@ -1208,8 +1491,14 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     Test that get_megatron_optimizer works correctly with custom process groups
     provided via pg_collection parameters.
     """
-    # Skip if world size doesn't match available GPUs
-    actual_world_size = torch.cuda.device_count()
+    # Process-group world size, not visible device count, determines whether
+    # the requested TP/CP/DP mesh can be constructed. A single pytest process
+    # may legitimately see every GPU on the node.
+    actual_world_size = (
+        torch.distributed.get_world_size()
+        if torch.distributed.is_initialized()
+        else Utils.world_size
+    )
     if actual_world_size != world_size:
         pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
