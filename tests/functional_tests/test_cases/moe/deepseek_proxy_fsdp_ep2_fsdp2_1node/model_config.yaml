@@ -1,6 +1,7 @@
 # DeepSeek-style proxy: 2 layers — first dense, second MoE with expert parallelism 4.
 # Used for functional testing of dense+MoE hybrid and EP.
 ENV_VARS:
+  N_REPEAT: 2
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
