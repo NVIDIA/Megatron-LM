@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from dataclasses import dataclass
 
@@ -16,6 +17,7 @@ from .utils import (
     TensorReshardSpec,
     TransferOp,
     _build_layer_module_prefix_map,
+    _get_rank_in_group,
     extract_param_metadata,
     named_refit_tensors,
     select_src_metadata_balanced,
@@ -304,15 +306,11 @@ def _finalize_dp_transfers(
 
 def _determine_source_ranks_for_dst_param(
     param_name: str,
-    src_meta_list: list[ParameterMetadata],
     src_metadata: ParameterMetadata,
     dst_metadata: ParameterMetadata,
     my_global_rank: int,
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
     """Route to dimension-specific planner based on parameter sharding type."""
-
-    if src_metadata.is_gtp or dst_metadata.is_gtp:
-        return plan_gtp(param_name, src_meta_list, src_metadata, dst_metadata)
 
     # Regular TP/DP planning with EP-resolved metadata.  _plan_tp handles both
     # plain TP and block-interleaved TP (partition_sizes-driven) layouts.
@@ -363,9 +361,18 @@ def _iter_global_transfer_ops(
                 )
             # Choose a representative source metadata with DP round-robin balancing.
             src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
-            sources = plan_sharded_transfer(
-                resolved_name, src_meta_list, src_metadata, dst_metadata
-            )
+            if dst_metadata.is_gtp or any(metadata.is_gtp for metadata in src_meta_list):
+                # A GTP shard is an additional dim-0 partition layered on top
+                # of the TP layout. Plan in logical global coordinates so TP,
+                # packed parameters, GTP padding, and their combinations compose.
+                sources = plan_sharded_transfer(
+                    resolved_name, src_meta_list, src_metadata, dst_metadata
+                )
+            else:
+                # Preserve the established TP/DP lowering for non-GTP models.
+                sources = _determine_source_ranks_for_dst_param(
+                    resolved_name, src_metadata, dst_metadata, dst_rank
+                )
             for src_rank, src_slice, dst_slice in sources:
                 task_id = next_task_id
                 next_task_id += 1
@@ -548,6 +555,10 @@ def _build_tensor_reshard_specs(
             # error. Keep this helper side-effect free for callers that invoke
             # it independently in tests.
             return None, f"{resolved_name}: source parameter metadata is missing"
+        if any(metadata.is_gtp for metadata in src_meta_list) or any(
+            metadata.is_gtp for metadata in dst_by_rank.values()
+        ):
+            return None, f"{resolved_name}: GTP shards are unsupported by native resharding"
 
         src_groups: dict[tuple[int, ...], dict[int, ParameterMetadata]] = {}
         for metadata in src_meta_list:

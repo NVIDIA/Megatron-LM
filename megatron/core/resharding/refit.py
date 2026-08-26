@@ -36,6 +36,18 @@ from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 RefitBackendName = Literal["nccl", "nccl_m2n", "gloo", "nvshmem", "nixl"]
 
 
+class _ParallelConfig(NamedTuple):
+    """Parallel group sizes that determine a refit plan."""
+
+    tp_size: int
+    pp_size: int
+    ep_size: int
+    dp_size: int
+    expert_tp_size: int
+    gtp_remat_size: int
+    expert_gtp_remat_size: int
+
+
 @dataclass(frozen=True)
 class _PlanCacheKey:
     """

@@ -17,7 +17,7 @@ import torch.nn as nn
 
 import megatron.core.resharding.refit as refit
 from megatron.core.resharding.copy_services.base import CopyService
-from megatron.core.resharding.refit import _PlanCacheKey
+from megatron.core.resharding.refit import _get_parallel_config, _ParallelConfig, _PlanCacheKey
 from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
 
 

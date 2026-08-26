@@ -9,7 +9,8 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from megatron.core.fp8_utils import is_mxfp8tensor
+from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
+from megatron.core.tensor_parallel import gtp_api
 from megatron.core.transformer.module import MegatronModule
 
 from .copy_services.base import CopyService
@@ -151,7 +152,7 @@ def execute_reshard_plan(
         logger.info("Reshard complete")
         return
 
-    # Cache dequantized BF16 views of MXFP8 source params so that multiple
+    # Cache dequantized BF16 views of quantized source params so that multiple
     # send ops for the same param reuse one dequant instead of repeating it.
     # Issue all dequants on a side stream and record per-param events so each
     # send op only waits on its own dequant (later dequants can overlap with
@@ -226,18 +227,7 @@ def execute_reshard_plan(
         if dst_param is None:
             continue
 
-        # Try to recv directly into the destination parameter slice to avoid
-        # allocating a separate buffer + a writeback copy.  This is safe when
-        # the slice view is already contiguous AND the parameter is a plain
-        # tensor (not quantized — quantized params need deferred accumulation).
-        dst_slice_view = dst_param.data[op.my_slice]
         dst_requires_staging = _requires_bf16_staging(dst_param)
-
-        if not dst_requires_staging and dst_slice_view.is_contiguous():
-            service.submit_recv(dst_slice_view, op.peer_rank, task_id=op.task_id)
-            writebacks.append(_Writeback(kind='direct'))
-            continue
-
         if dst_requires_staging:
             # Quantized parameter: recv directly into pre-allocated BF16 accumulation
             # buffer to avoid per-slice BF16 allocations.
@@ -247,9 +237,19 @@ def execute_reshard_plan(
                 service.submit_recv(accum_view, op.peer_rank, task_id=op.task_id)
                 writebacks.append(_Writeback(kind='direct'))
                 continue
+            staged_view = accum_view
+        else:
+            # Receive directly into a contiguous plain-tensor slice to avoid
+            # allocating a separate buffer and writeback copy.
+            dst_slice_view = dst_param.data[op.my_slice]
+            if dst_slice_view.is_contiguous():
+                service.submit_recv(dst_slice_view, op.peer_rank, task_id=op.task_id)
+                writebacks.append(_Writeback(kind='direct'))
+                continue
+            staged_view = dst_slice_view
 
         # Fallback: stage into a temporary BF16 buffer (non-contiguous slice).
-        recv_buffer = torch.empty_like(dst_slice_view.contiguous())
+        recv_buffer = torch.empty_like(staged_view.contiguous())
         service.submit_recv(recv_buffer, op.peer_rank, task_id=op.task_id)
         writebacks.append(
             _Writeback(
