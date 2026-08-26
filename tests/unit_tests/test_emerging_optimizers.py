@@ -587,6 +587,128 @@ def test_muon_entry_registered_with_dispatcher():
     assert adaptive_entry.config_to_kwargs is eo_mod._adaptive_muon_config_to_kwargs
 
 
+# ---------------------------------------------------------------------------
+# Hybrid dense/expert NS modes (muon_expert_tp_mode): per-bucket class dispatch
+# ---------------------------------------------------------------------------
+# ``muon_expert_tp_mode`` gives expert-parallel weights their own NS mode (default: follow
+# ``muon_tp_mode``). When the effective modes differ, get_megatron_optimizer keeps the
+# dense/expert buckets separate and _create_emerging_optimizer runs once per bucket, which
+# must build the class each mode selects -- e.g. TensorParallelMuon with tp_mode='auto' for
+# the dense bucket and LayerShardedMuon for the expert bucket. With equal modes (the default
+# follow) the registry dispatch above is untouched. These construct real optimizers on tiny
+# params at the strict defaults (ns_batch_size=1), which every emerging-optimizers release
+# supports; no distributed init.
+
+
+class _HybridPGStub:
+    """Duck-typed ProcessGroupCollection with a distinct sentinel per field, so the tests can
+    assert WHICH domain's groups each bucket's optimizer received."""
+
+    def __init__(self):
+        self.gtp_remat = object()
+        self.expt_gtp_remat = object()
+        self.tp = object()
+        self.expt_tp = object()
+
+
+def _hybrid_cfg(tp_mode, expert_tp_mode=None, split_qkv=False) -> OptimizerConfig:
+    """A valid muon config (``__post_init__`` enforces the layer_sharded requirements)."""
+    return OptimizerConfig(
+        optimizer='muon',
+        use_layer_wise_distributed_optimizer=True,
+        muon_tp_mode=tp_mode,
+        muon_expert_tp_mode=expert_tp_mode,
+        muon_split_qkv=split_qkv,
+    )
+
+
+def _hybrid_bucket(is_expert: bool):
+    """One param group shaped like _get_param_groups output for one bucket."""
+    return [{'params': [torch.nn.Parameter(torch.randn(8, 8))], 'is_expert_parallel': is_expert}]
+
+
+def _create_hybrid(cfg, groups, pg_collection=None):
+    optimizer, init_state_fn = eo_mod._create_emerging_optimizer(
+        cfg, groups, 'muon', [_DispatchChunk()], pg_collection=pg_collection
+    )
+    assert init_state_fn is eo_mod._EMERGING_OPTIMIZERS['muon'].init_state_fn
+    return optimizer
+
+
+def test_hybrid_routes_buckets_to_different_classes():
+    cfg = _hybrid_cfg('auto', 'layer_sharded')
+    assert eo_mod._muon_modes_are_hybrid(cfg)
+
+    dense_opt = _create_hybrid(cfg, _hybrid_bucket(is_expert=False))
+    assert type(dense_opt) is eo_mod.TensorParallelMuon
+    assert dense_opt.tp_mode == 'auto', "dense bucket must honor muon_tp_mode"
+
+    expert_opt = _create_hybrid(cfg, _hybrid_bucket(is_expert=True))
+    assert isinstance(expert_opt, LayerShardedMuon)
+    # 'layer_sharded' is the registry selector; the class receives the bitwise reference
+    # mode for its delegated (fallback/degenerate) paths.
+    assert expert_opt.tp_mode == 'duplicated'
+
+
+def test_hybrid_expert_bucket_gets_expert_domain_groups():
+    pgs = _HybridPGStub()
+    expert_opt = _create_hybrid(
+        _hybrid_cfg('auto', 'layer_sharded'), _hybrid_bucket(is_expert=True), pg_collection=pgs
+    )
+    assert expert_opt.gtp_remat_group is pgs.expt_gtp_remat
+    assert expert_opt.tp_group is pgs.expt_tp
+
+    # Reverse hybrid: the DENSE bucket's LayerShardedMuon keeps the dense domain.
+    dense_opt = _create_hybrid(
+        _hybrid_cfg('layer_sharded', 'duplicated'),
+        _hybrid_bucket(is_expert=False),
+        pg_collection=pgs,
+    )
+    assert isinstance(dense_opt, LayerShardedMuon)
+    assert dense_opt.gtp_remat_group is pgs.gtp_remat
+    assert dense_opt.tp_group is pgs.tp
+
+
+def test_reverse_hybrid_expert_bucket_is_tensor_parallel_muon():
+    expert_opt = _create_hybrid(
+        _hybrid_cfg('layer_sharded', 'duplicated'), _hybrid_bucket(is_expert=True)
+    )
+    assert type(expert_opt) is eo_mod.TensorParallelMuon
+    assert expert_opt.tp_mode == 'duplicated'
+
+
+@pytest.mark.parametrize("tp_mode", ['layer_sharded', 'auto'])
+def test_expert_mode_follows_dense_by_default(tp_mode):
+    """An unset expert mode is NOT hybrid: both buckets get the class the single mode
+    selects, through the registry path."""
+    cfg = _hybrid_cfg(tp_mode)
+    assert not eo_mod._muon_modes_are_hybrid(cfg)
+    expected = LayerShardedMuon if tp_mode == 'layer_sharded' else eo_mod.TensorParallelMuon
+    for is_expert in (False, True):
+        optimizer = _create_hybrid(cfg, _hybrid_bucket(is_expert))
+        assert isinstance(optimizer, expected), f"tp_mode={tp_mode}, is_expert={is_expert}"
+
+
+def test_hybrid_expert_bucket_tolerates_split_qkv():
+    """Under hybrid modes split-QKV may stay on for the dense (TensorParallelMuon) bucket;
+    the expert LayerShardedMuon bucket, which owns no QKV, gets it forced off instead of
+    tripping the constructor reject."""
+    cfg = _hybrid_cfg('auto', 'layer_sharded', split_qkv=True)
+    dense_opt = _create_hybrid(cfg, _hybrid_bucket(is_expert=False))
+    assert dense_opt.split_qkv is True, "dense bucket must keep split-QKV"
+    expert_opt = _create_hybrid(cfg, _hybrid_bucket(is_expert=True))
+    assert isinstance(expert_opt, LayerShardedMuon)
+    assert expert_opt.split_qkv is False
+
+
+def test_explicit_expert_mode_equal_to_dense_is_not_hybrid():
+    cfg = _hybrid_cfg('auto', 'auto')
+    assert not eo_mod._muon_modes_are_hybrid(cfg)
+    optimizer = _create_hybrid(cfg, _hybrid_bucket(is_expert=True))
+    assert type(optimizer) is eo_mod.TensorParallelMuon
+    assert optimizer.tp_mode == 'auto'
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )

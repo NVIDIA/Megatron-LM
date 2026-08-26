@@ -325,6 +325,20 @@ class OptimizerConfig:
     mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
     emerging-optimizers >= 0.3.0."""
 
+    muon_expert_tp_mode: Optional[str] = None
+    """NS mode for expert-parallel weights. None (default): expert weights follow
+    muon_tp_mode. Any muon_tp_mode value gives the expert domain its own mode — e.g.
+    muon_tp_mode='auto' with muon_expert_tp_mode='layer_sharded' runs the per-weight
+    duplicated/distributed cost model on dense weights while layer-sharding the MoE expert
+    weights, where the layer-sharded win concentrates (many identically shaped matrices per
+    NS home). When the effective modes differ, the optimizer builder keeps the dense and
+    expert buckets separate and constructs one base optimizer per bucket; both feed
+    LayerWiseDistributedOptimizer. layer_sharded on either side needs optimizer='muon' and
+    the layer-wise path (__post_init__ checks); the split-QKV restriction is keyed to
+    muon_tp_mode only, since expert weights own no QKV. Requires num_experts when set
+    explicitly (validate_args: a model without expert weights has no expert bucket to
+    route)."""
+
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
     on its own CUDA stream so one group's compute fills another group's all_to_all stall.
@@ -488,24 +502,31 @@ class OptimizerConfig:
             and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
         )
 
-        if self.muon_tp_mode == 'layer_sharded':
+        # Expert-parallel weights follow muon_tp_mode unless muon_expert_tp_mode overrides it.
+        muon_expert_tp_mode = self.muon_expert_tp_mode or self.muon_tp_mode
+        if 'layer_sharded' in (self.muon_tp_mode, muon_expert_tp_mode):
+            selector = (
+                "muon_tp_mode" if self.muon_tp_mode == 'layer_sharded' else "muon_expert_tp_mode"
+            ) + "='layer_sharded'"
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
             if self.optimizer not in ('muon', 'dist_muon'):
                 raise ValueError(
-                    f"muon_tp_mode='layer_sharded' requires optimizer='muon' (got "
-                    f"{self.optimizer!r}); other optimizers, including adaptive_muon, do not "
-                    "implement layer sharding."
+                    f"{selector} requires optimizer='muon' (got {self.optimizer!r}); other "
+                    "optimizers, including adaptive_muon, do not implement layer sharding."
                 )
             if not will_be_layer_wise:
                 raise ValueError(
-                    "muon_tp_mode='layer_sharded' requires the layer-wise distributed "
-                    "optimizer path (use_layer_wise_distributed_optimizer=True)."
+                    f"{selector} requires the layer-wise distributed optimizer path "
+                    "(use_layer_wise_distributed_optimizer=True)."
                 )
-            if self.muon_split_qkv:
-                raise ValueError(
-                    "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
-                    "set muon_split_qkv=False."
-                )
+        # Keyed to the dense side only: split-QKV lives on TensorParallelMuon's path and
+        # expert weights own no QKV, so muon_tp_mode='auto' with
+        # muon_expert_tp_mode='layer_sharded' keeps dense QKV splitting available.
+        if self.muon_tp_mode == 'layer_sharded' and self.muon_split_qkv:
+            raise ValueError(
+                "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
+                "set muon_split_qkv=False."
+            )
 
         # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
         fp32 = (torch.float32, 'fp32')

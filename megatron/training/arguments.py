@@ -1659,6 +1659,15 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
+        if getattr(args, 'muon_expert_tp_mode', None) is not None:
+            # An explicit expert mode routes expert-parallel weights separately;
+            # a model without experts has no expert bucket to route.
+            assert args.num_experts is not None and args.num_experts > 0, (
+                "--muon-expert-tp-mode routes expert-parallel weights, but this "
+                "model has no experts (--num-experts). Drop the flag for "
+                "dense-only models (expert weights follow --muon-tp-mode)."
+            )
+
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer and args.optimizer in ('sgd', 'adam'):
@@ -2714,6 +2723,18 @@ def _add_regularization_args(parser):
                        'with all_to_all (same math as duplicated, no redundant NS); '
                        'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
                        'OptimizerConfig.muon_tp_mode.')
+    group.add_argument('--muon-expert-tp-mode', type=str, default=None,
+                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
+                                'layer_sharded'],
+                       help='NS mode for expert-parallel weights. Default (unset): '
+                       'expert weights follow --muon-tp-mode. Set to give the expert '
+                       'domain its own mode — e.g. --muon-tp-mode auto '
+                       '--muon-expert-tp-mode layer_sharded runs the per-weight '
+                       'cost model on dense weights while layer-sharding the MoE '
+                       'expert weights. When the modes differ, the optimizer builder '
+                       'keeps dense/expert buckets separate and constructs one base '
+                       'optimizer per bucket. Requires --num-experts when set. See '
+                       'OptimizerConfig.muon_expert_tp_mode.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '
                        'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
