@@ -38,6 +38,7 @@ allocation and can be captured in a CUDA graph.
 
 import gc
 import math
+import os
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1601,6 +1602,12 @@ class ReplicaCuTeDSLWeightBridge:
         # any one-weight-ahead gather (or performs the cold synchronous gather)
         # and stages the full native experts before CuTeDSL exchanges replicas.
         self.prepare_source_weights(retain_for_grad=retain_for_grad)
+        # The CuTeDSL kernel has a device-side cross-rank rendezvous.  Keep an
+        # opt-in host rendezvous available for debugging launch skew and stale
+        # symmetric-memory signal state; it must remain opt-in because a host
+        # collective cannot be captured into a CUDA graph.
+        if os.environ.get("MCORE_REPLICA_PREFETCH_HOST_BARRIER", "0") == "1":
+            dist.barrier(group=self.group, device_ids=[self.device.index])
         current_stream = torch.cuda.current_stream(self.device)
         weight_stream = self.workspace.select_weight_stream(current_stream)
         self.prefetch_ready.record(current_stream)
@@ -2409,7 +2416,13 @@ def _launch_stable_route_bucket_sort(
 ) -> None:
     """Launch the one-kernel stable expert-bucket route ordering."""
 
-    num_programs = min(256, num_routes)
+    # A cooperative launch must keep the complete grid resident.  The old
+    # fixed 256-program launch can exceed the device's occupancy limit for
+    # this register-heavy kernel, which then poisons the CUDA context and is
+    # often reported by Triton at a later module-load call.  The 128-program
+    # default is safe on the validated GB300 workload and retains substantially
+    # more parallelism than the conservative 64-program debug setting.
+    num_programs = min(128, num_routes)
     grid = (num_programs,)
 
     _stable_route_bucket_sort_kernel[grid](
