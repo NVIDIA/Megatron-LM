@@ -295,24 +295,11 @@ class OptimizerConfig:
     LayerShardedMuon rejects it at construction; the training path surfaces it earlier
     via validate_args). Defaults to "duplicated"."""
 
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
-
-    muon_use_syrk: bool = False
-    """Use the Triton SYRK (symmetric rank-k) kernel for the symmetric-output
-    Newton-Schulz GEMMs (all Muon modes; TensorParallelMuon additionally needs
-    emerging-optimizers >= 0.4.0 for the TP entry point), computing one triangle only —
-    roughly a third off total NS FLOPs for near-square matrices. Only takes effect
-    with muon_fp32_matmul_prec='medium', 8-aligned dims, Triton >= 3.4 and a
-    validated SM arch. Unbatched (2-D) NS chunks always qualify; batched (3-D)
-    chunks additionally need an emerging-optimizers that ships the batched SYRK
-    kernel (batched_tsyrk_ex, >= 0.5.0a0) and otherwise fall back to baddbmm
-    with a one-time warning. Same math,
-    different kernel: results differ from the GEMM path by kernel-level rounding.
-    Operational caveat: each rank pays a one-time Triton autotune+compile
-    (tens of seconds) per distinct matrix shape, so the first optimizer step on a
-    cold Triton cache is slow — budget for it in step-time monitoring, or persist
-    TRITON_CACHE_DIR across runs. Defaults to False."""
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
