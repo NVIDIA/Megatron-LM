@@ -49,6 +49,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.utils import (
     get_pg_size,
     make_tp_sharded_tensor_for_checkpoint,
@@ -1099,6 +1100,10 @@ class Compressor(MegatronModule):
         )
         config.init_method(_ape)
         self.ape = mark_keep_in_fp32(nn.Parameter(_ape))
+        if get_pg_size(pg_collection.tp) > 1 and config.sequence_parallel:
+            # APE is replicated, but its gradient is computed from sequence-
+            # parallel slices and must be reduced across the TP group.
+            setattr(self.ape, 'sequence_parallel', True)
 
         norm_config = copy.copy(config)
         norm_config.normalization = "RMSNorm"
@@ -1771,6 +1776,8 @@ class CompressedSparseAttention(MegatronModule):
         self.attn_sink = mark_keep_in_fp32(
             nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
         )
+        if tp_size > 1:
+            set_tensor_model_parallel_attributes(self.attn_sink, True, 0, 1)
 
         # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
         if self.compress_ratio > 1 and submodules.compressor is not None:

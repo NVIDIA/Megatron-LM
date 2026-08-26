@@ -27,6 +27,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import c
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_size, is_te_min_version, make_tp_sharded_tensor_for_checkpoint
 
@@ -197,6 +198,8 @@ class DSv4HybridAttention(Attention):
         )
         self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
+        if self.tp_size > 1:
+            set_tensor_model_parallel_attributes(self.linear_o_group_proj, True, 0, 1)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
 
