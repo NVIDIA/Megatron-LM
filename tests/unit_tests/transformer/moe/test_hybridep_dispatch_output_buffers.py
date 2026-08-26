@@ -29,3 +29,19 @@ def test_enabled_dispatch_output_buffer_reuse_requires_a_positive_slot_count():
             moe_hybridep_reuse_dispatch_output_buffers=True,
             moe_hybridep_num_dispatch_output_buffers=0,
         )
+
+
+def test_dispatch_output_buffer_reuse_rejects_fused_group_mlp_offload():
+    with pytest.raises(ValueError, match="incompatible.*fused_group_mlp"):
+        _config(
+            num_moe_experts=2,
+            moe_hybridep_reuse_dispatch_output_buffers=True,
+            moe_hybridep_num_dispatch_output_buffers=4,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            overlap_moe_expert_parallel_comm=True,
+            moe_expert_rank_capacity_factor=1.0,
+            fp8="hybrid",
+            fine_grained_activation_offloading=True,
+            offload_modules=["fused_group_mlp"],
+        )

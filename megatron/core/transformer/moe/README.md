@@ -320,7 +320,9 @@ accumulation without consumer-event backpressure. The ring size can be overridde
 trade-off for DeepSeek-V3 MBS2. This requires
 `--overlap-moe-expert-parallel-comm`, FP8 or FP4 expert GEMMs, and a static output bound from
 `--moe-expert-rank-capacity-factor` or `--moe-pad-expert-input-to-capacity`. The installed DeepEP
-must expose the caller-provided `output_token` argument; Megatron fails early otherwise.
+must expose the caller-provided `output_token` argument; Megatron fails early otherwise. Dispatch
+output reuse is incompatible with fine-grained `fused_group_mlp` activation offload because that
+offload path releases the grouped-MLP input storage.
 
 Setting `--moe-hybridep-num-expert-output-buffers N` additionally makes the fused grouped MLP
 write FC2 results directly into an `N`-slot persistent ring. HybridEP combine records the final

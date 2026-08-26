@@ -2160,6 +2160,16 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_hybridep_num_dispatch_output_buffers requires FP8 or FP4 expert "
                     "GEMMs so the BF16 dispatch input is not saved for backward"
                 )
+            if (
+                self.fine_grained_activation_offloading
+                and "fused_group_mlp" in (self.offload_modules or [])
+            ):
+                raise ValueError(
+                    "moe_hybridep_reuse_dispatch_output_buffers is incompatible with "
+                    "fine-grained activation offloading of fused_group_mlp because that "
+                    "offload path releases the dispatch input storage; disable dispatch "
+                    "output reuse or remove fused_group_mlp from offload_modules"
+                )
 
         if self.moe_hybridep_num_expert_output_buffers < 0:
             raise ValueError("moe_hybridep_num_expert_output_buffers must be non-negative")
