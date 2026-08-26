@@ -152,7 +152,9 @@ def test_sequence_packing_dense_config_passes():
 
 @requires_te_2_9
 def test_sequence_packing_moe_requires_alltoall_dispatcher():
-    with pytest.raises(AssertionError, match="alltoall"):
+    # The general allgather-vs-variable_seq_lengths check fires first, since
+    # sequence packing derives variable_seq_lengths=True.
+    with pytest.raises(ValueError, match="alltoall"):
         _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="allgather")
 
 

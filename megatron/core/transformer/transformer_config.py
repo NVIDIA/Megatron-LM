@@ -2977,7 +2977,9 @@ class TransformerConfig(ModelParallelConfig):
                         "full-iteration CUDA graphs"
                     )
 
-        if self.moe_token_dispatcher_type in ["allgather"]:
+        # Only meaningful for MoE models; dense models never dispatch tokens,
+        # so the (unused) dispatcher default must not fail validation.
+        if self.num_moe_experts is not None and self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
@@ -3296,7 +3298,9 @@ class TransformerConfig(ModelParallelConfig):
 
             # TODO(tailaim): add support for other dispatcher types
             # Only relevant for MoE models; dense models never dispatch tokens,
-            # so the (unused) dispatcher default must not fail validation.
+            # so the (unused) dispatcher default must not fail validation. For
+            # allgather specifically, the general variable_seq_lengths check
+            # above raises first (packing derives variable_seq_lengths=True).
             if self.num_moe_experts is not None:
                 assert self.moe_token_dispatcher_type == "alltoall", (
                     f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
