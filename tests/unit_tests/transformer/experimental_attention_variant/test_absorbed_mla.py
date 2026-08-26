@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProv
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
@@ -155,6 +156,20 @@ class MockCoreAttention(torch.nn.Module):
         return torch.cat(out_list, dim=0)
 
 
+class FakeCPGroup:
+    """Minimal context-parallel group for local RoPE caller tests."""
+
+    def __init__(self, size=1, rank=0):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
 def get_mock_mla_config(
     tensor_model_parallel_size: int,
     context_parallel_size: int,
@@ -164,6 +179,9 @@ def get_mock_mla_config(
     fp8_recipe: str = "delayed",
     fp4: Optional[str] = None,
     fp4_recipe: str = "nvfp4",
+    apply_rope_fusion: bool = False,
+    rope_type: str = "yarn",
+    rotary_percent: float = 1.0,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -185,8 +203,9 @@ def get_mock_mla_config(
         tensor_model_parallel_size=tensor_model_parallel_size,
         sequence_parallel=tensor_model_parallel_size > 1 and sequence_parallel,
         context_parallel_size=context_parallel_size,
-        apply_rope_fusion=False,
-        rope_type="yarn",
+        apply_rope_fusion=apply_rope_fusion,
+        rope_type=rope_type,
+        rotary_percent=rotary_percent,
         rotary_scaling_factor=40,
         mscale=1.0,
         mscale_all_dim=1.0,
@@ -287,17 +306,15 @@ def get_mla_submodules(
 # TODO: Add test case to cover TP > 1 but SP = False.
 
 
-@pytest.mark.parametrize("tp_cp_sp", [[1, 1, False], [2, 1, True], [1, 2, False], [2, 2, True]])
-@pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
-@pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
-@pytest.mark.parametrize("recompute_mla_up_proj", [False, True])
-@pytest.mark.parametrize("combined_kv_up_projection", [True, False])
-def test_functionality(
+def _run_functionality(
     tp_cp_sp: List,
     qkv_format: str,
     down_proj_use_column_parallel: bool,
     recompute_mla_up_proj: bool,
     combined_kv_up_projection: bool,
+    apply_rope_fusion: bool = False,
+    rope_type: str = "yarn",
+    check_hidden_grad: bool = False,
 ):
     """Test that AbsorbedMLASelfAttention is equivalent to standard MLA."""
     tp_size, cp_size, sp = tp_cp_sp
@@ -312,6 +329,8 @@ def test_functionality(
         context_parallel_size=cp_size,
         sequence_parallel=sp,
         recompute_mla_up_proj=recompute_mla_up_proj,
+        apply_rope_fusion=apply_rope_fusion,
+        rope_type=rope_type,
     )
     absorbed_submodules = get_absorbed_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
@@ -382,12 +401,15 @@ def test_functionality(
         grads = torch.randn_like(hidden_states)
         packed_seq_params = None
 
+    absorbed_hidden_states = hidden_states.detach().requires_grad_(check_hidden_grad)
+    standard_hidden_states = hidden_states.detach().clone().requires_grad_(check_hidden_grad)
+
     # Forward & Backward
     for name, param in absorbed_mla.named_parameters():
         if param.grad is not None:
             param.grad.zero_()
     absorbed_outputs, _ = absorbed_mla(
-        hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        absorbed_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
     )
     absorbed_outputs.backward(grads)
 
@@ -395,7 +417,7 @@ def test_functionality(
         if param.grad is not None:
             param.grad.zero_()
     standard_outputs, _ = standard_mla(
-        hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        standard_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
     )
     standard_outputs.backward(grads)
 
@@ -416,6 +438,10 @@ def test_functionality(
     assert cosine_sim > 0.9999, f"output cosine similarity = {cosine_sim} < 0.9999"
     assert _calculate_tensor_similarity(absorbed_outputs, standard_outputs) > 0.9999
     torch.testing.assert_close(absorbed_outputs, standard_outputs, atol=5e-3, rtol=5e-3)
+    if check_hidden_grad:
+        torch.testing.assert_close(
+            absorbed_hidden_states.grad, standard_hidden_states.grad, atol=5e-3, rtol=5e-3
+        )
 
     for name, param in absorbed_mla.named_parameters():
         assert param.grad is not None
@@ -471,6 +497,154 @@ def test_functionality(
             ).item()
             assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
             assert _calculate_tensor_similarity(absorbed_grad, standard_grad) > 0.9999
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("tp_cp_sp", [[1, 1, False], [2, 1, True], [1, 2, False], [2, 2, True]])
+@pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
+@pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
+@pytest.mark.parametrize("recompute_mla_up_proj", [False, True])
+@pytest.mark.parametrize("combined_kv_up_projection", [True, False])
+def test_functionality(
+    tp_cp_sp: List,
+    qkv_format: str,
+    down_proj_use_column_parallel: bool,
+    recompute_mla_up_proj: bool,
+    combined_kv_up_projection: bool,
+):
+    _run_functionality(
+        tp_cp_sp,
+        qkv_format,
+        down_proj_use_column_parallel,
+        recompute_mla_up_proj,
+        combined_kv_up_projection,
+    )
+
+
+@pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
+def test_standard_rope_fusion_functionality(qkv_format):
+    """Absorbed MLA's fused packing must match standard MLA end to end."""
+    _run_functionality(
+        [1, 1, False],
+        qkv_format,
+        down_proj_use_column_parallel=False,
+        recompute_mla_up_proj=False,
+        combined_kv_up_projection=True,
+        apply_rope_fusion=True,
+        rope_type="rope",
+        check_hidden_grad=True,
+    )
+
+
+@pytest.mark.parametrize("attention_type", ["standard", "absorbed"])
+@pytest.mark.parametrize(("qkv_format", "cp_size"), [("sbhd", 1), ("thd", 1), ("thd", 2)])
+@pytest.mark.parametrize("rotary_percent", [1.0, 0.5], ids=["full", "partial-fallback"])
+def test_standard_rope_fused_unfused_parity(attention_type, qkv_format, cp_size, rotary_percent):
+    """Standard RoPE fusion or fallback must preserve outputs and all gradients."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+
+    configs = [
+        get_mock_mla_config(
+            tensor_model_parallel_size=1,
+            context_parallel_size=cp_size,
+            sequence_parallel=False,
+            recompute_mla_up_proj=False,
+            apply_rope_fusion=apply_rope_fusion,
+            rope_type="rope",
+            rotary_percent=rotary_percent,
+        )
+        for apply_rope_fusion in (False, True)
+    ]
+
+    if attention_type == "absorbed":
+        attention_cls = AbsorbedMLASelfAttention
+        submodules = [
+            get_absorbed_mla_submodules(
+                down_proj_use_column_parallel=False,
+                qk_layernorm=True,
+                rms_norm=True,
+                combined_kv_up_projection=True,
+            )
+            for _ in configs
+        ]
+    else:
+        attention_cls = MLASelfAttention
+        submodules = [
+            get_mla_submodules(
+                down_proj_use_column_parallel=False, qk_layernorm=True, rms_norm=True
+            )
+            for _ in configs
+        ]
+
+    cp_group = FakeCPGroup(size=cp_size, rank=cp_size - 1)
+    attentions = [
+        attention_cls(
+            config=config,
+            submodules=module_spec,
+            layer_number=0,
+            attn_mask_type=AttnMaskType.causal,
+            cp_comm_type="all_gather" if cp_size > 1 else None,
+            pg_collection=ProcessGroupCollection(tp=None, cp=cp_group),
+        ).cuda()
+        for config, module_spec in zip(configs, submodules)
+    ]
+    attentions[1].load_state_dict(attentions[0].state_dict())
+
+    if qkv_format == "thd":
+        seqlens = [96, 160, 64]
+        cu_seqlens = torch.tensor([0, 96, 256, 320], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_kv=max(seqlens),
+            qkv_format="thd",
+        )
+        hidden_states = torch.randn(
+            (sum(seqlens) // cp_size, 1, configs[0].hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+    else:
+        packed_seq_params = None
+        hidden_states = torch.randn(
+            (320, 2, configs[0].hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+
+    inputs = [hidden_states.detach().clone().requires_grad_(True) for _ in attentions]
+    output_grad = torch.randn_like(hidden_states)
+    outputs = []
+    for attention, input_tensor in zip(attentions, inputs):
+        output, _ = attention(
+            input_tensor, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        output.backward(output_grad)
+        outputs.append(output)
+
+    torch.testing.assert_close(outputs[1], outputs[0], atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(inputs[1].grad, inputs[0].grad, atol=5e-3, rtol=5e-3)
+
+    unfused_parameters = dict(attentions[0].named_parameters())
+    fused_parameters = dict(attentions[1].named_parameters())
+    assert fused_parameters.keys() == unfused_parameters.keys()
+    for name in unfused_parameters:
+        unfused_grad = unfused_parameters[name].grad
+        fused_grad = fused_parameters[name].grad
+        assert unfused_grad is not None, f"unfused parameter {name} has no gradient"
+        assert fused_grad is not None, f"fused parameter {name} has no gradient"
+        fused_grad_fp64 = fused_grad.double()
+        unfused_grad_fp64 = unfused_grad.double()
+        denominator = (fused_grad_fp64.square() + unfused_grad_fp64.square()).sum()
+        similarity = (
+            1.0
+            if denominator == 0
+            else (2 * fused_grad_fp64 * unfused_grad_fp64).sum() / denominator
+        )
+        assert similarity > 0.9999, f"parameter {name} gradient similarity = {similarity}"
 
     Utils.destroy_model_parallel()
 
