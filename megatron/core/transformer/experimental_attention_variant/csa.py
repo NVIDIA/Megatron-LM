@@ -1838,6 +1838,16 @@ class CompressedSparseAttention(MegatronModule):
             )
         else:
             self.indexer = None
+        if (
+            config.dsa_cp_balance_indexer
+            and self.compress_ratio == 4
+            and not config.csa_dense_mode
+            and self.indexer is None
+        ):
+            raise ValueError(
+                "dsa_cp_balance_indexer requires an indexer submodule on every "
+                "compress-ratio-4 CSA layer; the selected module spec provides none."
+            )
 
         # Compact CUDA graphs reference caller-owned THD offsets and MXFP8
         # buffers by address. Retain every warmed-up static geometry for the
@@ -2887,8 +2897,8 @@ class CompressedSparseAttention(MegatronModule):
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
                 nvtx_range_push("indexer_total")
-                # Switch 1: take the load-balanced CP path via config flag (a run-level
-                # invariant — see the config validation). CP<=1 has nothing to balance.
+                # Switch 1: enable per-pack balanced routing via the config flag.
+                # CP<=1 has nothing to balance.
                 use_balance = self.config.dsa_cp_balance_indexer and cp_size > 1
                 if use_balance:
                     from megatron.core.transformer.experimental_attention_variant import (
@@ -2897,10 +2907,9 @@ class CompressedSparseAttention(MegatronModule):
 
                     # Per-pack routing: a pack the zigzag builders cannot represent
                     # (raw-cu middle stages and non-scheduler frontends can produce
-                    # one even under a conforming pad alignment) takes the original
-                    # contiguous reference path for this microbatch -- per-pack shape
-                    # variation between fused calls is verified safe below the kernel
-                    # row limit. The verdict comes from prebuild's cache (no probe),
+                    # one regardless of the configured capacity alignment) takes the
+                    # original contiguous reference path for this microbatch. The
+                    # verdict comes from prebuild's cache (no probe),
                     # the module registry under capture (raises without an eager
                     # warmup), or one cached D2H probe for frontends that never
                     # prebuild.
