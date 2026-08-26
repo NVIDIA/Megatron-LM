@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Mapping, Optional
 
 import torch
@@ -155,6 +155,11 @@ class ReshardPlan:
     # Number of globally coordinated batches in send_ops/recv_ops. Backends
     # that require one stable model-wide registration can opt out at execution.
     num_batches: int = 1
+    # Lazily populated by the generic executor so cached plans validate and
+    # group their immutable transfer schedule only once.
+    _cached_execution_batches: tuple[tuple[int, list[TransferOp], list[TransferOp]], ...] | None = (
+        field(default=None, init=False, repr=False, compare=False)
+    )
 
     def __str__(self):
         return f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"

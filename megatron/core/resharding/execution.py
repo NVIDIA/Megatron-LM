@@ -97,6 +97,25 @@ def _validate_execution_batches(plan: ReshardPlan) -> None:
             )
 
 
+def _get_execution_batches(
+    plan: ReshardPlan,
+) -> tuple[tuple[int, list[TransferOp], list[TransferOp]], ...]:
+    """Return the plan's validated batch grouping, building it only once."""
+    if plan._cached_execution_batches is None:
+        _validate_execution_batches(plan)
+        send_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
+        recv_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
+        for op in plan.send_ops:
+            send_ops_by_batch[op.batch_id].append(op)
+        for op in plan.recv_ops:
+            recv_ops_by_batch[op.batch_id].append(op)
+        plan._cached_execution_batches = tuple(
+            (batch_id, send_ops_by_batch[batch_id], recv_ops_by_batch[batch_id])
+            for batch_id in range(plan.num_batches)
+        )
+    return plan._cached_execution_batches
+
+
 def _execute_batch(
     send_ops: list[TransferOp],
     recv_ops: list[TransferOp],
@@ -300,31 +319,20 @@ def execute_reshard_plan(
         logger.info("Reshard complete")
         return
 
-    batches: list[tuple[int | None, list[TransferOp], list[TransferOp]]]
-    if service.supports_multiple_runs_per_plan:
-        _validate_execution_batches(plan)
-        send_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
-        recv_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
-        for op in plan.send_ops:
-            send_ops_by_batch[op.batch_id].append(op)
-        for op in plan.recv_ops:
-            recv_ops_by_batch[op.batch_id].append(op)
-        batches = [
-            (batch_id, send_ops_by_batch[batch_id], recv_ops_by_batch[batch_id])
-            for batch_id in range(plan.num_batches)
-        ]
+    batches: tuple[tuple[int | None, list[TransferOp], list[TransferOp]], ...]
+    if service.supports_multiple_runs_per_plan and plan.num_batches > 1:
+        batches = _get_execution_batches(plan)
     else:
         # NIXL registers the complete receive address map once and requires the
-        # same map on later refits, so preserve its model-wide submission.
-        batches = [(None, plan.send_ops, plan.recv_ops)]
+        # same map on later refits. The default one-batch path also avoids
+        # regrouping every operation on each refit.
+        batches = ((None, plan.send_ops, plan.recv_ops),)
 
+    # _execute_batch still selects only the quantized parameters used by that
+    # batch. Inspect the tensor dictionary here so large plans are not walked
+    # an extra time merely to decide whether a shared prefetch stream is needed.
     prefetch_stream = (
-        torch.cuda.Stream()
-        if any(
-            op.param_name in src_params and is_mxfp8tensor(src_params[op.param_name])
-            for op in plan.send_ops
-        )
-        else None
+        torch.cuda.Stream() if any(is_mxfp8tensor(param) for param in src_params.values()) else None
     )
 
     had_mxfp8_staging = False

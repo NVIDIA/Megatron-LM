@@ -186,8 +186,8 @@ across refits.
 
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
-| `_service_cache` | Backend name + process-group identity | `CopyService` instance | Avoid re-creating backend communicators and buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits |
+| `_service_cache` | Backend name + process-group identity + M2N execution limit | `CopyService` instance | Avoid re-creating backend communicators and buffers |
+| `_plan_cache` | (rank, src_config, dst_config, num_experts, execution limit) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.

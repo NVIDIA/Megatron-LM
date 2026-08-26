@@ -75,12 +75,12 @@ def model_provider(pre_process=True, post_process=True, parallel_output=False,
     )
 
 
-def create_refit_service(method):
+def create_refit_service(method, execution_batch_bytes: int | None = None):
     """Create and return a refit service instance."""
     if method == 'nvshmem':
         return NVSHMEMCopyService()
     elif method == 'nccl_m2n':
-        return NCCLM2NCopyService()
+        return NCCLM2NCopyService(max_group_bytes=execution_batch_bytes)
     elif method == 'nccl':
         return NCCLCopyService()
     elif method == 'gloo':
@@ -268,7 +268,9 @@ def benchmark_collocated():
 
     # Create refit service
     print_rank_0(f"Creating {args.refit_method} service...")
-    refit_service = create_refit_service(args.refit_method)
+    refit_service = create_refit_service(
+        args.refit_method, execution_batch_bytes=args.refit_execution_batch_bytes
+    )
     print_rank_0("Service created.\n")
 
     try:
@@ -379,7 +381,9 @@ def benchmark_non_collocated():
 
     # Create refit service
     print_rank_0(f"Creating {args.refit_method} service...")
-    refit_service = create_refit_service(args.refit_method)
+    refit_service = create_refit_service(
+        args.refit_method, execution_batch_bytes=args.refit_execution_batch_bytes
+    )
     print_rank_0("Service created.\n")
 
     try:

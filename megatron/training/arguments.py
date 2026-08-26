@@ -2857,8 +2857,9 @@ def _add_rl_args(parser):
         type=int,
         default=None,
         help=(
-            'Optional soft per-rank byte limit for generic ReFIT executor staging. '
-            'The default None preserves one model-wide submission.'
+            'Optional soft per-rank byte limit for ReFIT execution staging. '
+            'The default None preserves one model-wide generic submission and '
+            "NCCL M2N's existing 256 MiB default."
         ),
     )
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,

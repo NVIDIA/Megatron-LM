@@ -223,6 +223,26 @@ class TestExecutionBatches:
         for name, src_param in src_module.named_parameters():
             assert torch.equal(dict(dst_module.named_parameters())[name], src_param)
 
+    def test_cached_plan_validates_and_groups_once(self):
+        src_module = _make_module_with_params(
+            {
+                "first": torch.tensor([1.0, 2.0], device="cuda"),
+                "second": torch.tensor([3.0, 4.0], device="cuda"),
+            }
+        )
+        dst_module = _make_module_with_params(
+            {"first": torch.zeros(2, device="cuda"), "second": torch.zeros(2, device="cuda")}
+        )
+        plan = self._two_parameter_plan()
+        service = MockCopyService()
+
+        with patch("megatron.core.resharding.execution._validate_execution_batches") as validate:
+            _run(plan, src_module, dst_module, service)
+            _run(plan, src_module, dst_module, service)
+
+        validate.assert_called_once_with(plan)
+        assert service.runs == [([0], [0]), ([1], [1]), ([0], [0]), ([1], [1])]
+
     def test_backend_can_require_one_model_wide_run(self):
         src_module = _make_module_with_params(
             {

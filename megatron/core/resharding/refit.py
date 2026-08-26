@@ -118,13 +118,16 @@ def _build_plan_cache_key(
 
 # Module-level cache for refit services to avoid repeated allocations. Services
 # own process-group-specific communicators, so the group identity is part of the
-# key. ``id(group)`` is safe because the cached service retains the group object,
-# preventing its address from being reused while the cache entry exists.
-_service_cache: dict[tuple[str, int | None], CopyService] = {}
+# key; M2N's immutable grouped-submission limit is included as well. ``id(group)``
+# is safe because the cached service retains the group object, preventing its
+# address from being reused while the cache entry exists.
+_service_cache: dict[tuple[str, int | None, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
 
 
-def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
+def get_or_create_service(
+    backend: RefitBackendName, group=None, execution_batch_bytes: int | None = None
+) -> CopyService:
     """Get or create a cached CopyService instance for the given backend.
 
     This avoids expensive repeated allocations (especially for NVSHMEM buffers)
@@ -133,15 +136,19 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     Args:
         backend: Backend name ("nccl", "nccl_m2n", "gloo", "nvshmem", or "nixl").
         group: Optional process group for the backend.
+        execution_batch_bytes: Optional soft byte limit for execution staging.
+            For NCCL M2N, this overrides its grouped-submission limit. None
+            preserves M2N's existing environment setting or 256 MiB default.
     """
-    cache_key = (backend, id(group) if group is not None else None)
+    service_batch_bytes = execution_batch_bytes if backend == "nccl_m2n" else None
+    cache_key = (backend, id(group) if group is not None else None, service_batch_bytes)
     if cache_key in _service_cache:
         return _service_cache[cache_key]
 
     if backend == "nccl":
         service = NCCLCopyService(group=group)
     elif backend == "nccl_m2n":
-        service = NCCLM2NCopyService(group=group)
+        service = NCCLM2NCopyService(group=group, max_group_bytes=execution_batch_bytes)
     elif backend == "gloo":
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
@@ -407,11 +414,16 @@ def swap_model_weights(
             (``pool == dst_pool_index``) and is a pure source otherwise.
             Defaults ``(1, 0)`` reproduce the single-destination behavior.
         execution_batch_bytes: Optional soft per-rank limit for transient
-            generic-executor staging. A single complete parameter may exceed this
-            value. None keeps the model-wide submission behavior.
+            execution staging. A single complete parameter may exceed this
+            value. With a string ``nccl_m2n`` backend, this overrides M2N's
+            grouped-submission limit; None preserves its existing environment
+            setting or 256 MiB default. Other backends keep the model-wide
+            submission behavior when this is None.
     """
     if isinstance(refit_method, str):
-        service = get_or_create_service(refit_method, group=group)
+        service = get_or_create_service(
+            refit_method, group=group, execution_batch_bytes=execution_batch_bytes
+        )
     elif isinstance(refit_method, CopyService):
         service = refit_method
     else:
