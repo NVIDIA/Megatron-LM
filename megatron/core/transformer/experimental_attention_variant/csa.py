@@ -2628,14 +2628,9 @@ class CompressedSparseAttention(MegatronModule):
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
                 nvtx_range_push("indexer_total")
-                # Switch 1: take the load-balanced CP path via config flag. Fall back to the
-                # contiguous path for CP<=1 or short sequences, where the redistribute overhead
-                # outweighs the imbalance savings.
-                use_balance = (
-                    self.config.dsa_cp_balance_indexer
-                    and cp_size > 1
-                    and max_seqlen_q >= (self.config.dsa_cp_balance_min_seqlen or 0)
-                )
+                # Switch 1: take the load-balanced CP path via config flag (a run-level
+                # invariant — see the config validation). CP<=1 has nothing to balance.
+                use_balance = self.config.dsa_cp_balance_indexer and cp_size > 1
                 # Layout precondition (contiguous) is enforced module-wide above:
                 # CompressedSparseAttention raises for any CP run whose
                 # PackedSeqParams.cp_partition_mode is not "contiguous".
@@ -2809,7 +2804,6 @@ class CompressedSparseAttention(MegatronModule):
                         cp_size,
                         l_local,
                         config=self.config,
-                        use_fused=self.use_fused_kernels,
                         layout_cache=getattr(
                             packed_seq_params, "_dsa_cp_balance_layout_cache", None
                         ),

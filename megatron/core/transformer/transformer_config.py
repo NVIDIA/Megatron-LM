@@ -400,13 +400,15 @@ class TransformerConfig(ModelParallelConfig):
     (``None``/``"max"`` disqualify), and every (padded) sequence length in the pack divisible
     by ``2 * cp_size`` (the alignment condition is a prefilter: per-microbatch pack
     divisibility decides; prebuilt A2A routes come from ``prebuild_balanced_layouts``).
-    Any other pack — and the unfused backend — keeps the original contiguous split (the
-    unbalanced reference path; no balancing happens there). Under the fused backend the
-    per-process fused-call row count is pinned at the first call: a pack that would change
-    it (zigzag-eligibility alternation, or a varying pack capacity under eager varlen)
-    raises rather than expose a fused-call shape transition the kernel package is known to
-    silently corrupt — fused balanced runs therefore require a fixed pack capacity and
-    uniformly divisible packs.
+    Eligibility is a RUN-LEVEL
+    INVARIANT: enabling the flag requires the fused backend and the alignment condition at
+    config validation, and a pack that violates per-sequence or tail divisibility raises at
+    data-prep/dispatch time instead of falling back — the fused kernel package silently
+    corrupts fused calls whose row shape differs from earlier calls, so balanced/reference
+    switching between microbatches is forbidden. The per-process fused-call row pin
+    additionally requires a fixed pack capacity (varying eager-varlen capacity raises).
+    Whether balancing is worthwhile for a workload is decided once, at recipe level, by
+    this flag.
     Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
     history sees fewer recordings than the reference during eval (training forwards identical).
     CUDA-graph support in this PR is scoped to STATIC pack compositions with
@@ -416,20 +418,6 @@ class TransformerConfig(ModelParallelConfig):
     data-prep time);
     varying-composition (varlen) and PP/VPP support with graphs land in a follow-up PR. When
     False, the indexer uses the contiguous CP split."""
-
-    dsa_cp_balance_min_seqlen: int = 0
-    """Minimum ``max_seqlen_q`` required to use the balanced CP indexer. In packed THD batches this
-    is the PER-SEQUENCE maximum, not the pack length — deliberately: the causal imbalance is driven
-    by sequences long enough to span multiple CP ranks, so packs of only-short sequences are already
-    balanced and the redistribute overhead outweighs the savings. Below this length the indexer
-    keeps the contiguous CP split. 0 means no lower bound (always balance when enabled). Under
-    CUDA graphs this gate is a host-side branch frozen at capture time (both branches are exact;
-    only the balancing benefit follows the captured decision). Rejected at config validation with the fused
-    indexer backend: a nonzero gate alternates balanced (half-row) and reference (full-row)
-    fused calls within one process, a shape transition the kernel package is known to
-    silently corrupt (see the WORKSPACE NOTE in
-    tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py). Usable with the
-    unfused indexer only, pending the kernel-side fix."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -1796,11 +1784,6 @@ class TransformerConfig(ModelParallelConfig):
                 "dsa_cp_balance_indexer requires " "experimental_attention_variant='dsv4_hybrid'."
             )
 
-        if (self.dsa_cp_balance_min_seqlen or 0) < 0:
-            raise ValueError(
-                f"dsa_cp_balance_min_seqlen must be >= 0, got {self.dsa_cp_balance_min_seqlen!r}."
-            )
-
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately
         # before the centralized attention-variant validation consumes dsa_kernel_backend.
@@ -1855,27 +1838,34 @@ class TransformerConfig(ModelParallelConfig):
                 "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
-        if self.dsa_cp_balance_indexer and (self.dsa_cp_balance_min_seqlen or 0) > 0:
-            # A nonzero gate alternates balanced (half-row) and reference (full-row)
-            # fused indexer calls within one process. The fused kernel package carries
-            # cross-call state that silently corrupts calls whose shape differs from
-            # earlier calls (measured; see the WORKSPACE NOTE in
-            # test_cp_balanced_indexer_layout.py), and the falsified priming experiment
-            # there shows no user-side warmup can mitigate it — so fail closed until
-            # the kernel-side fix. The unfused indexer carries no such state. Evaluated
-            # after the deprecated apply_dsa_kernel_fusion switch is folded into
-            # dsa_kernel_backend above, so the predicate sees the final backend.
+        if self.dsa_cp_balance_indexer:
+            # Balanced-indexer eligibility is a RUN-LEVEL INVARIANT, not a per-microbatch
+            # decision: the fused indexer package silently corrupts fused calls whose row
+            # shape differs from earlier calls in the process (see the WORKSPACE NOTE in
+            # test_cp_balanced_indexer_layout.py), so balanced/reference switching between
+            # microbatches is forbidden. Enforce the invariant's preconditions here and
+            # fail fast; nonconforming packs raise at data-prep/dispatch time instead of
+            # falling back. Evaluated after the deprecated apply_dsa_kernel_fusion switch
+            # is folded into dsa_kernel_backend above, so the predicate sees the final
+            # backend.
             from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
                 use_fused_dsa_kernels,
             )
 
-            if use_fused_dsa_kernels(self):
+            if not use_fused_dsa_kernels(self):
                 raise ValueError(
-                    "dsa_cp_balance_min_seqlen > 0 with the fused DSA indexer backend "
-                    "alternates fused-call shapes within one process, which the kernel "
-                    "package is known to silently corrupt. Set "
-                    "dsa_cp_balance_min_seqlen=0, or run the indexer unfused "
-                    "(attention_backend=unfused or dsa_kernel_backend='none')."
+                    "dsa_cp_balance_indexer requires the fused DSA indexer backend "
+                    "(dsa_kernel_backend != 'none' and attention_backend != unfused): "
+                    "the balanced zigzag scorer is fused-only."
+                )
+            cp = self.context_parallel_size
+            pad = self.pad_packed_seq_alignment
+            if cp > 1 and not (isinstance(pad, int) and pad > 0 and pad % (2 * cp) == 0):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires pad_packed_seq_alignment to be a "
+                    f"positive integer multiple of 2 * context_parallel_size = {2 * cp} "
+                    f"(got {pad!r}), so every pack is zigzag-representable and the "
+                    "balanced call shape stays fixed for the whole run."
                 )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):

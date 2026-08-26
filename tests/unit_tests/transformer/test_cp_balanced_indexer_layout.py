@@ -24,9 +24,8 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
     _FUSED_CALL_ROWS,
     _ZZ_PACK_OK,
-    _pack_zigzag_ok,
+    _ensure_pack_zigzag_ok,
     _pin_fused_call_rows,
-    _use_zigzag,
     _zigzag_plan,
     prebuild_balanced_layouts,
 )
@@ -220,18 +219,10 @@ def test_route_a2a_roundtrip(name, cu_list, cp_size, capacity):
         assert torch.equal(out.squeeze(1), mine), (name, r)
 
 
-class _Cfg:
-    """Minimal config stub for the zigzag gate."""
-
-    def __init__(self, pad):
-        self.pad_packed_seq_alignment = pad
-
-
-def test_prebuild_pack_verdict_gates_zigzag():
-    """A non-2N-aligned pack must flip the pack verdict to folding, and a later
-    aligned pack must restore it (regression: the prebuild bail-out used to
-    leave stale plans consumable and the config-only gate open). Prebuild writes
-    the verdict on BOTH the microbatch cache and the module registry."""
+def test_prebuild_enforces_pack_invariant():
+    """Prebuild records OK verdicts for conforming packs (microbatch cache + module
+    registry) and RAISES for a pack that violates per-sequence 2N divisibility —
+    eligibility is a run-level invariant, with no per-microbatch fallback."""
     group = _StubGroup(4, 0)
     g = getattr(group, "group_name", None) or id(group)  # mirrors _group_key
 
@@ -239,55 +230,48 @@ def test_prebuild_pack_verdict_gates_zigzag():
     prebuild_balanced_layouts(aligned, cp_group=group)
     assert _ZZ_PACK_OK[(g, 1024)] is True
     assert aligned._dsa_cp_balance_layout_cache["zz_pack_ok"] == (1024, True)
-    assert _use_zigzag(4, 1024, True, _Cfg(1024)) is True
-    assert _pack_zigzag_ok(None, group, 4, 1024, aligned._dsa_cp_balance_layout_cache) is True
+    _ensure_pack_zigzag_ok(None, group, 4, 1024, aligned._dsa_cp_balance_layout_cache)
 
-    # Sequence lengths 500/508 are not divisible by 2 * cp_size = 8, but the
-    # config-level gate (pad alignment 1024, even l_local 252) would still say
-    # yes — only the recorded pack verdict can force the folding path here.
+    # Sequence lengths 500/508 are not divisible by 2 * cp_size = 8: fail fast at
+    # data-prep time, before any dispatch could mix fused-call shapes.
     unaligned = _packed_params([0, 500, 1008], 1008)
-    prebuild_balanced_layouts(unaligned, cp_group=group)
-    assert _ZZ_PACK_OK[(g, 252)] is False
-    assert unaligned._dsa_cp_balance_layout_cache["zz_pack_ok"] == (252, False)
-    assert _pack_zigzag_ok(None, group, 4, 252, unaligned._dsa_cp_balance_layout_cache) is False
-    # Verdicts are per (group, l_local): the aligned capacity's entry is untouched.
+    with pytest.raises(ValueError, match="not zigzag-representable"):
+        prebuild_balanced_layouts(unaligned, cp_group=group)
+    # The violating pack records no OK verdict; the aligned capacity is untouched.
+    assert (g, 252) not in _ZZ_PACK_OK
     assert _ZZ_PACK_OK[(g, 1024)] is True
 
     prebuild_balanced_layouts(aligned, cp_group=group)
     assert _ZZ_PACK_OK[(g, 1024)] is True
 
 
-def test_pack_probe_gates_unprebuilt_legacy_packs():
+def test_eager_probe_enforces_pack_invariant():
     """A frontend that never prebuilds (legacy varlen ``get_batch``) can hand the
-    dispatch a raw, non-2N-aligned pack. The eager probe must route it to the
-    folding path (regression: it used to reach ``_zigzag_plan``'s hard error) and
-    cache the verdict on both the microbatch cache and the module registry."""
+    dispatch a raw, non-2N-aligned pack. The eager fail-fast check must RAISE for
+    it (no per-microbatch fallback) and cache OK verdicts for conforming packs."""
     group = _StubGroup(4, 0)
-    g = getattr(group, "group_name", None) or id(group)
     cache = {}
 
-    # 500 % (2 * 4) != 0 -> fold. l_local = 252 (raw pack, no capacity padding).
+    # 500 % (2 * 4) != 0 -> run-level invariant violation. l_local = 252 (raw pack).
     cu = torch.tensor([0, 500, 1008], dtype=torch.int32)
-    assert _pack_zigzag_ok(cu, group, 4, 252, cache) is False
-    assert cache["zz_pack_ok"] == (252, False)
-    assert _ZZ_PACK_OK[(g, 252)] is False
-    # Second call is served from the microbatch cache (no re-probe of cu).
-    assert _pack_zigzag_ok(None, group, 4, 252, cache) is False
+    with pytest.raises(ValueError, match="not zigzag-representable"):
+        _ensure_pack_zigzag_ok(cu, group, 4, 252, cache)
+    assert "zz_pack_ok" not in cache
 
     # Aligned pack with a capacity-padding tail (both 2N-aligned) -> zigzag OK.
     cu2 = torch.tensor([0, 1024, 3072], dtype=torch.int32)
     cache2 = {}
-    assert _pack_zigzag_ok(cu2, group, 4, 1024, cache2) is True
+    _ensure_pack_zigzag_ok(cu2, group, 4, 1024, cache2)
     assert cache2["zz_pack_ok"] == (1024, True)
 
     # A cached verdict probed at a different capacity does not apply: re-probe.
-    stale = {"zz_pack_ok": (128, False)}
-    assert _pack_zigzag_ok(cu2, group, 4, 1024, stale) is True
+    stale = {"zz_pack_ok": (128, True)}
+    _ensure_pack_zigzag_ok(cu2, group, 4, 1024, stale)
     assert stale["zz_pack_ok"] == (1024, True)
 
-    # With no cu to probe and no recorded verdict, the gate defaults to folding
-    # (only a recorded verdict can admit the zigzag path).
-    assert _pack_zigzag_ok(None, _StubGroup(4, 1), 4, 64, None) is False
+    # With no cu to probe and no recorded verdict, the check cannot verify: raise.
+    with pytest.raises(RuntimeError, match="cannot verify pack eligibility"):
+        _ensure_pack_zigzag_ok(None, _StubGroup(4, 1), 4, 64, None)
 
 
 def test_zigzag_plan_rejects_unaligned_pack_eagerly():
@@ -340,13 +324,10 @@ def test_prebuild_refresh_preserves_old_plan_objects():
     assert pack_b2._dsa_cp_balance_layout_cache[("zigzag", 0)] is plan_b
 
     # Under CUDA graphs the composition is contract-static: with graphs enabled a
-    # change raises at data-prep time, BEFORE any early return (a below-min_seqlen
-    # pack still counts as a composition observation).
+    # change raises at data-prep time, before any early return.
     pack_c = _packed_params([0, 1024, 2048, 4096], 4096)
     with pytest.raises(RuntimeError, match="static pack composition"):
         prebuild_balanced_layouts(pack_c, cp_group=group, graphs_enabled=True)
-    with pytest.raises(RuntimeError, match="static pack composition"):
-        prebuild_balanced_layouts(pack_c, cp_group=group, graphs_enabled=True, min_seqlen=1 << 30)
     # Without graphs, changing packs is ordinary varlen operation: silent.
     prebuild_balanced_layouts(pack_c, cp_group=group)
     assert pack_c._dsa_cp_balance_layout_cache[("zigzag", 0)] is not plan_b
@@ -521,8 +502,9 @@ def test_fused_call_row_pin_fails_closed():
 # parity; the zigzag head and tail calls share one row count), and
 # shape-ALTERNATING regimes have no user-side mitigation — the falsified
 # priming experiment above shows warmup schemes cannot help — so production
-# fails closed until the kernel-side fix: config validation rejects a nonzero
-# ``dsa_cp_balance_min_seqlen`` with the fused backend, and
+# fails closed until the kernel-side fix: balanced eligibility is a RUN-LEVEL
+# INVARIANT (config validation requires the fused backend and a compatible pack
+# alignment; nonconforming packs raise at prebuild/dispatch), and
 # ``cp_balanced_indexer`` pins the per-process fused-call row count, raising
 # on any transition (``test_fused_call_row_pin_fails_closed`` above). To be
 # raised with the kernel owners together with the sub-32-head silent-zero mode.

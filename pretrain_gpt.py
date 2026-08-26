@@ -149,7 +149,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             prebuild_balanced_layouts(
                 batch[5],
                 pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
-                min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
                 graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
             )
         return batch
@@ -206,7 +205,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 packed_seq_params,
                 pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
                 capacity=args.seq_length,
-                min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
                 graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
             )
         return (None, None, None, None, None, packed_seq_params, None)
@@ -265,7 +263,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         prebuild_balanced_layouts(
             packed_seq_params,
             pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
-            min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
             graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
         )
 
