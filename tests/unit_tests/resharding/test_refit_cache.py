@@ -299,12 +299,12 @@ class TestSetupMxfp8TransformOnPlan:
         _setup_mxfp8_transform_on_plan(plan, _Model())
         assert plan.transform is sentinel
 
-    def test_flashinfer_uses_triton_canonical_refit_buffers(self, monkeypatch):
-        """FlashInfer refit updates canonical weights before refreshing Major-K weights."""
+    def test_flashinfer_uses_canonical_triton_buffers(self, monkeypatch):
+        """FlashInfer refit derives Major-K weights from canonical Triton storage."""
         from megatron.core.resharding import refit
         from megatron.core.resharding.utils import ReshardPlan
 
-        class _Cfg:
+        class _Config:
             transformer_impl = "inference_optimized"
             fp8_recipe = "mxfp8"
             inference_grouped_gemm_backend = "flashinfer"
@@ -312,7 +312,7 @@ class TestSetupMxfp8TransformOnPlan:
         class _Model(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.config = _Cfg()
+                self.config = _Config()
                 self.decoder = nn.Linear(4, 4, bias=False)
 
         captured = {}
@@ -326,9 +326,7 @@ class TestSetupMxfp8TransformOnPlan:
 
         plan = ReshardPlan(send_ops=[], recv_ops=[])
         refit._setup_mxfp8_transform_on_plan(plan, _Model())
-
-        assert captured["backend"] == "triton"
-        assert plan.transform.backend == "triton"
+        assert captured["backend"] == plan.transform.backend == "triton"
 
 
 class TestRefitTensorCache:

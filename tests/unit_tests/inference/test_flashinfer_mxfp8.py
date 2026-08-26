@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.inference.moe.flashinfer_mxfp8 import select_routed_mxfp8_active_rows
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -48,9 +49,6 @@ def test_inference_mode_rejects_invalid_decode_bound():
 def test_flashinfer_mxfp8_active_row_policy(
     token_capacity, decode_only, decode_upper_bound, expected
 ):
-    pytest.importorskip("flashinfer")
-    from megatron.core.inference.moe.flashinfer_mxfp8 import select_routed_mxfp8_active_rows
-
     assert (
         select_routed_mxfp8_active_rows(
             65536,
@@ -114,7 +112,7 @@ def test_missing_routed_mxfp8_capability_has_precise_error(monkeypatch):
         ImportError("missing routed MXFP8 API"),
     )
 
-    with pytest.raises(RuntimeError, match="requires a FlashInfer release"):
+    with pytest.raises(RuntimeError, match="requires FlashInfer >= 0.6.4"):
         flashinfer_mxfp8.require_flashinfer_routed_mxfp8()
 
 
