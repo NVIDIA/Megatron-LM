@@ -597,8 +597,8 @@ def balanced_compute_cp_indexer_topk(
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
     Returns ``(compressed_topk, layout)`` in the same contiguous ``[l_local, topk]`` layout the
-    caller expects, so ``build_attention_indices`` / sparse attention are unchanged. Every sequence is
-    tiled into ``2 * cp_size`` chunks; this rank scores chunk ``r`` (head) and chunk
+    caller expects, so ``build_attention_indices`` / sparse attention are unchanged. Every
+    sequence is tiled into ``2 * cp_size`` chunks; this rank scores chunk ``r`` (head) and chunk
     ``2 * cp_size - 1 - r`` (tail) of every sequence — one cheap and one expensive under
     the causal mask — via per-chunk calls that follow the reference (RoPE positions,
     causal offsets, packing, tight KV bounds), then combines the top-k back to contiguous

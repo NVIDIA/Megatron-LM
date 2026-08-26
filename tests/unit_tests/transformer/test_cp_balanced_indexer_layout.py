@@ -793,24 +793,23 @@ def test_zigzag_plan_rejects_wrong_capacity_cache():
     assert cache[("zigzag", 0)] is plan
 
 
-def test_static_composition_gate_covers_planless_runs():
-    """The static-composition gate must fire even when no zigzag plan is ever
-    built (e.g. a pad alignment that never opens the zigzag gate): folding-only
-    captures still bake composition-sensitive host state, so the observation is
-    recorded on every prebuild call, independent of plan construction."""
+def test_prebuild_rejects_ineligible_pad_alignment():
+    """Balanced eligibility is a run-level invariant: prebuild refuses pad
+    alignments the zigzag gate can never accept (config validation enforces the
+    same thing at startup; a mismatch here means the caller wired a different
+    value). There is no planless balanced run any more — ineligible
+    configurations take the reference path — so every graphs-enabled balanced
+    run builds plans and the static-composition gate always has one to compare
+    against (pinned by test_prebuild_refresh_preserves_old_plan_objects)."""
     group = _StubGroup(4, 0)
-    pack_a = _packed_params([0, 1024, 4096], 4096)
-    # pad_alignment=None: the config can never open the zigzag gate -> no plan.
-    prebuild_balanced_layouts(pack_a, cp_group=group, pad_alignment=None, graphs_enabled=True)
-    assert ("zigzag", 0) not in pack_a._dsa_cp_balance_layout_cache
-
-    pack_b = _packed_params([0, 2048, 4096], 4096)
-    with pytest.raises(RuntimeError, match="static pack composition"):
-        prebuild_balanced_layouts(pack_b, cp_group=group, pad_alignment=None, graphs_enabled=True)
-
-    # Same composition again: fine.
-    pack_a2 = _packed_params([0, 1024, 4096], 4096)
-    prebuild_balanced_layouts(pack_a2, cp_group=group, pad_alignment=None, graphs_enabled=True)
+    for bad in (None, "max", 12):  # 12 % (2 * 4) != 0
+        pack = _packed_params([0, 1024, 4096], 4096)
+        with pytest.raises(ValueError, match="run-level invariant"):
+            prebuild_balanced_layouts(pack, cp_group=group, pad_alignment=bad, graphs_enabled=True)
+    # An eligible alignment builds the plan as usual.
+    pack = _packed_params([0, 1024, 4096], 4096)
+    prebuild_balanced_layouts(pack, cp_group=group, pad_alignment=8, graphs_enabled=True)
+    assert ("zigzag", 0) in pack._dsa_cp_balance_layout_cache
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="indexer scoring runs on device")
