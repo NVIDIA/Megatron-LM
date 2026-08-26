@@ -39,35 +39,6 @@ def test_dummy_weight_gradient_reuses_parameter_storage():
     assert not dummy.requires_grad
 
 
-def test_accumulate_weight_gradient_adds_to_main_grad_and_returns_dummy(monkeypatch):
-    param = _parameter_with_main_grad()
-    grad = torch.full_like(param, 0.5)
-    dummy = torch.empty_like(param)
-    monkeypatch.setattr(mok_megakernel, "_dummy_weight_gradient", lambda _: dummy)
-
-    actual = mok_megakernel._accumulate_weight_gradient(param, grad)
-    mok_megakernel._accumulate_weight_gradient(param, grad)
-
-    assert actual is dummy
-    torch.testing.assert_close(param.main_grad, torch.ones_like(param.main_grad))
-    assert param.grad_added_to_main_grad
-
-
-def test_accumulate_weight_gradient_requires_main_grad():
-    param = torch.nn.Parameter(torch.zeros((4, 8), dtype=torch.bfloat16))
-
-    with pytest.raises(RuntimeError, match="param.main_grad"):
-        mok_megakernel._accumulate_weight_gradient(param, torch.zeros_like(param))
-
-
-def test_accumulate_weight_gradient_rejects_shape_mismatch():
-    param = _parameter_with_main_grad()
-
-    with pytest.raises(RuntimeError, match="shape mismatch"):
-        mok_megakernel._accumulate_weight_gradient(
-            param, torch.zeros((2, 16), dtype=torch.bfloat16)
-        )
-
 
 def test_finish_weight_gradient_marks_ready_without_accumulating(monkeypatch):
     param = _parameter_with_main_grad()
@@ -509,96 +480,211 @@ def _parameter_with_preserved_init(init_val):
     return param, cleared
 
 
-def test_import_weights_preserves_reordered_init_for_optimizer(monkeypatch):
-    class Stub:
-        pass
+def _shared_module(fc1_weight, down_weight):
+    shared = torch.nn.Module()
+    shared.linear_fc1 = torch.nn.Module()
+    shared.linear_fc2 = torch.nn.Module()
+    shared.linear_fc1.register_parameter("weight", fc1_weight)
+    shared.linear_fc2.register_parameter("weight", down_weight)
+    return shared
 
-    monkeypatch.setattr(mok_megakernel, "_debug_tag", lambda *_: None)
 
-    hidden_size = 3
-    routed_intermediate = 2
-    shared_intermediate = 1
-    num_experts = 2
-
-    routed = Stub()
-    routed.linear_fc1 = Stub()
-    routed.linear_fc2 = Stub()
-    routed.linear_fc1.single_grouped_weight = False
-    routed.linear_fc2.single_grouped_weight = False
-
-    routed_fc1_init = []
-    routed_fc2_init = []
-    cleared = []
-    for expert_idx in range(num_experts):
-        fc1_init = (
-            torch.arange(2 * routed_intermediate * hidden_size, dtype=torch.float32)
-            .reshape(2 * routed_intermediate, hidden_size)
-            .add_(100 * expert_idx + 0.125)
-        )
-        fc2_init = (
-            torch.arange(hidden_size * routed_intermediate, dtype=torch.float32)
-            .reshape(hidden_size, routed_intermediate)
-            .add_(100 * expert_idx + 0.375)
-        )
-        fc1_param, fc1_cleared = _parameter_with_preserved_init(fc1_init)
-        fc2_param, fc2_cleared = _parameter_with_preserved_init(fc2_init)
-        setattr(routed.linear_fc1, f"weight{expert_idx}", fc1_param)
-        setattr(routed.linear_fc2, f"weight{expert_idx}", fc2_param)
-        routed_fc1_init.append(fc1_init)
-        routed_fc2_init.append(fc2_init)
-        cleared.extend((fc1_cleared, fc2_cleared))
-
-    shared = Stub()
-    shared.linear_fc1 = Stub()
-    shared.linear_fc2 = Stub()
-    shared_fc1_init = torch.arange(
-        2 * shared_intermediate * hidden_size, dtype=torch.float32
-    ).reshape(2 * shared_intermediate, hidden_size)
-    shared_fc2_init = torch.arange(hidden_size * shared_intermediate, dtype=torch.float32).reshape(
-        hidden_size, shared_intermediate
-    )
-    shared.linear_fc1.weight, shared_fc1_cleared = _parameter_with_preserved_init(shared_fc1_init)
-    shared.linear_fc2.weight, shared_fc2_cleared = _parameter_with_preserved_init(shared_fc2_init)
-    cleared.extend((shared_fc1_cleared, shared_fc2_cleared))
-
+def _shared_adapter(intermediate_size=2, hidden_size=3):
     module = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
     torch.nn.Module.__init__(module)
+    module.intermediate_size = intermediate_size
     module.hidden_size = hidden_size
-    module.intermediate_size = routed_intermediate
-    module.shared_intermediate_size = shared_intermediate
-    module.num_local_experts = num_experts
     module._debug_module_index = 0
+    return module
 
-    module._import_routed_weights(routed)
-    module._import_shared_weights(shared)
 
-    expected_routed_gate = torch.stack([value[:routed_intermediate] for value in routed_fc1_init])
-    expected_routed_up = torch.stack([value[routed_intermediate:] for value in routed_fc1_init])
-    expected_routed_down = torch.stack(routed_fc2_init)
+def test_adopt_shared_weights_reuses_native_bf16_combined_parameters(monkeypatch):
+    monkeypatch.setattr(mok_megakernel, "_debug_tag", lambda *_: None)
+    fc1 = torch.nn.Parameter(torch.randn((4, 3), dtype=torch.bfloat16))
+    down = torch.nn.Parameter(torch.randn((3, 2), dtype=torch.bfloat16))
+    shared = _shared_module(fc1, down)
+    module = _shared_adapter()
 
-    expected_shared_gate = torch.zeros((routed_intermediate, hidden_size))
-    expected_shared_up = torch.zeros_like(expected_shared_gate)
-    expected_shared_down = torch.zeros((hidden_size, routed_intermediate))
-    expected_shared_gate[:shared_intermediate].copy_(shared_fc1_init[:shared_intermediate])
-    expected_shared_up[:shared_intermediate].copy_(shared_fc1_init[shared_intermediate:])
-    expected_shared_down[:, :shared_intermediate].copy_(shared_fc2_init)
+    module._adopt_shared_weights(shared)
+    gate, up, actual_down = module.shared_weight_views()
 
-    expected_by_param = {
-        module.routed_gate_weight: expected_routed_gate,
-        module.routed_up_weight: expected_routed_up,
-        module.routed_down_weight: expected_routed_down,
-        module.shared_gate_weight: expected_shared_gate,
-        module.shared_up_weight: expected_shared_up,
-        module.shared_down_weight: expected_shared_down,
-    }
+    assert module.shared_fc1_weight is fc1
+    assert module.shared_down_weight is down
+    assert shared.linear_fc1.weight is fc1
+    assert shared.linear_fc2.weight is down
+    assert gate.untyped_storage().data_ptr() == fc1.untyped_storage().data_ptr()
+    assert up.untyped_storage().data_ptr() == fc1.untyped_storage().data_ptr()
+    assert gate.storage_offset() == 0
+    assert up.storage_offset() == fc1.shape[1] * module.intermediate_size
+    assert actual_down is down
+    torch.testing.assert_close(gate, fc1[:2])
+    torch.testing.assert_close(up, fc1[2:])
+
+
+def test_adopt_shared_weights_replaces_quantized_wrapper_and_preserves_init(
+    monkeypatch,
+):
+    from megatron.core import fp8_utils
     from megatron.core.optimizer.optimizer import _pop_high_precision_init_val
 
-    for param, expected in expected_by_param.items():
-        torch.testing.assert_close(
-            param.float(), expected.to(torch.bfloat16).float(), rtol=0, atol=0
-        )
-        preserved = _pop_high_precision_init_val(param)
-        torch.testing.assert_close(preserved, expected, rtol=0, atol=0)
-        assert _pop_high_precision_init_val(param) is None
+    monkeypatch.setattr(mok_megakernel, "_debug_tag", lambda *_: None)
+    monkeypatch.setattr(fp8_utils, "is_float8tensor", lambda _: True)
+    fc1_init = torch.arange(12, dtype=torch.float32).reshape(4, 3).add_(0.125)
+    down_init = torch.arange(6, dtype=torch.float32).reshape(3, 2).add_(0.375)
+    fc1, fc1_cleared = _parameter_with_preserved_init(fc1_init)
+    down, down_cleared = _parameter_with_preserved_init(down_init)
+    shared = _shared_module(fc1, down)
+    module = _shared_adapter()
 
-    assert all(item == [True] for item in cleared)
+    module._adopt_shared_weights(shared)
+
+    assert module.shared_fc1_weight is shared.linear_fc1.weight
+    assert module.shared_down_weight is shared.linear_fc2.weight
+    assert module.shared_fc1_weight is not fc1
+    assert module.shared_down_weight is not down
+    assert module.shared_fc1_weight.dtype == torch.bfloat16
+    assert module.shared_down_weight.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        module.shared_fc1_weight.float(), fc1_init.to(torch.bfloat16).float()
+    )
+    torch.testing.assert_close(
+        module.shared_down_weight.float(), down_init.to(torch.bfloat16).float()
+    )
+    torch.testing.assert_close(
+        _pop_high_precision_init_val(module.shared_fc1_weight), fc1_init
+    )
+    torch.testing.assert_close(
+        _pop_high_precision_init_val(module.shared_down_weight), down_init
+    )
+    assert fc1_cleared == [True]
+    assert down_cleared == [True]
+
+
+def test_combined_shared_main_grad_is_split_into_zero_copy_mok_views(monkeypatch):
+    from mok import ops
+
+    module = _split_module(use_mxfp8_weights=False)
+    module._split_main_grad_descriptor_cache = None
+    for param in module.autograd_routed_parameters:
+        param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+    module.shared_fc1_weight = _parameter_with_main_grad((8, 8))
+    module.shared_down_weight = _parameter_with_main_grad((8, 4))
+
+    monkeypatch.setattr(
+        ops, "make_routed_d_weight_storage_table", lambda grads: tuple(grads)
+    )
+    main_grads, _ = module.main_grad_arguments()
+
+    shared_fc1_grad = module.shared_fc1_weight.main_grad
+    assert main_grads[0].untyped_storage().data_ptr() == (
+        shared_fc1_grad.untyped_storage().data_ptr()
+    )
+    assert main_grads[2].untyped_storage().data_ptr() == (
+        shared_fc1_grad.untyped_storage().data_ptr()
+    )
+    assert main_grads[0].storage_offset() == 0
+    assert main_grads[2].storage_offset() == 4 * 8
+    assert main_grads[4] is module.shared_down_weight.main_grad
+
+
+@pytest.mark.parametrize("single_grouped", [False, True])
+def test_mok_sharded_state_dict_emits_no_parameter_aliases(single_grouped):
+    module = _split_module(use_mxfp8_weights=False)
+    module.native_single_grouped_weights = single_grouped
+
+    assert module.sharded_state_dict(prefix="layers.0.mlp.mok_experts.") == {}
+    assert module.state_dict(prefix="layers.0.mlp.mok_experts.") == {}
+
+
+@pytest.mark.parametrize("single_grouped", [False, True])
+def test_native_checkpoint_load_ignores_all_mok_alias_keys(single_grouped):
+    experts = torch.nn.Module()
+    experts.linear_fc1 = torch.nn.Module()
+    experts.linear_fc2 = torch.nn.Module()
+    if single_grouped:
+        routed_fc1 = torch.nn.Parameter(torch.zeros((2, 8, 8)))
+        routed_down = torch.nn.Parameter(torch.zeros((2, 8, 4)))
+        experts.linear_fc1.register_parameter("weight", routed_fc1)
+        experts.linear_fc2.register_parameter("weight", routed_down)
+        routed_checkpoint = {
+            "experts.linear_fc1.weight": torch.full_like(routed_fc1, 3.0),
+            "experts.linear_fc2.weight": torch.full_like(routed_down, 5.0),
+        }
+    else:
+        routed_fc1 = torch.nn.Parameter(torch.zeros((8, 8)))
+        routed_down = torch.nn.Parameter(torch.zeros((8, 4)))
+        experts.linear_fc1.register_parameter("weight0", routed_fc1)
+        experts.linear_fc2.register_parameter("weight0", routed_down)
+        routed_checkpoint = {
+            "experts.linear_fc1.weight0": torch.full_like(routed_fc1, 3.0),
+            "experts.linear_fc2.weight0": torch.full_like(routed_down, 5.0),
+        }
+
+    shared_fc1 = torch.nn.Parameter(torch.zeros((8, 8)))
+    shared_down = torch.nn.Parameter(torch.zeros((8, 4)))
+    shared = _shared_module(shared_fc1, shared_down)
+
+    mok = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
+    torch.nn.Module.__init__(mok)
+    mok.native_single_grouped_weights = single_grouped
+    mok._prepared_routed_weight_cache = object()
+    mok._split_main_grad_descriptor_cache = object()
+    mok.is_first_microbatch = False
+    if single_grouped:
+        mok.register_parameter("routed_fc1_weight", routed_fc1)
+        mok.register_parameter("routed_down_weight", routed_down)
+    else:
+        mok._routed_fc1_parameter_names = ("routed_fc1_weight0",)
+        mok._routed_down_parameter_names = ("routed_down_weight0",)
+        mok.register_parameter("routed_fc1_weight0", routed_fc1)
+        mok.register_parameter("routed_down_weight0", routed_down)
+    mok.register_parameter("shared_fc1_weight", shared_fc1)
+    mok.register_parameter("shared_down_weight", shared_down)
+
+    parent = torch.nn.Module()
+    parent.add_module("experts", experts)
+    parent.add_module("shared_experts", shared)
+    parent.add_module("mok_experts", mok)
+    checkpoint = {
+        **routed_checkpoint,
+        "shared_experts.linear_fc1.weight": torch.full_like(shared_fc1, 7.0),
+        "shared_experts.linear_fc2.weight": torch.full_like(shared_down, 11.0),
+    }
+    # A checkpoint from the earlier alias-owning prototype may contain these
+    # duplicate keys. They must not override the canonical native entries.
+    if single_grouped:
+        checkpoint["mok_experts.routed_fc1_weight"] = torch.full_like(
+            routed_fc1, 13.0
+        )
+        checkpoint["mok_experts.routed_down_weight"] = torch.full_like(
+            routed_down, 17.0
+        )
+    else:
+        checkpoint["mok_experts.routed_fc1_weight0"] = torch.full_like(
+            routed_fc1, 13.0
+        )
+        checkpoint["mok_experts.routed_down_weight0"] = torch.full_like(
+            routed_down, 17.0
+        )
+    checkpoint["mok_experts.shared_fc1_weight"] = torch.full_like(
+        shared_fc1, 19.0
+    )
+    checkpoint["mok_experts.shared_down_weight"] = torch.full_like(
+        shared_down, 23.0
+    )
+
+    parent.load_state_dict(checkpoint, strict=True)
+
+    torch.testing.assert_close(routed_fc1, next(iter(routed_checkpoint.values())))
+    torch.testing.assert_close(
+        routed_down, tuple(routed_checkpoint.values())[1]
+    )
+    torch.testing.assert_close(
+        shared_fc1, checkpoint["shared_experts.linear_fc1.weight"]
+    )
+    torch.testing.assert_close(
+        shared_down, checkpoint["shared_experts.linear_fc2.weight"]
+    )
+    assert mok._prepared_routed_weight_cache is None
+    assert mok._split_main_grad_descriptor_cache is None
+    assert mok.is_first_microbatch

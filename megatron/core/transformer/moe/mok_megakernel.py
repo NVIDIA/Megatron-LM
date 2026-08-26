@@ -2,8 +2,8 @@
 """Minimal Mixture-of-Kittens adapter for MCore MoE training experiments.
 
 This module intentionally keeps the integration narrow: MCore owns routing,
-parameters, DDP, and the optimizer, while MoK replaces dispatch, routed/shared
-expert computation, and combine. Checkpoint conversion remains out of scope.
+parameters, DDP, the optimizer, and the logical checkpoint format, while MoK
+replaces dispatch, routed/shared expert computation, and combine.
 """
 
 from __future__ import annotations
@@ -200,11 +200,9 @@ def _indexed_grouped_weight(linear: nn.Module, index: int, num_experts: int) -> 
 
 
 def _new_bf16_parameter(
-    shape: Iterable[int], reference: torch.Tensor, *, allreduce: bool, zero: bool = False
+    shape: Iterable[int], reference: torch.Tensor, *, allreduce: bool
 ) -> nn.Parameter:
     data = torch.empty(tuple(shape), dtype=torch.bfloat16, device=reference.device)
-    if zero:
-        data.zero_()
     param = nn.Parameter(data)
     _copy_parameter_attributes(param, reference, allreduce=allreduce)
     return param
@@ -468,18 +466,6 @@ def _native_single_grouped_weight_views(
     return fc1_views, fc1_views, fc2_views
 
 
-@torch.no_grad()
-def _accumulate_weight_gradient(param: nn.Parameter, grad: torch.Tensor) -> torch.Tensor:
-    """Accumulate a materialized wgrad; fallback for non-fused MOK precisions."""
-    main_grad = _main_grad_buffer(param)
-    if main_grad.shape != grad.shape:
-        raise RuntimeError(
-            "MOK weight-gradient shape mismatch: "
-            f"main_grad={tuple(main_grad.shape)}, grad={tuple(grad.shape)}"
-        )
-    main_grad.add_(grad)
-    return _finish_weight_gradient(param)
-
 
 def _mok_mxfp8_backward_weight_views(
     native_weight: tuple[torch.Tensor, ...],
@@ -711,13 +697,16 @@ class _MoKAutograd(torch.autograd.Function):
         from mok import functional
 
         num_routed_parameters = len(module.autograd_routed_parameters)
-        if len(parameters) != num_routed_parameters + 3:
+        if len(parameters) != num_routed_parameters + 2:
             raise RuntimeError(
                 "MOK autograd parameter count mismatch: "
-                f"got {len(parameters)}, expected {num_routed_parameters + 3}"
+                f"got {len(parameters)}, expected {num_routed_parameters + 2}"
             )
         routed_parameters = parameters[:num_routed_parameters]
-        shared_gate, shared_up, shared_down = parameters[num_routed_parameters:]
+        shared_fc1, shared_down = parameters[num_routed_parameters:]
+        shared_gate, shared_up, shared_down = module.shared_weight_views(
+            shared_fc1, shared_down
+        )
 
         workspace = functional.get_workspace(
             module.mok_config,
@@ -795,8 +784,7 @@ class _MoKAutograd(torch.autograd.Function):
             x,
             router_weights,
             *routed_parameters,
-            shared_gate,
-            shared_up,
+            shared_fc1,
             shared_down,
         )
         return output
@@ -807,7 +795,10 @@ class _MoKAutograd(torch.autograd.Function):
 
         x, router_weights, *parameters = ctx.saved_tensors
         num_routed_parameters = len(ctx.module.autograd_routed_parameters)
-        shared_gate, shared_up, shared_down = parameters[num_routed_parameters:]
+        shared_fc1, shared_down = parameters[num_routed_parameters:]
+        shared_gate, shared_up, shared_down = ctx.module.shared_weight_views(
+            shared_fc1, shared_down
+        )
         prepared_gate, prepared_up, prepared_down = ctx.quantized_weights
         if ctx.module.use_mxfp8_weights and ctx.module.native_single_grouped_weights:
             backward_gate = prepared_gate
@@ -889,13 +880,13 @@ class _MoKAutograd(torch.autograd.Function):
             )
         if ctx.module.fuse_wgrad_accumulation:
             routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
-            d_shared_gate = _finish_weight_gradient(ctx.module.shared_gate_weight)
-            d_shared_up = _finish_weight_gradient(ctx.module.shared_up_weight)
+            d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
             d_shared_down = _finish_weight_gradient(ctx.module.shared_down_weight)
         else:
             # Materialized routed gradients are only supported by the original
             # dense/single-grouped interface.
             routed_parameter_grads = (d_routed_gate, d_routed_down)
+            d_shared_fc1 = torch.cat((d_shared_gate, d_shared_up), dim=0)
 
         ctx.module = None
         ctx.workspace = None
@@ -908,14 +899,13 @@ class _MoKAutograd(torch.autograd.Function):
             d_router_weights,
             None,
             *routed_parameter_grads,
-            d_shared_gate,
-            d_shared_up,
+            d_shared_fc1,
             d_shared_down,
         )
 
 
 class MoKMegakernel(nn.Module):
-    """Own MCore trainable weights in the layouts consumed by the MoK kernel."""
+    """Execute MOK using trainable parameters owned by native MCore modules."""
 
     def __init__(
         self,
@@ -939,22 +929,28 @@ class MoKMegakernel(nn.Module):
                 "MOK native routed weights require gradient_accumulation_fusion=True"
             )
         if config.moe_mlp_glu_interleave_size is not None:
-            raise ValueError("MoK weight import requires non-interleaved MCore routed FC1 weights")
+            raise ValueError("MOK requires non-interleaved native MCore routed FC1 weights")
         if config.moe_shared_expert_glu_interleave_size is not None:
-            raise ValueError("MoK weight import requires non-interleaved shared FC1 weights")
+            raise ValueError("MOK requires non-interleaved native shared FC1 weights")
         if config.moe_pad_expert_input_to_capacity:
             raise ValueError(
                 "MOK supports at most moe_router_topk logical routes per token; "
                 "use MOK internal expert padding instead of moe_pad_expert_input_to_capacity"
             )
         if config.moe_shared_expert_gate:
-            raise ValueError("MoK does not support MCore's optional shared-expert output gate")
+            raise ValueError("MOK does not support MCore's optional shared-expert output gate")
 
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_ffn_hidden_size
-        self.shared_intermediate_size = config.moe_shared_expert_intermediate_size
+        shared_intermediate_size = config.moe_shared_expert_intermediate_size
+        if shared_intermediate_size != self.intermediate_size:
+            raise ValueError(
+                "MOK requires routed and shared experts to use the same intermediate "
+                f"size, got routed={self.intermediate_size}, "
+                f"shared={shared_intermediate_size}"
+            )
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
         self.use_mxfp8_weights = config.mok_use_mxfp8_weights
@@ -1005,8 +1001,8 @@ class MoKMegakernel(nn.Module):
             # Keep each native MCore expert parameter authoritative. MOK selects
             # its per-expert TMA descriptor inside the grouped-GEMM task, so no
             # dense expert-major payload or duplicate optimizer parameter is
-            # required. Register aliases before the caller unregisters the
-            # source expert module so DDP/optimizer hooks remain attached here.
+            # required. The aliases let MOK participate in parameter-gather hooks;
+            # the source expert module remains registered as the canonical owner.
             self._routed_fc1_parameter_names = []
             self._routed_down_parameter_names = []
             for expert_idx in range(self.num_local_experts):
@@ -1048,14 +1044,12 @@ class MoKMegakernel(nn.Module):
                 self._routed_down_parameter_names
             )
 
-        self._import_shared_weights(shared_experts)
+        self._adopt_shared_weights(shared_experts)
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
         self.is_first_microbatch = True
         self._prepared_routed_weight_cache = None
-        self._quantized_cache: tuple[Any, Any, Any] | None = None
-        self._quantized_versions: tuple[int, int, int] | None = None
         self._split_main_grad_descriptor_cache = None
 
     @property
@@ -1079,26 +1073,34 @@ class MoKMegakernel(nn.Module):
         return self.routed_fc1_parameters + self.routed_down_parameters
 
     @property
-    def routed_gate_parameter(self) -> nn.Parameter:
-        return self.routed_fc1_parameters[0]
-
-    @property
-    def routed_up_parameter(self) -> nn.Parameter:
-        return self.routed_fc1_parameters[0]
-
-    @property
-    def routed_down_parameter(self) -> nn.Parameter:
-        return self.routed_down_parameters[0]
-
-    @property
     def routed_debug_parameter(self) -> nn.Parameter:
-        return self.routed_gate_parameter
+        return self.routed_fc1_parameters[0]
+
+    def shared_weight_views(
+        self,
+        fc1: torch.Tensor | None = None,
+        down: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split native combined FC1 into zero-copy gate/up views for MOK."""
+        fc1 = self.shared_fc1_weight if fc1 is None else fc1
+        down = self.shared_down_weight if down is None else down
+        i, h = self.intermediate_size, self.hidden_size
+        if tuple(fc1.shape) != (2 * i, h) or tuple(down.shape) != (h, i):
+            raise RuntimeError(
+                "MOK shared weight shape mismatch: expected "
+                f"{(2 * i, h)} and {(h, i)}, got "
+                f"{tuple(fc1.shape)} and {tuple(down.shape)}"
+            )
+        if not fc1.is_contiguous() or not down.is_contiguous():
+            raise RuntimeError("MOK shared weights must use contiguous native storage")
+        return fc1.narrow(0, 0, i), fc1.narrow(0, i, i), down
 
     def main_grad_arguments(self):
         """Return MOK logical main grads and optional per-expert descriptors."""
-        shared_gate_grad = _main_grad_buffer(self.shared_gate_weight)
-        shared_up_grad = _main_grad_buffer(self.shared_up_weight)
-        shared_down_grad = _main_grad_buffer(self.shared_down_weight)
+        shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
+        shared_gate_grad, shared_up_grad, shared_down_grad = self.shared_weight_views(
+            shared_fc1_grad, _main_grad_buffer(self.shared_down_weight)
+        )
         fc1_main_grads = tuple(
             _main_grad_buffer(param) for param in self.routed_fc1_parameters
         )
@@ -1145,119 +1147,65 @@ class MoKMegakernel(nn.Module):
         )
 
     @torch.no_grad()
-    def _import_routed_weights(self, experts: nn.Module) -> None:
-        fc1 = experts.linear_fc1
-        fc2 = experts.linear_fc2
-        fc1_ref = _indexed_grouped_weight(fc1, 0, self.num_local_experts)
-        fc2_ref = _indexed_grouped_weight(fc2, 0, self.num_local_experts)
-        i, h, e = self.intermediate_size, self.hidden_size, self.num_local_experts
+    def _adopt_shared_weights(self, shared: nn.Module) -> None:
+        """Keep native BF16 shared weights and expose zero-copy MOK aliases.
 
-        self.routed_gate_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
-        self.routed_up_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
-        self.routed_down_weight = _new_bf16_parameter((e, h, i), fc2_ref, allreduce=False)
-        _debug_tag(self.routed_gate_weight, f"module{self._debug_module_index}.routed_gate_weight")
-        _debug_tag(self.routed_up_weight, f"module{self._debug_module_index}.routed_up_weight")
-        _debug_tag(self.routed_down_weight, f"module{self._debug_module_index}.routed_down_weight")
-
-        routed_gate_init = None
-        routed_up_init = None
-        routed_down_init = None
-        fc1_has_preserved_init = None
-        fc2_has_preserved_init = None
-
-        for expert_idx in range(e):
-            source_fc1, current_fc1_has_preserved_init = _materialize_parameter_init(
-                _indexed_grouped_weight(fc1, expert_idx, self.num_local_experts)
-            )
-            source_fc2, current_fc2_has_preserved_init = _materialize_parameter_init(
-                _indexed_grouped_weight(fc2, expert_idx, self.num_local_experts)
-            )
-            source_fc1 = source_fc1.reshape(2 * i, h)
-            source_fc2 = source_fc2.reshape(h, i)
-
-            if fc1_has_preserved_init is None:
-                fc1_has_preserved_init = current_fc1_has_preserved_init
-                if fc1_has_preserved_init:
-                    routed_gate_init = torch.empty(
-                        (e, i, h), dtype=source_fc1.dtype, device=source_fc1.device
-                    )
-                    routed_up_init = torch.empty_like(routed_gate_init)
-            elif fc1_has_preserved_init != current_fc1_has_preserved_init:
-                raise RuntimeError("MOK routed FC1 weights have inconsistent initialization state")
-
-            if fc2_has_preserved_init is None:
-                fc2_has_preserved_init = current_fc2_has_preserved_init
-                if fc2_has_preserved_init:
-                    routed_down_init = torch.empty(
-                        (e, h, i), dtype=source_fc2.dtype, device=source_fc2.device
-                    )
-            elif fc2_has_preserved_init != current_fc2_has_preserved_init:
-                raise RuntimeError("MOK routed FC2 weights have inconsistent initialization state")
-
-            self.routed_gate_weight[expert_idx].copy_(source_fc1[:i].to(torch.bfloat16))
-            self.routed_up_weight[expert_idx].copy_(source_fc1[i:].to(torch.bfloat16))
-            self.routed_down_weight[expert_idx].copy_(source_fc2.to(torch.bfloat16))
-            if routed_gate_init is not None:
-                routed_gate_init[expert_idx].copy_(source_fc1[:i])
-                routed_up_init[expert_idx].copy_(source_fc1[i:])
-            if routed_down_init is not None:
-                routed_down_init[expert_idx].copy_(source_fc2)
-
-        _attach_high_precision_init(self.routed_gate_weight, routed_gate_init)
-        _attach_high_precision_init(self.routed_up_weight, routed_up_init)
-        _attach_high_precision_init(self.routed_down_weight, routed_down_init)
-
-    @torch.no_grad()
-    def _import_shared_weights(self, shared: nn.Module) -> None:
+        The routed path may consume MXFP8 parameters directly. The initial MOK
+        integration deliberately keeps the shared expert in BF16, so a TE FP8
+        parameter created from the global model configuration is converted once
+        during construction and replaced in the native shared-expert module.
+        """
         fc1_ref = shared.linear_fc1.weight
-        fc2_ref = shared.linear_fc2.weight
-        routed_i = self.intermediate_size
-        shared_i = self.shared_intermediate_size
-        h = self.hidden_size
-
-        # Upstream MoK currently has one intermediate-size template parameter for
-        # both routed and shared experts. Zero-padding is mathematically inert and
-        # keeps the DSv4-Pro shared MLP (2048) equivalent inside a routed-I=3072
-        # kernel. The extra shared compute is reported as a known POC overhead.
-        self.shared_gate_weight = _new_bf16_parameter(
-            (routed_i, h), fc1_ref, allreduce=True, zero=True
-        )
-        self.shared_up_weight = _new_bf16_parameter(
-            (routed_i, h), fc1_ref, allreduce=True, zero=True
-        )
-        self.shared_down_weight = _new_bf16_parameter(
-            (h, routed_i), fc2_ref, allreduce=True, zero=True
-        )
-        _debug_tag(self.shared_gate_weight, f"module{self._debug_module_index}.shared_gate_weight")
-        _debug_tag(self.shared_up_weight, f"module{self._debug_module_index}.shared_up_weight")
-        _debug_tag(self.shared_down_weight, f"module{self._debug_module_index}.shared_down_weight")
-        source_fc1, fc1_has_preserved_init = _materialize_parameter_init(fc1_ref)
-        source_fc2, fc2_has_preserved_init = _materialize_parameter_init(fc2_ref)
-        source_fc1 = source_fc1.reshape(2 * shared_i, h)
-        source_fc2 = source_fc2.reshape(h, shared_i)
-        self.shared_gate_weight[:shared_i].copy_(source_fc1[:shared_i].to(torch.bfloat16))
-        self.shared_up_weight[:shared_i].copy_(source_fc1[shared_i:].to(torch.bfloat16))
-        self.shared_down_weight[:, :shared_i].copy_(source_fc2.to(torch.bfloat16))
-
-        shared_gate_init = None
-        shared_up_init = None
-        shared_down_init = None
-        if fc1_has_preserved_init:
-            shared_gate_init = torch.zeros(
-                (routed_i, h), dtype=source_fc1.dtype, device=source_fc1.device
+        down_ref = shared.linear_fc2.weight
+        i, h = self.intermediate_size, self.hidden_size
+        if tuple(fc1_ref.shape) != (2 * i, h) or tuple(down_ref.shape) != (h, i):
+            raise RuntimeError(
+                "MOK requires native combined shared FC1/FC2 shapes "
+                f"{(2 * i, h)} and {(h, i)}, got "
+                f"{tuple(fc1_ref.shape)} and {tuple(down_ref.shape)}"
             )
-            shared_up_init = torch.zeros_like(shared_gate_init)
-            shared_gate_init[:shared_i].copy_(source_fc1[:shared_i])
-            shared_up_init[:shared_i].copy_(source_fc1[shared_i:])
-        if fc2_has_preserved_init:
-            shared_down_init = torch.zeros(
-                (h, routed_i), dtype=source_fc2.dtype, device=source_fc2.device
-            )
-            shared_down_init[:, :shared_i].copy_(source_fc2)
 
-        _attach_high_precision_init(self.shared_gate_weight, shared_gate_init)
-        _attach_high_precision_init(self.shared_up_weight, shared_up_init)
-        _attach_high_precision_init(self.shared_down_weight, shared_down_init)
+        from megatron.core.fp8_utils import is_float8tensor
+
+        def native_bf16_parameter(
+            param: nn.Parameter, shape: tuple[int, ...], name: str
+        ) -> nn.Parameter:
+            if not isinstance(param, nn.Parameter):
+                raise RuntimeError(f"MOK shared {name} must be an nn.Parameter")
+            if (
+                not is_float8tensor(param)
+                and param.dtype == torch.bfloat16
+                and param.is_contiguous()
+            ):
+                return param
+
+            source, has_preserved_init = _materialize_parameter_init(param)
+            source = source.reshape(shape)
+            adopted = _new_bf16_parameter(shape, param, allreduce=True)
+            adopted.copy_(source.to(torch.bfloat16))
+            if has_preserved_init:
+                _attach_high_precision_init(adopted, source)
+            return adopted
+
+        shared_fc1 = native_bf16_parameter(fc1_ref, (2 * i, h), "FC1")
+        shared_down = native_bf16_parameter(down_ref, (h, i), "FC2")
+        if shared_fc1 is not fc1_ref:
+            shared.linear_fc1.weight = shared_fc1
+        if shared_down is not down_ref:
+            shared.linear_fc2.weight = shared_down
+
+        # These are aliases, not extra ownership. The native shared_experts
+        # module remains registered and emits the canonical checkpoint entries.
+        self.register_parameter("shared_fc1_weight", shared_fc1)
+        self.register_parameter("shared_down_weight", shared_down)
+        _debug_tag(
+            self.shared_fc1_weight,
+            f"module{self._debug_module_index}.shared_fc1_weight",
+        )
+        _debug_tag(
+            self.shared_down_weight,
+            f"module{self._debug_module_index}.shared_down_weight",
+        )
 
     @torch.no_grad()
     def quantized_routed_weights(self):
@@ -1339,6 +1287,34 @@ class MoKMegakernel(nn.Module):
         self.is_first_microbatch = False
         return self._prepared_routed_weight_cache
 
+    def sharded_state_dict(
+        self, prefix="", sharded_offsets=(), metadata=None
+    ):
+        """Emit no aliases; native expert modules own all checkpoint shards."""
+        del prefix, sharded_offsets, metadata
+        return {}
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """Emit no aliases in regular state dicts either."""
+        del destination, prefix, keep_vars
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Ignore legacy aliases and invalidate state derived from native weights."""
+        del state_dict, prefix, local_metadata, strict
+        del missing_keys, unexpected_keys, error_msgs
+        self._prepared_routed_weight_cache = None
+        self._split_main_grad_descriptor_cache = None
+        self.is_first_microbatch = True
+
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
@@ -1359,8 +1335,7 @@ class MoKMegakernel(nn.Module):
             router_weights,
             top_experts,
             *self.autograd_routed_parameters,
-            self.shared_gate_weight,
-            self.shared_up_weight,
+            self.shared_fc1_weight,
             self.shared_down_weight,
         )
         return output.view(original_shape)
