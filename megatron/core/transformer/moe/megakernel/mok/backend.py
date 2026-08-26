@@ -187,6 +187,8 @@ class MoKMegakernel(MegakernelBackend):
         )
         fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
         down_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_down_parameters)
+        # MCore combines routed gate/up in one FC1 main-grad; MOK receives the same
+        # representative twice and distinguishes them by row offset and expert descriptor.
         main_grads = (
             shared_gate_grad,
             fc1_main_grads[0],
