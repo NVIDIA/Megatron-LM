@@ -348,20 +348,29 @@ class TestMXFP8Tensor:
         assert torch.equal(tensor.data, expected.data)
         assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
-    def test_copy_normalizes_flashinfer_fp32_input_to_bf16(self):
-        if not HAVE_FLASHINFER:
-            pytest.skip("FlashInfer not available")
-
-        source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
-        tensor = MXFP8Tensor.from_bf16(source, backend="flashinfer")
+    def test_copy_normalizes_flashinfer_fp32_input_to_bf16(self, monkeypatch):
+        tensor = MXFP8Tensor(
+            data=torch.empty((16, 128), device="cuda", dtype=torch.float8_e4m3fn),
+            scale=torch.empty(512, device="cuda", dtype=torch.uint8),
+            backend="flashinfer",
+        )
         update = torch.randn(16, 128, device="cuda", dtype=torch.float32)
-        expected = MXFP8Tensor.from_bf16(update.to(torch.bfloat16), backend="flashinfer")
+        expected_data = torch.zeros_like(tensor.data)
+        expected_scale = torch.zeros_like(tensor.scale)
+        quantizer_input = {}
+
+        def fake_from_bf16(cls, value, group_size=32, backend="flashinfer"):
+            quantizer_input["dtype"] = value.dtype
+            return cls(data=expected_data, scale=expected_scale, backend=backend, dtype=value.dtype)
+
+        monkeypatch.setattr(MXFP8Tensor, "from_bf16", classmethod(fake_from_bf16))
 
         tensor.copy_(update)
 
+        assert quantizer_input["dtype"] == torch.bfloat16
         assert tensor.dtype == torch.bfloat16
-        assert torch.equal(tensor.data, expected.data)
-        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+        assert torch.equal(tensor.data, expected_data)
+        assert torch.equal(tensor.scale, expected_scale)
 
     def test_copy_rejects_stacked_storage(self):
         tensor = MXFP8Tensor.from_bf16(

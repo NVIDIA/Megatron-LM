@@ -1230,12 +1230,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
                 )
                 if mxfp8.dtype is not None:
-                    if source_dtype is not None and mxfp8.dtype != source_dtype:
+                    source_dtype = source_dtype or mxfp8.dtype
+                    if mxfp8.dtype != source_dtype:
                         raise RuntimeError(
                             f"Conflicting source dtypes for {linear_name} expert weights: "
                             f"{source_dtype} and {mxfp8.dtype}."
                         )
-                    source_dtype = mxfp8.dtype
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
