@@ -553,7 +553,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
 
         device_type = device.type if device is not None else "cuda"
-        has_outer_dp_axis = ddp_config.num_distributed_optimizer_instances > 1
 
         # Expert parameters are ZeRO-3 sharded over the whole expert-DP domain and never
         # take an outer axis: they are the large ones, so sharding them maximally matters
@@ -568,7 +567,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
 
-        if has_outer_dp_axis:
+        if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
             # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
@@ -710,12 +709,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
-            )
-        if ddp_config.outer_dp_sharding_strategy not in _DATA_PARALLEL_PLACEMENTS:
-            raise ValueError(
-                "MFSDP v2 supports outer_dp_sharding_strategy in "
-                f"{sorted(_DATA_PARALLEL_PLACEMENTS)}, got "
-                f"{ddp_config.outer_dp_sharding_strategy!r}."
             )
         if (
             ddp_config.outer_dp_sharding_strategy != "no_shard"

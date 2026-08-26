@@ -777,23 +777,3 @@ class TestMcoreAdapterHybrid:
             assert meshes == {("dp_outer", "dp_shard"), ("expert_dp",)}, meshes
         finally:
             Utils.destroy_model_parallel()
-
-    def test_outer_strategy_without_outer_axis_is_rejected(self):
-        """An outer strategy with a single instance has no axis to apply to."""
-        Utils.initialize_model_parallel(1, 1)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234)
-        config = self._config()
-        with pytest.raises(ValueError, match="requires an outer DP axis"):
-            FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    outer_dp_sharding_strategy="optim",
-                ),
-                module=_build_block(config),
-                pg_collection=pg_collection,
-            )

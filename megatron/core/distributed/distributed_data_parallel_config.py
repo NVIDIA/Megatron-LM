@@ -7,6 +7,10 @@ import torch
 
 from ..utils import is_torch_min_version
 
+# Sharding strategy names, ordered as the ZeRO ladder: each level shards one more
+# buffer than the last.
+_OUTER_DP_SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params")
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -281,6 +285,12 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.outer_dp_sharding_strategy not in _OUTER_DP_SHARDING_STRATEGIES:
+            raise ValueError(
+                "outer_dp_sharding_strategy must be one of "
+                f"{list(_OUTER_DP_SHARDING_STRATEGIES)}, got "
+                f"{self.outer_dp_sharding_strategy!r}."
+            )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 
