@@ -72,6 +72,9 @@ def _make_gpt_args(
     args.linear_num_key_heads = None
     args.linear_num_value_heads = None
     args.linear_conv_kernel_dim = None
+    args.kda_f_lora_rank = None
+    args.kda_use_full_rank_gate = True
+    args.kda_gate_lora_rank = None
     # MLA fields (unused but referenced).
     args.q_lora_rank = None
     args.qk_head_dim = None
@@ -106,6 +109,9 @@ def _make_kda_hybrid_args():
     args.hybrid_layer_pattern = "K"
     args.linear_key_head_dim = 32
     args.linear_value_head_dim = 32
+    args.kda_f_lora_rank = 16
+    args.kda_use_full_rank_gate = True
+    args.kda_gate_lora_rank = 24
     args.linear_num_key_heads = 8
     args.linear_num_value_heads = 8
     args.linear_conv_kernel_dim = 4
@@ -425,21 +431,30 @@ class TestHybridMatchesStandard:
 class TestKimiDeltaAttentionFlops:
     """KDA layers must contribute their projection and kernel work."""
 
-    def test_direct_projection_formula(self):
+    @pytest.mark.parametrize("use_full_rank_gate", (True, False))
+    def test_lora_projection_formula(self, use_full_rank_gate):
         args = _make_kda_hybrid_args()
+        args.kda_use_full_rank_gate = use_full_rank_gate
         batch_size = 2
         total_tokens = batch_size * args.seq_length
         qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
         v_dim = args.linear_value_head_dim * args.linear_num_value_heads
-        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        gate_projection_flops = args.hidden_size * v_dim
+        if not use_full_rank_gate:
+            gate_projection_flops = (
+                args.hidden_size * args.kda_gate_lora_rank + args.kda_gate_lora_rank * v_dim
+            )
+        projection_flops = (
+            args.hidden_size * (2 * qk_dim + v_dim + args.linear_num_key_heads)
+            + args.hidden_size * args.kda_f_lora_rank
+            + args.kda_f_lora_rank * qk_dim
+            + gate_projection_flops
+            + args.hidden_size * v_dim
+        )
         kda_forward = (
             2
             * total_tokens
-            * (
-                args.hidden_size * (in_proj_dim + args.linear_num_key_heads)
-                + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
-                + args.hidden_size * v_dim
-            )
+            * (projection_flops + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim))
         )
         kda_forward += (
             8

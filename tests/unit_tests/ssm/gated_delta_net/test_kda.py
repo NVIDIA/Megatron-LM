@@ -37,6 +37,9 @@ def _make_config(
     sequence_parallel: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
     linear_cp_mode: str = "headwise",
+    f_lora_rank: int = 16,
+    use_full_rank_gate: bool = True,
+    gate_lora_rank: int = 16,
 ) -> TransformerConfig:
     return TransformerConfig(
         hidden_size=128,
@@ -49,6 +52,9 @@ def _make_config(
         linear_value_head_dim=32,
         linear_num_key_heads=4,
         linear_num_value_heads=4,
+        kda_f_lora_rank=f_lora_rank,
+        kda_use_full_rank_gate=use_full_rank_gate,
+        kda_gate_lora_rank=gate_lora_rank,
         kda_safe_gate=True,
         kda_lower_bound=-5.0,
         normalization="RMSNorm",
@@ -110,6 +116,12 @@ def test_kda_config_rejects_unsupported_head_layouts():
     with pytest.raises(ValueError, match="equal key and value head dimensions"):
         replace(_make_config(), linear_value_head_dim=64)
 
+    with pytest.raises(ValueError, match="kda_f_lora_rank"):
+        replace(_make_config(), kda_f_lora_rank=0)
+
+    with pytest.raises(ValueError, match="kda_gate_lora_rank"):
+        replace(_make_config(use_full_rank_gate=False), kda_gate_lora_rank=-1)
+
     with pytest.raises(ValueError, match="must be either 'headwise' or 'chunkwise'"):
         _make_config(linear_cp_mode="tokenwise")
 
@@ -154,16 +166,30 @@ def test_kda_rejects_invalid_packed_boundaries():
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_kda_forward_backward():
+@pytest.mark.parametrize(
+    ("f_lora_rank", "use_full_rank_gate", "gate_lora_rank"),
+    [(16, True, 16), (8, False, 12)],
+    ids=["low-rank-f-full-rank-gate", "low-rank-f-low-rank-gate"],
+)
+def test_kda_forward_backward(f_lora_rank, use_full_rank_gate, gate_lora_rank):
     Utils.initialize_distributed()
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
     )
     try:
         model_parallel_cuda_manual_seed(123)
-        config = _make_config()
+        config = _make_config(
+            f_lora_rank=f_lora_rank,
+            use_full_rank_gate=use_full_rank_gate,
+            gate_lora_rank=gate_lora_rank,
+        )
         kda = _build_kda(config)
-        assert kda.in_proj_split_names == ["query", "key", "value", "g", "gate"]
+        assert kda.in_proj_split_names == ["query", "key", "value"]
+        assert kda.in_proj_dim == 2 * kda.qk_dim + kda.v_dim
+        assert kda.f_a_proj.weight.shape == (f_lora_rank, config.hidden_size)
+        assert kda.f_b_proj.weight.shape == (kda.qk_dim, f_lora_rank)
+        assert getattr(kda.f_a_proj, "bias", None) is None
+        assert getattr(kda.f_b_proj, "bias", None) is None
         assert kda.A_log.dtype == torch.float32
         assert kda.dt_bias.dtype == torch.float32
         assert getattr(kda.A_log, "keep_in_fp32", False)
@@ -175,6 +201,37 @@ def test_kda_forward_backward():
             dtype=torch.bfloat16,
             requires_grad=True,
         )
+        state_keys = set(kda.state_dict())
+        assert "f_a_proj.weight" in state_keys
+        assert "f_b_proj.weight" in state_keys
+        gate_weight_keys = {
+            key
+            for key in state_keys
+            if key.startswith(("g_proj.", "g_a_proj.", "g_b_proj.")) and key.endswith(".weight")
+        }
+
+        projection_input = hidden_states.detach()
+        f_latent, _ = kda.f_a_proj(projection_input)
+        f_actual, _ = kda.f_b_proj(f_latent)
+        f_expected = F.linear(F.linear(projection_input, kda.f_a_proj.weight), kda.f_b_proj.weight)
+        torch.testing.assert_close(f_actual, f_expected, atol=1e-2, rtol=1e-2)
+
+        if use_full_rank_gate:
+            assert gate_weight_keys == {"g_proj.weight"}
+            assert getattr(kda.g_proj, "bias", None) is None
+            gate_actual, _ = kda.g_proj(projection_input)
+            gate_expected = F.linear(projection_input, kda.g_proj.weight)
+        else:
+            assert gate_weight_keys == {"g_a_proj.weight", "g_b_proj.weight"}
+            assert getattr(kda.g_a_proj, "bias", None) is None
+            assert getattr(kda.g_b_proj, "bias", None) is None
+            gate_latent, _ = kda.g_a_proj(projection_input)
+            gate_actual, _ = kda.g_b_proj(gate_latent)
+            gate_expected = F.linear(
+                F.linear(projection_input, kda.g_a_proj.weight), kda.g_b_proj.weight
+            )
+        torch.testing.assert_close(gate_actual, gate_expected, atol=1e-2, rtol=1e-2)
+
         output, bias = kda(hidden_states, None)
         assert bias is None
         assert output.shape == hidden_states.shape
@@ -203,6 +260,9 @@ def test_kda_gate_parameters_remain_fp32_after_model_cast():
         assert wrapped.module.beta_proj.weight.dtype == torch.bfloat16
         assert wrapped.module.A_log.dtype == torch.float32
         assert wrapped.module.dt_bias.dtype == torch.float32
+        assert wrapped.module.f_a_proj.weight.dtype == torch.bfloat16
+        assert wrapped.module.f_b_proj.weight.dtype == torch.bfloat16
+        assert wrapped.module.g_proj.weight.dtype == torch.bfloat16
     finally:
         Utils.destroy_model_parallel()
 
@@ -392,18 +452,42 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1():
 
 
 @pytest.mark.parametrize(
-    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
+    (
+        "sequence_packing",
+        "tp",
+        "sp",
+        "cp",
+        "linear_cp_mode",
+        "f_lora_rank",
+        "use_full_rank_gate",
+        "gate_lora_rank",
+    ),
     [
-        (False, 2, True, 1, "headwise"),
-        (True, 1, False, 2, "headwise"),
-        (True, 2, True, 2, "headwise"),
-        (True, 1, False, 2, "chunkwise"),
-        (True, 2, True, 2, "chunkwise"),
+        (False, 2, True, 1, "headwise", 16, True, 16),
+        (True, 1, False, 2, "headwise", 8, False, 12),
+        (True, 2, True, 2, "headwise", 16, True, 16),
+        (True, 1, False, 2, "chunkwise", 8, False, 12),
+        (True, 2, True, 2, "chunkwise", 8, False, 12),
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode):
-    config = _make_config(linear_cp_mode=linear_cp_mode)
+def test_parallel_kda_correctness(
+    tmp_path_dist_ckpt,
+    sequence_packing,
+    tp,
+    sp,
+    cp,
+    linear_cp_mode,
+    f_lora_rank,
+    use_full_rank_gate,
+    gate_lora_rank,
+):
+    config = _make_config(
+        linear_cp_mode=linear_cp_mode,
+        f_lora_rank=f_lora_rank,
+        use_full_rank_gate=use_full_rank_gate,
+        gate_lora_rank=gate_lora_rank,
+    )
     _test_parallel_attention_correctness(
         transformer_config=config,
         transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,

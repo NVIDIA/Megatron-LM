@@ -439,6 +439,15 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    kda_f_lora_rank: Optional[int] = None
+    """Rank of KDA's bias-free F-decay projection. Defaults to ``linear_key_head_dim``."""
+
+    kda_use_full_rank_gate: bool = True
+    """Use a full-rank output gate in KDA. When False, use a bias-free low-rank gate."""
+
+    kda_gate_lora_rank: Optional[int] = None
+    """Rank of KDA's low-rank output gate; defaults to ``linear_value_head_dim`` when used."""
+
     kda_safe_gate: bool = False
     """Whether the KDA kernel should use bounded gate values."""
 
@@ -1808,6 +1817,20 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError("KDA requires equal key and value head counts.")
                 if self.linear_key_head_dim != self.linear_value_head_dim:
                     raise ValueError("KDA requires equal key and value head dimensions.")
+                if self.kda_f_lora_rank is None:
+                    self.kda_f_lora_rank = self.linear_key_head_dim
+                if self.kda_f_lora_rank <= 0:
+                    raise ValueError(
+                        f"KDA requires kda_f_lora_rank > 0, got {self.kda_f_lora_rank}."
+                    )
+                if not self.kda_use_full_rank_gate:
+                    if self.kda_gate_lora_rank is None:
+                        self.kda_gate_lora_rank = self.linear_value_head_dim
+                    if self.kda_gate_lora_rank <= 0:
+                        raise ValueError(
+                            "KDA requires kda_gate_lora_rank > 0, "
+                            f"got {self.kda_gate_lora_rank}."
+                        )
                 if self.kda_safe_gate:
                     if self.kda_lower_bound is None:
                         raise ValueError("KDA requires kda_lower_bound when kda_safe_gate=True.")

@@ -228,8 +228,7 @@ class _GDNBase(MegatronModule):
             assert (
                 getattr(self, attr) is not None
             ), f"Attribute {attr} for the GDN-family variant is not set"
-        # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+        self.in_proj_dim = self._get_in_proj_dim()
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -326,12 +325,23 @@ class _GDNBase(MegatronModule):
 
         self.reset_parameters()
 
+    def _get_in_proj_dim(self) -> int:
+        """Return the fused input-projection width for this GDN-family variant.
+
+        The shared GDN layout contains Q, K, V, the output gate, and any
+        variant-specific gate features. Variants with separately parameterized
+        projections can override this hook without encoding a negative
+        ``in_proj_extra_dim``.
+        """
+
+        return self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+
     def _setup_variant_attrs(self):
         """Set variant projection sections, gate parameter sizes, and kernel callable.
 
         Must set:
-        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the base
-          class derives ``in_proj_dim`` from it)
+        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the default
+          ``_get_in_proj_dim`` implementation derives ``in_proj_dim`` from it)
         - ``in_proj_split_names``
         - ``in_proj_split_sections``
         - ``dt_bias_dim`` / ``a_log_dim`` (sizes of the gate parameters, which the
