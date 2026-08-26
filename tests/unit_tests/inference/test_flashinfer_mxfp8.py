@@ -93,6 +93,34 @@ def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
     assert config.expert_model_parallel_size == 2
 
 
+def test_vllm_config_rejects_enabled_mxfp8():
+    with pytest.raises(ValueError, match="vLLM Triton fused MoE only supports BF16"):
+        _make_bounded_mxfp8_config(
+            inference_grouped_gemm_backend="vllm", inference_flashinfer_mxfp8_token_capacity=None
+        )
+
+
+def test_inference_mxfp8_config_requires_fp8_param():
+    with pytest.raises(ValueError, match="fp8_param must be enabled"):
+        _make_bounded_mxfp8_config(fp8_param=False)
+
+
+def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
+    config = _make_bounded_mxfp8_config(
+        fp8=None,
+        fp8_param=False,
+        activation_func=F.gelu,
+        inference_flashinfer_mxfp8_token_capacity=None,
+    )
+
+    assert config.fp8 is None
+
+
+def test_bounded_flashinfer_mxfp8_config_requires_enabled_fp8():
+    with pytest.raises(ValueError, match="requires.*FP8 enabled"):
+        _make_bounded_mxfp8_config(fp8=None, fp8_param=False)
+
+
 @pytest.mark.parametrize("activation_func", [F.gelu, F.silu, F.relu])
 def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func):
     with pytest.raises(ValueError, match="supports only non-gated squared-ReLU experts"):
@@ -123,6 +151,47 @@ def test_missing_routed_mxfp8_capability_has_precise_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires FlashInfer >= 0.6.4"):
         flashinfer_mxfp8.require_flashinfer_routed_mxfp8()
+
+
+def test_routed_mxfp8_packing_preserves_topk_probabilities():
+    from megatron.core.inference.moe.flashinfer_mxfp8 import pack_routed_mxfp8_routing
+
+    expert_ids = torch.tensor([[3, 7], [1, 9]], dtype=torch.int64)
+    probabilities = torch.tensor([[0.75, 0.25], [0.625, 0.375]], dtype=torch.float32)
+
+    packed = pack_routed_mxfp8_routing(expert_ids, probabilities)
+    unpacked_ids = packed >> 16
+    unpacked_probabilities = (packed & 0xFFFF).to(torch.int16).view(torch.bfloat16)
+
+    assert torch.equal(unpacked_ids, expert_ids.to(torch.int32))
+    assert torch.equal(unpacked_probabilities, probabilities.to(torch.bfloat16))
+
+
+def test_flashinfer_mxfp8_refresh_reports_noop_before_weight_build():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=False,
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER,
+    )
+
+    assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
+
+
+def test_flashinfer_mxfp8_refresh_rejects_stale_non_routed_buffer(monkeypatch):
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe import experts
+
+    monkeypatch.setattr(experts, "require_flashinfer_routed_mxfp8", lambda: None)
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=True,
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER,
+        _fc1_weight=torch.empty(1),
+    )
+
+    with pytest.raises(TypeError, match="_fc1_weight is not a FlashInfer routed MXFP8 weight"):
+        experts.InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp)
 
 
 def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):

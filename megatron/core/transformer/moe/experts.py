@@ -1283,13 +1283,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
     @torch.inference_mode(False)
     @torch.no_grad()
-    def refresh_flashinfer_mxfp8_weights(self) -> None:
-        """Refresh routed Major-K expert weights in place after an MXFP8 refit."""
+    def refresh_flashinfer_mxfp8_weights(self) -> bool:
+        """Refresh routed Major-K expert weights in place after an MXFP8 refit.
+
+        Returns whether derived FlashInfer weights were refreshed.
+        """
         if (
             not self._concatenated_weights_built
             or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
         ):
-            return
+            return False
         require_flashinfer_routed_mxfp8()
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             routed_weight = getattr(self, buf_name)
@@ -1297,6 +1300,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 raise TypeError(f"{buf_name} is not a FlashInfer routed MXFP8 weight")
             canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
+        return True
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
@@ -1443,7 +1447,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         if not InferenceMode.is_active():
             assert (
-                not self.config.fp8_recipe == "mxfp8"
+                not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 

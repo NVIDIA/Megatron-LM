@@ -207,6 +207,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -219,6 +220,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "transformer_engine"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -231,7 +233,21 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "delayed"
+
+        class _Model:
+            config = _Cfg()
+
+        assert _needs_mxfp8_conversion(_Model()) is False
+
+    def test_inactive_mxfp8_recipe_returns_false(self):
+        from megatron.core.resharding.refit import _needs_mxfp8_conversion
+
+        class _Cfg:
+            transformer_impl = "inference_optimized"
+            fp8 = None
+            fp8_recipe = "mxfp8"
 
         class _Model:
             config = _Cfg()
@@ -244,6 +260,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -306,6 +323,7 @@ class TestSetupMxfp8TransformOnPlan:
 
         class _Config:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
             inference_grouped_gemm_backend = "flashinfer"
 

@@ -373,7 +373,7 @@ class MoELayer(BaseMoELayer):
                     "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
                 fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
-                if fp8_recipe == "mxfp8":
+                if config.fp8 and fp8_recipe == "mxfp8":
                     require_flashinfer_routed_mxfp8()
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available

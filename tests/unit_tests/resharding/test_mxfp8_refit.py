@@ -300,7 +300,7 @@ class TestMXFP8ReshardTransform:
             new_data = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
             transform.finalize_recv(name, (slice(None), slice(None)), [new_data])
 
-        InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp)
+        assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is True
 
         for linear_name, routed_weight in (
             ("linear_fc1", grouped_mlp._fc1_weight),

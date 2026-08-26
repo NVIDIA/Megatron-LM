@@ -252,6 +252,7 @@ def _needs_mxfp8_conversion(model) -> bool:
     config = lm.config
     return (
         getattr(config, 'transformer_impl', None) == 'inference_optimized'
+        and bool(getattr(config, 'fp8', None))
         and getattr(config, 'fp8_recipe', None) == 'mxfp8'
     )
 
@@ -316,17 +317,16 @@ def prepare_swap_model_weights(
     same module-level cache as swap_model_weights, so subsequent calls reuse it
     without needing to inspect named_parameters() again.
 
-    If the *target_model* uses an inference-optimized layer spec with MXFP8
-    (``config.transformer_impl == 'inference_optimized'`` and
-    ``config.fp8_recipe == 'mxfp8'``), this function also:
+    If the target_model uses an inference-optimized layer spec with MXFP8
+    (config.transformer_impl == 'inference_optimized' and
+    config.fp8 is not None and config.fp8_recipe == 'mxfp8'), this function also:
       - computes which parameters are eligible for MXFP8 conversion,
       - quantizes the target decoder weights to persistent MXFP8Tensor buffers
         (whose addresses are later baked into CUDA graphs),
-      - creates an ``MXFP8ReshardTransform`` that subsequent
-        ``swap_model_weights`` calls use automatically.
+      - creates an MXFP8ReshardTransform that subsequent
+        swap_model_weights calls use automatically.
 
-    Callers do **not** need to know about MXFP8 — the transform is created and
-    cached transparently.
+    Callers do not need to know about MXFP8; the transform is created and cached transparently.
 
     All participating ranks must call this simultaneously — the plan builder uses
     collective communication internally.
@@ -515,8 +515,7 @@ def reshard_model_weights(
         for module in tgt_core.modules():
             refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
             if refresh is not None:
-                refresh()
-                refreshed = True
+                refreshed = bool(refresh()) or refreshed
         if refreshed:
             # Repacking is asynchronous. Synchronize before another stream replays graphs
             # that read these derived weight buffers.

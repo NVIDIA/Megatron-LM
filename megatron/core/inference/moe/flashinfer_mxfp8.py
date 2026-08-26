@@ -295,6 +295,8 @@ def flashinfer_routed_mxfp8_moe_prequantized(
         local_expert_offset=local_expert_offset,
         local_num_experts=fc1_weight.data.shape[0],
         routed_scaling_factor=None,
+        # Packed precomputed routing consumes these weights as-is; no routing
+        # softmax or top-k renormalization is applied.
         routing_method_type=0,
         use_shuffled_weight=True,
         weight_layout=WeightLayout.MajorK.value,
@@ -356,7 +358,7 @@ def flashinfer_routed_mxfp8_moe(
         policy_key = (policy, token_capacity, decode_token_upper_bound, full_rows)
         if policy_key not in _LOGGED_TOKEN_POLICIES:
             _LOGGED_TOKEN_POLICIES.add(policy_key)
-            logger.warning(
+            logger.info(
                 "FlashInfer MXFP8 token policy: %s active_rows=%d full_rows=%d "
                 "configured_capacity=%d decode_upper_bound=%s",
                 policy,
