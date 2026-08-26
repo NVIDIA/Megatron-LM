@@ -140,6 +140,20 @@ class ProcessGroupCollection:
     # _EXPERT_GTP_WEIGHT_REMAT_GROUP
     expt_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
+    # The full GTP group (GTP = TP x GTP_remat): the flattened domain for
+    # layer-sharded Muon's single-all_to_all exchange. Never built from
+    # parallel_state (which is compatibility-only). OPTIONAL OVERRIDE: when
+    # unset, the layer-wise optimizer wiring derives the communicator lazily
+    # from the tp and gtp_remat groups (parallel_state-free, multimodal-safe);
+    # supply it here only to override that. Domains containing GTP-padded
+    # params use the bitwise-identical two-stage exchange instead. Rank-order
+    # contract either way: group rank g * tp_size + t, TP innermost (asserted
+    # at step time).
+    gtp: torch.distributed.ProcessGroup = field(init=False)
+
+    # Expert variant: the full expert GTP group (expt_tp x egtp_remat).
+    expt_gtp: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
@@ -308,6 +322,12 @@ class ProcessGroupCollection:
             'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
             ),
+            # Not built from parallel_state: the full-GTP fused domain for
+            # layer-sharded Muon is opt-in and must be supplied by the caller
+            # (the two-stage exchange is the default). Every field needs an
+            # entry here or the required_pgs assert below fires.
+            'gtp': lambda: None,
+            'expt_gtp': lambda: None,
         }
 
         assert all(
