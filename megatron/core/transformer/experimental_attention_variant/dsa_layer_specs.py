@@ -21,9 +21,7 @@ Usage::
 import copy
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
-    DSGroupedSelfAttention,
-)
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa import DSGroupedSelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 

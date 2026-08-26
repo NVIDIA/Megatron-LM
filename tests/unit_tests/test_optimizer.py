@@ -28,12 +28,11 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
 from megatron.core.optimizer.optimizer import (
     MegatronOptimizer,
+    copy_optimizer_param_metadata,
     get_param_group_identifier_tuple,
 )
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -288,9 +287,7 @@ def test_separate_dsa_clipping_uses_independent_norms_and_thresholds(monkeypatch
         },
     )()
 
-    combined_norm = MegatronOptimizer.clip_grad_norm_separate_dsa_indexer(
-        optimizer, clip_grad=1.0
-    )
+    combined_norm = MegatronOptimizer.clip_grad_norm_separate_dsa_indexer(optimizer, clip_grad=1.0)
 
     assert combined_norm == pytest.approx((4.0**2 + 2.0**2) ** 0.5)
     assert optimizer._last_dsa_split_grad_norms == (4.0, 2.0)
@@ -315,16 +312,8 @@ def test_dsa_split_parameters_follow_param_group_metadata():
                 {
                     'param_groups': [
                         {'params': [main_param], 'is_dsa_indexer': False},
-                        {
-                            'params': [indexer_weight],
-                            'is_dsa_indexer': True,
-                            'wd_mult': 1.0,
-                        },
-                        {
-                            'params': [indexer_bias],
-                            'is_dsa_indexer': True,
-                            'wd_mult': 0.0,
-                        },
+                        {'params': [indexer_weight], 'is_dsa_indexer': True, 'wd_mult': 1.0},
+                        {'params': [indexer_bias], 'is_dsa_indexer': True, 'wd_mult': 0.0},
                     ]
                 },
             )()
@@ -342,9 +331,7 @@ def test_global_clipping_path_records_preclip_dsa_split_norms_for_logging():
         (),
         {
             'optimizer': type(
-                '_TorchOptimizer',
-                (),
-                {'param_groups': [{'params': [], 'is_dsa_indexer': True}]},
+                '_TorchOptimizer', (), {'param_groups': [{'params': [], 'is_dsa_indexer': True}]}
             )(),
             'get_dsa_split_grad_norms': lambda self: (3.0, 4.0),
             '_last_dsa_split_grad_norms': None,
@@ -446,8 +433,7 @@ def test_distributed_fused_adam_state_dict_preserves_indexer_clock(monkeypatch):
         ],
     }
     harness = SimpleNamespace(
-        optimizer=SimpleNamespace(state_dict=lambda: inner_state_dict),
-        grad_scaler=None,
+        optimizer=SimpleNamespace(state_dict=lambda: inner_state_dict), grad_scaler=None
     )
 
     state_dict = DistributedOptimizer.state_dict(harness)

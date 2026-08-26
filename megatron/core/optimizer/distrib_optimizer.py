@@ -67,7 +67,6 @@ from .optimizer import (
     MixedPrecisionOptimizer,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
-    param_group_identifier_keys,
     get_param_group_identifier_tuple,
 )
 from .optimizer_config import OptimizerConfig

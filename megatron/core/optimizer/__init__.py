@@ -374,6 +374,7 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
+
     # Sort keys, None first.
     # Keys gathered from other ranks or module domains may predate the is_dsa_indexer
     # element; treat a missing element as False so ordering stays total either way.
