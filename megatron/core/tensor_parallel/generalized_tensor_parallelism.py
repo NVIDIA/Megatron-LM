@@ -1857,7 +1857,8 @@ class GTPShardedParam(torch.nn.Parameter):
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
         hook = getattr(param, "_grad_accum_hook", None)
         if hook is not None:
-            register_capture_wgrad_finalize(param)
+            if _chain_is_graphed(param.chain_id):
+                register_capture_wgrad_finalize(param)
             hook()
 
         param._set_rs_state(GTPWeightState.NONE)

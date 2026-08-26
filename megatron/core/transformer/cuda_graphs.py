@@ -1059,6 +1059,27 @@ class _CudaGraphRunner(torch.nn.Module):
         for s in side_streams:
             torch.cuda.current_stream().wait_stream(s)
 
+    def _set_gtp_finalize_hook_plan(self, finalized_params):
+        """Build the replay hook plan from captured GRAPHED finalization occurrences."""
+        self.finalized_during_bwd_capture = list(finalized_params) if self.gtp_remat else []
+        self._gtp_finalize_hook_plan = []
+        if not self.finalized_during_bwd_capture:
+            return
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat", "expt_gtp_remat"]
+        )
+        dense_group = pg_collection.gtp_remat
+        expert_group = pg_collection.expt_gtp_remat
+        params_by_group = defaultdict(list)
+        for param in self.finalized_during_bwd_capture:
+            is_expert = not getattr(param, 'allreduce', True)
+            params_by_group[expert_group if is_expert else dense_group].append(param)
+        self._gtp_finalize_hook_plan = [
+            (get_rs_stream(GTPChain.GRAPHED.value, group), params)
+            for group, params in params_by_group.items()
+        ]
+
     def __str__(self):
         return "%s; hid %s" % (
             self.base_module.__class__.__name__,
@@ -1549,28 +1570,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.unfreeze()
 
-        self.finalized_during_bwd_capture = (
-            list(capture_comms.finalized_params) if self.gtp_remat else []
-        )
         self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
-
-        # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's
-        # replay-invariant — so Graphed.backward avoids per-replay group lookups.
-        self._gtp_finalize_hook_plan = []
-        if self.gtp_remat and self.finalized_during_bwd_capture:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-            dense_group = pg_collection.gtp_remat
-            expert_group = pg_collection.expt_gtp_remat
-            params_by_group = defaultdict(list)
-            for param in self.finalized_during_bwd_capture:
-                is_expert = not getattr(param, 'allreduce', True)
-                params_by_group[expert_group if is_expert else dense_group].append(param)
-            self._gtp_finalize_hook_plan = [
-                (get_rs_stream(GTPChain.GRAPHED.value, group), params)
-                for group, params in params_by_group.items()
-            ]
+        self._set_gtp_finalize_hook_plan(capture_comms.finalized_params if self.gtp_remat else ())
 
         for arg in args_to_clear_buffers:
             arg.cg_buffer_metadata.bwd_cudagraph_buffer = None

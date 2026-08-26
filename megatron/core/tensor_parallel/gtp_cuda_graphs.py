@@ -157,7 +157,7 @@ class GTPCaptureCommState:
             self.wgrad_ring_slots.append(slot)
 
     def register_wgrad_finalize(self, param) -> None:
-        """Record one DDP grad-ready occurrence produced by captured GTP finalization."""
+        """Record one DDP grad-ready occurrence produced by GRAPHED GTP finalization."""
         # Repeated uses of one parameter must remain repeated: DDP learns the expected ready
         # count during eager execution, and CUDA graph replay must reproduce that count.
         self.finalized_params.append(param)
@@ -173,7 +173,7 @@ def register_capture_comm(param, stream: torch.cuda.Stream, *, reduce_scatter: b
 
 
 def register_capture_wgrad_finalize(param) -> None:
-    """Record one GTP wgrad-finalization occurrence with the active capture."""
+    """Record one GRAPHED GTP wgrad-finalization occurrence with the active capture."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
         _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_finalize(param)
 
