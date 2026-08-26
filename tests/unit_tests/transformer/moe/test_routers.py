@@ -213,7 +213,7 @@ class TestTop2Router:
             ("allgather", "deepep", None, None),
             ("alltoall", "deepep", None, None),
             ("flex", "deepep", None, None),
-            ("flex", "deepepv2", None, None),
+            ("flex", "ncclep", None, None),
             ("flex", "hybridep", 1.0, None),
             ("flex", "hybridep", None, 1.0),
         ],
@@ -245,13 +245,18 @@ class TestTop2Router:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("with_padding_mask", [False, True])
-    def test_expert_bias_token_counts_with_padding_mask(self, with_padding_mask):
+    @pytest.mark.parametrize("dispatcher,backend", [("allgather", "deepep"), ("flex", "hybridep")])
+    def test_expert_bias_token_counts_with_padding_mask(
+        self, with_padding_mask, dispatcher, backend
+    ):
         """Test expert-bias counts in grad-enabled masked and unmasked forwards."""
         config = dataclasses.replace(
             self.transformer_config,
             moe_router_enable_expert_bias=True,
             moe_router_load_balancing_type="none",
             moe_router_score_function="sigmoid",
+            moe_token_dispatcher_type=dispatcher,
+            moe_flex_dispatcher_backend=backend,
         )
         submodules = get_submodules(
             get_gpt_layer_local_submodules(
@@ -276,6 +281,9 @@ class TestTop2Router:
             padding_mask[-2:, 0] = True
 
         probs, routing_map = router(hidden_states, padding_mask=padding_mask)
+        if dispatcher == "flex" and padding_mask is not None:
+            assert not routing_map[padding_mask.reshape(-1)].any()
+
         valid_routing_map = routing_map
         if padding_mask is not None:
             valid_routing_map = routing_map[~padding_mask.reshape(-1)]
