@@ -256,17 +256,7 @@ class TestHybridModel:
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
 
-    def test_mtp_tp_overlap_is_normalized_before_decoder_configs(self, monkeypatch):
-        class CheckingMTPBlock(torch.nn.Module):
-
-            def __init__(self, config, **kwargs):
-                super().__init__()
-                assert config.tp_comm_overlap is False
-
-        monkeypatch.setattr(
-            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock", CheckingMTPBlock
-        )
-
+    def test_mtp_rejects_tp_overlap(self):
         model_config = TransformerConfig(
             num_layers=1,
             hidden_size=256,
@@ -275,8 +265,10 @@ class TestHybridModel:
             mtp_num_layers=1,
             tp_comm_overlap=True,
         )
-        with pytest.warns(UserWarning, match="Disabling tp_comm_overlap"):
-            model = HybridModel(
+        with pytest.raises(
+            ValueError, match="TP communication overlap is not supported with hybrid MTP layers"
+        ):
+            HybridModel(
                 config=model_config,
                 hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=100,
@@ -284,8 +276,7 @@ class TestHybridModel:
                 hybrid_layer_pattern="-/M",
             )
 
-        assert model.config.tp_comm_overlap is False
-        assert all(config.tp_comm_overlap is False for config in model.decoder.layer_config_list)
+        assert model_config.tp_comm_overlap is True
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config

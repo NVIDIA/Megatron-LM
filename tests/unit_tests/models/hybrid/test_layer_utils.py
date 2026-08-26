@@ -1,7 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
-
 import pytest
 
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -113,7 +111,7 @@ class TestGetLayerSymbolFromConfig:
 
 
 @pytest.mark.internal
-class TestNormalizeTpCommOverlap:
+class TestValidateTpCommOverlap:
 
     @pytest.mark.parametrize(
         ("segment", "has_mtp", "unsupported_features"),
@@ -124,20 +122,18 @@ class TestNormalizeTpCommOverlap:
             (layer_utils.Symbols.DS_ATTENTION + layer_utils.Symbols.MLA, True, "MLA/DSA/MTP"),
         ],
     )
-    def test_disables_overlap_for_unsupported_features(
-        self, segment, has_mtp, unsupported_features
-    ):
+    def test_rejects_overlap_for_unsupported_features(self, segment, has_mtp, unsupported_features):
         config = _make_transformer_config(tp_comm_overlap=True)
-        expected_warning = (
+        expected_error = (
             "TP communication overlap is not supported with hybrid "
-            f"{unsupported_features} layers. Disabling tp_comm_overlap."
+            f"{unsupported_features} layers. Set tp_comm_overlap=False."
         )
 
-        with pytest.warns(UserWarning) as warning_records:
-            layer_utils.normalize_tp_comm_overlap(config, segment, has_mtp)
+        with pytest.raises(ValueError) as exc_info:
+            layer_utils.validate_tp_comm_overlap(config, segment, has_mtp)
 
-        assert config.tp_comm_overlap is False
-        assert [str(warning.message) for warning in warning_records] == [expected_warning]
+        assert config.tp_comm_overlap is True
+        assert str(exc_info.value) == expected_error
 
     @pytest.mark.parametrize(
         ("tp_comm_overlap", "segment", "has_mtp"),
@@ -160,9 +156,6 @@ class TestNormalizeTpCommOverlap:
     ):
         config = _make_transformer_config(tp_comm_overlap=tp_comm_overlap)
 
-        with warnings.catch_warnings(record=True) as warning_records:
-            warnings.simplefilter("always")
-            layer_utils.normalize_tp_comm_overlap(config, segment, has_mtp)
+        layer_utils.validate_tp_comm_overlap(config, segment, has_mtp)
 
         assert config.tp_comm_overlap is tp_comm_overlap
-        assert warning_records == []

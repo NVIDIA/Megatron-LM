@@ -1,7 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
-
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -105,18 +103,18 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     return matching_symbols[0]
 
 
-def normalize_tp_comm_overlap(
+def validate_tp_comm_overlap(
     config: TransformerConfig, segment: str, has_mtp: bool = False
 ) -> None:
-    """Disable TP communication overlap unsupported by built-in hybrid layers.
-
-    This must run before ``validate_segment_layers`` copies the stack-level config so
-    every generated layer config receives the normalized value.
+    """Validate TP communication overlap support for built-in hybrid layers.
 
     Args:
-        config: Stack-level config that will be copied for each layer.
-        segment: Selected pipeline segment, containing only layer symbols.
+        config: Config whose TP communication overlap setting should be validated.
+        segment: Layer symbols governed by ``config``.
         has_mtp: Whether this model instance will build an MTP block.
+
+    Raises:
+        ValueError: If TP communication overlap is enabled with MLA, DSA, or MTP.
     """
     unsupported_features: list[str] = []
     if Symbols.MLA in segment:
@@ -129,9 +127,7 @@ def normalize_tp_comm_overlap(
     if not config.tp_comm_overlap or not unsupported_features:
         return
 
-    config.tp_comm_overlap = False
-    warnings.warn(
+    raise ValueError(
         "TP communication overlap is not supported with hybrid "
-        f"{'/'.join(unsupported_features)} layers. Disabling tp_comm_overlap.",
-        stacklevel=2,
+        f"{'/'.join(unsupported_features)} layers. Set tp_comm_overlap=False."
     )
