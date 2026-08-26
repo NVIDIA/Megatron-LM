@@ -58,7 +58,7 @@ def _Cfg(use_layer_sharding_muon: bool) -> OptimizerConfig:
 def test_shared_muon_kwargs_ignore_layer_sharding_flag():
     """The shared builder must stay pure even with the lsh flag set."""
     kwargs = eo_mod._muon_config_to_kwargs(_Cfg(True), [_Chunk()], pg_collection=None)
-    for lsh_only in ("gtp_remat_group", "tp_group", "fused_group", "ns_batch_size"):
+    for lsh_only in ("gtp_remat_group", "tp_group", "gtp_group", "ns_batch_size"):
         assert lsh_only not in kwargs, f"LayerShardedMuon-only kwarg leaked: {lsh_only}"
     assert "is_qkv_fn" in kwargs
     assert "qkv_split_shapes" in kwargs

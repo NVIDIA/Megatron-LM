@@ -26,8 +26,8 @@ pytest.importorskip("emerging_optimizers", reason="LayerShardedMuon requires eme
 from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
 
 from megatron.core.optimizer.layer_sharded_a2a import (
-    layer_sharded_all_to_all_bwd,
-    layer_sharded_all_to_all_fwd,
+    route_from_ns_home,
+    route_to_ns_home,
 )
 from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 from megatron.core.utils import is_emerging_optimizers_min_version
@@ -165,11 +165,11 @@ def test_layer_sharding_pipeline_matches_allgather_ns(P, Q, N):
     assignment = {i: i % S for i in range(N)}
 
     # --- Layer sharding path ---
-    complete, my_indices = layer_sharded_all_to_all_fwd(
+    complete, my_indices = route_to_ns_home(
         local_shards, assignment, _world(), shard_dim=0
     )
     ns_results = [newton_schulz(m.float(), steps=5, coefficient_type="quintic") for m in complete]
-    update_shards = layer_sharded_all_to_all_bwd(
+    update_shards = route_from_ns_home(
         ns_results, my_indices, local_shards, assignment, _world(), shard_dim=0
     )
 
@@ -542,7 +542,7 @@ def test_replicated_mixed_with_sharded(fused, ns_batch):
         fp32_matmul_prec="highest",
         gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
-        fused_group=_world() if fused else None,
+        gtp_group=_world() if fused else None,
         ns_batch_size=ns_batch,
     )
     optimizer.set_param_ns_homes({id(p): s[3] for p, s in zip(params, specs)})
@@ -1062,7 +1062,7 @@ def test_fused_bitwise_matches_two_stage():
             fp32_matmul_prec="highest",
             gtp_remat_group=gtp_remat_group,
             tp_group=tp_group,
-            fused_group=fused,
+            gtp_group=fused,
             ns_batch_size=1,  # per-matrix NS -> the paths must be bit-identical
         )
         opt.set_param_ns_homes({id(p): s[2] for p, s in zip(params, specs)})
@@ -1098,7 +1098,7 @@ def test_fused_matches_full_matrix_reference():
         fp32_matmul_prec="highest",
         gtp_remat_group=gtp_remat_group,
         tp_group=tp_group,
-        fused_group=_world(),
+        gtp_group=_world(),
     )
     opt.set_param_ns_homes({id(p): s[2] for p, s in zip(params, specs)})
     opt.step()
@@ -1283,7 +1283,7 @@ def test_tp_sharded_without_gtp_marker_is_rejected():
         opt.step()
 
 
-def test_fused_group_wrong_rank_order_is_rejected(monkeypatch):
+def test_gtp_group_wrong_rank_order_is_rejected(monkeypatch):
     """The fused exchange requires flat rank g * tp_size + t (TP innermost).
     A group whose rank order violates that must trip the assert on every rank
     (before any collective) instead of scattering blocks to wrong coordinates.
@@ -1309,7 +1309,7 @@ def test_fused_group_wrong_rank_order_is_rejected(monkeypatch):
     p = _gtp_param(torch.randn(8, 6))
     p.partition_dim = 0
     opt = LayerShardedMuon(
-        [p], lr=0.1, gtp_remat_group=gtp_remat_group, tp_group=tp_group, fused_group=world
+        [p], lr=0.1, gtp_remat_group=gtp_remat_group, tp_group=tp_group, gtp_group=world
     )
     opt.set_param_ns_homes({id(p): (0, 0)})
     p.grad = torch.randn_like(p)
@@ -1477,7 +1477,7 @@ def test_weight_update_hooks_called_on_all_paths(fused):
         num_ns_steps=5,
         fp32_matmul_prec="highest",
         gtp_remat_group=_world(),
-        fused_group=_world() if fused else None,
+        gtp_group=_world() if fused else None,
     )
     opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(routed_params)})
 
@@ -1551,7 +1551,7 @@ def test_padded_param_matches_duplicated(fused):
         num_ns_steps=5,
         fp32_matmul_prec="highest",
         gtp_remat_group=_world(),
-        fused_group=_world() if fused else None,
+        gtp_group=_world() if fused else None,
     )
     opt.set_param_ns_homes({id(p): (1 % S, 0)})
 
@@ -1677,7 +1677,7 @@ def test_padded_param_2d_fused_raises():
     p.pad_length = 2
     opt = LayerShardedMuon(
         [p], lr=0.1, weight_decay=0.0, gtp_remat_group=gtp_remat_group, tp_group=tp_group,
-        fused_group=_world(),
+        gtp_group=_world(),
     )
     opt.set_param_ns_homes({id(p): (0, 0)})
     p.grad = torch.randn_like(p)
@@ -1749,7 +1749,7 @@ def test_tp_replicated_ns_chunking_is_column_invariant():
 
 
 # ---------------------------------------------------------------------------
-# Lazy fused-communicator build (_build_gtp_group / _select_fused_group):
+# Lazy fused-communicator build (_build_gtp_group / _select_gtp_group):
 # the wiring derives the full GTP (TP x GTP_remat) communicator from the two
 # axis groups, parallel_state-free. Group rank must satisfy the g*T+t contract
 # by construction; padded and non-grid domains fall back to two-stage.
@@ -1757,12 +1757,12 @@ def test_tp_replicated_ns_chunking_is_column_invariant():
 
 from megatron.core.optimizer.layer_wise_optimizer import (  # noqa: E402
     _build_gtp_group,
-    _select_fused_group,
+    _select_gtp_group,
 )
 
 
 def test_build_gtp_group_rank_contract_and_bitwise():
-    """The lazily built communicator satisfies g*T+t and, used as fused_group,
+    """The lazily built communicator satisfies g*T+t and, used as gtp_group,
     reproduces the two-stage exchange bitwise."""
     _require_four_ranks()
     tp_group, gtp_remat_group = _get_2d_groups()
@@ -1787,13 +1787,13 @@ def test_build_gtp_group_rank_contract_and_bitwise():
         return tp_local[g_rank * 4 : (g_rank + 1) * 4, :].clone()
 
     results = []
-    for fused_group in (None, fused):
+    for gtp_group in (None, fused):
         p = _gtp_param(_shard(full))
         p.partition_dim = 0
         opt = LayerShardedMuon(
             [p], lr=1e-2, weight_decay=0.0, num_ns_steps=5,
             fp32_matmul_prec="highest", gtp_remat_group=gtp_remat_group,
-            tp_group=tp_group, fused_group=fused_group,
+            tp_group=tp_group, gtp_group=gtp_group,
         )
         opt.set_param_ns_homes({id(p): (1, 1)})
         p.grad = _shard(grad)
@@ -1814,7 +1814,7 @@ def test_build_gtp_group_cached():
     assert first is second
 
 
-def test_select_fused_group_pad_gate_and_axes():
+def test_select_gtp_group_pad_gate_and_axes():
     """Padded domains fall back to two-stage; 1-D domains use the surviving axis."""
     _require_four_ranks()
     tp_group, gtp_remat_group = _get_2d_groups()
@@ -1822,14 +1822,14 @@ def test_select_fused_group_pad_gate_and_axes():
     padded.pad_length = 2
     clean = torch.nn.Parameter(torch.randn(4, 4))
 
-    assert _select_fused_group(gtp_remat_group, tp_group, None, [clean, padded]) is None
-    got = _select_fused_group(gtp_remat_group, tp_group, None, [clean])
+    assert _select_gtp_group(gtp_remat_group, tp_group, None, [clean, padded]) is None
+    got = _select_gtp_group(gtp_remat_group, tp_group, None, [clean])
     assert got is not None and got.size() == 4  # cached from the earlier build
     # Explicit supply of the right size wins over the lazy build.
-    assert _select_fused_group(gtp_remat_group, tp_group, got, [clean]) is got
+    assert _select_gtp_group(gtp_remat_group, tp_group, got, [clean]) is got
     # 1-D domains: the surviving axis group is the flat domain.
-    assert _select_fused_group(gtp_remat_group, None, None, [clean]) is gtp_remat_group
-    assert _select_fused_group(None, tp_group, None, [clean]) is tp_group
+    assert _select_gtp_group(gtp_remat_group, None, None, [clean]) is gtp_remat_group
+    assert _select_gtp_group(None, tp_group, None, [clean]) is tp_group
 
 
 def test_build_gtp_group_non_grid_falls_back():
@@ -1860,7 +1860,7 @@ def test_exchange_plan_cache_bitwise_and_reused(fused):
     T = 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
-    fused_group = _build_gtp_group(gtp_remat_group, tp_group) if fused else None
+    gtp_group = _build_gtp_group(gtp_remat_group, tp_group) if fused else None
 
     torch.manual_seed(_SEED + 700)
     NUM_STEPS = 3
@@ -1887,7 +1887,7 @@ def test_exchange_plan_cache_bitwise_and_reused(fused):
         opt = LayerShardedMuon(
             params, lr=1e-2, weight_decay=0.0, num_ns_steps=5,
             fp32_matmul_prec="highest", gtp_remat_group=gtp_remat_group,
-            tp_group=tp_group, fused_group=fused_group,
+            tp_group=tp_group, gtp_group=gtp_group,
         )
         opt.set_param_ns_homes({id(params[0]): (0, 1), id(params[1]): (1, 0)})
         return params, opt

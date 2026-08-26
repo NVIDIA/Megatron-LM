@@ -138,7 +138,7 @@ def _build_gtp_group(gtp_remat_group, tp_group):
     return result
 
 
-def _select_fused_group(gtp_remat_group, tp_group, explicit, domain_params):
+def _select_gtp_group(gtp_remat_group, tp_group, explicit, domain_params):
     """Pick the flat (GTP_remat x TP) communicator — i.e. the full GTP group
     (GTP = TP x GTP_remat) — for the single-all_to_all exchange.
 
@@ -823,7 +823,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # Axis groups + the optional explicitly supplied fused communicator per
         # family. The fused decision itself happens per DOMAIN after pooling:
-        # the pad gate in _select_fused_group needs to see the domain's params.
+        # the pad gate in _select_gtp_group needs to see the domain's params.
         dense_axes = (
             getattr(pg_collection, 'gtp_remat', None),
             getattr(pg_collection, 'tp', None),
@@ -854,11 +854,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
             # Fused communicator per domain: explicit supply wins, else lazily
             # derived from the axis groups; padded domains fall back to the
-            # two-stage exchange (see _select_fused_group). Every rank walks
+            # two-stage exchange (see _select_gtp_group). Every rank walks
             # the same optimizers/groups, so the world collective inside
             # _build_gtp_group stays aligned (and cached after the first call).
             fused_by_domain = {
-                key: _select_fused_group(g_grp, t_grp, explicit, domain_params)
+                key: _select_gtp_group(g_grp, t_grp, explicit, domain_params)
                 for key, (g_grp, t_grp, explicit, domain_params) in domains.items()
             }
             group_pgs: Dict[int, Tuple] = {
