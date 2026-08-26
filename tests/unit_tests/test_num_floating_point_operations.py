@@ -73,7 +73,6 @@ def _make_gpt_args(
     args.linear_num_value_heads = None
     args.linear_conv_kernel_dim = None
     args.kda_f_lora_rank = None
-    args.kda_use_full_rank_gate = True
     args.kda_gate_lora_rank = None
     # MLA fields (unused but referenced).
     args.q_lora_rank = None
@@ -110,8 +109,7 @@ def _make_kda_hybrid_args():
     args.linear_key_head_dim = 32
     args.linear_value_head_dim = 32
     args.kda_f_lora_rank = 16
-    args.kda_use_full_rank_gate = True
-    args.kda_gate_lora_rank = 24
+    args.kda_gate_lora_rank = None
     args.linear_num_key_heads = 8
     args.linear_num_value_heads = 8
     args.linear_conv_kernel_dim = 4
@@ -431,23 +429,28 @@ class TestHybridMatchesStandard:
 class TestKimiDeltaAttentionFlops:
     """KDA layers must contribute their projection and kernel work."""
 
-    @pytest.mark.parametrize("use_full_rank_gate", (True, False))
-    def test_lora_projection_formula(self, use_full_rank_gate):
+    @pytest.mark.parametrize(
+        ("f_lora_rank", "gate_lora_rank"),
+        [(None, None), (16, None), (16, 24), (None, 24)],
+        ids=["legacy-fused", "kimi-k3", "both-low-rank", "low-rank-gate-only"],
+    )
+    def test_projection_formula(self, f_lora_rank, gate_lora_rank):
         args = _make_kda_hybrid_args()
-        args.kda_use_full_rank_gate = use_full_rank_gate
+        args.kda_f_lora_rank = f_lora_rank
+        args.kda_gate_lora_rank = gate_lora_rank
         batch_size = 2
         total_tokens = batch_size * args.seq_length
         qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
         v_dim = args.linear_value_head_dim * args.linear_num_value_heads
+        f_projection_flops = args.hidden_size * qk_dim
+        if f_lora_rank is not None:
+            f_projection_flops = args.hidden_size * f_lora_rank + f_lora_rank * qk_dim
         gate_projection_flops = args.hidden_size * v_dim
-        if not use_full_rank_gate:
-            gate_projection_flops = (
-                args.hidden_size * args.kda_gate_lora_rank + args.kda_gate_lora_rank * v_dim
-            )
+        if gate_lora_rank is not None:
+            gate_projection_flops = args.hidden_size * gate_lora_rank + gate_lora_rank * v_dim
         projection_flops = (
             args.hidden_size * (2 * qk_dim + v_dim + args.linear_num_key_heads)
-            + args.hidden_size * args.kda_f_lora_rank
-            + args.kda_f_lora_rank * qk_dim
+            + f_projection_flops
             + gate_projection_flops
             + args.hidden_size * v_dim
         )

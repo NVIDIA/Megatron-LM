@@ -136,6 +136,7 @@ hybrid_stack_spec = ModuleSpec(
                         in_proj=TEColumnParallelLinear,
                         beta_proj=TEColumnParallelLinear,
                         out_norm=TENorm,
+                        f_proj=TEColumnParallelLinear,
                         f_a_proj=TELinear,
                         f_b_proj=TEColumnParallelLinear,
                         g_proj=TEColumnParallelLinear,

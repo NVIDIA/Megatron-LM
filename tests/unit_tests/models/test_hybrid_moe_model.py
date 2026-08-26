@@ -167,7 +167,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "kda_gate_lora_rank": None,
     "kda_lower_bound": None,
     "kda_safe_gate": False,
-    "kda_use_full_rank_gate": True,
     "kitchen_attention_backend": "sdpa",
     "kv_channels": 128,
     "layernorm_epsilon": 1e-05,

@@ -47,6 +47,7 @@ class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
     """Submodules used by Kimi Delta Attention."""
 
     beta_proj: ModuleSpec | type = IdentityOp
+    f_proj: ModuleSpec | type = IdentityOp
     f_a_proj: ModuleSpec | type = IdentityOp
     f_b_proj: ModuleSpec | type = IdentityOp
     g_proj: ModuleSpec | type = IdentityOp
@@ -57,9 +58,11 @@ class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
 class KimiDeltaAttention(_GDNBase):
     """Channel-wise Gated DeltaNet variant matching Kimi K3's KDA projections.
 
-    KDA uses a mandatory bias-free low-rank F-decay projection and either a
-    full-rank or bias-free low-rank output gate. Training supports equal
-    query/key and value head layouts; recurrent inference remains unsupported.
+    KDA supports full-rank or bias-free low-rank F-decay and output-gate
+    projections. When neither low-rank projection is enabled, the historical
+    fused Q/K/V/F/G input projection is preserved for checkpoint compatibility.
+    Training supports equal query/key and value head layouts; recurrent
+    inference remains unsupported.
     """
 
     def __init__(
@@ -100,37 +103,52 @@ class KimiDeltaAttention(_GDNBase):
             is_mtp_layer=is_mtp_layer,
         )
 
-        assert self.config.kda_f_lora_rank is not None
-
-        # Preserve Kimi K3's two distinct, bias-free F-decay weights. The down
-        # projection is replicated across TP and the up projection is sharded by head.
-        self.f_a_proj = build_module(
-            submodules.f_a_proj,
-            self.hidden_size,
-            self.config.kda_f_lora_rank,
-            config=self.config,
-            init_method=self.config.init_method,
-            parallel_mode="duplicated",
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            is_expert=False,
-            name=(name + ".f_a_proj") if name is not None else None,
-        )
-        self.f_b_proj = build_module(
-            submodules.f_b_proj,
-            self.config.kda_f_lora_rank,
-            self.qk_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=False,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="fc1",
-            tp_group=self.pg_collection.tp,
-            name=(name + ".f_b_proj") if name is not None else None,
-        )
+        if not self.use_legacy_fused_projections:
+            if self.config.kda_f_lora_rank is None:
+                self.f_proj = build_module(
+                    submodules.f_proj,
+                    self.hidden_size,
+                    self.qk_dim,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name="fc1",
+                    tp_group=self.pg_collection.tp,
+                    name=(name + ".f_proj") if name is not None else None,
+                )
+            else:
+                # Preserve Kimi K3's two distinct, bias-free F-decay weights. The down
+                # projection is replicated across TP and the up projection is sharded by head.
+                self.f_a_proj = build_module(
+                    submodules.f_a_proj,
+                    self.hidden_size,
+                    self.config.kda_f_lora_rank,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    parallel_mode="duplicated",
+                    bias=False,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                    is_expert=False,
+                    name=(name + ".f_a_proj") if name is not None else None,
+                )
+                self.f_b_proj = build_module(
+                    submodules.f_b_proj,
+                    self.config.kda_f_lora_rank,
+                    self.qk_dim,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name="f_b_proj",
+                    tp_group=self.pg_collection.tp,
+                    name=(name + ".f_b_proj") if name is not None else None,
+                )
 
         # KDA keeps beta in a separate projection so its checkpoint layout remains
         # independent from the Q/K/V, F-decay, and output-gate projections.
@@ -149,50 +167,50 @@ class KimiDeltaAttention(_GDNBase):
             name=(name + ".beta_proj") if name is not None else None,
         )
 
-        if self.config.kda_use_full_rank_gate:
-            self.g_proj = build_module(
-                submodules.g_proj,
-                self.hidden_size,
-                self.v_dim,
-                config=self.config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name="fc1",
-                tp_group=self.pg_collection.tp,
-                name=(name + ".g_proj") if name is not None else None,
-            )
-        else:
-            assert self.config.kda_gate_lora_rank is not None
-            self.g_a_proj = build_module(
-                submodules.g_a_proj,
-                self.hidden_size,
-                self.config.kda_gate_lora_rank,
-                config=self.config,
-                init_method=self.config.init_method,
-                parallel_mode="duplicated",
-                bias=False,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                is_expert=False,
-                name=(name + ".g_a_proj") if name is not None else None,
-            )
-            self.g_b_proj = build_module(
-                submodules.g_b_proj,
-                self.config.kda_gate_lora_rank,
-                self.v_dim,
-                config=self.config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name="fc1",
-                tp_group=self.pg_collection.tp,
-                name=(name + ".g_b_proj") if name is not None else None,
-            )
+        if not self.use_legacy_fused_projections:
+            if self.config.kda_gate_lora_rank is None:
+                self.g_proj = build_module(
+                    submodules.g_proj,
+                    self.hidden_size,
+                    self.v_dim,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name="fc1",
+                    tp_group=self.pg_collection.tp,
+                    name=(name + ".g_proj") if name is not None else None,
+                )
+            else:
+                self.g_a_proj = build_module(
+                    submodules.g_a_proj,
+                    self.hidden_size,
+                    self.config.kda_gate_lora_rank,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    parallel_mode="duplicated",
+                    bias=False,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                    is_expert=False,
+                    name=(name + ".g_a_proj") if name is not None else None,
+                )
+                self.g_b_proj = build_module(
+                    submodules.g_b_proj,
+                    self.config.kda_gate_lora_rank,
+                    self.v_dim,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name="g_b_proj",
+                    tp_group=self.pg_collection.tp,
+                    name=(name + ".g_b_proj") if name is not None else None,
+                )
 
         # These kernel parameters participate in FP32 gate math and must remain
         # FP32 through model casting, optimizer construction, and checkpointing.
@@ -206,18 +224,33 @@ class KimiDeltaAttention(_GDNBase):
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
 
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
-
-        # F-decay and output-gate weights are separate native projections.
-        self.in_proj_extra_dim = 0
-
-        # Only Q/K/V remain fused in in_proj and its distributed-checkpoint factory.
-        # All five runtime outputs still share the existing CP head permutation.
-        self.in_proj_split_names = ["query", "key", "value"]
-        self.in_proj_split_sections = (
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
+        self.use_legacy_fused_projections = (
+            self.config.kda_f_lora_rank is None and self.config.kda_gate_lora_rank is None
         )
+
+        if self.use_legacy_fused_projections:
+            # Preserve the original input-projection shape and distributed-checkpoint
+            # split keys so existing KDA checkpoints load without migration.
+            self.in_proj_extra_dim = self.qk_dim
+            self.in_proj_split_names = ["query", "key", "value", "g", "gate"]
+            self.in_proj_split_sections = (
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+            )
+        else:
+            # Low-rank-enabled layouts keep only Q/K/V in the fused projection.
+            self.in_proj_extra_dim = 0
+            self.in_proj_split_names = ["query", "key", "value"]
+            self.in_proj_split_sections = (
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+            )
+
+        # All projection layouts produce these five runtime sections before CP A2A.
         self.runtime_projection_split_sections = (
             self.qk_dim_local_tp,
             self.qk_dim_local_tp,
@@ -231,8 +264,10 @@ class KimiDeltaAttention(_GDNBase):
         self.gated_delta_rule = chunk_kda
 
     def _get_in_proj_dim(self) -> int:
-        """Return the fused Q/K/V projection width; F and output gate stay separate."""
+        """Return the legacy or low-rank-enabled fused projection width."""
 
+        if self.use_legacy_fused_projections:
+            return super()._get_in_proj_dim()
         return self.qk_dim * 2 + self.v_dim
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int]:
@@ -463,17 +498,22 @@ class KimiDeltaAttention(_GDNBase):
     ):
         """Core KDA computation (projections -> conv1d -> KDA -> norm -> out_proj)."""
 
-        # Preserve every Kimi K3 projection as an independent checkpoint weight.
         nvtx_range_push(suffix="in_proj")
-        qkv, _ = self.in_proj(hidden_states)
-        f_latent, _ = self.f_a_proj(hidden_states)
-        raw_g, _ = self.f_b_proj(f_latent)
-        if self.config.kda_use_full_rank_gate:
-            gate, _ = self.g_proj(hidden_states)
+        if self.use_legacy_fused_projections:
+            qkvfg, _ = self.in_proj(hidden_states)
         else:
-            gate_latent, _ = self.g_a_proj(hidden_states)
-            gate, _ = self.g_b_proj(gate_latent)
-        qkvfg = torch.cat((qkv, raw_g, gate), dim=-1)
+            qkv, _ = self.in_proj(hidden_states)
+            if self.config.kda_f_lora_rank is None:
+                raw_g, _ = self.f_proj(hidden_states)
+            else:
+                f_latent, _ = self.f_a_proj(hidden_states)
+                raw_g, _ = self.f_b_proj(f_latent)
+            if self.config.kda_gate_lora_rank is None:
+                gate, _ = self.g_proj(hidden_states)
+            else:
+                gate_latent, _ = self.g_a_proj(hidden_states)
+                gate, _ = self.g_b_proj(gate_latent)
+            qkvfg = torch.cat((qkv, raw_g, gate), dim=-1)
         beta, _ = self.beta_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
@@ -762,11 +802,15 @@ class KimiDeltaAttention(_GDNBase):
         """Execute weight-gradient computation for all KDA projections."""
 
         super().backward_dw()
-        self.f_a_proj.backward_dw()
-        self.f_b_proj.backward_dw()
         self.beta_proj.backward_dw()
-        if self.config.kda_use_full_rank_gate:
-            self.g_proj.backward_dw()
-        else:
-            self.g_a_proj.backward_dw()
-            self.g_b_proj.backward_dw()
+        if not self.use_legacy_fused_projections:
+            if self.config.kda_f_lora_rank is None:
+                self.f_proj.backward_dw()
+            else:
+                self.f_a_proj.backward_dw()
+                self.f_b_proj.backward_dw()
+            if self.config.kda_gate_lora_rank is None:
+                self.g_proj.backward_dw()
+            else:
+                self.g_a_proj.backward_dw()
+                self.g_b_proj.backward_dw()
