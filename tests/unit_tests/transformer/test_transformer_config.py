@@ -61,8 +61,8 @@ def test_gdp_num_householder_accepts_positive_values():
     assert config.gdp_num_householder == 5
 
 
-def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
-    config = TransformerConfig(
+def _make_replica_hybridep_config(**overrides):
+    kwargs = dict(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
@@ -77,15 +77,49 @@ def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
         add_bias_linear=False,
         activation_func=F.silu,
         gated_linear_unit=True,
-        cuda_graph_impl="local",
-        cuda_graph_modules=["moe"],
         bf16=True,
         params_dtype=torch.bfloat16,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
+    config = _make_replica_hybridep_config(
+        cuda_graph_impl="local",
+        cuda_graph_modules=["moe"],
     )
 
     assert config.moe_flex_dispatcher_backend == "replica_hybridep"
     assert config.moe_expert_rank_capacity_factor == 1.0
     assert config.moe_single_grouped_weight is False
+    assert config.grad_reduce_in_bf16 is False
+
+
+def test_replica_hybridep_bf16_grad_reduce_requires_ddp_fp32_accumulation():
+    with pytest.raises(ValueError, match="ddp-reduce-scatter-with-fp32-accumulation"):
+        _make_replica_hybridep_config(grad_reduce_in_bf16=True)
+
+
+def test_replica_hybridep_bf16_grad_reduce_requires_gtp_fp32_accumulation_with_gtp():
+    with pytest.raises(ValueError, match="gtp-remat-reduce-scatter-with-fp32-accumulation"):
+        _make_replica_hybridep_config(
+            grad_reduce_in_bf16=True,
+            ddp_reduce_scatter_with_fp32_accumulation=True,
+            expert_tensor_parallel_num_weight_shards=2,
+        )
+
+
+@pytest.mark.parametrize("expert_gtp", [False, True])
+def test_replica_hybridep_accepts_bf16_grad_reduce_with_fp32_accumulation(expert_gtp):
+    config = _make_replica_hybridep_config(
+        grad_reduce_in_bf16=True,
+        ddp_reduce_scatter_with_fp32_accumulation=True,
+        expert_tensor_parallel_num_weight_shards=2 if expert_gtp else 1,
+        gtp_remat_reduce_scatter_with_fp32_accumulation=expert_gtp,
+    )
+
+    assert config.grad_reduce_in_bf16 is True
 
 
 def test_replica_hybridep_allows_native_mxfp8_and_router_padding():

@@ -223,12 +223,14 @@ def _bulk_load_copy(
     bulk_elements: cutlass.Constexpr[int],
     bulks_per_chunk: cutlass.Constexpr[int],
 ):
-    """Issue one G2S chunk and arrive on its pipeline barrier."""
+    """Issue one warp-collective G2S chunk and arrive on its pipeline barrier."""
     for bulk in cutlass.range_constexpr(bulks_per_chunk):
         source_bulk = _tensor_1d(source + bulk * bulk_elements, bulk_elements)
         destination_bulk = _tensor_1d(destination + bulk * bulk_elements, bulk_elements)
-        with cute.arch.elect_one():
-            cute.copy(copy_atom, source_bulk, destination_bulk, mbar_ptr=barrier)
+        # CopyBulkG2SOp performs its own full-warp lane election.  Wrapping it
+        # in elect_one leaves the compiler-generated election divergent and
+        # can deadlock the pipeline.
+        cute.copy(copy_atom, source_bulk, destination_bulk, mbar_ptr=barrier)
 
 
 @cute.jit
@@ -239,10 +241,11 @@ def _bulk_store_copy(
     bulk_elements: cutlass.Constexpr[int],
     bulks_per_chunk: cutlass.Constexpr[int],
 ):
-    """Issue one elected thread's S2G chunk."""
+    """Issue one warp-collective S2G chunk."""
     for bulk in cutlass.range_constexpr(bulks_per_chunk):
         source_bulk = _tensor_1d(source + bulk * bulk_elements, bulk_elements)
         destination_bulk = _tensor_1d(destination + bulk * bulk_elements, bulk_elements)
+        # CopyBulkS2GOp performs its own full-warp lane election.
         cute.copy(copy_atom, source_bulk, destination_bulk)
 
 
@@ -516,16 +519,15 @@ class _ReplicaWeightPushKernel:
                 )
                 load_pipe.consumer_wait(consume_state)
                 stage = stage_smem[(None, consume_state.index)]
-                with cute.arch.elect_one():
-                    _bulk_store_copy(
-                        store_atom,
-                        stage.iterator,
-                        peer + destination_offset,
-                        cutlass.const_expr(self.bulk_elements),
-                        cutlass.const_expr(self.bulks_per_chunk),
-                    )
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                _bulk_store_copy(
+                    store_atom,
+                    stage.iterator,
+                    peer + destination_offset,
+                    cutlass.const_expr(self.bulk_elements),
+                    cutlass.const_expr(self.bulks_per_chunk),
+                )
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
                 load_pipe.consumer_release(consume_state)
                 consume_state.advance()
         if cutlass.const_expr(self.has_scales):
@@ -598,16 +600,15 @@ class _ReplicaWeightPushKernel:
                     )
                     scale_load_pipe.consumer_wait(scale_consume_state)
                     stage = scale_stage_smem[(None, scale_consume_state.index)]
-                    with cute.arch.elect_one():
-                        _bulk_store_copy(
-                            store_atom,
-                            stage.iterator,
-                            peer + destination_offset,
-                            cutlass.const_expr(self.scale_bulk_elements),
-                            cutlass.const_expr(self.scale_bulks_per_chunk),
-                        )
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    _bulk_store_copy(
+                        store_atom,
+                        stage.iterator,
+                        peer + destination_offset,
+                        cutlass.const_expr(self.scale_bulk_elements),
+                        cutlass.const_expr(self.scale_bulks_per_chunk),
+                    )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                     scale_load_pipe.consumer_release(scale_consume_state)
                     scale_consume_state.advance()
 
@@ -911,28 +912,27 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                 # Amortize the bulk-group drain across the hardware's eight
                 # outstanding groups while preserving sparse-slot addressing.
                 for base in cutlass.range(block, clear_work, self.num_sms * 8, unroll=1):
-                    with cute.arch.elect_one():
-                        for batch in cutlass.range_constexpr(8):
-                            work = base + batch * self.num_sms
-                            if work < clear_work:
-                                active = work // bulks_per_slot
-                                slot_bulk = work - active * bulks_per_slot
-                                slot = active_slots[active]
-                                destination_offset = Int64(slot) * self.fc1_member_numel + Int64(
-                                    slot_bulk * self.BULK_ELEMENTS
+                    for batch in cutlass.range_constexpr(8):
+                        work = base + batch * self.num_sms
+                        if work < clear_work:
+                            active = work // bulks_per_slot
+                            slot_bulk = work - active * bulks_per_slot
+                            slot = active_slots[active]
+                            destination_offset = Int64(slot) * self.fc1_member_numel + Int64(
+                                slot_bulk * self.BULK_ELEMENTS
+                            )
+                            if slot_bulk >= bulks_per_fc1:
+                                destination_offset = (
+                                    Int64(virtual_fc1_numel)
+                                    + Int64(slot) * self.fc2_member_numel
+                                    + Int64((slot_bulk - bulks_per_fc1) * self.BULK_ELEMENTS)
                                 )
-                                if slot_bulk >= bulks_per_fc1:
-                                    destination_offset = (
-                                        Int64(virtual_fc1_numel)
-                                        + Int64(slot) * self.fc2_member_numel
-                                        + Int64((slot_bulk - bulks_per_fc1) * self.BULK_ELEMENTS)
-                                    )
-                                clear_destination = _tensor_1d(
-                                    arena.iterator + destination_offset, self.BULK_ELEMENTS
-                                )
-                                cute.copy(store_atom, zero_smem, clear_destination)
-                                cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            clear_destination = _tensor_1d(
+                                arena.iterator + destination_offset, self.BULK_ELEMENTS
+                            )
+                            cute.copy(store_atom, zero_smem, clear_destination)
+                            cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
 
 
 def _validate_compile_shape(

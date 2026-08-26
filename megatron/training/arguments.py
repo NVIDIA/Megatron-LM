@@ -2378,6 +2378,10 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        # already defined manually by the mixed-precision/distributed argument groups
+        "grad_reduce_in_bf16",
+        "ddp_reduce_scatter_with_fp32_accumulation",
+        "gtp_remat_reduce_scatter_with_fp32_accumulation",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards

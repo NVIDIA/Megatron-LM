@@ -907,12 +907,14 @@ class TransformerConfig(ModelParallelConfig):
     uses deterministic route placement and asynchronous runtime weight replication on top of
     HybridEP."""
 
-    replica_hybridep_grad_dtype: torch.dtype = torch.float32
-    """Gradient transport and storage dtype used by ``replica_hybridep``.
+    grad_reduce_in_bf16: bool = False
+    """Use BF16 gradient storage and communication instead of the default FP32."""
 
-    This follows the effective DDP main-gradient dtype. BF16 transport still accumulates all
-    virtual-expert contributions locally in FP32 before one final BF16 downcast.
-    """
+    ddp_reduce_scatter_with_fp32_accumulation: bool = False
+    """Use BF16 wire traffic with local FP32 accumulation for DDP reduce-scatter."""
+
+    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+    """Use BF16 wire traffic with local FP32 accumulation for GTP reduce-scatter."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1809,9 +1811,19 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
             replica_errors = []
-            if self.replica_hybridep_grad_dtype not in (torch.float32, torch.bfloat16):
+            if self.grad_reduce_in_bf16 and not self.ddp_reduce_scatter_with_fp32_accumulation:
                 replica_errors.append(
-                    "replica_hybridep_grad_dtype in {torch.float32, torch.bfloat16}"
+                    "--ddp-reduce-scatter-with-fp32-accumulation with "
+                    "--grad-reduce-in-bf16"
+                )
+            if (
+                self.grad_reduce_in_bf16
+                and self.expert_gtp_weight_remat_size > 1
+                and not self.gtp_remat_reduce_scatter_with_fp32_accumulation
+            ):
+                replica_errors.append(
+                    "--gtp-remat-reduce-scatter-with-fp32-accumulation with expert GTP and "
+                    "--grad-reduce-in-bf16"
                 )
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
