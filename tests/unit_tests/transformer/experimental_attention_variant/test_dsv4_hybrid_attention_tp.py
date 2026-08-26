@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
@@ -40,6 +41,7 @@ class TestDSv4HybridAttentionTP:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=32,
             dsa_indexer_topk=8,
+            num_query_groups=1,
         )
         request.cls.pg = ProcessGroupCollection.use_mpu_process_groups()
         yield
@@ -75,7 +77,21 @@ class TestDSv4HybridAttentionTP:
             device="cuda",
             requires_grad=True,
         )
-        output, bias = attn(hidden_states=hidden, attention_mask=None)
+        cu_seqlens = torch.tensor([0, local_seq], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=local_seq,
+            max_seqlen_kv=local_seq,
+        )
+        output, bias = attn(
+            hidden_states=hidden,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+        )
         assert output.shape == hidden.shape
         assert torch.isfinite(output).all()
         output.float().square().mean().backward()

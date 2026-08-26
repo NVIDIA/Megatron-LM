@@ -1902,7 +1902,7 @@ class CompressedSparseAttention(MegatronModule):
                     q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
                         x_det, qr_det, packed_seq_params
                     )
-                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
                     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
                     weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
                     non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
@@ -2246,7 +2246,7 @@ class CompressedSparseAttention(MegatronModule):
 
                     key_for_loss_thd = compressed_kv.unsqueeze(1).expand(-1, np_, -1)
                     weights_for_unfused = w_thd * self.indexer.softmax_scale
-                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
 
                     # Physical padded offsets define the packed address space;
                     # unpadded lengths identify the real rows within each segment.
@@ -2498,7 +2498,7 @@ class CompressedSparseAttention(MegatronModule):
         ``(total_q, 1, np * hn)``.
         """
         sparse_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", True)
-        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
 
         x_det = x.detach()
         qr_det = qr.detach()
