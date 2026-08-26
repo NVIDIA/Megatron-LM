@@ -48,6 +48,7 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.replica_planner import (
     HybridEPReplicaWeightBridge,
     ReplicaPlannerWorkspace,
+    map_replica_plan_to_hybridep,
     plan_replica_routes,
     start_replica_grad_reduce_after_expert_backward,
     start_replica_weight_prefetch_before_combine_backward,
@@ -1080,7 +1081,6 @@ class _HybridEPManager(_DispatchManager):
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
-        self.token_indices: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
         # Used for padding the output for each expert
@@ -1100,7 +1100,6 @@ class _HybridEPManager(_DispatchManager):
         self._padded_num_tokens: Optional[int] = None
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        self.token_indices = None
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
 
@@ -1191,7 +1190,7 @@ class _HybridEPManager(_DispatchManager):
             hybrid_ep_dispatch(
                 x=hidden_states,
                 routing_map=self.routing_map,
-                probs=self.token_probs if self.token_indices is None else None,
+                probs=self.token_probs,
                 group=self.group,
                 num_local_experts=self.num_local_experts,
                 num_sms_dispatch_api=self.config.moe_flex_dispatcher_num_sms,
@@ -1202,9 +1201,6 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
                 fused=self.config.moe_permute_fusion_into_hybridep,
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
-                topk_idx=self.token_indices,
-                topk_weights=self.token_probs if self.token_indices is not None else None,
-                num_experts=self.num_experts if self.token_indices is not None else None,
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
@@ -1327,7 +1323,9 @@ class _ReplicaPlannedManagerMixin:
             group=self.group,
             num_experts=self.semantic_num_experts,
             num_local_experts=self.num_owned_experts,
-            grad_dtype=self.config.replica_hybridep_grad_dtype,
+            grad_dtype=(
+                torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32
+            ),
             num_sms=self.config.moe_flex_dispatcher_num_sms,
             num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
             num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
@@ -1511,7 +1509,6 @@ class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
             torch.ones_like(self.semantic_token_indices.reshape(-1), dtype=torch.int32),
         )
         self.num_local_tokens = num_tokens
-        self.token_indices = None
         self.token_probs = self.semantic_token_probs
 
     def dispatch(
@@ -1521,9 +1518,9 @@ class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
         plan = self._prepare_replica_plan(hidden_states)
-        self.token_indices = plan.virtual_experts
-        self.token_probs = self.semantic_token_probs
-        self.routing_map = None
+        self.routing_map, self.token_probs = map_replica_plan_to_hybridep(
+            plan, self.semantic_token_probs, num_experts=self.num_experts
+        )
         self._original_num_tokens = self.num_local_tokens
         self._padded_num_tokens = self.num_local_tokens
         alignment = (
@@ -1564,7 +1561,6 @@ class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
         hidden_states = self._wrap_replica_combine_output(hidden_states)
-        self.token_indices = None
         self.token_probs = None
         self.routing_map = None
         self._finish_replica_plan()

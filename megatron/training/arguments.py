@@ -2533,6 +2533,10 @@ def _add_network_size_args(parser):
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
+        # already defined manually by the mixed-precision/distributed argument groups
+        "grad_reduce_in_bf16",
+        "ddp_reduce_scatter_with_fp32_accumulation",
+        "gtp_remat_reduce_scatter_with_fp32_accumulation",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
