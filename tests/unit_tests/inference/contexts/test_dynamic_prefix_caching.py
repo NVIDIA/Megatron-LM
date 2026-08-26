@@ -1,23 +1,41 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import gc
 from collections import deque
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
+)
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    DynamicInferenceContext,
+)
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
 )
+from megatron.core.inference.data_parallel_inference_coordinator.coordinator import (
+    DataParallelInferenceCoordinator,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    handle_control_signal,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.state import CoordinatorState
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -25,9 +43,15 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.engines.test_dynamic_engine import (
+    DynamicEngineTestConfig,
+    DynamicInferenceEngineTestBase,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -114,11 +138,15 @@ class PrefixCachingTestBase:
         )
 
     @staticmethod
-    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True):
+    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True, sampling_params=None):
         return DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            sampling_params=(
+                sampling_params
+                if sampling_params is not None
+                else SamplingParams(num_tokens_to_generate=10)
+            ),
             block_size_tokens=ctx.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
@@ -164,12 +192,22 @@ class PrefixCachingTestBase:
 
 class _StubEngine(DynamicInferenceEngine):
 
+    @staticmethod
+    def _close_notification(_callback, coroutine):
+        coroutine.close()
+
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
+        self.controller = SimpleNamespace(tokenizer=SimpleNamespace(eod=0))
+        self.rank = 0
+        self.materialize_only_last_token_logits = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.cuda_graph_all_prefills = False
         self._prefix_coordination_waits = 0
         self._loop = asyncio.new_event_loop()
+        # This synchronous stub never runs its event loop, so consume scheduler
+        # notification coroutines instead of leaving them queued at teardown.
+        self._loop.call_soon_threadsafe = self._close_notification
         self.waiting_request_ids: deque = deque()
         self.requests = {}
         self._generation_epoch = None
@@ -540,6 +578,53 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.kv_hash_to_block_id[h1] == s1
 
     @pytest.mark.internal
+    def test_failed_partial_hit_admission_rolls_back_and_retries(self):
+        """A failed allocation must not pin or double-count a matched prefix."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        producer = self._req(ctx, self._prompt(2 * bs))
+        ctx.add_request(producer)
+        matched_blocks = self._block_ids(ctx, 0, 2)
+        matched_hashes = list(producer.precomputed_block_hashes)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # Keep every raw pool block in use. The only allocatable blocks are the
+        # two cached matches, which the follower pins before requesting its tail.
+        drained = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert drained is not None
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 2
+
+        follower = self._req(ctx, self._prompt(3 * bs), request_id=2)
+        hits_before = ctx.prefix_cache_hits
+        blocks_before = ctx.prefix_cache_blocks_matched
+        with pytest.raises(BlockOverflowError):
+            ctx.add_request(follower)
+
+        assert ctx.total_request_count == 0
+        assert follower.num_cached_tokens == 0
+        assert ctx.prefix_cache_hits == hits_before
+        assert ctx.prefix_cache_blocks_matched == blocks_before
+        assert [alloc.block_ref_counts[block].item() for block in matched_blocks] == [0, 0]
+        assert all(
+            alloc.kv_hash_to_block_id[hash_] == block
+            for hash_, block in zip(matched_hashes, matched_blocks)
+        )
+
+        # Releasing one unregistered block makes the retry succeed. The prefix
+        # is counted once, and the cached blocks stay shared rather than evicted.
+        alloc.release_memory_blocks(drained[:1])
+        ctx.add_request(follower)
+        assert follower.num_cached_tokens == 2 * bs
+        assert ctx.prefix_cache_hits == hits_before + 1
+        assert ctx.prefix_cache_blocks_matched == blocks_before + 2
+        assert self._block_ids(ctx, 0, 2) == matched_blocks
+        assert len(set(self._block_ids(ctx, 0, 3))) == 3
+
+    @pytest.mark.internal
     def test_check_availability_excludes_already_pinned_matches(self):
         """check_availability reserves only matched blocks that are currently
         evictable (ref_count == 0). A matched prefix already pinned by an
@@ -696,6 +781,281 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         req.status = Status.ACTIVE_AND_GENERATING_TOKENS
         req.sampling_params.num_tokens_to_generate = 10
         engine.waiting_request_ids.append(request_id)
+
+    @pytest.mark.internal
+    def test_generation_epoch_invalidates_coordinator_prefix_assignments(self):
+        def serialized_epoch_payload(epoch):
+            wire_payload = msgpack.packb(
+                [Headers.SET_GENERATION_EPOCH.value, epoch], use_bin_type=True
+            )
+            return msgpack.unpackb(wire_payload, raw=False)
+
+        client = b"client"
+        ranks = [f"rank-{index}".encode() for index in range(4)]
+        broadcasts = []
+        coordinator = DataParallelInferenceCoordinator.__new__(DataParallelInferenceCoordinator)
+        coordinator.known_clients = {client}
+        coordinator.state = CoordinatorState.RUNNING
+        coordinator._generation_epoch = None
+        coordinator._identities_list = ranks
+        coordinator.identity_to_rank_index = {rank: index for index, rank in enumerate(ranks)}
+        coordinator._pending_counts = np.zeros(len(ranks), dtype=np.int32)
+        coordinator.max_requests = 16
+        coordinator.enable_prefix_caching = True
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        coordinator.prefix_caching_routing_alpha = 0.5
+        coordinator._hash_table = {}
+        coordinator._hash_assignment_counter = 0
+        coordinator._broadcast_to_engines = broadcasts.append
+
+        owners = []
+        for group in range(8):
+            hashes = [100 + 2 * group, 101 + 2 * group]
+            owner = coordinator.get_best_data_parallel_rank(hashes)
+            coordinator._update_rank_hashes(owner, hashes)
+            coordinator._pending_counts[coordinator.identity_to_rank_index[owner]] += 1
+            assert coordinator.get_best_data_parallel_rank(hashes) == owner
+            owners.append(owner)
+        assert set(owners) == set(ranks)
+        assert len(coordinator._hash_table) == 16
+
+        epoch_one = serialized_epoch_payload(1)
+        handle_control_signal(coordinator, client, epoch_one)
+        assert coordinator._hash_table == {}
+        coordinator._update_rank_hashes(ranks[-1], [999])
+        handle_control_signal(coordinator, client, serialized_epoch_payload(1))
+        assert coordinator._hash_table == {999: {3: coordinator._hash_assignment_counter}}
+        epoch_two = serialized_epoch_payload(2)
+        handle_control_signal(coordinator, client, epoch_two)
+        assert coordinator._hash_table == {}
+        assert broadcasts == [epoch_one, epoch_one, epoch_two]
+
+    @pytest.mark.internal
+    def test_epoch_change_keeps_unstarted_requests_cacheable(self):
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        seed = self._req(ctx, self._prompt(ctx.block_size_tokens), request_id=99)
+        ctx.add_request(seed)
+        seed_hash = seed.precomputed_block_hashes[0]
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.reset_metadata(preserve_prefix_cache=True)
+        assert seed_hash in alloc.kv_hash_to_block_id
+
+        engine = self._engine(ctx)
+        before = self._req(ctx, self._prompt(ctx.block_size_tokens), request_id=1)
+        before_hashes = list(before.precomputed_block_hashes)
+        engine._add_request(before)
+
+        engine._set_generation_epoch(1)
+
+        assert seed_hash not in alloc.kv_hash_to_block_id
+        assert before.enable_prefix_caching
+        assert before.precomputed_block_hashes == before_hashes
+        assert before.policy_epoch == [(0, 1)]
+        assert before.kv_cache_epoch == [(0, 1)]
+
+        after = self._req(ctx, before.prompt_tokens.clone(), request_id=2)
+        engine._add_request(after)
+        assert after.enable_prefix_caching
+        assert after.policy_epoch == [(0, 1)]
+        assert after.kv_cache_epoch == [(0, 1)]
+
+        engine._set_generation_epoch(1)
+        assert before.policy_epoch == after.policy_epoch == [(0, 1)]
+        assert before.kv_cache_epoch == after.kv_cache_epoch == [(0, 1)]
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 1 and list(engine.waiting_request_ids) == [2]
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 2
+        assert after.num_cached_tokens == ctx.block_size_tokens
+
+    @pytest.mark.internal
+    def test_epoch_change_disables_hidden_chunked_prefill_cache_publication(self):
+        ctx = self._ctx(
+            block_size_tokens=256,
+            max_sequence_length=1024,
+            max_tokens=256,
+            max_requests=4,
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+        )
+        engine = self._engine(ctx, enable_chunked_prefill=True)
+        request = self._req(ctx, self._prompt(512))
+        self._add_to_waiting(engine, ctx, request)
+
+        engine.schedule_chunked_prefill()
+        assert request.finished_chunk_token_count == 256
+        assert ctx.chunked_prefill_request_id == request.request_id
+        block_id = self._block_ids(ctx, 0, 1)[0]
+        self._mamba_allocate_and_register(ctx, [block_id])
+
+        # update_requests() hides an in-progress chunk at this boundary while
+        # retaining its KV and Mamba state for the next prefill chunk.
+        ctx.total_request_count = 0
+        ctx.active_token_count = 0
+        engine._set_generation_epoch(1)
+
+        assert not request.enable_prefix_caching
+        assert request.precomputed_block_hashes == []
+        assert not ctx.kv_block_allocator.kv_hash_to_block_id
+        assert not ctx.mamba_slot_allocator.hash_to_block_id
+
+        engine.schedule_chunked_prefill()
+        assert ctx.chunked_prefill_request_id == -1
+        assert len(request.remaining_prompt_tokens) == 0
+        assert not ctx.kv_block_allocator.kv_hash_to_block_id
+        assert not ctx.mamba_slot_allocator.hash_to_block_id
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    def test_epoch_change_invalidates_inference_tensors_outside_inference_mode(self, hybrid):
+        with torch.inference_mode():
+            ctx = self._ctx(
+                max_tokens=128,
+                max_requests=4,
+                mamba_config=self._mamba_config() if hybrid else None,
+                prefix_caching_mamba_gb=0.01 if hybrid else None,
+            )
+            alloc = ctx.kv_block_allocator
+            engine = self._engine(ctx)
+            request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+            ctx.add_request(request)
+            (block_id,) = self._block_ids(ctx, 0, 1)
+            block_hash = request.precomputed_block_hashes[0]
+            if hybrid:
+                mamba = ctx.mamba_slot_allocator
+                (slot,) = self._mamba_allocate_and_register(ctx, [block_id])
+                mamba._intermediate_offsets_cpu[0, 0] = 1
+                mamba._intermediate_counts_cpu[0] = 1
+                mamba._intermediate_block_ids_cpu[0, 0] = block_id
+                mamba._eos_cache_block_id_cpu[0] = block_id
+                mamba._has_intermediates = True
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+            pool_avail_before = alloc.pool_avail
+            assert alloc.block_bag.is_inference()
+            if hybrid:
+                assert mamba.block_to_slot.is_inference()
+                assert mamba.free_count == mamba.max_slots - 1
+
+        assert not torch.is_inference_mode_enabled()
+        engine._set_generation_epoch(1)
+
+        assert block_hash not in alloc.kv_hash_to_block_id
+        assert alloc.block_hashes[block_id].item() == -1
+        assert alloc.pool_avail == pool_avail_before + 1
+        if hybrid:
+            assert mamba.free_count == mamba.max_slots
+            assert not mamba.hash_to_block_id
+            assert mamba.block_to_slot[block_id].item() == -1
+            assert mamba.slot_to_block[slot].item() == -1
+            assert mamba._intermediate_offsets_cpu.count_nonzero().item() == 0
+            assert mamba._intermediate_counts_cpu.count_nonzero().item() == 0
+            assert torch.all(mamba._intermediate_block_ids_cpu == -1)
+            assert torch.all(mamba._eos_cache_block_id_cpu == -1)
+            assert not mamba._has_intermediates
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize(
+        "policy",
+        [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO],
+        ids=["lru", "ref-zero"],
+    )
+    def test_epoch_change_invalidates_cache_without_disrupting_live_request(self, hybrid, policy):
+        ctx = self._ctx(
+            max_tokens=256,
+            max_requests=8,
+            mamba_config=self._mamba_config() if hybrid else None,
+            prefix_caching_mamba_gb=0.01 if hybrid else None,
+            prefix_caching_eviction_policy=policy,
+        )
+        alloc = ctx.kv_block_allocator
+        engine = self._engine(ctx)
+        bs = ctx.block_size_tokens
+
+        live = self._req(ctx, self._prompt(2 * bs), request_id=1)
+        ctx.add_request(live)
+        self._add_to_waiting(engine, ctx, live)
+        live_blocks = self._block_ids(ctx, 0, 2)
+        live_hashes = set(live.precomputed_block_hashes)
+
+        cached = self._req(ctx, self._prompt(bs, offset=10_000), request_id=2)
+        ctx.add_request(cached)
+        (cached_block,) = self._block_ids(ctx, 1, 1)
+        cached_hash = cached.precomputed_block_hashes[0]
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        assert alloc.block_ref_counts[cached_block].item() == 0
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            assert alloc.kv_hash_to_block_id[cached_hash] == cached_block
+        else:
+            assert cached_hash not in alloc.kv_hash_to_block_id
+            assert alloc.block_hashes[cached_block].item() == -1
+
+        routing = np.ones((bs, 1, 1), dtype=np.int64)
+        alloc.block_routing[live_blocks[0]] = routing.copy()
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            alloc.block_routing[cached_block] = routing.copy()
+        pool_avail_before = alloc.pool_avail
+        if hybrid:
+            mamba_alloc = ctx.mamba_slot_allocator
+            assert mamba_alloc._has_intermediates
+            free_slots = mamba_alloc.free_slots
+            assert not free_slots.is_inference()
+
+        dynamo_events = []
+
+        def _record_dynamo_event(kind, payload):
+            dynamo_events.append((kind, payload, dict(alloc.kv_hash_to_block_id)))
+
+        ctx.dynamo_helper.add_kv_event_listener(_record_dynamo_event)
+        ctx.dynamo_helper.queue_kv_stored_event({"block_hashes": list(live_hashes)})
+
+        engine._set_generation_epoch(1)
+
+        assert [kind for kind, _, _ in dynamo_events] == ["removed", "cleared"]
+        expected_removed_hashes = live_hashes | (
+            {cached_hash} if policy == PrefixCachingEvictionPolicy.LRU else set()
+        )
+        assert set(dynamo_events[0][1]["block_hashes"]) == expected_removed_hashes
+        assert dynamo_events[1][:2] == ("cleared", {})
+        assert all(discoverable == {} for _, _, discoverable in dynamo_events)
+        events_after_change = list(dynamo_events)
+        engine._set_generation_epoch(1)
+        ctx.dynamo_helper.publish_pending_kv_stored_events()
+        assert dynamo_events == events_after_change
+
+        assert live.enable_prefix_caching is False
+        assert live.precomputed_block_hashes == []
+        assert live.kv_cache_epoch == [(0, 1)]
+        assert live_hashes.isdisjoint(alloc.kv_hash_to_block_id)
+        assert cached_hash not in alloc.kv_hash_to_block_id
+        assert all(alloc.block_hashes[block_id].item() == -1 for block_id in live_blocks)
+        assert all(alloc.block_ref_counts[block_id].item() == 1 for block_id in live_blocks)
+        expected_reclaimed = int(policy == PrefixCachingEvictionPolicy.LRU)
+        assert alloc.pool_avail == pool_avail_before + expected_reclaimed
+        assert live_blocks[0] in alloc.block_routing
+        assert cached_block not in alloc.block_routing
+        replacement = alloc.allocate_memory_blocks(1)
+        assert replacement is not None and replacement.item() == cached_block
+
+        if hybrid:
+            assert mamba_alloc.free_slots is free_slots
+            assert not mamba_alloc.free_slots.is_inference()
+            assert not mamba_alloc._has_intermediates
+            assert mamba_alloc.free_count == mamba_alloc.max_slots
+            (slot,) = mamba_alloc.allocate_slots_batch(replacement.tolist())
+            mamba_alloc.invalidate_block(replacement.item())
+            assert mamba_alloc.free_slots[-1].item() == slot
+            durable_free_before = mamba_alloc.free_count
+            uncacheable = self._req(
+                ctx, self._prompt(2 * bs, offset=20_000), request_id=3, enable_prefix_caching=False
+            )
+            ctx.add_request(uncacheable)
+            assert not mamba_alloc._has_intermediates
+            mamba_alloc.commit_intermediate_states()
+            assert mamba_alloc.free_count == durable_free_before
 
     @pytest.mark.internal
     def test_disabled_mode(self):
@@ -1684,6 +2044,78 @@ class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
     @pytest.mark.internal
+    def test_finished_checkpointed_request_reconstructs_full_routing(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        generated = [bs + 1, bs + 2, bs + 3, bs + 4]
+        prompt = self._prompt(2 * bs)
+        producer = self._req(ctx, prompt.clone(), request_id=99)
+        ctx.add_request(producer)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        request = self._req(
+            ctx,
+            prompt,
+            request_id=0,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+            ),
+        )
+        ctx.add_request(request)
+        assert request.num_cached_tokens == 2 * bs
+        engine = _StubEngine(ctx)
+        future = engine._add_request(request)
+        engine.waiting_request_ids.clear()
+        record = engine.requests[request.request_id].record
+        record.checkpoint()
+        current = record[-1]
+        current.generated_tokens = generated[:3]
+        current.generated_log_probs = [-0.1, -0.2, -0.3]
+        assert len(record.requests) == 2
+        assert all(part.routing_indices is None for part in record.requests)
+
+        block_ids = self._block_ids(ctx, 1, 2)
+        block_ids += ctx.kv_block_allocator.allocate_memory_blocks(1).tolist()
+        routing = np.arange(3 * bs * 4, dtype=np.int16).reshape(3 * bs, 2, 2)
+        for block_idx, block_id in enumerate(block_ids):
+            start = block_idx * bs
+            ctx.kv_block_allocator.store_block_routing(
+                block_id, np.arange(bs), routing[start : start + bs]
+            )
+
+        engine.finished_request_count = 0
+        engine.evicted_request_count = 0
+        engine.track_generated_token_events = False
+        engine.num_speculative_tokens = 0
+        engine.stop_word_being_finished_ids = set()
+        active_ids, finished_records = engine.post_process_requests(
+            request_ids=torch.tensor([request.request_id]),
+            finished_request_ids=torch.tensor([request.request_id]),
+            evict_request_ids=torch.empty(0, dtype=torch.int64),
+            step_time=0.0,
+            sample=torch.tensor(generated[3:]),
+            accepted_tokens=None,
+            log_probs=[[-0.4]],
+            consumed_chunked_prefill_request_id=-1,
+            finished_routing_block_ids={request.request_id: block_ids},
+        )
+
+        expected = routing[: 2 * bs + 3]
+        merged = record.merge()
+        assert active_ids == []
+        assert finished_records == [record]
+        assert future.result() is record
+        assert merged.generated_tokens == generated
+        assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
+        np.testing.assert_array_equal(current.routing_indices, expected)
+        np.testing.assert_array_equal(merged.routing_indices, expected)
+        assert merged.routing_indices.shape[0] == (
+            len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
+        )
+
+    @pytest.mark.internal
     def test_store_and_get_block_routing(self):
         """Verify store_block_routing / get_block_routing round-trip."""
         ctx = self._ctx()
@@ -1890,6 +2322,121 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert np.allclose(alloc.get_block_routing(b1), routing_b1)
 
 
+class TestPrefixCachePromptLogprobs(PrefixCachingTestBase):
+    """Focused real-engine prompt-logprob coverage."""
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prompt_logprobs_bypass_prefix_cache(self):
+        block_size = 256
+        prompt_length = 2 * block_size + 5
+        generated_length = 4
+
+        def run_request(enable_prefix_caching):
+            config = DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=prompt_length,
+                max_prompt_length=prompt_length,
+                num_tokens_to_generate=generated_length,
+                max_sequence_length=prompt_length + generated_length + 4,
+                context_buffer_size_gb=0.02,
+                context_block_size_tokens=block_size,
+                context_max_requests=32,
+                context_max_tokens=4096,
+                model_provider="gpt",
+                enable_prefix_caching=enable_prefix_caching,
+                materialize_only_last_token_logits=False,
+            )
+            engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
+            engine.controller.tokenizer = SimpleNamespace(
+                vocab_size=config.vocab_size,
+                eod=-1,
+                detokenize=lambda tokens: "".join(f"{token} " for token in tokens),
+            )
+            prompt = torch.arange(prompt_length, device=torch.cuda.current_device()) % (
+                config.vocab_size - 1
+            )
+
+            donor = DynamicInferenceRequest(
+                request_id=100,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=8, termination_id=-1, top_k=1
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_prefix_caching,
+            )
+            engine._add_request(donor)
+            engine.step_modern()
+            if enable_prefix_caching:
+                assert donor.precomputed_block_hashes
+                assert set(donor.precomputed_block_hashes) <= (
+                    engine.context.kv_block_allocator.kv_hash_to_block_id.keys()
+                )
+
+            request = DynamicInferenceRequest(
+                request_id=101,
+                prompt_tokens=prompt,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=generated_length,
+                    termination_id=-1,
+                    top_k=1,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=False,
+                    top_n_logprobs=5,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_prefix_caching,
+            )
+            if enable_prefix_caching:
+                assert request.precomputed_block_hashes
+            hits_before = engine._prefix_cache_hits
+            engine._add_request(request)
+            assert not request.enable_prefix_caching
+            assert request.precomputed_block_hashes == []
+
+            output = None
+            for _ in range(32):
+                result = engine.step_modern()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    if merged.request_id == request.request_id:
+                        output = merged
+                if output is not None:
+                    break
+
+            assert output is not None, "prompt-logprob request did not finish"
+            assert engine._prefix_cache_hits == hits_before
+            assert output.num_cached_tokens == 0
+            assert len(output.prompt_log_probs) == prompt_length - 1
+            return output
+
+        cached = run_request(enable_prefix_caching=True)
+        baseline = run_request(enable_prefix_caching=False)
+        assert cached.generated_tokens == baseline.generated_tokens
+        assert (
+            len(cached.generated_log_probs) == len(baseline.generated_log_probs) == generated_length
+        )
+        np.testing.assert_allclose(
+            cached.prompt_log_probs, baseline.prompt_log_probs, atol=1e-5, rtol=0
+        )
+        np.testing.assert_allclose(
+            cached.generated_log_probs, baseline.generated_log_probs, atol=1e-5, rtol=0
+        )
+
+        for cached_values, baseline_values, expected_length in (
+            (cached.prompt_top_n_logprobs, baseline.prompt_top_n_logprobs, prompt_length - 1),
+            (cached.generated_top_n_logprobs, baseline.generated_top_n_logprobs, generated_length),
+        ):
+            assert cached_values is not None and baseline_values is not None
+            assert len(cached_values) == len(baseline_values) == expected_length
+            for cached_top_n, baseline_top_n in zip(cached_values, baseline_values):
+                assert tuple(cached_top_n) == tuple(baseline_top_n)
+                np.testing.assert_allclose(
+                    list(cached_top_n.values()), list(baseline_top_n.values()), atol=1e-5, rtol=0
+                )
+
+
 class TestPrefixCacheReuse(PrefixCachingTestBase):
     """Cross-request prefix reuse on hybrid (Mamba) models:
 
@@ -2015,3 +2562,1164 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
             msa._intermediate_block_ids_cpu[0, idx].item()
             == ctx.request_to_kv_block_ids[0][last_aligned_abs // bs - 1].item()
         )
+
+    @pytest.mark.internal
+    def test_mamba_aligned_chunk_endpoint_commits_and_restores(self):
+        # A block boundary exactly at a non-final chunk end is not an extractable
+        # interior offset. Commit it from the live state, then prove that a
+        # matching request skips to and restores that exact boundary.
+        ctx = self._ctx(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(2 * bs + 7)
+        seed = self._req(ctx, prompt.clone())
+        ctx.add_request(seed)
+        msa = ctx.mamba_slot_allocator
+
+        seed.finished_chunk_token_count = bs
+        msa.compute_and_store_offsets(
+            seed,
+            current_id=0,
+            skip_tokens=0,
+            prefill_chunk_length=bs,
+            num_matched_blocks=0,
+            matched_block_ids=[],
+            overall_required_blocks=ctx.request_kv_block_counts[0].item(),
+        )
+        seed.finished_chunk_token_count = 0
+
+        endpoint_block = ctx.request_to_kv_block_ids[0][1].item()
+        assert msa._intermediate_counts_cpu[0].item() == 0
+        assert msa._eos_cache_block_id_cpu[0].item() == endpoint_block
+
+        ctx.initialize_attention_state()
+        seed_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[0].item()
+        ctx.mamba_conv_states[:, seed_mamba_idx].fill_(17)
+        ctx.mamba_ssm_states[:, seed_mamba_idx].fill_(23)
+        msa.commit_intermediate_states()
+
+        endpoint_hash = seed.precomputed_block_hashes[1]
+        endpoint_slot = msa.block_to_slot[endpoint_block].item()
+        assert msa.hash_to_block_id[endpoint_hash] == endpoint_block
+        assert torch.all(msa.conv_states[:, endpoint_slot] == 17)
+        assert torch.all(msa.ssm_states[:, endpoint_slot] == 23)
+
+        follower = self._req(ctx, prompt.clone(), request_id=2)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(follower, len(prompt))
+        assert len(matched) == 2 and prefix_skip == 2 * bs
+        ctx.add_request(follower)
+        assert follower._mamba_num_matched_blocks == 2
+        ctx.initialize_attention_state()
+
+        follower_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
+        assert torch.all(ctx.mamba_conv_states[:, follower_mamba_idx] == 17)
+        assert torch.all(ctx.mamba_ssm_states[:, follower_mamba_idx] == 23)
+
+    @pytest.mark.internal
+    def test_mamba_cache_disabled_no_hash_request_skips_state_publication(self):
+        ctx = self._ctx(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        bs = ctx.block_size_tokens
+        msa = ctx.mamba_slot_allocator
+        free_before = msa.free_count
+        # This aligned prompt would stage both an interior offset and its live
+        # endpoint if add_request sent this uncacheable request to the allocator.
+        request = self._req(ctx, self._prompt(2 * bs), enable_prefix_caching=False)
+        assert request.precomputed_block_hashes == []
+
+        ctx.add_request(request)
+
+        assert msa._intermediate_counts_cpu[0].item() == 0
+        assert msa._eos_cache_block_id_cpu[0].item() == -1
+        assert not msa._has_intermediates
+
+        ctx.initialize_attention_state()
+        msa.commit_intermediate_states()
+
+        assert msa.free_count == free_before
+        assert torch.all(msa.block_to_slot == -1)
+        assert not msa.hash_to_block_id
+
+
+PREFIX_CACHE_CONTEXT_CASES = [
+    pytest.param(feature, policy, id=f"{feature}-{policy.name.lower()}")
+    for feature in (
+        "exact-prefix",
+        "partial-prefix",
+        "missing-prefix",
+        "concurrent-sharing",
+        "mixed-cached-fresh",
+    )
+    for policy in (PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO)
+]
+
+
+class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
+    """Exercise five context behaviors under both eviction policies and forced pressure."""
+
+    def _apply_local_churn(self, ctx, producer, producer_blocks):
+        """Exhaust the pool and make a new request recycle or evict producer blocks."""
+        alloc = ctx.kv_block_allocator
+        policy = alloc.prefix_caching_eviction_policy
+        ctx.release_memory_blocks_from_request_indexes(torch.arange(ctx.total_request_count))
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            cached_before = dict(alloc.kv_hash_to_block_id)
+            assert cached_before
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+        else:
+            assert not alloc.kv_hash_to_block_id
+            assert all(alloc.block_hashes[block_id].item() == -1 for block_id in producer_blocks)
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+            producer_tensor = torch.tensor(producer_blocks, dtype=torch.int32)
+            assert set(producer_blocks) <= set(filler.tolist())
+            alloc.release_memory_blocks(producer_tensor)
+            assert alloc.pool_avail == len(producer_blocks)
+
+        pressure = self._req(
+            ctx, self._prompt(3 * ctx.block_size_tokens, offset=200_000), request_id=100
+        )
+        pressure_idx = ctx.total_request_count
+        ctx.add_request(pressure)
+        pressure_blocks = set(self._block_ids(ctx, pressure_idx, 3))
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            evicted_ids = {
+                block_id
+                for block_hash, block_id in cached_before.items()
+                if block_hash not in alloc.kv_hash_to_block_id
+            }
+            assert pressure_blocks == evicted_ids
+        else:
+            assert pressure_blocks == set(producer_blocks)
+            assert not any(
+                block_hash in alloc.kv_hash_to_block_id
+                for block_hash in producer.precomputed_block_hashes
+            )
+
+    def _run_feature_probe(self, feature, policy):
+        """Execute one sharing behavior, then force policy-specific allocator churn."""
+        ctx = self._ctx(
+            buffer_size_gb=0.001,
+            rounder=1,
+            max_requests=12,
+            max_tokens=512,
+            prefix_caching_eviction_policy=policy,
+        )
+        alloc = ctx.kv_block_allocator
+        block_size = ctx.block_size_tokens
+        prompt = self._prompt(3 * block_size)
+        producer = self._req(ctx, prompt.clone())
+        ctx.add_request(producer)
+        producer_blocks = self._block_ids(ctx, 0, 3)
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        if feature == "exact-prefix":
+            probe = self._req(ctx, prompt.clone(), request_id=2)
+            matched, _, _, _, skipped, effective = ctx._compute_prefix_match(probe, len(prompt))
+            assert matched == producer_blocks
+            assert skipped == 2 * block_size and effective == block_size
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 3 * block_size
+
+        elif feature == "partial-prefix":
+            partial = torch.cat((prompt[: 2 * block_size], self._prompt(block_size, offset=50_000)))
+            probe = self._req(ctx, partial, request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, len(partial))
+            assert matched == producer_blocks[:2]
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 2 * block_size
+
+        elif feature == "missing-prefix":
+            probe = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, 3 * block_size)
+            assert not matched
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 0
+
+        elif feature == "concurrent-sharing":
+            for request_id in range(2, 5):
+                ctx.add_request(self._req(ctx, prompt.clone(), request_id=request_id))
+            expected_refs = 3 + int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[block_id].item() == expected_refs
+                for block_id in producer_blocks
+            )
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([1, 2, 3]))
+            remaining_refs = int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[block_id].item() == remaining_refs
+                for block_id in producer_blocks
+            )
+
+        else:
+            assert feature == "mixed-cached-fresh"
+            cached = self._req(ctx, prompt.clone(), request_id=2)
+            fresh = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=3)
+            ctx.add_request(cached)
+            ctx.add_request(fresh)
+            assert ctx.request_query_lengths[1].item() == block_size
+            assert ctx.request_query_lengths[2].item() == 3 * block_size
+            assert cached.num_cached_tokens == 3 * block_size
+            assert fresh.num_cached_tokens == 0
+
+        self._apply_local_churn(ctx, producer, producer_blocks)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("feature,policy", PREFIX_CACHE_CONTEXT_CASES)
+    def test_context_policy_matrix(self, feature, policy):
+        self._run_feature_probe(feature, policy)
+
+
+PREFIX_CACHE_ENGINE_CASES = [
+    pytest.param(
+        dict(name="tp4-ref-zero", feature="tp", tp=4, policy=PrefixCachingEvictionPolicy.REF_ZERO),
+        id="tp4-ref-zero",
+    ),
+    pytest.param(
+        dict(name="pp4-lru", feature="pp", pp=4, policy=PrefixCachingEvictionPolicy.LRU),
+        id="pp4-lru",
+    ),
+    pytest.param(
+        dict(name="ep4-moe-lru", feature="moe", ep=4, policy=PrefixCachingEvictionPolicy.LRU),
+        id="ep4-moe-lru",
+    ),
+    pytest.param(
+        dict(name="gpt-chunked-lru", feature="chunked", policy=PrefixCachingEvictionPolicy.LRU),
+        id="gpt-chunked-lru",
+    ),
+    pytest.param(
+        dict(
+            name="gpt-fused-rope-ref-zero",
+            feature="fused-rope",
+            policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        ),
+        id="gpt-fused-rope-ref-zero",
+    ),
+    pytest.param(
+        dict(name="mtp2-ref-zero", feature="mtp", policy=PrefixCachingEvictionPolicy.REF_ZERO),
+        id="mtp2-ref-zero",
+    ),
+    pytest.param(
+        dict(
+            name="hybrid-mamba-ref-zero",
+            feature="mamba",
+            model_provider="hybrid",
+            policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        ),
+        id="hybrid-mamba-ref-zero",
+    ),
+]
+
+
+class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
+    """Run real model rows through cache hits, runtime feature paths, and KV pressure."""
+
+    @classmethod
+    def _build_inference_context(
+        cls, test_config, transformer_config, requests, mamba_inference_state_config=None
+    ):
+        """Build the shared harness context with the row's cache eviction policy."""
+        assert not requests
+        return DynamicInferenceContext(
+            model_config=transformer_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=test_config.max_sequence_length,
+                num_cuda_graphs=test_config.num_cuda_graphs,
+                use_cuda_graphs_for_non_decode_steps=(
+                    test_config.use_cuda_graphs_for_non_decode_steps
+                ),
+                cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
+                buffer_size_gb=test_config.context_buffer_size_gb,
+                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+                block_size_tokens=test_config.context_block_size_tokens,
+                max_requests=test_config.context_max_requests,
+                max_tokens=test_config.context_max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
+                materialize_only_last_token_logits=(test_config.materialize_only_last_token_logits),
+                kv_cache_management_mode=KVCacheManagementMode(
+                    test_config.kv_cache_management_mode
+                ),
+                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
+                unified_memory_level=test_config.unified_memory_level,
+                enable_chunked_prefill=test_config.enable_chunked_prefill,
+                enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                prefix_caching_mamba_gb=(
+                    0.2
+                    if test_config.enable_prefix_caching
+                    and mamba_inference_state_config is not None
+                    else None
+                ),
+                use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
+                num_speculative_tokens=test_config.num_speculative_tokens,
+                async_sched_mode=test_config.async_sched_mode,
+                sampling_backend="torch",
+            ),
+        )
+
+    @staticmethod
+    def _case_config(case, *, enable_prefix_caching):
+        """Build a small real-engine configuration for one capability row."""
+        block_size = 256  # FlashAttention paged KV blocks must be divisible by 256.
+        prompt_length = 2 * block_size + 5
+        feature = case["feature"]
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=4,
+            max_sequence_length=(
+                prompt_length + block_size + 16 if feature == "chunked" else prompt_length + 8
+            ),
+            context_buffer_size_gb=0.02,
+            context_block_size_tokens=block_size,
+            context_max_requests=32,
+            context_max_tokens=block_size + 8 if feature == "chunked" else 4096,
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            model_provider=case.get("model_provider", "gpt"),
+            enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=feature == "chunked",
+            num_speculative_tokens=2 if feature == "mtp" else 0,
+            materialize_only_last_token_logits=feature != "mtp",
+            position_embedding_type="rope" if feature == "fused-rope" else "learned_absolute",
+            hidden_size=64 if feature == "fused-rope" else None,
+            top_k=1,
+        )
+        config.prefix_caching_eviction_policy = case["policy"]
+        config.use_flashinfer_fused_rope = feature == "fused-rope"
+        return config
+
+    @staticmethod
+    def _make_request(context, request_id, prompt, enable_prefix_caching):
+        """Build a deterministic request whose hashes are ready before scheduling."""
+        return DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                # Chunked prefill currently emits one extra generated-top-N
+                # entry for an intermediate chunk. This foundation owns
+                # generated-logprob parity there; top-N remains covered by all
+                # non-chunked rows.
+                top_n_logprobs=0 if context.enable_chunked_prefill else 5,
+                skip_prompt_log_probs=True,
+                top_k=1,
+            ),
+            block_size_tokens=context.block_size_tokens,
+            enable_prefix_caching=enable_prefix_caching,
+        )
+
+    @staticmethod
+    def _install_runtime_witnesses(engine, feature):
+        """Count calls on the feature path during the stressed engine run."""
+        evidence = {
+            "tp_reducing_forwards": 0,
+            "pipeline_forwards": 0,
+            "moe_dispatches": 0,
+            "moe_request_ids": set(),
+            "fused_rope_calls": 0,
+            "mamba_restores": 0,
+        }
+        model = engine.controller.inference_wrapped_model.model
+
+        if feature == "tp":
+
+            def trace_tp_reduce(module, *_):
+                assert torch.distributed.get_world_size(module.tp_group) > 1
+                evidence["tp_reducing_forwards"] += 1
+
+            for module in model.modules():
+                if module.__class__.__name__ == "RowParallelLinear":
+                    module.register_forward_pre_hook(trace_tp_reduce)
+
+        if feature == "pp":
+            wrapper = engine.controller.inference_wrapped_model
+            original = wrapper.forward_pass_with_pipeline_parallel
+
+            def traced_pipeline_forward(*args, **kwargs):
+                assert wrapper.model_is_pipeline_parallel
+                evidence["pipeline_forwards"] += 1
+                return original(*args, **kwargs)
+
+            wrapper.forward_pass_with_pipeline_parallel = traced_pipeline_forward
+
+        if feature == "moe":
+            instrumented_layers = 0
+            for module in model.modules():
+                if module.__class__.__name__ != "MoELayer":
+                    continue
+                original = module.dispatch
+
+                def traced_moe_dispatch(*args, _module=module, _original=original, **kwargs):
+                    dispatcher = _module.token_dispatcher
+                    assert torch.distributed.get_world_size(dispatcher.ep_group) > 1
+                    evidence["moe_dispatches"] += 1
+                    active_request_ids = engine.context.request_ids[
+                        engine.context.paused_request_count : engine.context.total_request_count
+                    ]
+                    evidence["moe_request_ids"].update(
+                        request_id for request_id in active_request_ids.tolist() if request_id >= 0
+                    )
+                    return _original(*args, **kwargs)
+
+                module.dispatch = traced_moe_dispatch
+                instrumented_layers += 1
+            assert instrumented_layers > 0
+
+        if feature == "fused-rope":
+            context = engine.context
+            original = context.apply_fused_qk_rotary_emb
+
+            def traced_fused_rope(*args, **kwargs):
+                assert context.use_flashinfer_fused_rope
+                cos_sin_cache = args[2] if len(args) > 2 else kwargs["cos_sin_emb"]
+                assert cos_sin_cache.is_cuda
+                evidence["fused_rope_calls"] += 1
+                return original(*args, **kwargs)
+
+            context.apply_fused_qk_rotary_emb = traced_fused_rope
+
+        if feature == "mamba" and engine.context.mamba_slot_allocator is not None:
+            allocator = engine.context.mamba_slot_allocator
+            original = allocator.restore_to_live
+
+            def traced_mamba_restore(*args, **kwargs):
+                restored = original(*args, **kwargs)
+                evidence["mamba_restores"] += int(restored)
+                return restored
+
+            allocator.restore_to_live = traced_mamba_restore
+
+        return evidence
+
+    @torch.inference_mode()
+    def _run_engine_session(self, case, *, enable_prefix_caching):
+        """Run three donor/follower/pressure waves through one real engine."""
+        config = self._case_config(case, enable_prefix_caching=enable_prefix_caching)
+        env = self._build_test_env(config)
+        engine = env.engine
+        context = engine.context
+        allocator = context.kv_block_allocator
+        engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+        if case["feature"] == "fused-rope":
+            # The shared test model is CPU-initialized, while FlashInfer requires
+            # its cos/sin cache on CUDA. Establish that kernel precondition here;
+            # lazy cache migration is owned by the separate fused-RoPE fix.
+            model = engine.controller.inference_wrapped_model.model
+            model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.cuda()
+            model.rotary_pos_emb_cache.clear()
+            assert model.config.hidden_size // model.config.num_attention_heads == 16
+        evidence = self._install_runtime_witnesses(engine, case["feature"])
+        pool_size = allocator.pool_size
+        storage_size = context.memory_buffer.untyped_storage().nbytes()
+        finished = {}
+        wave_block_ids = []
+        all_hashes = set()
+        min_pool_avail = allocator.pool_avail
+        saw_chunk = False
+        max_mamba_matched_blocks = 0
+        step_count = 0
+        cached_request_ids = set()
+        feature_seen_for_cached_request = False
+        mtp_seen_for_cached_decode = False
+
+        for cycle in range(3):
+            block_size = context.block_size_tokens
+            base = (
+                torch.arange(
+                    2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+                )
+                + cycle * 17
+            ) % (config.vocab_size - 1)
+            pressure = (base + 37) % (config.vocab_size - 1)
+
+            # Cached execution normally needs three producer blocks, one
+            # follower tail, and three divergent blocks. The chunked row gives
+            # the follower a second tail block so the hit-bearing request must
+            # itself continue prefill. Cache-off needs nine blocks normally and
+            # ten for the extended chunked follower, though those requests run
+            # serially under the chunk budget.
+            target_allocatable = (
+                8
+                if enable_prefix_caching and config.enable_chunked_prefill
+                else 7 if enable_prefix_caching or config.enable_chunked_prefill else 9
+            )
+            allocatable = allocator.get_allocatable_count()
+            if allocatable > target_allocatable:
+                filler = allocator.allocate_memory_blocks(allocatable - target_allocatable)
+                assert filler is not None
+            assert allocator.get_allocatable_count() == target_allocatable
+
+            follower_prompt = base.clone()
+            if case["feature"] == "chunked":
+                follower_prompt = torch.cat((base, base[: block_size + 8]))
+            requests = [
+                self._make_request(
+                    context, 3 * cycle, base, enable_prefix_caching=enable_prefix_caching
+                ),
+                self._make_request(context, 3 * cycle + 1, follower_prompt, enable_prefix_caching),
+                self._make_request(context, 3 * cycle + 2, pressure, enable_prefix_caching),
+            ]
+            wave_ids = {request.request_id for request in requests}
+            if enable_prefix_caching:
+                for request in requests:
+                    engine._add_request(request)
+                    all_hashes.update(request.precomputed_block_hashes)
+            else:
+                engine._add_request(requests[0])
+                if not config.enable_chunked_prefill:
+                    engine._add_request(requests[2])
+
+            baseline_follower_pending = not enable_prefix_caching
+            hits_before = engine._prefix_cache_hits
+            blocks_this_wave = set()
+            while wave_ids - finished.keys():
+                step_hits_before = engine._prefix_cache_hits
+                cached_tokens_before = {
+                    request.request_id: request.num_cached_tokens for request in requests
+                }
+                generated_before = {
+                    request.request_id: len(request.generated_tokens) for request in requests
+                }
+                feature_key = {
+                    "tp": "tp_reducing_forwards",
+                    "pp": "pipeline_forwards",
+                    "fused-rope": "fused_rope_calls",
+                    "mamba": "mamba_restores",
+                }.get(case["feature"])
+                feature_before = evidence[feature_key] if feature_key is not None else None
+                mtp_before = int(engine._spec_tokens_proposed_per_pos.sum())
+                result = engine.step_modern()
+                step_count += 1
+                newly_cached_ids = {
+                    request.request_id
+                    for request in requests
+                    if request.num_cached_tokens > cached_tokens_before[request.request_id]
+                }
+                if engine._prefix_cache_hits > step_hits_before:
+                    assert newly_cached_ids
+                    cached_request_ids.update(newly_cached_ids)
+                    if feature_key is not None:
+                        assert evidence[feature_key] > feature_before
+                        feature_seen_for_cached_request = True
+                    elif case["feature"] == "chunked":
+                        assert any(
+                            request.request_id in newly_cached_ids
+                            and (
+                                request.finished_chunk_token_count > 0
+                                or context.chunked_prefill_request_id == request.request_id
+                            )
+                            for request in requests
+                        )
+                        feature_seen_for_cached_request = True
+
+                # MTP intentionally starts after prefill, so its request-specific
+                # witness belongs to a later decode step rather than the hit step.
+                # A cached request whose generated length grows in a step that
+                # records proposals necessarily contributed to the MTP counter.
+                mtp_after = int(engine._spec_tokens_proposed_per_pos.sum())
+                if case["feature"] == "mtp" and mtp_after > mtp_before:
+                    mtp_seen_for_cached_decode |= any(
+                        request.request_id in cached_request_ids
+                        and len(request.generated_tokens) > generated_before[request.request_id]
+                        for request in requests
+                    )
+                if baseline_follower_pending and (
+                    not config.enable_chunked_prefill or context.chunked_prefill_request_id == -1
+                ):
+                    engine._add_request(requests[1])
+                    if config.enable_chunked_prefill:
+                        engine._add_request(requests[2])
+                    baseline_follower_pending = False
+
+                min_pool_avail = min(min_pool_avail, allocator.pool_avail)
+                active_blocks = context.request_to_kv_block_ids[: context.total_request_count]
+                blocks_this_wave.update(active_blocks[active_blocks >= 0].tolist())
+                saw_chunk |= context.chunked_prefill_request_id != -1
+                max_mamba_matched_blocks = max(
+                    max_mamba_matched_blocks,
+                    *(getattr(request, "_mamba_num_matched_blocks", 0) for request in requests),
+                )
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                assert step_count < 256, f"{case['name']} did not converge"
+
+            torch.cuda.synchronize()
+            assert allocator.pool_size == pool_size
+            assert context.memory_buffer.untyped_storage().nbytes() == storage_size
+            assert context.total_request_count == 0
+            assert allocator.get_active_used() == 0
+            assert allocator.get_allocatable_count() == target_allocatable
+            wave_block_ids.append(blocks_this_wave)
+            if enable_prefix_caching:
+                assert engine._prefix_cache_hits > hits_before
+                if case["policy"] == PrefixCachingEvictionPolicy.REF_ZERO:
+                    assert not allocator.kv_hash_to_block_id
+                    assert all(
+                        allocator.block_ref_counts[block_id].item() == 0
+                        for block_id in blocks_this_wave
+                    )
+
+        assert len(finished) == 9
+        if enable_prefix_caching:
+            assert min_pool_avail == 0
+            assert engine._prefix_cache_hits >= 3
+            assert engine._prefix_cache_blocks_matched >= 6
+            assert engine._prefix_coordination_waits >= 3
+            if case["policy"] == PrefixCachingEvictionPolicy.LRU:
+                assert all_hashes - allocator.kv_hash_to_block_id.keys()
+            else:
+                assert all(
+                    len(previous & current) >= 2
+                    for previous, current in zip(wave_block_ids, wave_block_ids[1:])
+                )
+        else:
+            assert engine._prefix_cache_hits == 0
+
+        if enable_prefix_caching and case["feature"] == "moe":
+            # EP routing evidence is recorded with the live request IDs inside
+            # token_dispatch. The engine drains hit accounting after the forward,
+            # so correlating the dispatcher batch to the cached follower is more
+            # precise than comparing counters on adjacent host steps.
+            assert cached_request_ids & evidence["moe_request_ids"]
+            feature_seen_for_cached_request = True
+
+        return finished, {
+            "saw_chunk": saw_chunk,
+            "mtp_tokens_proposed": int(engine._spec_tokens_proposed_per_pos.sum()),
+            "min_pool_avail": min_pool_avail,
+            "max_mamba_matched_blocks": max_mamba_matched_blocks,
+            "feature_seen_for_cached_request": feature_seen_for_cached_request,
+            "mtp_seen_for_cached_decode": mtp_seen_for_cached_decode,
+            **evidence,
+        }
+
+    @staticmethod
+    def _assert_scalar_logprob_close(value, expected, *, rel=2e-2, abs=5e-2):
+        """Compare one logprob while preserving matching non-finite results."""
+        if np.isnan(value) or np.isnan(expected):
+            assert np.isnan(value) and np.isnan(expected)
+        else:
+            assert value == pytest.approx(expected, rel=rel, abs=abs)
+
+    @staticmethod
+    def _assert_logprob_parity(cached_request, baseline_request):
+        """Check generated and top-N logprobs against the cache-off run."""
+        cached_logprobs = cached_request.generated_log_probs
+        baseline_logprobs = baseline_request.generated_log_probs
+        assert cached_logprobs is not None and baseline_logprobs is not None
+        assert len(cached_logprobs) == len(cached_request.generated_tokens)
+        np.testing.assert_allclose(cached_logprobs, baseline_logprobs, rtol=2e-2, atol=5e-2)
+
+        cached_top_n = cached_request.generated_top_n_logprobs
+        baseline_top_n = baseline_request.generated_top_n_logprobs
+        if cached_request.sampling_params.top_n_logprobs == 0:
+            assert not cached_top_n
+            assert not baseline_top_n
+            assert not cached_request.prompt_log_probs
+            assert not cached_request.prompt_top_n_logprobs
+            return
+        assert cached_top_n is not None and baseline_top_n is not None
+        assert len(cached_top_n) == len(cached_request.generated_tokens)
+        for token, logprob, baseline_logprob, cached_values, baseline_values in zip(
+            cached_request.generated_tokens,
+            cached_logprobs,
+            baseline_logprobs,
+            cached_top_n,
+            baseline_top_n,
+        ):
+            assert 0 < len(cached_values) <= 5
+            assert len(cached_values) == len(baseline_values)
+            cached_keys = set(cached_values)
+            baseline_keys = set(baseline_values)
+            for key in cached_keys & baseline_keys:
+                TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                    cached_values[key], baseline_values[key]
+                )
+            token_key = f"tok_{token}"
+            assert token_key in cached_values
+            assert token_key in baseline_values
+            TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                cached_values[token_key], logprob, abs=0.1
+            )
+            TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                baseline_values[token_key], baseline_logprob, abs=0.1
+            )
+
+            cached_ranked = sorted(cached_values.values(), reverse=True)
+            baseline_ranked = sorted(baseline_values.values(), reverse=True)
+            np.testing.assert_allclose(cached_ranked, baseline_ranked, rtol=2e-2, atol=5e-2)
+            if cached_keys != baseline_keys:
+                cached_cutoff = cached_ranked[-1]
+                baseline_cutoff = baseline_ranked[-1]
+                for key in cached_keys - baseline_keys:
+                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                        cached_values[key], baseline_cutoff
+                    )
+                for key in baseline_keys - cached_keys:
+                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                        baseline_values[key], cached_cutoff
+                    )
+
+        assert not cached_request.prompt_log_probs
+        assert not cached_request.prompt_top_n_logprobs
+
+    @staticmethod
+    def _clear_engine_runtime():
+        """Release per-row model and inference allocations before rebuilding."""
+        torch.cuda.synchronize()
+        delete_cuda_graphs()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @torch.inference_mode()
+    def _run_engine_case(self, case):
+        """Compare cache-on and cache-off output while asserting row activation."""
+        self._clear_engine_runtime()
+        try:
+            cached, stats = self._run_engine_session(case, enable_prefix_caching=True)
+            self._clear_engine_runtime()
+            baseline, baseline_stats = self._run_engine_session(case, enable_prefix_caching=False)
+
+            for request_id in range(9):
+                cached_request = cached[request_id]
+                baseline_request = baseline[request_id]
+                assert cached_request.generated_tokens == baseline_request.generated_tokens
+                assert cached_request.generated_text == baseline_request.generated_text
+                assert len(cached_request.generated_tokens) == 4
+                self._assert_logprob_parity(cached_request, baseline_request)
+
+            assert stats["min_pool_avail"] == 0
+            assert baseline_stats["min_pool_avail"] <= 1
+            feature = case["feature"]
+            if feature == "mtp":
+                assert stats["mtp_seen_for_cached_decode"]
+            else:
+                assert stats["feature_seen_for_cached_request"]
+            if feature == "tp":
+                assert stats["tp_reducing_forwards"] > 0
+            elif feature == "pp":
+                assert stats["pipeline_forwards"] > 0
+            elif feature == "moe":
+                assert stats["moe_dispatches"] > 0
+            elif feature == "chunked":
+                assert stats["saw_chunk"]
+            elif feature == "fused-rope":
+                assert stats["fused_rope_calls"] > 0
+            elif feature == "mamba":
+                assert stats["max_mamba_matched_blocks"] > 0
+                assert stats["mamba_restores"] > 0
+            else:
+                assert feature == "mtp"
+                assert stats["mtp_tokens_proposed"] > 0
+        finally:
+            self._clear_engine_runtime()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("case", PREFIX_CACHE_ENGINE_CASES)
+    def test_real_engine_stress_row(self, case):
+        if case["feature"] == "mamba":
+            available, reason = _check_mamba_sequence_packing_support()
+            if not available:
+                pytest.skip(reason)
+        if case["feature"] == "fused-rope":
+            pytest.importorskip("flashinfer")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            self._run_engine_case(case)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("kv_cache_management_mode", ["offload", "recompute"])
+    @torch.inference_mode()
+    def test_real_cuda_graph_suspend_resume_lifecycle(self, kv_cache_management_mode):
+        """Rebuild deleted graphs without capturing over live requests or cache state."""
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        self._clear_engine_runtime()
+        try:
+            case = {"feature": "cuda-graph", "policy": PrefixCachingEvictionPolicy.LRU}
+            config = self._case_config(case, enable_prefix_caching=True)
+            config.num_cuda_graphs = 2
+            config.force_build_cuda_graphs = True
+            config.use_cuda_graphs_for_non_decode_steps = False
+            config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+            config.kv_cache_management_mode = kv_cache_management_mode
+            config.static_kv_memory_pointers = False
+            config.context_max_requests = 1
+
+            env = self._build_test_env(config)
+            engine = env.engine
+            context = engine.context
+            assert context.kv_cache_management_mode == KVCacheManagementMode(
+                kv_cache_management_mode
+            )
+            assert context.cuda_graphs_available
+            assert not engine._cuda_graph_rebuild_pending
+            assert CudaGraphManager.global_mempool is not None
+
+            graph_managers = [
+                manager
+                for manager in list(CudaGraphManager._instances)
+                if manager.cudagraph_runners
+            ]
+            assert graph_managers
+            assert any(manager.custom_cudagraphs_lookup_table for manager in graph_managers)
+
+            block_size = context.block_size_tokens
+            prompt = torch.arange(
+                2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+            ) % (config.vocab_size - 1)
+            requests = [
+                self._make_request(context, request_id, prompt.clone(), True)
+                for request_id in range(2)
+            ]
+            engine._add_request(requests[0])
+            first_result = engine.step_modern()
+            assert not first_result["finished_request_records"]
+            assert context.total_request_count == 1
+            engine._add_request(requests[1])
+            assert list(engine.waiting_request_ids) == [1]
+
+            capture_snapshots = []
+            original_create_cuda_graphs = engine.create_cuda_graphs
+
+            def tracked_create_cuda_graphs(*args, **kwargs):
+                assert context.total_request_count == 0
+                assert context.chunked_prefill_request_id == -1
+                counters_before = (
+                    context.step_count,
+                    context.prefix_cache_lru_clock,
+                    context.lifetime_prefill_token_count,
+                    context.async_sched_step_count,
+                    context.async_sched_compaction_step_count,
+                )
+                cache_before = dict(context.kv_block_allocator.kv_hash_to_block_id)
+                result = original_create_cuda_graphs(*args, **kwargs)
+                counters_after = (
+                    context.step_count,
+                    context.prefix_cache_lru_clock,
+                    context.lifetime_prefill_token_count,
+                    context.async_sched_step_count,
+                    context.async_sched_compaction_step_count,
+                )
+                cache_after = dict(context.kv_block_allocator.kv_hash_to_block_id)
+                assert counters_after == counters_before
+                assert cache_after == cache_before
+                capture_snapshots.append((counters_after, cache_after))
+                return result
+
+            engine.create_cuda_graphs = tracked_create_cuda_graphs
+            engine.suspend()
+            assert not context.cuda_graphs_available
+            assert engine._cuda_graph_rebuild_pending
+            assert CudaGraphManager.global_mempool is None
+            assert all(not manager.cudagraph_runners for manager in graph_managers)
+            assert all(not manager.custom_cudagraphs_lookup_table for manager in graph_managers)
+
+            engine.resume()
+            if kv_cache_management_mode == "offload":
+                assert context.total_request_count == 1
+                assert not context.cuda_graphs_available
+                assert engine._cuda_graph_rebuild_pending
+                assert not capture_snapshots
+                with pytest.raises(AssertionError, match="empty inference context"):
+                    original_create_cuda_graphs()
+            else:
+                assert context.cuda_graphs_available
+                assert not engine._cuda_graph_rebuild_pending
+                assert len(capture_snapshots) == 1
+
+            finished = {}
+            saw_unavailable_step = False
+            saw_graph_after_rebuild = False
+            for _ in range(64):
+                result = engine.step_modern()
+                using_cuda_graph = context.using_cuda_graph_this_step()
+                if not context.cuda_graphs_available:
+                    assert not using_cuda_graph
+                    assert all(not manager.cudagraph_runners for manager in graph_managers)
+                    saw_unavailable_step = True
+                elif capture_snapshots and using_cuda_graph:
+                    saw_graph_after_rebuild = True
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail(f"{kv_cache_management_mode} graph lifecycle did not converge")
+
+            assert len(capture_snapshots) == 1
+            captured_counters, captured_cache = capture_snapshots[0]
+            assert captured_counters[0] > 0
+            assert captured_counters[1] > 0
+            assert CudaGraphManager.global_mempool is not None
+            assert any(manager.cudagraph_runners for manager in graph_managers)
+            assert any(manager.custom_cudagraphs_lookup_table for manager in graph_managers)
+            assert saw_graph_after_rebuild
+            assert len(finished) == 2
+            assert all(len(request.generated_tokens) == 4 for request in finished.values())
+            assert requests[1].num_cached_tokens >= 2 * block_size
+            if kv_cache_management_mode == "offload":
+                assert saw_unavailable_step
+                assert captured_cache
+            else:
+                assert not saw_unavailable_step
+        finally:
+            self._clear_engine_runtime()
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _live_cuda_graph_manager_state():
+        """Return stable identities for every currently populated graph manager."""
+        state = {}
+        for manager in list(CudaGraphManager._instances):
+            if not manager.cudagraph_runners:
+                continue
+            state[id(manager)] = (
+                tuple(id(runner) for runner in manager.cudagraph_runners),
+                tuple(
+                    sorted(
+                        (repr(key), id(runner))
+                        for key, runner in manager.custom_cudagraphs_lookup_table.items()
+                    )
+                ),
+            )
+        assert state
+        return state
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_static_uvm_preserves_hybrid_state_cache_and_graphs(self):
+        """Static UVM pointers keep live KV/Mamba state and captured graphs valid."""
+        available, reason = _check_mamba_sequence_packing_support()
+        if not available:
+            pytest.skip(reason)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "feature": "cuda-graph",
+                "model_provider": "hybrid",
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            config = self._case_config(case, enable_prefix_caching=True)
+            config.num_cuda_graphs = 2
+            config.force_build_cuda_graphs = True
+            config.use_cuda_graphs_for_non_decode_steps = False
+            config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+            config.kv_cache_management_mode = "offload"
+            config.static_kv_memory_pointers = True
+            config.unified_memory_level = 1
+            config.context_max_requests = 1
+
+            env = self._build_test_env(config)
+            engine = env.engine
+            context = engine.context
+            assert context.is_hybrid_model
+            assert context.unified_memory_level == 1
+            assert context.static_kv_memory_pointers
+            assert context.mamba_slot_allocator is not None
+            graph_state = self._live_cuda_graph_manager_state()
+
+            block_size = context.block_size_tokens
+            prompt = torch.arange(
+                2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+            ) % (config.vocab_size - 1)
+            requests = [
+                self._make_request(context, request_id, prompt.clone(), True)
+                for request_id in range(2)
+            ]
+            engine._add_request(requests[0])
+            first_result = engine.step_modern()
+            assert not first_result["finished_request_records"]
+            assert context.total_request_count == 1
+            engine._add_request(requests[1])
+            assert list(engine.waiting_request_ids) == [1]
+
+            block_ids = context.request_to_kv_block_ids[: context.total_request_count]
+            block_ids = torch.unique(block_ids[block_ids >= 0]).to(
+                device=context.memory_buffer.device, dtype=torch.long
+            )
+            assert block_ids.numel() > 0
+            kv_pointer = context.memory_buffer.data_ptr()
+            kv_data = context.memory_buffer.index_select(2, block_ids).clone()
+
+            mamba_index = int(context.mamba_metadata.request_to_mamba_state_idx[0])
+            assert mamba_index >= 0
+            mamba_pointers = (
+                context.mamba_conv_states.data_ptr(),
+                context.mamba_ssm_states.data_ptr(),
+            )
+            mamba_data = (
+                context.mamba_conv_states[:, mamba_index].clone(),
+                context.mamba_ssm_states[:, mamba_index].clone(),
+            )
+            kv_hashes = dict(context.kv_block_allocator.kv_hash_to_block_id)
+            mamba_hashes = dict(context.mamba_slot_allocator.hash_to_block_id)
+            assert kv_hashes
+            assert mamba_hashes
+
+            engine.suspend()
+            assert context.cuda_graphs_available
+            assert not engine._cuda_graph_rebuild_pending
+            engine.resume()
+
+            assert context.memory_buffer.data_ptr() == kv_pointer
+            assert torch.equal(context.memory_buffer.index_select(2, block_ids), kv_data)
+            assert (
+                context.mamba_conv_states.data_ptr(),
+                context.mamba_ssm_states.data_ptr(),
+            ) == mamba_pointers
+            assert torch.equal(context.mamba_conv_states[:, mamba_index], mamba_data[0])
+            assert torch.equal(context.mamba_ssm_states[:, mamba_index], mamba_data[1])
+            assert context.kv_block_allocator.kv_hash_to_block_id == kv_hashes
+            assert context.mamba_slot_allocator.hash_to_block_id == mamba_hashes
+            assert self._live_cuda_graph_manager_state() == graph_state
+
+            finished = {}
+            saw_graph_replay = False
+            for _ in range(64):
+                result = engine.step_modern()
+                saw_graph_replay |= context.using_cuda_graph_this_step()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("static UVM hybrid graph lifecycle did not converge")
+
+            assert saw_graph_replay
+            assert len(finished) == 2
+            assert requests[1].num_cached_tokens >= 2 * block_size
+            assert self._live_cuda_graph_manager_state() == graph_state
+        finally:
+            self._clear_engine_runtime()
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_persist_tp2_pp2_replays_same_graphs_after_resume(self):
+        """PERSIST leaves TP2/PP2 graph runners and KV storage live across resume."""
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+        )
+        self._clear_engine_runtime()
+        try:
+            case = {"feature": "cuda-graph", "policy": PrefixCachingEvictionPolicy.LRU}
+            config = self._case_config(case, enable_prefix_caching=True)
+            config.num_cuda_graphs = 2
+            config.force_build_cuda_graphs = True
+            config.use_cuda_graphs_for_non_decode_steps = False
+            config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+            config.kv_cache_management_mode = "persist"
+            config.static_kv_memory_pointers = True
+            config.context_max_requests = 2
+            config.tensor_model_parallel_size = 2
+            config.pipeline_model_parallel_size = 2
+            config.sequence_parallel = True
+
+            env = self._build_test_env(config)
+            engine = env.engine
+            context = engine.context
+            assert context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
+            assert torch.distributed.get_world_size() >= 4
+            graph_state = self._live_cuda_graph_manager_state()
+
+            block_size = context.block_size_tokens
+            prompt = torch.arange(
+                2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+            ) % (config.vocab_size - 1)
+            requests = [
+                self._make_request(context, request_id, prompt.clone(), True)
+                for request_id in range(2)
+            ]
+            engine._add_request(requests[0])
+
+            saw_graph_before = False
+            donor_finished = False
+            for _ in range(16):
+                result = engine.step_modern()
+                saw_graph_before |= context.using_cuda_graph_this_step()
+                donor_finished |= bool(result["finished_request_records"])
+                if donor_finished:
+                    break
+            assert saw_graph_before
+            assert donor_finished
+            assert context.total_request_count == 0
+
+            engine._add_request(requests[1])
+            assert list(engine.waiting_request_ids) == [1]
+
+            kv_pointer = context.memory_buffer.data_ptr()
+            kv_hashes = dict(context.kv_block_allocator.kv_hash_to_block_id)
+            assert kv_hashes
+            engine.suspend()
+            engine.resume()
+
+            assert context.memory_buffer.data_ptr() == kv_pointer
+            assert context.kv_block_allocator.kv_hash_to_block_id == kv_hashes
+            assert context.cuda_graphs_available
+            assert not engine._cuda_graph_rebuild_pending
+            assert self._live_cuda_graph_manager_state() == graph_state
+
+            finished = {}
+            saw_graph_after = False
+            for _ in range(32):
+                result = engine.step_modern()
+                saw_graph_after |= context.using_cuda_graph_this_step()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("PERSIST TP2/PP2 graph replay did not converge")
+
+            assert saw_graph_after
+            assert requests[1].num_cached_tokens >= 2 * block_size
+            assert self._live_cuda_graph_manager_state() == graph_state
+        finally:
+            self._clear_engine_runtime()
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()

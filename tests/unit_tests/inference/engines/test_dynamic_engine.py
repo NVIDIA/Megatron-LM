@@ -160,6 +160,7 @@ class DynamicEngineTestConfig:
     use_cuda_graphs_for_non_decode_steps: bool = True
     cuda_graph_all_prefills: bool = False
     fp8: bool = False
+    hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -187,6 +188,7 @@ class DynamicEngineTestConfig:
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
+    unified_memory_level: int = 0
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
@@ -397,7 +399,11 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=128 if test_config.fp8 else 32,
+                hidden_size=(
+                    test_config.hidden_size
+                    if test_config.hidden_size is not None
+                    else (128 if test_config.fp8 else 32)
+                ),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
@@ -439,11 +445,17 @@ class DynamicInferenceEngineTestBase:
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec()
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec()
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec()
+                layer_spec = get_gpt_layer_with_inference_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None

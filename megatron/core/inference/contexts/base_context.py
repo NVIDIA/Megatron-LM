@@ -17,6 +17,8 @@ class BaseInferenceContext(abc.ABC):
         Args:
         """
         self.config = inference_config
+        self.cuda_graphs_available = True
+        self.is_creating_cuda_graphs = False
 
     @abc.abstractmethod
     def is_static_batching(self) -> bool:

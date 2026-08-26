@@ -473,6 +473,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._pending_signals = deque()
 
         self.resume_request_ids = None
+        self._cuda_graph_rebuild_pending = not self.context.cuda_graphs_available
 
         # Speculative decoding acceptance tracking (per-position).
         # Each tensor has length num_speculative_tokens; index i tracks position i+1
@@ -525,6 +526,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
+        assert (
+            context.total_request_count == 0 and context.chunked_prefill_request_id == -1
+        ), "CUDA graph capture requires an empty inference context"
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -629,7 +633,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 cache_key=("mtp", n, depth),
                             )
 
-                context.reset()
+                context.reset(preserve_prefix_cache=True, preserve_counters=True)
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
             # This isolates pool growth from process-wide scratch churn (KV cache,
@@ -673,6 +677,16 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+        context.cuda_graphs_available = True
+        self._cuda_graph_rebuild_pending = False
+
+    def _can_rebuild_cuda_graphs(self) -> bool:
+        """Return whether dummy graph capture cannot overwrite live request state."""
+        return (
+            self._cuda_graph_rebuild_pending
+            and self.context.total_request_count == 0
+            and self.context.chunked_prefill_request_id == -1
+        )
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -981,6 +995,12 @@ class DynamicInferenceEngine(AbstractEngine):
             and not self.context.static_kv_memory_pointers
         ):
             delete_cuda_graphs()
+            if (
+                self.inference_cuda_graph_scope != InferenceCudaGraphScope.none
+                and self.cuda_graph_impl == "local"
+            ):
+                self.context.cuda_graphs_available = False
+                self._cuda_graph_rebuild_pending = True
 
         # Build the list of requests to re-add on resume.
         # All waiting requests are always included; active requests are included
@@ -1037,6 +1057,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
+                and self._can_rebuild_cuda_graphs()
             ):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
@@ -1240,6 +1261,17 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         request_id = request.request_id
+        if (
+            self.context.enable_prefix_caching
+            and request.enable_prefix_caching
+            and request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        ):
+            # Cached tokens do not retain logits. Compute this request normally so
+            # prompt log probabilities stay complete while other requests can still
+            # use the shared prefix cache.
+            request.enable_prefix_caching = False
+            request.precomputed_block_hashes = []
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
@@ -1800,11 +1832,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 if request_id in finished_request_ids:
                     # Reconstruct routing from per-block storage before popping.
-                    if (
-                        finished_routing_block_ids
-                        and request_id in finished_routing_block_ids
-                        and len(self.requests[request_id].record.requests) == 1
-                    ):
+                    if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
                         request.routing_indices = (
@@ -2489,6 +2517,11 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        # OFFLOAD keeps live KV/Mamba state, so dummy graph capture must wait until
+        # those requests drain. Rebuild before admitting the next waiting request.
+        if self._can_rebuild_cuda_graphs():
+            self.create_cuda_graphs()
+
         # Discard registrations left by an interrupted prior step before this
         # step's scheduling queues new registrations.
         dynamo_helper = getattr(self.context, "dynamo_helper", None)
@@ -3021,6 +3054,53 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    @torch.inference_mode()
+    def _set_generation_epoch(self, generation_epoch: int) -> None:
+        """Apply a model-generation epoch received from the inference client."""
+        if generation_epoch == self._generation_epoch:
+            return
+
+        self.context.kv_block_allocator.invalidate_prefix_cache()
+        if self.context.mamba_slot_allocator is not None:
+            self.context.mamba_slot_allocator.invalidate_cache()
+        self.context.dynamo_helper.notify_kv_cache_cleared()
+        self._generation_epoch = generation_epoch
+
+        # RECOMPUTE suspension deletes tensor attributes, and no request owns live
+        # KV in that state. OFFLOAD and PERSIST retain their bookkeeping tensors.
+        if hasattr(self.context, "request_ids"):
+            context_request_ids = set(
+                self.context.request_ids[: self.context.total_request_count].tolist()
+            )
+            if self.context.chunked_prefill_request_id != -1:
+                context_request_ids.add(self.context.chunked_prefill_request_id)
+        else:
+            context_request_ids = set()
+
+        # Stamp all requests with the new epoch. Each field stores a
+        # sparse list of (start_token_index, epoch) boundaries.
+        for request_id, entry in self.requests.items():
+            request = entry.record[-1]
+            owns_live_kv = request_id in context_request_ids
+            if owns_live_kv and request.enable_prefix_caching:
+                # This request may still own KV computed by the prior model.
+                # Let it finish, but do not publish any more of its blocks for
+                # reuse by requests that start in the new epoch.
+                request.enable_prefix_caching = False
+                request.precomputed_block_hashes = []
+            total = len(request.prompt_tokens) + len(request.generated_tokens)
+            if total > 0:
+                boundary = (total - 1, generation_epoch)
+                never_started = not owns_live_kv and len(entry.record.requests) == 1
+                if request.policy_epoch is None or never_started:
+                    request.policy_epoch = [(0, generation_epoch)]
+                else:
+                    request.policy_epoch.append(boundary)
+                if request.kv_cache_epoch is None or not owns_live_kv:
+                    request.kv_cache_epoch = [(0, generation_epoch)]
+                else:
+                    request.kv_cache_epoch.append(boundary)
+
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
@@ -3171,22 +3251,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._poll_pending_kv_pushes()
 
         if new_generation_epoch is not None:
-            self._generation_epoch = new_generation_epoch
-            # Stamp all active requests with the new epoch.
-            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
-            for entry in self.requests.values():
-                request = entry.record[-1]
-                total = len(request.prompt_tokens) + len(request.generated_tokens)
-                if total > 0:
-                    boundary = (total - 1, new_generation_epoch)
-                    if request.policy_epoch is None:
-                        request.policy_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.policy_epoch.append(boundary)
-                    if request.kv_cache_epoch is None:
-                        request.kv_cache_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.kv_cache_epoch.append(boundary)
+            self._set_generation_epoch(new_generation_epoch)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

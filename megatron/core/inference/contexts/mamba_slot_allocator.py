@@ -468,7 +468,7 @@ class MambaSlotAllocator:
         # later turns could not skip prefill.
         chunk_start = req.finished_chunk_token_count + skip_tokens
         seq_len = prefill_chunk_length - skip_tokens  # tokens computed this chunk
-        is_last_chunk = req.finished_chunk_token_count + prefill_chunk_length >= prompt_len
+        chunk_end = req.finished_chunk_token_count + prefill_chunk_length
 
         # Candidate absolute block boundaries at which to cache Mamba state.
         kv_div_abs = num_matched_blocks * bs
@@ -505,13 +505,12 @@ class MambaSlotAllocator:
             self._has_intermediates = True
         self._intermediate_counts_cpu[current_id] = count
 
-        # Block-aligned EOS: when the prompt length is exactly block-aligned, the
-        # request's live final state IS the last block boundary's state and can be
-        # cached directly. Only valid on the final chunk (otherwise the live state
-        # is mid-prompt). Non-block-aligned prompts cache their last complete block
-        # via the intermediate-extraction path above instead.
-        if is_last_chunk and last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // bs - 1
+        # At a block-aligned chunk end, the request's live state is exactly the
+        # state for that block boundary and can be cached directly. This covers
+        # both aligned final prompts and non-final boundaries, which cannot use
+        # intermediate extraction because their offset equals `seq_len`.
+        if chunk_end > 0 and chunk_end % bs == 0:
+            last_block_idx = chunk_end // bs - 1
             if last_block_idx >= 0:
                 self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
                     last_block_idx
@@ -718,17 +717,21 @@ class MambaSlotAllocator:
     # Reset
     # =========================================================================
 
-    def reset(self) -> None:
-        """Reset all state (mappings, free pool, cache, intermediate tracking)."""
+    def invalidate_cache(self) -> None:
+        """Discard durable and pending prefix state without touching GPU storage."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
         torch.arange(self.max_slots, out=self.free_slots)
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
-        self.intermediate_ssm_out.zero_()
-        self.intermediate_conv_out.zero_()
         self._intermediate_offsets_cpu.fill_(0)
         self._intermediate_counts_cpu.fill_(0)
         self._intermediate_block_ids_cpu.fill_(-1)
         self._eos_cache_block_id_cpu.fill_(-1)
         self._has_intermediates = False
+
+    def reset(self) -> None:
+        """Reset all state (mappings, free pool, cache, intermediate tracking)."""
+        self.invalidate_cache()
+        self.intermediate_ssm_out.zero_()
+        self.intermediate_conv_out.zero_()

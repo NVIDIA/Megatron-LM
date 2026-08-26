@@ -967,8 +967,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
+            and self.unified_memory_level == 0
         ):
-            assert self.unified_memory_level == 0
             self._offloadable_tensor_names.add("memory_buffer")
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
@@ -1044,8 +1044,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             if (
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
+                and self.unified_memory_level == 0
             ):
-                assert self.unified_memory_level == 0
                 self._offloadable_tensor_names.add("mamba_conv_states")
                 self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
                     self.mamba_conv_states, device="cpu"
@@ -2434,14 +2434,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
-        best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
-            batch_dimensions,
-            self.cuda_graph_batch_dimensions_list,
-            strict=self.is_hybrid_model,
-            ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
-            ep_zmq_communicator=self._ep_zmq_communicator,
-        )
+        best_graph = None
+        if self.cuda_graphs_available or construct_graph_dimensions is not None:
+            best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+                batch_dimensions,
+                self.cuda_graph_batch_dimensions_list,
+                strict=self.is_hybrid_model,
+                ep_group=self.expert_model_parallel_group,
+                match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+                ep_zmq_communicator=self._ep_zmq_communicator,
+            )
         self._using_cuda_graph_this_step = best_graph is not None
 
         if construct_graph_dimensions is not None:
@@ -3296,15 +3298,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # Track prefix cache hits. num_cached_tokens accumulates across prefill
-        # chunks: each chunk matches a disjoint block range (start advances with
-        # finished_chunk_token_count), so a long cached prefix is discovered
-        # incrementally and must be summed, not overwritten.
-        if num_matched_blocks > 0:
-            self.prefix_cache_hits += 1
-            self.prefix_cache_blocks_matched += num_matched_blocks
-            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
-
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
 
@@ -3332,6 +3325,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
+
+        # Track prefix cache hits only after allocation succeeds. num_cached_tokens
+        # accumulates across successful prefill chunks; a failed admission can be
+        # retried and must not count the same cached prefix twice.
+        if num_matched_blocks > 0:
+            self.prefix_cache_hits += 1
+            self.prefix_cache_blocks_matched += num_matched_blocks
+            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -3482,11 +3483,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # compute_and_store_offsets sets CPU state + GPU staging buffers that
         # commit_intermediate_states() consumes after the forward pass. Run it for
-        # EVERY prefill chunk (not just the first): the last complete block of a
+        # EVERY cacheable prefill chunk (not just the first): the last complete block of a
         # multi-chunk prompt falls in a continuation chunk, and caching its Mamba
         # state is precisely what lets a later turn skip prefill on a hybrid model.
         # Mamba slot allocation / state restore above stays first-chunk-only.
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
+        if (
+            self.is_hybrid_model
+            and self.mamba_slot_allocator is not None
+            and req.precomputed_block_hashes
+        ):
             self.mamba_slot_allocator.compute_and_store_offsets(
                 req,
                 current_id,
