@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for deterministic replica planning and compact HybridEP routing."""
+"""Unit tests for deterministic replica planning and HybridEP routing."""
 
 import os
 from types import SimpleNamespace
@@ -24,9 +24,7 @@ from megatron.core.transformer.moe.replica_planner import (
 
 
 def test_replica_hybridep_rank_layout_requires_equal_shapes(monkeypatch):
-    from megatron.core.transformer.moe.token_dispatcher import (
-        _validate_replica_rank_layout,
-    )
+    from megatron.core.transformer.moe.token_dispatcher import _validate_replica_rank_layout
 
     group = object()
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
@@ -41,7 +39,13 @@ def test_replica_hybridep_rank_layout_requires_equal_shapes(monkeypatch):
         )
 
 
-def test_replica_hybridep_binds_the_cutedsl_bridge(monkeypatch):
+@pytest.mark.parametrize(
+    ("grad_reduce_in_bf16", "expected_grad_dtype"),
+    [(False, torch.float32), (True, torch.bfloat16)],
+)
+def test_replica_hybridep_binds_the_cutedsl_bridge(
+    monkeypatch, grad_reduce_in_bf16, expected_grad_dtype
+):
     from megatron.core.transformer.moe import token_dispatcher
     from megatron.core.transformer.moe.token_dispatcher import _ReplicaHybridEPManager
 
@@ -66,7 +70,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(monkeypatch):
         moe_hybridep_num_blocks_permute=7,
         moe_hybridep_num_blocks_unpermute=5,
         moe_hybridep_num_sms_preprocessing=9,
-        replica_hybridep_grad_dtype=torch.bfloat16,
+        grad_reduce_in_bf16=grad_reduce_in_bf16,
     )
     experts = FakeExperts()
     manager.bind_experts(experts)
@@ -75,6 +79,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(monkeypatch):
     assert experts.bound_bridge is bridge
     assert captured["num_experts"] == 8
     assert captured["num_local_experts"] == 2
+    assert captured["grad_dtype"] == expected_grad_dtype
 
 
 def test_replica_hybridep_metadata_uses_routing_map_for_zero_probability_routes():
@@ -100,24 +105,24 @@ def test_replica_hybridep_metadata_uses_routing_map_for_zero_probability_routes(
     torch.testing.assert_close(probs.grad, routing_map.to(probs.dtype))
 
 
-def test_replica_hybridep_keeps_virtual_routes_compact():
+def test_replica_hybridep_expands_virtual_routes_for_hybridep():
     plan = ReplicaPlan(
         virtual_experts=torch.tensor([[1, 6], [3, 4]], dtype=torch.int64),
         experts_to_copy=torch.empty((0,), dtype=torch.int32),
     )
-    probs = torch.tensor([[0.75, 0.25], [0.6, 0.4]])
+    probs = torch.tensor([[0.75, 0.25], [0.6, 0.4]], requires_grad=True)
     routing_map, dense_probs = map_replica_plan_to_hybridep(plan, probs, num_experts=8)
 
     assert routing_map.shape == (2, 8)
     assert dense_probs.shape == (2, 8)
     assert routing_map[0, 1] and routing_map[0, 6]
     assert dense_probs[1, 3] == 0.6
+    dense_probs.sum().backward()
+    torch.testing.assert_close(probs.grad, torch.ones_like(probs))
 
 
 def test_replica_hybridep_rank_capacity_includes_per_expert_padding():
-    from megatron.core.transformer.moe.token_dispatcher import (
-        _get_replica_hybridep_rank_capacity,
-    )
+    from megatron.core.transformer.moe.token_dispatcher import _get_replica_hybridep_rank_capacity
 
     common = {
         "num_tokens": 8192,
@@ -141,51 +146,6 @@ def test_replica_hybridep_rank_capacity_includes_per_expert_padding():
             **common, capacity_factor=1.0, alignment=0
         )
         == 180224
-    )
-
-
-def test_hybridep_compact_router_gradient_is_gathered_from_dense_result(monkeypatch):
-    dense_prob_grad = torch.tensor([[10.0, 11.0, 12.0, 13.0], [20.0, 21.0, 22.0, 23.0]])
-
-    class FakeHybridEPBuffer:
-        def dispatch_with_permute(self, **kwargs):
-            return (
-                kwargs["hidden"].clone(),
-                kwargs["topk_weights"].clone(),
-                None,
-                torch.ones(2, dtype=torch.int32),
-                (torch.tensor(0),),
-            )
-
-        def combine_with_unpermute(self, **kwargs):
-            return kwargs["hidden"], dense_prob_grad
-
-    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", FakeHybridEPBuffer())
-    hidden = torch.randn(2, 3, requires_grad=True)
-    topk_idx = torch.tensor([[1, 3], [0, -1]], dtype=torch.int64)
-    topk_weights = torch.randn(2, 2, requires_grad=True)
-    outputs = fused_a2a.HybridEPDispatch.apply(
-        hidden,
-        None,
-        None,
-        object(),
-        2,
-        None,
-        None,
-        None,
-        None,
-        False,
-        4,
-        None,
-        108,
-        topk_idx,
-        topk_weights,
-        4,
-    )
-    (outputs[0].sum() + outputs[1].sum()).backward()
-
-    torch.testing.assert_close(
-        topk_weights.grad, torch.tensor([[11.0, 13.0], [20.0, 0.0]])
     )
 
 
@@ -555,9 +515,7 @@ def _run_replica_hybridep_full_layer_parity(
             "replica_hybridep distributed coverage requires a 4-rank torchrun launch"
         )
 
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_layer_with_transformer_engine_spec,
-    )
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.spec_utils import get_submodules
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -635,7 +593,12 @@ def _run_replica_hybridep_full_layer_parity(
         raise ValueError(f"Unsupported reference dispatcher {reference_dispatcher!r}.")
     backend_config = {}
     if backend == "replica_hybridep":
-        backend_config["replica_hybridep_grad_dtype"] = grad_dtype
+        bf16_grad_reduce = grad_dtype == torch.bfloat16
+        backend_config.update(
+            grad_reduce_in_bf16=bf16_grad_reduce,
+            ddp_reduce_scatter_with_fp32_accumulation=bf16_grad_reduce,
+            gtp_remat_reduce_scatter_with_fp32_accumulation=bf16_grad_reduce and gtp,
+        )
     replica_config = TransformerConfig(
         **common,
         **backend_config,
