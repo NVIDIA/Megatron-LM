@@ -501,6 +501,7 @@ except ImportError:
 
 _hybrid_ep_buffer = None
 _hybrid_ep_dispatch_output_pool = ReusableOutputBufferPool("HybridEP dispatch output")
+_hybrid_ep_expert_output_pool = ReusableOutputBufferPool("HybridEP expert output")
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
@@ -578,6 +579,19 @@ def reset_hybrid_ep_buffer():
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = None
     _hybrid_ep_dispatch_output_pool.reset()
+    _hybrid_ep_expert_output_pool.reset()
+
+
+def acquire_hybrid_ep_expert_output_buffer(
+    like: torch.Tensor, num_expert_output_buffers: int
+) -> torch.Tensor | None:
+    """Acquire a persistent buffer for the fused expert FC2 output.
+
+    HybridEP's expert output has the same static shape and dtype as its dispatched token input.
+    The buffer is released after HybridEP combine enqueues its final read.
+    """
+    _hybrid_ep_expert_output_pool.configure(num_expert_output_buffers)
+    return _hybrid_ep_expert_output_pool.acquire(tuple(like.shape), like.dtype, like.device)
 
 
 class HybridEPDispatch(torch.autograd.Function):

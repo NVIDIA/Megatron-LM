@@ -322,6 +322,12 @@ trade-off for DeepSeek-V3 MBS2. This requires
 `--moe-expert-rank-capacity-factor` or `--moe-pad-expert-input-to-capacity`. The installed DeepEP
 must expose the caller-provided `output_token` argument; Megatron fails early otherwise.
 
+Setting `--moe-hybridep-num-expert-output-buffers N` additionally makes the fused grouped MLP
+write FC2 results directly into an `N`-slot persistent ring. HybridEP combine records the final
+consumer event before releasing each slot, so this works with both combined-1F1B overlap and the
+regular layer-by-layer schedule. It requires the same static HybridEP output bound, the Transformer
+Engine op fuser, and a Transformer Engine build with GroupedLinear caller-output support.
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
@@ -569,6 +575,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-permute-fusion | Fuse permutation ops | False |
 | --moe-hybridep-reuse-dispatch-output-buffers | Reuse caller-owned HybridEP token outputs | False |
 | --moe-hybridep-num-dispatch-output-buffers | Persistent HybridEP token output ring size | 4 |
+| --moe-hybridep-num-expert-output-buffers | Persistent caller-owned HybridEP FC2 output ring | 0 |
 
 ### Performance Optimization
 | Argument | Description | Default |

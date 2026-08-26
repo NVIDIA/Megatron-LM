@@ -1059,6 +1059,15 @@ class TransformerConfig(ModelParallelConfig):
     ``moe_hybridep_reuse_dispatch_output_buffers``.
     """
 
+    moe_hybridep_num_expert_output_buffers: int = 0
+    """Number of persistent caller-provided buffers for HybridEP expert FC2 outputs.
+
+    The fused grouped MLP writes directly into these buffers and HybridEP combine releases each
+    slot after enqueueing its final read. This avoids allocator pending-free accumulation in both
+    combined-1F1B and regular schedules. Requires static HybridEP output shapes and Transformer
+    Engine GroupedLinear caller-output support. Zero disables reuse.
+    """
+
     moe_ncclep_static_shape: bool = False
     """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
     instead of narrowing to the (data-dependent) number of received tokens, removing the D2H sync
@@ -2150,6 +2159,34 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_hybridep_num_dispatch_output_buffers requires FP8 or FP4 expert "
                     "GEMMs so the BF16 dispatch input is not saved for backward"
+                )
+
+        if self.moe_hybridep_num_expert_output_buffers < 0:
+            raise ValueError("moe_hybridep_num_expert_output_buffers must be non-negative")
+        if self.moe_hybridep_num_expert_output_buffers > 0:
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires the HybridEP flex "
+                    "dispatcher"
+                )
+            if not self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires "
+                    "use_transformer_engine_op_fuser"
+                )
+            if not self.moe_grouped_gemm:
+                raise ValueError("moe_hybridep_num_expert_output_buffers requires moe_grouped_gemm")
+            if (
+                self.moe_expert_rank_capacity_factor is None
+                and not self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires a static HybridEP "
+                    "output size from moe_expert_rank_capacity_factor or "
+                    "moe_pad_expert_input_to_capacity"
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into

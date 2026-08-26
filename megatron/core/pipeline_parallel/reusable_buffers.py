@@ -106,7 +106,11 @@ class ReusableOutputBufferPool:
     def _release(self, slot_index: int, stream: torch.cuda.Stream) -> None:
         slot = self._slots[slot_index]
         if not slot.in_use:
-            raise RuntimeError(f"{self.name} slot {slot_index} was released more than once")
+            # Some final consumers own their lifetime and release immediately after enqueueing
+            # work, while ScheduleNode subsequently visits the same input in its generic
+            # free-input path. Treat that second visit as an ownership query: the persistent
+            # storage is already safe and must not be resized or record_stream'ed.
+            return
         if slot.event is None:
             # External events become explicit CUDA graph event nodes. This is required when
             # capture begins after eager warmup: an internal event wait would otherwise create
@@ -135,7 +139,9 @@ def release_reusable_output_buffer(tensor: torch.Tensor, stream: torch.cuda.Stre
     Returns:
         ``True`` when the tensor belongs to a reusable pool. The caller must then avoid
         resizing its storage or calling ``record_stream``, because the pool owns the storage
-        and records the precise consumer completion event itself.
+        and records the precise consumer completion event itself. Releasing an already-released
+        registered storage is an idempotent ownership query, so a final consumer may release it
+        before ``ScheduleNode`` reaches its generic free-input path.
     """
     owner = _buffer_owners.get(_storage_key(tensor))
     if owner is None:

@@ -6,12 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.transformer.moe.token_dispatcher as token_dispatcher_module
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher, _HybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    MoETokenDispatcher,
+    _HybridEPManager,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -106,6 +111,73 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
+
+
+def test_hybridep_combine_releases_expert_output_at_final_consumer(monkeypatch):
+    manager = object.__new__(_HybridEPManager)
+    manager.handle = object()
+    manager.num_permuted_tokens = 8
+    manager.pad_multiple = 4
+    manager.config = SimpleNamespace(moe_permute_fusion_into_hybridep=False)
+    manager._padded_num_tokens = None
+    manager._original_num_tokens = None
+    manager.drop_and_pad = False
+    expert_output = torch.empty(8, 4)
+    combined_output = torch.empty(2, 4)
+    stream = object()
+    releases = []
+
+    monkeypatch.setattr(token_dispatcher_module, "hybrid_ep_combine", lambda **_: combined_output)
+    monkeypatch.setattr(
+        token_dispatcher_module,
+        "release_reusable_output_buffer",
+        lambda tensor, release_stream: releases.append((tensor, release_stream)) or True,
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    output = manager.combine(expert_output)
+
+    assert output is combined_output
+    assert releases == [(expert_output, stream)]
+
+
+def test_hybridep_dispatcher_acquires_expert_output_buffer(monkeypatch):
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.config = SimpleNamespace(
+        moe_flex_dispatcher_backend="hybridep", moe_hybridep_num_expert_output_buffers=4
+    )
+    dispatched_input = torch.empty(8, 4)
+    expected = torch.empty_like(dispatched_input)
+    calls = []
+    monkeypatch.setattr(
+        token_dispatcher_module,
+        "acquire_hybrid_ep_expert_output_buffer",
+        lambda tensor, slots: calls.append((tensor, slots)) or expected,
+    )
+
+    output = dispatcher.get_expert_output_buffer(dispatched_input)
+
+    assert output is expected
+    assert calls == [(dispatched_input, 4)]
+
+
+def test_hybridep_expert_output_buffers_allow_regular_schedule():
+    transformer_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=16,
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.0,
+        moe_hybridep_num_expert_output_buffers=2,
+        overlap_moe_expert_parallel_comm=False,
+    )
+
+    assert transformer_config.moe_hybridep_num_expert_output_buffers == 2
 
 
 class MoEModelTestContainer:

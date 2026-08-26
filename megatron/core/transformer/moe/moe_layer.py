@@ -616,8 +616,12 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # HybridEP can provide a persistent buffer that fused FC2 writes directly into.
+            # The dispatcher releases it after combine enqueues the final read.
+            output_buffer = self.token_dispatcher.get_expert_output_buffer(dispatched_input)
+            expert_kwargs = {"output_buffer": output_buffer} if output_buffer is not None else {}
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)

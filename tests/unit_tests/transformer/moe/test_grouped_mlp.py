@@ -190,6 +190,36 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     assert fused_ops.args[3] is tokens_per_expert
 
 
+def test_fused_forward_routes_caller_output_to_fc2(monkeypatch):
+    output_buffer = torch.empty(2, 4)
+
+    class FakeFusedOps:
+        def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens, *, op_kwargs=None):
+            self.op_kwargs = op_kwargs
+            return op_kwargs[-1]["output"]
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(
+        fp8=False,
+        fp4=False,
+        moe_router_padding_for_quantization=False,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_paged_stash=False,
+        delay_offload_until_cuda_graph=False,
+    )
+    fused_ops = FakeFusedOps()
+    module._fused_ops = (fused_ops,)
+    monkeypatch.setattr(experts_module, "OUTPUT_BUFFER_KEY", "output")
+
+    output = module._fused_forward(
+        torch.zeros(2, 4), torch.tensor([1, 1]), torch.ones(2), output_buffer
+    )
+
+    assert output is output_buffer
+    assert fused_ops.op_kwargs == {-1: {"output": output_buffer}}
+
+
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
     intermediate = torch.arange(6, dtype=torch.float32).view(3, 2)
 
