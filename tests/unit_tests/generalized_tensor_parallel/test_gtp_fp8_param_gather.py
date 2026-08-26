@@ -582,6 +582,104 @@ class TestGTPFp8ParamGather:
     @pytest.mark.skipif(
         not HAVE_EMERGING_OPTIMIZERS, reason="emerging-optimizers package is required"
     )
+    def test_moe_grouped_tensor_op_fuser_layerwise_mxfp8_sync_parity(self, monkeypatch):
+        """Grouped-tensor op fuser must match regular TEGroupedMLP with LayerWise MXFP8 sync.
+
+        The reference disables grouped-tensor execution and the TE op fuser; the target enables
+        both. Everything else is identical: MXFP8 primary weights, parameter gather, grad-buffer
+        reuse, padded LayerWise layout, and overlap. The target therefore reaches
+        ``_stage_layerwise_mxfp8_params`` through the fused implementation's forwarded pre-hooks.
+        """
+        if Utils.world_size != 4:
+            pytest.skip("Requires exactly 4 torchrun ranks for EP2 x EDP2")
+
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+
+        harness = _FP8ParamHarness()
+        harness.setup_method(None)
+        harness.seq_length = 128
+        harness.micro_batch_size = 1
+        try:
+            common = dict(
+                tp_size=1,
+                num_steps=6,
+                num_layers=1,
+                padded_vocab_size=512,
+                hidden_size=256,
+                num_attention_heads=8,
+                ffn_hidden_size=256,
+                global_batch_size=4,
+                num_experts=2,
+                moe_grouped_gemm=True,
+                moe_single_grouped_weight=False,
+                moe_ffn_hidden_size=256,
+                expert_model_parallel_size=2,
+                expert_tensor_parallel_size=1,
+                expert_tensor_parallel_num_weight_shards=1,
+                moe_token_dispatcher_type="alltoall",
+                moe_router_topk=2,
+                moe_router_pre_softmax=True,
+                moe_router_load_balancing_type="none",
+                moe_aux_loss_coeff=0.0,
+                add_bias_linear=False,
+                optimizer="muon",
+                muon_scalar_optimizer="adam",
+                muon_momentum=0.9,
+                muon_scale_mode="spectral",
+                muon_num_ns_steps=5,
+                muon_coefficient_type="quintic",
+                muon_tp_mode="duplicated",
+                lr=1e-3,
+                clip_grad=0.0,
+                tensor_parallel_num_weight_shards=1,
+                use_layer_wise_param_layout=True,
+                untie_embeddings_and_output_weights=True,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                overlap_param_gather=True,
+                overlap_grad_reduce=True,
+            )
+
+            loss_reference = harness._run_test_helper(
+                recipe="mxfp8",
+                fp8_param_gather=True,
+                moe_use_grouped_tensor=False,
+                use_transformer_engine_op_fuser=False,
+                **common,
+            )
+
+            loss_target = harness._run_test_helper(
+                recipe="mxfp8",
+                fp8_param_gather=True,
+                moe_use_grouped_tensor=True,
+                use_transformer_engine_op_fuser=True,
+                **common,
+            )
+
+            local_trajectories = torch.stack((loss_target, loss_reference)).cuda()
+            gathered_trajectories = [
+                torch.empty_like(local_trajectories)
+                for _ in range(torch.distributed.get_world_size())
+            ]
+            torch.distributed.all_gather(gathered_trajectories, local_trajectories)
+            trajectories = torch.stack(gathered_trajectories)
+            torch.testing.assert_close(
+                trajectories[:, 0],
+                trajectories[:, 1],
+                atol=1e-4,
+                rtol=1e-3,
+            )
+        finally:
+            harness.teardown_method(None)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS, reason="emerging-optimizers package is required"
+    )
     @pytest.mark.skipif(
         not HAVE_GDP_DEPS,
         reason=(

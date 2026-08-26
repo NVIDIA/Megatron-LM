@@ -585,10 +585,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             if self.ddp_config is not None
             else config.overlap_param_gather
         )
-        if not self.use_buffer_param_sync and (
-            self.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
-        ):
-            # Legacy bucket path: set up per-bucket param lists for variable-size all-gather.
+        # Selects who executes LayerWise parameter synchronization. True means DDP bucket groups
+        # launch it: a full layout uses the fixed-size parameter buffer, while the variable-size
+        # path without a full layout uses grad_data. False means the optimizer calls
+        # allgather_params() synchronously after its step, using temporary flatten/receive buffers.
+        self.layerwise_param_sync_via_bucket_group = (
+            self.ddp_config.param_sync_via_bucket_group
+            if self.ddp_config is not None
+            else self.overlap_param_gather or config.reuse_grad_buf_for_mxfp8_param_ag
+        )
+
+        needs_variable_size_bucket_metadata = (
+            not self.use_buffer_param_sync and self.layerwise_param_sync_via_bucket_group
+        )
+        if needs_variable_size_bucket_metadata:
+            # With use_layer_wise_param_layout=False, set up per-bucket param lists for
+            # variable-size all-gather.
             # Overlap uses this from forward pre-hooks; synchronous MXFP8 reuse uses the same
             # path during optimizer step so both modes stage FP32 masters into BF16 grad_data.
             assert (
@@ -1007,9 +1019,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
         if not self.overlap_param_gather:
-            if self.use_buffer_param_sync or self.config.reuse_grad_buf_for_mxfp8_param_ag:
-                # Full layouts use the standard DDP buffer all-gather. Legacy MXFP8 reuse uses
-                # the variable-size bucket path, which stages FP32 masters into BF16 grad_data.
+            if self.layerwise_param_sync_via_bucket_group:
+                # Full layouts use the standard DDP buffer all-gather. With
+                # use_layer_wise_param_layout=False, the variable-size path uses grad_data.
                 # Both cases sync only the LayerWise-owned bucket groups.
                 self.start_param_sync_for_bucket_group_subset()
             else:

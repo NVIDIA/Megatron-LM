@@ -1025,11 +1025,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                                 main_param = high_precision_init_val.to(
                                     device=param.device, dtype=torch.float32, copy=True
                                 )
-                                clear_high_precision_init_val = getattr(
-                                    param, 'clear_high_precision_init_val', None
-                                )
-                                if clear_high_precision_init_val is not None:
-                                    clear_high_precision_init_val()
+                                param.clear_high_precision_init_val()
                             else:
                                 main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.

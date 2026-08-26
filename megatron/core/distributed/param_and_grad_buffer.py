@@ -247,11 +247,7 @@ class _ParamAndGradBucketGroup:
         # LayerWise parameter sync can use this collective group without the distributed
         # optimizer: asynchronously when overlap is enabled, or synchronously when MXFP8 reuses
         # grad_data as its BF16 all-gather transport.
-        if (
-            self.ddp_config.use_distributed_optimizer
-            or self.ddp_config.overlap_param_gather
-            or self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-        ):
+        if self.ddp_config.param_sync_via_bucket_group:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
@@ -440,13 +436,7 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        # overlap_param_gather covers the layer-wise optimizer case, which sets
-        # overlap_param_gather=True without use_distributed_optimizer.
-        assert (
-            self.ddp_config.use_distributed_optimizer
-            or self.ddp_config.overlap_param_gather
-            or self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-        )
+        assert self.ddp_config.param_sync_via_bucket_group
 
         if force_sync:
             if self.param_gather_handle is not None:
