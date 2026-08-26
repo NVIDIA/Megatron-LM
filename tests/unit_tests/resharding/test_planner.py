@@ -384,10 +384,18 @@ def _plan_edges(plans):
     return sends, recvs
 
 
-def _build_all(gathered_pairs):
+def _build_all(gathered_pairs, execution_batch_bytes=None):
     """Build every rank's plan from a rank-ordered list of (src_meta, dst_meta)."""
     dst_by_rank, src_by_name = index_metadata_rosters(gathered_pairs)
-    return {rank: build_plan_from_rosters(dst_by_rank, src_by_name, rank) for rank in dst_by_rank}
+    return {
+        rank: build_plan_from_rosters(
+            dst_by_rank,
+            src_by_name,
+            rank,
+            execution_batch_bytes=execution_batch_bytes,
+        )
+        for rank in dst_by_rank
+    }
 
 
 def _recv_sig(plan):
@@ -442,7 +450,10 @@ class TestBuildPlanFromRosters:
             ),
         ]
 
-        plans = _build_all(gathered)
+        default_plans = _build_all(gathered)
+        assert {plan.num_batches for plan in default_plans.values()} == {1}
+
+        plans = _build_all(gathered, execution_batch_bytes=256 * 1024 * 1024)
 
         assert {plan.num_batches for plan in plans.values()} == {2}
         send_batches = {op.task_id: op.batch_id for op in plans[0].send_ops}
@@ -506,8 +517,18 @@ def test_execution_batch_ids_keep_replicas_together():
     assert num_batches == 2
 
 
-def test_local_plan_uses_smallest_rank_execution_batch_bytes(monkeypatch):
-    """Heterogeneous ranks derive one deterministic, memory-safe limit."""
+@pytest.mark.parametrize(
+    ("gathered_limits", "local_limit", "expected_limit"),
+    [
+        ([200, 100], 200, 100),
+        ([None, None], None, None),
+        ([None, 100], None, 100),
+    ],
+)
+def test_local_plan_resolves_rank_execution_batch_bytes(
+    monkeypatch, gathered_limits, local_limit, expected_limit
+):
+    """Ranks agree on the smallest configured limit or preserve the unset default."""
     sentinel = object()
     forwarded = {}
 
@@ -522,7 +543,7 @@ def test_local_plan_uses_smallest_rank_execution_batch_bytes(monkeypatch):
 
     def fake_all_gather_object(output, _local_entry, group):
         assert isinstance(group, FakeGroup)
-        output[:] = [([], [], 200), ([], [], 100)]
+        output[:] = [([], [], limit) for limit in gathered_limits]
 
     def fake_build(dst_by_rank, src_by_name, rank, execution_batch_bytes):
         forwarded["args"] = (dst_by_rank, src_by_name, rank)
@@ -533,11 +554,14 @@ def test_local_plan_uses_smallest_rank_execution_batch_bytes(monkeypatch):
     monkeypatch.setattr(planner, "build_plan_from_rosters", fake_build)
 
     result = planner.build_local_reshard_plan(
-        None, None, group=FakeGroup(), execution_batch_bytes=200
+        None, None, group=FakeGroup(), execution_batch_bytes=local_limit
     )
 
     assert result is sentinel
-    assert forwarded == {"args": ({0: {}, 1: {}}, {}, 0), "execution_batch_bytes": 100}
+    assert forwarded == {
+        "args": ({0: {}, 1: {}}, {}, 0),
+        "execution_batch_bytes": expected_limit,
+    }
 
 
 def test_centralized_planner_compatibility_wrapper(monkeypatch):

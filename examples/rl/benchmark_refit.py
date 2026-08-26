@@ -104,14 +104,26 @@ def print_config_summary(args, src_config, dst_config, world_size, mode):
     print_rank_0(f"{'='*80}\n")
 
 
-def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iterations):
+def run_benchmark(
+    src_model,
+    dst_model,
+    refit_service,
+    num_warmup,
+    num_iterations,
+    execution_batch_bytes: int | None = None,
+):
     """Run warmup and benchmark iterations, return timings."""
     # Warmup (builds refit plan on first iteration)
     print_rank_0(f"Warmup: {num_warmup} iterations...")
     for i in range(num_warmup):
         torch.cuda.synchronize()
         torch.distributed.barrier()
-        swap_model_weights(src_model, dst_model, refit_method=refit_service)
+        swap_model_weights(
+            src_model,
+            dst_model,
+            refit_method=refit_service,
+            execution_batch_bytes=execution_batch_bytes,
+        )
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
@@ -126,7 +138,12 @@ def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iteration
         torch.distributed.barrier()
 
         start_time = time.perf_counter()
-        swap_model_weights(src_model, dst_model, refit_method=refit_service)
+        swap_model_weights(
+            src_model,
+            dst_model,
+            refit_method=refit_service,
+            execution_batch_bytes=execution_batch_bytes,
+        )
         torch.cuda.synchronize()
         end_time = time.perf_counter()
 
@@ -261,6 +278,7 @@ def benchmark_collocated():
             refit_service,
             args.num_benchmark_warmup,
             args.num_benchmark_iterations,
+            execution_batch_bytes=args.refit_execution_batch_bytes,
         )
         print_results(timings)
     finally:
@@ -371,6 +389,7 @@ def benchmark_non_collocated():
             refit_service,
             args.num_benchmark_warmup,
             args.num_benchmark_iterations,
+            execution_batch_bytes=args.refit_execution_batch_bytes,
         )
         print_results(timings)
     finally:

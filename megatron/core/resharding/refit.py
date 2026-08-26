@@ -29,7 +29,6 @@ from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
-from .planner import _DEFAULT_EXECUTION_BATCH_BYTES
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
@@ -61,7 +60,7 @@ class _PlanCacheKey:
     pool_index: int = 0
     # Execution batches are part of the plan, so a different memory limit must
     # not reuse a cached schedule built with another limit.
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES
+    execution_batch_bytes: int | None = None
 
 
 def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
@@ -97,7 +96,7 @@ def _build_plan_cache_key(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     pool_index: int = 0,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ) -> _PlanCacheKey:
     """Build cache key for reshard plan."""
     # group.rank()/size() support cross-cluster ProcessGroups where members
@@ -227,7 +226,7 @@ def _build_or_get_plan(
     src_rank_offset,
     dst_rank_offset,
     pool_index=0,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ):
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
@@ -320,7 +319,7 @@ def prepare_swap_model_weights(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ):
     """Pre-build and cache the reshard plan and any format-conversion transforms.
 
@@ -350,8 +349,9 @@ def prepare_swap_model_weights(
         group: Optional process group for collective communication.
         src_rank_offset: Rank offset for source (training) workers.
         dst_rank_offset: Rank offset for destination (inference) workers.
-        execution_batch_bytes: Soft per-rank limit for transient generic-executor
-            staging. A single complete parameter may exceed this value.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            generic-executor staging. A single complete parameter may exceed this
+            value. None keeps the model-wide submission behavior.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(
@@ -380,7 +380,7 @@ def swap_model_weights(
     transform: Optional[ReshardTransform] = None,
     num_dst_pools: int = 1,
     dst_pool_index: int = 0,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ):
     """
     Orchestrate weight swap/refit.
@@ -406,8 +406,9 @@ def swap_model_weights(
             receives into ``target_model`` only on its own pool's pass
             (``pool == dst_pool_index``) and is a pure source otherwise.
             Defaults ``(1, 0)`` reproduce the single-destination behavior.
-        execution_batch_bytes: Soft per-rank limit for transient generic-executor
-            staging. A single complete parameter may exceed this value.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            generic-executor staging. A single complete parameter may exceed this
+            value. None keeps the model-wide submission behavior.
     """
     if isinstance(refit_method, str):
         service = get_or_create_service(refit_method, group=group)
@@ -518,7 +519,7 @@ def reshard_model_weights(
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
     pool_index: int = 0,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -533,8 +534,9 @@ def reshard_model_weights(
         src_rank_offset / dst_rank_offset: Offsets for mapping local ranks to global ranks
             in independent torch.distributed worlds.
         transform: Optional ReshardTransform for custom format conversion.
-        execution_batch_bytes: Soft per-rank limit for transient generic-executor
-            staging. A single complete parameter may exceed this value.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            generic-executor staging. A single complete parameter may exceed this
+            value. None keeps the model-wide submission behavior.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(

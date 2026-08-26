@@ -24,12 +24,6 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-# Bound transient source dequantization and destination staging in the generic
-# executor. This matches the native NCCL M2N service's default grouped-submission
-# limit. A single parameter is allowed to exceed the soft limit.
-_DEFAULT_EXECUTION_BATCH_BYTES = 256 * 1024 * 1024
-
-
 @dataclass(frozen=True)
 class _NativeParameterPart:
     global_shape: tuple[int, ...]
@@ -377,7 +371,7 @@ def _iter_global_transfer_ops(
 def _build_execution_batch_ids(
     dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
     src_param_metadata: dict[str, list[ParameterMetadata]],
-    max_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    max_batch_bytes: int | None = None,
 ) -> tuple[dict[str, int], int]:
     """Assign complete logical parameters to deterministic memory-bounded batches.
 
@@ -386,11 +380,9 @@ def _build_execution_batch_ids(
     without another collective. Source and destination bytes are accumulated per
     rank; starting a new batch when any rank would cross the soft limit bounds
     both sender-side dequantization and receiver-side staging. All replicas and
-    shards of one resolved parameter stay in one batch.
+    shards of one resolved parameter stay in one batch. ``None`` assigns every
+    parameter to one model-wide batch, preserving the uncapped behavior.
     """
-    if max_batch_bytes <= 0:
-        raise ValueError("max_batch_bytes must be positive")
-
     parameter_order: list[str] = []
     destination_bytes: dict[str, dict[int, int]] = {}
     for dst_rank in sorted(dst_param_metadata_by_rank):
@@ -406,6 +398,11 @@ def _build_execution_batch_ids(
             destination_bytes[resolved_name][metadata.owner_rank] = max(
                 destination_bytes[resolved_name].get(metadata.owner_rank, 0), rank_bytes
             )
+
+    if max_batch_bytes is None:
+        return {resolved_name: 0 for resolved_name in parameter_order}, 1
+    if max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be positive or None")
 
     source_bytes: dict[str, dict[int, int]] = {}
     for resolved_name in parameter_order:
@@ -734,14 +731,15 @@ def build_plan_from_rosters(
     dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
     src_param_metadata: dict[str, list[ParameterMetadata]],
     my_global_rank: int,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Replay the deterministic global schedule and keep only this rank's ops.
 
     Pure and collective-free, so it can be tested or reused with preassembled
     rosters without touching the process group. Live membership orchestration
-    is intentionally outside this module. ``execution_batch_bytes`` is a soft
-    per-rank limit; a single complete parameter may exceed it.
+    is intentionally outside this module. ``execution_batch_bytes`` is an optional
+    soft per-rank limit; a single complete parameter may exceed it. ``None`` keeps
+    the model-wide submission behavior.
     """
     batch_ids, num_batches = _build_execution_batch_ids(
         dst_param_metadata_by_rank, src_param_metadata, max_batch_bytes=execution_batch_bytes
@@ -798,7 +796,7 @@ def build_local_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """
     Build this rank's reshard plan locally: all-gather the parameter metadata,
@@ -814,7 +812,8 @@ def build_local_reshard_plan(
     src_module/dst_module may be None for non-collocated ranks (destination-only,
     source-only, or idle). Each rank contributes metadata only for the models it
     owns, including its parallel-group membership. ``execution_batch_bytes`` is
-    the soft per-rank limit for transient generic-executor staging.
+    an optional soft per-rank limit for transient generic-executor staging;
+    ``None`` keeps the model-wide submission behavior.
     """
     # group.rank()/size() (not dist.get_rank(group)) support cross-cluster PGs
     # whose members have independent default PGs.
@@ -834,14 +833,17 @@ def build_local_reshard_plan(
     # One all-gather gives every rank the full (src, dst) picture, replacing the
     # gather-to-0 + scatter. Include each rank's configured staging limit so a
     # heterogeneous source/destination cluster deterministically uses the
-    # smallest value and every rank derives matching batches.
+    # smallest configured value and every rank derives matching batches. None
+    # means that rank does not request a cap; all None preserves one model-wide
+    # submission.
     gathered_entries = [None] * world_size
     dist.all_gather_object(
         gathered_entries, (my_src_metadata, my_dst_metadata, execution_batch_bytes), group=group
     )
     del my_src_metadata, my_dst_metadata
 
-    execution_batch_bytes = min(entry[2] for entry in gathered_entries)
+    configured_limits = [entry[2] for entry in gathered_entries if entry[2] is not None]
+    execution_batch_bytes = min(configured_limits) if configured_limits else None
     gathered_pairs = [(entry[0], entry[1]) for entry in gathered_entries]
     del gathered_entries
     dst_param_metadata_by_rank, src_param_metadata = index_metadata_rosters(gathered_pairs)
@@ -861,7 +863,7 @@ def build_centralized_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
-    execution_batch_bytes: int = _DEFAULT_EXECUTION_BATCH_BYTES,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Deprecated compatibility wrapper for :func:`build_local_reshard_plan`."""
     warnings.warn(
