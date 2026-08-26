@@ -395,12 +395,18 @@ class TransformerConfig(ModelParallelConfig):
     causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
     each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
     existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
-    contiguous order. Packs whose padded sequence lengths are all multiples of ``2 * cp_size`` take
-    the per-sequence zigzag with prebuilt A2A routes (``prebuild_balanced_layouts``) when
-    ``pad_packed_seq_alignment`` is an integer divisible by ``2 * cp_size`` (``None``/``"max"``
-    disqualify) and the fused indexer kernel backend is active; any other pack (or the unfused
-    backend) takes the fully general chunk-pair folding fallback. The alignment condition is a
-    prefilter: per-microbatch pack divisibility decides.
+    contiguous order. Balancing requires the per-sequence zigzag: the fused indexer kernel backend
+    active, ``pad_packed_seq_alignment`` an integer divisible by ``2 * cp_size``
+    (``None``/``"max"`` disqualify), and every (padded) sequence length in the pack divisible
+    by ``2 * cp_size`` (the alignment condition is a prefilter: per-microbatch pack
+    divisibility decides; prebuilt A2A routes come from ``prebuild_balanced_layouts``).
+    Any other pack — and the unfused backend — keeps the original contiguous split (the
+    unbalanced reference path; no balancing happens there). Under the fused backend the
+    per-process fused-call row count is pinned at the first call: a pack that would change
+    it (zigzag-eligibility alternation, or a varying pack capacity under eager varlen)
+    raises rather than expose a fused-call shape transition the kernel package is known to
+    silently corrupt — fused balanced runs therefore require a fixed pack capacity and
+    uniformly divisible packs.
     Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
     history sees fewer recordings than the reference during eval (training forwards identical).
     CUDA-graph support in this PR is scoped to STATIC pack compositions with
@@ -418,11 +424,12 @@ class TransformerConfig(ModelParallelConfig):
     balanced and the redistribute overhead outweighs the savings. Below this length the indexer
     keeps the contiguous CP split. 0 means no lower bound (always balance when enabled). Under
     CUDA graphs this gate is a host-side branch frozen at capture time (both branches are exact;
-    only the balancing benefit follows the captured decision). Caution: under the fused indexer
-    backend a nonzero gate alternates balanced (half-row) and reference (full-row) kernel calls
-    within one process, exercising a known cross-call issue in the kernel package (see the
-    WORKSPACE NOTE in tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py); pending
-    the kernel-side fix, validate such mixed runs against the reference."""
+    only the balancing benefit follows the captured decision). Rejected at config validation with the fused
+    indexer backend: a nonzero gate alternates balanced (half-row) and reference (full-row)
+    fused calls within one process, a shape transition the kernel package is known to
+    silently corrupt (see the WORKSPACE NOTE in
+    tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py). Usable with the
+    unfused indexer only, pending the kernel-side fix."""
 
     ####################
     # DeepSeek-v4 hybrid attention

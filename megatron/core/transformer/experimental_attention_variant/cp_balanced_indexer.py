@@ -7,13 +7,16 @@ CP ranks become stragglers (the layout-level max/min work ratio is ``2 * cp_size
 module removes that imbalance without a new kernel: it splits the sequence(s) into
 ``2 * cp_size`` near-equal chunks and gives CP rank ``r`` chunk ``r`` (a low-position "head",
 light) and chunk ``2 * cp_size - 1 - r`` (a high-position "tail", heavy), so
-``work(head) + work(tail)`` is ~constant across ranks. Two regimes share that ownership: packs
-whose padded sequence lengths divide ``2 * cp_size`` take the PER-SEQUENCE ZIGZAG — each rank's
-head/tail chunks of every sequence are gathered via prebuilt A2A routes and scored by two packed
-fused-top-k calls against synthetic per-sequence layouts with explicit RoPE positions; any other
-pack takes the GLOBAL CHUNK-PAIR FOLDING, where each chunk is scored by a per-chunk call to
-``compute_cp_indexer_topk`` at the chunk's true global offset. Multi-sequence packs, the
-``use_fused`` flag, and non-even per-rank lengths are handled exactly as in the reference path.
+``work(head) + work(tail)`` is ~constant across ranks. The balanced ownership is realized by the
+PER-SEQUENCE ZIGZAG: packs whose padded sequence lengths divide ``2 * cp_size`` gather each
+rank's head/tail chunks of every sequence via prebuilt A2A routes and score them with two
+packed fused-top-k calls against synthetic per-sequence layouts with explicit RoPE positions.
+Any other pack — and the unfused backend — takes the REFERENCE FALLBACK: this rank scores its
+own contiguous rows via ``compute_cp_indexer_topk`` exactly like the unbalanced path, keeping
+the original imbalance (the former chunk-pair folding fallback measured slower than that
+baseline on unequal packs and was removed). Fused calls issued by this module pin the
+per-process row count and raise on a transition (``_pin_fused_call_rows``); non-even per-rank
+lengths and multi-sequence packs follow the reference semantics.
 
 ``balanced_compute_cp_indexer_topk`` is a drop-in replacement for
 ``csa_utils.cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
@@ -526,7 +529,7 @@ def _zigzag_plan(cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, la
             # One eager-only D2H check per plan build (rare): the ragged enumeration
             # below floors ``lens / 2N`` and would emit out-of-range gather indices
             # for non-2N-aligned packs. The pack gate (``_pack_zigzag_ok``) routes
-            # such packs to the folding path before any dispatch is issued; reaching
+            # such packs to the reference fallback before any dispatch is issued; reaching
             # this error means a caller bypassed the gate.
             raise ValueError(
                 "balanced CP indexer zigzag plan requires every packed sequence length "
@@ -1125,8 +1128,8 @@ def prebuild_balanced_layouts(
         isinstance(pad_alignment, int) and pad_alignment % (2 * N) == 0
     ):
         # The config-level zigzag gate (_use_zigzag) can never open for this run:
-        # every pack takes the folding path, which needs only the verdicts recorded
-        # above. Skip the per-batch route construction entirely.
+        # every pack takes the reference fallback, which needs only the verdicts
+        # recorded above. Skip the per-batch route construction entirely.
         _stash_verdict(False)
         return
     if min_seqlen and getattr(packed_seq_params, "max_seqlen_q", None) is not None:
@@ -1139,9 +1142,9 @@ def prebuild_balanced_layouts(
             # path for this microbatch; the verdicts above are enough.
             _stash_verdict(False)
             return
-    # The unified zigzag path also serves single-full-sequence packs (per-sequence zigzag
-    # of one pack-spanning sequence IS the global folding), so the plan and its A2A routes
-    # are built for every pack composition.
+    # The unified zigzag path also serves single-full-sequence packs (the per-sequence
+    # zigzag of one pack-spanning sequence is the plain 2N-fold of the whole pack), so the
+    # plan and its A2A routes are built for every pack composition.
 
     # Idempotent prebuild: for static pack compositions (every CUDA-graph run, and
     # any fixed-length workload) the plan content is identical each microbatch.
@@ -1161,9 +1164,11 @@ def prebuild_balanced_layouts(
     seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
     if any(sl % (2 * N) for sl in seq_lens_list):
         # Record the verdict so eager forwards (and any capture recorded from here
-        # on) take the folding path: the zigzag builders cannot represent this
-        # pack. Under CUDA graphs an eligibility flip is a composition change and
-        # is already rejected by the static-composition gate above.
+        # on) take the reference fallback: the zigzag builders cannot represent
+        # this pack. Under CUDA graphs an eligibility flip is a composition change
+        # and is already rejected by the static-composition gate above; in eager,
+        # the first fused fallback call after zigzag calls trips the row pin
+        # (fail-closed) rather than mixing fused-call shapes.
         _stash_verdict(False)
         return
 

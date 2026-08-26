@@ -2782,10 +2782,10 @@ class CompressedSparseAttention(MegatronModule):
                             nseg_real = int((seg_lens > 0).sum().item())
                             total_real = int(cu_seqlens[-1].item())
                             # "multi" here means "NOT a single sequence filling the whole
-                            # pack": the global folding is exactly balanced only in that
-                            # case; a single sequence with a capacity-padding tail is
-                            # unbalanced under folding (tail chunks land in the dead zone)
-                            # and belongs to the zigzag path.
+                            # pack". A single full-pack sequence lets the reference
+                            # fallback score against a sliced K prefix with a synthetic
+                            # layout (see _chunk_topk); multi-sequence packs keep the
+                            # full K width there.
                             bal_multi_seq = not (nseg_real == 1 and total_real == cp_size * l_local)
                             self._dsa_cp_multi_seq_eager = (l_local, bal_multi_seq)
                         packed_seq_params._dsa_cp_multi_seq = (l_local, bal_multi_seq)
