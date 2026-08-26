@@ -572,10 +572,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
             dp_mesh = _build_hybrid_dp_mesh(
-                pg_collection.inter_dist_opt,
-                pg_collection.intra_dp_cp,
-                pg_collection.dp_cp,
-                device_type,
+                pg_collection.inter_dist_opt, pg_collection.intra_dp_cp, device_type
             )
             outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
             inner = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
@@ -828,15 +825,17 @@ _DATA_PARALLEL_PLACEMENTS = {
 }
 
 
-def _build_hybrid_dp_mesh(outer_group, inner_group, flat_group, device_type):
+def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
     """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain.
 
-    The rank table is derived from the process groups rather than assumed: a rank's
-    position within inner_group is its dp_shard coordinate and its position within
-    outer_group is its dp_outer coordinate, so gathering each rank's inner group over the
-    flattened domain reconstructs the table exactly. Position matters -- it is the mesh
-    coordinate -- so a layout that merely had the right members would still assign shard
-    indices to the wrong ranks.
+    DeviceMesh.from_group requires an explicit rank table when given more than one group,
+    since no single argument spans the mesh. parallel_state cuts the data-parallel domain
+    into num_distributed_optimizer_instances contiguous chunks, so the table is world
+    ranks reshaped to (outer, inner).
+
+    The assumption is checked rather than trusted, because the position of a rank in the
+    table is its mesh coordinate: a table with the right members in the wrong order would
+    keep reducing over valid groups while assigning every shard index to the wrong rank.
     """
     if outer_group is None or inner_group is None:
         raise ValueError(
@@ -844,16 +843,24 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, flat_group, device_type):
             "inter- and intra-distributed-optimizer process groups."
         )
 
-    inner_ranks = dist.get_process_group_ranks(inner_group)
-    outer_ranks = dist.get_process_group_ranks(outer_group)
+    inner_size = inner_group.size()
+    layout = torch.arange(dist.get_world_size()).reshape(outer_group.size(), inner_size).tolist()
 
-    # Every rank reports the inner group it belongs to. The row at each dp_outer
-    # coordinate is then just the inner group of the rank sitting at that coordinate.
-    flat_ranks = dist.get_process_group_ranks(flat_group)
-    rows: List[List[int]] = [None] * len(flat_ranks)
-    dist.all_gather_object(rows, inner_ranks, group=flat_group)
-    position = {rank: index for index, rank in enumerate(flat_ranks)}
-    layout = [rows[position[rank]] for rank in outer_ranks]
+    outer_index, inner_index = divmod(dist.get_rank(), inner_size)
+    expected_inner = layout[outer_index]
+    expected_outer = [row[inner_index] for row in layout]
+    actual_inner = dist.get_process_group_ranks(inner_group)
+    actual_outer = dist.get_process_group_ranks(outer_group)
+    if actual_inner != expected_inner:
+        raise ValueError(
+            f"MFSDP v2 hybrid mesh row {expected_inner} does not match the intra "
+            f"data-parallel group {actual_inner}."
+        )
+    if actual_outer != expected_outer:
+        raise ValueError(
+            f"MFSDP v2 hybrid mesh column {expected_outer} does not match the inter "
+            f"distributed-optimizer group {actual_outer}."
+        )
 
     return DeviceMesh.from_group(
         [outer_group, inner_group],
