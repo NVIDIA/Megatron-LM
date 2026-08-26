@@ -837,6 +837,21 @@ def _assert_similarity(a: torch.Tensor, b: torch.Tensor, label: str, eps: float)
     assert tensor_sim > 1 - eps, f"{label}: tensor_sim={tensor_sim:.10f}, eps={eps}"
 
 
+def _real_param_view_for_native(
+    name: str, real_tensor: torch.Tensor, native_tensor: torch.Tensor
+) -> torch.Tensor:
+    """Match the legacy grouped-output weight layout to the native reference."""
+    if real_tensor.shape == native_tensor.shape:
+        return real_tensor
+
+    # TE BatchedLinear owns a 3D weight, while the torch.einsum fallback keeps
+    # the legacy checkpoint-compatible 2D layout and reshapes it in forward.
+    assert (
+        name == "linear_o_group_proj.weight" and real_tensor.numel() == native_tensor.numel()
+    ), f"Shape mismatch for {name}: native={native_tensor.shape}, real={real_tensor.shape}"
+    return real_tensor.reshape_as(native_tensor)
+
+
 def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
     real_params = dict(real_layer.named_parameters())
     for name, native_param in native_layer.named_parameters():
@@ -848,10 +863,8 @@ def _copy_real_params_to_native(real_layer: nn.Module, native_layer: nn.Module):
         assert real_name in real_params, f"Missing real parameter for native parameter {name}"
         real_param = real_params[real_name]
         real_params[name] = real_param
-        assert (
-            native_param.shape == real_param.shape
-        ), f"Shape mismatch for {name}: native={native_param.shape}, real={real_param.shape}"
-        native_param.data = real_param.data.to(
+        real_param_data = _real_param_view_for_native(name, real_param.data, native_param.data)
+        native_param.data = real_param_data.to(
             device=native_param.device, dtype=real_param.dtype
         ).clone()
     return real_params
@@ -1098,8 +1111,9 @@ class TestDSv4HybridNativeParity:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
+            real_grad = _real_param_view_for_native(name, real_param.grad, native_param.grad)
             _assert_similarity(
-                real_param.grad,
+                real_grad,
                 native_param.grad,
                 f"{backend}-{variant}-{compress_ratio}-{seqlen}:param_grad:{name}",
                 eps=bwd_eps,
@@ -1210,8 +1224,9 @@ class TestDSv4HybridNativeParity:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
+            real_grad = _real_param_view_for_native(name, real_param.grad, native_param.grad)
             _assert_similarity(
-                real_param.grad,
+                real_grad,
                 native_param.grad,
                 f"thd-{backend}-{variant}-{compress_ratio}-{seqlen}:param_grad:{name}",
                 eps=bwd_eps,
@@ -1342,8 +1357,9 @@ class TestDSv4HybridNativeParity:
                 continue
             assert native_param.grad is not None, f"Missing native grad for {name}"
             assert real_param.grad is not None, f"Missing real grad for {name}"
+            real_grad = _real_param_view_for_native(name, real_param.grad, native_param.grad)
             _assert_similarity(
-                real_param.grad,
+                real_grad,
                 native_param.grad,
                 f"thd-multiseg-{backend}-{variant}-{compress_ratio}-{seg_label}:param_grad:{name}",
                 eps=bwd_eps,
