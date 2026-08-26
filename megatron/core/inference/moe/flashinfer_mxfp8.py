@@ -8,18 +8,37 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from flashinfer import mxfp8_quantize, shuffle_matrix_a
-from flashinfer.fused_moe import (
-    Fp8QuantizationType,
-    WeightLayout,
-    trtllm_fp8_block_scale_routed_moe,
-)
-from flashinfer.utils import get_shuffle_matrix_sf_a_row_indices
+
+try:
+    from flashinfer import mxfp8_quantize, shuffle_matrix_a
+    from flashinfer.fused_moe import (
+        Fp8QuantizationType,
+        WeightLayout,
+        trtllm_fp8_block_scale_routed_moe,
+    )
+    from flashinfer.utils import get_shuffle_matrix_sf_a_row_indices
+
+    HAVE_FLASHINFER_ROUTED_MXFP8 = True
+    _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR: ImportError | None = None
+except ImportError as exc:
+    HAVE_FLASHINFER_ROUTED_MXFP8 = False
+    _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR = exc
 
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 logger = logging.getLogger(__name__)
 _LOGGED_TOKEN_POLICIES: set[tuple[str, int, int | None, int]] = set()
+
+
+def require_flashinfer_routed_mxfp8() -> None:
+    """Raise a precise error when routed MXFP8 APIs are unavailable."""
+    if not HAVE_FLASHINFER_ROUTED_MXFP8:
+        raise RuntimeError(
+            "FlashInfer routed MXFP8 MoE requires a FlashInfer release that provides "
+            "mxfp8_quantize, shuffled Major-K weights, and "
+            "trtllm_fp8_block_scale_routed_moe. Upgrade flashinfer-python or select a "
+            "different inference_grouped_gemm_backend."
+        ) from _FLASHINFER_ROUTED_MXFP8_IMPORT_ERROR
 
 
 @dataclass
@@ -87,8 +106,15 @@ def _shuffle_routed_scale(scale: torch.Tensor) -> torch.Tensor:
     return _block_scale_interleave(scale_u8[row_indices]).contiguous().view(torch.uint8)
 
 
-def prepare_routed_mxfp8_weights(weight: MXFP8Tensor) -> FlashInferRoutedMXFP8Weight:
-    """Repack a stacked MCore MXFP8 expert weight without requantizing it."""
+def prepare_routed_mxfp8_weights(
+    weight: MXFP8Tensor, out: FlashInferRoutedMXFP8Weight | None = None
+) -> FlashInferRoutedMXFP8Weight:
+    """Repack a stacked MCore MXFP8 expert weight without requantizing it.
+
+    When `out` is provided, its data and scale tensors are refreshed in place.
+    This preserves addresses captured by CUDA graphs across model refits.
+    """
+    require_flashinfer_routed_mxfp8()
     if weight.backend != "triton":
         raise ValueError(
             "FlashInfer routed MXFP8 weights must be repacked from the Triton/cublas "
@@ -101,13 +127,39 @@ def prepare_routed_mxfp8_weights(weight: MXFP8Tensor) -> FlashInferRoutedMXFP8We
     padded_cols = _round_up(logical_cols, 128)
     scale_cols = padded_cols // 32
 
-    routed_data = torch.empty(
-        experts, padded_rows, padded_cols, dtype=weight.data.dtype, device=weight.data.device
-    )
-    routed_scale = torch.empty(
-        experts, padded_rows * scale_cols, dtype=torch.uint8, device=weight.data.device
-    )
+    expected_data_shape = (experts, padded_rows, padded_cols)
+    expected_scale_shape = (experts, padded_rows * scale_cols)
+    if out is None:
+        routed_data = torch.empty(
+            expected_data_shape, dtype=weight.data.dtype, device=weight.data.device
+        )
+        routed_scale = torch.empty(
+            expected_scale_shape, dtype=torch.uint8, device=weight.data.device
+        )
+    else:
+        expected_metadata = (logical_rows, logical_cols, padded_rows, padded_cols)
+        actual_metadata = (out.logical_rows, out.logical_cols, out.padded_rows, out.padded_cols)
+        if actual_metadata != expected_metadata:
+            raise ValueError(
+                "existing FlashInfer routed MXFP8 weight metadata changed across refit: "
+                f"got {actual_metadata}, expected {expected_metadata}"
+            )
+        if (
+            tuple(out.data.shape) != expected_data_shape
+            or tuple(out.scale.shape) != expected_scale_shape
+        ):
+            raise ValueError(
+                "existing FlashInfer routed MXFP8 storage shape changed across refit: "
+                f"data={tuple(out.data.shape)}, scale={tuple(out.scale.shape)}, "
+                f"expected data={expected_data_shape}, scale={expected_scale_shape}"
+            )
+        routed_data = out.data
+        routed_scale = out.scale
 
+    # MCore and FlashInfer use different kernel-specific layouts for the same MXFP8
+    # weights. MCore stores row-major MXFP8 data with cuBLAS-swizzled UE8M0 scales but TRT-LLM
+    # kernels require 128-aligned Major-K data and its interleaved scale layout. Repack the data
+    # and scales into TRT-LLM's 128-aligned Major-K layout without requantizing.
     for expert in range(experts):
         padded_data = torch.zeros(
             padded_rows, padded_cols, dtype=weight.data.dtype, device=weight.data.device
@@ -125,6 +177,8 @@ def prepare_routed_mxfp8_weights(weight: MXFP8Tensor) -> FlashInferRoutedMXFP8We
         )
         routed_scale[expert].copy_(_shuffle_routed_scale(logical_scale))
 
+    if out is not None:
+        return out
     return FlashInferRoutedMXFP8Weight(
         data=routed_data,
         scale=routed_scale,
@@ -155,6 +209,7 @@ def quantize_routed_mxfp8_input(
     hidden_states: torch.Tensor, padded_hidden_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pad and quantize routed-MoE input, returning a 2D uint8 scale matrix."""
+    require_flashinfer_routed_mxfp8()
     hidden_padding = padded_hidden_size - hidden_states.shape[-1]
     if hidden_padding < 0:
         raise ValueError(
@@ -219,6 +274,7 @@ def flashinfer_routed_mxfp8_moe_prequantized(
     activation_type: int,
 ) -> torch.Tensor:
     """Launch routed MXFP8 MoE with prequantized input and packed routing."""
+    require_flashinfer_routed_mxfp8()
     output = trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_routing,
         routing_bias=None,

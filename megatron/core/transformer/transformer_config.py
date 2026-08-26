@@ -1267,7 +1267,8 @@ class TransformerConfig(ModelParallelConfig):
 
     Decode-only dynamic-inference graphs use this fixed prefix when their
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
-    and oversized decode graphs retain the full dispatcher buffer.
+    and oversized decode graphs retain the full dispatcher buffer. Requires
+    the NVLS inference dispatcher and expert model parallelism greater than one.
     """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
@@ -1735,6 +1736,15 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "inference_flashinfer_mxfp8_token_capacity requires "
                         "inference_grouped_gemm_backend='flashinfer' and fp8_recipe='mxfp8'"
+                    )
+                if (
+                    self.inference_moe_token_dispatcher_type != "nvls"
+                    or self.expert_model_parallel_size <= 1
+                ):
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity requires "
+                        "inference_moe_token_dispatcher_type='nvls' and "
+                        "expert_model_parallel_size > 1"
                     )
 
             if self.batch_invariant_mode:

@@ -12,6 +12,8 @@ try:
 except ImportError:
     _HAVE_FLASHINFER = False
 
+from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
+
 pytestmark = pytest.mark.skipif(
     not _IS_BLACKWELL, reason="MXFP8 tests require Blackwell GPU (SM >= 10)"
 )
@@ -244,6 +246,76 @@ class TestMXFP8ReshardTransform:
             assert buf.data.data_ptr() == data_ptr
             assert buf.scale.data_ptr() == scale_ptr
             assert buf.backend == "triton"
+
+    @pytest.mark.skipif(
+        not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
+    )
+    def test_flashinfer_routed_moe_buffers_refresh_in_place(self):
+        """Refit refreshes derived Major-K weights without changing graph addresses."""
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        class Namespace:
+            pass
+
+        num_experts, rows, cols = 2, 96, 128
+        grouped_mlp = Namespace()
+        grouped_mlp.num_local_experts = num_experts
+        grouped_mlp.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
+        grouped_mlp._concatenated_weights_built = False
+        buffers = {}
+        for linear_name in ("linear_fc1", "linear_fc2"):
+            linear = Namespace()
+            setattr(grouped_mlp, linear_name, linear)
+            for expert_idx in range(num_experts):
+                tensor = MXFP8Tensor.from_bf16(
+                    torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda"), backend="triton"
+                )
+                setattr(linear, f"weight{expert_idx}", tensor)
+                buffers[f"{linear_name}.weight{expert_idx}"] = tensor
+
+        InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped_mlp)
+        grouped_mlp._concatenated_weights_built = True
+        data_ptrs = (
+            grouped_mlp._fc1_weight.data.data_ptr(),
+            grouped_mlp._fc2_weight.data.data_ptr(),
+        )
+        scale_ptrs = (
+            grouped_mlp._fc1_weight.scale.data_ptr(),
+            grouped_mlp._fc2_weight.scale.data_ptr(),
+        )
+
+        transform = MXFP8ReshardTransform(
+            convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
+        )
+        for name in buffers:
+            new_data = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
+            transform.finalize_recv(name, (slice(None), slice(None)), [new_data])
+
+        InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp)
+
+        for linear_name, routed_weight in (
+            ("linear_fc1", grouped_mlp._fc1_weight),
+            ("linear_fc2", grouped_mlp._fc2_weight),
+        ):
+            canonical = InferenceGroupedMLP._stack_mxfp8_linear_weight(
+                grouped_mlp, linear_name, "triton"
+            )
+            expected = prepare_routed_mxfp8_weights(canonical)
+            assert torch.equal(routed_weight.data, expected.data)
+            assert torch.equal(routed_weight.scale, expected.scale)
+
+        assert data_ptrs == (
+            grouped_mlp._fc1_weight.data.data_ptr(),
+            grouped_mlp._fc2_weight.data.data_ptr(),
+        )
+        assert scale_ptrs == (
+            grouped_mlp._fc1_weight.scale.data_ptr(),
+            grouped_mlp._fc2_weight.scale.data_ptr(),
+        )
 
 
 # ===========================================================================

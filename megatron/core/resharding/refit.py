@@ -282,11 +282,6 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     grouped_gemm_backend = getattr(
         lm.config.inference_grouped_gemm_backend, "value", lm.config.inference_grouped_gemm_backend
     )
-    if grouped_gemm_backend == "flashinfer":
-        raise ValueError(
-            "MXFP8 refit does not yet support the FlashInfer routed-MoE backend: "
-            "its derived shuffled expert weights must be refreshed in place after each refit."
-        )
 
     # 1. Compute which parameters are eligible for MXFP8 conversion.
     #    Must be done while params are still visible as nn.Parameter (BF16).
@@ -296,7 +291,14 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
             convertible.add(f"decoder.{name}")
 
     # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
-    backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
+    # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
+    # representation. The reshard transform updates those canonical buffers, then
+    # ``refresh_flashinfer_mxfp8_weights`` refreshes the derived buffers in place.
+    backend = (
+        "triton"
+        if grouped_gemm_backend == "flashinfer"
+        else resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
+    )
     persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
     # 3. Build the transform and attach it to the plan.
@@ -516,3 +518,14 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
+    if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
+        refreshed = False
+        for module in tgt_core.modules():
+            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
+            if refresh is not None:
+                refresh()
+                refreshed = True
+        if refreshed:
+            # Refit is already a synchronized operation. Keep the derived-weight
+            # refresh complete before callers replay graphs on another stream.
+            torch.cuda.synchronize()
