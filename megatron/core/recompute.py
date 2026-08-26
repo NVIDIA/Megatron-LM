@@ -76,10 +76,9 @@ def checkpointed_forward(
                 else:
                     inner_quantization_context = nullcontext()
 
-                # Build the full TransformerLayer kwarg set. Hybrid mHC wraps
-                # TransformerLayer instead of subclassing it, so detect that
-                # case through inner_layer without importing hybrid_block here
-                # (which would create a circular import).
+                # Build the full TransformerLayer kwarg set. Hybrid mHC wrappers expose
+                # an explicit capability flag so this module does not need to import
+                # hybrid_block (which would create a circular import).
                 layer_kwargs = dict(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -95,14 +94,15 @@ def checkpointed_forward(
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
-                    elif isinstance(getattr(layer, "inner_layer", None), TransformerLayer):
+                    elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
                         # HyperConnectionHybridLayer accepts the routing metadata
-                        # needed by its wrapped MoE layer, but not cross-attention
-                        # kwargs from the TransformerLayer interface.
+                        # consumed by wrapped MoE layers, but not cross-attention kwargs
+                        # from the TransformerLayer interface. This also covers a wrapper
+                        # around a MambaLayer; the wrapper narrows kwargs for its inner layer.
                         for k in ("context", "context_mask", "attention_bias"):
                             layer_kwargs.pop(k, None)
                         hidden_states, context = layer(**layer_kwargs)
-                    else:  # MambaLayer (HybridStack `M` slot)
+                    else:  # An unwrapped layer with a narrower interface, e.g. MambaLayer.
                         for k in (
                             "context",
                             "context_mask",

@@ -329,10 +329,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold passed
+                to an MoE router when constructing a HybridStack layer.
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules_config = submodules
@@ -420,6 +423,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        # Cache these predicates because the split hybrid mHC path consults them on every
+        # forward. The sibling HyperConnectionTransformerLayer uses the same attributes.
+        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
+        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(
+            self.pre_mlp_layernorm, IdentityOp
+        )
         # [Module 8: MLP block]
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP
@@ -442,15 +451,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "Consider migrating the `mlp` submodule spec to a direct call of the "
                 "`as_mlp_submodule` classmethod instead.",
             )
+        mlp_kwargs: Dict[str, Any] = {
+            "config": self.config,
+            "pg_collection": pg_collection,
+            "is_mtp_layer": self.is_mtp_layer,
+            "layer_number": self.layer_number,
+            "name": (name + ".mlp") if name is not None else None,
+        }
+        if hash_moe_layer_threshold is not None:
+            mlp_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
         try:
-            self.mlp = submodules.mlp(
-                config=self.config,
-                pg_collection=pg_collection,
-                is_mtp_layer=self.is_mtp_layer,
-                layer_number=self.layer_number,
-                name=(name + ".mlp") if name is not None else None,
-            )
+            self.mlp = submodules.mlp(**mlp_kwargs)
         except TypeError:
+            if hash_moe_layer_threshold is not None:
+                raise
             # Fallback for MLP builders that don't accept layer_number (dense MLP, TEFusedMLP).
             self.mlp = submodules.mlp(
                 config=self.config,
@@ -626,7 +640,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         checkpoint_input_layernorm = self.recompute_input_layernorm or (
-            mhc_recompute_manager is not None and not isinstance(self.input_layernorm, IdentityOp)
+            mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
         )
         if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
@@ -878,7 +892,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     ):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
         )
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(

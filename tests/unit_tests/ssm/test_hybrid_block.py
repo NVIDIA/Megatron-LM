@@ -7,7 +7,7 @@ from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel, _validate_hash_moe_pipeline_placement
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, GatedDeltaNet, KimiDeltaAttention
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -327,6 +327,7 @@ class TestHybridBlock:
             vocab_size=128,
             max_sequence_length=8,
             hybrid_layer_pattern=layer_pattern,
+            pg_collection=self.get_pg_collection(),
         )
         block = model.decoder
 
@@ -339,30 +340,17 @@ class TestHybridBlock:
 
         assert [layer.layer_number for layer in moe_layers] == [2, 4, 6, 8]
         assert [router.is_hash_layer for router in routers] == [True, True, True, False]
+        assert [router.hash_moe_layer_threshold for router in routers] == [6, 6, 6, 6]
         assert model.config.moe_n_hash_layers == 3
 
-    @pytest.mark.parametrize(
-        ("layer_pattern", "error_match"),
-        [
-            (
-                Symbols.MAMBA + Symbols.PIPE + Symbols.MOE,
-                "same virtual pipeline stage as the embedding",
-            ),
-            (
-                Symbols.MAMBA + Symbols.MOE,
-                "must contain pipe",
-            ),
-        ],
-    )
-    def test_hash_moe_pipeline_placement_validation(self, layer_pattern, error_match):
-        """Hash MoE layers must remain on the embedding stage under pipeline parallelism."""
+    def test_hash_moe_pipeline_placement_validation(self):
+        """A stage without the embedding cannot own a hash-routed MoE layer."""
+        layer_pattern = Symbols.MAMBA + Symbols.MOE
         config = TransformerConfig(
             hidden_size=256,
-            num_layers=len(layer_pattern.replace(Symbols.PIPE, '')),
+            num_layers=len(layer_pattern),
             num_attention_heads=4,
             use_cpu_initialization=True,
-            pipeline_model_parallel_size=2,
-            pipeline_dtype=torch.float32,
             is_hybrid_model=True,
             num_moe_experts=4,
             moe_ffn_hidden_size=64,
@@ -375,14 +363,25 @@ class TestHybridBlock:
             add_bias_linear=False,
         )
 
-        with pytest.raises(AssertionError, match=error_match):
+        with pytest.raises(ValueError, match="same pipeline/virtual-pipeline stage"):
             HybridModel(
                 config=config,
                 hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=128,
                 max_sequence_length=8,
                 hybrid_layer_pattern=layer_pattern,
+                pre_process=False,
+                pg_collection=self.get_pg_collection(),
             )
+
+    def test_hash_moe_pipeline_placement_allows_non_hash_stage(self):
+        """A later stage from a pipe-free split is valid when its MoE is not hash-routed."""
+        _validate_hash_moe_pipeline_placement(
+            [Symbols.MAMBA, Symbols.MOE],
+            layer_offset=2,
+            hash_moe_layer_threshold=2,
+            pre_process=False,
+        )
 
     def test_layer_types(self):
         """

@@ -252,9 +252,11 @@ class MockSFTLowLevelDataset:
         self.format = kwargs.get("format", "thd")
         self.vocab_size = vocab_size
 
-        if mode in ("file", "distribution") and (vocab_size is None or vocab_size <= 0):
+        if mode in ("file", "distribution") and (vocab_size is None or vocab_size < 2):
             raise ValueError(
-                f"vocab_size must be a positive integer for generated mock data, got {vocab_size}"
+                "Generated mock data requires vocab_size >= 2. If tokenizer.vocab_size is "
+                "unavailable, set vocab_size in the mock dataset config JSON; "
+                f"got {vocab_size}."
             )
 
         if mode == "file":
@@ -328,7 +330,10 @@ class MockSFTLowLevelDataset:
             if self.vocab_size is None:
                 raise RuntimeError("Generated mock data requires a configured vocabulary size")
             sample = np.arange(1, length, dtype=np.int64)
-            sample %= self.vocab_size
+            # Preserve the original positive-token invariant while bounding IDs to the
+            # tokenizer vocabulary. In particular, do not synthesize token 0, which is
+            # commonly used as EOD/padding and therefore masked out of the loss.
+            sample = (sample - 1) % (self.vocab_size - 1) + 1
             return sample
 
 
@@ -359,7 +364,7 @@ class MockSFTDataset(SFTDataset):
             }
         else:
             mock_config = load_json_arg(config.sft_mock_dataset_config_json)
-        mock_config["vocab_size"] = config.tokenizer.vocab_size
+        mock_config.setdefault("vocab_size", getattr(config.tokenizer, "vocab_size", None))
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:

@@ -139,9 +139,9 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        # Callers may tailor the batch structure for their pipeline stage by
-        # replacing or removing entries. Keep those mutations from corrupting
-        # the cached structure while continuing to share its static tensors.
+        # Shallow-copy so callers may replace or remove top-level entries to tailor the
+        # batch to their pipeline stage without mutating the cached static buffer. Nested
+        # containers and the tensors themselves are still shared with the buffer.
         return StaticBufferLoader.static_buffers[stage][microbatch].copy()
 
 

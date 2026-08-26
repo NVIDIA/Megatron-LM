@@ -1918,6 +1918,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
+        if self.mtp_layer_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
+                "overlap scheduler does not expand the nested HybridStack."
+            )
 
         # Validate attention mask type if using transformer-based inner layers
         if self.submodules.mtp_model_layer is not None and hasattr(
@@ -2492,9 +2497,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # This is the standard non-EP-overlap checkpoint path. Hybrid MTP with
-            # overlap_moe_expert_parallel_comm is not currently supported because the
-            # overlap scheduler does not expand the nested HybridStack.
             # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
             # Hybrid MTP instead owns a nested HybridStack, which consumes the global
             # recompute_num_layers setting to chunk its layer pattern. The outer MTP layer
@@ -2937,7 +2939,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
+            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,

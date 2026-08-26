@@ -52,6 +52,7 @@ class Router(ABC, MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """
         Initialize the Router module.
@@ -60,6 +61,8 @@ class Router(ABC, MegatronModule):
             config (TransformerConfig): Configuration object for the Transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                hash routing. When omitted, use config.moe_n_hash_layers.
         """
         super().__init__(config)
         self.config = config
@@ -67,6 +70,11 @@ class Router(ABC, MegatronModule):
         self.moe_aux_loss_func = None
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
+        self.hash_moe_layer_threshold = (
+            self.config.moe_n_hash_layers
+            if hash_moe_layer_threshold is None
+            else hash_moe_layer_threshold
+        )
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -176,6 +184,7 @@ class TopKRouter(Router):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -183,12 +192,15 @@ class TopKRouter(Router):
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                hash routing. Hybrid models use this to translate a MoE-position count.
         """
         super().__init__(
             config=config,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             layer_number=layer_number,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
@@ -197,12 +209,12 @@ class TopKRouter(Router):
         self.mtp_layer_number: Optional[int] = None
         self.frozen_expert_bias = False
 
-        if self.config.moe_n_hash_layers > 0:
+        if self.hash_moe_layer_threshold > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
         self.is_hash_layer = (
             not self.is_mtp_layer
-            and self.config.moe_n_hash_layers > 0
-            and layer_number <= self.config.moe_n_hash_layers
+            and self.hash_moe_layer_threshold > 0
+            and layer_number <= self.hash_moe_layer_threshold
         )
         if self.is_hash_layer:
             # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
@@ -964,6 +976,7 @@ class InferenceTopKRouter(TopKRouter):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
@@ -986,6 +999,7 @@ class InferenceTopKRouter(TopKRouter):
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             layer_number=layer_number,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
 
     @staticmethod

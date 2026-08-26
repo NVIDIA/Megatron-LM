@@ -114,6 +114,8 @@ class TestParallelTransformerLayer:
         layer = self.parallel_transformer_layer
         layer.input_layernorm = torch.nn.LayerNorm(layer.config.hidden_size)
         layer.pre_mlp_layernorm = torch.nn.LayerNorm(layer.config.hidden_size)
+        layer.mhc_checkpoint_input_layernorm = True
+        layer.mhc_checkpoint_pre_mlp_layernorm = True
         layer.recompute_input_layernorm = False
         layer.recompute_pre_mlp_layernorm = False
         layer.off_interface = lambda _enabled, hidden_states, _name: nullcontext(hidden_states)
@@ -152,7 +154,7 @@ class TestParallelTransformerLayer:
         layer._forward_mlp_output_with_bias(hidden_states)
         assert seen_managers == []
 
-        manager = CheckpointManager()
+        manager = MHCCheckpointManager()
         attention_output, _, _ = layer._forward_self_attention_output_with_bias(
             hidden_states, mhc_recompute_manager=manager
         )

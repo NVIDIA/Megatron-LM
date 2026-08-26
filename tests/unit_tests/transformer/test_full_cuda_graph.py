@@ -50,6 +50,9 @@ def reset_full_cuda_graph_state():
     gc.collect()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="StaticBufferLoader stages inputs on the GPU"
+)
 def test_static_buffer_loader_isolates_cached_batch_structure():
     loader = StaticBufferLoader()
     first_inputs = {

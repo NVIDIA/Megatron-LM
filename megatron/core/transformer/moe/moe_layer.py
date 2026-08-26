@@ -148,7 +148,14 @@ class RouterBuilder(Protocol):
     """Protocol for building a Router."""
 
     def __call__(
-        self, /, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None
+        self,
+        /,
+        *,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection | None,
+        is_mtp_layer: bool = False,
+        layer_number: int | None = None,
+        hash_moe_layer_threshold: int | None = None,
     ) -> RouterInterface: ...
 
 
@@ -229,10 +236,13 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                selecting hash-routed MoE layers.
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules = not_none(submodules)
@@ -261,12 +271,21 @@ class MoELayer(BaseMoELayer):
         self.tp_ep_group = pg_collection.tp_ep
 
         # Initialize router.
-        self.router = self.submodules.router(
-            config=self.config,
-            pg_collection=pg_collection,
-            is_mtp_layer=is_mtp_layer,
-            layer_number=layer_number,
-        )
+        if hash_moe_layer_threshold is None:
+            self.router = self.submodules.router(
+                config=self.config,
+                pg_collection=pg_collection,
+                is_mtp_layer=is_mtp_layer,
+                layer_number=layer_number,
+            )
+        else:
+            self.router = self.submodules.router(
+                config=self.config,
+                pg_collection=pg_collection,
+                is_mtp_layer=is_mtp_layer,
+                layer_number=layer_number,
+                hash_moe_layer_threshold=hash_moe_layer_threshold,
+            )
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.

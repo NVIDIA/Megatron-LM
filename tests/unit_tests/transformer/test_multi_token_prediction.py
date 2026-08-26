@@ -30,6 +30,7 @@ from megatron.core.transformer.multi_token_prediction import (
     ContiguousPackedSeqRollPlan,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
     _mtp_logits_are_vocab_sharded,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
@@ -97,6 +98,22 @@ class TestMultiTokenPredictionLayer:
             num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
         )
         assert config.mtp_detach_heads is False
+
+    def test_hybrid_mtp_rejects_expert_parallel_overlap(self):
+        """Hybrid MTP must fail clearly before the unsupported overlap path is built."""
+        config = TransformerConfig(
+            num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
+        )
+        # Mutate after config validation to exercise the model-family-specific guard directly.
+        config.overlap_moe_expert_parallel_comm = True
+
+        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
+            MultiTokenPredictionLayer(
+                config=config,
+                submodules=None,
+                pg_collection=types.SimpleNamespace(cp=None, tp=None),
+                mtp_layer_pattern="M",
+            )
 
     def test_constructor_with_detach_heads(self):
         """Test construction of MTP module with mtp_detach_heads=True."""

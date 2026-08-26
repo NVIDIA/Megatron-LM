@@ -118,6 +118,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     + the inner router/preprocess submodules for partial MoE capture (experts stay eager).
     """
 
+    supports_hybrid_recompute_kwargs = True
+
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
         super().__init__(config=config)
         if (
@@ -569,7 +571,7 @@ class HybridStack(MegatronModule):
             Defaults to True.
         layer_type_list (list, optional): pre-computed list of layer type symbols for
             this pipeline segment. When provided (by HybridModel), pipeline stage
-            selection has already been done via '|' separators in the pattern.
+            selection has already been done by the hybrid layer allocation helper.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -582,6 +584,8 @@ class HybridStack(MegatronModule):
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
         mtp_layer_number (int, optional): enclosing MTP depth for logging nested MTP metrics.
+        hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
+            to select hash-routed MoE layers. Defaults to the standard config semantics.
     """
 
     def __init__(
@@ -598,6 +602,7 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         mtp_layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ) -> None:
         """
@@ -737,6 +742,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
+                        hash_moe_layer_threshold=hash_moe_layer_threshold,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.GDN:

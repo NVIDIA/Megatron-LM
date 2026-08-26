@@ -75,27 +75,29 @@ def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) 
 
 
 def _validate_hash_moe_pipeline_placement(
-    main_pattern: str | None,
-    n_hash_layers: int,
-    pipeline_model_parallel_size: int,
+    layer_type_list: list[str],
+    layer_offset: int,
+    hash_moe_layer_threshold: int,
+    pre_process: bool,
 ) -> None:
-    """Require all hybrid hash-MoE layers to share the embedding pipeline stage."""
-    if n_hash_layers <= 0 or pipeline_model_parallel_size <= 1:
+    """Reject local hash-MoE layers on a stage that does not own the token IDs."""
+    if hash_moe_layer_threshold <= 0 or pre_process:
         return
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
-    assert main_pattern is not None and Symbols.PIPE in main_pattern, (
-        "hybrid_layer_pattern must contain pipe ('|') separators when using hash MoE layers "
-        "with pipeline parallelism (PP > 1)."
-    )
-    embedding_stage_pattern = main_pattern.split(Symbols.PIPE, 1)[0]
-    n_moe_layers_with_embedding = embedding_stage_pattern.count(Symbols.MOE)
-    assert n_hash_layers <= n_moe_layers_with_embedding, (
-        "Currently, all hash MoE layers must be in the same virtual pipeline stage as the "
-        f"embedding. The embedding stage has {n_moe_layers_with_embedding} MoE layers, but "
-        f"moe_n_hash_layers={n_hash_layers}."
-    )
+    local_hash_layer_numbers = [
+        layer_offset + local_layer_number
+        for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
+        if layer_type == Symbols.MOE
+        and layer_offset + local_layer_number <= hash_moe_layer_threshold
+    ]
+    if local_hash_layer_numbers:
+        raise ValueError(
+            "Currently, all hash MoE layers must be in the same pipeline/virtual-pipeline "
+            "stage as the embedding because only that stage owns input_ids. This "
+            f"non-embedding stage contains hash MoE layer(s) {local_hash_layer_numbers}."
+        )
 
 
 class HybridModel(LanguageModule, GraphableMegatronModule):
@@ -250,11 +252,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hash_layer_threshold = _get_hash_moe_layer_threshold(
             parsed.main_pattern, configured_n_hash_layers
         )
-        _validate_hash_moe_pipeline_placement(
-            parsed.main_pattern,
-            configured_n_hash_layers,
-            self.config.pipeline_model_parallel_size,
-        )
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
@@ -265,6 +262,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
             **logging_pg_kwargs,
+        )
+        _validate_hash_moe_pipeline_placement(
+            layer_type_list,
+            layer_offset,
+            hash_layer_threshold,
+            self.pre_process,
         )
 
         # Determine if MTP is needed (based on pattern parsing)
@@ -328,23 +331,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-        # TopKRouter allocates all hash-specific state during construction. Temporarily expose
-        # the global Hybrid layer threshold, then restore the user-facing MoE count.
-        self.config.moe_n_hash_layers = hash_layer_threshold
-        try:
-            self.decoder = build_module(
-                hybrid_stack_spec,
-                self.config,
-                pre_process=self.pre_process,
-                layer_type_list=layer_type_list,
-                pp_layer_offset=layer_offset,
-                post_process=self.post_process,
-                dtype=config.params_dtype,
-                pg_collection=self.pg_collection,
-                name="decoder",
-            )
-        finally:
-            self.config.moe_n_hash_layers = configured_n_hash_layers
+        self.decoder = build_module(
+            hybrid_stack_spec,
+            self.config,
+            pre_process=self.pre_process,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=layer_offset,
+            post_process=self.post_process,
+            dtype=config.params_dtype,
+            pg_collection=self.pg_collection,
+            hash_moe_layer_threshold=(
+                hash_layer_threshold if configured_n_hash_layers > 0 else None
+            ),
+            name="decoder",
+        )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
