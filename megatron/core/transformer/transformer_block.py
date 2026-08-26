@@ -925,6 +925,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
+        if self.config.mla_latent_cp:
+            from .experimental_attention_variant.mla_with_latent_cp import preprocess_mla_latent_cp
+
+            preprocess_mla_latent_cp(self, hidden_states, packed_seq_params)
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:

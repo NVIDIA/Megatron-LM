@@ -830,6 +830,14 @@ def get_batch_on_this_rank_for_sequence_packing(
         if dynamic_cp
         else None
     )
+    if dynamic_cp:
+        assert (
+            type(local_cp_size) is int and local_cp_size > 0
+        ), "dynamic CP scheduler must produce a positive Python local_cp_size"
+        assert cp_group is not None, "dynamic CP scheduler must produce a CP process group"
+        assert (
+            cp_group.size() == local_cp_size
+        ), "dynamic CP scheduler local_cp_size must match its CP process group"
 
     # cu_seqlens_q/kv hold the original (unpadded) boundaries so downstream
     # loss paths (e.g. CSA indexer KL) can identify padding rows.

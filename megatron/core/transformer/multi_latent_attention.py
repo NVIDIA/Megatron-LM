@@ -171,6 +171,12 @@ class MultiLatentAttention(Attention):
             self.gate_projection_size = self.config.num_attention_heads
 
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
+        no_rope = (
+            bool(self.config.no_rope_freq[self.layer_number - 1])
+            if self.config.no_rope_freq
+            else False
+        )
+        self.use_rope = not no_rope
 
         # Overwrite the base class kv shape to support MLA inference
         self.key_hidden_size = self.q_head_dim
@@ -182,11 +188,17 @@ class MultiLatentAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
-        mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
+        mscale = (
+            _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
+            if self.use_rope
+            else 1.0
+        )
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
         self.cache_mla_latents = self.config.cache_mla_latents
 
-        if self.config.rope_type == "rope":
+        if not self.use_rope:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -797,32 +809,35 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
-        )
-
-        # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
+        rotary_pos_emb = None
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
-        else:
-            if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
-                )
-                rotary_pos_emb = None
-                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_apply_mla_rope_for_q is not None
-                    and fused_apply_mla_rope_for_kv is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
+        if self.use_rope:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, None, hidden_states, self.config, packed_seq_params
+            )
+
+            # rotary_pos_emb:[s, b, 1, 64]
+            if self.config.rope_type == "rope":
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq=thd_packed_seq
-                )
+                if self.config.apply_rope_fusion:
+                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                        rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
+                    )
+                    assert (
+                        inference_context is None
+                    ), "Inference with MLA RoPE fusion is not supported"
+                    assert (
+                        fused_apply_mla_rope_for_q is not None
+                        and fused_apply_mla_rope_for_kv is not None
+                    ), "Fused MLA RoPE apply is not imported successfully"
+                else:
+                    rotary_pos_emb, mscale = self.rotary_pos_emb(
+                        rotary_seq_len, packed_seq=thd_packed_seq
+                    )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -907,22 +922,23 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
             # Dynamic batching: use inference context methods
-            q_pos_emb = inference_context.apply_rotary_emb_query(
-                q_pos_emb,
-                rotary_pos_emb,
-                config=self.config,
-                cu_seqlens_q=cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
-                mscale=mscale,
-            )
-            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = inference_context.apply_rotary_emb_key(
-                k_pos_emb,
-                rotary_pos_emb,
-                config=self.config,
-                cp_group=self.pg_collection.cp,
-                mscale=mscale,
-            )
+            if self.use_rope:
+                q_pos_emb = inference_context.apply_rotary_emb_query(
+                    q_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cp_group=self.pg_collection.cp,
+                    mscale=mscale,
+                )
+                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                k_pos_emb = inference_context.apply_rotary_emb_key(
+                    k_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cp_group=self.pg_collection.cp,
+                    mscale=mscale,
+                )
 
             # Create KV cache entry. It will the be the key vector in cache mla latents path
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
@@ -985,7 +1001,7 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             # todo add assert about fusions and caching
-            if self.config.apply_rope_fusion:
+            if self.use_rope and self.config.apply_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_apply_mla_rope_for_q(
@@ -1011,23 +1027,6 @@ class MLASelfAttention(MultiLatentAttention):
                     cp_size,
                 )
             else:
-                q_len = q.size()[0]
-                if inference_context is not None:
-                    # add offset to the sequence start for inference
-                    sequence_start = inference_context.sequence_len_offset
-                    sequence_end = sequence_start + q_len
-                    rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif not thd_packed_seq or self.config.context_parallel_size == 1:
-                    # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
-                    # When sequence packing and context parallel are both enabled, the
-                    # position embedding will not split rotary_pos_emb, so it may exceed
-                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
-                    # to cover the full sequence, so we do not shorten it here.
-                    rotary_pos_emb = rotary_pos_emb[0:q_len]
-
                 # q_no_pe: [num_tokens, n, qk_head_dim]
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_no_pe, q_pos_emb = torch.split(
@@ -1040,28 +1039,46 @@ class MLASelfAttention(MultiLatentAttention):
                     kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
                 )
 
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_pos_emb = apply_rotary_pos_emb(
-                    q_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    max_seqlen=rope_max_seqlen_q,
-                )
-                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = apply_rotary_pos_emb(
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    max_seqlen=rope_max_seqlen_kv,
-                )
+                if self.use_rope:
+                    q_len = q.size()[0]
+                    if inference_context is not None:
+                        # add offset to the sequence start for inference
+                        sequence_start = inference_context.sequence_len_offset
+                        sequence_end = sequence_start + q_len
+                        rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
+                    elif not thd_packed_seq or self.config.context_parallel_size == 1:
+                        # Shorten rotary_pos_emb to the sequence length when inference_params
+                        # is not provided. This makes sure we can run forward directly with
+                        # any sequence length. During training, the sequence length is always
+                        # the full rotary_pos_emb length, except for sequence packing + CP.
+                        # When sequence packing and context parallel are both enabled, the
+                        # position embedding will not split rotary_pos_emb, so it may exceed
+                        # the sequence length on this CP rank, but we need the full rotary_pos_emb
+                        # to cover the full sequence, so we do not shorten it here.
+                        rotary_pos_emb = rotary_pos_emb[0:q_len]
+
+                    # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                    q_pos_emb = apply_rotary_pos_emb(
+                        q_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_q,
+                        mscale=mscale,
+                        cp_group=self.pg_collection.cp,
+                        mla_rotary_interleaved=True,
+                        max_seqlen=rope_max_seqlen_q,
+                    )
+                    # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                    k_pos_emb = apply_rotary_pos_emb(
+                        k_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=mscale,
+                        cp_group=self.pg_collection.cp,
+                        mla_rotary_interleaved=True,
+                        max_seqlen=rope_max_seqlen_kv,
+                    )
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)

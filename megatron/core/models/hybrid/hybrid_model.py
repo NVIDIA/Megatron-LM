@@ -138,6 +138,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             HybridModel.mup_warning_printed = True
 
+        if config.mla_latent_cp:
+            from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
+
+            hybrid_stack_spec = mla_with_latent_cp.configure_mla_latent_cp_hybrid_stack(
+                hybrid_stack_spec
+            )
+
         self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length

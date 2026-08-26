@@ -118,6 +118,12 @@ class GPTModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        if config.mla_latent_cp:
+            from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
+
+            transformer_layer_spec = mla_with_latent_cp.configure_mla_latent_cp_decoder(
+                transformer_layer_spec
+            )
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length

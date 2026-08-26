@@ -302,6 +302,10 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    mla_latent_cp: bool = False
+    """Use the experimental MLA implementation that communicates latent KV for P2P context
+    parallelism. The model-spec builders opt in only when this flag is set."""
+
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
     An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,
@@ -1624,6 +1628,22 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.mla_latent_cp:
+            if not self.multi_latent_attention:
+                raise ValueError("mla_latent_cp requires multi_latent_attention=True.")
+            if self.experimental_attention_variant not in (None, "gated_delta_net"):
+                raise ValueError(
+                    "mla_latent_cp supports ordinary MLA or gated_delta_net hybrid GPT only."
+                )
+            if self.cp_partition_mode != "zigzag":
+                raise ValueError("mla_latent_cp requires cp_partition_mode='zigzag'.")
+            if (self.mtp_num_layers or 0) > 0:
+                raise ValueError("mla_latent_cp does not support MTP layers.")
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError("mla_latent_cp is training-only and rejects inference_optimized.")
+            if self.attention_backend not in (AttnBackend.fused, AttnBackend.flash):
+                raise ValueError("mla_latent_cp requires attention_backend to be fused or flash.")
 
         if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -3909,6 +3929,8 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.mla_latent_cp and self.mla_down_proj_fusion:
+            raise ValueError("mla_latent_cp does not support mla_down_proj_fusion.")
         if (
             self.multi_latent_attention
             and self.apply_rope_fusion
