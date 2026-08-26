@@ -7,7 +7,7 @@ layer-sharding branch must live ONLY on the ``muon`` entry's dispatcher
 (``_muon_registry_config_to_kwargs``), never in the shared
 ``_muon_config_to_kwargs`` that ``adaptive_muon`` layers its own kwargs on.
 When the branch leaked into the shared helper,
-``--optimizer adaptive_muon --use-layer-sharding-muon`` crashed at
+``--optimizer adaptive_muon --muon-tp-mode layer_sharded`` crashed at
 construction: TensorParallelAdaptiveMuon received LayerShardedMuon-only
 kwargs (gtp_remat_group, ns_batch_size, ...) and lost the ones it needs
 (is_qkv_fn, qkv_split_shapes, pg_collection).
@@ -48,11 +48,11 @@ class _Chunk:
     config = _ModelCfg()
 
 
-def _Cfg(use_layer_sharding_muon: bool) -> OptimizerConfig:
+def _Cfg(layer_sharded: bool) -> OptimizerConfig:
     """A real OptimizerConfig, so the reflective ``_kwargs_from_config`` lookups
     exercise the actual field surface instead of a stub that makes every
     ``hasattr`` fail (which would shrink the test to the hardcoded keys only)."""
-    return OptimizerConfig(use_layer_sharding_muon=use_layer_sharding_muon)
+    return OptimizerConfig(muon_tp_mode='layer_sharded' if layer_sharded else 'duplicated')
 
 
 def test_shared_muon_kwargs_ignore_layer_sharding_flag():
@@ -82,6 +82,9 @@ def test_adaptive_muon_kwargs_match_constructor_signature(lsh_flag):
 def test_muon_entry_dispatches_on_layer_sharding_flag():
     """The muon entry's dispatcher pairs lsh kwargs with the lsh class."""
     lsh_kwargs = eo_mod._muon_registry_config_to_kwargs(_Cfg(True), [_Chunk()], pg_collection=None)
+    # 'layer_sharded' is the registry selector, not a TensorParallelMuon mode:
+    # the constructor must receive the bitwise reference mode instead.
+    assert lsh_kwargs["tp_mode"] == "duplicated"
     assert "gtp_remat_group" in lsh_kwargs
     assert eo_mod._muon_config_to_cls(_Cfg(True)) is LayerShardedMuon
 
