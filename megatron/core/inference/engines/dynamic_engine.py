@@ -308,8 +308,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.vision_embedding_cache_max_bytes = int(
             getattr(inference_config, "vision_embedding_cache_max_bytes", 0)
         )
-        self.allow_stale_vision_embeddings = bool(
-            getattr(inference_config, "allow_stale_vision_embeddings", False)
+        self.allow_stale_multimodal_embeddings = bool(
+            getattr(inference_config, "allow_stale_multimodal_embeddings", False)
         )
         if self.vision_embedding_cache_max_bytes < 0:
             raise ValueError("vision_embedding_cache_max_bytes must be non-negative.")
@@ -522,7 +522,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _invalidate_vision_state(self) -> None:
         """Mark cached and request-local projected media as weight-stale."""
-        if getattr(self, "allow_stale_vision_embeddings", False):
+        if getattr(self, "allow_stale_multimodal_embeddings", False):
             return
         self.clear_vision_embedding_cache()
         for entry in self.requests.values():

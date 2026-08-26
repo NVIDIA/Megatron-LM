@@ -205,7 +205,7 @@ async def run_text_generation_server(
                 hostname=hostname,
                 chat_template=chat_template,
                 multimodal_prompt_config=(
-                    engine.controller.inference_wrapped_model.get_multimodal_prompt_config()
+                    engine.controller.inference_wrapped_model.multimodal_prompt_config
                 ),
             )
 

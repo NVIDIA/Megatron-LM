@@ -58,7 +58,7 @@ def test_vlm_wrapper_resolves_media_id_from_tokenizer_not_model_sentinel():
         convert_tokens_to_ids=lambda token: 99 if token == "<image>" else 0, unk_token_id=0
     )
 
-    assert wrapper.get_multimodal_prompt_config().image_spec.model_token == "<image>"
+    assert wrapper.multimodal_prompt_config.image_spec.model_token == "<image>"
     assert wrapper.resolve_media_token_id(tokenizer, "image") == 99
 
 

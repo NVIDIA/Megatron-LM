@@ -36,12 +36,10 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
     supports_video = True
     supports_audio = False
 
-    def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
-        """Return Nemotron Omni's compact visual-span contract."""
-        return MultimodalPromptConfig(
-            image_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
-            video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
-        )
+    _media_prompt_spec = MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>")
+    multimodal_prompt_config = MultimodalPromptConfig(
+        image_spec=_media_prompt_spec, video_spec=_media_prompt_spec
+    )
 
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return the model's internal sentinel for already-expanded visual prompts."""

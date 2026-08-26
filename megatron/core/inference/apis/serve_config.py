@@ -2,9 +2,6 @@
 
 import socket
 from dataclasses import dataclass, field
-from typing import Optional
-
-from megatron.core.inference.config import MultimodalPromptConfig
 
 
 @dataclass
@@ -52,6 +49,3 @@ class ServeConfig:
 
     Must already be bound to a real port; when set, `host` / `port` are not used for binding.
     """
-
-    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None
-    """Optional override for model-specific image and video prompt lowering."""

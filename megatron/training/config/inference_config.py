@@ -262,8 +262,8 @@ class InferenceSetupConfig:
     use_flashinfer_fused_rope: bool = False
     """Use flashinfer's fused rope implementation. Mirrors ``--use-flashinfer-fused-rope``."""
 
-    inference_dynamic_batching_allow_stale_vision_embeddings: bool = False
-    """Allow request-local and cached vision embeddings across weight-change boundaries."""
+    inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
+    """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
 
     def to_inference_config(
         self,
@@ -393,8 +393,8 @@ class InferenceSetupConfig:
             vision_embedding_cache_max_bytes=(
                 self.inference_dynamic_batching_vision_embedding_cache_max_bytes
             ),
-            allow_stale_vision_embeddings=(
-                self.inference_dynamic_batching_allow_stale_vision_embeddings
+            allow_stale_multimodal_embeddings=(
+                self.inference_dynamic_batching_allow_stale_multimodal_embeddings
             ),
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
             metrics_writer=metrics_writer,

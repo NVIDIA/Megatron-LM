@@ -31,10 +31,10 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
     _recv_only_vision_embeds: bool = False
     _encoder_only: bool = False
 
-    def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
-        """Use the conventional compact ``<image>`` placeholder."""
-        spec = MediaPromptSpec(model_token="<image>")
-        return MultimodalPromptConfig(image_spec=spec, video_spec=spec)
+    _media_prompt_spec = MediaPromptSpec(model_token="<image>")
+    multimodal_prompt_config = MultimodalPromptConfig(
+        image_spec=_media_prompt_spec, video_spec=_media_prompt_spec
+    )
 
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return LLaVA's internal sentinel without exposing it as a vocabulary ID."""

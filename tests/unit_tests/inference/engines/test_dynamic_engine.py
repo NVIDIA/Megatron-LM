@@ -1027,7 +1027,7 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
         image_token_mask=torch.tensor([0, 1, -1]),
     )
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.allow_stale_vision_embeddings = False
+    engine.allow_stale_multimodal_embeddings = False
     engine._vision_embedding_cache = {"media": request.image_embeddings}
     engine._vision_embedding_cache_bytes = request.image_embeddings.numel() * 4
     engine.requests = {
@@ -1046,7 +1046,7 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
 
 def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.allow_stale_vision_embeddings = True
+    engine.allow_stale_multimodal_embeddings = True
     engine._vision_embedding_cache = {"media": torch.ones(1)}
     engine._vision_embedding_cache_bytes = 4
     engine.requests = {}

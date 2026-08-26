@@ -119,14 +119,14 @@ class TestInferenceConfig:
                 "2.5",
                 "--inference-dynamic-batching-vision-embedding-cache-max-bytes",
                 "1048576",
-                "--inference-dynamic-batching-allow-stale-vision-embeddings",
+                "--inference-dynamic-batching-allow-stale-multimodal-embeddings",
             ]
         )
         assert args.inference_dynamic_batching_async_sched_mode == "async"
         assert args.inference_dynamic_batching_media_cache_coordinator_policy == "load_balanced"
         assert args.inference_dynamic_batching_media_cache_routing_weight == 2.5
         assert args.inference_dynamic_batching_vision_embedding_cache_max_bytes == 1048576
-        assert args.inference_dynamic_batching_allow_stale_vision_embeddings is True
+        assert args.inference_dynamic_batching_allow_stale_multimodal_embeddings is True
 
     @pytest.mark.parametrize("invalid_mode", ["serial", "overlap"])
     def test_async_sched_argparse_rejects_removed_modes(self, invalid_mode):
@@ -148,7 +148,7 @@ class TestInferenceConfig:
             inference_dynamic_batching_media_cache_coordinator_policy="load_balanced",
             inference_dynamic_batching_media_cache_routing_weight=2.5,
             inference_dynamic_batching_vision_embedding_cache_max_bytes=1048576,
-            inference_dynamic_batching_allow_stale_vision_embeddings=True,
+            inference_dynamic_batching_allow_stale_multimodal_embeddings=True,
         )
 
         inference_config = setup_config.to_inference_config(
@@ -166,7 +166,7 @@ class TestInferenceConfig:
         )
         assert inference_config.media_cache_routing_weight == 2.5
         assert inference_config.vision_embedding_cache_max_bytes == 1048576
-        assert inference_config.allow_stale_vision_embeddings is True
+        assert inference_config.allow_stale_multimodal_embeddings is True
 
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""

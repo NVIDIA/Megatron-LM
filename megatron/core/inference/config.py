@@ -455,7 +455,7 @@ class InferenceConfig:
     """Maximum GPU bytes retained for reusable vision embeddings.
 
     A value of zero disables the cache. Cache entries use an automatically
-    generated media-content key and, unless ``allow_stale_vision_embeddings``
+    generated media-content key and, unless ``allow_stale_multimodal_embeddings``
     is enabled, are discarded whenever the inference engine is suspended or its
     generation epoch changes.
     """
@@ -597,7 +597,7 @@ class InferenceConfig:
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
 
-    allow_stale_vision_embeddings: bool = False
+    allow_stale_multimodal_embeddings: bool = False
     """Allow projected-media embeddings to survive weight-change boundaries.
 
     By default, suspend/resume and generation-epoch changes invalidate both the

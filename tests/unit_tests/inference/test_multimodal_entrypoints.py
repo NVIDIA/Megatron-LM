@@ -256,6 +256,10 @@ def toy_media_preprocessing(monkeypatch):
             _toy_preprocessed_media("video") if media == [_MEDIA_BYTES] else None
         ),
     )
+    # Keep this toy E2E path on CPU even when the test worker can see a GPU.
+    # Otherwise resolve_multimodal_data_for_engine constructs a CUDA device
+    # before the mocked preprocessors have a chance to ignore it.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
 
 

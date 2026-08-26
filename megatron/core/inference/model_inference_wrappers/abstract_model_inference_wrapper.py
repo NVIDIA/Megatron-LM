@@ -41,6 +41,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
     supports_image: ClassVar[bool] = False
     supports_video: ClassVar[bool] = False
     supports_audio: ClassVar[bool] = False
+    multimodal_prompt_config: ClassVar[Optional[MultimodalPromptConfig]] = None
 
     @deprecate_args(*DEPRECATED_ARGS)
     def __init__(
@@ -90,10 +91,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context.reset()
 
-    def get_multimodal_prompt_config(self) -> Optional[MultimodalPromptConfig]:
-        """Return this model's structured-media prompt contract, if any."""
-        return None
-
     def validate_input_modalities(self, *modalities: str) -> None:
         """Reject input modalities that this wrapper does not support."""
         capabilities = {
@@ -110,7 +107,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
     def resolve_media_token_id(self, tokenizer, modality: str) -> int:
         """Resolve a compact media marker to one nonnegative tokenizer ID."""
-        prompt_config = self.get_multimodal_prompt_config()
+        prompt_config = self.multimodal_prompt_config
         if prompt_config is None:
             raise ValueError(f"{type(self).__name__} does not define a multimodal prompt contract.")
         spec = prompt_config.get_spec(modality)

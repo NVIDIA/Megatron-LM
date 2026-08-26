@@ -2236,10 +2236,10 @@ def _add_inference_args(parser):
                        dest='inference_dynamic_batching_vision_embedding_cache_max_bytes',
                        help='Maximum GPU bytes retained per engine for reusable vision '
                        'embeddings. Zero disables the cache. Default: 0.')
-    group.add_argument('--inference-dynamic-batching-allow-stale-vision-embeddings',
+    group.add_argument('--inference-dynamic-batching-allow-stale-multimodal-embeddings',
                        action='store_true',
-                       dest='inference_dynamic_batching_allow_stale_vision_embeddings',
-                       help='Allow request-local and cached vision embeddings to survive '
+                       dest='inference_dynamic_batching_allow_stale_multimodal_embeddings',
+                       help='Allow request-local and cached multimodal embeddings to survive '
                        'suspend/resume and generation-epoch changes. Use only when model '
                        'weights do not change across these boundaries.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',

@@ -213,10 +213,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             )
 
             assert self._coord_runtime is not None
-            multimodal_prompt_config = (
-                serve_config.multimodal_prompt_config
-                or self._controller.inference_wrapped_model.get_multimodal_prompt_config()
-            )
             start_text_gen_server(
                 coordinator_addr=self._coord_runtime.coord_addr,
                 tokenizer=self._controller.tokenizer,
@@ -227,7 +223,9 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 num_replicas=serve_config.frontend_replicas,
                 hostname=serve_config.host,
                 sock=serve_config.sock,
-                multimodal_prompt_config=multimodal_prompt_config,
+                multimodal_prompt_config=(
+                    self._controller.inference_wrapped_model.multimodal_prompt_config
+                ),
             )
             self._serve_started = True
 
