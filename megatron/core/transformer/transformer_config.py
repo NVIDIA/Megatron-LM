@@ -2224,8 +2224,7 @@ class TransformerConfig(ModelParallelConfig):
             replica_errors = []
             if self.grad_reduce_in_bf16 and not self.ddp_reduce_scatter_with_fp32_accumulation:
                 replica_errors.append(
-                    "--ddp-reduce-scatter-with-fp32-accumulation with "
-                    "--grad-reduce-in-bf16"
+                    "--ddp-reduce-scatter-with-fp32-accumulation with " "--grad-reduce-in-bf16"
                 )
             if (
                 self.grad_reduce_in_bf16
@@ -2249,6 +2248,8 @@ class TransformerConfig(ModelParallelConfig):
                 replica_errors.append("add_bias_linear=False")
             if not self.moe_grouped_gemm:
                 replica_errors.append("moe_grouped_gemm=True")
+            if self.moe_single_grouped_weight:
+                replica_errors.append("moe_single_grouped_weight=False")
             if self.moe_single_grouped_bias:
                 replica_errors.append("moe_single_grouped_bias=False")
             if not self.use_transformer_engine_op_fuser:
@@ -2425,11 +2426,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if self.moe_flex_dispatcher_backend not in (
-                "hybridep",
-                "replica_hybridep",
-                "ncclep",
-            ):
+            if self.moe_flex_dispatcher_backend not in ("hybridep", "replica_hybridep", "ncclep"):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
                     "'hybridep' or 'ncclep'."
