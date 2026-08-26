@@ -56,7 +56,7 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
 def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) -> int:
     """Convert a leading hash-MoE count to a global hybrid layer-number threshold."""
     if n_hash_layers <= 0:
-        return n_hash_layers
+        return 0
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
@@ -247,10 +247,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
+                "overlap scheduler does not expand the nested HybridStack."
+            )
 
-        configured_n_hash_layers = self.config.moe_n_hash_layers
         hash_layer_threshold = _get_hash_moe_layer_threshold(
-            parsed.main_pattern, configured_n_hash_layers
+            parsed.main_pattern, self.config.moe_n_hash_layers
         )
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
@@ -340,9 +344,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
-            hash_moe_layer_threshold=(
-                hash_layer_threshold if configured_n_hash_layers > 0 else None
-            ),
+            hash_moe_layer_threshold=hash_layer_threshold or None,
             name="decoder",
         )
 
@@ -363,6 +365,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
+                hash_moe_layer_threshold=hash_layer_threshold or None,
                 name="mtp",
             )
             self._setup_mtp_cuda_graphs()

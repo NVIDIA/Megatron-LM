@@ -423,12 +423,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-        # Cache these predicates because the split hybrid mHC path consults them on every
-        # forward. The sibling HyperConnectionTransformerLayer uses the same attributes.
-        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
-        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(
-            self.pre_mlp_layernorm, IdentityOp
-        )
         # [Module 8: MLP block]
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP
@@ -479,6 +473,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        # Cache whether these optional layernorms are materialized. The split hybrid mHC
+        # recompute and fine-grained activation-offloading paths share these predicates.
+        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
+        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -1825,14 +1824,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def _set_offload_modules(self):
         """Set the offload modules for the transformer layer."""
         if self.config.fine_grained_activation_offloading:
-            self.offload_attn_norm = "attn_norm" in self.config.offload_modules and not isinstance(
-                self.input_layernorm, IdentityOp
+            self.offload_attn_norm = (
+                "attn_norm" in self.config.offload_modules and self.mhc_checkpoint_input_layernorm
             )
             self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
             self.offload_core_attn = "core_attn" in self.config.offload_modules
             self.offload_attn_proj = "attn_proj" in self.config.offload_modules
-            self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
-                self.pre_mlp_layernorm, IdentityOp
+            self.offload_mlp_norm = (
+                "mlp_norm" in self.config.offload_modules and self.mhc_checkpoint_pre_mlp_layernorm
             )
             self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
             self.offload_moe_act = "moe_act" in self.config.offload_modules
@@ -1966,11 +1965,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         self.mlp_hyper_connection = build_module(
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
-
-        # When mHC recompute is active, skip checkpointing if the layernorm
-        # is IdentityOp (fused into TE linear) — there is nothing to recompute.
-        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
-        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
 
         self._validate_mhc_recompute_attn_cuda_graph_split()
 

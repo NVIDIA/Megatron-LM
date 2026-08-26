@@ -327,8 +327,7 @@ class MockSFTLowLevelDataset:
             assert len(sample) == target
             return sample.astype(np.int64)
         else:
-            if self.vocab_size is None:
-                raise RuntimeError("Generated mock data requires a configured vocabulary size")
+            assert self.vocab_size is not None and self.vocab_size >= 2
             sample = np.arange(1, length, dtype=np.int64)
             # Preserve the original positive-token invariant while bounding IDs to the
             # tokenizer vocabulary. In particular, do not synthesize token 0, which is

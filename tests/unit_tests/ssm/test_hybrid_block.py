@@ -7,7 +7,11 @@ from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.hybrid_model import HybridModel, _validate_hash_moe_pipeline_placement
+from megatron.core.models.hybrid.hybrid_model import (
+    HybridModel,
+    _get_hash_moe_layer_threshold,
+    _validate_hash_moe_pipeline_placement,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, GatedDeltaNet, KimiDeltaAttention
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -23,6 +27,12 @@ from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("n_hash_layers", [-3, -1, 0])
+def test_non_positive_hash_moe_count_has_disabled_threshold(n_hash_layers):
+    """Non-positive hash-MoE counts normalize to the disabled threshold."""
+    assert _get_hash_moe_layer_threshold(Symbols.MOE, n_hash_layers) == 0
 
 
 @pytest.mark.internal
@@ -306,9 +316,11 @@ class TestHybridBlock:
     def test_hash_moe_counts_only_moe_layers(self):
         """Hash routing derives a global layer threshold from the MoE positions."""
         layer_pattern = (Symbols.MLP + Symbols.MOE) * 4
+        mtp_pattern = Symbols.MOE
         config = TransformerConfig(
             hidden_size=256,
             num_layers=len(layer_pattern),
+            mtp_num_layers=1,
             num_attention_heads=4,
             use_cpu_initialization=True,
             num_moe_experts=4,
@@ -326,7 +338,7 @@ class TestHybridBlock:
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=8,
-            hybrid_layer_pattern=layer_pattern,
+            hybrid_layer_pattern=f"{layer_pattern}/{mtp_pattern}",
             pg_collection=self.get_pg_collection(),
         )
         block = model.decoder
@@ -341,6 +353,9 @@ class TestHybridBlock:
         assert [layer.layer_number for layer in moe_layers] == [2, 4, 6, 8]
         assert [router.is_hash_layer for router in routers] == [True, True, True, False]
         assert [router.hash_moe_layer_threshold for router in routers] == [6, 6, 6, 6]
+        mtp_router = model.mtp.layers[0].mtp_model_layer.layers[0].mlp.router
+        assert mtp_router.hash_moe_layer_threshold == 6
+        assert not mtp_router.is_hash_layer
         assert model.config.moe_n_hash_layers == 3
 
     def test_hash_moe_pipeline_placement_validation(self):
@@ -382,6 +397,29 @@ class TestHybridBlock:
             hash_moe_layer_threshold=2,
             pre_process=False,
         )
+
+    def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
+        """Reject overlap before constructing any HybridModel submodule."""
+        config = TransformerConfig(
+            hidden_size=256, num_layers=1, num_attention_heads=4, use_cpu_initialization=True
+        )
+        # Mutate after generic config validation to exercise the pattern-specific guard.
+        config.overlap_moe_expert_parallel_comm = True
+
+        def fail_build(*args, **kwargs):
+            pytest.fail("HybridModel submodule construction must not begin")
+
+        monkeypatch.setattr("megatron.core.models.hybrid.hybrid_model.build_module", fail_build)
+
+        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
+                pg_collection=self.get_pg_collection(),
+            )
 
     def test_layer_types(self):
         """

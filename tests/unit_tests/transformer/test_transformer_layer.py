@@ -101,6 +101,10 @@ class TestParallelTransformerLayer:
         parallel_transformer_layer = self.parallel_transformer_layer
         assert isinstance(parallel_transformer_layer, TransformerLayer)
         assert parallel_transformer_layer.layer_number == 1
+        # The TE dense spec fuses both norms into their following linears, leaving
+        # IdentityOp placeholders that must not be checkpointed independently.
+        assert not parallel_transformer_layer.mhc_checkpoint_input_layernorm
+        assert not parallel_transformer_layer.mhc_checkpoint_pre_mlp_layernorm
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
@@ -111,13 +115,18 @@ class TestParallelTransformerLayer:
 
         import megatron.core.transformer.transformer_layer as transformer_layer_module
 
-        layer = self.parallel_transformer_layer
-        layer.input_layernorm = torch.nn.LayerNorm(layer.config.hidden_size)
-        layer.pre_mlp_layernorm = torch.nn.LayerNorm(layer.config.hidden_size)
-        layer.mhc_checkpoint_input_layernorm = True
-        layer.mhc_checkpoint_pre_mlp_layernorm = True
-        layer.recompute_input_layernorm = False
-        layer.recompute_pre_mlp_layernorm = False
+        def build_layernorm(config, hidden_size, eps):
+            del config
+            return torch.nn.LayerNorm(hidden_size, eps=eps)
+
+        submodules = transformer_layer_module.TransformerLayerSubmodules(
+            input_layernorm=build_layernorm, pre_mlp_layernorm=build_layernorm
+        )
+        layer = TransformerLayer(self.parallel_transformer_layer.config, submodules)
+        assert layer.mhc_checkpoint_input_layernorm
+        assert layer.mhc_checkpoint_pre_mlp_layernorm
+        assert not layer.recompute_input_layernorm
+        assert not layer.recompute_pre_mlp_layernorm
         layer.off_interface = lambda _enabled, hidden_states, _name: nullcontext(hidden_states)
 
         class IdentityBranch(torch.nn.Module):

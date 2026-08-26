@@ -99,22 +99,6 @@ class TestMultiTokenPredictionLayer:
         )
         assert config.mtp_detach_heads is False
 
-    def test_hybrid_mtp_rejects_expert_parallel_overlap(self):
-        """Hybrid MTP must fail clearly before the unsupported overlap path is built."""
-        config = TransformerConfig(
-            num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
-        )
-        # Mutate after config validation to exercise the model-family-specific guard directly.
-        config.overlap_moe_expert_parallel_comm = True
-
-        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
-            MultiTokenPredictionLayer(
-                config=config,
-                submodules=None,
-                pg_collection=types.SimpleNamespace(cp=None, tp=None),
-                mtp_layer_pattern="M",
-            )
-
     def test_constructor_with_detach_heads(self):
         """Test construction of MTP module with mtp_detach_heads=True."""
         torch.manual_seed(_SEED)
@@ -2262,7 +2246,7 @@ class TestMultiTokenPredictionHybrid:
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     def test_full_recompute_with_multi_layer_chunks_mamba(self):
-        """Hybrid MTP accepts decoder-sized uniform recompute chunks."""
+        """Hybrid MTP chunks are recomputed once without an outer MTP checkpoint."""
         args = self.create_test_args(
             tp=1,
             cp=1,
@@ -2289,14 +2273,41 @@ class TestMultiTokenPredictionHybrid:
             pg_collection=pg_collection,
         )
 
-        output = model[0].forward(
-            input_ids=batch['tokens'],
-            position_ids=batch['position_ids'],
-            attention_mask=batch['attention_mask'],
-            labels=batch['labels'],
-            loss_mask=batch['loss_mask'],
-        )
-        output.mean().backward()
+        mtp_layers = [
+            module
+            for module in unwrap_model(model[0]).modules()
+            if isinstance(module, MultiTokenPredictionLayer)
+        ]
+        assert len(mtp_layers) == args.mtp_num_layers
+
+        inner_layer_forward_counts = {}
+
+        def count_inner_layer_forward(module, _inputs, _output):
+            inner_layer_forward_counts[module] += 1
+
+        hook_handles = []
+        for mtp_layer in mtp_layers:
+            for inner_layer in mtp_layer.mtp_model_layer.layers:
+                inner_layer_forward_counts[inner_layer] = 0
+                hook_handles.append(inner_layer.register_forward_hook(count_inner_layer_forward))
+
+        try:
+            output = model[0].forward(
+                input_ids=batch['tokens'],
+                position_ids=batch['position_ids'],
+                attention_mask=batch['attention_mask'],
+                labels=batch['labels'],
+                loss_mask=batch['loss_mask'],
+            )
+            output.mean().backward()
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        # Each nested layer runs once in the original forward and once when its HybridStack
+        # chunk is recomputed in backward. An outer MTP checkpoint would add a third execution.
+        assert inner_layer_forward_counts
+        assert all(count == 2 for count in inner_layer_forward_counts.values())
 
         for name, param in model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
