@@ -17,11 +17,13 @@ orphan: true
 
 This document proposes a deliberately narrow first implementation. It is not a compatibility plan
 for the existing MLA attention path. The attention algorithm and all backend code remain isolated
-in the feature-owned module, while narrow config and model-spec plumbing makes the feature directly
-selectable by GPT and HybridModel builders. Transformer Engine (TE) and all existing MLA tests
-remain unchanged. One shared MLA file has a deliberately small compatibility change: it honors the
-existing per-layer `no_rope_freq` flag by not constructing or applying a rotary embedding for that
-layer. The latent-CP module owns all CP, backend, merge, and transport logic.
+in the feature-owned module. That module also owns its local attention spec, non-mutating GPT and
+Hybrid spec rewrites, and the decoder-forward preflight wrapper. GPTModel and HybridModel each make
+one conditional initialization call; their layer-spec and training builders have no latent-CP
+branch. Transformer Engine (TE) and all existing MLA tests remain unchanged. One shared MLA file has
+a deliberately small compatibility change: it honors the existing per-layer `no_rope_freq` flag by
+not constructing or applying a rotary embedding for that layer. The latent-CP module owns all CP,
+backend, merge, and transport logic.
 
 P2P context parallelism (CP) circulates normalized MLA latent KV and the positional key component,
 rather than expanded K and V. Each receiving CP rank reconstructs K/V immediately before its
@@ -645,18 +647,20 @@ cached with strong group references. The first layer for a new signature prepare
 classes and completes CP-then-TP `MIN`; only that success stores the shared adapter. Later layers and
 steps with the same signature reuse its already-prepared process/device adapter with zero consensus
 collectives. Failure never writes an entry, and CP1 x TP1 performs neither consensus all-reduce.
-GPTModel and HybridModel establish a feature-owned `latent_cp_preflight_scope()` immediately
-around each decoder forward. The first latent-CP layer for a dynamic subgroup still resolves the
-ordered grid, prepares any missing plans, and completes CP-then-TP `MIN`. Only that rank-common
-success enters the forward-local scope. Later layers in the same forward reuse it before package
-resolution, GPU-to-CPU metadata conversion, grid discovery, or consensus. The scope key includes
-the effective CP/TP group identities, the original cumulative-length tensor identity, device,
-backend, head dimensions, scale, and maximum global length; strong references in the scoped result
-guard against identity reuse. Exiting the decoder forward discards the scope, so the next
-microbatch establishes its own rank-common result. Manual/custom module calls outside GPTModel or
-HybridModel keep the conservative behavior: dynamic invocations bypass the process-local
-grid-identity early return and execute CP-then-TP `MIN` every time. No local cache history is used
-to infer a cross-rank hit.
+The feature-owned GPT and Hybrid configurators wrap each decoder root in a cached, state-dict-neutral
+subclass whose forward mixin establishes `latent_cp_preflight_scope()`. GPTModel and HybridModel
+select that configured root once during initialization; their forward methods remain ordinary
+decoder calls and contain no latent-CP context logic. The first latent-CP layer for a dynamic
+subgroup still resolves the ordered grid, prepares any missing plans, and completes CP-then-TP
+`MIN`. Only that rank-common success enters the forward-local scope. Later layers in the same
+forward reuse it before package resolution, GPU-to-CPU metadata conversion, grid discovery, or
+consensus. The scope key includes the effective CP/TP group identities, the original
+cumulative-length tensor identity, device, backend, head dimensions, scale, and maximum global
+length; strong references in the scoped result guard against identity reuse. Exiting the decoder
+forward discards the scope, so the next microbatch establishes its own rank-common result.
+Manual/custom module calls outside a configured GPTModel or HybridModel keep the conservative
+behavior: dynamic invocations bypass the process-local grid-identity early return and execute
+CP-then-TP `MIN` every time. No local cache history is used to infer a cross-rank hit.
 
 This cache records successful deterministic availability/plan preflight, not numerical qualification:
 runtime does not execute random/reference inputs, compare numbers, mutate the allow-list tuple, or
@@ -673,11 +677,13 @@ tests/unit_tests/transformer/experimental_attention_variant/test_mla_with_latent
 
 The production file contains the module, phase planner, FP32 merger, direct adapters,
 differentiable synchronous ring transport, no-op zigzag layout adapter, and spec factory.
-Small integration changes add `TransformerConfig.mla_latent_cp`, route only GPT/HybridModel
-attention slots through that factory, and bracket each selected model's decoder call with the
-feature-owned preflight scope. The shared `multi_latent_attention.py` change is limited to
-the existing `no_rope_freq` contract: it avoids rotary construction/application and selects the
-standard scale on flagged layers. It contains no latent-CP algorithm.
+Small integration changes add `TransformerConfig.mla_latent_cp` and one feature-initialization call
+in each of GPTModel and HybridModel. GPT/Hybrid layer-spec builders and training builders do not
+carry latent-CP branches. The feature initializer rewrites only compatible attention slots and
+installs the feature-owned preflight-scoped decoder root before module construction. The shared
+`multi_latent_attention.py` change is limited to the existing `no_rope_freq` contract: it avoids
+rotary construction/application and selects the standard scale on flagged layers. It contains no
+latent-CP algorithm.
 
 `get_gpt_layer_local_spec(...)` returns a whole transformer-layer `ModuleSpec`; the attention
 factory does not accept that outer object. `make_mla_with_latent_cp_spec(base_mla_spec)` accepts
@@ -715,7 +721,17 @@ latent_layer_spec = replace(
 
 The factory internally uses the same `dataclasses.replace` pattern for `base_mla_spec` and
 `base_mla_spec.submodules`; it does not assign to either input object. Normal model construction
-instead opts in through configuration:
+uses the feature-owned `get_mla_with_latent_cp_spec()` directly rather than importing a GPT layer
+factory. `configure_mla_latent_cp_decoder()` accepts either one transformer-layer `ModuleSpec` or a
+`TransformerBlockSubmodules`, replaces only exact ordinary `MLASelfAttention` slots, and leaves GDN,
+KDA, DSA/CSA/HCA, Mamba, MLP, and MoE slots untouched. It returns a fresh spec plus the
+preflight-scoped decoder class. `configure_mla_latent_cp_hybrid_stack()` derives its ordinary
+attention slot from the Hybrid stack's own `mla_layer` template, replaces that template's attention,
+and returns a fresh root spec whose module owns the same preflight scope. Neither path mutates its
+input spec, nests the decoder under a wrapper module, changes state-dict keys, or imports GPT code
+from the Hybrid layer-spec file.
+
+Model construction opts in through configuration:
 
 ```yaml
 multi_latent_attention: true
@@ -727,8 +743,9 @@ cp_partition_mode: zigzag
 
 The argument factory also exposes `--mla-latent-cp`. Ordinary GPT replaces self-attention in both
 dense and MoE layers; gated-delta GPT and `HybridModel` replace only their standard-attention (`*`)
-slots. Mamba/GDN, D, CSA/HCA, window-attention, MLP, and MoE slot selection stays unchanged. Explicit
-layer/stack specs, inference/modelopt, MTP, and other unsupported combinations fail rather than
+slots. Mamba/GDN, D, CSA/HCA, window-attention, MLP, and MoE slot selection stays unchanged.
+Structurally compatible explicit layer/stack specs are transformed non-mutatingly; specs without an
+ordinary MLA template, inference/modelopt, MTP, and other unsupported combinations fail rather than
 silently ignoring the flag. `attention_backend` remains the fused-versus-FA4 selector. The manual
 factory above remains useful to developers building custom specs.
 
@@ -925,9 +942,11 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    case begins locally successful,
    injects failure into CP `MIN`, still requires the following TP `MIN`, and asserts exact
    `[CP, TP]` group/op order.
-   Dynamic signatures prove the complementary scope rule: two matching layers in one decoder
-   forward perform one uncached grid discovery and one CP-then-TP consensus, while a new forward
-   repeats that rank-common gate without rebuilding an already prepared adapter.
+   Feature-initialization tests require non-mutating GPT/Hybrid spec rewrites and a
+   state-dict-neutral scoped decoder root. Dynamic signatures prove the complementary scope rule:
+   two matching layers in one decoder forward perform one uncached grid discovery and one
+   CP-then-TP consensus, while a new forward repeats that rank-common gate without rebuilding an
+   already prepared adapter.
 7. **cuDNN merge backward.** Compare all phase shapes against standard PyTorch, including `G_i`,
    `gE_i`, `O_corr`, zero/tiny norm rows, extreme phase weights/LSE, and BF16 boundary casts.
 8. **Dtype and functional merge.** Assert raw BF16 backend output, canonical/merged FP32 output+LSE,

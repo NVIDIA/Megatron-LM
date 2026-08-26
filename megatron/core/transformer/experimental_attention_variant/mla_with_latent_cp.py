@@ -2,8 +2,9 @@
 
 """Experimental MLA self-attention that exchanges latent KV over a P2P CP ring.
 
-This module intentionally has no registration side effects. Model-spec builders opt in through
-``TransformerConfig.mla_latent_cp`` and use ``make_mla_with_latent_cp_spec``. The implementation
+This module intentionally has no registration side effects. GPTModel and HybridModel opt in through
+``TransformerConfig.mla_latent_cp`` and call the feature-owned, non-mutating decoder/stack
+configurators during initialization. The implementation
 bypasses MCore and Transformer Engine attention wrappers: only the existing MLA projection modules
 and RoPE implementation are reused.
 """
@@ -20,6 +21,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import IntEnum
+from functools import cache
 from typing import Any, Final, Iterator, Literal, Protocol, TypeAlias
 
 import torch
@@ -41,6 +43,7 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 CUDNN_FRONTEND_SOURCE_REV: Final[str] = "0a14b7181d129d30e7bad34b8c3ed0a0c995e23d"
@@ -1302,6 +1305,34 @@ def latent_cp_preflight_scope() -> Iterator[None]:
         _LATENT_CP_PREFLIGHT_STATE.reset(token)
 
 
+class _LatentCPPreflightMixin:
+    """Open the feature-owned preflight scope around one decoder forward."""
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegate one decoder forward inside a fresh latent-CP preflight scope."""
+
+        with latent_cp_preflight_scope():
+            return super().forward(*args, **kwargs)  # type: ignore[misc]
+
+
+@cache
+def _preflight_scoped_module(module: type[torch.nn.Module]) -> type[torch.nn.Module]:
+    """Return a state-dict-neutral subclass that owns the decoder-forward scope."""
+
+    _require(
+        isinstance(module, type) and issubclass(module, torch.nn.Module),
+        "decoder module must be a torch.nn.Module class",
+    )
+    return type(
+        f"LatentCPPreflight{module.__name__}",
+        (_LatentCPPreflightMixin, module),
+        {
+            "__doc__": f"{module.__name__} with a feature-owned latent-CP preflight scope.",
+            "__module__": __name__,
+        },
+    )
+
+
 _BACKEND_PREFLIGHT_LOCK: Final[threading.Lock] = threading.Lock()
 _BACKEND_PREFLIGHT_SUCCESS: dict[
     tuple[int, int, _BackendPreflightSignature], DirectAttentionAdapter
@@ -2170,4 +2201,97 @@ def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
         params=dict(base_mla_spec.params),
         submodules=latent_submodules,
         metainfo=dict(base_mla_spec.metainfo),
+    )
+
+
+def get_mla_with_latent_cp_spec() -> ModuleSpec:
+    """Build the feature-owned local MLA attention spec used by model integration."""
+
+    return ModuleSpec(
+        module=MLAWithLatentCP,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=MLASelfAttentionSubmodules(
+            linear_q_proj=ColumnParallelLinear,
+            linear_q_down_proj=ColumnParallelLinear,
+            linear_q_up_proj=ColumnParallelLinear,
+            linear_kv_down_proj=ColumnParallelLinear,
+            linear_kv_up_proj=ColumnParallelLinear,
+            core_attention=IdentityOp,
+            linear_gate=ColumnParallelLinear,
+            linear_proj=RowParallelLinear,
+            q_layernorm=_build_local_latent_norm,
+            kv_layernorm=_build_local_latent_norm,
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+
+
+def _replace_transformer_layer_attention(layer_spec: ModuleSpec) -> tuple[ModuleSpec, bool]:
+    """Replace one ordinary MLA attention slot without mutating its layer spec."""
+
+    _require(isinstance(layer_spec, ModuleSpec), "decoder layers must use ModuleSpec")
+    layer_submodules = layer_spec.submodules
+    _require(layer_submodules is not None, "decoder layer spec must define submodules")
+    attention_spec = getattr(layer_submodules, "self_attention", None)
+    if not isinstance(attention_spec, ModuleSpec) or attention_spec.module is not MLASelfAttention:
+        return layer_spec, False
+    return (
+        replace(
+            layer_spec,
+            params=dict(layer_spec.params),
+            metainfo=dict(layer_spec.metainfo),
+            submodules=replace(
+                layer_submodules,
+                self_attention=get_mla_with_latent_cp_spec(),
+                sharded_state_dict_keys_map=dict(layer_submodules.sharded_state_dict_keys_map),
+            ),
+        ),
+        True,
+    )
+
+
+def configure_mla_latent_cp_decoder(
+    decoder_module: type[torch.nn.Module], decoder_spec: ModuleSpec | TransformerBlockSubmodules
+) -> tuple[type[torch.nn.Module], ModuleSpec | TransformerBlockSubmodules]:
+    """Return a preflight-scoped decoder class and non-mutating latent-CP GPT spec."""
+
+    replaced = 0
+    if isinstance(decoder_spec, ModuleSpec):
+        configured_spec, changed = _replace_transformer_layer_attention(decoder_spec)
+        replaced = int(changed)
+    elif isinstance(decoder_spec, TransformerBlockSubmodules):
+        _require(decoder_spec.layer_specs is not None, "decoder block must define layer specs")
+        configured_layers = []
+        for layer_spec in decoder_spec.layer_specs:
+            configured_layer, changed = _replace_transformer_layer_attention(layer_spec)
+            configured_layers.append(configured_layer)
+            replaced += int(changed)
+        configured_spec = replace(decoder_spec, layer_specs=configured_layers)
+    else:
+        raise LatentCPError(
+            "latent CP requires a ModuleSpec or TransformerBlockSubmodules decoder spec"
+        )
+    _require(replaced > 0, "decoder spec contains no ordinary MLA attention slot")
+    return _preflight_scoped_module(decoder_module), configured_spec
+
+
+def configure_mla_latent_cp_hybrid_stack(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Return a non-mutating Hybrid stack with latent CP in its ordinary attention slot."""
+
+    _require(isinstance(stack_spec, ModuleSpec), "hybrid stack must use ModuleSpec")
+    stack_submodules = stack_spec.submodules
+    _require(stack_submodules is not None, "hybrid stack spec must define submodules")
+    mla_layer = getattr(stack_submodules, "mla_layer", None)
+    _require(
+        isinstance(mla_layer, ModuleSpec),
+        "hybrid stack must provide its ordinary MLA layer template",
+    )
+    latent_layer, replaced = _replace_transformer_layer_attention(mla_layer)
+    _require(replaced, "hybrid MLA layer template has no ordinary MLA attention slot")
+    return replace(
+        stack_spec,
+        module=_preflight_scoped_module(stack_spec.module),
+        params=dict(stack_spec.params),
+        metainfo=dict(stack_spec.metainfo),
+        submodules=replace(stack_submodules, attention_layer=latent_layer),
     )

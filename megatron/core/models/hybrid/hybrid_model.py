@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from contextlib import AbstractContextManager, nullcontext
 from typing import Literal, Optional
 
 from torch import Tensor
@@ -138,6 +137,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "MuP for HybridModel is experimental and not fully validated yet.",
             )
             HybridModel.mup_warning_printed = True
+
+        if config.mla_latent_cp:
+            from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
+
+            hybrid_stack_spec = mla_with_latent_cp.configure_mla_latent_cp_hybrid_stack(
+                hybrid_stack_spec
+            )
 
         self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
@@ -523,22 +529,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.config.moe_n_hash_layers > 0 and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
-        # Share latent-CP preflight only within this decoder forward.
-        preflight_scope: AbstractContextManager[None] = nullcontext()
-        if self.config.mla_latent_cp:
-            from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
-
-            preflight_scope = mla_with_latent_cp.latent_cp_preflight_scope()
-        with preflight_scope:
-            decoder_output = self.decoder(
-                hidden_states=decoder_input,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-                **decoder_extra_block_kwargs,
-            )
+        # Run decoder.
+        decoder_output = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            **decoder_extra_block_kwargs,
+        )
         # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
         # (hidden_states, mhc_multistream) in exactly one case: enable_hyper_connections and
         # post_process and mtp_num_layers > 0 and not is_mtp_layer — where MTP's mHC branch

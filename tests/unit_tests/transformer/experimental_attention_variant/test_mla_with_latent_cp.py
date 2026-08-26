@@ -32,11 +32,7 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.context_parallel_layout.utils import finalize_packed_seq_params
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_layer_specs,
-    get_gpt_layer_local_spec,
-    get_mla_latent_cp_self_attention_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -1187,98 +1183,72 @@ def test_mla_latent_cp_config_validation_is_fail_closed():
         replace(config, attention_backend=AttnBackend.auto)
 
 
-def test_config_drives_gpt_specs_without_mutation():
-    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-        _get_self_attention_module_spec,
+def test_feature_configures_gpt_decoder_without_mutation():
+    from megatron.core.transformer.transformer_block import (
+        TransformerBlock,
+        TransformerBlockSubmodules,
     )
 
-    config = _make_config()
-    latent_attention = get_mla_latent_cp_self_attention_spec(config)
-    assert latent_attention.module is latent_cp.MLAWithLatentCP
-    assert latent_attention.metainfo == {"fuse_input_layernorm": False}
-
-    decoder_layers = get_gpt_decoder_layer_specs(
-        config, use_transformer_engine=torch.cuda.is_available(), normalization=config.normalization
+    base_layer = get_gpt_layer_local_spec(
+        num_experts=None,
+        moe_grouped_gemm=False,
+        qk_layernorm=True,
+        multi_latent_attention=True,
+        normalization="RMSNorm",
     )
-    assert len(decoder_layers) == config.num_layers
-    assert all(
-        layer.submodules.self_attention.module is latent_cp.MLAWithLatentCP
-        for layer in decoder_layers
+    untouched_layer = replace(
+        base_layer,
+        submodules=replace(base_layer.submodules, self_attention=ModuleSpec(module=object)),
+    )
+    block_spec = TransformerBlockSubmodules(layer_specs=[base_layer, untouched_layer])
+    decoder_module, configured = latent_cp.configure_mla_latent_cp_decoder(
+        TransformerBlock, block_spec
     )
 
-    experimental_standard = _get_self_attention_module_spec(config)
-    assert experimental_standard.module is latent_cp.MLAWithLatentCP
+    assert (
+        decoder_module is latent_cp.configure_mla_latent_cp_decoder(TransformerBlock, block_spec)[0]
+    )
+    assert issubclass(decoder_module, TransformerBlock)
+    assert configured is not block_spec
+    assert configured.layer_specs[0] is not base_layer
+    assert configured.layer_specs[0].submodules.self_attention.module is latent_cp.MLAWithLatentCP
+    assert configured.layer_specs[1] is untouched_layer
+    assert base_layer.submodules.self_attention.module is base_mla.MLASelfAttention
 
-    gate_config = _make_config(attention_output_gate=True, gate_granularity="headwise")
-    base_gate = _base_mla_spec().submodules.linear_gate
-    gated_attention = get_mla_latent_cp_self_attention_spec(gate_config)
+    gated_attention = latent_cp.get_mla_with_latent_cp_spec()
     assert gated_attention.module is latent_cp.MLAWithLatentCP
-    assert gated_attention.submodules.linear_gate is base_gate
-    assert _base_mla_spec().submodules.linear_gate is base_gate
+    assert gated_attention.metainfo == {"fuse_input_layernorm": False}
+    assert gated_attention.submodules.linear_gate is latent_cp.ColumnParallelLinear
+
+    class ProbeDecoder(nn.Module):
+        def forward(self):
+            assert latent_cp._LATENT_CP_PREFLIGHT_STATE.get() is not None
+            return "scoped"
+
+    scoped_probe, _ = latent_cp.configure_mla_latent_cp_decoder(ProbeDecoder, base_layer)
+    assert latent_cp._LATENT_CP_PREFLIGHT_STATE.get() is None
+    assert scoped_probe()() == "scoped"
+    assert latent_cp._LATENT_CP_PREFLIGHT_STATE.get() is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_config_drives_hybrid_model_spec_without_mutation():
-    from megatron.core.models.hybrid.hybrid_layer_specs import (
-        hybrid_mla_latent_cp_stack_spec,
-        hybrid_stack_spec,
-    )
+def test_feature_configures_hybrid_stack_without_mutation():
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.attention import SelfAttention
 
-    config = _make_config()
     base_attention = hybrid_stack_spec.submodules.attention_layer
     assert base_attention.submodules.self_attention.module is SelfAttention
-    latent_stack = hybrid_mla_latent_cp_stack_spec(config)
+    latent_stack = latent_cp.configure_mla_latent_cp_hybrid_stack(hybrid_stack_spec)
     assert latent_stack is not hybrid_stack_spec
     assert latent_stack.submodules is not hybrid_stack_spec.submodules
+    assert latent_stack.module is not hybrid_stack_spec.module
+    assert issubclass(latent_stack.module, hybrid_stack_spec.module)
     assert (
         latent_stack.submodules.attention_layer.submodules.self_attention.module
         is latent_cp.MLAWithLatentCP
     )
     assert hybrid_stack_spec.submodules.attention_layer is base_attention
     assert base_attention.submodules.self_attention.module is SelfAttention
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_gpt_model_builder_selects_config_driven_latent_cp_spec():
-    from megatron.training.models.gpt import default_layer_spec
-
-    config = _make_config()
-    gpt_block = ModuleSpec(module=object)
-    gpt_config = SimpleNamespace(transformer=config, restore_modelopt_state=False)
-    with mock.patch(
-        "megatron.training.models.gpt.get_gpt_decoder_block_spec", return_value=gpt_block
-    ) as get_gpt_block:
-        assert default_layer_spec(gpt_config, vp_stage=3) is gpt_block
-    get_gpt_block.assert_called_once_with(
-        config,
-        use_transformer_engine=config.transformer_impl == "transformer_engine",
-        normalization=config.normalization,
-        qk_l2_norm=config.qk_l2_norm,
-        vp_stage=3,
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_hybrid_model_builder_selects_config_driven_latent_cp_spec():
-    from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
-
-    config = _make_config()
-    hybrid_config = HybridModelConfig(transformer=config, vocab_size=128, hybrid_layer_pattern="*")
-    latent_stack = ModuleSpec(module=object)
-    process_groups = SimpleNamespace(pp=object())
-    with (
-        mock.patch(
-            "megatron.training.models.hybrid.hybrid_mla_latent_cp_stack_spec",
-            return_value=latent_stack,
-        ) as get_hybrid_stack,
-        mock.patch("megatron.training.models.hybrid.HybridModel") as hybrid_model,
-    ):
-        HybridModelBuilder(hybrid_config).build_model(
-            process_groups, pre_process=True, post_process=True
-        )
-    get_hybrid_stack.assert_called_once_with(config)
-    assert hybrid_model.call_args.kwargs["hybrid_stack_spec"] is latent_stack
 
 
 def test_qualification_constants_are_exact_and_fail_closed():

@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
-from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -119,6 +118,15 @@ class GPTModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        decoder_module: Any = TransformerBlock
+        if config.mla_latent_cp:
+            from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
+
+            decoder_module, transformer_layer_spec = (
+                mla_with_latent_cp.configure_mla_latent_cp_decoder(
+                    decoder_module, transformer_layer_spec
+                )
+            )
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -230,7 +238,7 @@ class GPTModel(LanguageModule):
         self.rotary_pos_emb_cache = {}
 
         # Transformer.
-        self.decoder = TransformerBlock(
+        self.decoder = decoder_module(
             config=self.config,
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
@@ -609,26 +617,20 @@ class GPTModel(LanguageModule):
         if self.config.moe_n_hash_layers > 0 and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
-        # Share latent-CP preflight only within this decoder forward.
-        preflight_scope: AbstractContextManager[None] = nullcontext()
-        if self.config.mla_latent_cp:
-            from megatron.core.transformer.experimental_attention_variant import mla_with_latent_cp
-
-            preflight_scope = mla_with_latent_cp.latent_cp_preflight_scope()
-        with preflight_scope:
-            decoder_output = self.decoder(
-                hidden_states=decoder_input,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                rotary_pos_cos_sin=rotary_pos_cos_sin,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                padding_mask=padding_mask,
-                **decoder_extra_block_kwargs,
-            )
+        # Run decoder.
+        decoder_output = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            padding_mask=padding_mask,
+            **decoder_extra_block_kwargs,
+        )
         # When mHC + MTP, the decoder returns (contracted, multi-stream).
         # MTP needs multi-stream; lm_head needs contracted.
         if isinstance(decoder_output, tuple):
