@@ -501,6 +501,40 @@ def test_fused_call_row_pin_fails_closed():
         _FUSED_CALL_ROWS.clear()
 
 
+# WORKSPACE NOTE: the cuDNN indexer package carries cross-call state that
+# corrupts a fused call preceded by fused calls of OTHER shapes in the same
+# process (measured: a 1024-row call followed by an 8192-row call corrupts
+# ~100% of the larger call's rows; large-then-small is fine; sync/empty_cache
+# do not help; and a discarded 65536-row priming call did NOT protect an
+# identically-sized subsequent call — CI run 32712450771 — so this is NOT
+# simple capacity sizing). In shared-process CI lanes, other suites' tiny
+# fused calls run before this file (they don't trip the bug themselves: they
+# compare fused output against equally-degenerate references at sub-32 head
+# counts, where the kernel silently returns all-zero scores). The only defense
+# valid under every model of the bug is process isolation:
+# ``test_fused_kernel_suite_isolated`` below re-runs the five fused tests in a
+# fresh subprocess (clean CUDA context, clean kernel-package state), where the
+# in-file ordering — the multi-offset test's 65536-row call first — is
+# sufficient (pinned green standalone on GB200). In-process, those five tests
+# skip unless MCORE_DSA_FUSED_CHILD=1. Production exposure: per-layer call
+# shapes are constant within a run for a fixed capacity (proven by e2e loss
+# parity; the zigzag head and tail calls share one row count), and
+# shape-ALTERNATING regimes have no user-side mitigation — the falsified
+# priming experiment above shows warmup schemes cannot help — so production
+# fails closed until the kernel-side fix: config validation rejects a nonzero
+# ``dsa_cp_balance_min_seqlen`` with the fused backend, and
+# ``cp_balanced_indexer`` pins the per-process fused-call row count, raising
+# on any transition (``test_fused_call_row_pin_fails_closed`` above). To be
+# raised with the kernel owners together with the sub-32-head silent-zero mode.
+_FUSED_ISOLATED_TESTS = (
+    "test_fused_multi_offset_packed_layout",
+    "test_fused_tight_width_smoke",
+    "test_fused_sliced_k_prefix_view_smoke",
+    "test_fused_tight_width_ceiling_smoke",
+    "test_fused_reduced_mq_matches_full_mq",
+)
+_IN_FUSED_CHILD = os.environ.get("MCORE_DSA_FUSED_CHILD") == "1"
+
 _fused_kernel_test = pytest.mark.skipif(
     not torch.cuda.is_available() or not _IN_FUSED_CHILD,
     reason="fused indexer kernel required; runs inside the isolated subprocess "
