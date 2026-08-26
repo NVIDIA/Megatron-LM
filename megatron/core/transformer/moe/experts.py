@@ -1202,6 +1202,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Stack one linear's per-expert MXFP8 weights in canonical layout."""
         linear = getattr(self, linear_name)
         q_list, s_list = [], []
+        source_dtype: torch.dtype | None = None
         for i in range(self.num_local_experts):
             weight = getattr(linear, f'weight{i}')
             if isinstance(weight, MXFP8Tensor):
@@ -1216,11 +1217,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
             validate_mxfp8_tensor(
                 mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
             )
+            if mxfp8.dtype is not None:
+                source_dtype = source_dtype or mxfp8.dtype
+                if mxfp8.dtype != source_dtype:
+                    raise RuntimeError(
+                        f"Conflicting source dtypes for {linear_name} expert weights: "
+                        f"{source_dtype} and {mxfp8.dtype}."
+                    )
             q_list.append(mxfp8.data)
             s_list.append(mxfp8.scale)
         return MXFP8Tensor(
             data=torch.stack(q_list, dim=0).contiguous(),
             scale=torch.stack(s_list, dim=0).contiguous(),
+            dtype=source_dtype,
             backend=backend,
         )
 

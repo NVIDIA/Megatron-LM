@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from megatron.core.resharding.execution import execute_reshard_plan
+from megatron.core.resharding.execution import execute_reshard_plan, refresh_module_caches
 from megatron.core.resharding.utils import ReshardPlan
 from megatron.core.transformer.module import MegatronModule
 
@@ -22,6 +22,15 @@ def test_default_refresh_cache_is_noop():
     module = MegatronModule(config=MagicMock())
 
     assert module.refresh_cache() is None
+
+
+def test_refresh_module_caches_accepts_model_lists():
+    events: list[str] = []
+
+    refresh_module_caches(None)
+    refresh_module_caches([torch.nn.Sequential(_CacheAwareModule(events)), torch.nn.Sequential()])
+
+    assert events == ["refresh"]
 
 
 def test_execute_reshard_plan_refreshes_caches_before_final_sync(monkeypatch):
