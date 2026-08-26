@@ -422,7 +422,11 @@ def test_optional_cases_are_isolated_into_skip_tolerant_suites():
 
 @pytest.mark.parametrize(
     ("capabilities", "expected_profile"),
-    [([(9, 0)] * 8, "standard"), ([(10, 0)] * 4, "blackwell")],
+    [
+        ([(9, 0)] * 8, "standard"),
+        ([(10, 0)] * 4, "blackwell"),
+        ([(10, 3)] * 4, "blackwell"),
+    ],
 )
 def test_default_hardware_detection_selects_supported_profile(
     capabilities, expected_profile

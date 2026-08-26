@@ -197,8 +197,13 @@ def _probe_hardware(torch_module, profile: str) -> HardwareSelection:
     architecture = next(
         (
             name
-            for name, expected_capability in ARCHITECTURE_CAPABILITIES.items()
-            if expected_capability == capability
+            for name, minimum_capability in sorted(
+                ARCHITECTURE_CAPABILITIES.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if capability[0] == minimum_capability[0]
+            and capability >= minimum_capability
         ),
         None,
     )
