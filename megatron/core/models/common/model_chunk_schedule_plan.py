@@ -371,10 +371,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             extra_block_kwargs: Additional keyword arguments for blocks.
             runtime_gather_output: Whether to gather output at runtime.
             loss_mask (torch.Tensor): Used to mask out some portions of the loss
-            mtp_input_mask (torch.Tensor): Boolean mask of shape ``[batch, sequence]``.
-                ``True`` marks a valid MTP conditioning token; ``False`` invalidates that
-                token and any deeper MTP prediction path that crosses it. ``None`` applies
-                no additional conditioning mask.
+            mtp_input_mask (Optional[torch.Tensor]): Tensor of shape ``[batch, sequence]``
+                whose values are converted to booleans. Nonzero/``True`` marks a valid MTP
+                conditioning token; zero/``False`` invalidates that token and any deeper MTP
+                prediction path that crosses it. ``None`` applies no additional conditioning
+                mask.
             output_processor (Callable): Custom postprocess hook to run instead of the
                 default logits/loss path.
             output_processor_context (Any): User-defined context object forwarded to
