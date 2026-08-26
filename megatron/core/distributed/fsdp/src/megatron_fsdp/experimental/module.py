@@ -36,13 +36,6 @@ def _is_in_backward() -> bool:
     return torch._C._current_graph_task_id() != -1
 
 
-def _validate_prefetch_size(prefetch_size: int | None, name: str) -> int | None:
-    """Validate an optional non-negative parameter-element prefetch budget."""
-    if prefetch_size is not None and prefetch_size < 0:
-        raise ValueError(f"{name} must be non-negative, got {prefetch_size}.")
-    return prefetch_size
-
-
 class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
@@ -197,12 +190,16 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
-        self._forward_prefetch_size = _validate_prefetch_size(
-            forward_prefetch_size, "forward_prefetch_size"
-        )
-        self._backward_prefetch_size = _validate_prefetch_size(
-            backward_prefetch_size, "backward_prefetch_size"
-        )
+        if forward_prefetch_size is not None and forward_prefetch_size < 0:
+            raise ValueError(
+                f"forward_prefetch_size must be non-negative, got {forward_prefetch_size}."
+            )
+        if backward_prefetch_size is not None and backward_prefetch_size < 0:
+            raise ValueError(
+                f"backward_prefetch_size must be non-negative, got {backward_prefetch_size}."
+            )
+        self._forward_prefetch_size = forward_prefetch_size
+        self._backward_prefetch_size = backward_prefetch_size
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -374,10 +371,9 @@ class FsdpModule:
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
         next_module = order.next_item(self)
-        if next_module is None or prefetch_size == 0:
-            return
         if prefetch_size is None:
-            next_module._unshard_parameter_groups()
+            if next_module is not None:
+                next_module._unshard_parameter_groups()
             return
 
         prefetched_size = 0

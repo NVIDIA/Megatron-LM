@@ -253,8 +253,6 @@ def test_overlaps_communication_and_compute(
     dist.destroy_process_group(dp_group)
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     """Zero per-module prefetch budgets should launch all-gathers before compute."""
     world_size = distributed_setup.world_size
@@ -267,8 +265,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     dtype = torch.bfloat16
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
-    dp_group = dist.new_group(backend="nccl")
-    mesh = DeviceMesh.from_group(dp_group, device.type)
+    mesh = DeviceMesh.from_group(dist.group.WORLD, device.type)
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     placements = _flat_placements()
@@ -307,5 +304,3 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
         not any(event_groups_overlap(allgather, gemm) for gemm in gemm_groups)
         for allgather in allgather_groups
     ), "All-gathers overlapped GEMM compute despite zero prefetch budgets."
-
-    dist.destroy_process_group(dp_group)
