@@ -36,7 +36,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
       - [Per-microbatch schedule](#per-microbatch-schedule)
       - [Communication volume breakdown](#communication-volume-breakdown)
       - [GTP + NVFP4 (native NVFP4 param)](#gtp--nvfp4-native-nvfp4-param)
-    - [1.4 Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
+    - [1.4 Composability with TP / SP / CP / EP / DDP](#14-composability-with-tp--sp--cp--ep--ddp)
     - [1.5 Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
     - [1.6 Optimizer-agnostic (Adam + Muon)](#16-optimizer-agnostic-adam--muon)
     - [1.7 Scaling](#17-scaling)
@@ -74,6 +74,11 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
       - [Where padding lands](#where-padding-lands)
       - [Why pad this way](#why-pad-this-way)
       - [Trade-off](#trade-off)
+    - [3.8 GTP\_remat + Context Parallelism (CP)](#38-gtp_remat--context-parallelism-cp)
+      - [The weight-sharding group absorbs CP](#the-weight-sharding-group-absorbs-cp)
+      - [Consequence 1: the DDP bucket must skip CP](#consequence-1-the-ddp-bucket-must-skip-cp)
+      - [Consequence 2: checkpoint writer election must exclude CP](#consequence-2-checkpoint-writer-election-must-exclude-cp)
+      - [What this does not change](#what-this-does-not-change)
   - [4. Testing](#4-testing)
 
 ---
@@ -160,7 +165,7 @@ NVFP4 GTP_remat keeps each shard as a native `NVFP4Tensor` and all-gathers it as
 - **`--fp4-param-gather` is mandatory.** Without it NVFP4 GTP falls back to a BF16 all-gather that trips TE's scaling-mode assert (`DELAYED` vs `NVFP4`); `validate_args` enforces it and raises early.
 - **Mixed-precision models (per-layer quant config).** A model may assign recipes per layer — e.g. NVFP4 default, MXFP8 for `mixer.out_proj`, BF16 for attention (`linear_qkv`/`linear_proj`) and latent MLPs. NVFP4 params gather natively as above. **MXFP8 params cannot be native-param-gathered** — the DDP param buffer has no MXFP8 storage remap (`replace_raw_data` is unimplemented for `MXFP8Tensor`, unlike NVFP4's packed-rowwise remap), so they are all-gathered in **BF16** and re-quantized with the layer's **own MXFP8 quantizer** inside the TE backward dgrad path (not the global delayed recipe). BF16-recipe layers gather BF16 unchanged.
 
-### 1.4 Composability with TP / SP / EP / DDP
+### 1.4 Composability with TP / SP / CP / EP / DDP
 
 - **TP** (intra-layer): orthogonal axis — GTP_remat shards `out_features` regardless of TP's parallel mode (column or row). 2D grid naturally formed via `tp_group × gtp_remat_group`.
 
@@ -173,6 +178,7 @@ NVFP4 GTP_remat keeps each shard as a native `NVFP4Tensor` and all-gathers it as
 > | **duplicated** (`fc1_latent_proj`, `fc2_latent_proj`) | none (weight replicated across TP) | `out_features` | GTP_remat only → `out_features/GTP_remat`; full output reconstructed via AG. Requires `--gtp-remat-opt-in-modules moe_latent_proj`. |
 
 - **SP** (sequence-parallel): transparent — GTP_remat operates at weight dim, SP at sequence dim.
+- **CP** (context-parallel): supported, but not transparent — a CP rank produces a partial wgrad for the whole weight, so GTP_remat **absorbs** the CP axis into its own weight-sharding group rather than running beside it. The DDP bucket and the DCP writer election then have to exclude CP to avoid double-counting it. See §3.8.
 - **EP** (MoE): `GroupedLinear` with GTP_remat → each routed expert sharded across `EXPERT_GTP_WEIGHT_REMAT_GROUP`, independent of EP. MoE AllToAll (HybridEP/NVLink) runs independently of GTP_remat AG/RS (NCCL/IB).
 - **DDP**: GTP_remat bypasses autograd's grad accumulator (async RS returns `None`; `_finalize_wgrad` accumulates directly into `main_grad`). DDP registers its grad-ready hook on GTP_remat params via `register_grad_accum_hook` (not autograd's `AccumulateGrad`); GTP_remat invokes it from `_finalize_wgrad` (eager path) and `_CudagraphReplayNode.backward` (captured path) **after** the wgrad lands in `main_grad`, so a bucket's DDP reduce-scatter runs strictly after every GTP_remat param's `{RS → main_grad add}` — never over a stale `main_grad` — and DDP↔GTP_remat NIC deadlock at IB scale is avoided. See §3.2.
 
@@ -845,6 +851,40 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 - **Negligible in the common case, severe in the small-`dim0` one.** That fraction is ~0 when `dim0 ≫ pad_for_alignment × gtp_remat_size`, but Case B's `dim0 = 1` weight pads to 64 rows — **98% (63/64) padding**, with 3 of its 4 per-rank shards pure padding and contributing nothing.
 - **No automatic mitigation.** Choosing `gtp_remat_size` to divide (or nearly divide) a weight's real `dim0` avoids this, but GTP does not warn when it doesn't — it's on the caller to notice.
 - **A bookkeeping tax on every raw-buffer consumer.** Checkpointing, `num_zeros`, and the wgrad ring all have to explicitly account for padding rather than assume a shard's buffer is fully real.
+
+### 3.8 GTP_remat + Context Parallelism (CP)
+
+CP shards activations along the sequence dimension; GTP_remat shards weights along `out_features`. The two are orthogonal in what they cut, but **not** independent in how gradients are reduced — a CP rank computes a partial wgrad for the whole (unsharded-in-sequence) weight, exactly like a DP rank does. GTP_remat therefore absorbs the CP axis rather than running beside it.
+
+#### The weight-sharding group absorbs CP
+
+When both are active, a dense weight's materialization all-gather and wgrad reduce-scatter run over the **merged `cp × gtp_remat` group** (`get_gtp_weight_remat_group_with_cp`, exposed as `pg_collection.cp_gtp_remat`), not over `gtp_remat` alone. A dense weight is thus split into `cp_size × gtp_remat_size` shards, and its RS sums CP's contribution as a side effect of sharding over that axis. `resolve_gtp_remat_group` is the single seam that hands this group to weight-owning modules; when CP is inactive the merged group is an alias of the plain one, so non-CP runs are byte-identical.
+
+Routed-expert weights are unaffected: the expert rank grid has no CP axis to begin with (MoE token dispatch reuses the dense CP group directly), so `expt_gtp_remat` is used as-is.
+
+Rank locality is ordered `tp-cp-gtp_remat-ep-dp-pp`, giving CP higher locality than GTP_remat so the merged group stays contiguous.
+
+The merged group is a distinct communicator with its own NCCL config key, `gtp_remat_cp` (not `gtp_remat`), so it can be tuned separately in `nccl_communicator_config.yaml`. On Blackwell and later, `arguments.py` auto-appends it to `--high-priority-stream-groups` whenever CP and GTP_remat are both active — under CP it, not `gtp_remat`, is the communicator carrying the dense AG/RS traffic.
+
+#### Consequence 1: the DDP bucket must skip CP
+
+Because the GTP reduce-scatter already summed over CP, the ordinary DDP bucket collective must **not** sum it again. GTP-managed dense params are therefore split into their own DDP buffer, flagged by `BufferKey.excludes_cp_from_bucket`, whose bucket collective runs over the CP-free `dp` group (with the matching `1/dp_size` gradient scaling) instead of `dp_cp`. Everything else — plain params, expert params — keeps the usual `dp_cp` bucket.
+
+That flag also drives the optimizer-state layout: `resolve_buffer_dp_world_size` pads and shards such a buffer over `dp_size / cp_size`, so the distributed optimizer's shard boundaries agree with the group DDP actually reduces over.
+
+Both consumers read the CP degree off the param itself — `param.gtp_remat_cp_size`, stamped at GTP wrap time from `gtp_remat_cp_size(pg_collection, is_expert)`. Keeping the fact on the param (rather than threading a `context_parallel_size` argument down through `group_params_for_buffers` and `compute_full_param_layout`) leaves those signatures untouched and makes it impossible for DDP and the optimizer to disagree about whether a buffer excludes CP.
+
+#### Consequence 2: checkpoint writer election must exclude CP
+
+DCP elects one writer per shard among the shard's *true replicas*. Whatever axes the materialization group shards over must be excluded from that election — otherwise CP peers holding **different** shards collide on one `replica_id`, and every other shard is left with no writer at all (surfacing as `Invalid access pattern` / `out of bounds chunk` at save time, not as a silent corruption).
+
+So the replica group is the mirror image of the materialization group: dense weights elect over the CP-free `dp`, routed-expert weights over `expt_dp`. `resolve_gtp_replica_group` is the single seam for this, and `gtp_replica_rank` falls back to the same rule off the MPU globals.
+
+#### What this does not change
+
+- Activation memory and the sequence-dim split are plain CP — GTP_remat adds nothing to the forward-path sequence math.
+- `num_weight_shards` still counts only `tp × gtp_remat`; the CP expansion is internal to the communicator, not a user-facing shard count.
+- No new flag: combining `--context-parallel-size > 1` with GTP_remat is enough.
 
 ## 4. Testing
 

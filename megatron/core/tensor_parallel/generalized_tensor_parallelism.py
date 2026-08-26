@@ -595,16 +595,20 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
 
 
 def _gtp_attach_attrs(
-    gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0, replica_group=None
+    gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0, replica_group=None, cp_size=1
 ):
     """Attach group / gtp_remat_size / routed-expert tags and register in _GTP_PARAMS.
 
     Separate from _gtp_slice_one_param so attrs land on the post-quantize param (when
     quantize fires between slice and attach).
 
-    ``replica_group`` (the caller's gtp_remat-EXCLUDED DP x CP group) is stamped on the param so
+    ``replica_group`` (the caller's gtp_remat-EXCLUDED DP group) is stamped on the param so
     distributed checkpointing can elect a writer without reading the MPU globals; None leaves
     the checkpoint path on its MPU fallback. See :func:`gtp_replica_rank`.
+
+    ``cp_size`` is the CP degree folded into ``gtp_remat_group`` (see
+    :func:`megatron.core.process_groups_config.gtp_remat_cp_size`). Stamped so DDP bucketing and
+    the optimizer layout can see that this weight's own reduce-scatter already summed over CP.
     """
     # DistributedWeight requires implementers stay torch.Tensor subclasses; enforce at construction.
     assert isinstance(gtp_shard, torch.Tensor), (
@@ -619,6 +623,7 @@ def _gtp_attach_attrs(
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+    gtp_shard.gtp_remat_cp_size = cp_size
     if replica_group is not None:
         gtp_shard.gtp_replica_group = replica_group
     global _GTP_PARAMS
@@ -674,12 +679,11 @@ def _gtp_reclass_native_fp8_shard(param):
 
 
 def attach_gtp_to_presharded_module(
-    module, gtp_remat_group, pad_length, is_grouped=False, replica_group=None
+    module, gtp_remat_group, pad_length, is_grouped=False, replica_group=None, cp_size=1
 ):
     """Turn each pre-sharded weight into a GTP param (FP8/BF16) and attach GTP wiring.
 
-    ``replica_group``: the caller's gtp_remat-excluded DP x CP group
-    (see :func:`_gtp_attach_attrs`).
+    ``replica_group`` / ``cp_size``: see :func:`_gtp_attach_attrs`.
     """
     # GTP shards per-expert weight0..weight{num_gemms-1}; a coalesced single weight has no sibling
     # shards to attach, so reject it here (once, at setup) instead of silently attaching nothing.
@@ -710,6 +714,7 @@ def attach_gtp_to_presharded_module(
             is_grouped=is_grouped,
             expert_idx=idx,
             replica_group=replica_group,
+            cp_size=cp_size,
         )
         new_weights.append(gtp_param)
     if is_grouped and new_weights:
@@ -813,7 +818,7 @@ def gtp_native_fp8_load_context(module):
 
 
 def wrap_module_params_gtp(
-    module, weight_names, gtp_remat_group, is_grouped=None, replica_group=None
+    module, weight_names, gtp_remat_group, is_grouped=None, replica_group=None, cp_size=1
 ):
     """Shard and re-register module params as GTPShardedParam (post-init slice).
 
@@ -822,8 +827,7 @@ def wrap_module_params_gtp(
     already-shard-sized (GTP-agnostic init) and wired via :func:`attach_gtp_to_presharded_module`.
     Params that are already GTP are skipped.
 
-    ``replica_group``: the caller's gtp_remat-excluded DP x CP group
-    (see :func:`_gtp_attach_attrs`).
+    ``replica_group`` / ``cp_size``: see :func:`_gtp_attach_attrs`.
     """
     if gtp_remat_group.size() == 1:
         return
@@ -847,6 +851,7 @@ def wrap_module_params_gtp(
             is_grouped=bool(is_grouped),
             expert_idx=idx,
             replica_group=replica_group,
+            cp_size=cp_size,
         )
         # register the newly sharded param back to the module
         module._parameters[name] = gtp_shard
@@ -2652,14 +2657,15 @@ def gtp_replica_rank(param, explicit_group=None):
     """Rank of this process among the true replicas of ``param``'s GTP shard.
 
     The replicas of a GTP shard are the data-parallel peers EXCLUDING the gtp_remat axis
-    (gtp_remat peers hold *different* shards). Electing over a gtp_remat-inclusive group would
-    leave every shard but one without a writer, so the group must be known to exclude it. Which
-    data-parallel axis applies depends on the param: a routed-expert weight (``allreduce=False``)
-    is replicated over EXPERT DP (``expt_dp``), a dense weight over ``dp_cp``. Resolution order:
+    (gtp_remat peers hold *different* shards) -- electing over a gtp_remat-inclusive group would
+    leave every shard but one without a writer. For a dense (non-expert) weight, gtp_remat also
+    spans CP whenever CP is active (see ``get_gtp_weight_remat_group_with_cp``), so the replica
+    group must exclude CP too: dense weights use ``dp``, routed-expert weights (no CP-expanded
+    EGTP axis) use ``expt_dp``. Resolution order:
 
     1. ``explicit_group`` passed by the caller,
     2. ``param.gtp_replica_group``, stamped at wrap time from the caller's collection
-       (``expt_dp`` for expert modules, ``dp_cp`` otherwise),
+       (``expt_dp`` for expert modules, ``dp`` otherwise),
     3. the MPU globals, picking the expert or dense axis by the param's ``allreduce`` tag.
 
     A caller on an explicit process-group grid that never initializes ``parallel_state`` must
@@ -2679,14 +2685,14 @@ def gtp_replica_rank(param, explicit_group=None):
         if not getattr(param, 'allreduce', True):  # routed-expert weight
             return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
         return parallel_state.get_data_parallel_rank(
-            with_context_parallel=True, with_gtp_remat=False
+            with_context_parallel=False, with_gtp_remat=False
         )
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 0  # single-process save: this rank is the only replica.
     raise RuntimeError(
-        "GTP distributed checkpointing needs the gtp_remat-excluded DP x CP group to elect a "
-        "shard writer, but parallel_state is not initialized and the param carries no "
-        "gtp_replica_group. Pass a pg_collection containing `dp_cp` when building the model "
+        "GTP distributed checkpointing needs the gtp_remat-excluded (and, for dense weights, "
+        "CP-excluded) DP group to elect a shard writer, but parallel_state is not initialized "
+        "and the param carries no gtp_replica_group. Pass a pg_collection containing `dp` "
         "(it is stamped onto GTP params at wrap time)."
     )
 
@@ -2709,10 +2715,10 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     so this is zero-cost when GTP is inactive.
 
     ``intra_dp_cp_group`` optionally overrides the replica group behind the replica_ids of the
-    GTP-REPLICATED entries here (bias / extra_state); it must EXCLUDE the gtp_remat axis. Left
-    None, the group is taken from the params themselves. GTP-sharded tensors elect their writer
-    inside :func:`make_tp_sharded_tensor_for_checkpoint`, always off their own stamped group.
-    See :func:`gtp_replica_rank`.
+    GTP-REPLICATED entries here (bias / extra_state); it must exclude the gtp_remat axis (and,
+    for dense weights under CP, CP too -- see :func:`gtp_replica_rank`). Left None, the group is
+    taken from the params themselves. GTP-sharded tensors elect their writer inside
+    :func:`make_tp_sharded_tensor_for_checkpoint`, always off their own stamped group.
     """
     from megatron.core.transformer.utils import (  # noqa: E402
         make_sharded_object_for_checkpoint,

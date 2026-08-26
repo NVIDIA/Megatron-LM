@@ -22,7 +22,12 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    gtp_remat_cp_size,
+    resolve_gtp_remat_group,
+    resolve_gtp_replica_group,
+)
 from megatron.core.utils import (
     divide,
     get_pg_rank,
@@ -379,7 +384,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                replica_group=getattr(pg_collection, "dp_cp", None),
+                replica_group=resolve_gtp_replica_group(pg_collection, is_expert=False),
+                cp_size=gtp_remat_cp_size(pg_collection, is_expert=False),
             )
             self.gtp_remat_size = gtp_remat_group.size()
             # Nothing prefetches embedding — it is head of the UNGRAPHED
@@ -1154,10 +1160,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                # Expert weights replicate over EXPERT dp; dense over dp_cp.
-                replica_group=getattr(
-                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
-                ),
+                replica_group=resolve_gtp_replica_group(pg_collection, self.is_expert),
+                cp_size=gtp_remat_cp_size(pg_collection, self.is_expert),
             )
             self.gtp_remat_size = gtp_remat_group.size()
 
@@ -1526,10 +1530,8 @@ class RowParallelLinear(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                # Expert weights replicate over EXPERT dp; dense over dp_cp.
-                replica_group=getattr(
-                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
-                ),
+                replica_group=resolve_gtp_replica_group(pg_collection, self.is_expert),
+                cp_size=gtp_remat_cp_size(pg_collection, self.is_expert),
             )
             self.gtp_remat_size = gtp_remat_group.size()
 

@@ -137,6 +137,11 @@ class ProcessGroupCollection:
     # _GTP_WEIGHT_REMAT_GROUP
     gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
+    # _GTP_WEIGHT_REMAT_GROUP_WITH_CP — gtp_remat expanded to also span CP; weight
+    # materialization only (see resolve_gtp_remat_group). Identical to ``gtp_remat`` when
+    # CP is inactive.
+    cp_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
+
     # _EXPERT_GTP_WEIGHT_REMAT_GROUP
     expt_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
 
@@ -304,6 +309,9 @@ class ProcessGroupCollection:
             ),
             'gtp_remat': partial(
                 parallel_state.get_gtp_weight_remat_group, check_initialized=False
+            ),
+            'cp_gtp_remat': partial(
+                parallel_state.get_gtp_weight_remat_group_with_cp, check_initialized=False
             ),
             'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False
@@ -699,19 +707,68 @@ def resolve_gtp_remat_group(
     pre-pg_collection callers working — a collection that does carry the field is always
     honored, including when it holds a custom (non-MPU) group.
 
+    For the dense axis, prefers ``cp_gtp_remat`` (gtp_remat expanded to also span CP) over the
+    CP-free ``gtp_remat`` — this is the group weight materialization / wgrad reduce-scatter
+    should use (see get_gtp_weight_remat_group_with_cp). The expert axis has no CP-expanded
+    counterpart: the expert RankGenerator has no CP axis to begin with (MoE token dispatch
+    reuses the dense CP group directly), so ``expt_gtp_remat`` is used as-is.
+
     Args:
         pg_collection: Collection supplied by the caller, or None.
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
     """
-    attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
+    if is_expert:
+        attr, fallback_attr = 'expt_gtp_remat', None
+    else:
+        attr, fallback_attr = 'cp_gtp_remat', 'gtp_remat'
     # `vars()`, not hasattr: __getattr__ makes hasattr always True, so the fallback below
     # would be unreachable.
-    if pg_collection is not None and attr in vars(pg_collection):
-        return getattr(pg_collection, attr)
+    if pg_collection is not None:
+        if attr in vars(pg_collection):
+            return getattr(pg_collection, attr)
+        if fallback_attr is not None and fallback_attr in vars(pg_collection):
+            return getattr(pg_collection, fallback_attr)
     mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=['gtp_remat', 'expt_gtp_remat']
+        required_pgs=['gtp_remat', 'cp_gtp_remat', 'expt_gtp_remat']
     )
     return getattr(mpu_pgs, attr)
+
+
+def gtp_remat_cp_size(pg_collection: Optional["ProcessGroupCollection"], is_expert: bool) -> int:
+    """CP degree folded into the group :func:`resolve_gtp_remat_group` returns (1 if none).
+
+    Stamped onto GTP params at wrap time so downstream consumers (DDP bucketing, optimizer
+    layout) can tell that a weight's own reduce-scatter already summed over CP without being
+    handed the CP size separately. The expert axis never spans CP, hence 1.
+
+    Args:
+        pg_collection: Collection supplied by the caller, or None.
+        is_expert: Whether this is the expert axis.
+    """
+    if is_expert or pg_collection is None:
+        return 1
+    plain = vars(pg_collection).get('gtp_remat')
+    merged = vars(pg_collection).get('cp_gtp_remat')
+    if plain is None or merged is None:
+        return 1
+    return merged.size() // plain.size()
+
+
+def resolve_gtp_replica_group(
+    pg_collection: Optional["ProcessGroupCollection"], is_expert: bool
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Resolve the group over which a GTP shard is truly replicated (checkpoint writer election).
+
+    Counterpart of :func:`resolve_gtp_remat_group`: whatever axes that group shards over must
+    be excluded here. Dense weights therefore use the CP-free ``dp`` (their materialization
+    group spans CP), routed-expert weights use ``expt_dp``. See
+    :func:`megatron.core.tensor_parallel.generalized_tensor_parallelism.gtp_replica_rank`.
+
+    Args:
+        pg_collection: Collection supplied by the caller, or None.
+        is_expert: Select the expert axis (``expt_dp``) instead of the dense one.
+    """
+    return getattr(pg_collection, 'expt_dp' if is_expert else 'dp', None)
 
 
 @dataclass

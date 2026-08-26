@@ -30,6 +30,8 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# GTP_remat weight-sharding group expanded to also span CP -- see get_gtp_weight_remat_group_with_cp.
+_GTP_WEIGHT_REMAT_GROUP_WITH_CP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -946,6 +948,25 @@ def initialize_model_parallel(
             _GTP_WEIGHT_REMAT_GROUP = group
             _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
 
+    # Weight-sharding group expanded to also span CP (see get_gtp_weight_remat_group_with_cp).
+    # Unconditional whenever both axes are active; aliases the plain group otherwise.
+    global _GTP_WEIGHT_REMAT_GROUP_WITH_CP
+    assert (
+        _GTP_WEIGHT_REMAT_GROUP_WITH_CP is None
+    ), "generalized tensor parallel (with CP) group is already initialized"
+    if context_parallel_size > 1 and gtp_remat_size > 1:
+        for gtp_cp_ranks in decoder_rank_generator.get_ranks('cp-gtp_remat'):
+            group = create_group(
+                gtp_cp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("gtp_remat_cp", nccl_comm_cfgs),
+                group_desc="GTP_WEIGHT_REMAT_GROUP_WITH_CP",
+            )
+            if rank in gtp_cp_ranks:
+                _GTP_WEIGHT_REMAT_GROUP_WITH_CP = group
+    else:
+        _GTP_WEIGHT_REMAT_GROUP_WITH_CP = _GTP_WEIGHT_REMAT_GROUP
+
     # Disable Gloo under GTP_remat (out of scope; the GTP_remat optimizer uses DCP).
     if gtp_remat_size > 1:
         create_gloo_process_groups = False
@@ -1716,6 +1737,19 @@ def get_gtp_weight_remat_group(check_initialized=True):
             _GTP_WEIGHT_REMAT_GROUP is not None
         ), "generalized tensor parallel group is not initialized"
     return _GTP_WEIGHT_REMAT_GROUP
+
+
+def get_gtp_weight_remat_group_with_cp(check_initialized=True):
+    """Get the GTP weight-materialization group, expanded to include CP when CP is active.
+
+    Use only for the GTP weight all-gather / wgrad reduce-scatter. Every other caller must stay
+    on the CP-free :func:`get_gtp_weight_remat_group`. Aliases that group when CP is inactive.
+    """
+    if check_initialized:
+        assert (
+            _GTP_WEIGHT_REMAT_GROUP_WITH_CP is not None
+        ), "generalized tensor parallel (with CP) group is not initialized"
+    return _GTP_WEIGHT_REMAT_GROUP_WITH_CP
 
 
 def get_gtp_weight_remat_world_size():
@@ -2526,6 +2560,9 @@ def destroy_model_parallel():
 
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+
+    global _GTP_WEIGHT_REMAT_GROUP_WITH_CP
+    _GTP_WEIGHT_REMAT_GROUP_WITH_CP = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None

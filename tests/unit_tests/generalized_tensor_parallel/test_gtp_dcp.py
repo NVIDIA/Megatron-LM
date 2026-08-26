@@ -1056,6 +1056,217 @@ def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, po
             )
 
 
+def _worker_gtp_cp_writer_election_no_gaps(rank, world_size, port):
+    """Regression test: with context_parallel_size>1 AND gtp_remat_size>1 combined, GTP's own
+    weight-materialization group spans cp*gtp_remat shards (see
+    parallel_state.get_gtp_weight_remat_group_with_cp), so every one of those shards must get
+    exactly one checkpoint writer. Before the fix, gtp_replica_rank's default fallback used a
+    CP-inclusive replica group, so two CP peers holding DISTINCT shards collided on the same
+    replica_id -- half the shards (odd axis_fragmentation indices) got zero writers, raising
+    'Invalid access pattern' at save (this reproduces the embedding.word_embeddings.weight /
+    mixer.out_proj.weight / etc. failures seen with TP1 GTP2 EP2 EGTP1 CP2).
+
+    world=4 -> tp1 * cp2 * gtp2 * dp1: vocab split in 4 (cp*gtp_remat), no replication.
+    """
+    from collections import defaultdict
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+    )
+    gtp_group = ps.get_gtp_weight_remat_group_with_cp()
+    assert gtp_group.size() == 4, f"expected cp(2)*gtp_remat(2)=4, got {gtp_group.size()}"
+
+    full_vocab, hidden = 8, 4
+    per_shard = full_vocab // gtp_group.size()  # 2
+    weight = _make_gtp_shard(full_vocab, hidden, gtp_group)
+    assert weight.shape == (per_shard, hidden)
+
+    st = make_tp_sharded_tensor_for_checkpoint(
+        tensor=weight,
+        key="embedding.word_embeddings.weight",
+        tp_axis=0,
+        allow_shape_mismatch=True,  # how VocabParallelEmbedding calls it
+        prepend_offsets=(),
+        tp_group=ps.get_tensor_model_parallel_group(),
+        dp_cp_group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+    mine = (int(st.global_offset[0]), tuple(st.replica_id))
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, mine)
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    if rank == 0:
+        by_offset = defaultdict(list)
+        for off, rid in gathered:
+            by_offset[off].append(rid)
+        expected_offsets = {i * per_shard for i in range(gtp_group.size())}
+        assert set(by_offset) == expected_offsets, (
+            f"cp*gtp_remat shards must tile with no gaps: {sorted(by_offset)} != "
+            f"{sorted(expected_offsets)}"
+        )
+        for off, rids in by_offset.items():
+            n_writers = sum(is_main_replica(r) for r in rids)
+            assert n_writers == 1, (
+                f"vocab offset {off}: expected exactly 1 checkpoint writer, got {n_writers} "
+                f"(replica_ids {rids}); a CP-inclusive replica group leaves a CP-derived shard "
+                f"with no main-replica writer -> 'Invalid access pattern' at save"
+            )
+
+
+def _worker_vocab_embedding_wiring_no_gaps_under_cp(rank, world_size, port):
+    """Regression test for the actual wiring bug (not just gtp_replica_rank's fallback logic):
+    VocabParallelEmbedding.__init__ (megatron/core/tensor_parallel/layers.py) stamps
+    wrap_module_params_gtp(..., replica_group=pg_collection.dp_cp) -- a real
+    ProcessGroupCollection has both `dp` and `dp_cp` populated, so this bug would NOT be caught
+    by a test that only exercises gtp_replica_rank's no-pg_collection fallback path. Constructs
+    the real module end-to-end (as pretrain_hybrid.py does) and asserts every vocab shard gets
+    exactly one checkpoint writer -- this reproduces the real
+    'embedding.word_embeddings.weight ... Invalid access pattern' failure seen with
+    TP1 GTP2 EP2 EGTP1 CP2.
+    """
+    from collections import defaultdict
+
+    from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'dp', 'dp_cp', 'gtp_remat', 'cp_gtp_remat']
+    )
+    model_parallel_cuda_manual_seed(42)
+    config = TransformerConfig(
+        num_attention_heads=1,
+        num_layers=1,
+        hidden_size=4,
+        params_dtype=torch.bfloat16,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+    )
+    full_vocab, hidden = 8, 4
+    embedding = VocabParallelEmbedding(
+        full_vocab,
+        hidden,
+        init_method=torch.nn.init.zeros_,
+        config=config,
+        pg_collection=pg_collection,
+    ).cuda()
+    assert (
+        embedding.gtp_remat_size == 4
+    ), f"expected cp(2)*gtp_remat(2)=4, got {embedding.gtp_remat_size}"
+    # The CP degree folded into that group is stamped on the param itself, so DDP bucketing and
+    # the optimizer layout can see it without being handed a context_parallel_size.
+    stamped_cp = getattr(embedding.weight, 'gtp_remat_cp_size', 1)
+    assert stamped_cp == 2, f"expected gtp_remat_cp_size=2 stamped on the param, got {stamped_cp}"
+
+    sd = embedding.sharded_state_dict(metadata={'dp_cp_group': pg_collection.dp_cp})
+    st = sd['weight']
+    mine = (int(st.global_offset[0]), tuple(st.replica_id))
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, mine)
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+    GTPShardedParam._chain_state = {}
+
+    if rank == 0:
+        per_shard = full_vocab // embedding.gtp_remat_size
+        by_offset = defaultdict(list)
+        for off, rid in gathered:
+            by_offset[off].append(rid)
+        expected_offsets = {i * per_shard for i in range(embedding.gtp_remat_size)}
+        assert set(by_offset) == expected_offsets, (
+            f"cp*gtp_remat shards must tile with no gaps: {sorted(by_offset)} != "
+            f"{sorted(expected_offsets)}"
+        )
+        for off, rids in by_offset.items():
+            n_writers = sum(is_main_replica(r) for r in rids)
+            assert n_writers == 1, (
+                f"vocab offset {off}: expected exactly 1 checkpoint writer, got {n_writers} "
+                f"(replica_ids {rids}); wrap_module_params_gtp's replica_group is still "
+                f"CP-inclusive -> 'Invalid access pattern' at save"
+            )
+
+
+def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base):
+    """End-to-end DCP save->load of a GTP-sharded weight with CP folded in (real
+    VocabParallelEmbedding, real pg_collection wiring -- not synthetic groups).
+
+    world=4 -> tp1 * cp2 * gtp2 * dp1: 4 shards, each rank's local shard filled with a
+    rank-distinctive value. Verifies every rank's LOADED shard matches its ORIGINAL local
+    value exactly -- i.e. save/load didn't just avoid crashing (test_gtp_cp_writer_election_no_gaps
+    / test_vocab_embedding_wiring_no_gaps_under_cp only check that), but round-tripped the right
+    data to the right rank. Would have caught a variant of the bug where two CP peers' shards
+    swap or one overwrites another instead of one being silently dropped.
+    """
+    from megatron.core.dist_checkpointing import load, save
+    from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+    )
+    try:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'dp', 'dp_cp', 'gtp_remat', 'cp_gtp_remat']
+        )
+        model_parallel_cuda_manual_seed(42)
+        config = TransformerConfig(
+            num_attention_heads=1,
+            num_layers=1,
+            hidden_size=4,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+        full_vocab, hidden = 8, 4
+        embedding = VocabParallelEmbedding(
+            full_vocab,
+            hidden,
+            init_method=torch.nn.init.zeros_,
+            config=config,
+            pg_collection=pg_collection,
+        ).cuda()
+        assert embedding.gtp_remat_size == 4, f"expected cp(2)*gtp_remat(2)=4, {embedding}"
+
+        # Rank-distinctive local shard: if load ever mixes up which rank's data lands where,
+        # this catches it (a uniform-fill weight would not).
+        with torch.no_grad():
+            embedding.weight.copy_(
+                torch.full_like(embedding.weight, fill_value=float(rank), dtype=torch.bfloat16)
+            )
+        original_local = embedding.weight.detach().clone()
+
+        sd = embedding.sharded_state_dict(metadata={'dp_cp_group': pg_collection.dp_cp})
+
+        with TempNamedDir(ckpt_base / 'gtp_cp_sharded_roundtrip', sync=True) as ckpt_dir:
+            save(sd, ckpt_dir)
+            loaded = load(sd, ckpt_dir)
+
+        torch.testing.assert_close(loaded['weight'].cpu(), original_local.cpu(), rtol=0, atol=0)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
 def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     """GTP_remat+Muon ckpt fix: in_proj's gathered+split model entry does NOT id-match the
     per-shard optimizer param, so get_param_id_to_sharded_param_map misses it (the KeyError seen in
@@ -1532,6 +1743,18 @@ class TestGtpDcpHelper:
     def test_embedding_writer_election(self):
         _require_world_size(4)
         _worker_embedding_writer_election_gtp_inclusive_default(dist.get_rank(), 4, None)
+
+    def test_gtp_cp_writer_election_no_gaps(self):
+        _require_world_size(4)
+        _worker_gtp_cp_writer_election_no_gaps(dist.get_rank(), 4, None)
+
+    def test_vocab_embedding_wiring_no_gaps_under_cp(self):
+        _require_world_size(4)
+        _worker_vocab_embedding_wiring_no_gaps_under_cp(dist.get_rank(), 4, None)
+
+    def test_gtp_cp_sharded_save_load_roundtrip(self, tmp_path_dist_ckpt):
+        _require_world_size(4)
+        _worker_gtp_cp_sharded_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
 
     def test_public_wrapper_delegates(self):
         _require_world_size(4)

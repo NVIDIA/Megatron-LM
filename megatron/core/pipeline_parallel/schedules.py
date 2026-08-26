@@ -700,6 +700,9 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     # gtp_remat axis: consumers read these with getattr and silently skip the gtp_remat
     # reduction when absent, so populate them even when GTP_remat is inactive.
     pg_collection.gtp_remat = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    pg_collection.cp_gtp_remat = parallel_state.get_gtp_weight_remat_group_with_cp(
+        check_initialized=False
+    )
     pg_collection.expt_gtp_remat = parallel_state.get_expert_gtp_weight_remat_group(
         check_initialized=False
     )
