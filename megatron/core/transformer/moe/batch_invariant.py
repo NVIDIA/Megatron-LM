@@ -6,6 +6,9 @@ from typing import Optional
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_collective,
+)
 
 
 def build_inverse_permutation_map(
@@ -61,7 +64,20 @@ def unpermute(
     inference NVLS rank-ordered combine.
     """
     input_dtype = permuted_tokens.dtype
-    output_tokens = torch.zeros(restore_shape, dtype=torch.float32, device=permuted_tokens.device)
+    # Mirror the inference engine's summation tree exactly:
+    # - When probs is None the activations were probability-weighted upstream
+    #   (gated/SwiGLU convention) and the engine's within-rank _moe_sum
+    #   accumulates in fp64 with unit weights -> mirror in fp64, round each
+    #   rank partial to fp32 (the engine stores fp32 partials into the RSV
+    #   buffer before the collective).
+    # - The cross-rank stage matches the configured collective: "multimem"
+    #   returns the correctly-rounded exact fp32 sum of the partials (mirror =
+    #   fp64 accumulate, single final rounding); "ordered" is an ascending
+    #   rank-order fp32 chain.
+    within_rank_fp64 = probs is None
+    cross_rank_fp64 = get_batch_invariant_collective() == "multimem"
+    acc_dtype = torch.float64 if cross_rank_fp64 else torch.float32
+    output_tokens = torch.zeros(restore_shape, dtype=acc_dtype, device=permuted_tokens.device)
     ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
     assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
     experts_per_rank = num_experts // ep_size
@@ -69,8 +85,11 @@ def unpermute(
     inverse_experts = inverse_map[1]
     topk = inverse_rows.size(1)
 
+    partial_dtype = torch.float64 if within_rank_fp64 else torch.float32
     for ep_rank in range(ep_size):
-        rank_partial = torch.zeros_like(output_tokens)
+        rank_partial = torch.zeros(
+            restore_shape, dtype=partial_dtype, device=permuted_tokens.device
+        )
         start_expert = ep_rank * experts_per_rank
         end_expert = start_expert + experts_per_rank
 
@@ -80,13 +99,15 @@ def unpermute(
             valid_mask = (row_ids >= 0) & (expert_ids >= start_expert) & (expert_ids < end_expert)
 
             safe_rows = row_ids.clamp_min(0)
-            chunk = permuted_tokens.index_select(0, safe_rows).to(torch.float32)
+            chunk = permuted_tokens.index_select(0, safe_rows).to(partial_dtype)
             if probs is not None:
                 safe_experts = expert_ids.clamp_min(0)
-                chunk = chunk * probs.gather(1, safe_experts.unsqueeze(1)).to(torch.float32)
+                chunk = chunk * probs.gather(1, safe_experts.unsqueeze(1)).to(partial_dtype)
             chunk.masked_fill_(~valid_mask.unsqueeze(-1), 0.0)
             rank_partial += chunk
 
-        output_tokens += rank_partial
+        # The engine stores each rank's partial as fp32 (the RSV buffer dtype)
+        # before the cross-rank reduction; mirror that rounding point.
+        output_tokens += rank_partial.to(torch.float32).to(acc_dtype)
 
-    return output_tokens.to(dtype=input_dtype)
+    return output_tokens.to(torch.float32).to(dtype=input_dtype)

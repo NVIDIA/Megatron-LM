@@ -12,6 +12,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER as _TOKEN_ROUNDER
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -315,7 +316,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     """
 
     DEFAULT_MAX_TOKENS = 16384
-    TOKEN_ROUNDER = 64
+    TOKEN_ROUNDER = _TOKEN_ROUNDER
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
 

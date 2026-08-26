@@ -32,6 +32,19 @@ def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int
         _make_overlap_config(mtp_num_layers)
 
 
+def test_batch_invariant_backend_rejects_unknown_value_at_construction():
+    # Programmatic construction bypasses argparse's Literal choices, so
+    # __post_init__ must catch typos before model init.
+    with pytest.raises(AssertionError, match="Unknown batch_invariant_backend"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te-native",
+        )
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 

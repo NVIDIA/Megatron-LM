@@ -386,6 +386,7 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -448,6 +449,8 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:
+        assert args.refit_method != 'nccl_m2n', 'nccl_m2n is unsupported by the built-in RL loop'
+
         # ----------------------------------------------------------------
         # CUDA graphs
         #
@@ -884,6 +887,14 @@ def validate_args(args, defaults={}):
             f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
             + f"The supported position embedding types are rope and none."
         )
+
+    if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
+        warn_rank_0(
+            "--mtp-hsm needs at least two MTP layers to mix anything, but "
+            f"--mtp-num-layers is {args.mtp_num_layers}. Disabling Hidden State Mixing.",
+            args.rank,
+        )
+        args.mtp_hsm = False
 
     # Validate MTP args for hybrid vs non-hybrid models
     if args.hybrid_layer_pattern is not None:
@@ -1577,6 +1588,21 @@ def validate_args(args, defaults={}):
                 "(MXFP8 params keep their own quantized storage; mapping them into the param "
                 "buffer via replace_raw_data is unsupported)."
             )
+
+        # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
+        # windows), which contradicts --disable-symmetric-registration.
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            assert not getattr(args, 'disable_symmetric_registration', False), (
+                "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
+                "cannot be combined with --disable-symmetric-registration."
+            )
+            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+                print_rank_0(
+                    "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
+                    "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
+                    "symmetric reduce-scatters accumulate in fp32 in-switch "
+                    "(NCCL multimem.ld_reduce .acc::f32)."
+                )
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -2625,11 +2651,13 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
-                       choices=['blockwise', 'duplicated', 'distributed'],
+                       choices=['blockwise', 'duplicated', 'distributed', 'auto'],
                        help='How to perform NS calculation for tensor model parallel weights. '
                        'blockwise orthogonalizes each shard on its own, so the update rule '
                        'depends on the parallelism config; duplicated and distributed both '
-                       'orthogonalize the whole matrix and give TP-invariant results.')
+                       'orthogonalize the whole matrix and give TP-invariant results; auto '
+                       'select between duplicated and distributed mode per-weight for '
+                       'dense weights.')
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the Gram matrix '
                        'in Newton-Schulz iteration.')
@@ -2811,11 +2839,14 @@ def _add_rl_args(parser):
         ),
     )
     group.add_argument('--refit-method', type=str, default='gloo',
-                       choices=['nccl', 'gloo', 'nvshmem'],
-                       help=('Method to refit the model weights between training and inference models during RL. '
-                             'nccl: use NCCLCopyService to refit using NCCL; '
+                       choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem', 'nixl'],
+                       help=('Method to refit model weights. '
+                             'nccl: use NCCLCopyService; '
+                             'nccl_m2n: use the official NCCL M2N API from a non-RL '
+                             'launcher such as the ReFIT benchmark; '
                              'gloo: use GlooCopyService over CPU; '
-                             'nvshmem: use NVSHMEMCopyService to refit using the NVSHMEM.'))
+                             'nvshmem: use NVSHMEMCopyService; '
+                             'nixl: use NixlCopyService.'))
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
@@ -3151,7 +3182,13 @@ def _add_distributed_args(parser):
                        'which is improving the performance of the overlapped computation.')
     group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
-                       'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
+                       'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set. '
+                       'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require symmetric windows.')
+    group.add_argument('--gtp-remat-nccl-ub', action='store_true', dest='gtp_remat_nccl_ub',
+                       default=False, help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
+                       'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).')
+    group.add_argument('--gtp-expert-remat-nccl-ub', action='store_true', dest='gtp_expert_remat_nccl_ub',
+                       default=False, help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')

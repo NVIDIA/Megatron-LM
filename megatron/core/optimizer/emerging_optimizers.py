@@ -174,6 +174,79 @@ _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 # ===========================================================================
 
 
+# tp_mode="auto" selects tp_mode per weight (Dense/GTP weights only)
+_AUTO_TP_MODES = ("duplicated", "distributed")
+
+
+@dataclass(frozen=True)
+class HardwareProfile:
+    """HW spec for different GPU. Use for cost model when selecting TP mode.
+    Bandwidths are UNIDIRECTIONAL."""
+
+    bf16_peak_tflops: float  # dense, fp32_matmul_prec = "medium" for now
+    bw_intra_gbps: float  # collectives staying inside one NVLink domain
+    bw_inter_gbps: float  # collectives crossing domains, over the fabric
+
+
+_PROFILES = {
+    # Keys are matched as a substring of the reported device name ("NVIDIA GB200").
+    # Both bandwidths are PER GPU. Only run on GB200 & GB300 for now.
+    # TODO: May need to add other HW Spec
+    "GB200": HardwareProfile(bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0),
+    "GB300": HardwareProfile(bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0),
+}
+
+
+def _hardware_profile() -> Optional[HardwareProfile]:
+    """Profile for the local GPU, or None when the hardware is not in the registry."""
+    try:
+        name = torch.cuda.get_device_properties(0).name
+    except Exception:  # noqa: BLE001 - no CUDA device: fall back, do not fail
+        return None
+    return next((prof for key, prof in _PROFILES.items() if key in name), None)
+
+
+def _select_tp_mode(
+    m: int,
+    n: int,
+    group_size: int,
+    steps: int,
+    use_syrk: bool,
+    elem_size: int,
+    communication_crosses_domain: bool,
+    profile: Optional[HardwareProfile] = None,
+    candidates: tuple[str, ...] = _AUTO_TP_MODES,
+) -> str:
+    """Cost model for per weight tp_mode selection. Mirrors the op sequence in
+    scaled_orthogonalize_fn_with_gtp_remat -- keep in sync.
+    """
+    min_dim, max_dim = min(m, n), max(m, n)
+    m_partitioned = (
+        m // group_size
+    )  # dist orthogonalizes the [n, m/group_size] shard; transpose is forced
+    gram = 1 if use_syrk else 2  # SYRK halves the two gram ops
+    # Per NS step: gram X@X.T + gram A@A + GEMM B@X.
+    flops = {
+        "duplicated": steps
+        * (gram * (min_dim * min_dim * max_dim + min_dim**3) + 2 * min_dim * min_dim * max_dim),
+        "distributed": steps * (gram * (n * n * m_partitioned + n**3) + 2 * n * n * m_partitioned),
+    }
+    if profile is None:
+        return "duplicated" if communication_crosses_domain else min(candidates, key=flops.get)
+
+    ring_fraction = (
+        group_size - 1
+    ) / group_size  # ring: each rank moves (group_size-1)/group_size of the buffer
+    num_bytes = {
+        "duplicated": m * n * elem_size * ring_fraction,  # one all-gather
+        "distributed": steps * 2 * n * n * elem_size * ring_fraction,  # gram all-reduce per step
+    }
+    bw = (profile.bw_inter_gbps if communication_crosses_domain else profile.bw_intra_gbps) * 1e9
+    peak = profile.bf16_peak_tflops * 1e12
+    cost = {mode: flops[mode] / peak + num_bytes[mode] / bw for mode in candidates}
+    return min(candidates, key=cost.get)
+
+
 class TensorParallelMuon(OrthogonalizedOptimizer):
     """Tensor Parallel Muon optimizer."""
 
@@ -194,7 +267,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
     ) -> None:
         if num_ns_steps < 1:
@@ -210,6 +283,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             grad: torch.Tensor,
             tp_group: torch.distributed.ProcessGroup,
             partition_dim: int | None = None,
+            tp_mode_this_group: str = tp_mode,
         ) -> torch.Tensor:
             log_single_rank(
                 logger,
@@ -230,7 +304,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 coefficient_type=coefficient_type,
                 tp_group=tp_group,
                 partition_dim=partition_dim,
-                tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
+                tp_mode="duplicated" if tp_mode_this_group == "blockwise" else tp_mode_this_group,
                 **ns_kwargs,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
@@ -241,6 +315,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        # For the tp_mode="auto" cost model (_resolve_tp_mode / _select_tp_mode).
+        self.num_ns_steps = num_ns_steps
+        self.use_syrk = use_syrk
+        self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
+        self._tp_mode_cache: Dict[tuple, str] = {}
+        self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -265,17 +345,60 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         torch.distributed.all_gather(shards, t.contiguous(), group)
         return torch.cat(shards, dim=dim)
 
+    @staticmethod
+    def _strip_pad(t, pad_length):
+        """Drop the trailing ``pad_length`` rows of dim 0 (no-op if ``pad_length == 0``)."""
+        return t[:-pad_length] if pad_length else t
+
+    @staticmethod
+    def _restore_pad(t, pad_length):
+        """Re-append ``pad_length`` zero rows to dim 0 (no-op if ``pad_length == 0``)."""
+        return torch.nn.functional.pad(t, (0, 0, 0, pad_length)) if pad_length else t
+
+    def _resolve_tp_mode(self, m: int, n: int, group_size: int) -> str:
+        """Cached per-shape mode for tp_mode="auto", dense (GTP) weights only.
+
+        communication_crosses_domain=False always: this is only called for dense weights
+        (see scaled_orthogonalize_fn_with_gtp_remat), and GTP stays inside one NVLink domain.
+        """
+        key = (m, n, group_size)
+        if key not in self._tp_mode_cache:
+            self._tp_mode_cache[key] = _select_tp_mode(
+                m,
+                n,
+                group_size,
+                self.num_ns_steps,
+                self.use_syrk,
+                self.elem_size,
+                communication_crosses_domain=False,
+                profile=self._hw_profile,
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"muon tp_mode=auto (dense): ({m}, {n}) group_size={group_size} -> "
+                f"{self._tp_mode_cache[key]}",
+            )
+        return self._tp_mode_cache[key]
+
     def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
         """Orthogonalize a (possibly GTP-sharded) momentum, then reshard.
 
         When GTP is inactive this is a plain passthrough to ``scaled_orthogonalize_fn``.
-        Otherwise, ``self.tp_mode`` controls how GTP sharding is handled:
+        Otherwise, ``mode`` (``self.tp_mode``, or resolved per-weight when
+        ``self.tp_mode == "auto"``) controls how GTP sharding is handled:
 
         - **blockwise**: orthogonalize the local GTP shard independently, no collective.
         - **duplicated**: all-gather over GTP, run whole-matrix NS (TP-aware), reshard.
         - **distributed**: distribute NS over GTP via small-Gram all-reduce. When both
           GTP and TP are active, NS is distributed over the larger group to minimize
           redundant compute; the smaller group is all-gathered beforehand.
+
+        GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
+        duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
+        after, since every rank holds a uniform, fully-reconstructed tensor by then.
+        distributed does not: it stays row-sharded through its own collective, where
+        stripping isn't safe (known limitation).
         """
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
@@ -285,31 +408,64 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             else None
         )
 
-        if gtp_remat_group is None or get_pg_size(gtp_remat_group) <= 1:
-            return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
-
         # Parameters with is_gtp_weight_remat=False are not sharded along the
         # GTP process group, and do not require all-gathering prior to
         # orthogonalization.
-        if not getattr(p, 'is_gtp_weight_remat', False):
-            return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+        gtp_active = (
+            gtp_remat_group is not None
+            and get_pg_size(gtp_remat_group) > 1
+            and getattr(p, 'is_gtp_weight_remat', False)
+        )
+        gtp_remat_size = get_pg_size(gtp_remat_group) if gtp_active else 1
 
-        gtp_remat_size = get_pg_size(gtp_remat_group)
+        mode = self.tp_mode
+        if mode == "auto":
+            # Scoped to dense (GTP) weights for now; expert weights keep today's default.
+            mode = (
+                self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
+                if gtp_active and not is_expert
+                else "duplicated"
+            )
 
-        if self.tp_mode == "blockwise":
+        if not gtp_active:
+            return self.scaled_orthogonalize_fn(
+                grad, tp_group, partition_dim, tp_mode_this_group=mode
+            )
+
+        gtp_rank = get_pg_rank(gtp_remat_group)
+        pad_length = getattr(p, 'pad_length', 0)
+
+        if mode == "blockwise":
             # Local block NS on this rank's GTP row-shard (shape [M/gtp_remat_size, K]):
             # partition_dim=None makes scaled_orthogonalize_fn run a plain Newton-Schulz on
-            # the shard with no GTP/TP collective.
-            return self.scaled_orthogonalize_fn(grad, tp_group, None)
+            # the shard with no GTP/TP collective. pad_length can exceed one shard's row
+            # count, so only the overlap between this rank's shard and the trailing padded
+            # rows of the full tensor is this rank's own padding.
+            shard_size = grad.size(0)
+            ranks_from_end = gtp_remat_size - 1 - gtp_rank
+            local_pad_length = min(shard_size, max(0, pad_length - ranks_from_end * shard_size))
+            if local_pad_length == shard_size:
+                # Entirely padding: grad is exact zero, and NS(0) = 0.
+                return torch.zeros_like(grad)
+            result = self.scaled_orthogonalize_fn(
+                self._strip_pad(grad, local_pad_length), tp_group, None, tp_mode_this_group=mode
+            )
+            return self._restore_pad(result, local_pad_length)
 
-        if self.tp_mode == "duplicated":
-            # All-gather the full matrix over GTP (dim 0), orthogonalize the whole tensor
+        if mode == "duplicated":
+            # All-gather over GTP (dim 0), strip/restore padding exactly (every rank now
+            # holds the same padded tensor), orthogonalize the whole matrix
             # (scaled_orthogonalize_fn handles any TP sharding per tp_mode), reshard dim 0.
             gathered_grad = self._all_gather_tensor(grad, gtp_remat_group, 0)
-            gathered_grad = self.scaled_orthogonalize_fn(gathered_grad, tp_group, partition_dim)
-            shard_size = gathered_grad.size(0) // gtp_remat_size
-            gtp_rank = get_pg_rank(gtp_remat_group)
-            return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
+            result = self.scaled_orthogonalize_fn(
+                self._strip_pad(gathered_grad, pad_length),
+                tp_group,
+                partition_dim,
+                tp_mode_this_group=mode,
+            )
+            result = self._restore_pad(result, pad_length)
+            reshard_size = result.size(0) // gtp_remat_size
+            return result[gtp_rank * reshard_size : (gtp_rank + 1) * reshard_size].contiguous()
 
         # distributed: NS via the small-Gram all-reduce (no redundant full-matrix NS).
         # A momentum with both TP and GTP as sharding axes takes two communication steps: an
@@ -317,13 +473,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
         # communication needed. partition_dim is what says whether TP is a sharding axis here,
         # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
+        #
+        # GTP_remat's alignment padding is not corrected for here -- see the class docstring.
         needs_two_step_communication = (
             partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
         )
 
         if not needs_two_step_communication:
             # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
-            return self.scaled_orthogonalize_fn(grad, gtp_remat_group, partition_dim=0)
+            return self.scaled_orthogonalize_fn(
+                grad, gtp_remat_group, partition_dim=0, tp_mode_this_group=mode
+            )
 
         # GTP + TP: distributed NS can only operate over one (group, dim) at a
         # time. Distribute over the larger group so that the NS GEMMs are sharded
@@ -338,7 +498,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             larger_group, larger_dim = tp_group, partition_dim
 
         gathered_grad = self._all_gather_tensor(grad, smaller_group, smaller_dim)
-        orthogonalized_grad = self.scaled_orthogonalize_fn(gathered_grad, larger_group, larger_dim)
+        orthogonalized_grad = self.scaled_orthogonalize_fn(
+            gathered_grad, larger_group, larger_dim, tp_mode_this_group=mode
+        )
         shard_size = orthogonalized_grad.size(smaller_dim) // get_pg_size(smaller_group)
         reshard_rank = get_pg_rank(smaller_group)
         return orthogonalized_grad.narrow(
@@ -431,7 +593,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         scale_mode: The type of scale factor to use for the update.
         extra_scale_factor: The additional scale factor to use for the update.
         pg_collection: Process group collection for distributed training.
-        tp_mode: Tensor parallel mode ("blockwise", "duplicated", or "distributed").
+        tp_mode: Tensor parallel mode ("blockwise", "duplicated", "distributed", or "auto").
         use_syrk: Whether to use the Triton SYRK kernel for the Gram matrix in
             Newton-Schulz. Requires emerging_optimizers >= 0.4.0.
         moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
@@ -456,7 +618,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,

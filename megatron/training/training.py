@@ -2137,6 +2137,13 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
+    if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+        # Deregister the GTP symmetric-memory pools: windows left registered when the
+        # process groups are destroyed make NCCL abort.
+        deregister_and_clear_gtp_symm_pools()
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -2713,7 +2720,11 @@ def setup_model_and_optimizer(
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
     # also covers the config-container builder path, which does not call get_model.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp_api import configure_gtp_remat_from_recipe
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+        from megatron.core.tensor_parallel.gtp_api import (
+            configure_gtp_remat_from_recipe,
+            register_gtp_symm_pool,
+        )
 
         configure_gtp_remat_from_recipe(
             fp4=getattr(args, 'fp4', None) is not None,
@@ -2724,6 +2735,11 @@ def setup_model_and_optimizer(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
         )
+
+        if getattr(args, 'gtp_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+        if getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -3052,14 +3068,26 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # and subsequent param_data zero are baked into the graph and replay
         # unconditionally. We must populate param_data so the replayed AG gathers
         # correct weights, even when forward pre-hooks are disabled.
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+        # A model component's DDP config may differ from the global args. Check the
+        # DistributedOptimizer config that owns the buffers and hooks; non-overlapped
+        # optimizers stage during optimizer.step().
+        optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
+        mxfp8_overlap_optimizers = [
+            optim_instance
+            for optim_instance in optimizer_instances
+            if (
+                isinstance(optim_instance, DistributedOptimizer)
+                and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and optim_instance.ddp_config.overlap_param_gather
+            )
+        ]
+        if mxfp8_overlap_optimizers:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
+                for optim_instance in mxfp8_overlap_optimizers:
+                    optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -5009,13 +5037,11 @@ def train(
         disable_forward_pre_hook(model, optimizer=optimizer)
 
     ft_integration.on_checkpointing_start()
-    # This will finalize all unfinalized async request and terminate a persistent
-    # async worker if persistent ckpt worker is enabled. Exposed TERMINATE cost:
-    # the trainer BLOCKS here until the final async checkpoint is durably written
-    # (the worker drains) -- a defense cost on the exit path that otherwise reads
-    # as dark/unobserved time (it runs after the last iteration, before shutdown).
+    # Finalize all unfinished async requests and terminate the persistent
+    # async worker (if enabled) if the code is meant to exit and not return from this
+    # function.
     with _otel_managed_span('checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True):
-        maybe_finalize_async_save(blocking=True, terminate=True)
+        maybe_finalize_async_save(blocking=True, terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     if args.log_energy:
@@ -5035,6 +5061,13 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+            # Deregister the GTP symmetric-memory pools: windows left registered when the
+            # process groups are destroyed make NCCL abort.
+            deregister_and_clear_gtp_symm_pools()
+
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
