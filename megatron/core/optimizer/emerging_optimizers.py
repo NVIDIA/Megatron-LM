@@ -126,6 +126,56 @@ class EmergingOptimizerEntry:
 def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
     """Instantiate an emerging optimizer and return it with its init_state_fn."""
     entry = _EMERGING_OPTIMIZERS[eopt_name]
+
+    # Hybrid modes: when muon_expert_tp_mode differs from muon_tp_mode, the caller
+    # keeps the dense/expert bucket split (see get_megatron_optimizer's grouping)
+    # and calls this once per bucket, constructing one base optimizer per bucket
+    # under its own mode — e.g. dense on TensorParallelMuon tp_mode='auto' while
+    # expert weights run LayerShardedMuon (where the layer-sharded win
+    # concentrates: many identically shaped matrices per NS home). Both land in
+    # layer_wise_base_results — LayerWiseDistributedOptimizer takes a list of
+    # base optimizers, and its NS-home wiring only touches LayerShardedMuon
+    # instances.
+    if eopt_name == 'muon' and _muon_modes_are_hybrid(config):
+        is_expert_bucket = bool(param_groups) and bool(
+            param_groups[0].get('is_expert_parallel', False)
+        )
+        mode = _muon_expert_tp_mode(config) if is_expert_bucket else getattr(
+            config, 'muon_tp_mode', 'duplicated'
+        )
+        if mode == 'layer_sharded':
+            from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+            eopt_kwargs = _layer_sharded_muon_config_to_kwargs(
+                config, model_chunks, pg_collection
+            )
+            if is_expert_bucket:
+                # Under hybrid modes split-QKV may legitimately be enabled for
+                # the dense (TensorParallelMuon) bucket — QKV weights are dense —
+                # but LayerShardedMuon rejects split_qkv at construction. The
+                # expert bucket never owns QKV weights, so forcing it off here is
+                # semantics-free. (A dense LayerShardedMuon bucket keeps the loud
+                # constructor reject: validate_args already forbids split-QKV
+                # when the dense mode is layer_sharded.)
+                eopt_kwargs['split_qkv'] = False
+                # This instance only ever owns expert groups, so its
+                # constructor-default domain should be the expert one. Per-group
+                # wiring (_wire_layer_sharding_ns_homes) still assigns domains
+                # group by group; this keeps the fallback consistent if wiring
+                # is ever skipped.
+                eopt_kwargs['gtp_remat_group'] = (
+                    getattr(pg_collection, 'expt_gtp_remat', None) if pg_collection else None
+                )
+                eopt_kwargs['tp_group'] = (
+                    getattr(pg_collection, 'expt_tp', None) if pg_collection else None
+                )
+            return LayerShardedMuon(param_groups, **eopt_kwargs), entry.init_state_fn
+        eopt_kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+        # The reflective builder read muon_tp_mode; this bucket's mode may be the
+        # expert override instead.
+        eopt_kwargs['tp_mode'] = mode
+        return TensorParallelMuon(param_groups, **eopt_kwargs), entry.init_state_fn
+
     if entry.config_to_kwargs is not None:
         eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
     else:
@@ -689,7 +739,21 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
 def _is_layer_sharded(config) -> bool:
     """Whether the config selects layer sharding: ``muon_tp_mode='layer_sharded'``
     is a registry-level class selector, not a TensorParallelMuon runtime mode."""
-    return getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded' 
+    return getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded'
+
+
+def _muon_expert_tp_mode(config) -> str:
+    """Effective NS mode for expert-parallel weights: ``muon_expert_tp_mode``
+    when set, otherwise following ``muon_tp_mode``."""
+    return getattr(config, 'muon_expert_tp_mode', None) or getattr(
+        config, 'muon_tp_mode', 'duplicated'
+    )
+
+
+def _muon_modes_are_hybrid(config) -> bool:
+    """Whether dense and expert weights run DIFFERENT NS modes, requiring one
+    base optimizer per (dense, expert) bucket."""
+    return _muon_expert_tp_mode(config) != getattr(config, 'muon_tp_mode', 'duplicated') 
 
 
 def _muon_config_to_cls(config) -> type:

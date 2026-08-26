@@ -66,6 +66,7 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
+    _muon_modes_are_hybrid,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
@@ -825,10 +826,25 @@ def _get_megatron_emerging_optimizer(
     all_param_groups = _get_param_groups(
         model_chunks, config, config_overrides, param_group_process_group
     )
+    # Layer-wise distributed optimizer handles expert params internally so the
+    # expert split is normally collapsed — EXCEPT when the effective expert NS
+    # mode differs from the dense one (muon_expert_tp_mode): the primary
+    # optimizer's dense and expert buckets then deliberately stay separate so
+    # _create_emerging_optimizer can build one base optimizer per bucket under
+    # its own mode (both feed layer_wise_base_results). The split is restricted
+    # to the primary emerging optimizer: scalar (adam/lion) groups keep
+    # collapsing, since the non-emerging fallback path rejects expert-parallel
+    # groups.
+    hybrid_muon_modes = (
+        use_layer_wise and eopt_name == 'muon' and _muon_modes_are_hybrid(config)
+    )
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
-        is_expert = group['is_expert_parallel'] and not use_layer_wise
+        keep_expert_split = not use_layer_wise or (
+            hybrid_muon_modes and opt_name == eopt_name
+        )
+        is_expert = group['is_expert_parallel'] and keep_expert_split
         grouped_param_groups[(opt_name, is_expert)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
