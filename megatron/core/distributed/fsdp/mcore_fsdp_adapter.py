@@ -14,7 +14,7 @@
 
 import logging
 import random
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
 
@@ -30,7 +30,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor.placement_types import Placement
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -551,17 +552,51 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             self.mp_policy,
         )
 
-        dp_group = pg_collection.dp_cp
         device_type = device.type if device is not None else "cuda"
-        dp_mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
+        has_outer_dp_axis = ddp_config.num_distributed_optimizer_instances > 1
+
+        # Expert parameters are ZeRO-3 sharded over the whole expert-DP domain and never
+        # take an outer axis: they are the large ones, so sharding them maximally matters
+        # more than the intra-instance collectives hybrid sharding buys. Dense parameters
+        # are the ones that go hybrid below.
         expert_dp_mesh = None
+        expert_placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
         if config.expert_model_parallel_size > 1:
             expert_dp_mesh = DeviceMesh.from_group(
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
-        placements = Placements(
-            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
-        )
+
+        if has_outer_dp_axis:
+            # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
+            # each axis takes the placements of its own strategy, so no_shard outer over
+            # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
+            dp_mesh = _build_hybrid_dp_mesh(
+                pg_collection.inter_dist_opt,
+                pg_collection.intra_dp_cp,
+                pg_collection.dp_cp,
+                device_type,
+            )
+            outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
+            inner = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
+            placements = Placements(
+                dp_axes=[0, 1],
+                parameter=[outer.parameter, inner.parameter],
+                gradient=[outer.gradient, inner.gradient],
+                optimizer=[outer.optimizer, inner.optimizer],
+            )
+        else:
+            dp_mesh = DeviceMesh.from_group(
+                pg_collection.dp_cp, device_type=device_type, mesh_dim_names=("dp",)
+            )
+            axis = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
+            placements = Placements(
+                dp_axes=[0],
+                parameter=[axis.parameter],
+                gradient=[axis.gradient],
+                optimizer=[axis.optimizer],
+            )
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
@@ -576,7 +611,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
-                            placements=placements,
+                            placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
                         )
@@ -676,8 +711,23 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
             )
-        if ddp_config.outer_dp_sharding_strategy != "no_shard":
-            raise ValueError("MFSDP v2 does not currently support outer DP sharding.")
+        if ddp_config.outer_dp_sharding_strategy not in _DATA_PARALLEL_PLACEMENTS:
+            raise ValueError(
+                "MFSDP v2 supports outer_dp_sharding_strategy in "
+                f"{sorted(_DATA_PARALLEL_PLACEMENTS)}, got "
+                f"{ddp_config.outer_dp_sharding_strategy!r}."
+            )
+        if (
+            ddp_config.outer_dp_sharding_strategy != "no_shard"
+            and ddp_config.num_distributed_optimizer_instances <= 1
+        ):
+            # Without a second instance there is no outer axis for the strategy to apply
+            # to, so honouring it is impossible and ignoring it would be silent.
+            raise ValueError(
+                "MFSDP v2 outer_dp_sharding_strategy="
+                f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
+                "i.e. num_distributed_optimizer_instances > 1."
+            )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
@@ -754,6 +804,69 @@ def FullyShardedDataParallel(
     )
     return fsdp_class(
         config, ddp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
+    )
+
+
+# (parameter, gradient, optimizer) placements for a single mesh axis, per sharding
+# strategy, following the table in src/docs/mfsdp_design.md#sharding-strategies. Each
+# ZeRO level shards one more buffer than the last.
+#
+# Gradients are never replicated: an axis either still holds an unreduced contribution
+# (Partial) or has reduce-scattered it (Shard). The reduce op has to be "avg" to match
+# the partial gradient buffer MFSDP allocates, or a redistribute crosses two mesh axes
+# at once and is rejected.
+#
+# Applying this per axis reproduces the named strategies: HSDP is no_shard outer over
+# ZeRO-3 inner, HFSDP is optim outer over ZeRO-3 inner -- whose optimizer placement is
+# then Shard on both axes, i.e. sharded across the flattened DP domain.
+class _AxisPlacements(NamedTuple):
+    """How one mesh axis places each of MFSDP's three buffers."""
+
+    parameter: Placement
+    gradient: Placement
+    optimizer: Placement
+
+
+_DATA_PARALLEL_PLACEMENTS = {
+    "no_shard": _AxisPlacements(Replicate(), Partial("avg"), Replicate()),  # DDP
+    "optim": _AxisPlacements(Replicate(), Partial("avg"), Shard(0)),  # ZeRO-1
+    "optim_grads": _AxisPlacements(Replicate(), Shard(0), Shard(0)),  # ZeRO-2
+    "optim_grads_params": _AxisPlacements(Shard(0), Shard(0), Shard(0)),  # ZeRO-3
+}
+
+
+def _build_hybrid_dp_mesh(outer_group, inner_group, flat_group, device_type):
+    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain.
+
+    The rank table is derived from the process groups rather than assumed: a rank's
+    position within inner_group is its dp_shard coordinate and its position within
+    outer_group is its dp_outer coordinate, so gathering each rank's inner group over the
+    flattened domain reconstructs the table exactly. Position matters -- it is the mesh
+    coordinate -- so a layout that merely had the right members would still assign shard
+    indices to the wrong ranks.
+    """
+    if outer_group is None or inner_group is None:
+        raise ValueError(
+            "MFSDP v2 with num_distributed_optimizer_instances > 1 requires both the "
+            "inter- and intra-distributed-optimizer process groups."
+        )
+
+    inner_ranks = dist.get_process_group_ranks(inner_group)
+    outer_ranks = dist.get_process_group_ranks(outer_group)
+
+    # Every rank reports the inner group it belongs to. The row at each dp_outer
+    # coordinate is then just the inner group of the rank sitting at that coordinate.
+    flat_ranks = dist.get_process_group_ranks(flat_group)
+    rows: List[List[int]] = [None] * len(flat_ranks)
+    dist.all_gather_object(rows, inner_ranks, group=flat_group)
+    position = {rank: index for index, rank in enumerate(flat_ranks)}
+    layout = [rows[position[rank]] for rank in outer_ranks]
+
+    return DeviceMesh.from_group(
+        [outer_group, inner_group],
+        device_type=device_type,
+        mesh=layout,
+        mesh_dim_names=("dp_outer", "dp_shard"),
     )
 
 
