@@ -26,11 +26,14 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
+    pack_magi_forward_kwargs,
     pack_thd_forward_kwargs,
     set_cross_entropy_fusion,
+    unpack_magi_forward_output,
     unpack_thd_forward_output,
 )
 from megatron.lite.model.qwen3_moe.common import is_expert_param
@@ -89,6 +92,7 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
     deterministic: bool = True
     lora: LoraConfig | dict | None = None
+    attention_backend_override: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +131,23 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen3MoEConfig
 # ---------------------------------------------------------------------------
 
 
+def _model_attention_backend(model: nn.Module) -> str:
+    current = model
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        backend = getattr(current, "attention_backend", None)
+        if backend is not None:
+            return str(backend)
+        current = getattr(current, "module", None)
+    return "te"
+
+
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
-    kwargs = pack_thd_forward_kwargs(model, batch)
+    if _model_attention_backend(model) == "magi":
+        kwargs = pack_magi_forward_kwargs(model, batch)
+    else:
+        kwargs = pack_thd_forward_kwargs(model, batch)
     add_loss_context_kwargs(kwargs, include_return_log_probs=True)
     add_cross_entropy_fusion(kwargs, model)
     return model(**kwargs)
@@ -140,7 +159,29 @@ def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
+    if _model_attention_backend(model) == "magi":
+        return unpack_magi_forward_output(model, batch, output)
     return unpack_thd_forward_output(model, batch, output)
+
+
+def _validate_magi_attention_config(impl_cfg: ImplConfig) -> None:
+    """Validate the magi backend selection against its supported scope.
+
+    MagiAttention has no user-facing tuning knobs: chunk sizing and overlap
+    staging are decided automatically, and any locally calibrated policy
+    belongs in ``resolve_magi_attention_config`` in the backend primitive.
+    """
+    if impl_cfg.attention_backend_override != "magi":
+        return
+    p = impl_cfg.parallel
+    if not impl_cfg.use_thd:
+        raise ValueError("Qwen3-MoE MagiAttention requires use_thd=True.")
+    if p.cp <= 1:
+        raise ValueError("Qwen3-MoE MagiAttention requires context parallel size CP>1.")
+    if p.pp != 1 or p.vpp != 1:
+        raise ValueError("Qwen3-MoE MagiAttention initially supports PP=1 and VPP=1 only.")
+    if impl_cfg.mtp_enable:
+        raise ValueError("Qwen3-MoE MagiAttention does not currently support MTP.")
 
 
 def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -154,6 +195,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    _validate_magi_attention_config(impl_cfg)
 
     # ── override model config from impl_cfg ──
     if impl_cfg.router_aux_loss_coef is not None:
@@ -185,6 +227,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         lora_config=lora_config,
+        attention_backend=("magi" if impl_cfg.attention_backend_override == "magi" else "te"),
     )
 
     vpp = None if p.vpp == 1 else p.vpp

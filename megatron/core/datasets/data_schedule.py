@@ -318,12 +318,10 @@ class DpBalancedScheduler(BasePackingScheduler):
                 ), f"Batch missing required key {key}, provided keys: {batch[0].keys()}"
 
             # Step 3: Strip data fields not needed by this PP stage to avoid
-            # unnecessary all-to-all communication. First PP needs tokens/position_ids,
+            # unnecessary rerouting communication. First PP needs tokens/position_ids,
             # last PP needs labels/loss_mask. MTP stages need all four.
-            # NOTE: this assumes _unpack_batch produces only the six keys below
-            # (tokens, position_ids, labels, loss_mask, original_seq_len,
-            # padded_seq_len). Any custom dataset metadata key outside this set
-            # would be silently dropped here; extend keys_to_keep if needed.
+            # DpBalancedScheduler supports the six fields below. Extend keys_to_keep
+            # and the reroute schema together when adding custom dataset metadata.
             keys_to_keep = {'original_seq_len', 'padded_seq_len'}
             if is_first_pp or mtp_on_this_pp:
                 keys_to_keep.update(['tokens', 'position_ids'])
@@ -355,9 +353,7 @@ class DpBalancedScheduler(BasePackingScheduler):
                 sample_id_groups,
                 offsets,
                 dp_group,
-                tp_group,
                 dp_cp_group,
-                total_dcp_gpus,
             )
 
             dcp_rank = dp_cp_group.rank()
@@ -382,7 +378,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             ) = (None, None, None, None)
 
         # Broadcast to TP group (for non-TP-0 ranks)
-        (num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) = (
+        num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
             broadcast_scalars(
                 [
                     num_micro_batches,

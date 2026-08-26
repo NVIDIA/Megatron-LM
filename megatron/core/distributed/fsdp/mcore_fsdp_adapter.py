@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,17 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _get_default_fsdp_unit_modules(overlap_moe_expert_parallel_comm: bool) -> List[torch.nn.Module]:
+    fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+    if overlap_moe_expert_parallel_comm:
+        return fsdp_unit_modules
+
+    from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+
+    return [*fsdp_unit_modules, MoTTransformerLayer]
 
 
 class FullyShardedDataParallel(_BaseDataParallel):
@@ -160,17 +171,22 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+                self.fsdp_unit_modules = _get_default_fsdp_unit_modules(
+                    config.overlap_moe_expert_parallel_comm
+                )
             else:
                 self.fsdp_unit_modules = []
 
         self._annotate_tensor_parallelism(module)
 
         if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
-                "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
-            )
+            if ddp_config.fsdp_double_buffer:
+                assert ddp_config.fsdp_buffer_count >= 3, (
+                    "1F1B overlap with persistent Megatron-FSDP communication buffers "
+                    "requires fsdp_buffer_count >= 3. A backward/recompute unit, the "
+                    "current forward unit, and its forward-prefetched successor can be "
+                    "live concurrently."
+                )
             assert config.cuda_graph_impl in ("none", "full_iteration"), (
                 "1F1B overlap with FSDP does not support per-layer CUDA graphs "
                 f"(cuda_graph_impl={config.cuda_graph_impl!r}). "

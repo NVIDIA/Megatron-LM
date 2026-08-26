@@ -350,14 +350,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
-            attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
+            attention_layer_map, dsa_layer_map, gdn_layer_map, kda_layer_map, mamba_layer_map = (
                 operator.itemgetter(
-                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
+                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.KDA, Symbols.MAMBA
                 )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
             )
 
             if len(gdn_layer_map) > 0:
                 raise NotImplementedError("GDN layers are not supported for inference.")
+            if len(kda_layer_map) > 0:
+                raise NotImplementedError("KDA layers are not supported for inference.")
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
@@ -384,7 +386,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
-            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -2663,7 +2665,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+        _, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 

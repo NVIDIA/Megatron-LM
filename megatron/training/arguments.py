@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -820,6 +820,8 @@ def validate_args(args, defaults={}):
         args.mtp_hybrid_override_pattern = None
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
 
+    parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+
     if args.hybrid_layer_pattern is not None:
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
@@ -899,9 +901,8 @@ def validate_args(args, defaults={}):
 
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
-        parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
-        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-            inferred_mtp_num_layers = parsed.mtp_num_depths
+        if parsed_hybrid_pattern.mtp_pattern and parsed_hybrid_pattern.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed_hybrid_pattern.mtp_num_depths
             if args.mtp_num_layers is None:
                 args.mtp_num_layers = inferred_mtp_num_layers
             elif args.mtp_num_layers != inferred_mtp_num_layers:
@@ -945,8 +946,13 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    # Infer use of MLA from the parsed main and MTP patterns before config-class selection.
+    if any(
+        symbol in pattern
+        for pattern in (parsed_hybrid_pattern.main_pattern, parsed_hybrid_pattern.mtp_pattern)
+        if pattern is not None
+        for symbol in Symbols.MLA_ATTENTION
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -1859,6 +1865,17 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
 
+        if (
+            args.optimizer == 'muon'
+            and (args.chunked_optimizer_state_offload or args.offload_optimizer_states)
+            and args.optimizer_state_offload_fraction > 0.0
+        ):
+            assert args.use_layer_wise_distributed_optimizer, (
+                "Muon optimizer state offload requires the LayerWise distributed optimizer "
+                "(--use-distributed-optimizer) so non-Muon parameter groups are routed through "
+                "a sibling DistributedOptimizer"
+            )
+
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert (
             not args.use_megatron_fsdp
@@ -2025,16 +2042,44 @@ def validate_args(args, defaults={}):
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
 
-    if args.offload_optimizer_states:
-        assert (
-            args.use_distributed_optimizer
-        ), "offload_optimizer_states is only supported with distributed optimizer"
-        assert (
-            args.optimizer == 'adam'
-        ), "offload_optimizer_states is only supported with adam optimizer"
+    # Optimizer configuration normalizes the deprecated spelling. Include it here so
+    # cross-config validation still runs before that configuration is constructed.
+    if (
+        args.chunked_optimizer_state_offload or args.offload_optimizer_states
+    ) and args.optimizer_state_offload_fraction > 0.0:
+        if args.optimizer_state_offload_chunk_size_mb == 0:
+            warn_rank_0(
+                "optimizer state offload is enabled with chunk size 0, so all "
+                "selected optimizer tensor state is temporarily restored together. Set "
+                "--optimizer-state-offload-chunk-size-mb to a positive value to bound the "
+                "tensor-state GPU window. Selected master weights always use one full "
+                "restore window regardless of chunk size."
+            )
         assert (
             not args.use_megatron_fsdp
-        ), "offload_optimizer_states does not support Megatron-FSDP for now."
+        ), "chunked optimizer state offload does not support Megatron-FSDP"
+        if not args.no_save_optim or not args.no_load_optim:
+            assert args.ckpt_format == 'torch_dist', (
+                "chunked optimizer state offload requires --ckpt-format torch_dist when "
+                "optimizer state is saved or loaded because its sharded load hooks preserve "
+                "CPU canonical storage"
+            )
+        if not args.no_save_optim:
+            assert not args.async_save, (
+                "chunked optimizer state offload does not support --async-save when optimizer "
+                "state is saved because the background writer can retain tensors backed by "
+                "reusable pinned CPU buffers"
+            )
+        assert (
+            args.cuda_graph_impl != 'full_iteration'
+        ), "chunked optimizer state offload does not support full-iteration CUDA graphs"
+        if args.optimizer == 'muon' and args.fp8_param_gather and args.overlap_param_gather:
+            warn_rank_0(
+                "Muon compact FP8 parameter gather with chunked optimizer state offload "
+                "forces LayerWise-owned pre-forward parameter buckets to complete before "
+                "masters are offloaded; sibling DistributedOptimizer gathers and "
+                "optimizer-state transfers remain overlapped."
+            )
 
     if args.non_persistent_ckpt_type == "local":
         assert (
@@ -2234,6 +2279,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         _pat = args.hybrid_layer_pattern
+        _has_kda = Symbols.KDA in _pat
         _has_dsv4_csa = (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
         _has_dsa = Symbols.DS_ATTENTION in _pat
         if getattr(args, 'experimental_attention_variant', None) is None:
@@ -2246,6 +2292,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif _has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
         # Normalize compact and legacy-padded ratios through the shared migration helper.
         _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
 
@@ -3714,7 +3762,8 @@ def _add_training_args(parser):
         '--optimizer-offload-fraction',
         type=float,
         default=1.0,
-        help='Ratio of optimizer state to offload to CPU',
+        help='Fraction used by --optimizer-cpu-offload. This is distinct from '
+        '--optimizer-state-offload-fraction, and the two offload modes are mutually exclusive.',
     )
     group.add_argument(
         '--use-torch-optimizer-for-cpu-offload',
@@ -3748,14 +3797,42 @@ def _add_training_args(parser):
         help='Disable pinning of CPU memory for parameters.',
     )
     group.add_argument(
+        '--chunked-optimizer-state-offload',
+        action='store_true',
+        help='Keep selected optimizer tensor states and master weights in CPU memory between '
+        'updates. GPU tensor-state updates run in bounded chunks, while selected master '
+        'weights use one full restore window.',
+    )
+    group.add_argument(
+        '--optimizer-state-offload-chunk-size-mb',
+        type=int,
+        default=0,
+        help='Target size of each optimizer tensor-state staging buffer in MiB. Two buffers '
+        'can be live for overlap (roughly 2x this value per active offload manager). Zero '
+        'temporarily restores all selected tensor state for one full GPU update. A single '
+        'atomic parameter state may exceed this soft target and is reported at runtime. This '
+        'value does not bound the selected master-weight window, which is always restored in '
+        'full.',
+    )
+    group.add_argument(
+        '--optimizer-state-offload-fraction',
+        type=float,
+        default=1.0,
+        help='Fraction of optimizer parameter bundles to offload. Selected bundles always '
+        'include both tensor state and any separate master weight. This is distinct from '
+        '--optimizer-offload-fraction, which belongs to --optimizer-cpu-offload; the modes are '
+        'mutually exclusive. Zero disables optimizer state offload even when its flag is set.',
+    )
+    group.add_argument(
         '--offload-optimizer-states',
         action='store_true',
         dest='offload_optimizer_states',
-        help='Offload optimizer states to CPU after each optimizer step and '
-        'reload them before the next optimizer step. '
-        'Only support TE FusedAdam optimizer.'
-        'Note that this still uses pure GPU optimizer instead of '
-        'HybridDeviceOptimizer for --optimizer-cpu-offload.',
+        help='Deprecated spelling for --chunked-optimizer-state-offload. It automatically '
+        'enables the replacement; the legacy-equivalent settings are chunk size 0 and offload '
+        'fraction 1.0 unless new tuning arguments are supplied. '
+        'With a nonzero fraction, optimizer-state checkpoint I/O requires --ckpt-format '
+        'torch_dist, optimizer-state saves must be synchronous, and optimizer or full-iteration '
+        'CUDA graphs are unsupported.',
     )
     group.add_argument(
         '--dataloader-type',
@@ -4192,10 +4269,20 @@ def _add_distributed_args(parser):
     group.add_argument(
         '--fsdp-double-buffer',
         action='store_true',
-        help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
-        "Double-buffering the communication memory improves memory management efficiency by "
-        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
-        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+        help="Enable persistent buffer pools for temporary memory needed for Megatron FSDP "
+        "communications. The legacy option name does not fix the pool capacity at two; use "
+        "--fsdp-buffer-count to control it. Persistent communication memory improves memory "
+        "management efficiency by reusing previously allocated buffers. This is required for "
+        "user buffer registration and is enabled automatically when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers in each Megatron FSDP communication pool. "
+        "The default of two provides conventional double buffering; combined 1F1B "
+        "overlap with forward prefetch requires at least three. A non-default value requires "
+        "--fsdp-double-buffer, --use-nccl-ub, or --megatron-fsdp-max-pool-double-buffer.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',
@@ -5013,8 +5100,8 @@ def _add_experimental_args(parser):
         '--hybrid-layer-pattern',
         type=str,
         default=None,
-        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+        help='Specify a hybrid layer pattern using M (mamba), G (gdn), K (kda), '
+        '* (attention), D (dsa), + (mla), - (mlp), E (moe). Use | to define pipeline '
         'stage boundaries for flexible virtual pipeline parallel (fVPP). '
         'Use / to separate MTP patterns. '
         'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '

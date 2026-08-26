@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
 import json
@@ -805,7 +805,7 @@ def get_nvtx_range():
         time: If True, also track with Megatron timers (default: False)
         log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
     """
-    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+    from megatron.core.utils import nvtx_range as core_nvtx_range
 
     @contextmanager
     def nvtx_range(msg, time=False, log_level=1):
@@ -813,10 +813,9 @@ def get_nvtx_range():
             timers = get_timers()
             timers(msg, log_level=log_level).start()
         try:
-            nvtx_range_push(msg)
-            yield
+            with core_nvtx_range(msg):
+                yield
         finally:
-            nvtx_range_pop(msg)
             if time:
                 timers(msg, log_level=log_level).stop()
 

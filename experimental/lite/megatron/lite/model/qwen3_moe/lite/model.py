@@ -126,6 +126,7 @@ class TransformerLayer(nn.Module):
         moe_act_recompute: bool = False,
         use_thd: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        attention_backend: str = "te",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -146,6 +147,7 @@ class TransformerLayer(nn.Module):
             use_thd=use_thd,
             qkv_layout="mcore",
             lora_config=lora_config,
+            attention_backend=attention_backend,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
@@ -361,6 +363,7 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        attention_backend: str = "te",
     ):
         super().__init__()
         self.config = config
@@ -368,6 +371,10 @@ class Qwen3MoEModel(nn.Module):
         self.fp8 = fp8
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
+        # The backend name is the model's entire attention-backend knowledge.
+        # Backend tuning is deliberately not configurable here: policy lives in
+        # the backend primitive (see resolve_magi_attention_config for magi).
+        self.attention_backend = attention_backend
         self._input_tensor: torch.Tensor | None = None
         layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, vpp, vpp_chunk_id)
         self.layer_indices = layout.layer_indices
@@ -395,6 +402,7 @@ class Qwen3MoEModel(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     lora_config=lora_config,
+                    attention_backend=attention_backend,
                 )
                 for idx in self.layer_indices
             ]
@@ -430,6 +438,27 @@ class Qwen3MoEModel(nn.Module):
         self.sp_params: list[nn.Parameter] = []
         if ps.tp_size > 1:
             self.sp_params = _collect_sp_grad_params(self)
+
+    def set_attention_backend(self, attention_backend: str) -> None:
+        """Hot-swap the attention backend on a built model.
+
+        Both backends are parameter-free, so the swap leaves parameters,
+        buffers, and optimizer state untouched: te-trained checkpoints resume
+        under magi and vice versa (only TE's ``_extra_state`` metadata keys
+        follow the te backend). The batch protocol re-reads
+        ``self.attention_backend`` for every microbatch, so the swap takes
+        effect on the next step. Only switch at step boundaries.
+        """
+        if attention_backend == "magi":
+            if self.ps.cp_size <= 1:
+                raise ValueError("MagiAttention requires context parallel size CP>1.")
+            if self.ps.pp_size != 1:
+                raise ValueError("MagiAttention supports PP=1 only.")
+            if self.config.num_nextn_predict_layers > 0:
+                raise ValueError("MagiAttention does not currently support MTP.")
+        for layer in self.layers:
+            layer.attn.set_attention_backend(attention_backend)
+        self.attention_backend = attention_backend
 
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):

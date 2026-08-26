@@ -1,10 +1,11 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -24,7 +25,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
-from megatron.core.tensor_parallel.random import CheckpointManager
+from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import CudaGraphModule
@@ -57,8 +58,10 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    kda_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    mla_layer: Union[ModuleSpec, type] = IdentityOp
     csa_layer: Union[ModuleSpec, type] = IdentityOp
     hca_layer: Union[ModuleSpec, type] = IdentityOp
     window_layer: Union[ModuleSpec, type] = IdentityOp
@@ -115,6 +118,32 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
         super().__init__(config=config)
+        if (
+            config.cuda_graph_impl in ("transformer_engine", "full_iteration")
+            and config.recompute_granularity == "selective"
+            and "mhc" in (config.recompute_modules or [])
+        ):
+            # Warn rather than reject: this combination was constructible before the
+            # attention-only split existed and nothing here is known to be wrong, it
+            # is just unlikely to pay. Under per-layer Transformer Engine capture the
+            # hybrid wrapper captures the mHC producer inside the graph, so that
+            # checkpoint's per-microbatch registration is swallowed and its activation
+            # is not recovered -- the rest of the mHC recompute group sits outside the
+            # graph and still works. The attention-only split, which keeps the producer
+            # eager, exists only on the GPT HyperConnectionTransformerLayer path.
+            # No manual dedup: the default warning filter already reports once per
+            # (message, category, module, lineno), and a module-level latch would
+            # leak across tests.
+            warnings.warn(
+                "mHC selective recompute with CUDA Graphs (cuda_graph_impl="
+                f"{config.cuda_graph_impl!r}) is not validated for HybridStack mHC "
+                "layers: per-layer capture takes the mHC producer with it, and "
+                "full-iteration capture records the recompute itself, so this "
+                "wrapper's aggregate checkpoint is not the saving it is on the GPT "
+                "path. The rest of the recompute group is unaffected.",
+                UserWarning,
+                stacklevel=2,
+            )
         self.inner_layer = layer
         self.layer_number = layer.layer_number
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
@@ -412,6 +441,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             inference_context=inference_context,
             padding_mask=padding_mask,
             input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
         )
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
@@ -636,6 +666,17 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif layer_type == LayerSymbols.MLA:
+                    layer = build_module(
+                        submodules.mla_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 elif layer_type == LayerSymbols.CSA:
                     # DSv4 Compressed Sparse Attention (compress_ratio fixed by the spec).
                     layer = build_module(
@@ -696,6 +737,15 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.KDA:
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -786,11 +836,11 @@ class HybridStack(MegatronModule):
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+    ) -> Tuple[List[Optional[MHCCheckpointManager]], List[bool]]:
         """Pre-build per-layer MHC recompute managers and block-end markers.
 
         The block-end plan is deterministic from config and cached on the
-        instance; only the per-block ``CheckpointManager`` instances are
+        instance; only the per-block ``MHCCheckpointManager`` instances are
         allocated fresh per forward pass (managers are single-use). Mirrors
         the caching scheme used by ``TransformerBlock``.
         """
@@ -802,17 +852,17 @@ class HybridStack(MegatronModule):
             self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
         is_recompute_block_end = self._mhc_block_end_plan
 
-        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
-        mhc_manager = CheckpointManager()
+        layer_managers: List[Optional[MHCCheckpointManager]] = [None] * num_layers
+        mhc_manager = MHCCheckpointManager()
         for l_no in range(num_layers):
             layer_managers[l_no] = mhc_manager
             if is_recompute_block_end[l_no] and l_no != num_layers - 1:
-                mhc_manager = CheckpointManager()
+                mhc_manager = MHCCheckpointManager()
         return layer_managers, is_recompute_block_end
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
-        mhc_manager: Optional[CheckpointManager],
+        mhc_manager: Optional[MHCCheckpointManager],
         hidden_states: Tensor,
         is_last_in_recompute_block: bool,
     ) -> None:
