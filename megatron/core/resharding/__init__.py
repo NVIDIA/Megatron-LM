@@ -9,6 +9,7 @@ from .planner import (
 from .refit import (
     clear_service_cache,
     get_or_create_service,
+    prepare_swap_model_weights,
     reshard_model_weights,
     swap_model_weights,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "execute_reshard_plan",
     "MXFP8ReshardTransform",
     "ReshardTransform",
+    "prepare_swap_model_weights",
     "swap_model_weights",
     "reshard_model_weights",
     "get_or_create_service",

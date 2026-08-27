@@ -18,11 +18,7 @@ from typing import Any, Coroutine, List, Optional, Tuple, Type, Union
 import torch.distributed as dist
 
 from megatron.core.inference.config import InferenceConfig
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.disaggregation.coordinator_setup import (
-    configure_prebuilt_disagg_engine,
-)
-from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -32,9 +28,6 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
 
 
 class _EventLoopManager:
@@ -289,17 +282,14 @@ class _MegatronLLMBase:
                     f"(got EP={ep_size}). Use coordinator mode to handle EP routing."
                 )
 
-        # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
-        engine_cls = DisaggDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
-        inference_config.reserve_recurrent_state_dummy_slot = (
-            engine_cls.requires_recurrent_state_dummy_slot
+        engine = build_dynamic_inference_engine(
+            model=model,
+            tokenizer=tokenizer,
+            inference_config=inference_config,
+            inference_wrapper_cls=inference_wrapper_cls,
         )
-        context = DynamicInferenceContext(model.config, inference_config)
-        wrapper = inference_wrapper_cls(model, context)
-        controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
-        engine = engine_cls(controller=controller, context=context)
-        if disaggregated:
-            configure_prebuilt_disagg_engine(engine)
+        context = engine.context
+        controller = engine.controller
 
         if use_coordinator:
             is_primary_rank = dist.get_rank() == 0

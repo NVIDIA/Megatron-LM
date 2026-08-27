@@ -7,10 +7,13 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.core.inference import shards as shards_module
+from megatron.core.inference.disaggregation.coordinator_setup import validate_disaggregation_shards
 from megatron.core.inference.shards_spec import (
+    InferenceShardAssignment,
     InferenceShardSpec,
     normalize_shard_specs,
     parse_inference_shards_spec,
+    resolve_inference_shard,
 )
 
 
@@ -50,6 +53,40 @@ def test_shard_spec_objects_match_string_parsing():
     # bad role rejected at construction
     with pytest.raises(ValueError):
         InferenceShardSpec(tp=1, role="both")
+
+
+@pytest.mark.parametrize(
+    "rank,index,rank_offset,role",
+    [(0, 0, 0, "prefill"), (1, 0, 0, "prefill"), (2, 1, 2, "decode"), (3, 1, 2, "decode")],
+)
+def test_resolve_inference_shard(rank, index, rank_offset, role):
+    assignment = resolve_inference_shard(
+        "tp=1,dp=2,role=prefill+tp=2,role=decode", world_size=4, rank=rank
+    )
+    assert assignment == InferenceShardAssignment(
+        index=index,
+        spec=InferenceShardSpec(
+            tp=1 if role == "prefill" else 2, dp=2 if role == "prefill" else 1, role=role
+        ),
+        rank_offset=rank_offset,
+        shard_count=2,
+    )
+
+
+@pytest.mark.parametrize("rank", [-1, 4])
+def test_resolve_inference_shard_rejects_out_of_range_rank(rank):
+    with pytest.raises(ValueError, match="rank must be in"):
+        resolve_inference_shard("tp=2+tp=2", world_size=4, rank=rank)
+
+
+def test_validate_disaggregation_shards_owns_role_validation():
+    specs = validate_disaggregation_shards("tp=1,role=prefill+tp=1,role=decode", world_size=2)
+    assert [spec.role for spec in specs] == ["prefill", "decode"]
+
+    with pytest.raises(ValueError, match="every disaggregated shard"):
+        validate_disaggregation_shards("tp=1+tp=1,role=decode", world_size=2)
+    with pytest.raises(ValueError, match="at least one prefill and one decode"):
+        validate_disaggregation_shards("tp=1,role=prefill+tp=1,role=prefill", world_size=2)
 
 
 # --------------------------------------------------------------------------

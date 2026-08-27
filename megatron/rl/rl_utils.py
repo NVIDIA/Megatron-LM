@@ -62,7 +62,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.resharding import prepare_swap_model_weights, swap_model_weights
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
@@ -159,6 +159,12 @@ def refit_inference_model(model, inference_model, args) -> int:
 
     num_dst_pools, dst_pool_index = disagg_refit_pools(
         args.inference_shards, args.world_size
+    )
+    prepare_swap_model_weights(
+        src_model=model,
+        target_model=inference_model,
+        num_dst_pools=num_dst_pools,
+        dst_pool_index=dst_pool_index,
     )
     swap_model_weights(
         model,

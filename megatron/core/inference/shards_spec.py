@@ -66,6 +66,23 @@ class InferenceShardSpec:
         return d
 
 
+@dataclass(frozen=True)
+class InferenceShardAssignment:
+    """Resolved shard membership for one global rank.
+
+    Attributes:
+        index: Zero-based index of the containing shard.
+        spec: Validated specification for the containing shard.
+        rank_offset: First global rank belonging to the shard.
+        shard_count: Total number of shards in the layout.
+    """
+
+    index: int
+    spec: InferenceShardSpec
+    rank_offset: int
+    shard_count: int
+
+
 def normalize_shard_specs(
     shards: Union[str, Sequence["InferenceShardSpec"], Sequence[dict]], world_size: int
 ) -> List["InferenceShardSpec"]:
@@ -80,7 +97,40 @@ def normalize_shard_specs(
     return _finalize_and_validate(out, world_size)
 
 
-def spec_declares_disaggregation(spec_str: str) -> bool:
+def resolve_inference_shard(
+    shards: Union[str, Sequence["InferenceShardSpec"], Sequence[dict]], world_size: int, rank: int
+) -> InferenceShardAssignment:
+    """Resolve a global rank to its shard in a validated layout.
+
+    Args:
+        shards: Any shard layout accepted by :func:`normalize_shard_specs`.
+        world_size: Total number of ranks partitioned by the layout.
+        rank: Global rank to resolve.
+
+    Returns:
+        The rank's shard assignment, including its index and rank offset.
+
+    Raises:
+        ValueError: If ``rank`` is outside ``[0, world_size)``.
+    """
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}); got {rank}")
+
+    specs = normalize_shard_specs(shards, world_size)
+    rank_offset = 0
+    for index, spec in enumerate(specs):
+        if rank < rank_offset + spec.world_size:
+            return InferenceShardAssignment(
+                index=index, spec=spec, rank_offset=rank_offset, shard_count=len(specs)
+            )
+        rank_offset += spec.world_size
+
+    # ``normalize_shard_specs`` guarantees that the specs exactly partition
+    # ``world_size``, so a valid rank must have been found above.
+    raise RuntimeError(f"rank {rank} was not assigned to an inference shard")
+
+
+def spec_declares_disaggregation(spec_str: str | None) -> bool:
     """Whether a shard spec tags any shard with a ``role=`` (prefill/decode).
 
     A role tag is what marks the layout as a prefill->decode handoff rather
@@ -97,7 +147,7 @@ def spec_declares_disaggregation(spec_str: str) -> bool:
     )
 
 
-def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[dict]:
+def parse_inference_shards_spec(spec_str: str, world_size: int) -> List[InferenceShardSpec]:
     """Parse + validate the ``--inference-shards`` string.
 
     Args:

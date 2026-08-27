@@ -3,21 +3,15 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
-from typing import Literal, Optional, Type
+from typing import Literal, Optional
 
 import torch
 
-from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-    GPTInferenceWrapper,
-)
 from megatron.core.inference.quantization.utils import (
     quantize_model_to_mxfp8,
     resolve_mxfp8_backend,
-)
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -381,14 +375,16 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
 
 def get_dynamic_inference_engine(
-    model: Optional[MegatronModule] = None,
-    engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
+    model: MegatronModule | None = None,
+    engine_class: type[DynamicInferenceEngine] | None = None,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 
     Args:
         model: Model to serve. Builds and loads one when omitted.
-        engine_class: Engine implementation to construct.
+        engine_class: Optional engine implementation override. When omitted,
+            the core factory selects the implementation from the inference
+            configuration.
     """
     args = get_args()
     if model is None:
@@ -396,11 +392,6 @@ def get_dynamic_inference_engine(
     tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)
-    inference_config.reserve_recurrent_state_dummy_slot = (
-        engine_class.requires_recurrent_state_dummy_slot
+    return build_dynamic_inference_engine(
+        model=model, tokenizer=tokenizer, inference_config=inference_config, engine_cls=engine_class
     )
-    context = DynamicInferenceContext(model.config, inference_config)
-    inference_wrapped_model = GPTInferenceWrapper(model, context)
-    controller = TextGenerationController(inference_wrapped_model, tokenizer)
-    engine = engine_class(controller, context)
-    return engine

@@ -23,13 +23,12 @@ def mock_pipeline(monkeypatch):
     """Stub out the engine pipeline so the constructor runs without torch/megatron."""
     from megatron.core import parallel_state
 
-    monkeypatch.setattr(base_mod, "DynamicInferenceContext", MagicMock())
-    monkeypatch.setattr(base_mod, "GPTInferenceWrapper", MagicMock())
-    monkeypatch.setattr(base_mod, "TextGenerationController", MagicMock())
-    monkeypatch.setattr(base_mod, "DynamicInferenceEngine", MagicMock())
+    engine = MagicMock()
+    engine.context = MagicMock()
+    engine.controller = MagicMock()
+    monkeypatch.setattr(base_mod, "build_dynamic_inference_engine", MagicMock(return_value=engine))
     # MegatronLLM / MegatronAsyncLLM default their inference_wrapper_cls to
-    # None and resolve to base_mod.GPTInferenceWrapper at call time, so the
-    # base_mod patch above is what steers them at construction time.
+    # None and resolve it in their public modules at call time.
     monkeypatch.setattr(llm_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(async_llm_mod, "GPTInferenceWrapper", MagicMock())
     # Bypass the EP-group initialization assert when no distributed setup

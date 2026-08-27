@@ -11,9 +11,13 @@ Covers:
   replaces a buffer).
 """
 
+from unittest.mock import MagicMock, call
+
+import pytest
 import torch
 import torch.nn as nn
 
+import megatron.core.resharding.refit as refit_module
 from megatron.core.resharding.refit import _PlanCacheKey
 from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
 
@@ -249,6 +253,47 @@ class TestSetupMxfp8TransformOnPlan:
 
         _setup_mxfp8_transform_on_plan(plan, _Model())
         assert plan.transform is sentinel
+
+
+class TestMultiDestinationPreparation:
+    """Every destination pool must have a plan before graph capture."""
+
+    def test_prepares_each_pool_and_only_exposes_local_target(self, monkeypatch):
+        plans = [MagicMock(name="prefill_plan"), MagicMock(name="decode_plan")]
+        unwrap = MagicMock(return_value=("src_core", "dst_core", 8))
+        build_plan = MagicMock(side_effect=plans)
+        setup_transform = MagicMock()
+        monkeypatch.setattr(refit_module, "_unwrap_model_cores", unwrap)
+        monkeypatch.setattr(refit_module, "_build_or_get_plan", build_plan)
+        monkeypatch.setattr(refit_module, "_setup_mxfp8_transform_on_plan", setup_transform)
+
+        refit_module.prepare_swap_model_weights(
+            src_model="training", target_model="inference", num_dst_pools=2, dst_pool_index=1
+        )
+
+        assert unwrap.call_args_list == [call("training", None), call("training", "inference")]
+        assert [invocation.args[-1] for invocation in build_plan.call_args_list] == [0, 1]
+        assert setup_transform.call_args_list == [call(plans[0], None), call(plans[1], "inference")]
+
+    @pytest.mark.parametrize(
+        "num_dst_pools,dst_pool_index", [(0, 0), (-1, 0), (1, -1), (1, 1), (2, 2)]
+    )
+    def test_rejects_invalid_pool_layout(self, num_dst_pools, dst_pool_index):
+        with pytest.raises(ValueError):
+            refit_module.prepare_swap_model_weights(
+                src_model=None,
+                target_model=None,
+                num_dst_pools=num_dst_pools,
+                dst_pool_index=dst_pool_index,
+            )
+        with pytest.raises(ValueError):
+            refit_module.swap_model_weights(
+                src_model=None,
+                target_model=None,
+                refit_method="nccl",
+                num_dst_pools=num_dst_pools,
+                dst_pool_index=dst_pool_index,
+            )
 
 
 class TestRefitTensorCache:

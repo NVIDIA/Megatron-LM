@@ -57,6 +57,30 @@ swap_model_weights(train_model, infer_model, refit_method="nccl")
 # MXFP8 transform is auto-resolved from the cached plan.
 ```
 
+### Multiple destination pools
+
+Disaggregated inference can refit the same training model into multiple
+disjoint destination shards. Every rank participates in one collective pass
+per pool and exposes its target model only during the pass identified by
+`dst_pool_index`. Use the same pool arguments for preparation and transfer so
+each plan, including any MXFP8 transform, is ready before CUDA graph capture:
+
+```python
+prepare_swap_model_weights(
+    src_model=train_model,
+    target_model=local_inference_model,
+    num_dst_pools=2,
+    dst_pool_index=local_pool_index,
+)
+swap_model_weights(
+    train_model,
+    local_inference_model,
+    refit_method="nccl",
+    num_dst_pools=2,
+    dst_pool_index=local_pool_index,
+)
+```
+
 ### Non-collocated (training and inference on disjoint ranks)
 
 ```python

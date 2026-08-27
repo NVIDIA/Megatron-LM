@@ -6,9 +6,9 @@ import copy
 
 import torch.distributed as dist
 
-from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.inference.shards import build_inference_pg_collections_for_shards
 from megatron.core.inference.shards_spec import (
-    parse_inference_shards_spec,
+    resolve_inference_shard,
     spec_declares_disaggregation,
 )
 
@@ -18,27 +18,16 @@ def is_disagg_rollout(args) -> bool:
     return spec_declares_disaggregation(args.inference_shards)
 
 
-def disagg_refit_pools(inference_shards, world_size: int, rank: int | None = None) -> tuple[int, int]:
+def disagg_refit_pools(
+    inference_shards: str | None, world_size: int, rank: int | None = None
+) -> tuple[int, int]:
     """Return the refit pool count and this rank's pool index."""
     if rank is None:
         rank = dist.get_rank()
     if not spec_declares_disaggregation(inference_shards):
         return 1, 0
-    specs = parse_inference_shards_spec(inference_shards, world_size)
-    offset = 0
-    for index, spec in enumerate(specs):
-        if offset <= rank < offset + spec.world_size:
-            return len(specs), index
-        offset += spec.world_size
-    raise RuntimeError(f"rank {rank} not in any disaggregated shard")
-
-
-def _iter_shard_windows(specs, rank):
-    """Yield each shard's rank offset and local-membership flag."""
-    offset = 0
-    for spec in specs:
-        yield offset, spec, (offset <= rank < offset + spec.world_size)
-        offset += spec.world_size
+    assignment = resolve_inference_shard(inference_shards, world_size, rank)
+    return assignment.shard_count, assignment.index
 
 
 def build_disagg_inference_model(
@@ -52,25 +41,19 @@ def build_disagg_inference_model(
     """Build this rank's disaggregated RL inference shard."""
     if not args.inference_dynamic_batching_enable_prefix_caching:
         raise ValueError("disaggregated RL rollouts require prefix caching")
-    rank = dist.get_rank()
-
-    my_pg = None
-    my_spec = None
-    specs = parse_inference_shards_spec(args.inference_shards, args.world_size)
-    for offset, spec, is_local in _iter_shard_windows(specs, rank):
-        pg = build_inference_pg_collection(
-            world_size=spec.world_size,
-            tp_size=spec.tp,
-            pp_size=spec.pp,
-            cp_size=1,
-            ep_size=spec.ep,
-            expt_tp_size=spec.expt_tp,
-            rank_offset=offset,
-            use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+    shards = build_inference_pg_collections_for_shards(
+        total_world_size=args.world_size,
+        shards=args.inference_shards,
+        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+    )
+    local_shards = [shard for shard in shards if shard.pg_collection is not None]
+    if len(local_shards) != 1:
+        raise RuntimeError(
+            f"rank {dist.get_rank()} belongs to {len(local_shards)} inference shards; expected one"
         )
-        if is_local:
-            my_pg, my_spec = pg, spec
-    assert my_pg is not None and my_spec is not None, f"rank {rank} not in any disagg shard window"
+    my_shard = local_shards[0]
+    my_pg = my_shard.pg_collection
+    my_spec = my_shard.spec
 
     # RL inference shards use CP=1.
     cfg = copy.deepcopy(transformer_config)

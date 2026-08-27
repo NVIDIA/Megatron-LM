@@ -4,11 +4,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch.distributed as dist
 
-from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
+from megatron.core.inference.shards_spec import (
+    InferenceShardSpec,
+    normalize_shard_specs,
+    resolve_inference_shard,
+)
 from megatron.core.utils import get_pg_rank
 
 PREFILL = "prefill"
@@ -28,35 +32,45 @@ def _validate_disagg_specs(specs: list[InferenceShardSpec]) -> None:
         raise ValueError("disaggregation needs at least one prefill and one decode shard")
 
 
+def validate_disaggregation_shards(
+    shards: str | Sequence[InferenceShardSpec] | Sequence[dict], world_size: int
+) -> list[InferenceShardSpec]:
+    """Normalize and validate a prefill/decode shard layout.
+
+    Args:
+        shards: Any shard layout accepted by ``normalize_shard_specs``.
+        world_size: Total number of ranks that the shards must partition.
+
+    Returns:
+        The normalized shard specifications.
+
+    Raises:
+        ValueError: If any shard lacks a role or the layout does not contain
+            at least one prefill and one decode shard.
+    """
+    specs = normalize_shard_specs(shards, world_size)
+    _validate_disagg_specs(specs)
+    return specs
+
+
 def configure_prebuilt_disagg_engine(engine: Any) -> None:
     """Configure an engine for coordinator-native disaggregation."""
     shards = engine.context.config.disaggregation_shards
     if shards is None:
         raise ValueError("disaggregation_shards must be configured")
-    specs = normalize_shard_specs(shards, dist.get_world_size())
-    _validate_disagg_specs(specs)
+    specs = validate_disaggregation_shards(shards, dist.get_world_size())
     ctx = engine.context
     # Decode admits imported KV through the prefix cache.
     if not ctx.enable_prefix_caching:
         raise ValueError("disaggregation requires prefix caching")
     rank = dist.get_rank()
-
-    # Shards occupy contiguous world-rank windows.
-    offset = 0
-    my_index = None
-    my_spec = None
-    for shard_index, spec in enumerate(specs):
-        if offset <= rank < offset + spec.world_size:
-            my_index, my_spec = shard_index, spec
-            break
-        offset += spec.world_size
-    assert my_spec is not None, f"rank {rank} not in any disagg shard window"
+    assignment = resolve_inference_shard(specs, dist.get_world_size(), rank)
 
     # Each shard replica needs a distinct coordinator identity.
     dp_rank = get_pg_rank(engine.pg_collection.dp)
     engine.set_disaggregation_config(
-        role=my_spec.role,
-        identity=f"{my_spec.role}_s{my_index}_dp{dp_rank}",
+        role=assignment.spec.role,
+        identity=f"{assignment.spec.role}_s{assignment.index}_dp{dp_rank}",
         spawn_coordinator=(rank == 0),
         coordinator_group=dist.group.WORLD,
     )
