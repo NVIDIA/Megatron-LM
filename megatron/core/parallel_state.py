@@ -2532,6 +2532,15 @@ def destroy_model_parallel() -> None:
     except Exception:  # finalize must never block teardown
         pass
 
+    # Transformer Engine caches its FP8 reduction group globally. Clear the cache while the
+    # communicator still exists so later model-parallel initializations cannot reuse it.
+    try:
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        FP8GlobalStateManager.reset()
+    except (ImportError, ModuleNotFoundError):
+        pass
+
     _destroy_created_process_groups()
 
     global _MODEL_PARALLEL_GROUP
