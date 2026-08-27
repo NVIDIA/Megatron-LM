@@ -72,6 +72,7 @@ def _make_bounded_mxfp8_config(**overrides):
         moe_grouped_gemm=True,
         moe_router_dtype="fp32",
         transformer_impl="inference_optimized",
+        normalization="RMSNorm",
         expert_model_parallel_size=2,
         expert_tensor_parallel_size=1,
         inference_grouped_gemm_backend="flashinfer",
