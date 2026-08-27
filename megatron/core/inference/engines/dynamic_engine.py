@@ -1034,6 +1034,14 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
+            # Expire stale prefix-cache entries before any request is re-added
+            # below, so none of them match state produced by the pre-suspend
+            # weights. Engines driven by a coordinator get their epochs from
+            # SET_GENERATION_EPOCH instead; only count the resume when that
+            # signal is not in play, so a cycle is never counted twice.
+            if self._generation_epoch is None:
+                self.context.advance_prefix_cache_epoch()
+
             capture_time = time.time()
             if (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -3188,6 +3196,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.kv_cache_epoch = [(0, new_generation_epoch)]
                     else:
                         request.kv_cache_epoch.append(boundary)
+            # New weights invalidate cached state produced by the old ones; drop
+            # whatever has now outlived its bounded-staleness lease.
+            self.context.set_prefix_cache_epoch(new_generation_epoch)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

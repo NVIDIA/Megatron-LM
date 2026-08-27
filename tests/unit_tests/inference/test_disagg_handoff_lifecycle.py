@@ -346,7 +346,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     allocator = SimpleNamespace(
-        enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
+        enable_prefix_caching=True, enable_handoff_pinning=False, lease_enabled=False, pool_size=8
     )
     engine.context = SimpleNamespace(
         kv_block_allocator=allocator,
@@ -380,6 +380,14 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         engine.setup_kv_transfer("prefill")
         assert allocator.enable_handoff_pinning
 
+        # Bounded-staleness leases are not coordinated across a handoff pair
+        # yet, so configuring one alongside KV transfer is rejected up front
+        # rather than silently expiring blocks a peer is still reading.
+        allocator.lease_enabled = True
+        for role in ("prefill", "decode"):
+            with pytest.raises(AssertionError, match="does not support prefix cache leases"):
+                engine.setup_kv_transfer(role)
+
 
 def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     class _Backend:
@@ -399,7 +407,10 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(
         kv_block_allocator=SimpleNamespace(
-            enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
+            enable_prefix_caching=True,
+            enable_handoff_pinning=False,
+            lease_enabled=False,
+            pool_size=8,
         ),
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
         is_hybrid_model=True,

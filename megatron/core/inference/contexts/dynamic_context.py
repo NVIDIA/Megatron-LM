@@ -345,6 +345,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # counter is not overloaded with cache-eviction semantics.
         self.prefix_cache_lru_clock = 0
 
+        # Bounded-staleness lease length, in epochs, for cached KV blocks and the
+        # Mamba states hanging off them. 0 disables lease-based eviction.
+        self.prefix_caching_lease_epochs = inference_config.prefix_caching_lease_epochs
+
+        # Epoch counter for bounded staleness. One epoch is one suspend/resume
+        # cycle: in an RL post-training loop the engine suspends so the model
+        # weights can be updated, so cache entries stamped with an older epoch
+        # hold state produced by weights that many updates out of date.
+        self.prefix_cache_epoch = 0
+
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
@@ -656,6 +666,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_limit=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+            prefix_caching_lease_epochs=self.prefix_caching_lease_epochs,
         )
         self.dynamo_helper = DynamoHelper()
         self.kv_block_allocator.add_blocks_deregistered_observer(
@@ -2978,6 +2989,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not preserve_counters:
             self.step_count = 0
             self.prefix_cache_lru_clock = 0
+            # Safe to rewind with the counters: unless the prefix cache is being
+            # preserved, every leased entry is dropped by the reset below.
+            if not preserve_prefix_cache:
+                self.prefix_cache_epoch = 0
 
         # Reset Mamba cache state.
         if not preserve_prefix_cache and self.mamba_slot_allocator is not None:
@@ -3236,6 +3251,50 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_blocks_from_pool, potential_matched_count=potential_matched_count
         )
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
+
+    def set_prefix_cache_epoch(self, epoch: int) -> int:
+        """Move the prefix cache to `epoch` and evict entries whose lease ran out.
+
+        Driven by the engine from the trainer's `SET_GENERATION_EPOCH` control
+        signal, which is the authoritative "the weights just changed" event in
+        an RL post-training loop. Engines that never receive that signal fall
+        back to counting suspend/resume cycles (see `advance_prefix_cache_epoch`).
+
+        Args:
+            epoch: The new generation epoch. Absolute, in whatever units the
+                trainer supplies, so `prefix_caching_lease_epochs` is measured
+                in those same units.
+
+        Returns:
+            Number of blocks expired by the epoch change (0 when leasing is off).
+        """
+        if epoch == self.prefix_cache_epoch:
+            return 0
+        self.prefix_cache_epoch = epoch
+        if not self.enable_prefix_caching:
+            return 0
+        num_expired = self.kv_block_allocator.expire_leased_blocks()
+        if num_expired:
+            logging.info(
+                "Prefix cache: epoch %d expired %d block(s) past their %d-epoch lease.",
+                epoch,
+                num_expired,
+                self.prefix_caching_lease_epochs,
+            )
+        return num_expired
+
+    def advance_prefix_cache_epoch(self) -> int:
+        """Step the prefix cache forward one epoch and evict expired entries.
+
+        Fallback driver for engines that are suspended and resumed directly
+        rather than through a coordinator, so they never receive
+        `SET_GENERATION_EPOCH`. One suspend/resume cycle is treated as one
+        weight update, since that is why an RL trainer suspends the engine.
+
+        Returns:
+            Number of blocks expired by the new epoch (0 when leasing is off).
+        """
+        return self.set_prefix_cache_epoch(self.prefix_cache_epoch + 1)
 
     def _find_kv_match_count(
         self, req: DynamicInferenceRequest, start_block: int, end_block: int

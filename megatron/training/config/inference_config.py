@@ -184,6 +184,13 @@ class InferenceSetupConfig:
     the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
     space is needed."""
 
+    inference_dynamic_batching_prefix_caching_lease_epochs: int = 0
+    """Bounded-staleness lease for cached KV blocks and Mamba states, in generation epochs (one
+    engine suspend/resume cycle, i.e. one model-weight update in an RL post-training loop). A block
+    cached during epoch `e` is evicted once the epoch reaches `e + lease`, because the weights that
+    produced it are that many updates stale. 0 (default) disables lease-based eviction, leaving
+    entries to the configured eviction policy."""
+
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
         "longest_prefix", "first_prefix_block", "load_balanced"
     ] = "load_balanced"
@@ -366,6 +373,9 @@ class InferenceSetupConfig:
             enable_prefix_caching=self.inference_dynamic_batching_enable_prefix_caching,
             prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(
                 self.inference_dynamic_batching_prefix_caching_eviction_policy
+            ),
+            prefix_caching_lease_epochs=(
+                self.inference_dynamic_batching_prefix_caching_lease_epochs
             ),
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
                 self.inference_dynamic_batching_prefix_caching_coordinator_policy
