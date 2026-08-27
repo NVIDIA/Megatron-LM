@@ -56,6 +56,8 @@ class _MoKAutograd(torch.autograd.Function):
             up_forward = prepared_up[:2]
             down_forward = prepared_down[:2]
         else:
+            # BF16 single-weight and all non-single representations are already
+            # directly consumable by MOK; only single-weight MXFP8 needs tuple slicing.
             gate_forward = prepared_gate
             up_forward = prepared_up
             down_forward = prepared_down
