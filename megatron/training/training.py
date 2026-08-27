@@ -5575,7 +5575,7 @@ def train(
         params_norm = None
 
         if args.log_params_norm:
-            params_norm = calc_params_l2_norm(model)
+            params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
