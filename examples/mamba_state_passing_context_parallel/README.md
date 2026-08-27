@@ -86,3 +86,16 @@ RESULT,cp=4,L=32768,batch=1,tp_size=1,path=a2a,mean_ms=...,p50_ms=...,peak_gib=.
 The sequence length must divide the CP size, each rank's local length must be
 even (balanced CP gives each rank two chunks), and each local half must be a
 multiple of the SSD chunk size. The script asserts all three before measuring.
+
+---
+
+## Single-GPU Virtual Shape Kernel Benchmark
+
+To isolate and compare the pure computation kernel latency of `(Batch = B, SeqLen = L)` versus `(Batch = 2*B, SeqLen = L/2)` (the shape used by `virtual` CP mode), run:
+
+```bash
+python examples/mamba_state_passing_context_parallel/benchmark_mamba2_virtual_shape.py
+```
+
+This measures pure kernel execution (Fused Conv1d + SSD Scan, SSD Chunk Scan Only, and Causal Conv1d Only) on a single GPU across various batch sizes and sequence lengths without distributed communication overhead.
+
