@@ -302,12 +302,12 @@ def _build_cp_indexer_layout(
 
 
 # Verified fused-kernel row-limit defect: see FUSED_INDEXER_MAX_SAFE_ROWS in
-# fused_sparse_attention.py (single source of truth; re-exported here for the
+# dsa_fused_safety.py (single source of truth; re-exported here for the
 # balanced-indexer prebuild and tests). Policy at THIS wrapper: the balanced
 # synthetic-layout path fails closed above the limit; ordinary reference calls
 # proceed unchanged — the once-per-process correctness warning fires inside
-# _indexer_topk_core, the shared funnel of every fused caller (SBHD/THD
-# inference, the CP reference path, and fused training Path B included).
+# the CSA _indexer_topk_core funnel. The neighboring DSv3.2 backend applies the
+# same shared warning in dsa_cudnn_kernels before each direct cuDNN invocation.
 
 
 def compute_cp_indexer_topk(
@@ -361,8 +361,8 @@ def compute_cp_indexer_topk(
         #   path (the unfused arm treats layouts as metadata only);
         # - pre-existing callers (reference CP path and non-CP paths) keep their
         #   behavior and proceed fused; the once-per-process high-severity
-        #   correctness warning fires in _indexer_topk_core, the shared funnel
-        #   of every fused caller (so SBHD/non-CP paths are covered too).
+        #   correctness warning fires in the CSA _indexer_topk_core funnel;
+        #   DSv3.2 direct callers are guarded separately in dsa_cudnn_kernels.
         if synthetic_layout:
             raise RuntimeError(
                 f"fused indexer top-k with {int(q_indexer_local.shape[0])} query rows "

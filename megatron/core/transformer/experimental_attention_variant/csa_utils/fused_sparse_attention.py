@@ -30,6 +30,10 @@ import torch
 from torch import Tensor
 
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+    FUSED_INDEXER_MAX_SAFE_ROWS,
+    warn_fused_indexer_row_limit_once,
+)
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
@@ -835,41 +839,8 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
-# Verified defect in the fused indexer kernel package (measured on GB200 with
-# cudnn-frontend 1.26.0; no known-good version demonstrated yet): a fused top-k
-# call with more than this many query rows is silently corrupted from row 32768
-# on unless it is the process's FIRST fused call. The predecessor's shape is
-# irrelevant (a bit-identical predecessor also triggers it) and calls at or
-# below the limit are immune to process history — see the WORKSPACE NOTE in
-# tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py for the
-# controlled matrix and reproducer, and cudnn-frontend PR #410 for a candidate
-# upstream fix. Policy: pre-existing callers keep their behavior and get the
-# once-per-process high-severity warning below; the balanced CP path fails
-# closed instead (see cp_utils.compute_cp_indexer_topk). Do not add a version
-# exemption until a fixed kernel package is demonstrated against the reproducer.
-FUSED_INDEXER_MAX_SAFE_ROWS = 32768
-
-_ROW_LIMIT_WARNED = False
-
-
-def _warn_fused_row_limit_once(total_q: int) -> None:
-    global _ROW_LIMIT_WARNED
-    if _ROW_LIMIT_WARNED:
-        return
-    _ROW_LIMIT_WARNED = True
-    logging.getLogger(__name__).warning(
-        "CORRECTNESS WARNING: fused indexer top-k call with %d query rows exceeds "
-        "%d, the verified-safe limit of the current fused kernel package. On the "
-        "verified stack (GB200, cudnn-frontend 1.26.0) such a call following ANY "
-        "prior fused call silently returns incorrect top-k indices for rows >= "
-        "32768. Upgrade to a backend verified against the reproducer (see the "
-        "WORKSPACE NOTE in tests/unit_tests/transformer/"
-        "test_cp_balanced_indexer_layout.py and cudnn-frontend PR #410), reduce "
-        "rows per call (higher CP degree / smaller pack capacity), or disable the "
-        "fused implementation. Proceeding with the fused call.",
-        total_q,
-        FUSED_INDEXER_MAX_SAFE_ROWS,
-    )
+# The balanced CP path fails closed above the shared limit before reaching this
+# compatibility warning; see cp_utils.compute_cp_indexer_topk.
 
 
 def _indexer_topk_core(
@@ -947,7 +918,7 @@ def _indexer_topk_core(
             # Warn only after validation and backend resolution, immediately before
             # an affected fused invocation. Invalid/no-op calls must not consume the
             # process-wide warning or imply that the kernel actually ran.
-            _warn_fused_row_limit_once(total_q_rows)
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(1), w, ratio=ratio, **forward_kwargs)[
             "scores"
         ]  # (total_q, max_seqlen_kv) fp32, -inf on masked positions
@@ -976,7 +947,7 @@ def _indexer_topk_core(
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
         total_q_rows = int(q.shape[0] * q.shape[1])
         if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
-            _warn_fused_row_limit_once(total_q_rows)
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
             "scores"
         ]  # (b, sq, sk) fp32, -inf on masked positions

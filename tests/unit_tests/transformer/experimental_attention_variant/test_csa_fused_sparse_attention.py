@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from megatron.core.transformer.experimental_attention_variant import dsa_fused_safety
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention as dk,
 )
@@ -71,14 +72,14 @@ def reset_lazy_kernel_state():
     """
     saved_flash = dk._flash_mla_sparse_fwd
     saved_dsa = dk._DSA
-    saved_row_limit_warned = dk._ROW_LIMIT_WARNED
+    saved_row_limit_warned = dsa_fused_safety._ROW_LIMIT_WARNED
     dk._flash_mla_sparse_fwd = None
     dk._DSA = None
-    dk._ROW_LIMIT_WARNED = False
+    dsa_fused_safety._ROW_LIMIT_WARNED = False
     yield
     dk._flash_mla_sparse_fwd = saved_flash
     dk._DSA = saved_dsa
-    dk._ROW_LIMIT_WARNED = saved_row_limit_warned
+    dsa_fused_safety._ROW_LIMIT_WARNED = saved_row_limit_warned
 
 
 def _make_local_idxs(b: int, sq: int, topk: int, *, with_invalid: bool = False) -> torch.Tensor:
@@ -1406,7 +1407,7 @@ def test_fused_row_limit_warns_only_for_launched_calls(
             )
 
     assert not [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
-    assert dk._ROW_LIMIT_WARNED is False
+    assert dsa_fused_safety._ROW_LIMIT_WARNED is False
 
 
 # ---------------------------------------------------------------------------
