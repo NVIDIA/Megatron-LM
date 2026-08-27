@@ -37,24 +37,35 @@ class TestSelectiveStateUpdateInputPurity:
         device = "cuda"
         B, nheads, headdim, dstate, ngroups = 4, 8, 64, 64, 2
         x = torch.randn(B, seq_len, nheads, headdim, device=device)
-        dt = torch.randn(B, seq_len, nheads, device=device).unsqueeze(-1).expand(
-            B, seq_len, nheads, headdim
+        dt = (
+            torch.randn(B, seq_len, nheads, device=device)
+            .unsqueeze(-1)
+            .expand(B, seq_len, nheads, headdim)
         )
-        A = (-torch.rand(nheads, device=device) - 1.0).view(nheads, 1, 1).expand(
-            nheads, headdim, dstate
+        A = (
+            (-torch.rand(nheads, device=device) - 1.0)
+            .view(nheads, 1, 1)
+            .expand(nheads, headdim, dstate)
         )
         Bm = torch.randn(B, seq_len, ngroups, dstate, device=device)
         Cm = torch.randn(B, seq_len, ngroups, dstate, device=device)
         D = torch.randn(nheads, device=device).unsqueeze(-1).expand(nheads, headdim)
-        dt_bias = (torch.rand(nheads, device=device) - 4.0).unsqueeze(-1).expand(
-            nheads, headdim
-        )
+        dt_bias = (torch.rand(nheads, device=device) - 4.0).unsqueeze(-1).expand(nheads, headdim)
         state = torch.randn(B, nheads, headdim, dstate, device=device)
         inputs = {"x": x, "dt": dt, "A": A, "B": Bm, "C": Cm, "D": D, "dt_bias": dt_bias}
         before = {k: v.clone() for k, v in inputs.items()}
 
         selective_state_update(
-            state, x, dt, A, Bm, Cm, D, z=None, dt_bias=dt_bias, dt_softplus=True,
+            state,
+            x,
+            dt,
+            A,
+            Bm,
+            Cm,
+            D,
+            z=None,
+            dt_bias=dt_bias,
+            dt_softplus=True,
             state_batch_indices=torch.arange(B, dtype=torch.int64, device=device),
         )
         torch.cuda.synchronize()
