@@ -213,6 +213,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net_padding.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/test_gated_delta_net_parallel.py]
     products:
       - environment: [lts, dev]
