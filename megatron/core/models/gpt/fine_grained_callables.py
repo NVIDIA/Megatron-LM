@@ -390,14 +390,10 @@ class TransformerLayerNode(ScheduleNode):
             )
 
     def reset_for_recompute(self):
-        """Release the forward activation tensors held by this node while keeping the
-        node reusable for a later recompute forward.
+        """Release this node's forward activations, keeping it reusable for a replay.
 
-        Used by the VPP-stage full recompute path (EP A2A overlap): after the initial
-        (no-grad) forward, the layer node's activation tensors are freed so that only
-        the stage input tensor survives the forward->backward gap. The same node
-        object is later re-run (with grad enabled) to rebuild ``inputs``/``output``/
-        ``detached`` before the backward pass.
+        Under full recompute only each segment's input survives the forward->backward
+        gap; the same node is later re-run with grad enabled to rebuild its state.
         """
         self.inputs = None
         self.output = None
@@ -634,10 +630,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             layer.set_te_cuda_graph_backward_dw_wrapper()
             # The fine-grained schedule calls _te_cuda_graph_replay directly,
             # bypassing TransformerLayer.__call__ where _mhc_recompute_manager is
-            # normally set. Thread it here so the attention-only split replay can
-            # bind its fixed-address recompute arena slot (see
-            # HyperConnectionTransformerLayer._te_cuda_graph_replay_mhc_attention_split_overlap).
-            if is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
+            # normally set. Thread it here for every hyper-connection layer: the
+            # split replay binds its fixed-address arena slot through it, and the
+            # non-split overlap replay registers its MLP-side mHC checkpoints
+            # through it. Without mHC recompute the manager is None and the
+            # assignment is a no-op, matching __call__'s pop default.
+            if is_hyper_connection_layer:
                 layer._mhc_recompute_manager = mhc_recompute_manager
             forward_func = layer._te_cuda_graph_replay
         else:
@@ -740,17 +738,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
         ):
             forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-        elif is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
-            # The attention-only split replay runs the MoE routing tail itself, so
-            # it needs the padding_mask that the eager branch above reads straight
-            # off node.chunk_state; without it the graphed path routes as if the
-            # batch were unpadded. The guard is the split predicate, not merely
-            # "hyper-connection layer": hyper connections with TE attention graphs
-            # but without mHC recompute are a supported configuration, and they
-            # fall through to GraphableMegatronModule._te_cuda_graph_replay, which
-            # copies **kwargs straight to TE. padding_mask only enters sample_kwargs
-            # on the THD path, so on SBHD it was never a capture-time argument and
-            # passing it breaks replay -- including when it is None.
+        elif is_hyper_connection_layer:
+            # Replay paths that run the MoE routing tail themselves -- the split
+            # (dense and overlap variants) and the non-split overlap branch --
+            # need the padding_mask the eager branch above reads straight off
+            # node.chunk_state; without it the graphed path routes as if the
+            # batch were unpadded. It must never reach TE, though: padding_mask
+            # only enters sample_kwargs on the THD path, so on SBHD it was never
+            # a capture-time argument and forwarding it breaks replay, None
+            # included -- on THD it IS a captured kwarg and must stay in kwargs,
+            # while on SBHD TE reads only the keys it captured and ignores the
+            # rest, so leaving it in kwargs is safe on both layouts.
             forward_kwargs["padding_mask"] = node.chunk_state.padding_mask
         forward_outputs = forward_func(**forward_kwargs)
         if is_mhc_layer:

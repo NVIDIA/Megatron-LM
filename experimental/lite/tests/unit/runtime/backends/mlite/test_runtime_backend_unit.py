@@ -179,6 +179,7 @@ def test_build_impl_cfg_preserves_explicit_impl_hf_path():
         ("fused", ("0", "1", "0")),
         ("unfused", ("0", "0", "1")),
         ("local", ("0", "0", "0")),
+        ("magi", ("1", "1", "1")),
     ],
 )
 def test_attention_backend_override_sets_expected_env(monkeypatch, backend, expected):

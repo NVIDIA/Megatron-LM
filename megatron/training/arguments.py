@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -820,6 +820,8 @@ def validate_args(args, defaults={}):
         args.mtp_hybrid_override_pattern = None
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
 
+    parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+
     if args.hybrid_layer_pattern is not None:
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
@@ -899,9 +901,8 @@ def validate_args(args, defaults={}):
 
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
-        parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
-        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-            inferred_mtp_num_layers = parsed.mtp_num_depths
+        if parsed_hybrid_pattern.mtp_pattern and parsed_hybrid_pattern.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed_hybrid_pattern.mtp_num_depths
             if args.mtp_num_layers is None:
                 args.mtp_num_layers = inferred_mtp_num_layers
             elif args.mtp_num_layers != inferred_mtp_num_layers:
@@ -945,8 +946,13 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    # Infer use of MLA from the parsed main and MTP patterns before config-class selection.
+    if any(
+        symbol in pattern
+        for pattern in (parsed_hybrid_pattern.main_pattern, parsed_hybrid_pattern.mtp_pattern)
+        if pattern is not None
+        for symbol in Symbols.MLA_ATTENTION
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -2273,6 +2279,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         _pat = args.hybrid_layer_pattern
+        _has_kda = Symbols.KDA in _pat
         _has_dsv4_csa = (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
         _has_dsa = Symbols.DS_ATTENTION in _pat
         if getattr(args, 'experimental_attention_variant', None) is None:
@@ -2285,6 +2292,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif _has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
         # Normalize compact and legacy-padded ratios through the shared migration helper.
         _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
 
@@ -4260,10 +4269,20 @@ def _add_distributed_args(parser):
     group.add_argument(
         '--fsdp-double-buffer',
         action='store_true',
-        help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
-        "Double-buffering the communication memory improves memory management efficiency by "
-        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
-        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+        help="Enable persistent buffer pools for temporary memory needed for Megatron FSDP "
+        "communications. The legacy option name does not fix the pool capacity at two; use "
+        "--fsdp-buffer-count to control it. Persistent communication memory improves memory "
+        "management efficiency by reusing previously allocated buffers. This is required for "
+        "user buffer registration and is enabled automatically when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers in each Megatron FSDP communication pool. "
+        "The default of two provides conventional double buffering; combined 1F1B "
+        "overlap with forward prefetch requires at least three. A non-default value requires "
+        "--fsdp-double-buffer, --use-nccl-ub, or --megatron-fsdp-max-pool-double-buffer.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',
@@ -4878,6 +4897,13 @@ def _add_mla_args(parser):
         help="Rank of Key and Value tensors' low rank representation.",
     )
     group.add_argument(
+        '--attention-latent-norm-epsilon',
+        type=float,
+        default=None,
+        help="Epsilon for the primary query and key-value latent norms in attention. "
+        "Defaults to --norm-epsilon when unset.",
+    )
+    group.add_argument(
         '--qk-head-dim',
         type=int,
         default=128,
@@ -5081,8 +5107,8 @@ def _add_experimental_args(parser):
         '--hybrid-layer-pattern',
         type=str,
         default=None,
-        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+        help='Specify a hybrid layer pattern using M (mamba), G (gdn), K (kda), '
+        '* (attention), D (dsa), + (mla), - (mlp), E (moe). Use | to define pipeline '
         'stage boundaries for flexible virtual pipeline parallel (fVPP). '
         'Use / to separate MTP patterns. '
         'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
