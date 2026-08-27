@@ -260,8 +260,7 @@ class TestHybridModel:
 
         placement.assert_called_once()
         placement_args = placement.call_args.kwargs
-        assert placement_args["pp_rank"] == model.pg_collection.pp.rank()
-        assert placement_args["pp_size"] == model.pg_collection.pp.size()
+        assert placement_args["pp_group"] is model.pg_collection.pp
         assert placement_args["vp_size"] == model_config.virtual_pipeline_model_parallel_size
 
     def test_forward_propagates_mtp_input_mask(self, mocker):
