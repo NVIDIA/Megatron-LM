@@ -23,6 +23,8 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -821,6 +823,30 @@ class DynamicInferenceContext(BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+            )
+
+        # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
+        # inside CUDA graph capture; one buffer set is shared by all MoE layers
+        # and graphs. Like the dispatcher buffers above, these persist across
+        # engine suspend/resume.
+        if (
+            model_config.num_moe_experts
+            and model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+        ):
+            ep_size = get_pg_size(self.expert_model_parallel_group)
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
+            # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
+            moe_max_rows = max(
+                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
+            )
+            VllmFusedMoeBuffers.allocate_buffers(
+                max_tokens=moe_max_rows,
+                topk=model_config.moe_router_topk,
+                fc1_output_size=model_config.moe_ffn_hidden_size
+                * (2 if model_config.gated_linear_unit else 1),
+                hidden_size=moe_hidden_size,
+                num_local_experts=model_config.num_moe_experts // ep_size,
             )
 
         # Deal with chunked prefill
