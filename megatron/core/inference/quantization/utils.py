@@ -71,6 +71,8 @@ def resolve_mxfp8_backend(
     Returns:
         The MXFP8 quantization and storage backend to use. FlashInfer routed MoE
         derives its TRT-LLM Major-K weights from the canonical Triton/cuBLAS layout.
+        With the TE backend, grouped-MoE expert weights stay in native TE format while
+        other inference-optimized linear layers use the canonical Triton layout.
 
     Raises:
         ValueError: If the grouped-GEMM backend does not support MXFP8.
@@ -78,9 +80,10 @@ def resolve_mxfp8_backend(
     grouped_gemm_backend = getattr(
         inference_grouped_gemm_backend, "value", inference_grouped_gemm_backend
     )
-    # Both grouped-MoE backends consume MCore's canonical Triton/cuBLAS layout.
-    # FlashInfer repacks expert weights into TRT-LLM Major-K layout separately.
-    if grouped_gemm_backend in ("torch", "flashinfer"):
+    # All grouped-MoE backends consume MCore's canonical Triton/cuBLAS layout for the
+    # dense inference-optimized linear layers. FlashInfer repacks expert weights into
+    # TRT-LLM Major-K layout separately; TE keeps expert weights in native TE format.
+    if grouped_gemm_backend in ("te", "torch", "flashinfer"):
         return "triton"
     raise ValueError(
         "MXFP8 inference does not support "
@@ -88,7 +91,26 @@ def resolve_mxfp8_backend(
     )
 
 
-def quantize_model_to_mxfp8(model: torch.nn.Module, backend: MXFP8Backend = "flashinfer") -> None:
+def get_te_grouped_moe_parameter_ids(model: torch.nn.Module) -> set[int]:
+    """Collect expert parameters preserved for the native TE grouped-MoE backend."""
+    parameter_ids: set[int] = set()
+    for module in model.modules():
+        grouped_gemm_backend = getattr(module, "inference_grouped_gemm_backend", None)
+        grouped_gemm_backend = getattr(grouped_gemm_backend, "value", grouped_gemm_backend)
+        if grouped_gemm_backend != "te":
+            continue
+        for linear_name in ("linear_fc1", "linear_fc2"):
+            linear = getattr(module, linear_name, None)
+            if isinstance(linear, torch.nn.Module):
+                parameter_ids.update(id(param) for param in linear.parameters())
+    return parameter_ids
+
+
+def quantize_model_to_mxfp8(
+    model: torch.nn.Module,
+    backend: MXFP8Backend = "flashinfer",
+    excluded_parameter_ids: set[int] | None = None,
+) -> None:
     """Convert TE MXFP8 weights to mcore MXFP8Tensor format.
 
     Recursively walks the model and replaces each TEMXFP8Tensor parameter
@@ -97,22 +119,26 @@ def quantize_model_to_mxfp8(model: torch.nn.Module, backend: MXFP8Backend = "fla
     Args:
         model: The model whose TE MXFP8 parameters should be converted.
         backend: 'flashinfer' or 'triton' quantization backend.
+        excluded_parameter_ids: Parameters to preserve in their native TE format.
+            The TE grouped-MoE backend uses this for its expert weights while dense
+            inference layers are still converted to the requested MCore layout.
     """
     assert HAVE_TE
-    import logging
-
-    rank = torch.distributed.get_rank()
     if backend == "flashinfer":
         assert HAVE_FLASHINFER, "FlashInfer not available for MXFP8 quantization"
 
     for child in model.children():
-        quantize_model_to_mxfp8(child, backend=backend)
+        quantize_model_to_mxfp8(
+            child, backend=backend, excluded_parameter_ids=excluded_parameter_ids
+        )
 
     def replace_in_dict(attr_dict):
         """Helper function to replace TE MXFP8 weights."""
         keys = list(attr_dict.keys())
         for key in keys:
             val = attr_dict[key]
+            if excluded_parameter_ids is not None and id(val) in excluded_parameter_ids:
+                continue
             is_te_mxfp8 = isinstance(val, TEMXFP8Tensor) or (
                 hasattr(val, 'data') and isinstance(val.data, TEMXFP8Tensor)
             )
@@ -187,6 +213,7 @@ def quantize_params_to_mxfp8(
     persistent_buffers: Optional[Dict[str, MXFP8Tensor]] = None,
     _prefix: str = "",
     backend: MXFP8Backend = "flashinfer",
+    excluded_parameter_ids: set[int] | None = None,
 ) -> Dict[str, MXFP8Tensor]:
     """Quantize model parameters to mutable MXFP8Tensor storage.
 
@@ -204,6 +231,7 @@ def quantize_params_to_mxfp8(
             Updated in-place and returned.
         _prefix: Internal recursion prefix; callers should not set this.
         backend: 'flashinfer' or 'triton' quantization backend.
+        excluded_parameter_ids: Parameters that should remain in native TE format.
 
     Returns:
         The ``persistent_buffers`` dict (created on first call if ``None``).
@@ -218,7 +246,11 @@ def quantize_params_to_mxfp8(
     for child_name, child_module in model.named_children():
         child_prefix = f"{_prefix}{child_name}." if _prefix else f"{child_name}."
         quantize_params_to_mxfp8(
-            child_module, persistent_buffers, _prefix=child_prefix, backend=backend
+            child_module,
+            persistent_buffers,
+            _prefix=child_prefix,
+            backend=backend,
+            excluded_parameter_ids=excluded_parameter_ids,
         )
 
     # Process parameters owned directly by this module
@@ -227,6 +259,8 @@ def quantize_params_to_mxfp8(
         for key in keys:
             val = model._parameters[key]
             if val is None:
+                continue
+            if excluded_parameter_ids is not None and id(val) in excluded_parameter_ids:
                 continue
             if not _should_quantize_param(val):
                 continue

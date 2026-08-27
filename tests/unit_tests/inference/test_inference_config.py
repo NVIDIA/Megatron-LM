@@ -34,6 +34,8 @@ class TestInferenceConfig:
         [
             ("torch", "triton"),
             (InferenceGroupedGemmBackend.TORCH, "triton"),
+            ("te", "triton"),
+            (InferenceGroupedGemmBackend.TE, "triton"),
             ("flashinfer", "triton"),
             (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
         ],
@@ -45,6 +47,22 @@ class TestInferenceConfig:
     def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
             resolve_mxfp8_backend(grouped_gemm_backend)
+
+    def test_te_grouped_moe_parameter_ids_exclude_only_expert_weights(self):
+        from megatron.core.inference.quantization.utils import get_te_grouped_moe_parameter_ids
+
+        root = torch.nn.Module()
+        root.dense = torch.nn.Linear(4, 4, bias=False)
+        root.experts = torch.nn.Module()
+        root.experts.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.TE
+        root.experts.linear_fc1 = torch.nn.Linear(4, 8, bias=False)
+        root.experts.linear_fc2 = torch.nn.Linear(8, 4, bias=False)
+
+        excluded = get_te_grouped_moe_parameter_ids(root)
+
+        assert id(root.dense.weight) not in excluded
+        assert id(root.experts.linear_fc1.weight) in excluded
+        assert id(root.experts.linear_fc2.weight) in excluded
 
     @staticmethod
     def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):

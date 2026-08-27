@@ -482,8 +482,9 @@ class TestSetupMxfp8TransformOnPlan:
 
         captured = {}
 
-        def _quantize(_decoder, *, backend):
+        def _quantize(_decoder, *, backend, excluded_parameter_ids=None):
             captured["backend"] = backend
+            captured["excluded_parameter_ids"] = excluded_parameter_ids
             return {}
 
         monkeypatch.setattr(refit, "_should_quantize_param", lambda _param: True)
@@ -492,6 +493,8 @@ class TestSetupMxfp8TransformOnPlan:
         plan = ReshardPlan(send_ops=[], recv_ops=[])
         refit._setup_mxfp8_transform_on_plan(plan, _Model())
         assert captured["backend"] == plan.transform.backend == "triton"
+        # No TE grouped-MoE experts here, so nothing is held back from conversion.
+        assert captured["excluded_parameter_ids"] == set()
 
 
 class TestRefitTensorCache:
