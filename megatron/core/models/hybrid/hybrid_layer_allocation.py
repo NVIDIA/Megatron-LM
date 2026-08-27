@@ -16,15 +16,20 @@ class Symbols:
 
     MAMBA = "M"
     GDN = 'G'
+    KDA = 'K'
     ATTENTION = "*"
     DS_ATTENTION = "D"
     MLA = "+"
+    CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
+    HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
+    WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0; no compressor/indexer)
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
-    ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA}
+    VALID_LAYERS = {MAMBA, GDN, KDA, ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW, MLP, MOE}
+    # MLA-based attention layers (incompatible with standard '*' attention in one model).
+    MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -175,10 +180,10 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'G': 0, 'D': 0, 'M': 2, '-': 0, 'E': 0}
+        {'*': 2, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'K': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'W': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'G': 0, 'D': 0, 'M': 8, '-': 4, 'E': 0}
+        {'*': 1, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'K': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'W': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
@@ -294,9 +299,12 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
+    # MLA variants (DSA / CSA / HCA / Window) may freely coexist with each other.
+    if Symbols.ATTENTION in pattern and any(s in pattern for s in Symbols.MLA_ATTENTION):
+        raise ValueError(
+            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
+        )
 
 
 def validate_segment_layers(segment: str) -> List[str]:
@@ -322,9 +330,11 @@ def validate_segment_layers(segment: str) -> List[str]:
                 f"one of {Symbols.VALID_LAYERS}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and (Symbols.DS_ATTENTION in segment or Symbols.MLA in segment):
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
+    if Symbols.ATTENTION in segment and any(s in segment for s in Symbols.MLA_ATTENTION):
+        raise ValueError(
+            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
+        )
 
     return layer_type_list
 

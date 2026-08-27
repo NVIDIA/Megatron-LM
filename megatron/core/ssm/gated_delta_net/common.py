@@ -58,9 +58,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GatedDeltaNetSubmodules:
-    """
-    Contains the module specs for the input linear, output norm, and output linear layers.
-    """
+    """Module specs shared by GDN-family layers."""
 
     in_proj: Union[ModuleSpec, type] = IdentityOp
     out_norm: Union[ModuleSpec, type] = IdentityOp
@@ -68,12 +66,7 @@ class GatedDeltaNetSubmodules:
 
 
 class GatedDeltaRuleInterface(Protocol):
-    """
-    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
-
-    Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
-    variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
-    """
+    """Callable interface shared by GDN-family kernels."""
 
     def __call__(
         self,
@@ -92,11 +85,12 @@ class GatedDeltaRuleInterface(Protocol):
 
 
 class _GDNBase(MegatronModule):
-    """Common base class for the Gated Delta Net (GDN) family of layers.
+    """Shared implementation for the GDN-family layers.
 
-    Hosts everything the GDN variants share: the fused input projection, causal
-    convolution on q/k/v, the CP all-to-all plumbing, the kernel-input preparation
-    skeleton, the gated output norm + projection, and sharded checkpointing.
+    Provides the projection, Q/K/V causal convolution, gated delta-rule parameters,
+    context-parallel layout handling, gated output normalization, output projection,
+    and sharded-checkpoint plumbing shared by head-wise GatedDeltaNet and channel-wise
+    Kimi Delta Attention.
     """
 
     dt_bias_dim: int
@@ -130,7 +124,7 @@ class _GDNBase(MegatronModule):
         Args:
             config: The config of the model.
             submodules: Contains the module specs for the input and output linear layers.
-            layer_number: The layer number of this GDN layer.
+            layer_number: The layer number of this GDN-family layer.
             bias: Whether to use bias in the linear layers.
             conv_bias: Whether to use bias in the causal convolution.
             conv_init: The initialization range for the causal convolution weights.
@@ -161,7 +155,7 @@ class _GDNBase(MegatronModule):
         assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
         self.A_init_range = A_init_range
         self.use_qk_l2norm = use_qk_l2norm
-        assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
+        assert pg_collection is not None, "pg_collection must be provided for a GDN-family layer"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
@@ -183,6 +177,21 @@ class _GDNBase(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
+        # Headwise CP shards heads over the CP group; chunkwise CP keeps heads local.
+        if self.config.linear_cp_mode == "headwise":
+            num_key_heads_per_tp = self.num_key_heads // self.tp_size
+            num_value_heads_per_tp = self.num_value_heads // self.tp_size
+            assert num_key_heads_per_tp % self.cp_size == 0, (
+                f"GDN-family head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+                f"to evenly divide num_key_heads per TP rank ({num_key_heads_per_tp}); "
+                f"all runtime dynamic cp_size values divide the static one and so will also divide."
+            )
+            assert num_value_heads_per_tp % self.cp_size == 0, (
+                f"GDN-family head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+                f"to evenly divide num_value_heads per TP rank ({num_value_heads_per_tp}); "
+                f"all runtime dynamic cp_size values divide the static one and so will also divide."
+            )
+
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
@@ -197,15 +206,17 @@ class _GDNBase(MegatronModule):
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
-            assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
-        # QK, V, gate, shared across all variants
-        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
-        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
+            assert hasattr(self, attr), f"Attribute {attr} for the GDN-family variant is not set"
+            assert (
+                getattr(self, attr) is not None
+            ), f"Attribute {attr} for the GDN-family variant is not set"
+        # Full input projection width: q, k, v, output gate, and variant-specific gate features.
+        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
-                "For FP8, the innermost dimension of the GDN layer "
+                "For FP8, the innermost dimension of the GDN-family layer "
                 "input projection output tensor must be a multiple of 16."
             )
         self.in_proj = build_module(
@@ -245,7 +256,9 @@ class _GDNBase(MegatronModule):
 
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.dt_bias_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
@@ -253,7 +266,9 @@ class _GDNBase(MegatronModule):
 
         self.A_log = nn.Parameter(
             torch.empty(
-                self.a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.a_log_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
@@ -289,7 +304,7 @@ class _GDNBase(MegatronModule):
         self.reset_parameters()
 
     def _setup_variant_attrs(self):
-        """Set variant specifics on the module. Called once from ``__init__``.
+        """Set variant projection sections, gate parameter sizes, and kernel callable.
 
         Must set:
         - ``in_proj_dim``
@@ -324,9 +339,7 @@ class _GDNBase(MegatronModule):
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                 self._reset_dt_bias()
                 A = torch.empty(
-                    self.A_log.shape[0],
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
+                    self.A_log.shape[0], dtype=self.A_log.dtype, device=self.A_log.device
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 

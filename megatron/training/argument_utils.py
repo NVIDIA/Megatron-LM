@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
 import builtins
@@ -345,8 +345,22 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+
+        pattern = args.hybrid_layer_pattern
+        has_kda = Symbols.KDA in pattern
+        has_dsv4_csa = any(s in pattern for s in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA))
+        has_dsa = Symbols.DS_ATTENTION in pattern
+        if getattr(args, 'experimental_attention_variant', None) is None:
+            if has_dsv4_csa:
+                kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+            elif has_dsa:
+                kw_args['experimental_attention_variant'] = 'dsa'
+            elif has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
+
+    _resolve_dsa_kernel_backend_cli_default(args, kw_args)
 
     kw_args['inference_sampling_seed'] = args.seed
 

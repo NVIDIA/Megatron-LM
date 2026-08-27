@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -787,6 +787,8 @@ def validate_args(args, defaults={}):
         args.mtp_hybrid_override_pattern = None
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
 
+    parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+
     if args.hybrid_layer_pattern is not None:
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
@@ -866,9 +868,8 @@ def validate_args(args, defaults={}):
 
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
-        parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
-        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-            inferred_mtp_num_layers = parsed.mtp_num_depths
+        if parsed_hybrid_pattern.mtp_pattern and parsed_hybrid_pattern.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed_hybrid_pattern.mtp_num_depths
             if args.mtp_num_layers is None:
                 args.mtp_num_layers = inferred_mtp_num_layers
             elif args.mtp_num_layers != inferred_mtp_num_layers:
@@ -918,10 +919,12 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and (
-            Symbols.MLA in args.hybrid_layer_pattern
-            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    # Infer use of MLA from the parsed main and MTP patterns before config-class selection.
+    if any(
+        symbol in pattern
+        for pattern in (parsed_hybrid_pattern.main_pattern, parsed_hybrid_pattern.mtp_pattern)
+        if pattern is not None
+        for symbol in Symbols.MLA_ATTENTION
     ):
         args.multi_latent_attention = True
 
@@ -2029,6 +2032,120 @@ def _print_args(title, args):
 
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
+
+
+def core_transformer_config_from_args(args, config_class=None):
+
+    # Config class.
+    config_class = config_class or TransformerConfig
+
+    if args.multi_latent_attention:
+        config_class = MLATransformerConfig
+
+    if args.heterogeneous_layers_config_path is not None:
+        assert (
+            not args.multi_latent_attention
+        ), "Multi latent attention with heterogeneous layers is not supported."
+        config_class = HeterogeneousTransformerConfig
+
+    # Translate args to core transformer configuration
+    kw_args = {}
+    for f in dataclasses.fields(config_class):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['num_moe_experts'] = args.num_experts
+    kw_args['actual_vocab_size'] = args.padded_vocab_size
+    kw_args['rotary_interleaved'] = args.rotary_interleaved
+    kw_args['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
+    kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['fp4_param'] = args.fp4_param_gather
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    else:
+        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
+    if args.squared_relu:
+        assert not args.swiglu
+        kw_args['activation_func'] = squared_relu
+    elif args.quick_geglu:
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = quick_gelu
+    if args.init_method_xavier_uniform:
+        kw_args['init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    if args.group_query_attention:
+        kw_args['num_query_groups'] = args.num_query_groups
+    else:
+        kw_args['num_query_groups'] = None
+    kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.rope_type is None:
+        # Pop 'rope_type' to let the config class use the default value.
+        kw_args.pop('rope_type', None)
+    else:
+        assert (
+            args.multi_latent_attention or args.rope_type == 'rope'
+        ), f'Common attention only support rope_type="rope", but got {args.rope_type}.'
+
+    if len(args.cp_comm_type) == 1:
+        kw_args['cp_comm_type'] = args.cp_comm_type[0]
+    if args.hybrid_layer_pattern is not None:
+        kw_args['is_hybrid_model'] = True
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+        _pat = args.hybrid_layer_pattern
+        _has_kda = Symbols.KDA in _pat
+        _has_dsv4_csa = (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
+        _has_dsa = Symbols.DS_ATTENTION in _pat
+        if getattr(args, 'experimental_attention_variant', None) is None:
+            # 'C'/'H'/'W' run the DSv4 CompressedSparseAttention (CSA/HCA/window-only), which
+            # requires the full dsv4_hybrid contract (MLA, TP==1, no qk_clip,
+            # qk_head_dim/kv_lora_rank derivation). Set the variant so transformer_config runs
+            # that validation+derivation rather than silently skipping it. 'D' alone stays legacy
+            # DSv3 'dsa'. An explicit --experimental-attention-variant is always respected.
+            if _has_dsv4_csa:
+                kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+            elif _has_dsa:
+                kw_args['experimental_attention_variant'] = 'dsa'
+            elif _has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
+        # Normalize compact and legacy-padded ratios through the shared migration helper.
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
+
+    _resolve_dsa_kernel_backend_cli_default(args, kw_args)
+
+    kw_args['inference_sampling_seed'] = args.seed
+
+    # handle quantization config
+    # NOTE: Kitchen arguments are only added to the namespace when
+    # Kitchen library is available.
+    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
+    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
+
+    kw_args['moe_latent_size'] = args.moe_latent_size
+
+    if args.te_precision_config_file:
+        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
+        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
+        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
+
+    if hasattr(args, "use_kitchen_attention"):
+        kw_args['use_kitchen_attention'] = args.use_kitchen_attention
+    if hasattr(args, "kitchen_attention_backend"):
+        kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
+
+    # Return config.
+    return config_class(**kw_args)
 
 
 def _add_transformer_engine_args(parser):
@@ -3682,28 +3799,43 @@ def _add_heterogeneous_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--enable-experimental', action='store_true',
-                       help='Enable experimental features.')
-    group.add_argument('--spec', type=str, default=None, nargs='*',
-                       help='Specify the <module_location function_name> pair '
-                       'that returns a spec to customize a model, transformer '
-                       'block, or transformer layer, depending on the use case.'
-                       'To use local spec specify local as the argument.'
-                       'For more details, see the model class, '
-                       '`transformer_block.py`, or `transformer_layer.py`')
-    group.add_argument('--hybrid-layer-pattern', type=str, default=None,
-                       help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
-                       'stage boundaries for flexible virtual pipeline parallel (fVPP). '
-                       'Use / to separate MTP patterns. '
-                       'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
-                       'When this flag is used, it is the sole indicator that a hybrid model '
-                       'is being run.')
-    group.add_argument('--hybrid-override-pattern', type=str, default=None,
-                       help='Deprecated. Use --hybrid-layer-pattern instead. '
-                       'If specified, its value will be forwarded to --hybrid-layer-pattern.')
-    group.add_argument('--yaml-cfg', type=str, default=None,
-                       help = 'Config file to add additional arguments')
+    group.add_argument(
+        '--enable-experimental', action='store_true', help='Enable experimental features.'
+    )
+    group.add_argument(
+        '--spec',
+        type=str,
+        default=None,
+        nargs='*',
+        help='Specify the <module_location function_name> pair '
+        'that returns a spec to customize a model, transformer '
+        'block, or transformer layer, depending on the use case.'
+        'To use local spec specify local as the argument.'
+        'For more details, see the model class, '
+        '`transformer_block.py`, or `transformer_layer.py`',
+    )
+    group.add_argument(
+        '--hybrid-layer-pattern',
+        type=str,
+        default=None,
+        help='Specify a hybrid layer pattern using M (mamba), G (gdn), K (kda), '
+        '* (attention), D (dsa), + (mla), - (mlp), E (moe). Use | to define pipeline '
+        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
+        'Use / to separate MTP patterns. '
+        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+        'When this flag is used, it is the sole indicator that a hybrid model '
+        'is being run.',
+    )
+    group.add_argument(
+        '--hybrid-override-pattern',
+        type=str,
+        default=None,
+        help='Deprecated. Use --hybrid-layer-pattern instead. '
+        'If specified, its value will be forwarded to --hybrid-layer-pattern.',
+    )
+    group.add_argument(
+        '--yaml-cfg', type=str, default=None, help='Config file to add additional arguments'
+    )
 
     # Args of precision-aware optimizer.
     group.add_argument('--use-precision-aware-optimizer', action='store_true',

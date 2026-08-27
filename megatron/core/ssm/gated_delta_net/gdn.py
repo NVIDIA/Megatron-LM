@@ -37,8 +37,9 @@ except ImportError:
     fused_recurrent_gated_delta_rule = None
 
 
-class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
-    # pylint: disable=missing-class-docstring
+class GatedDeltaNet(_GDNBase):
+    """Gated DeltaNet with a head-wise scalar memory-decay gate."""
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         # alpha, beta

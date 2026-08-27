@@ -453,18 +453,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "boundaries are not rounded between decode chunks."
                 )
 
-            # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
-            # one map in global layer order; independently generated per-symbol maps both
-            # start at zero and would alias if they were simply unioned.
-            attention_layer_map, dsa_layer_map = operator.itemgetter(
-                Symbols.ATTENTION, Symbols.DS_ATTENTION
-            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
-            recurrent_layer_map = {}
-            for global_layer_idx, layer_type in enumerate(
-                mamba_inference_state_config.layer_type_list
-            ):
-                if layer_type in (Symbols.MAMBA, Symbols.GDN):
-                    recurrent_layer_map[global_layer_idx] = len(recurrent_layer_map)
+            # For hybrid models, the layer map converts the global layer index to the
+            # corresponding attention layer index or Mamba layer index depending on the
+            # layer type.
+            attention_layer_map, dsa_layer_map, gdn_layer_map, kda_layer_map, mamba_layer_map = (
+                operator.itemgetter(
+                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.KDA, Symbols.MAMBA
+                )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+            )
+
+            if len(gdn_layer_map) > 0:
+                raise NotImplementedError("GDN layers are not supported for inference.")
+            if len(kda_layer_map) > 0:
+                raise NotImplementedError("KDA layers are not supported for inference.")
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(recurrent_layer_map)
@@ -3188,7 +3189,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
             request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
-        matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
+        _, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 

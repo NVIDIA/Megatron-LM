@@ -45,9 +45,13 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    kda_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
+    csa_layer: Union[ModuleSpec, type] = IdentityOp
+    hca_layer: Union[ModuleSpec, type] = IdentityOp
+    window_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -191,6 +195,29 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.CSA:
+                    # DSv4 Compressed Sparse Attention (compress_ratio fixed by the spec).
+                    layer = build_module(
+                        submodules.csa_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                    )
+                elif layer_type == LayerSymbols.HCA:
+                    # DSv4 Heavily Compressed Attention (compress_ratio fixed by the spec).
+                    layer = build_module(
+                        submodules.mla_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
                     )
                 elif layer_type == LayerSymbols.MLP:
                     layer = build_module(
@@ -228,6 +255,15 @@ class HybridStack(MegatronModule):
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.KDA:
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
