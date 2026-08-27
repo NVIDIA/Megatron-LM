@@ -365,6 +365,7 @@ def _ddp_wrap(
                 use_trace_replay=get_model_config(model[0]).overlap_moe_expert_parallel_comm,
                 use_symmetric_memory=ddp_config.nccl_ub,
                 enable_trace_pool=ddp_config.fsdp_trace_pool,
+                prefetch_depth=ddp_config.fsdp_prefetch_depth,
             )
             if wrap_v2_shared_context
             else nullcontext()

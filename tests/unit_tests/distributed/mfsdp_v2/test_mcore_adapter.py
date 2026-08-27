@@ -37,6 +37,21 @@ from tests.unit_tests.test_utilities import Utils
 logger = logging.getLogger(__name__)
 
 
+def test_ddp_prefetch_depth_validation():
+    """Trace depth is positive and belongs only to Megatron-FSDP v2."""
+    with pytest.raises(ValueError, match="fsdp_prefetch_depth must be positive"):
+        DistributedDataParallelConfig(
+            use_megatron_fsdp=True, megatron_fsdp_version=2, fsdp_prefetch_depth=0
+        )
+    with pytest.raises(ValueError, match="requires Megatron-FSDP v2"):
+        DistributedDataParallelConfig(fsdp_prefetch_depth=2)
+
+    config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True, megatron_fsdp_version=2, fsdp_prefetch_depth=3
+    )
+    assert config.fsdp_prefetch_depth == 3
+
+
 def _build_layer(config: TransformerConfig) -> TransformerLayer:
     return TransformerLayer(
         config=config,
@@ -440,6 +455,7 @@ class TestMcoreAdapterDense:
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 gradient_accumulation_fusion=True,
+                add_bias_linear=False,
             ),
             ddp_config=DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
@@ -463,8 +479,12 @@ class TestMcoreAdapterDense:
 
         assert experts.parameter_groups
         assert all(group.fuse_wgrad_accumulation for group in experts.parameter_groups)
+        assert all(group.fused_wgrad_is_complete for group in experts.parameter_groups)
         assert wrapped.module.parameter_groups
         assert all(not group.fuse_wgrad_accumulation for group in wrapped.module.parameter_groups)
+        assert all(
+            not group.fused_wgrad_is_complete for group in wrapped.module.parameter_groups
+        )
 
         expert_compute_parameters = [
             fsdp_parameter.unsharded

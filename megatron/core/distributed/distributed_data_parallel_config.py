@@ -154,6 +154,12 @@ class DistributedDataParallelConfig:
       to share storage. With NCCL user buffers, the slots use PyTorch symmetric memory.
     """
 
+    fsdp_prefetch_depth: int = 1
+    """One-based future execution-trace occurrence prefetched by Megatron-FSDP v2.
+      One preserves immediate-successor prefetch. Larger values increase lead time
+      and full-parameter residency.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
@@ -294,6 +300,13 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+
+        if self.fsdp_prefetch_depth < 1:
+            raise ValueError("fsdp_prefetch_depth must be positive")
+        if self.fsdp_prefetch_depth != 1 and (
+            not self.use_megatron_fsdp or self.megatron_fsdp_version != 2
+        ):
+            raise ValueError("FSDP prefetch depth requires Megatron-FSDP v2")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."

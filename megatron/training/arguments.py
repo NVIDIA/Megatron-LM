@@ -3308,6 +3308,10 @@ def _add_distributed_args(parser):
                        help="Enable trace-planned temporary-buffer storage for Megatron FSDP v2. "
                         "The first global batch records buffer lifetimes; later batches reuse fixed slots. "
                         "With NCCL user buffers, the slots use PyTorch symmetric memory.")
+    group.add_argument('--fsdp-prefetch-depth', type=int, default=1,
+                       help="Select the Nth future execution-trace occurrence for Megatron FSDP v2 "
+                       "parameter prefetch. One preserves immediate-successor behavior; larger "
+                       "values trade full-parameter residency for additional prefetch lead time.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
