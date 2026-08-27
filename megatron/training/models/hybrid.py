@@ -88,6 +88,14 @@ class HybridModelConfig(ModelConfig):
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
+        # Own dataclass fields always live on this object: proxying them to the
+        # embedded TransformerConfig would leave the class-level default visible
+        # through normal attribute lookup on self whenever TransformerConfig
+        # declares a same-named field (e.g. ``hybrid_layer_pattern``), silently
+        # dropping the configured value.
+        if name in type(self).__dataclass_fields__:
+            super().__setattr__(name, value)
+            return
         # Use object.__getattribute__ to avoid triggering __getattr__ while
         # `transformer` may not yet exist (e.g. during dataclass __init__).
         try:
