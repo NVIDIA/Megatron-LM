@@ -850,9 +850,22 @@ class TestHybridBlock:
         with pytest.raises(ValueError):
             self.get_mla_hybrid_block(layer_pattern)
 
+
+_HAVE_MAMBA_SSM = __import__("importlib").util.find_spec("mamba_ssm") is not None
+requires_mamba_ssm = pytest.mark.skipif(
+    not _HAVE_MAMBA_SSM, reason="mamba_ssm not installed in this environment"
+)
+
+
 @pytest.mark.internal
 class TestAttnResHybridBlock:
-    """Attention residuals in hybrid stacks (AttnResHybridLayer + HybridStack)."""
+    """Attention residuals in hybrid stacks (AttnResHybridLayer + HybridStack).
+
+    The wrapper is entry-type agnostic, so the always-on tests use pure
+    transformer-entry patterns (runnable in containers without mamba_ssm);
+    Mamba-entry variants are guarded by ``requires_mamba_ssm`` and run in the
+    CI mamba bucket.
+    """
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -896,7 +909,7 @@ class TestAttnResHybridBlock:
         from megatron.core.models.hybrid.hybrid_block import AttnResHybridLayer
 
         layer_type_list = validate_segment_layers(
-            Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION
+            Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP
         )
         config = self._make_config(len(layer_type_list), block_layers=2)
         block = self._make_stack(config, layer_type_list)
@@ -925,7 +938,17 @@ class TestAttnResHybridBlock:
         output = block(hidden_states, attention_mask=attention_mask)
         assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
 
-    def test_init_equivalence_forward(self):
+    @pytest.mark.parametrize(
+        "layer_pattern",
+        [
+            Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP,
+            pytest.param(
+                Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION,
+                marks=requires_mamba_ssm,
+            ),
+        ],
+    )
+    def test_init_equivalence_forward(self, layer_pattern):
         """Zero-init AttnRes hybrid stack matches the baseline at the first forward.
 
         Zero pseudo-queries make every aggregation the exact mean of the depth
@@ -933,7 +956,6 @@ class TestAttnResHybridBlock:
         (scale-invariant up to eps) norms, and the wrapper's delta
         reconstruction is exact — so with a tiny eps the outputs must agree.
         """
-        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION
         layer_type_list = validate_segment_layers(layer_pattern)
 
         model_parallel_cuda_manual_seed(123)
@@ -979,7 +1001,7 @@ class TestAttnResHybridBlock:
         """Depth sources + partial cross PP boundaries as one seq-dim-concat payload."""
         from megatron.core.transformer.attention_residual import attn_res_num_payload_slices
 
-        stage0_types = validate_segment_layers(Symbols.MAMBA + Symbols.ATTENTION)
+        stage0_types = validate_segment_layers(Symbols.ATTENTION + Symbols.MLP)
         stage1_types = validate_segment_layers(Symbols.MLP + Symbols.ATTENTION)
         config = self._make_config(4, block_layers=block_layers)
 
