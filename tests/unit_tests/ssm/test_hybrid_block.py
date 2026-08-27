@@ -924,8 +924,15 @@ class TestAttnResHybridBlock:
         assert [layer.attn_res_num_sources for layer in block.layers] == [1, 1, 2, 2]
         assert isinstance(block.final_attn_res, torch.nn.Module)
 
-    def test_gpu_forward(self):
-        layer_type_list = validate_segment_layers(Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP)
+    @pytest.mark.parametrize(
+        "layer_pattern",
+        [
+            Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION,
+            pytest.param(Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP, marks=requires_mamba_ssm),
+        ],
+    )
+    def test_gpu_forward(self, layer_pattern):
+        layer_type_list = validate_segment_layers(layer_pattern)
         config = self._make_config(len(layer_type_list), block_layers=1)
         block = self._make_stack(config, layer_type_list).cuda()
         sequence_length, micro_batch_size = 32, 2
