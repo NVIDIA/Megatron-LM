@@ -58,7 +58,12 @@ def _mock_rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 def _make_config(
-    *, use_sparse_loss: bool, calculate_per_token_loss: bool, dsa_kernel_backend: str
+    *,
+    use_sparse_loss: bool,
+    calculate_per_token_loss: bool,
+    dsa_kernel_backend: str,
+    dsa_indexer_weights_proj_use_quantization: bool = True,
+    dsa_indexer_weights_proj_output_dtype: str = "bf16",
 ) -> MLATransformerConfig:
     return MLATransformerConfig(
         multi_latent_attention=True,
@@ -76,6 +81,8 @@ def _make_config(
         dsa_indexer_topk=2048,
         dsa_indexer_loss_coeff=0.01,
         dsa_indexer_use_sparse_loss=use_sparse_loss,
+        dsa_indexer_weights_proj_use_quantization=(dsa_indexer_weights_proj_use_quantization),
+        dsa_indexer_weights_proj_output_dtype=dsa_indexer_weights_proj_output_dtype,
         calculate_per_token_loss=calculate_per_token_loss,
         add_bias_linear=False,
         bf16=True,
@@ -194,6 +201,7 @@ class NativeIndexer(nn.Module):
         index_topk: int,
         use_sparse_loss: bool,
         dsa_indexer_k_norm_epsilon: float,
+        weights_proj_output_dtype: str,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -203,6 +211,7 @@ class NativeIndexer(nn.Module):
         self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.index_topk = index_topk
         self.use_sparse_loss = use_sparse_loss
+        self.weights_proj_output_dtype = weights_proj_output_dtype
         self.softmax_scale = self.index_head_dim**-0.5
 
         self.linear_wq_b = nn.Linear(
@@ -237,9 +246,20 @@ class NativeIndexer(nn.Module):
 
         q = _mock_rotate_activation(q)
         k = _mock_rotate_activation(k)
-        weights = self.linear_weights_proj(x) * (self.index_n_heads**-0.5)
+        if self.weights_proj_output_dtype == "fp32":
+            # The published DeepSeek indexer reference consumes the model-dtype
+            # checkpoint parameter with FP32 operands. Reproduce that arithmetic
+            # independently with PyTorch rather than calling the MCore primitive.
+            weights = F.linear(
+                x.float(), self.linear_weights_proj.weight.float(), self.linear_weights_proj.bias
+            )
+        else:
+            weights = self.linear_weights_proj(x)
+        weights = weights * (self.index_n_heads**-0.5)
 
-        logits = torch.einsum("bthd,bsd->bths", q, k)
+        # Q/K operands originate in BF16, but score accumulation is FP32 independently
+        # of the weights-projection output dtype.
+        logits = torch.einsum("bthd,bsd->bths", q.float(), k.float())
         logits = F.relu(logits) * weights.unsqueeze(-1) * self.softmax_scale
         logits = logits.sum(dim=2) + attention_mask.squeeze(1)
         topk_logits, topk_indices = logits.topk(min(self.index_topk, x.size(1)), dim=-1)
@@ -270,6 +290,7 @@ class NativeDSA(nn.Module):
         mscale: float,
         rope_factor: float,
         calculate_per_token_loss: bool,
+        dsa_indexer_weights_proj_output_dtype: str,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -315,6 +336,7 @@ class NativeDSA(nn.Module):
             index_topk=dsa_indexer_topk,
             use_sparse_loss=dsa_indexer_use_sparse_loss,
             dsa_indexer_k_norm_epsilon=dsa_indexer_k_norm_epsilon,
+            weights_proj_output_dtype=dsa_indexer_weights_proj_output_dtype,
         )
 
     def forward(
@@ -424,6 +446,8 @@ def run_absorbed_mla_dsa_parity(
     calculate_per_token_loss: bool,
     use_sparse_loss: bool,
     num_iterations: int,
+    dsa_indexer_weights_proj_use_quantization: bool = True,
+    dsa_indexer_weights_proj_output_dtype: str = "bf16",
 ) -> None:
     """Compare one MCore DSA backend configuration with the native reference module."""
     if attention_backend != AttnBackend.unfused:
@@ -443,6 +467,8 @@ def run_absorbed_mla_dsa_parity(
             dsa_kernel_backend=(
                 kernel_backend if attention_backend != AttnBackend.unfused else "none"
             ),
+            dsa_indexer_weights_proj_use_quantization=(dsa_indexer_weights_proj_use_quantization),
+            dsa_indexer_weights_proj_output_dtype=dsa_indexer_weights_proj_output_dtype,
         )
         object.__setattr__(config, "attention_backend", attention_backend)
         is_fused_dense = attention_backend != AttnBackend.unfused and not use_sparse_loss
@@ -475,6 +501,9 @@ def run_absorbed_mla_dsa_parity(
                 mscale=config.mscale,
                 rope_factor=config.rotary_scaling_factor,
                 calculate_per_token_loss=config.calculate_per_token_loss,
+                dsa_indexer_weights_proj_output_dtype=(
+                    config.dsa_indexer_weights_proj_output_dtype
+                ),
             )
             .bfloat16()
             .cuda()
