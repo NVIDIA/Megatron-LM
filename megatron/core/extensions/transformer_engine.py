@@ -104,7 +104,7 @@ def _set_expert_parameter_attributes(
     Args:
         module: Transformer Engine module whose direct parameters should be marked.
         parallel_mode: Tensor-parallel mode used by the module (``"column"``, ``"row"``, or None).
-        use_expert_pgs: Whether to use EP/ETP/EGTP/EDP process groups instead of TP/GTP/CP/DP.
+        use_expert_pgs: Whether to use EP/ETP/EGTP/EDP process groups instead of TP/CP/GTP/DP.
     """
     for name, param in module.named_parameters(recurse=False):
         param.allreduce = not use_expert_pgs
