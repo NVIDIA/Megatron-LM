@@ -165,6 +165,10 @@ class RoutingMapToIndices(torch.autograd.Function):
         return grad_probs, None, None
 
 
+# TODO: Remove this standalone conversion once the megakernel scheduling interface can either
+# consume MCore's authoritative ``routing_map`` and ``probs`` directly or accept authoritative
+# compact routes emitted by the router. That avoids an extra kernel launch and materializing
+# intermediate ``[num_tokens, topk]`` tensors solely for the scheduler.
 def routing_map_to_mok_inputs(
     probs: torch.Tensor, routing_map: torch.Tensor, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
