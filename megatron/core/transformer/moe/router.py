@@ -554,29 +554,6 @@ class TopKRouter(Router):
         )
         return probs
 
-    def _get_aux_loss_groups(
-        self, packed_seq_params: Optional[PackedSeqParams] = None
-    ) -> _AuxLossGroupConfig:
-        """Return process groups for MoE aux-loss statistics and logging."""
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.local_cp_size is not None
-            and packed_seq_params.cp_group is not None
-        ):
-            return _AuxLossGroupConfig(
-                loss_reduce_groups=(packed_seq_params.cp_group, self.tp_group),
-                metric_reduce_group=None,
-                metric_avg_group=self.tp_dp_cp_group,
-                metric_needs_dp_avg=False,
-            )
-
-        return _AuxLossGroupConfig(
-            loss_reduce_groups=(self.tp_cp_group,),
-            metric_reduce_group=self.tp_cp_group,
-            metric_avg_group=None,
-            metric_needs_dp_avg=True,
-        )
-
     def _get_metric_layer_number(self) -> tuple[int, int]:
         """Return the 1-based metric index and the total number of metric slots."""
         num_layers = self.config.num_layers + (self.config.mtp_num_layers or 0)
