@@ -19,6 +19,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     select_pipeline_segment,
     validate_segment_layers,
 )
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -153,8 +154,8 @@ class TestValidateSegmentLayers:
 
     def test_all_layer_symbols_have_an_expected_config_class(self):
         assert Symbols.LAYER_CONFIG_MAP == _EXPECTED_LAYER_CONFIG_CLASSES
-        assert not Symbols.is_valid_layer(Symbols.PIPE)
-        assert not Symbols.is_valid_layer(Symbols.MTP_SEPARATOR)
+        assert not layer_utils.is_valid_layer(Symbols.PIPE)
+        assert not layer_utils.is_valid_layer(Symbols.MTP_SEPARATOR)
 
     def test_repeated_layers_receive_independent_config_copies(self):
         self.config.test_mutable_value = {"items": []}
