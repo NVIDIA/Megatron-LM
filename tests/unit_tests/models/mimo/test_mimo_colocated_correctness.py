@@ -221,11 +221,7 @@ def _generate_and_broadcast_global_batches(
     for batch_idx in range(num_batches):
         if rank == 0:
             encoder_hidden_states = torch.randn(
-                image_seq_length,
-                global_mbs,
-                hidden_size,
-                device='cuda',
-                dtype=modality_dtype,
+                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=modality_dtype
             )
             image_tokens = torch.full(
                 (global_mbs, image_seq_length), image_token_id, dtype=torch.long, device='cuda'
@@ -236,11 +232,7 @@ def _generate_and_broadcast_global_batches(
             input_ids = torch.cat([image_tokens, text_tokens], dim=1)
         else:
             encoder_hidden_states = torch.empty(
-                image_seq_length,
-                global_mbs,
-                hidden_size,
-                device='cuda',
-                dtype=modality_dtype,
+                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=modality_dtype
             )
             input_ids = torch.empty(global_mbs, seq_length, dtype=torch.long, device='cuda')
 

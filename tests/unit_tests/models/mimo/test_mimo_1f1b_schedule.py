@@ -908,9 +908,7 @@ class TestMimo1F1BSchedule:
         )
 
     @pytest.mark.parametrize(
-        "llm_tp,llm_cp,hidden_size",
-        [(2, 1, 256), (1, 2, 128)],
-        ids=["tp2-cp1", "tp1-cp2"],
+        "llm_tp,llm_cp,hidden_size", [(2, 1, 256), (1, 2, 128)], ids=["tp2-cp1", "tp1-cp2"]
     )
     def test_fan_in_dp4_to_dp1_llm_pp2_8gpu(self, llm_tp, llm_cp, hidden_size):
         """Fan-in 4→1: Encoder DP=4 → LLM PP=2 DP=1 with TP or CP.

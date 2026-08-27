@@ -219,7 +219,7 @@ class TestNonColocatedCPCorrectness:
                 overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=False
             )
             torch.manual_seed(12345)
-            (ref_mimo, ref_module_to_grid_map, ref_topology, ref_language_pg, ref_vision_pg) = (
+            ref_mimo, ref_module_to_grid_map, ref_topology, ref_language_pg, ref_vision_pg = (
                 get_mimo_model(
                     encoder_name=encoder_name,
                     encoder_grid=ref_encoder_grid,
