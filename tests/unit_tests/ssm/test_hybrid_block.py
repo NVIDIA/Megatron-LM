@@ -157,8 +157,8 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     assert layout_manager_kwargs["boundary_layout"] == "contiguous"
 
 
-def test_hybrid_stack_accepts_layer_config_subclasses(monkeypatch):
-    """Layer config subclasses retain their parent layer's routing behavior."""
+def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):
+    """Layer config subclasses must be registered as distinct layer types."""
 
     class CustomMambaLayerConfig(MambaLayerConfig):
         pass
@@ -180,18 +180,20 @@ def test_hybrid_stack_accepts_layer_config_subclasses(monkeypatch):
 
     root_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
     layer_config = CustomMambaLayerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
-    block = HybridStack(
-        config=root_config,
-        submodules=hybrid_stack_spec.submodules,
-        layer_config_list=[layer_config],
-        pre_process=False,
-        post_layer_norm=False,
-        post_process=False,
-        pg_collection=_make_pg_collection(),
-    )
+    with pytest.raises(
+        ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
+    ):
+        HybridStack(
+            config=root_config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_config_list=[layer_config],
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=_make_pg_collection(),
+        )
 
-    assert build_calls == [hybrid_stack_spec.submodules.mamba_layer]
-    assert block.layers[0].config is layer_config
+    assert build_calls == []
 
 
 def test_layer_type_list_rejects_unsupported_tp_overlap():
@@ -385,11 +387,8 @@ def test_hybrid_stack_rejects_multi_character_layer_type():
 def test_mamba_state_shapes_are_selected_by_layer_config_type():
     """Mamba state shape lookup does not depend on layer symbols or module methods alone."""
 
-    class CustomMambaLayerConfig(MambaLayerConfig):
-        pass
-
     attention_config = object.__new__(AttentionLayerConfig)
-    mamba_config = object.__new__(CustomMambaLayerConfig)
+    mamba_config = object.__new__(MambaLayerConfig)
     attention_shapes = ((1,), (2,))
     mamba_shapes = ((3,), (4,))
     block = SimpleNamespace(

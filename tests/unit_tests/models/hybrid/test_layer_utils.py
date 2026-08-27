@@ -12,7 +12,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layer_config i
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
-_LAYER_CONFIG_TYPES = [
+_EXPECTED_LAYER_CONFIG_TYPES = [
     (layer_utils.Symbols.MAMBA, MambaLayerConfig),
     (layer_utils.Symbols.GDN, GDNLayerConfig),
     (layer_utils.Symbols.ATTENTION, AttentionLayerConfig),
@@ -54,7 +54,7 @@ class TestSymbols:
 @pytest.mark.internal
 class TestCreateLayerConfig:
 
-    @pytest.mark.parametrize(("layer_symbol", "config_type"), _LAYER_CONFIG_TYPES)
+    @pytest.mark.parametrize(("layer_symbol", "config_type"), _EXPECTED_LAYER_CONFIG_TYPES)
     def test_creates_independent_config_of_expected_type(self, layer_symbol, config_type):
         config = _make_transformer_config()
         config.test_mutable_value = {"items": []}
@@ -78,19 +78,22 @@ class TestCreateLayerConfig:
 @pytest.mark.internal
 class TestGetLayerSymbolFromConfig:
 
-    @pytest.mark.parametrize(("expected_symbol", "config_type"), _LAYER_CONFIG_TYPES)
+    @pytest.mark.parametrize(("expected_symbol", "config_type"), _EXPECTED_LAYER_CONFIG_TYPES)
     def test_returns_symbol_for_each_config_type(self, expected_symbol, config_type):
         layer_config = config_type.from_config(_make_transformer_config())
 
         assert layer_utils.get_layer_symbol_from_config(layer_config) == expected_symbol
 
-    def test_accepts_config_subclasses(self):
+    def test_rejects_config_subclasses(self):
         class CustomMambaLayerConfig(MambaLayerConfig):
             pass
 
         layer_config = CustomMambaLayerConfig.from_config(_make_transformer_config())
 
-        assert layer_utils.get_layer_symbol_from_config(layer_config) == layer_utils.Symbols.MAMBA
+        with pytest.raises(
+            ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
+        ):
+            layer_utils.get_layer_symbol_from_config(layer_config)
 
     def test_rejects_unknown_config_type(self):
         config = _make_transformer_config()
@@ -99,15 +102,6 @@ class TestGetLayerSymbolFromConfig:
             ValueError, match="Unexpected hybrid layer config type: TransformerConfig"
         ):
             layer_utils.get_layer_symbol_from_config(config)
-
-    def test_rejects_ambiguous_config_type(self):
-        class AmbiguousLayerConfig(MambaLayerConfig, AttentionLayerConfig):
-            pass
-
-        layer_config = AmbiguousLayerConfig.from_config(_make_transformer_config())
-
-        with pytest.raises(ValueError, match="Ambiguous hybrid layer config type"):
-            layer_utils.get_layer_symbol_from_config(layer_config)
 
 
 @pytest.mark.internal

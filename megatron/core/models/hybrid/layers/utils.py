@@ -36,6 +36,17 @@ class Symbols:
         return [value for (_, value) in valid_layer_attrs]
 
 
+_LAYER_CONFIG_TYPES = (
+    (Symbols.MAMBA, MambaLayerConfig),
+    (Symbols.GDN, GDNLayerConfig),
+    (Symbols.ATTENTION, AttentionLayerConfig),
+    (Symbols.DS_ATTENTION, DSALayerConfig),
+    (Symbols.MLA, MLALayerConfig),
+    (Symbols.MLP, MLPLayerConfig),
+    (Symbols.MOE, MoELayerConfig),
+)
+
+
 def create_layer_config(config: TransformerConfig, layer_symbol: str) -> TransformerConfig:
     """Create a layer-specific config from a normalized stack-level config.
 
@@ -49,25 +60,14 @@ def create_layer_config(config: TransformerConfig, layer_symbol: str) -> Transfo
     Raises:
         ValueError: If ``layer_symbol`` does not identify a supported hybrid layer.
     """
-    if layer_symbol == Symbols.MAMBA:
-        return MambaLayerConfig.from_config(config)
-    if layer_symbol == Symbols.GDN:
-        return GDNLayerConfig.from_config(config)
-    if layer_symbol == Symbols.ATTENTION:
-        return AttentionLayerConfig.from_config(config)
-    if layer_symbol == Symbols.DS_ATTENTION:
-        return DSALayerConfig.from_config(config)
-    if layer_symbol == Symbols.MLA:
-        return MLALayerConfig.from_config(config)
-    if layer_symbol == Symbols.MLP:
-        return MLPLayerConfig.from_config(config)
-    if layer_symbol == Symbols.MOE:
-        return MoELayerConfig.from_config(config)
+    for symbol, config_type in _LAYER_CONFIG_TYPES:
+        if layer_symbol == symbol:
+            return config_type.from_config(config)
     raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
 
 
 def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
-    """Return the canonical symbol for a layer config, including subclasses.
+    """Return the canonical symbol for a layer config.
 
     Args:
         layer_config: Layer config whose hybrid symbol should be returned.
@@ -76,31 +76,12 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
         The symbol corresponding to ``layer_config``.
 
     Raises:
-        ValueError: If the config type is unsupported or matches multiple layer types.
+        ValueError: If the exact config type is unsupported.
     """
-    matching_symbols: list[str] = []
-    if isinstance(layer_config, MambaLayerConfig):
-        matching_symbols.append(Symbols.MAMBA)
-    if isinstance(layer_config, GDNLayerConfig):
-        matching_symbols.append(Symbols.GDN)
-    if isinstance(layer_config, AttentionLayerConfig):
-        matching_symbols.append(Symbols.ATTENTION)
-    if isinstance(layer_config, DSALayerConfig):
-        matching_symbols.append(Symbols.DS_ATTENTION)
-    if isinstance(layer_config, MLALayerConfig):
-        matching_symbols.append(Symbols.MLA)
-    if isinstance(layer_config, MLPLayerConfig):
-        matching_symbols.append(Symbols.MLP)
-    if isinstance(layer_config, MoELayerConfig):
-        matching_symbols.append(Symbols.MOE)
-    if not matching_symbols:
-        raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
-    if len(matching_symbols) > 1:
-        raise ValueError(
-            f"Ambiguous hybrid layer config type: {type(layer_config).__name__} "
-            f"matches symbols {matching_symbols}"
-        )
-    return matching_symbols[0]
+    for symbol, config_type in _LAYER_CONFIG_TYPES:
+        if type(layer_config) is config_type:
+            return symbol
+    raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
 
 
 def validate_tp_comm_overlap(
