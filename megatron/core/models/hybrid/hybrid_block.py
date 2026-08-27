@@ -161,7 +161,7 @@ class HybridStack(MegatronModule):
             layer_layouts = tuple(
                 (
                     layer_config.attention_cp_layout
-                    if isinstance(layer_config, attention_config_types)
+                    if type(layer_config) in attention_config_types
                     else layer_config.linear_cp_layout
                 )
                 for layer_config in self.layer_config_list
@@ -192,7 +192,7 @@ class HybridStack(MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if isinstance(layer_config, layer_utils.MambaLayerConfig):
+                if type(layer_config) is layer_utils.MambaLayerConfig:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=layer_config,
@@ -201,7 +201,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif isinstance(layer_config, layer_utils.AttentionLayerConfig):
+                elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     layer = build_module(
                         submodules.attention_layer,
                         config=layer_config,
@@ -212,7 +212,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif isinstance(layer_config, layer_utils.DSALayerConfig):
+                elif type(layer_config) is layer_utils.DSALayerConfig:
                     layer = build_module(
                         submodules.dsa_layer,
                         config=layer_config,
@@ -223,7 +223,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif isinstance(layer_config, layer_utils.MLALayerConfig):
+                elif type(layer_config) is layer_utils.MLALayerConfig:
                     layer = build_module(
                         submodules.mla_layer,
                         config=layer_config,
@@ -233,7 +233,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
                     )
-                elif isinstance(layer_config, layer_utils.MLPLayerConfig):
+                elif type(layer_config) is layer_utils.MLPLayerConfig:
                     layer = build_module(
                         submodules.mlp_layer,
                         config=layer_config,
@@ -242,7 +242,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif isinstance(layer_config, layer_utils.MoELayerConfig):
+                elif type(layer_config) is layer_utils.MoELayerConfig:
                     layer = build_module(
                         submodules.moe_layer,
                         config=layer_config,
@@ -252,7 +252,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif isinstance(layer_config, layer_utils.GDNLayerConfig):
+                elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec = submodules.gdn_layer
                     if layer_config.experimental_attention_variant == "gdn2":
                         # 'G' layers build the GDN2 variant when the gdn2 experimental
@@ -338,9 +338,9 @@ class HybridStack(MegatronModule):
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
         for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
-            if isinstance(layer_config, layer_utils.MambaLayerConfig):
+            if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
-            if isinstance(layer_config, layer_utils.GDNLayerConfig):
+            if type(layer_config) is layer_utils.GDNLayerConfig:
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
