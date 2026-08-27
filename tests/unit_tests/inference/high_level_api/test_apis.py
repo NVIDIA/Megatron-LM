@@ -179,13 +179,21 @@ class TestLifecycleGuards:
 
         sock = MagicMock()
         llm.serve(
-            ServeConfig(port=1234, sock=sock, default_top_p=0.95, default_top_k=20, eval_mode=True),
+            ServeConfig(
+                port=1234,
+                sock=sock,
+                default_temperature=0.7,
+                default_top_p=0.95,
+                default_top_k=20,
+                eval_mode=True,
+            ),
             blocking=False,
         )
         assert llm._serve_started is True
         assert started["coordinator_addr"] == "tcp://coord:5555"
         assert started["server_port"] == 1234
         assert started["sock"] is sock
+        assert started["default_temperature"] == 0.7
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True

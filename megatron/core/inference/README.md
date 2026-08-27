@@ -43,6 +43,7 @@ async def main():
                 host="0.0.0.0",
                 port=5000,
                 eval_mode=True,
+                default_temperature=0.7,
                 default_top_p=0.95,
                 default_top_k=0,
             )
@@ -57,7 +58,7 @@ asyncio.run(main())
 |---|---|
 | `MegatronLLM` | Sync entry. Methods: `generate`, `pause`/`unpause`/`suspend`/`resume`, `shutdown`/`wait_for_shutdown`. Properties: `engine`, `context`, `controller`, `is_primary_rank`. Context-manager protocol. |
 | `MegatronAsyncLLM` | Async-flavored equivalent. Adds `serve(serve_config, blocking=True)` for HTTP. |
-| `ServeConfig` | Dataclass for the HTTP frontend. In addition to host, port, parsers, logging, and replica settings, `default_top_p` / `default_top_k` control sampling defaults and `eval_mode=True` avoids returning prompt token IDs by default. |
+| `ServeConfig` | Dataclass for the HTTP frontend. In addition to host, port, parsers, logging, and replica settings, `default_temperature` / `default_top_p` / `default_top_k` control sampling defaults and `eval_mode=True` avoids returning prompt token IDs by default. |
 | `SamplingParams`, `DynamicInferenceRequest`, `DynamicInferenceRequestRecord` | Re-exports from `megatron.core.inference`. |
 
 ## Caller responsibilities

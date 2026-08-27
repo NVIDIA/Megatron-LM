@@ -68,7 +68,9 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
+            temperature = float(
+                req.get("temperature", current_app.config.get('default_temperature', 1.0))
+            )
             top_p = float(req.get("top_p", current_app.config.get('default_top_p', 1.0)))
             top_k = int(req.get("top_k", current_app.config.get('default_top_k', 0)))
             echo = bool(req.get("echo", False))

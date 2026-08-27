@@ -50,6 +50,12 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
         help="Number of HTTP frontend processes spawned on the primary rank.",
     )
     group.add_argument(
+        "--default-temperature",
+        type=float,
+        default=1.0,
+        help="Default temperature sampling value when a request omits temperature.",
+    )
+    group.add_argument(
         "--default-top-p",
         type=float,
         default=1.0,
@@ -84,6 +90,7 @@ async def _serve(args, model, tokenizer, inference_config):
             parsers=args.parsers,
             verbose=args.verbose,
             frontend_replicas=args.frontend_replicas,
+            default_temperature=args.default_temperature,
             default_top_p=args.default_top_p,
             default_top_k=args.default_top_k,
             eval_mode=args.eval_mode,

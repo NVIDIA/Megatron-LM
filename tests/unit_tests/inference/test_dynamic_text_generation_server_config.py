@@ -43,19 +43,32 @@ class _CapturingClient:
     (
         "eval_mode",
         "request_overrides",
+        "expected_temperature",
         "expected_top_p",
         "expected_top_k",
         "expected_prompt_tokens",
     ),
     [
-        (False, {}, 0.95, 20, True),
-        (True, {}, 0.95, 20, False),
-        (True, {"top_p": 0.8, "top_k": 5, "prevent_retokenization": True}, 0.8, 5, True),
-        (True, {"return_tokenized_data": True}, 0.95, 20, True),
+        (False, {}, 0.7, 0.95, 20, True),
+        (True, {}, 0.7, 0.95, 20, False),
+        (
+            True,
+            {"temperature": 0.4, "top_p": 0.8, "top_k": 5, "prevent_retokenization": True},
+            0.4,
+            0.8,
+            5,
+            True,
+        ),
+        (True, {"return_tokenized_data": True}, 0.7, 0.95, 20, True),
     ],
 )
 async def test_chat_request_uses_server_defaults(
-    eval_mode, request_overrides, expected_top_p, expected_top_k, expected_prompt_tokens
+    eval_mode,
+    request_overrides,
+    expected_temperature,
+    expected_top_p,
+    expected_top_k,
+    expected_prompt_tokens,
 ):
     app = Quart(__name__)
     inference_client = _CapturingClient()
@@ -64,6 +77,7 @@ async def test_chat_request_uses_server_defaults(
         tokenizer=_Tokenizer(),
         parsers=[],
         verbose=False,
+        default_temperature=0.7,
         default_top_p=0.95,
         default_top_k=20,
         eval_mode=eval_mode,
@@ -76,6 +90,7 @@ async def test_chat_request_uses_server_defaults(
     assert response.status_code == 500
     assert len(inference_client.sampling_params) == 1
     sampling_params = inference_client.sampling_params[0]
+    assert sampling_params.temperature == expected_temperature
     assert sampling_params.top_p == expected_top_p
     assert sampling_params.top_k == expected_top_k
     assert sampling_params.return_prompt_tokens is expected_prompt_tokens
@@ -89,6 +104,7 @@ async def test_completions_request_uses_server_sampling_defaults():
         client=inference_client,
         tokenizer=_Tokenizer(),
         verbose=False,
+        default_temperature=0.6,
         default_top_p=0.9,
         default_top_k=0,
     )
@@ -99,5 +115,6 @@ async def test_completions_request_uses_server_sampling_defaults():
     assert response.status_code == 500
     assert len(inference_client.sampling_params) == 1
     sampling_params = inference_client.sampling_params[0]
+    assert sampling_params.temperature == 0.6
     assert sampling_params.top_p == 0.9
     assert sampling_params.top_k == 0

@@ -50,6 +50,9 @@ class ServeConfig:
     Must already be bound to a real port; when set, `host` / `port` are not used for binding.
     """
 
+    default_temperature: float = 1.0
+    """Default temperature value when an HTTP request omits `temperature`."""
+
     default_top_p: float = 1.0
     """Default top-p value when an HTTP request omits `top_p`."""
 

@@ -93,8 +93,9 @@ currently returns `"model": "EMPTY"` and does not validate the request
 
 For evaluation or other pure-serving workloads, pass `--eval-mode` to
 avoid returning prompt token IDs unless a request explicitly asks for them.
-Use `--default-top-p` and `--default-top-k` to change sampling defaults for
-requests that omit those fields; request-level values always take precedence.
+Use `--default-temperature`, `--default-top-p`, and `--default-top-k` to change
+sampling defaults for requests that omit those fields; request-level values
+always take precedence.
 
 ### Advanced examples
 
