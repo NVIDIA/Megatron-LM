@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     NCCLM2NCopyService,
+    _has_nccl_cuda_backend,
     _M2NChannel,
     _parameter_groups,
     _stage_pairs,
@@ -57,6 +58,21 @@ def test_validate_nccl_version():
     _validate_nccl_version(_nccl_with_version(2, 30, 5))
     with pytest.raises(RuntimeError, match=r"NCCL >= 2\.30\.5"):
         _validate_nccl_version(_nccl_with_version(2, 30, 4))
+
+
+def test_hybrid_group_uses_registered_nccl_cuda_backend(monkeypatch):
+    cuda_backend = SimpleNamespace(_get_backend_name=lambda: "nccl")
+    group = SimpleNamespace(_get_backend=lambda device: cuda_backend)
+    monkeypatch.setattr(dist, "get_backend", lambda _group: "gloo")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    assert _has_nccl_cuda_backend(group)
+
+    def get_missing_backend(_device):
+        raise RuntimeError("no CUDA backend")
+
+    gloo_only_group = SimpleNamespace(_get_backend=get_missing_backend)
+    assert not _has_nccl_cuda_backend(gloo_only_group)
 
 
 def test_validate_role_roster_accepts_source_first_disjoint_meshes():

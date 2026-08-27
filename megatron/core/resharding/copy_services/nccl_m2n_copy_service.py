@@ -119,6 +119,19 @@ def _validate_nccl_version(nccl_module: Any) -> None:
         raise RuntimeError(f"NCCL M2N requires NCCL >= {required}, found {version}")
 
 
+def _has_nccl_cuda_backend(group: Any) -> bool:
+    """Return whether CUDA collectives on *group* dispatch through NCCL."""
+    if dist.get_backend(group) == dist.Backend.NCCL:
+        return True
+    if group is None:
+        return False
+    try:
+        cuda_backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+    except RuntimeError:
+        return False
+    return cuda_backend._get_backend_name() == dist.Backend.NCCL
+
+
 def _stage_pairs(specs: list[TensorReshardSpec]) -> tuple[_StagePair, ...]:
     """Return the deterministic communicator roster used by every rank."""
     return tuple(sorted({(spec.src_ranks, spec.dst_ranks) for spec in specs}))
@@ -206,7 +219,7 @@ class NCCLM2NCopyService(CopyService):
         super().__init__(group=group)
 
         self._device = torch.device("cuda", torch.cuda.current_device())
-        if dist.get_backend(group) != "nccl":
+        if not _has_nccl_cuda_backend(group):
             raise RuntimeError("NCCLM2NCopyService requires an NCCL process group")
 
         _validate_nccl_version(nccl)
