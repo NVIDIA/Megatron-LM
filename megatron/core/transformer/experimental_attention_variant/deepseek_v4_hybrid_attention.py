@@ -935,7 +935,16 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 else:
                     q_len = q.size()[0]
                     # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided so direct forward accepts any sequence length.
+                    # is not provided so direct forward accepts any sequence length.  A
+                    # TP/sequence-parallel projection may append alignment rows after
+                    # the table was created from the unpadded input length; regenerate
+                    # the table in that case instead of relying on a broadcast that
+                    # fails one row short in the BSHD path.
+                    if local_rotary_pos_emb is not None and local_rotary_pos_emb.size(0) < q_len:
+                        if self._dsv4_uses_yarn_rope:
+                            local_rotary_pos_emb, _ = self.rotary_pos_emb(q_len, packed_seq=packed_seq)
+                        else:
+                            local_rotary_pos_emb = self.rotary_pos_emb(q_len, packed_seq=packed_seq)
                     local_rotary_pos_emb = local_rotary_pos_emb[0:q_len]
 
                     # q_no_pe: [num_tokens, n, qk_head_dim]
