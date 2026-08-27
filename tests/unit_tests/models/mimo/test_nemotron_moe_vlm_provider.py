@@ -273,6 +273,34 @@ def test_configs_follow_stock_dtype_args():
         assert config.bf16 is False
 
 
+def test_dense_tower_config_drops_language_wide_residual_settings():
+    """Vision and projector configs must not inherit the language residual architecture."""
+    from types import SimpleNamespace
+
+    from examples.mimo.model_providers.radio_encoder import _make_dense_non_hybrid
+
+    config = SimpleNamespace(
+        num_moe_experts=128,
+        moe_ffn_hidden_size=1856,
+        moe_shared_expert_intermediate_size=3712,
+        moe_grouped_gemm=True,
+        moe_router_fusion=True,
+        moe_permute_fusion=True,
+        moe_shared_expert_overlap=True,
+        is_hybrid_model=True,
+        use_fused_weighted_squared_relu=True,
+        wide_residual=object(),
+        residual_stream_recompute_num_layers=4,
+        recompute_modules=["moe_act", "residual_stream"],
+    )
+
+    _make_dense_non_hybrid(config)
+
+    assert config.wide_residual is None
+    assert config.residual_stream_recompute_num_layers is None
+    assert config.recompute_modules == ["moe_act"]
+
+
 def test_language_model_spec_builds_mamba():
     """language_model_spec returns a MambaModel spec carrying the preset config."""
     from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec

@@ -26,14 +26,25 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
+from megatron.core.transformer.residual_recompute import (
+    build_residual_stream_recompute_plan,
+    residual_stream_recompute_enabled,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.wide_residual_layer import (
+    build_wide_residual_readout,
+    expand_wide_residual_stream,
+    specialize_wide_residual_layer_spec,
+)
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -102,6 +113,9 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        # MTP consumes the main decoder readout and shifted-token embedding at hidden_size.
+        # Its auxiliary stack therefore remains ordinary width even when the decoder is wide.
+        self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -140,6 +154,13 @@ class HybridStack(MegatronModule):
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
 
+        def configure_layer_spec(layer_spec: Union[ModuleSpec, type]) -> Union[ModuleSpec, type]:
+            if self.uses_wide_residual_stream:
+                return specialize_wide_residual_layer_spec(layer_spec, self.config)
+            return layer_spec
+
+        mtp_layer_kwargs = {"is_mtp_layer": True} if is_mtp_layer else {}
+
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
@@ -153,16 +174,17 @@ class HybridStack(MegatronModule):
             with quant_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
-                        submodules.mamba_layer,
+                        configure_layer_spec(submodules.mamba_layer),
                         config=self.config,
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        **mtp_layer_kwargs,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
-                        submodules.attention_layer,
+                        configure_layer_spec(submodules.attention_layer),
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -173,7 +195,7 @@ class HybridStack(MegatronModule):
                     )
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
-                        submodules.dsa_layer,
+                        configure_layer_spec(submodules.dsa_layer),
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -184,7 +206,7 @@ class HybridStack(MegatronModule):
                     )
                 elif layer_type == LayerSymbols.MLA:
                     layer = build_module(
-                        submodules.mla_layer,
+                        configure_layer_spec(submodules.mla_layer),
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -194,16 +216,17 @@ class HybridStack(MegatronModule):
                     )
                 elif layer_type == LayerSymbols.MLP:
                     layer = build_module(
-                        submodules.mlp_layer,
+                        configure_layer_spec(submodules.mlp_layer),
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        **mtp_layer_kwargs,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
-                        submodules.moe_layer,
+                        configure_layer_spec(submodules.moe_layer),
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -221,7 +244,7 @@ class HybridStack(MegatronModule):
                         gdn_layer_spec = copy.deepcopy(gdn_layer_spec)
                         gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
                     layer = build_module(
-                        gdn_layer_spec,
+                        configure_layer_spec(gdn_layer_spec),
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -229,6 +252,7 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
+                        **mtp_layer_kwargs,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
@@ -239,6 +263,12 @@ class HybridStack(MegatronModule):
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+        self.residual_stream_readout = (
+            build_wide_residual_readout(self.config)
+            if self.post_process and self.uses_wide_residual_stream
+            else None
+        )
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
@@ -333,6 +363,11 @@ class HybridStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
+        if self.uses_wide_residual_stream and self.pre_process:
+            hidden_states = expand_wide_residual_stream(
+                hidden_states, self.config.wide_residual.num_streams
+            )
+
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
@@ -380,6 +415,18 @@ class HybridStack(MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
+        use_residual_stream_recompute = (
+            self.uses_wide_residual_stream
+            and residual_stream_recompute_enabled(self.config, self.training)
+        )
+        residual_stream_recompute_plan = (
+            build_residual_stream_recompute_plan(
+                len(self.layers), self.config.residual_stream_recompute_num_layers
+            )
+            if use_residual_stream_recompute
+            else [None] * len(self.layers)
+        )
+
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
@@ -402,6 +449,12 @@ class HybridStack(MegatronModule):
                         hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                             layer_index, hidden_states
                         )
+                    residual_stream_recompute_context = residual_stream_recompute_plan[layer_index]
+                    residual_recompute_kwargs = {}
+                    if residual_stream_recompute_context is not None:
+                        residual_recompute_kwargs["residual_stream_recompute_context"] = (
+                            residual_stream_recompute_context
+                        )
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
@@ -416,8 +469,22 @@ class HybridStack(MegatronModule):
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
+                                **residual_recompute_kwargs,
                             )
-                        else:  # MambaLayer, Expert, or MLP
+                        elif isinstance(layer, MambaLayer):
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=layer_packed_seq_params,
+                                **residual_recompute_kwargs,
+                            )
+                        else:  # Expert or MLP
+                            if residual_stream_recompute_context is not None:
+                                raise TypeError(
+                                    "Residual-stream recomputation in HybridStack supports "
+                                    "TransformerLayer and MambaLayer modules only."
+                                )
                             hidden_states = layer(
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
@@ -432,6 +499,11 @@ class HybridStack(MegatronModule):
                         hidden_states = hidden_states[0]
                     if cp_layout_state is not None:
                         hidden_states = cp_layout_state.finalize_layer(layer_index, hidden_states)
+                    if residual_stream_recompute_context is not None:
+                        residual_stream_recompute_context.finalize(hidden_states)
+
+        if self.residual_stream_readout is not None:
+            hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

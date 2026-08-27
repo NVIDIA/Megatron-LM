@@ -71,7 +71,7 @@ def _base_config(args: argparse.Namespace) -> TransformerConfig:
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:
-    """Strip language-only MoE/Mamba/hybrid settings inherited from the base config."""
+    """Strip language-only architecture settings inherited from the base config."""
     config.num_moe_experts = None
     config.moe_ffn_hidden_size = None
     config.moe_shared_expert_intermediate_size = None
@@ -81,6 +81,12 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     config.moe_shared_expert_overlap = False
     config.is_hybrid_model = False
     config.use_fused_weighted_squared_relu = False
+    config.wide_residual = None
+    config.residual_stream_recompute_num_layers = None
+    if config.recompute_modules is not None:
+        config.recompute_modules = [
+            module for module in config.recompute_modules if module != "residual_stream"
+        ]
 
 
 def _disable_gtp(config: TransformerConfig) -> None:

@@ -52,6 +52,54 @@ except ImportError:
 
 
 @dataclass
+class WideResidualConfig:
+    """Configuration for streamwise wide residuals around ordinary-width branches.
+
+    The model carries ``num_streams`` contiguous residual streams, each with
+    ``TransformerConfig.hidden_size`` features. Attention, MLP, and MoE branches
+    continue to operate at the ordinary hidden size.
+    """
+
+    num_streams: int
+    """Number of ordinary-width streams carried by the model; must be greater than one."""
+
+    streamwise_sigmoid_init_scale: float = 0.01
+    """Symmetric initialization spread for streamwise write logits."""
+
+    learned_retention: bool = False
+    """Apply one bounded learned carry factor to each residual stream."""
+
+    retention_init: float = 0.999
+    """Initial retention factor; values near one preserve the initial function."""
+
+    retention_max_forget: float = 0.10
+    """Maximum forget rate in ``1 - max_forget * sigmoid(-logit)``."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.num_streams, bool) or not isinstance(self.num_streams, int):
+            raise TypeError("wide residual num_streams must be an integer.")
+        if self.num_streams <= 1:
+            raise ValueError(
+                f"wide residual num_streams must be greater than one, got {self.num_streams}."
+            )
+        if self.streamwise_sigmoid_init_scale < 0.0:
+            raise ValueError(
+                "streamwise_sigmoid_init_scale must be non-negative, got "
+                f"{self.streamwise_sigmoid_init_scale}."
+            )
+        if self.learned_retention:
+            if not 0.0 < self.retention_max_forget < 1.0:
+                raise ValueError(
+                    f"retention_max_forget must be in (0, 1), got {self.retention_max_forget}."
+                )
+            if not 1.0 - self.retention_max_forget < self.retention_init < 1.0:
+                raise ValueError(
+                    "retention_init must satisfy 1 - retention_max_forget < "
+                    f"retention_init < 1, got {self.retention_init}."
+                )
+
+
+@dataclass
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
@@ -561,7 +609,8 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc".
+    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "residual_stream".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -577,9 +626,11 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_mhc_connections=True. Cannot be used with "mlp".
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
-    "mhc" use output-discarding checkpointing, "core_attn", "mlp", "moe", and
-    "shared_experts" use normal checkpointing.
+    "residual_stream": replay wide-residual reads, connected norms, and writes via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager.
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    and "residual_stream" use output-discarding checkpointing; "core_attn", "mlp", "moe",
+    and "shared_experts" use normal checkpointing.
     """
 
     ####################
@@ -1176,6 +1227,23 @@ class TransformerConfig(ModelParallelConfig):
     Must be a positive integer when set."""
 
     ####################
+    # Wide Residual Configuration
+    ####################
+    wide_residual: Optional[WideResidualConfig] = None
+    """Optional streamwise wide-residual architecture configuration.
+
+    When set, the model carries ``num_streams * hidden_size`` features between
+    layers while attention and MLP branches continue to operate at ``hidden_size``.
+    """
+
+    residual_stream_recompute_num_layers: Optional[int] = None
+    """Number of local layers per ordered residual-stream replay block.
+
+    ``None`` places all local layers in one block. This setting requires selective
+    recomputation with ``"residual_stream"`` in ``recompute_modules``.
+    """
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
@@ -1454,6 +1522,29 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        if self.wide_residual is not None:
+            if self.enable_mhc_connections:
+                raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
+            if self.pipeline_model_parallel_size > 1:
+                raise NotImplementedError(
+                    "wide_residual does not yet support pipeline_model_parallel_size > 1. "
+                    "Inter-stage communication buffers are still sized from hidden_size."
+                )
+            if self.inference_fuse_tp_communication:
+                raise NotImplementedError(
+                    "wide_residual is not compatible with inference_fuse_tp_communication. "
+                    "The fused inference path assumes an ordinary-width residual tensor."
+                )
+            if self.fp32_residual_connection:
+                raise NotImplementedError(
+                    "wide_residual does not yet support fp32_residual_connection."
+                )
+            if self.heterogeneous_block_specs:
+                raise NotImplementedError(
+                    "wide_residual does not yet support heterogeneous_block_specs. "
+                    "Residual-stream width is currently owned by the enclosing block."
+                )
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
@@ -2015,6 +2106,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_in_proj",
                     "gdp_qkv",
                     "mhc",
+                    "residual_stream",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2110,6 +2202,47 @@ class TransformerConfig(ModelParallelConfig):
                     "the offloading backward chunk is initialized, causing tensor_pop "
                     "on a None chunk. Disable one of them."
                 )
+
+        use_residual_stream_recompute = (
+            self.recompute_granularity == "selective"
+            and "residual_stream" in self.recompute_modules
+        )
+        if "residual_stream" in self.recompute_modules and not use_residual_stream_recompute:
+            raise ValueError(
+                "'residual_stream' in recompute_modules requires "
+                "recompute_granularity='selective'."
+            )
+        if use_residual_stream_recompute:
+            if self.wide_residual is None:
+                raise ValueError(
+                    "'residual_stream' recomputation requires a configured wide residual stream."
+                )
+            if self.residual_stream_recompute_num_layers is not None and (
+                isinstance(self.residual_stream_recompute_num_layers, bool)
+                or not isinstance(self.residual_stream_recompute_num_layers, int)
+                or self.residual_stream_recompute_num_layers < 1
+            ):
+                raise ValueError(
+                    "residual_stream_recompute_num_layers must be a positive integer or None."
+                )
+            if self.fine_grained_activation_offloading:
+                replay_owned_norms = {"attn_norm", "mlp_norm"} & set(self.offload_modules or [])
+                if replay_owned_norms:
+                    warnings.warn(
+                        "Residual-stream recomputation owns residual reads, connected-branch "
+                        "norms, and writes. Fine-grained activation offloading will skip "
+                        f"{sorted(replay_owned_norms)} only on connected branches."
+                    )
+            if self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "'residual_stream' recomputation requires cuda_graph_impl='none' because "
+                    "its Python checkpoint manager remains outside CUDA graph capture."
+                )
+        elif self.residual_stream_recompute_num_layers is not None:
+            raise ValueError(
+                "residual_stream_recompute_num_layers requires selective recomputation with "
+                "'residual_stream' in recompute_modules."
+            )
 
         if self.enable_mhc_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
