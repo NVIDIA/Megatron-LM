@@ -43,6 +43,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.paged_stash import (
     get_paged_stash_context,
+    mark_paged_stash_recompute_managed,
     paged_stash_group_commit,
     paged_stash_group_start,
 )
@@ -969,6 +970,8 @@ class TEGroupedMLP(MegatronModule):
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
+            if self.config.moe_paged_stash:
+                mark_paged_stash_recompute_managed(bias_act_output)
         else:
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)

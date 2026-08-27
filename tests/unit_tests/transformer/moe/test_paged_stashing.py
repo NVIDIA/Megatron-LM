@@ -15,6 +15,7 @@ from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantizat
 from megatron.core.transformer.moe.paged_stash import (
     PagedStashManager,
     check_paged_stash_overflow,
+    mark_paged_stash_recompute_managed,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
 )
@@ -138,6 +139,8 @@ class MoEModelTestContainer:
             activation_func=kwargs.get("activation_func", F.gelu),
             bias_activation_fusion=kwargs.get("bias_activation_fusion", False),
             activation_func_fp8_input_store=kwargs.get("activation_func_fp8_input_store", False),
+            recompute_granularity=kwargs.get("recompute_granularity", None),
+            recompute_modules=kwargs.get("recompute_modules", None),
             moe_router_force_biased=kwargs.get("moe_router_force_biased", None),
             # Shrinking the CUDA factor and zeroing the CPU one (no host-spill fallback) is how
             # a test forces a paged-stash overflow: the pool is provisioned once at the
@@ -278,6 +281,16 @@ _MXFP8_SKIP_REASON = (
 )
 
 
+def test_recompute_managed_tensor_bypasses_paged_stash_save_hook():
+    tensor = torch.randn(8, 4)
+    tensor.grouped_tensor_scale_inv = False
+    mark_paged_stash_recompute_managed(tensor)
+
+    # The ownership check happens before the manager needs CUDA streams or capture state.
+    manager = object.__new__(PagedStashManager)
+    assert manager.on_save_for_backward(tensor) is tensor
+
+
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
 @pytest.mark.skipif(
     not _te_grouped_tensor_environment_supported(),
@@ -319,10 +332,13 @@ class TestPagedStashingGroupedTensor:
             gated_linear_unit=True,
             activation_func=F.silu,
             bias_activation_fusion=True,
+            recompute_granularity="selective",
+            recompute_modules=["moe_act"],
         )
 
         assert container.config.use_transformer_engine_op_fuser is False
         assert container.config.moe_use_grouped_tensor is True
+        assert container.config.recompute_modules == ["moe_act"]
 
         hidden_states = torch.randn((1024, 1, container.config.hidden_size), dtype=torch.bfloat16)
 
