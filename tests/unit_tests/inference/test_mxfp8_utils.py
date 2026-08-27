@@ -11,6 +11,7 @@ Tests cover:
 import pytest
 import torch
 
+from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize, mxfp8_quantize_into
 from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
 
 pytestmark = [
@@ -149,8 +150,6 @@ class TestMxfp8Quantize:
     )
     def test_data_matches_reference(self, M, K):
         """Quantized FP8 data matches PyTorch reference."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         torch.manual_seed(42)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
 
@@ -180,8 +179,6 @@ class TestMxfp8Quantize:
     )
     def test_scales_match_reference(self, M, K):
         """Swizzled scales match ref_to_mxfp scales passed through ref_swizzle."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         torch.manual_seed(42)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
 
@@ -199,8 +196,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 2688)])
     def test_all_zeros_input(self, M, K):
         """All-zero input produces all-zero FP8 data and zero scales."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         x = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
         data, scales = mxfp8_quantize(x)
         assert (data.float() == 0).all()
@@ -209,8 +204,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 256)])
     def test_constant_input(self, M, K):
         """Constant input: all elements in a group have the same value."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         x = torch.full((M, K), 1.0, device="cuda", dtype=torch.bfloat16)
         data, _ = mxfp8_quantize(x)
         _, ref_data = ref_to_mxfp(x)
@@ -221,8 +214,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
     def test_input_dtypes(self, dtype):
         """Kernel accepts bf16, fp16, and fp32 inputs."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         x = torch.randn(16, 128, device="cuda", dtype=dtype)
         data, _ = mxfp8_quantize(x)
         assert data.dtype == torch.float8_e4m3fn
@@ -231,8 +222,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("M", [1, 127, 128, 129, 255, 256, 257, 512])
     def test_various_row_counts(self, M):
         """Test row counts that are not multiples of 128 (macro tile boundary)."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         K = 128
         torch.manual_seed(42)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -245,14 +234,31 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("seed", [0, 7, 42, 123, 999])
     def test_reproducible(self, seed):
         """Same input always produces same output."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         torch.manual_seed(seed)
         x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
         d1, s1 = mxfp8_quantize(x)
         d2, s2 = mxfp8_quantize(x)
         torch.testing.assert_close(d1.view(torch.uint8), d2.view(torch.uint8), atol=0, rtol=0)
         torch.testing.assert_close(s1.view(torch.uint8), s2.view(torch.uint8), atol=0, rtol=0)
+
+    def test_quantize_into_reuses_storage_and_clears_padding(self):
+        """Existing output buffers match allocating quantization byte-for-byte."""
+        torch.manual_seed(42)
+        x = torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)
+        expected_data, expected_scale = mxfp8_quantize(x)
+        out_data = torch.empty_like(expected_data)
+        out_scale = torch.full_like(expected_scale.view(torch.uint8), 0xFF).view(
+            torch.float8_e8m0fnu
+        )
+        data_ptr = out_data.data_ptr()
+        scale_ptr = out_scale.data_ptr()
+
+        mxfp8_quantize_into(x, out_data, out_scale)
+
+        assert out_data.data_ptr() == data_ptr
+        assert out_scale.data_ptr() == scale_ptr
+        assert torch.equal(out_data, expected_data)
+        assert torch.equal(out_scale.view(torch.uint8), expected_scale.view(torch.uint8))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -300,6 +306,22 @@ class TestMXFP8Tensor:
         )
         with pytest.raises(ValueError, match="shape mismatch"):
             tensor.copy_(torch.randn(32, 128, device="cuda", dtype=torch.bfloat16))
+
+    def test_triton_copy_does_not_allocate_quantized_outputs(self, monkeypatch):
+        source = torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)
+        tensor = MXFP8Tensor.from_bf16(source, backend="triton")
+        updated = torch.randn_like(source)
+        expected = MXFP8Tensor.from_bf16(updated, backend="triton")
+
+        def fail_from_bf16(*args, **kwargs):
+            raise AssertionError("Triton copy_ allocated temporary quantized outputs")
+
+        monkeypatch.setattr(MXFP8Tensor, "from_bf16", fail_from_bf16)
+
+        tensor.copy_(updated)
+
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
     def test_copy_requires_backend(self):
         source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)

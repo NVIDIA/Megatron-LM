@@ -3,8 +3,10 @@
 import pytest
 import torch
 
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.execution import execute_reshard_plan
+from megatron.core.resharding.transforms import MXFP8ReshardTransform
 from megatron.core.resharding.utils import ReshardPlan, TransferOp
 
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
@@ -154,6 +156,26 @@ class TestMXFP8ReshardTransform:
             assert buf.scale.data_ptr() == scale_ptr
             assert buf.backend == "triton"
             assert buf.scale.dtype == torch.float8_e8m0fnu
+
+    def test_full_prepare_recv_skips_staging_zero_fill(self, monkeypatch):
+        """A complete receive need not initialize storage that the transport overwrites."""
+        buf = MXFP8Tensor.from_bf16(
+            torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), backend="triton"
+        )
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={"weight": buf},
+            buffer_key_prefix="decoder.",
+        )
+
+        def fail_zeros(*args, **kwargs):
+            raise AssertionError("full receive unexpectedly zero-initialized staging storage")
+
+        monkeypatch.setattr(torch, "zeros", fail_zeros)
+        recv_buffers = transform.prepare_recv("decoder.weight", (slice(None), slice(None)))
+
+        assert recv_buffers[0].shape == buf.shape
+        assert recv_buffers[0].dtype == torch.bfloat16
 
     def test_sender_side_conversion_supports_explicit_triton_backend(self):
         """A sender without persistent buffers can select the Triton wire format."""
