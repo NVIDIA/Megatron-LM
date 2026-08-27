@@ -378,13 +378,9 @@ class MegatronOptimizer(ABC):
         norm and clipped independently using their group norm.
         """
         self.grad_norms_by_group = {}
-        params = self.get_parameters()
-        # Go through get_grad_norm() so a subclass that computes the norm differently
-        # clips by the value it reports. The base implementation is unchanged. Called
-        # unconditionally: it reduces over the grad-stats group even with no local
-        # parameters, and skipping it on a param-less rank would strand the others.
         grad_norm = self.get_grad_norm()
 
+        params = self.get_parameters()
         if clip_grad > 0.0 and params:
             # Only reduce group grad norms when clipping can use them.
             self._compute_grad_norms_by_group()
