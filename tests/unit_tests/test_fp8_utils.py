@@ -67,11 +67,7 @@ def test_fp8_model_init_uses_custom_recipe_attrs(monkeypatch):
         captured["kwargs"] = kwargs
         return nullcontext()
 
-    monkeypatch.setattr(
-        fp8_utils.transformer_engine.pytorch,
-        "fp8_model_init",
-        fake_fp8_model_init,
-    )
+    monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "fp8_model_init", fake_fp8_model_init)
 
     config = TransformerConfig(
         num_layers=1,

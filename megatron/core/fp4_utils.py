@@ -226,7 +226,7 @@ if HAVE_TE:
                     )
                 except AttributeError:
                     raise ValueError("""NVFP4BlockScaling recipe is not available in this version of
-                        Transformer Engine. Please make sure you are using TE version
+                        Transformer Engine. Please make sure you are using TE version 
                         >= 2.7.0.dev0.""")
             elif config.fp4_recipe == Fp4Recipe.custom:
                 fp4_recipe = _get_custom_recipe(config.fp4_quantizer_factory)
