@@ -18,7 +18,6 @@ from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
-    _indexed_grouped_weight,
     _mok_mxfp8_backward_weight_views,
     _native_single_grouped_weight_views,
     _native_split_weight_view,
@@ -121,14 +120,8 @@ class MoKMegakernel(MegakernelBackend):
             self._routed_fc1_parameter_names = []
             self._routed_fc2_parameter_names = []
             for expert_idx in range(self.num_local_experts):
-                fc1_param = _indexed_grouped_weight(fc1, expert_idx, self.num_local_experts)
-                fc2_param = _indexed_grouped_weight(fc2, expert_idx, self.num_local_experts)
-                if not isinstance(fc1_param, nn.Parameter) or not isinstance(
-                    fc2_param, nn.Parameter
-                ):
-                    raise RuntimeError(
-                        "MOK non-single integration requires registered per-expert Parameters"
-                    )
+                fc1_param = fc1.get_parameter(f"weight{expert_idx}")
+                fc2_param = fc2.get_parameter(f"weight{expert_idx}")
                 fc1_name = f"routed_fc1_weight{expert_idx}"
                 fc2_name = f"routed_fc2_weight{expert_idx}"
                 self.register_parameter(fc1_name, fc1_param)

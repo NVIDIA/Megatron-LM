@@ -45,27 +45,6 @@ def prepare_shared_expert_config(config: TransformerConfig) -> TransformerConfig
     return shared_config
 
 
-def _indexed_grouped_weight(linear: nn.Module, index: int, num_experts: int) -> torch.Tensor:
-    """Return one logical expert weight from either TE grouped layout."""
-    if not getattr(linear, "single_grouped_weight", False):
-        return getattr(linear, f"weight{index}")
-
-    weight = linear.weight
-    split_quantized = getattr(weight, "split_into_quantized_tensors", None)
-    if callable(split_quantized):
-        return split_quantized()[index]
-    if weight.ndim >= 3 and weight.shape[0] == num_experts:
-        return weight[index]
-    if weight.shape[0] % num_experts != 0:
-        raise RuntimeError(
-            f"Cannot split grouped weight with shape {tuple(weight.shape)} "
-            f"into {num_experts} experts"
-        )
-    return weight.narrow(
-        0, index * (weight.shape[0] // num_experts), weight.shape[0] // num_experts
-    )
-
-
 def _storage_view(
     storage: torch.Tensor, shape: tuple[int, ...], *, dtype: torch.dtype, name: str
 ) -> torch.Tensor:
