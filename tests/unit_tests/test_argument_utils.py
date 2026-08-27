@@ -1,20 +1,24 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import signal
+import sys
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Union
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    core_transformer_config_from_args,
     pretrain_cfg_container_from_args,
 )
+from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
 
 
@@ -39,6 +43,57 @@ class DummyConfig:
 
     enum_setting: signal.Signals = signal.SIGTERM
     """Setting with enum type to test enum handling"""
+
+
+@dataclass(init=False)
+class CapturingTransformerConfig:
+    """Minimal config that records kwargs produced by core_transformer_config_from_args."""
+
+    moe_use_norm_before_up_proj: bool = False
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def test_moe_norm_flag_reaches_transformer_config():
+    """The generated LatentMoE norm flag should populate the model config."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    default_args = parser.parse_args([])
+    assert default_args.moe_use_norm_before_up_proj is False
+
+    enabled_args = parser.parse_args(["--moe-use-norm-before-up-proj"])
+    # params_dtype has no CLI flag of its own; validate_args normally derives it.
+    enabled_args.params_dtype = torch.float32
+    config = core_transformer_config_from_args(
+        enabled_args, config_class=CapturingTransformerConfig
+    )
+
+    assert config.moe_use_norm_before_up_proj is True
+
+
+def test_moe_norm_flag_requires_latent_size(monkeypatch):
+    """validate_args should reject the LatentMoE norm flag without a latent size."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    # Let validate_args derive a global batch size that is valid for the
+    # active data-parallel size in distributed unit-test jobs.
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    args.moe_use_norm_before_up_proj = True
+    args.moe_latent_size = None
+
+    with pytest.raises(AssertionError, match="--moe-use-norm-before-up-proj requires"):
+        validate_args(args)
 
 
 @dataclass
@@ -676,6 +731,29 @@ class TestMegatronNetworkArgumentGeneration:
         args = parser.parse_args([])
         for field_name in callback_fields:
             assert not hasattr(args, field_name)
+
+
+class TestMegatronMixedPrecisionArguments:
+    """Test language-model logit dtype CLI choices."""
+
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_mixed_precision_args
+
+        return _add_mixed_precision_args(ArgumentParser(exit_on_error=False))
+
+    def test_logit_dtype_defaults_to_input_dtype(self):
+        args = self._parser().parse_args([])
+        assert args.logit_dtype is None
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+    def test_logit_dtype_accepts_supported_choices(self, dtype):
+        args = self._parser().parse_args(["--output-logit-dtype", dtype])
+        assert args.logit_dtype == dtype
+
+    def test_logit_dtype_rejects_fp16(self):
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            self._parser().parse_args(["--output-logit-dtype", "fp16"])
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.dist_checkpointing.models.common import common_test_pg_distribution_cache_e2e
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, reason_for_no_fp8 = check_fp8_support()
@@ -131,6 +132,35 @@ class TestExpertLayerReconfiguration:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('save_load_process_group', ['dp', 'ep_dp'])
+    @pytest.mark.parametrize(('tp', 'pp', 'ep'), [(1, 1, 1), (1, 1, 2), (1, 2, 2), (2, 1, 2)])
+    @pytest.mark.parametrize('expert_type', expert_type)
+    def test_pg_distribution_cache_e2e(
+        self, tmp_path_dist_ckpt, tp, pp, ep, expert_type, save_load_process_group
+    ):
+        """MoE experts must round-trip identically through the PG-distribution cache.
+
+        Experts are the case the cache targets: they dominate the shard count and can
+        be distributed over either parallelization group that
+        --ckpt-fully-parallel-{save,load}-process-group selects, so both 'dp' and
+        'ep_dp' are covered here, across tensor, pipeline and expert parallelism.
+        """
+        Utils.initialize_model_parallel(tp, pp, expert_model_parallel_size=ep)
+        if save_load_process_group == 'ep_dp':
+            parallelization_group = parallel_state.get_expert_data_parallel_group()
+        else:
+            parallelization_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            )
+        common_test_pg_distribution_cache_e2e(
+            lambda seed: initialize_expert_layer(seed, expert_type=expert_type),
+            tmp_path_dist_ckpt,
+            parallelization_group,
+            sharded_state_dict_fn=lambda model: model.sharded_state_dict(
+                prefix=f'{parallel_state.get_pipeline_model_parallel_rank()}.'
+            ),
+        )
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -346,6 +376,7 @@ class TestExpertLayerReconfiguration:
     def test_sequential_grouped_mlp_extra_state(
         self,
         tmp_path_dist_ckpt,
+        monkeypatch,
         src_tp_pp_exp,
         dest_tp_pp_exp,
         src_module,
@@ -393,6 +424,8 @@ class TestExpertLayerReconfiguration:
                 ckpt_dir_A,
                 load_strategy,
             )
+            # This checkpoint was created by the test and is therefore trusted.
+            monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
             model_A.load_state_dict(
                 {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
             )
