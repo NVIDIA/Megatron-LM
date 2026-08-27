@@ -449,7 +449,7 @@ def test_own_metadata_class(tmp_path):
     )
     with pytest.raises(ValueError, match="trust_custom_tokenizer=True"):
         MegatronTokenizer.from_pretrained(
-            tokenizer_path=tokenizer_path, metadata_path=untrusted_path
+            tokenizer_path=tokenizer_path, metadata_path=str(untrusted_path)
         )
 
     tokenizer = MegatronTokenizer.from_pretrained(
