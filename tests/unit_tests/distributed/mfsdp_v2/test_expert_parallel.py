@@ -38,27 +38,24 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer
 
-
-def _no_shard_placements() -> Placements:
-    return Placements(
-        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
-    )
+_NO_SHARD = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
+)
 
 
-def _zero1_placements() -> Placements:
-    return Placements(
-        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
-    )
+_ZERO1_SHARD = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
+)
 
 
-def _zero2_placements() -> Placements:
-    return Placements(
-        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
-    )
+_ZERO2_SHARD = Placements(
+    dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+)
 
 
-def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+_FLAT_SHARD = Placements(
+    dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+)
 
 
 def _transformer_config(
@@ -157,18 +154,16 @@ def _train(
 
 
 @pytest.mark.parametrize(
-    "dense_placements_factory",
-    [_no_shard_placements, _zero1_placements, _zero2_placements, _flat_placements],
+    "dense_placements",
+    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _FLAT_SHARD],
     ids=["no-shard", "zero1", "zero2", "zero3"],
 )
 @pytest.mark.parametrize(
-    "moe_placements_factory",
-    [_no_shard_placements, _zero1_placements, _zero2_placements, _flat_placements],
+    "moe_placements",
+    [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _FLAT_SHARD],
     ids=["no-shard", "zero1", "zero2", "zero3"],
 )
-def test_ep_fsdp_matches_fullbatch_reference(
-    distributed_setup, dense_placements_factory, moe_placements_factory
-):
+def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements, moe_placements):
     """All dense/MoE ZeRO combinations reproduce sequential no-shard training."""
     device = distributed_setup.device
     world_size, rank = distributed_setup.world_size, distributed_setup.rank
@@ -239,10 +234,10 @@ def test_ep_fsdp_matches_fullbatch_reference(
                 fully_shard(
                     decoder_layer.mlp.experts,
                     mesh=moe_mesh["edp"],
-                    placements=moe_placements_factory(),
+                    placements=moe_placements,
                     grad_divisor=ep_size,
                 )
-        fully_shard(model, mesh=world_mesh, placements=dense_placements_factory())
+        fully_shard(model, mesh=world_mesh, placements=dense_placements)
 
     # One global batch, identical on every rank; the reference sees all of it, the model its shard.
     torch.manual_seed(4321)
