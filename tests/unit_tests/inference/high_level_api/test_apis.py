@@ -198,6 +198,45 @@ class TestLifecycleGuards:
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True
 
+    @pytest.mark.asyncio
+    async def test_async_serve_primary_rank_starts_frontend(self, monkeypatch):
+        """Async serving forwards sampling defaults to the HTTP frontend."""
+        tgs = pytest.importorskip(
+            "megatron.core.inference.text_generation_server.dynamic_text_gen_server"
+            ".text_generation_server"
+        )
+        import torch.distributed as dist
+
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        llm._is_primary_rank = True
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.coord_addr = "tcp://coord:5555"
+
+        started = {}
+        monkeypatch.setattr(dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
+
+        sock = MagicMock()
+        await llm.serve(
+            ServeConfig(
+                port=1234,
+                sock=sock,
+                default_temperature=0.7,
+                default_top_p=0.95,
+                default_top_k=20,
+                eval_mode=True,
+            ),
+            blocking=False,
+        )
+        assert llm._serve_started is True
+        assert started["coordinator_addr"] == "tcp://coord:5555"
+        assert started["server_port"] == 1234
+        assert started["sock"] is sock
+        assert started["default_temperature"] == 0.7
+        assert started["default_top_p"] == 0.95
+        assert started["default_top_k"] == 20
+        assert started["eval_mode"] is True
+
 
 class TestNormalizePrompts:
     """Input-shape normalization (str / list[int] / list[str] / list[list[int]])."""

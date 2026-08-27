@@ -97,24 +97,49 @@ async def test_chat_request_uses_server_defaults(
 
 
 @pytest.mark.asyncio
-async def test_completions_request_uses_server_sampling_defaults():
+@pytest.mark.parametrize(
+    (
+        "default_temperature",
+        "default_top_p",
+        "default_top_k",
+        "request_overrides",
+        "expected_temperature",
+        "expected_top_p",
+        "expected_top_k",
+    ),
+    [
+        (0.6, 0.9, 0, {}, 0.6, 0.9, 0),
+        (0.6, 0.9, 0, {"temperature": 0.4, "top_p": 0.8, "top_k": 5}, 0.4, 0.8, 5),
+        (0.0, 0.9, 20, {}, 0.0, 0.0, 1),
+    ],
+)
+async def test_completions_request_uses_sampling_defaults_and_overrides(
+    default_temperature,
+    default_top_p,
+    default_top_k,
+    request_overrides,
+    expected_temperature,
+    expected_top_p,
+    expected_top_k,
+):
     app = Quart(__name__)
     inference_client = _CapturingClient()
     app.config.update(
         client=inference_client,
         tokenizer=_Tokenizer(),
         verbose=False,
-        default_temperature=0.6,
-        default_top_p=0.9,
-        default_top_k=0,
+        default_temperature=default_temperature,
+        default_top_p=default_top_p,
+        default_top_k=default_top_k,
     )
     app.register_blueprint(completions_blueprint)
 
-    response = await app.test_client().post("/v1/completions", json={"prompt": "hello"})
+    payload = {"prompt": "hello", **request_overrides}
+    response = await app.test_client().post("/v1/completions", json=payload)
 
     assert response.status_code == 500
     assert len(inference_client.sampling_params) == 1
     sampling_params = inference_client.sampling_params[0]
-    assert sampling_params.temperature == 0.6
-    assert sampling_params.top_p == 0.9
-    assert sampling_params.top_k == 0
+    assert sampling_params.temperature == expected_temperature
+    assert sampling_params.top_p == expected_top_p
+    assert sampling_params.top_k == expected_top_k
