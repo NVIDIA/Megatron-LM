@@ -332,13 +332,16 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
     app = quart.Quart(__name__)
     app.config.update(client=service, tokenizer=service.tokenizer, verbose=False)
     app.register_blueprint(bp)
+    encoded_media = base64.b64encode(_MEDIA_BYTES).decode("ascii")
+    if modality == "video":
+        encoded_media = f"data:video/mp4;base64,{encoded_media}"
 
     response = await app.test_client().post(
         "/v1/completions",
         json={
             "prompt": _PROMPT_TOKENS,
             "max_tokens": 1,
-            "multi_modal_data": {modality: base64.b64encode(_MEDIA_BYTES).decode("ascii")},
+            "multi_modal_data": {modality: encoded_media},
         },
     )
 
@@ -351,3 +354,33 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
     assert int((service.last_request.image_token_mask >= 0).sum()) == (
         service.last_request.image_embeddings.shape[0]
     )
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("multi_modal_data", "error"),
+    [
+        ({"audio": "payload"}, "Unsupported multimodal modalities"),
+        ({"image": "aW1hZ2U=", "video": "dmlkZW8="}, "cannot mix image and video"),
+        ({"video": ["dmlkZW8=", 1]}, "must be a string or list"),
+    ],
+)
+async def test_completions_rejects_invalid_multimodal_payloads(multi_modal_data, error):
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.completions import (
+        bp,
+    )
+
+    service = _ToyInferenceService(VLMInferenceWrapper, deserialize=False)
+    app = quart.Quart(__name__)
+    app.config.update(client=service, tokenizer=service.tokenizer, verbose=False)
+    app.register_blueprint(bp)
+
+    response = await app.test_client().post(
+        "/v1/completions", json={"prompt": _PROMPT_TOKENS, "multi_modal_data": multi_modal_data}
+    )
+
+    assert response.status_code == 400
+    assert error in (await response.get_data(as_text=True))
+    assert service.last_request is None
