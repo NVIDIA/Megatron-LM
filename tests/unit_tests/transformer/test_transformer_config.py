@@ -46,6 +46,21 @@ def test_batch_invariant_backend_rejects_unknown_value_at_construction():
         )
 
 
+def test_contiguous_cp_accepts_mtp_sequence_roll_support():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        context_parallel_size=2,
+        linear_cp_layout="contiguous",
+        attention_cp_layout="zigzag",
+        mtp_num_layers=1,
+    )
+
+    assert config.linear_cp_layout == "contiguous"
+    assert config.mtp_num_layers == 1
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 

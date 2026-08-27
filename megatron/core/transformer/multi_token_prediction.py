@@ -15,9 +15,11 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.fused_mtp_prefix import mtp_e2e_prefix_objective
+from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
@@ -30,6 +32,12 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollContext,
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_fields,
+)
+from megatron.core.transformer.mtp_sequence_roll import roll_tensor as roll_tensors_with_context
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -929,9 +937,177 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _process_mtp_e2e_tv_loss(
+    hidden_states_list: tuple[Tensor, ...],
+    loss_mask: Tensor,
+    output_layer: Callable,
+    output_weight: Tensor,
+    runtime_gather_output: Optional[bool],
+    is_training: bool,
+    config: TransformerConfig,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams],
+    scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
+    sequence_roll_context: Optional[MTPSequenceRollContext],
+    derived_labels_from_input_ids: bool,
+) -> Tensor:
+    """Apply the end-to-end TV objective to MTP draft hidden states.
+
+    The frozen backbone is projected once. For depth ``i``, its target logits are
+    shifted by ``i + 1`` positions to align with the MTP draft distribution for
+    the same future token. Only start positions with a complete chain across all
+    configured MTP depths contribute to the objective.
+    """
+    hidden_states = hidden_states_list[0]
+    logits_are_vocab_sharded = _mtp_logits_are_vocab_sharded(output_layer, runtime_gather_output)
+
+    # Project the frozen backbone once, then align each target distribution by
+    # rolling logits. Re-projecting one shifted hidden tensor per MTP depth would
+    # add a full vocabulary GEMM for every draft step.
+    with torch.no_grad():
+        target_logits, _ = output_layer(
+            hidden_states.detach(),
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            target_logits = scale_logits_fn(target_logits)
+    num_depths = config.mtp_num_layers
+    max_offset = num_depths + int(derived_labels_from_input_ids)
+    tv_roll_context = prepare_mtp_sequence_roll_fields(
+        sequence_roll_context,
+        (
+            MTPSequenceRollField("target_logits", target_logits, 0, 1, 0),
+            MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0),
+        ),
+        max_offset=max_offset,
+    )
+    use_prepared_roll_rows = tv_roll_context is not None
+    if use_prepared_roll_rows:
+        assert tv_roll_context is not None
+        aligned_loss_masks = tv_roll_context.materialize_all("loss_mask")
+        current_loss_mask = loss_mask
+        original_loss_mask = aligned_loss_masks[0] if derived_labels_from_input_ids else loss_mask
+    else:
+        # Keep vocabulary before sequence for the established cumulative-roll path.
+        target_logits = target_logits.permute(1, 2, 0)
+        current_loss_mask = loss_mask
+        if derived_labels_from_input_ids:
+            current_loss_mask = roll_tensors_with_context(
+                [current_loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=["loss_mask"],
+                roll_depth=0,
+            )[0]
+        original_loss_mask = current_loss_mask
+
+    original_num_tokens = original_loss_mask.sum()
+    chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
+    tv_distances = []
+
+    for mtp_layer_number in range(num_depths):
+        if use_prepared_roll_rows:
+            assert tv_roll_context is not None
+            target_address = tv_roll_context.address("target_logits", mtp_layer_number + 1)
+            current_loss_mask = aligned_loss_masks[
+                mtp_layer_number + int(derived_labels_from_input_ids)
+            ]
+        else:
+            target_logits = roll_tensors_with_context(
+                [target_logits],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                fill_values=[0],
+            )[0]
+            current_loss_mask = roll_tensors_with_context(
+                [current_loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=["loss_mask"],
+                roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
+            )[0]
+        chain_valid &= current_loss_mask.bool()
+
+        draft_logits, _ = output_layer(
+            hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            draft_logits = scale_logits_fn(draft_logits)
+        if use_prepared_roll_rows:
+            tv_distances.append(
+                vocab_parallel_tv_distance(
+                    draft_logits,
+                    target_address.source,
+                    tp_group=tp_group,
+                    logits_are_vocab_sharded=logits_are_vocab_sharded,
+                    target_row_indices=target_address.row_indices,
+                    target_valid_rows=target_address.valid_rows,
+                    target_halo_logits=target_address.halo,
+                )
+            )
+        else:
+            tv_distances.append(
+                vocab_parallel_tv_distance(
+                    draft_logits,
+                    target_logits.permute(2, 0, 1),
+                    tp_group=tp_group,
+                    logits_are_vocab_sharded=logits_are_vocab_sharded,
+                )
+            )
+
+    tv_distances_tensor = torch.stack(tv_distances, dim=0)
+    per_step_acceptance = 1.0 - tv_distances_tensor
+    e2e_tv_loss, prefix_losses = mtp_e2e_prefix_objective(per_step_acceptance)
+
+    chain_mask = chain_valid.transpose(0, 1).to(e2e_tv_loss.dtype)
+    num_tokens = chain_mask.sum()
+    masked_e2e_tv_loss = e2e_tv_loss * chain_mask
+
+    if is_training:
+        avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        for mtp_layer_number in range(config.mtp_num_layers):
+            loss_for_log = torch.sum(
+                prefix_losses[mtp_layer_number] * chain_mask
+            ) / num_tokens.clamp(min=1)
+            correct = torch.sum(per_step_acceptance[mtp_layer_number] * chain_mask)
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                loss_for_log,
+                correct,
+                num_tokens,
+                mtp_layer_number,
+                config.mtp_num_layers,
+                avg_group=avg_group,
+            )
+
+    assert config.mtp_loss_scaling_factor is not None
+    if config.calculate_per_token_loss:
+        normalized_loss = (
+            config.mtp_loss_scaling_factor
+            * masked_e2e_tv_loss
+            * (original_num_tokens / num_tokens.clamp(min=1))
+        )
+    else:
+        normalized_loss = (
+            config.mtp_loss_scaling_factor * masked_e2e_tv_loss / num_tokens.clamp(min=1)
+        )
+    return MTPLossAutoScaler.apply(hidden_states, normalized_loss)
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
-    labels: Tensor,
+    labels: Optional[Tensor],
     loss_mask: Optional[Tensor],
     output_layer: Callable,
     output_weight: Optional[Tensor],
@@ -944,6 +1120,7 @@ def process_mtp_loss(
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
+    sequence_roll_context: Optional[MTPSequenceRollContext] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -969,6 +1146,8 @@ def process_mtp_loss(
             ``labels`` is None (e.g. RL training), by rolling left to match the SFT
             label convention (``label[i] = input_id[i + 1]``). Ignored when ``labels``
             is provided.
+        sequence_roll_context (Optional[MTPSequenceRollContext]): Layout-specific
+            metadata shared by MTP rolls in this microbatch.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -976,16 +1155,16 @@ def process_mtp_loss(
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
-    # When labels are not provided (e.g. RL training), derive them from input_ids by
-    # rolling left so that label[i] = input_id[i + 1], matching the SFT label format.
-    derived_labels_from_input_ids = False
-    if labels is None:
+    derived_labels_from_input_ids = labels is None
+    if derived_labels_from_input_ids:
         if input_ids is None:
             return hidden_states
-        labels, _ = roll_tensor(
-            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
-        )
-        derived_labels_from_input_ids = True
+        if loss_mask is None:
+            loss_mask = torch.ones_like(input_ids)
+    elif loss_mask is None:
+        loss_mask = torch.ones_like(labels)
+
+    assert loss_mask is not None
 
     if config.mtp_detach_heads:
         if output_weight is not None:
@@ -993,21 +1172,59 @@ def process_mtp_loss(
         else:
             output_weight = output_layer.weight.detach()
 
-    mtp_labels = labels.clone()
-    if loss_mask is None:
-        loss_mask = torch.ones_like(mtp_labels)
-    if derived_labels_from_input_ids:
-        # input_ids has no real token beyond the sequence window, so the last rolled-in
-        # label is fabricated (zeroed). Roll loss_mask in lockstep with the
-        # input_ids -> labels shift so that boundary position is masked.
-        loss_mask, _ = roll_tensor(
-            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+    if config.mtp_loss_type == "e2e_tv":
+        assert output_weight is not None
+        return _process_mtp_e2e_tv_loss(
+            hidden_states_list=hidden_states_list,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=is_training,
+            config=config,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            packed_seq_params=packed_seq_params,
+            scale_logits_fn=scale_logits_fn,
+            sequence_roll_context=sequence_roll_context,
+            derived_labels_from_input_ids=derived_labels_from_input_ids,
         )
 
-    # Store the original number of tokens before rolling for proper normalization
-    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
-    # correctly scaled relative to the main loss gradients in finalize_model_grads.
-    original_num_tokens = loss_mask.sum()
+    label_source = input_ids if derived_labels_from_input_ids else labels
+    assert label_source is not None
+    label_key = "input_ids" if derived_labels_from_input_ids else "labels"
+    max_offset = config.mtp_num_layers + int(derived_labels_from_input_ids)
+    loss_roll_context = prepare_mtp_sequence_roll_fields(
+        sequence_roll_context,
+        (
+            MTPSequenceRollField(label_key, label_source, -1, 0, 0),
+            MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0),
+        ),
+        max_offset=max_offset,
+    )
+    use_prepared_roll_rows = loss_roll_context is not None
+    if use_prepared_roll_rows:
+        assert loss_roll_context is not None
+        aligned_labels = loss_roll_context.materialize_all(label_key)
+        aligned_loss_masks = loss_roll_context.materialize_all("loss_mask")
+        original_loss_mask = aligned_loss_masks[0] if derived_labels_from_input_ids else loss_mask
+        mtp_labels = label_source
+    else:
+        mtp_labels = label_source
+        if derived_labels_from_input_ids:
+            mtp_labels, loss_mask = roll_tensors_with_context(
+                [mtp_labels, loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=["input_ids", "loss_mask"],
+                roll_depth=0,
+            )
+        original_loss_mask = loss_mask
+
+    original_num_tokens = original_loss_mask.sum()
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
@@ -1017,12 +1234,23 @@ def process_mtp_loss(
         )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
-        mtp_labels, _ = roll_tensor(
-            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
-        )
-        loss_mask, num_tokens = roll_tensor(
-            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
-        )
+        if use_prepared_roll_rows:
+            offset_index = mtp_layer_number + int(derived_labels_from_input_ids)
+            mtp_labels = aligned_labels[offset_index]
+            loss_mask = aligned_loss_masks[offset_index]
+            num_tokens = loss_mask.sum()
+        else:
+            mtp_labels, loss_mask = roll_tensors_with_context(
+                [mtp_labels, loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=[label_key, "loss_mask"],
+                roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
+            )
+            num_tokens = loss_mask.sum()
 
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
 
@@ -1259,6 +1487,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+        roll_depth: int = 0,
+        _inputs_pre_aligned: bool = False,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -1274,30 +1505,42 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            sequence_roll_context: Layout-specific state shared by MTP rolls.
+            roll_depth: Zero-based prediction depth for the successor row.
+            _inputs_pre_aligned: Whether the block already materialized this absolute row.
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        if padding_mask is not None:
-            padding_mask, _ = roll_tensor(
-                padding_mask,
+        if not _inputs_pre_aligned:
+            tensors_to_roll = [input_ids]
+            fill_values = [0]
+            sequence_fields = ["input_ids"]
+            roll_position_ids = getattr(embedding, "add_position_embedding", True)
+            if roll_position_ids:
+                tensors_to_roll.append(position_ids)
+                fill_values.append(0)
+                sequence_fields.append("position_ids")
+            if padding_mask is not None:
+                tensors_to_roll.append(padding_mask)
+                fill_values.append(True)
+                sequence_fields.append("padding_mask")
+
+            rolled_tensors = roll_tensors_with_context(
+                tensors_to_roll,
                 shifts=-1,
                 dims=-1,
-                cp_group=self.cp_group,
+                cp_group=resolve_cp_group(self.cp_group, packed_seq_params),
                 packed_seq_params=packed_seq_params,
+                fill_values=fill_values,
+                roll_context=sequence_roll_context,
+                sequence_fields=sequence_fields,
+                roll_depth=roll_depth,
             )
+            input_ids = rolled_tensors[0]
+            next_tensor = 1
+            if roll_position_ids:
+                position_ids = rolled_tensors[next_tensor]
+                next_tensor += 1
+            if padding_mask is not None:
+                padding_mask = rolled_tensors[next_tensor]
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -1667,6 +1910,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         attention_bias: Optional[Tensor] = None,
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+        roll_depth: int = 0,
+        _inputs_pre_aligned: bool = False,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
     ):
@@ -1685,6 +1931,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             rotary_pos_cos (Tensor, optional): Cosine component of rotary positional embeddings.
             rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
+            sequence_roll_context: Layout-specific state shared by MTP rolls.
+            roll_depth: Zero-based prediction depth for this layer invocation.
+            _inputs_pre_aligned: Whether the block already selected this absolute row.
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
 
@@ -1700,6 +1949,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             embedding=embedding,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
+            sequence_roll_context=sequence_roll_context,
+            roll_depth=roll_depth,
+            _inputs_pre_aligned=_inputs_pre_aligned,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -1782,6 +2034,23 @@ class MultiTokenPredictionBlockSubmodules:
     """
 
     layer_specs: Optional[List[ModuleSpec]] = None
+
+
+def _scatter_mtp_padding_mask(
+    padding_mask: Optional[Tensor], *, sequence_parallel: bool, tp_group
+) -> Optional[Tensor]:
+    """Convert one globally aligned MTP routing mask to its TP-local layout."""
+    if padding_mask is None or not sequence_parallel:
+        return padding_mask
+    if tp_group is None:
+        raise ValueError("MTP sequence-parallel padding-mask scatter requires a TP group.")
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(), group=tp_group
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
 
 
 def _get_mtp_block_submodules(
@@ -2017,6 +2286,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         attention_bias: Optional[Tensor] = None,
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+        sequence_roll_padding_mask: Optional[Tensor] = None,
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
@@ -2029,6 +2300,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                 where s is the sequence length, b is the batch size, and h is the hidden size.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
+            sequence_roll_context: Layout-specific metadata shared across all MTP depths.
+            sequence_roll_padding_mask: Unsharded padding-mask source for absolute rows.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
@@ -2045,8 +2318,41 @@ class MultiTokenPredictionBlock(MegatronModule):
         if hidden_state_mixing_enabled:
             hidden_state_history = [hidden_states]
 
+        if sequence_roll_padding_mask is not None and padding_mask is None:
+            raise ValueError(
+                "MTP sequence_roll_padding_mask requires the corresponding TP-local padding_mask."
+            )
+        roll_position_ids = getattr(embedding, "add_position_embedding", True)
+        roll_fields = [MTPSequenceRollField("input_ids", input_ids, -1, 0, 0)]
+        if roll_position_ids:
+            roll_fields.append(MTPSequenceRollField("position_ids", position_ids, -1, 0, 0))
+        if sequence_roll_padding_mask is not None:
+            roll_fields.append(
+                MTPSequenceRollField("padding_mask", sequence_roll_padding_mask, -1, 0, True)
+            )
+        prepared_roll_context = None
+        if padding_mask is None or sequence_roll_padding_mask is not None:
+            prepared_roll_context = prepare_mtp_sequence_roll_fields(
+                sequence_roll_context, roll_fields, max_offset=self.config.mtp_num_layers
+            )
+        aligned_rows = None
+        if prepared_roll_context is not None:
+            aligned_rows = {
+                field.key: prepared_roll_context.materialize_all(field.key) for field in roll_fields
+            }
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+            if aligned_rows is not None:
+                input_ids = aligned_rows["input_ids"][iteration]
+                if roll_position_ids:
+                    position_ids = aligned_rows["position_ids"][iteration]
+                if sequence_roll_padding_mask is not None:
+                    padding_mask = _scatter_mtp_padding_mask(
+                        aligned_rows["padding_mask"][iteration],
+                        sequence_parallel=self.sequence_parallel,
+                        tp_group=getattr(self.layers[layer_idx], "tp_group", None),
+                    )
 
             # Older HSM entries predict earlier targets than the newest entry. Roll
             # them once per depth so all candidates correspond to the same target.
@@ -2123,6 +2429,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
+                sequence_roll_context=sequence_roll_context,
+                roll_depth=iteration,
+                _inputs_pre_aligned=aligned_rows is not None,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
                 **(extra_block_kwargs or {}),

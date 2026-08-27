@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -161,7 +161,11 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
 
 
 def _pack_sequences(
-    samples: List, padded_lengths: torch.Tensor, original_lengths: torch.Tensor, dev: torch.device
+    samples: List,
+    padded_lengths: torch.Tensor,
+    original_lengths: torch.Tensor,
+    dev: torch.device,
+    zigzag_cp_min_chunk_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
@@ -195,6 +199,11 @@ def _pack_sequences(
     cu_seqlens[0] = 0
     cu_seqlens[1:] = torch.cumsum(original_lengths, dim=0).reshape(-1)
     new_sample["cu_seqlens"] = cu_seqlens
+
+    if zigzag_cp_min_chunk_size is not None:
+        new_sample["zigzag_cp_min_chunk_size"] = torch.tensor(
+            zigzag_cp_min_chunk_size, dtype=torch.int32, device=dev
+        )
 
     return new_sample
 
@@ -272,6 +281,8 @@ def broadcast_to_pp_group(
             ]
             for sample in new_samples:
                 tensor_list.append(sample["max_seqlen"].reshape(1))
+            for sample in new_samples:
+                tensor_list.append(sample["zigzag_cp_min_chunk_size"].reshape(1))
             tensor_list.append(cu_seqlens_lengths)
             tensor_list.append(cu_seqlens_padded_lengths)
             for sample in new_samples:
@@ -307,6 +318,8 @@ def broadcast_to_pp_group(
                 cursor = 3
                 max_seqlens = info_to_broadcast[cursor : cursor + num_micro_batches]
                 cursor += num_micro_batches
+                zigzag_cp_min_chunk_sizes = info_to_broadcast[cursor : cursor + num_micro_batches]
+                cursor += num_micro_batches
                 cu_seqlens_lengths = info_to_broadcast[cursor : cursor + num_micro_batches].to(
                     torch.int64
                 )
@@ -322,6 +335,9 @@ def broadcast_to_pp_group(
                     cu_seqlens_padded_len = int(cu_seqlens_padded_lengths[i].item())
                     new_sample = {}
                     new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
+                    new_sample["zigzag_cp_min_chunk_size"] = zigzag_cp_min_chunk_sizes[i].to(
+                        torch.int32
+                    )
                     new_sample["cu_seqlens"] = info_to_broadcast[
                         cursor : cursor + cu_seqlens_len
                     ].to(torch.int32)
@@ -382,7 +398,15 @@ def create_data_iterator(new_samples, pp_group, tp_group, config):
         if tp_group.rank() == 0:
             if pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1:
                 metadata = [
-                    {k: sample[k] for k in ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]}
+                    {
+                        k: sample[k]
+                        for k in [
+                            "max_seqlen",
+                            "cu_seqlens",
+                            "cu_seqlens_padded",
+                            "zigzag_cp_min_chunk_size",
+                        ]
+                    }
                     for sample in new_samples
                 ]
                 if pp_group.rank() == 0:
@@ -525,13 +549,35 @@ def reroute_samples_to_dcp_ranks(
 
 
 def build_packed_microbatches(
-    grouped_samples: List[List[Dict[str, torch.Tensor]]], dev: torch.device
+    grouped_samples: List[List[Dict[str, torch.Tensor]]],
+    dev: torch.device,
+    sample_id_groups: Optional[List[List[List[int]]]] = None,
+    dcp_rank: Optional[int] = None,
+    global_id_seqlens: Optional[List[Tuple[int, int]]] = None,
 ) -> List[Dict[str, torch.Tensor]]:
-    """Build packed samples for each microbatch."""
+    """Build packed samples and optional zigzag one-hop scheduler certificates."""
     num_micro_batches = len(grouped_samples)
     seg_starts: List[int] = [0]
     original_lens_tensors = []
     padded_lens_tensors = []
+
+    can_certify_zigzag = (
+        sample_id_groups is not None and dcp_rank is not None and global_id_seqlens is not None
+    )
+    effective_cp_sizes: List[int] = []
+    if can_certify_zigzag:
+        assert sample_id_groups is not None
+        assert dcp_rank is not None
+        for microbatch_groups in sample_id_groups:
+            sample_ids_this_rank = microbatch_groups[dcp_rank]
+            assert sample_ids_this_rank, "Each scheduled DCP rank must own at least one sample."
+            effective_cp_sizes.append(
+                sum(
+                    sample_ids_this_rank[0] in rank_sample_ids
+                    for rank_sample_ids in microbatch_groups
+                )
+            )
+    padded_length_by_id = dict(global_id_seqlens) if global_id_seqlens is not None else None
 
     for i in range(num_micro_batches):
         samples = grouped_samples[i]
@@ -547,7 +593,26 @@ def build_packed_microbatches(
         samples = grouped_samples[i]
         lens_padded = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         lens_original = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
-        new_sample = _pack_sequences(samples, lens_padded, lens_original, dev)
+        zigzag_cp_min_chunk_size = None
+        if can_certify_zigzag:
+            assert sample_id_groups is not None
+            assert dcp_rank is not None
+            assert padded_length_by_id is not None
+            divisor = 2 * effective_cp_sizes[i]
+            padded_lengths_host = [
+                padded_length_by_id[sample_id] for sample_id in sample_id_groups[i][dcp_rank]
+            ]
+            if any(length % divisor != 0 for length in padded_lengths_host):
+                zigzag_cp_min_chunk_size = 0
+            else:
+                zigzag_cp_min_chunk_size = min(length // divisor for length in padded_lengths_host)
+        new_sample = _pack_sequences(
+            samples,
+            lens_padded,
+            lens_original,
+            dev,
+            zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
+        )
         new_samples.append(new_sample)
 
     return new_samples

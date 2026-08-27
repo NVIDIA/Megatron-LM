@@ -400,6 +400,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.padding_mask = padding_mask
+        self._model_chunk_state.mtp_padding_mask = padding_mask
+        self._model_chunk_state.mtp_sequence_roll_context = None
+        self._model_chunk_state.mtp_materialized_roll_rows = None
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.output_processor = output_processor
@@ -432,16 +435,26 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if module is None:
             return
         plan_cls = self.LAYER_SCHEDULE_PLAN_CLASS or TransformerLayerSchedulePlan
-        num_layers = len(module.layers)
-        for layer_idx in range(num_layers):
+        is_mtp_module = module is getattr(self._model_chunk_state.model, "mtp", None)
+        is_repeated_mtp = bool(is_mtp_module and getattr(module, "mtp_use_repeated_layer", False))
+        if is_repeated_mtp:
+            assert len(module.layers) == 1
+            num_layers = int(getattr(module, "mtp_num_depths", 0) or module.config.mtp_num_layers)
+            physical_layer = module.layers[0]
+            scheduled_layers = tuple(
+                (physical_layer, physical_layer.layer_number + logical_index)
+                for logical_index in range(num_layers)
+            )
+        else:
+            num_layers = len(module.layers)
+            scheduled_layers = tuple(
+                (layer, layer.layer_number if is_mtp_module else None) for layer in module.layers
+            )
+        for layer_idx, (layer, mtp_absolute_depth) in enumerate(scheduled_layers):
             extra_args = self._extra_args_for_layer(module, layer_idx, num_layers)
+            extra_args["mtp_absolute_depth"] = mtp_absolute_depth
             layer_plan = plan_cls(
-                module.layers[layer_idx],
-                self.event,
-                self.state,
-                comp_stream,
-                comm_stream,
-                extra_args,
+                layer, self.event, self.state, comp_stream, comm_stream, extra_args
             )
             self._transformer_layers.append(layer_plan)
 
@@ -488,6 +501,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
+        self._model_chunk_state.mtp_sequence_roll_context = None
+        self._model_chunk_state.mtp_materialized_roll_rows = None
         self._model_chunk_state.model = None
         self.pre_process.model_chunk_state = None
         self.pre_process = None

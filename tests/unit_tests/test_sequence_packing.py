@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+import megatron.core.datasets.data_schedule as data_schedule
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
     _build_thd_padding_mask,
@@ -14,9 +15,53 @@ from megatron.core.datasets.data_schedule import (
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.datasets.data_schedule_utils import build_packed_microbatches
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
+
+
+class _HostProcessGroup:
+    """Minimal rank/size interface for host-only batch metadata tests."""
+
+    def __init__(self, size=1, rank=0):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
+@pytest.mark.parametrize(("padded_lengths", "expected_min_chunk"), [((8, 12), 2), ((8, 10), 0)])
+def test_build_packed_microbatches_certifies_zigzag_chunk_size(padded_lengths, expected_min_chunk):
+    """The host schedule emits one conservative certificate per packed microbatch."""
+    samples = []
+    for padded_length in padded_lengths:
+        samples.append(
+            {
+                "tokens": torch.arange(padded_length, dtype=torch.int64),
+                "labels": torch.arange(padded_length, dtype=torch.int64),
+                "loss_mask": torch.ones(padded_length, dtype=torch.float32),
+                "position_ids": torch.arange(padded_length, dtype=torch.int64),
+                "original_seq_len": torch.tensor([padded_length - 1], dtype=torch.int32),
+                "padded_seq_len": torch.tensor([padded_length], dtype=torch.int32),
+            }
+        )
+    sample_id_groups = [[[0, 1], [0, 1]]]
+
+    packed = build_packed_microbatches(
+        [samples],
+        torch.device("cpu"),
+        sample_id_groups=sample_id_groups,
+        dcp_rank=0,
+        global_id_seqlens=list(enumerate(padded_lengths)),
+    )
+
+    assert len(packed) == 1
+    assert packed[0]["zigzag_cp_min_chunk_size"].item() == expected_min_chunk
 
 
 def test_scheduler_thd_padding_mask_from_cu_seqlens():
@@ -45,6 +90,96 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+@pytest.mark.parametrize(
+    ("cuda_graph_impl", "expected_certificate"), [("none", 2), ("full_iteration", None)]
+)
+def test_sequence_packing_certificate_is_graph_safe(
+    monkeypatch, cuda_graph_impl, expected_certificate
+):
+    """Full-iteration capture must stay on the certificate-independent fallback path."""
+    group = _HostProcessGroup()
+    pg_collection = SimpleNamespace(tp=group, pp=group, cp=group)
+    batch = {
+        "tokens": torch.arange(8, dtype=torch.int64),
+        "position_ids": torch.arange(8, dtype=torch.int64),
+        "labels": torch.arange(8, dtype=torch.int64),
+        "loss_mask": torch.ones(8, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+        "zigzag_cp_min_chunk_size": torch.tensor([2], dtype=torch.int32),
+    }
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: [0])
+    monkeypatch.setattr(
+        data_schedule, "broadcast_scalars", lambda values, *_args, **_kwargs: values
+    )
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *_args, **_kwargs: None)
+
+    *_, packed_seq_params, _ = get_batch_on_this_rank_for_sequence_packing(
+        iter([batch]),
+        pg_collection=pg_collection,
+        config=SimpleNamespace(cuda_graph_impl=cuda_graph_impl),
+    )
+
+    assert packed_seq_params.zigzag_cp_min_chunk_size == expected_certificate
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "pp_rank", "vpp_size", "vp_stage"),
+    [(3, 1, None, None), (2, 0, 2, 1)],
+    ids=["middle-pp", "middle-vpp"],
+)
+def test_sequence_packing_mtp_middle_stage_receives_cp_sliced_fields(
+    monkeypatch, pp_size, pp_rank, vpp_size, vp_stage
+):
+    """An MTP-only PP/VPP stage owns both model inputs and loss fields."""
+    tp_group = _HostProcessGroup()
+    pp_group = _HostProcessGroup(size=pp_size, rank=pp_rank)
+    cp_group = _HostProcessGroup(size=2, rank=0)
+    pg_collection = SimpleNamespace(tp=tp_group, pp=pp_group, cp=cp_group)
+    expected_indices = torch.tensor([0, 1, 6, 7], dtype=torch.int64)
+    batch = {
+        "tokens": torch.arange(8, dtype=torch.int64),
+        "position_ids": torch.arange(8, dtype=torch.int64),
+        "labels": torch.arange(8, dtype=torch.int64) + 1,
+        "loss_mask": torch.ones(8, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+        "zigzag_cp_min_chunk_size": torch.tensor([2], dtype=torch.int32),
+    }
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: [0])
+    monkeypatch.setattr(
+        data_schedule, "broadcast_scalars", lambda values, *_args, **_kwargs: values
+    )
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        data_schedule,
+        "tex",
+        SimpleNamespace(thd_get_partitioned_indices=lambda *_args: expected_indices),
+    )
+
+    tokens, labels, loss_mask, _, position_ids, _, padding_mask = (
+        get_batch_on_this_rank_for_sequence_packing(
+            iter([batch]),
+            vpp_size=vpp_size,
+            mtp_on_this_rank=True,
+            vp_stage=vp_stage,
+            pg_collection=pg_collection,
+        )
+    )
+
+    assert torch.equal(tokens, torch.tensor([[0, 1, 6, 7]]))
+    assert torch.equal(position_ids, torch.tensor([[0, 1, 6, 7]]))
+    assert torch.equal(labels, torch.tensor([[1, 2, 7, 8]]))
+    assert torch.equal(loss_mask, torch.ones(1, 4))
+    assert torch.equal(padding_mask, torch.zeros(1, 4, dtype=torch.bool))
 
 
 class MockVariableLengthSequencePackingDataIterator:

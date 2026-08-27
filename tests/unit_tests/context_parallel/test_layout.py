@@ -175,6 +175,7 @@ def test_packed_zigzag_layout_uses_padded_metadata(monkeypatch):
         max_seqlen_q=9,
         max_seqlen_kv=9,
         total_tokens=16,
+        cp_partition_mode="contiguous",
     )
     plan = SimpleNamespace(
         cu_seqlens_padded=target_cu_seqlens_padded, max_seqlen_padded=16, pad_between_seqs=True
@@ -196,6 +197,7 @@ def test_packed_zigzag_layout_uses_padded_metadata(monkeypatch):
     assert zigzag_params.max_seqlen_q == 16
     assert zigzag_params.max_seqlen_kv == 16
     assert zigzag_params.pad_between_seqs
+    assert zigzag_params.cp_partition_mode == "zigzag"
     assert zigzag_params.total_tokens is None
     assert zigzag_params.seq_idx is None
 

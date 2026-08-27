@@ -344,6 +344,7 @@ def forward_step(data_iterator, model: HybridModel):
             cp_group=hybrid_cp_group,
             total_tokens=total_tokens,
             tokens_per_sample=args.seq_length,
+            cp_partition_mode=args.linear_cp_layout,
         )
 
     timers('batch-generator').stop()

@@ -80,6 +80,14 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_loss_type: str = "cross_entropy"
+    """Training objective for Multi-Token Prediction (MTP) heads.
+
+    Supported values are ``cross_entropy`` and ``e2e_tv``. The end-to-end total
+    variation objective directly optimizes the normalized expected acceptance
+    length under rejection-sampling verification.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1438,14 +1446,6 @@ class TransformerConfig(ModelParallelConfig):
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
-        if (
-            self.linear_cp_layout == "contiguous"
-            and self.context_parallel_size > 1
-            and (self.mtp_num_layers or 0) > 0
-        ):
-            raise ValueError(
-                "linear_cp_layout='contiguous' with context parallelism does not yet support MTP."
-            )
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1476,6 +1476,20 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.mtp_hsm and (self.mtp_num_layers is None or self.mtp_num_layers < 2):
             raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
+
+        if self.mtp_loss_type not in ("cross_entropy", "e2e_tv"):
+            raise ValueError(
+                "mtp_loss_type must be one of 'cross_entropy' or 'e2e_tv', "
+                f"got {self.mtp_loss_type!r}."
+            )
+        if self.mtp_loss_type == "e2e_tv":
+            if self.mtp_num_layers is None or self.mtp_num_layers < 1:
+                raise ValueError("mtp_loss_type='e2e_tv' requires mtp_num_layers >= 1.")
+            if not self.mtp_detach_heads:
+                raise ValueError(
+                    "mtp_loss_type='e2e_tv' requires mtp_detach_heads=True so the target "
+                    "distribution and shared backbone remain frozen."
+                )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

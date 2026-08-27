@@ -800,6 +800,7 @@ def test_forward_step_exposes_actual_thd_lengths_for_contiguous_cp(
     assert torch.equal(packed_seq_params.cu_seqlens_kv, expected_cu_seqlens)
     assert torch.equal(packed_seq_params.cu_seqlens_q_padded, padded_cu_seqlens[0])
     assert packed_seq_params.total_tokens == 8
+    assert packed_seq_params.cp_partition_mode == linear_cp_layout
 
 
 def create_pretrain_data_iterator(

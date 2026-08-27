@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -25,8 +26,17 @@ class PackedSeqParams:
     total_tokens: int = None
     seq_idx: Tensor = None
     tokens_per_sample: int = None
-    pad_between_seqs: bool = None
+    pad_between_seqs: Optional[bool] = None
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     cp_scatter_cache: object = None
+    # Host-side certificate produced by the packing scheduler. None leaves
+    # zigzag packed-CP MTP on its established roll path. Zero records that the
+    # scheduler inspected the layout but could not certify one-hop addressing;
+    # a positive value proves the minimum non-empty half-chunk size. The
+    # certificate is runtime transport metadata, not part of a graph signature.
+    zigzag_cp_min_chunk_size: Optional[int] = field(
+        default=None, compare=False, metadata={"cuda_graph_ignore": True}
+    )
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -41,6 +51,12 @@ class PackedSeqParams:
         cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
         included.
         """
+        if self.zigzag_cp_min_chunk_size is not None and (
+            isinstance(self.zigzag_cp_min_chunk_size, bool)
+            or not isinstance(self.zigzag_cp_min_chunk_size, int)
+        ):
+            raise TypeError("zigzag_cp_min_chunk_size must be a host int or None.")
+
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
@@ -67,3 +83,12 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def resolve_cp_group(
+    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
+) -> dist.ProcessGroup:
+    """Return the dynamic CP group from packed_seq_params when available, else the static one."""
+    if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+        return packed_seq_params.cp_group
+    return static_cp_group

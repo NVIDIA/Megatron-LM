@@ -14,7 +14,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -25,6 +25,10 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -551,6 +555,41 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
+        mtp_cp_group = None
+        sequence_roll_context = None
+        if (
+            self.config.mtp_num_layers
+            and self.mtp_process
+            and compute_mtp_loss
+            and not (in_inference_mode or is_spec_decode)
+        ):
+            mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            reference = input_ids if input_ids is not None else labels
+            sequence_roll_context = prepare_mtp_sequence_roll_context(
+                reference, mtp_cp_group, packed_seq_params
+            )
+            if sequence_roll_context is not None:
+                fields = []
+                if input_ids is not None:
+                    fields.append(MTPSequenceRollField("input_ids", input_ids, -1, 0, 0))
+                if position_ids is not None and getattr(
+                    self.embedding, "add_position_embedding", True
+                ):
+                    fields.append(MTPSequenceRollField("position_ids", position_ids, -1, 0, 0))
+                if self.post_process and labels is not None:
+                    fields.append(MTPSequenceRollField("labels", labels, -1, 0, 0))
+                if self.post_process and loss_mask is not None:
+                    fields.append(MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0))
+                if padding_mask is not None:
+                    fields.append(MTPSequenceRollField("padding_mask", padding_mask, -1, 0, True))
+                if fields:
+                    max_offset = self.config.mtp_num_layers + int(
+                        self.post_process and labels is None
+                    )
+                    sequence_roll_context = sequence_roll_context.prepare_fields(
+                        fields, max_offset=max_offset
+                    )
+
         mtp_forward_ran = (
             self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
         )
@@ -563,6 +602,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
+                sequence_roll_context=sequence_roll_context,
+                sequence_roll_padding_mask=padding_mask,
+                padding_mask=padding_mask,
                 embedding=self.embedding,
             )
 
@@ -598,11 +640,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    sequence_roll_context=sequence_roll_context,
                 )
         sequence_parallel_override = False
         if (
