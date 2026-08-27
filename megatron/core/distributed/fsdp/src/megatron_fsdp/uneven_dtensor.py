@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
+import json
 from typing import Iterable, List, Union
 
 import torch
@@ -26,14 +28,54 @@ from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, Wri
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
+# Distinguishes successive preprocess_state_dict_for_uneven_dtensor calls in the store
+# key namespace. Consistent across ranks because the save path is collective.
+_stale_mesh_gather_generation = itertools.count()
+
+
+def _stale_mesh_dim_gather(mesh_tensor: torch.Tensor, key_prefix: str):
+    """Exchange per-mesh-dim shard shapes through the default store for a stale mesh.
+
+    Returns ``dim_gather(mesh_dim, shape) -> (rank_in_dim, gathered_shapes)`` where
+    the gather spans the ranks of this rank's pencil of ``mesh_tensor`` along
+    ``mesh_dim``. Only the pencil's member ranks participate, matching the group
+    semantics of the live-mesh path; the store keys make each (generation, tensor,
+    dim, rank) exchange unique, so no cross-rank creation-order agreement is needed.
+    The values are metadata-sized; keys are left to expire with the store.
+    """
+    store = dist.distributed_c10d._get_default_store()
+    my_rank = dist.get_rank()
+    coords = (mesh_tensor == my_rank).nonzero()
+    assert coords.shape[0] == 1, (
+        f"rank {my_rank} must appear exactly once in the stale DeviceMesh layout "
+        f"{mesh_tensor.tolist()} to recompute its chunk metadata"
+    )
+    coord = coords[0].tolist()
+
+    def dim_gather(mesh_dim: int, shape: List[int]):
+        index = list(coord)
+        index[mesh_dim] = slice(None)
+        pencil = mesh_tensor[tuple(index)].flatten().tolist()
+        prefix = f"{key_prefix}/dim{mesh_dim}"
+        store.set(f"{prefix}/{my_rank}", json.dumps(shape))
+        gathered = [json.loads(store.get(f"{prefix}/{peer}")) for peer in pencil]
+        return pencil.index(my_rank), gathered
+
+    return dim_gather
+
 
 def gather_and_compute_chunk_metadata(
-    dtensor: DTensor, device_mesh: DeviceMesh | None = None
+    dtensor: DTensor, device_mesh: DeviceMesh | None = None, dim_gather=None
 ) -> ChunkStorageMetadata:
     """
     Gather chunk metadata for a DTensor across all ranks and compute the
     offsets and sizes of each chunk. This is necessary for handling uneven
     sharding in distributed tensors.
+
+    When ``dim_gather`` is given, the per-mesh-dim shape exchange goes through it
+    instead of the mesh's process groups; used when the DTensor carries a stale
+    DeviceMesh whose groups no longer exist (see preprocess_state_dict_for_uneven_dtensor).
+    ``dim_gather(mesh_dim, shape)`` must return ``(rank_in_dim, gathered_shapes)``.
     """
     local_tensor = dtensor.to_local()
     local_shape = local_tensor.shape
@@ -45,16 +87,19 @@ def gather_and_compute_chunk_metadata(
     def _update_offsets_and_cumulative_shape(
         mesh_dim: int, offsets: List[int], cumulative_shape: List[int]
     ):
-        shard_group = device_mesh.get_group(mesh_dim)
         shard_dim = p.dim
 
         # Synchronize local shard dimensions across ranks
-        world_size = dist.get_world_size(shard_group)
-        global_shapes = [None] * world_size
-        dist.all_gather_object(global_shapes, cumulative_shape, group=shard_group)
+        if dim_gather is not None:
+            rank, global_shapes = dim_gather(mesh_dim, list(cumulative_shape))
+        else:
+            shard_group = device_mesh.get_group(mesh_dim)
+            world_size = dist.get_world_size(shard_group)
+            global_shapes = [None] * world_size
+            dist.all_gather_object(global_shapes, cumulative_shape, group=shard_group)
+            rank = dist.get_rank(shard_group)
 
         # Calculate global offset for current rank's shard
-        rank = dist.get_rank(shard_group)
         offset = sum(s[shard_dim] for s in global_shapes[:rank])
         # TODO: add documentation for the offset calculation
         # Add on the offset of the current mesh dimension
@@ -97,7 +142,7 @@ def gather_and_compute_chunk_metadata(
 
 
 def update_uneven_dtensor_chunk_metadata(
-    dtensor: DTensor, device_mesh: DeviceMesh | None = None
+    dtensor: DTensor, device_mesh: DeviceMesh | None = None, dim_gather=None
 ) -> dict:
     """
     Update the DTensor's chunk metadata to handle uneven sharding.
@@ -136,7 +181,7 @@ def update_uneven_dtensor_chunk_metadata(
     #    to amortize synchronization overhead
     if device_mesh is None:
         device_mesh = dtensor.device_mesh
-    uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor, device_mesh)
+    uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor, device_mesh, dim_gather)
 
     # Set the chunk list and write items closure for the DTensor
     dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
@@ -251,43 +296,30 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     visit_dtensor = filter_unflattened_state_dict(
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
     )
-    temporary_meshes = {}
-    temporary_groups = []
-    try:
-        # Sort the keys, since some state dictionaries are mocked
-        # and extended to include empty global keys.
-        for key_chain in sorted(visit_dtensor):
-            # Get the DTensor at the key chain
-            dtensor = get_unflattened_state_dict(state_dict, key_chain)
-            mesh = dtensor.device_mesh
-            try:
-                mesh.get_all_groups()
-            except RuntimeError:
-                # A checkpoint can carry a DeviceMesh whose c10d group names belong to a
-                # different process lifetime. Recreate equivalent groups from its rank layout
-                # only long enough to compute DCP's chunk metadata; never retain the old groups.
-                mesh_key = (
-                    mesh.device_type,
-                    tuple(mesh.mesh.flatten().tolist()),
-                    mesh.mesh_dim_names,
-                )
-                if mesh_key not in temporary_meshes:
-                    temporary_mesh = DeviceMesh(
-                        mesh.device_type, mesh.mesh, mesh_dim_names=mesh.mesh_dim_names
-                    )
-                    if hasattr(mesh, "_shard_order"):
-                        temporary_mesh._shard_order = mesh._shard_order
-                    temporary_meshes[mesh_key] = temporary_mesh
-                    temporary_groups.extend(
-                        group
-                        for group in temporary_mesh.get_all_groups()
-                        if group is not dist.group.WORLD
-                    )
-                mesh = temporary_meshes[mesh_key]
-            update_uneven_dtensor_chunk_metadata(dtensor, mesh)
-    finally:
-        for group in reversed(temporary_groups):
-            dist.destroy_process_group(group)
+    generation = next(_stale_mesh_gather_generation)
+    # Sort the keys, since some state dictionaries are mocked
+    # and extended to include empty global keys.
+    for key_chain in sorted(visit_dtensor):
+        # Get the DTensor at the key chain
+        dtensor = get_unflattened_state_dict(state_dict, key_chain)
+        mesh = dtensor.device_mesh
+        dim_gather = None
+        try:
+            mesh.get_all_groups()
+        except RuntimeError:
+            # A checkpoint can carry a DeviceMesh whose c10d group names belong to a
+            # different process lifetime. Recreating groups from its rank layout is not
+            # safe: each rank sees only its own slice of the mesh, so ranks would call
+            # new_group with differing rank lists and creation counts, and torch's group
+            # naming (both the sequential and the locally-deduped hashed scheme) then
+            # cross-wires the rendezvous. Exchange the shard shapes through the default
+            # store instead; it needs no group, no rendezvous, and no cross-rank
+            # ordering agreement.
+            key_str = "/".join(map(str, key_chain))
+            dim_gather = _stale_mesh_dim_gather(
+                mesh.mesh.cpu(), f"mfsdp_uneven_meta/{generation}/{key_str}"
+            )
+        update_uneven_dtensor_chunk_metadata(dtensor, mesh, dim_gather=dim_gather)
     return state_dict
 
 
