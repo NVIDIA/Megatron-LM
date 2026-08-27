@@ -9,7 +9,7 @@ import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -28,17 +28,27 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -148,6 +158,8 @@ class HybridStack(MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
         self.pg_collection = pg_collection
+
+        self._mhc_block_end_plan: Optional[List[bool]] = None
 
         assert layer_config_list is not None
         self.layer_config_list = layer_config_list
@@ -276,6 +288,8 @@ class HybridStack(MegatronModule):
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
                     )
 
+            if self.config.enable_mhc_connections:
+                layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
@@ -291,6 +305,18 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+            hc_mult = self.config.mhc_num_residual_streams
+            hc_dim = self.config.hidden_size * hc_mult
+            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+            nn.init.xavier_uniform_(self.hc_head_fn)
+            if self.config.sequence_parallel:
+                setattr(self.hc_head_fn, 'sequence_parallel', True)
+                setattr(self.hc_head_base, 'sequence_parallel', True)
+                setattr(self.hc_head_scale, 'sequence_parallel', True)
 
     @property
     def layer_type_list(self) -> list[str]:
@@ -341,8 +367,55 @@ class HybridStack(MegatronModule):
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
             if type(layer_config) is layer_utils.GDNLayerConfig:
+                if hasattr(layer, 'mamba_state_shapes_per_request'):
+                    state_shapes = layer.mamba_state_shapes_per_request()
+                    if state_shapes is not None:
+                        return state_shapes
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
+
+    def _compute_mhc_block_end_plan(self) -> List[bool]:
+        """Compute deterministic per-layer mHC recompute block boundaries."""
+        num_layers = len(self.layers)
+        block_ends: List[bool] = [False] * num_layers
+        if num_layers == 0:
+            return block_ends
+
+        layers_per_block = self.config.mhc_recompute_layer_num
+        for layer_idx in range(num_layers):
+            is_last_in_stack = layer_idx == num_layers - 1
+            block_ends[layer_idx] = is_last_in_stack or (
+                layers_per_block is not None and (layer_idx + 1) % layers_per_block == 0
+            )
+        return block_ends
+
+    def _build_mhc_recompute_layer_plan(
+        self, use_mhc_recompute: bool
+    ) -> Tuple[List[Optional[CheckpointWithoutOutputManager]], List[bool]]:
+        """Build single-use recompute managers for this forward pass."""
+        num_layers = len(self.layers)
+        if not use_mhc_recompute or num_layers == 0:
+            return [None] * num_layers, [False] * num_layers
+
+        if self._mhc_block_end_plan is None:
+            self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
+        block_ends = self._mhc_block_end_plan
+
+        layer_managers: List[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
+        manager = CheckpointWithoutOutputManager()
+        for layer_idx in range(num_layers):
+            layer_managers[layer_idx] = manager
+            if block_ends[layer_idx] and layer_idx != num_layers - 1:
+                manager = CheckpointWithoutOutputManager()
+        return layer_managers, block_ends
+
+    @staticmethod
+    def _finalize_mhc_recompute_layer(
+        manager: Optional[CheckpointWithoutOutputManager], hidden_states: Tensor, is_block_end: bool
+    ) -> None:
+        """Finalize the current mHC recompute block when its last layer finishes."""
+        if manager is not None and is_block_end:
+            manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
     def forward(
         self,
@@ -386,6 +459,11 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.config.mhc_num_residual_streams
+            )
 
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
@@ -434,6 +512,14 @@ class HybridStack(MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
+        use_mhc_recompute = (
+            self.training
+            and self.config.enable_mhc_connections
+            and self.config.recompute_granularity == 'selective'
+            and "mhc" in self.config.recompute_modules
+        )
+        mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
+
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
@@ -450,21 +536,25 @@ class HybridStack(MegatronModule):
                     cp_layout_state=cp_layout_state,
                 )
             else:
-                for layer_index, (layer_config, layer) in enumerate(
+                for layer_idx, (layer_config, layer) in enumerate(
                     zip(self.layer_config_list, self.layers, strict=True)
                 ):
                     layer_packed_seq_params = packed_seq_params
                     if cp_layout_state is not None:
                         hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
-                            layer_index, hidden_states
+                            layer_idx, hidden_states
                         )
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         layer_config, layer.layer_number - 1
                     )
+                    mhc_manager = mhc_layer_managers[layer_idx]
+                    if mhc_manager is not None:
+                        mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
+
                     with inner_quant_context:
-                        if isinstance(layer, TransformerLayer):
-                            hidden_states, _ = layer(
+                        if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                            layer_kwargs = dict(
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
                                 inference_context=inference_context,
@@ -473,6 +563,11 @@ class HybridStack(MegatronModule):
                                 packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
                             )
+                            if mhc_manager is not None and isinstance(
+                                layer, HyperConnectionHybridLayer
+                            ):
+                                layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                            hidden_states, _ = layer(**layer_kwargs)
                         else:  # MambaLayer, Expert, or MLP
                             hidden_states = layer(
                                 hidden_states=hidden_states,
@@ -487,7 +582,26 @@ class HybridStack(MegatronModule):
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
                     if cp_layout_state is not None:
-                        hidden_states = cp_layout_state.finalize_layer(layer_index, hidden_states)
+                        hidden_states = cp_layout_state.finalize_layer(layer_idx, hidden_states)
+
+                    self._finalize_mhc_recompute_layer(
+                        manager=mhc_manager,
+                        hidden_states=hidden_states,
+                        is_block_end=mhc_block_ends[layer_idx],
+                    )
+
+        mhc_multistream = None
+        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+            if (self.config.mtp_num_layers or 0) > 0:
+                mhc_multistream = hidden_states
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.mhc_num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -499,6 +613,8 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
         return hidden_states
 
     def sharded_state_dict(
@@ -523,6 +639,7 @@ class HybridStack(MegatronModule):
             dict: The sharded state dictionary for the current object.
         """
 
+        sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
 
@@ -556,6 +673,20 @@ class HybridStack(MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
+
+        local_state_dict: dict = {}
+        self._save_to_state_dict(local_state_dict, '', keep_vars=True)
+        if local_state_dict:
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            sharded_state_dict.update(
+                make_sharded_tensors_for_checkpoint(
+                    local_state_dict,
+                    prefix,
+                    sharded_offsets=sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            )
 
         return sharded_state_dict
 

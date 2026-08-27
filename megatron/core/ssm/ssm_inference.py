@@ -225,7 +225,18 @@ class SSMDynamicInferenceMixin:
         if decode_req_count > 0:
             seq_len = 1 + context.num_speculative_tokens
             decode_token_count = decode_req_count * seq_len
-            zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
+            if context.batch_invariant_mode:
+                # Batch-invariant execution may include token-only rows to preserve
+                # model-wide M alignment. Those rows do not represent requests and
+                # must not be passed to the recurrent decode kernels.
+                assert decode_token_count <= zxBCdt.shape[0], (
+                    "Batch-invariant SSM metadata describes more decode tokens "
+                    f"({decode_token_count}) than the input projection contains "
+                    f"({zxBCdt.shape[0]})."
+                )
+                zxBCdt_decode = zxBCdt[:decode_token_count]
+            else:
+                zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
             # Reshape from [N*S, 1, d] to [N, S, d] for the decode kernels.
             zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
             y_decode = self.ssm_decode(
@@ -270,6 +281,17 @@ class SSMDynamicInferenceMixin:
             y = y_prefill
         else:
             raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
+
+        if context.batch_invariant_mode:
+            # Restore the projection's token-only padding before the output projection.
+            # Its row count can be TP-local, unlike the context's global token count.
+            padding_token_count = zxBCdt.shape[0] - y.shape[0]
+            assert padding_token_count >= 0, (
+                "Batch-invariant SSM produced more token rows "
+                f"({y.shape[0]}) than the input projection contained ({zxBCdt.shape[0]})."
+            )
+            if padding_token_count > 0:
+                y = torch.cat((y, y.new_zeros(padding_token_count, *y.shape[1:])), dim=0)
 
         # Zero padding positions to avoid corrupting quantization amax calculations.
         if is_using_quantization_scales(self.config):

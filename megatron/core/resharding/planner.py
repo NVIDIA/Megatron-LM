@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from .shard_planner import plan_sharded_transfer
 from .utils import (
     ParameterMetadata,
     ReshardPlan,
@@ -360,9 +361,18 @@ def _iter_global_transfer_ops(
                 )
             # Choose a representative source metadata with DP round-robin balancing.
             src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
-            sources = _determine_source_ranks_for_dst_param(
-                resolved_name, src_metadata, dst_metadata, dst_rank
-            )
+            if dst_metadata.is_gtp or any(metadata.is_gtp for metadata in src_meta_list):
+                # A GTP shard is an additional dim-0 partition layered on top
+                # of the TP layout. Plan in logical global coordinates so TP,
+                # packed parameters, GTP padding, and their combinations compose.
+                sources = plan_sharded_transfer(
+                    resolved_name, src_meta_list, src_metadata, dst_metadata
+                )
+            else:
+                # Preserve the established TP/DP lowering for non-GTP models.
+                sources = _determine_source_ranks_for_dst_param(
+                    resolved_name, src_metadata, dst_metadata, dst_rank
+                )
             for src_rank, src_slice, dst_slice in sources:
                 task_id = next_task_id
                 next_task_id += 1
@@ -545,6 +555,10 @@ def _build_tensor_reshard_specs(
             # error. Keep this helper side-effect free for callers that invoke
             # it independently in tests.
             return None, f"{resolved_name}: source parameter metadata is missing"
+        if any(metadata.is_gtp for metadata in src_meta_list) or any(
+            metadata.is_gtp for metadata in dst_by_rank.values()
+        ):
+            return None, f"{resolved_name}: GTP shards are unsupported by native resharding"
 
         src_groups: dict[tuple[int, ...], dict[int, ParameterMetadata]] = {}
         for metadata in src_meta_list:

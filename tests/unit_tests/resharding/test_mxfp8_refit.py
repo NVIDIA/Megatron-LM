@@ -188,6 +188,7 @@ class TestMXFP8ReshardTransform:
         flashinfer_buffer = MXFP8Tensor(
             data=triton_buffer.data.clone(),
             scale=triton_buffer.scale.view(torch.uint8).clone(),
+            dtype=torch.bfloat16,
             backend="flashinfer",
         )
 
@@ -218,6 +219,8 @@ class TestMXFP8ReshardTransform:
                 tensor = MXFP8Tensor.from_bf16(
                     torch.randn(M, K, dtype=torch.bfloat16, device="cuda"), backend="triton"
                 )
+                if expert_idx == 0:
+                    tensor.dtype = None  # Simulate a legacy direct constructor.
                 setattr(linear, f"weight{expert_idx}", tensor)
                 buffers[f"{linear_name}.weight{expert_idx}"] = tensor
 
@@ -228,6 +231,8 @@ class TestMXFP8ReshardTransform:
         assert not torch.is_inference(grouped_mlp._fc1_weight.scale)
         assert not torch.is_inference(grouped_mlp._fc2_weight.data)
         assert not torch.is_inference(grouped_mlp._fc2_weight.scale)
+        assert grouped_mlp._fc1_weight.dtype == torch.bfloat16
+        assert grouped_mlp._fc2_weight.dtype == torch.bfloat16
 
         transform = MXFP8ReshardTransform(
             convertible_params=set(buffers), persistent_buffers=buffers
