@@ -1364,8 +1364,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 activation_type=self._flashinfer_activation_type.value,
                 out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
                 token_capacity=self._flashinfer_mxfp8_token_capacity,
-                decode_only=InferenceMode.is_decode_only(),
-                decode_token_upper_bound=InferenceMode.decode_token_upper_bound(),
+                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
             return output, None
         output = fused_moe.cutlass_fused_moe(

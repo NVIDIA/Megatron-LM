@@ -27,7 +27,7 @@ except ImportError as exc:
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 logger = logging.getLogger(__name__)
-_LOGGED_TOKEN_POLICIES: set[tuple[str, int, int | None, int]] = set()
+_LOGGED_TOKEN_POLICIES: set[tuple[str, int, int]] = set()
 
 
 def require_flashinfer_routed_mxfp8() -> None:
@@ -230,18 +230,13 @@ def quantize_routed_mxfp8_input(
 
 
 def select_routed_mxfp8_active_rows(
-    full_rows: int,
-    *,
-    token_capacity: int | None,
-    decode_only: bool,
-    decode_token_upper_bound: int | None,
+    full_rows: int, *, token_capacity: int | None, use_bounded_rows: bool
 ) -> tuple[int, str]:
     """Select the graph-stable row count for one routed-MoE invocation.
 
-    A bounded prefix is safe only for a decode-only graph with a host-known
-    upper bound no larger than the configured capacity. Mixed and prefill
-    graphs retain the full dispatcher buffer so prompt tokens are never
-    truncated.
+    The controller enables a bounded prefix only for a decode-only graph whose
+    static EP-wide token bound fits the configured capacity. All other graphs
+    retain the full dispatcher buffer so prompt tokens are never truncated.
     """
     if full_rows <= 0:
         raise ValueError(f"full_rows must be positive; got {full_rows}")
@@ -249,19 +244,9 @@ def select_routed_mxfp8_active_rows(
         return full_rows, "full"
     if token_capacity <= 0:
         raise ValueError(f"token_capacity must be positive; got {token_capacity}")
-    if decode_token_upper_bound is not None and decode_token_upper_bound <= 0:
-        raise ValueError(
-            "decode_token_upper_bound must be positive; " f"got {decode_token_upper_bound}"
-        )
-    if (
-        decode_only
-        and decode_token_upper_bound is not None
-        and decode_token_upper_bound <= token_capacity
-    ):
+    if use_bounded_rows:
         return min(token_capacity, full_rows), "bounded-decode"
-    if decode_only:
-        return full_rows, "full-decode-over-capacity"
-    return full_rows, "full-mixed"
+    return full_rows, "full"
 
 
 def flashinfer_routed_mxfp8_moe_prequantized(
@@ -320,14 +305,13 @@ def flashinfer_routed_mxfp8_moe(
     activation_type: int,
     out: torch.Tensor | None = None,
     token_capacity: int | None = None,
-    decode_only: bool = False,
-    decode_token_upper_bound: int | None = None,
+    use_bounded_rows: bool = False,
 ) -> torch.Tensor:
     """Run the FlashInfer TRT-LLM routed MXFP8 MoE kernel.
 
-    When token_capacity is set, only that fixed prefix is processed during
-    decode-only steps whose EP-wide token upper bound fits within the capacity.
-    Prefill, mixed steps, and too-large decode configurations process the full input.
+    When token_capacity is set and the controller marks the current graph safe,
+    only that fixed prefix is processed. Prefill, mixed steps, and too-large decode
+    configurations process the full input.
     Invalid rows in the bounded prefix must already have expert ID -1.
 
     The row choice is made when each CUDA graph is built, so graph replay sees fixed
@@ -349,23 +333,19 @@ def flashinfer_routed_mxfp8_moe(
 
     full_rows = hidden_states.shape[0]
     active_rows, policy = select_routed_mxfp8_active_rows(
-        full_rows,
-        token_capacity=token_capacity,
-        decode_only=decode_only,
-        decode_token_upper_bound=decode_token_upper_bound,
+        full_rows, token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
     )
     if token_capacity is not None:
-        policy_key = (policy, token_capacity, decode_token_upper_bound, full_rows)
+        policy_key = (policy, token_capacity, full_rows)
         if policy_key not in _LOGGED_TOKEN_POLICIES:
             _LOGGED_TOKEN_POLICIES.add(policy_key)
             logger.info(
                 "FlashInfer MXFP8 token policy: %s active_rows=%d full_rows=%d "
-                "configured_capacity=%d decode_upper_bound=%s",
+                "configured_capacity=%d",
                 policy,
                 active_rows,
                 full_rows,
                 token_capacity,
-                decode_token_upper_bound,
             )
 
     selected_hidden_states = hidden_states[:active_rows]

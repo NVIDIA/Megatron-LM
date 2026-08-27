@@ -26,8 +26,7 @@ class InferenceMode:
     """
 
     _is_active: bool = False
-    _is_decode_only: bool = False
-    _decode_token_upper_bound: int | None = None
+    _use_bounded_mxfp8_rows: bool = False
 
     @classmethod
     def is_active(cls) -> bool:
@@ -38,33 +37,23 @@ class InferenceMode:
     def set_active(cls) -> None:
         """Mark the inference engine active and reset its phase to the safe default."""
         cls._is_active = True
-        cls._is_decode_only = False
-        cls._decode_token_upper_bound = None
+        cls._use_bounded_mxfp8_rows = False
 
     @classmethod
-    def set_decode_state(cls, is_decode_only: bool, token_upper_bound: int | None) -> None:
-        """Publish the current dynamic-inference phase and safe decode token bound."""
-        if token_upper_bound is not None and token_upper_bound <= 0:
-            raise ValueError(f"decode token upper bound must be positive; got {token_upper_bound}")
-        cls._is_decode_only = is_decode_only
-        cls._decode_token_upper_bound = token_upper_bound
+    def set_bounded_mxfp8_rows(cls, enabled: bool) -> None:
+        """Select bounded FlashInfer MXFP8 rows for the current inference step."""
+        cls._use_bounded_mxfp8_rows = enabled
 
     @classmethod
-    def is_decode_only(cls) -> bool:
-        """Return True only while the current dynamic-inference step is decode-only."""
-        return cls._is_decode_only
-
-    @classmethod
-    def decode_token_upper_bound(cls) -> int | None:
-        """Return a host-known upper bound on EP-wide tokens in a decode-only step."""
-        return cls._decode_token_upper_bound
+    def use_bounded_mxfp8_rows(cls) -> bool:
+        """Return whether the current step may use the configured bounded row prefix."""
+        return cls._use_bounded_mxfp8_rows
 
     @classmethod
     def unset_active(cls) -> None:
         """Mark the inference engine as inactive. Idempotent."""
         cls._is_active = False
-        cls._is_decode_only = False
-        cls._decode_token_upper_bound = None
+        cls._use_bounded_mxfp8_rows = False
 
     @classmethod
     @contextlib.contextmanager
