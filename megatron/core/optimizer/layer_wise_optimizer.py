@@ -761,6 +761,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
+    def _unique_model_chunks(self) -> List[torch.nn.Module]:
+        """Model chunks for the per-chunk work in ChainedOptimizer.
+
+        The base class collects these from the chained children, but ours are
+        Float16OptimizerWithFloat16Params wrapping raw torch optimizers, which carry no
+        ``model_chunks`` -- so that scan returns [] and every per-chunk step becomes a silent
+        no-op, including the param all-gather after a checkpoint load. ``self.model_chunks`` is
+        assigned in ``__init__`` for exactly this reason; use it.
+        """
+        return list(self.model_chunks)
+
     def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.
 

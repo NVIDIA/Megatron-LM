@@ -130,6 +130,36 @@ class TestLayerWiseOptimizer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    def test_post_load_param_sync_reaches_the_model_chunks(self):
+        """The post-checkpoint-load refresh must be able to all-gather the params.
+
+        ``quantize_and_sync_model_params_from_main_params()`` gathers over
+        ``_unique_model_chunks()``, which ``ChainedOptimizer`` builds by scanning the chained
+        children for ``model_chunks``. ``LayerWiseDistributedOptimizer`` wraps raw torch
+        optimizers in ``Float16OptimizerWithFloat16Params``, which never set one, so the scan
+        returns [] and the gather silently never runs.
+        """
+        Utils.initialize_model_parallel(1, 1)
+        model, optimizer = setup_model_and_optimizer(
+            seed=2, tp=1, pp=1, dist_opt=True, optimizer='dist_muon', use_param_layout=True
+        )
+        # The outer chain is [LayerWiseDistributedOptimizer, DistributedOptimizer]; the latter
+        # does carry model_chunks, so the defect is only visible on the nested layer-wise one.
+        lw = next(
+            c for c in optimizer.chained_optimizers
+            if isinstance(c, LayerWiseDistributedOptimizer)
+        )
+
+        assert all(
+            not getattr(c, 'model_chunks', []) for c in lw.chained_optimizers
+        ), "a chained child grew model_chunks; the override may no longer be needed"
+
+        assert lw._unique_model_chunks(), (
+            f"_unique_model_chunks() is empty though {len(lw.model_chunks)} chunk(s) exist, so "
+            "start_param_sync never runs after a checkpoint load and each rank keeps only the "
+            "params it staged itself"
+        )
+
     def test_parameter_sharding(self):
         """Test that parameters are correctly sharded across DP ranks."""
         Utils.initialize_model_parallel(1, 1)
