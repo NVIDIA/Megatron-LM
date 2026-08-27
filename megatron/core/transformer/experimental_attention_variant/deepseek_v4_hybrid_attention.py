@@ -352,6 +352,37 @@ class DSv4HybridAttention(Attention):
                 'DSV4_TP_LOCAL_ATTENTION_COMPRESSOR is disabled: rank-distinct backward '
                 'gradient correctness failed. Set ..._UNSAFE=1 only to reproduce the negative experiment.'
             )
+        tp_local_indexer_compressor = (
+            os.environ.get('DSV4_TP_LOCAL_INDEXER_COMPRESSOR', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+            and self._dsv4_compress_ratio > 1
+        )
+        if tp_local_indexer_compressor and (
+            getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
+        ) > 0:
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_INDEXER_COMPRESSOR currently requires dsa_indexer_loss_coeff == 0.'
+            )
+        fuse_csa_input_gather = (
+            os.environ.get('DSV4_FUSE_CSA_INPUT_GATHER', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and not tp_local_indexer_q
+            and not tp_local_indexer_topk
+            and not tp_local_attention_compressor
+            and not tp_local_indexer_compressor
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+        )
         cp_group = self.pg_collection.tp if tp_local_csa else _orig_cp_group
         if not tp_local_csa and packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
@@ -368,7 +399,12 @@ class DSv4HybridAttention(Attention):
 
         sequence_parallel_local_length = hidden_states.size(0)
         core_hidden_states = hidden_states
-        if self.tp_size > 1 and self.config.sequence_parallel and not tp_local_csa:
+        if (
+            self.tp_size > 1
+            and self.config.sequence_parallel
+            and not tp_local_csa
+            and not fuse_csa_input_gather
+        ):
             # q-up uses TE's standard SP all-gather. The duplicated KV path
             # and CSA compressor need the same CP-local sequence explicitly.
             core_hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
@@ -383,9 +419,9 @@ class DSv4HybridAttention(Attention):
                 self.config.csa_window_size,
                 self.pg_collection.cp,
             )
-        attention_compressor_boundary_hidden = None
-        if tp_local_attention_compressor:
-            attention_compressor_boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+        local_compressor_boundary_hidden = None
+        if tp_local_attention_compressor or tp_local_indexer_compressor:
+            local_compressor_boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
                 hidden_states,
                 self._dsv4_compress_ratio,
                 self.config.csa_window_size,
@@ -455,7 +491,23 @@ class DSv4HybridAttention(Attention):
                 )
 
         core_q_compressed = q_compressed
-        if self.tp_size > 1 and self.config.sequence_parallel and not tp_local_csa:
+        if fuse_csa_input_gather:
+            q_compressed_3d = (
+                q_compressed.unsqueeze(1) if q_compressed.ndim == 2 else q_compressed
+            )
+            if q_compressed_3d.shape[0] != sequence_parallel_local_length:
+                raise RuntimeError(
+                    'DSV4 fused CSA input gather requires TP-local q-compressed rows: '
+                    f'shape={tuple(q_compressed_3d.shape)}, '
+                    f'local={sequence_parallel_local_length}'
+                )
+            fused_csa_inputs = tensor_parallel.gather_from_sequence_parallel_region(
+                torch.cat((hidden_states, q_compressed_3d), dim=-1),
+                group=self.pg_collection.tp,
+            )
+            core_hidden_states = fused_csa_inputs[..., : self.config.hidden_size]
+            core_q_compressed = fused_csa_inputs[..., self.config.hidden_size :].squeeze(1)
+        elif self.tp_size > 1 and self.config.sequence_parallel and not tp_local_csa:
             # q-down is duplicated and remains TP-local, while CSA's learned
             # indexer consumes the same complete CP-local sequence as the
             # gathered hidden states. Keep the local q-compressed tensor for
@@ -498,8 +550,13 @@ class DSv4HybridAttention(Attention):
                 attention_compressor_x_local=(
                     hidden_states if tp_local_attention_compressor else None
                 ),
-                attention_compressor_boundary_hidden=attention_compressor_boundary_hidden,
+                attention_compressor_boundary_hidden=local_compressor_boundary_hidden,
                 tp_local_attention_compressor=tp_local_attention_compressor,
+                indexer_compressor_x_local=(
+                    hidden_states if tp_local_indexer_compressor else None
+                ),
+                indexer_compressor_boundary_hidden=local_compressor_boundary_hidden,
+                tp_local_indexer_compressor=tp_local_indexer_compressor,
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
