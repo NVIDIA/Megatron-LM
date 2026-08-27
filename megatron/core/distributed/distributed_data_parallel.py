@@ -453,6 +453,18 @@ class DistributedDataParallel(_BaseDataParallel):
                                         self._make_backward_post_hook(param)
                                     )
                                     break
+                elif getattr(param, 'is_cpu_offloaded_expert', False) and getattr(
+                    param, 'skip_backward_post_hook', False
+                ):
+                    # for offloaded expert params, gradient is handled manually in backward()
+                    for module in self.module.modules():
+                        if hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
+                            for param_value in module.parameters():
+                                if param is param_value:
+                                    module.register_wgrad_accumulation_and_reduce_hooks(
+                                        self._make_backward_post_hook(param)
+                                    )
+                                    break
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)

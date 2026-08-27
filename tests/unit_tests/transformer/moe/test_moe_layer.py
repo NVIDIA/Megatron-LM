@@ -9,6 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.experts import OffloadingExpertsMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -395,6 +396,128 @@ class TestMoELayerRecompute:
 
         for name, param in moe_layer.named_parameters():
             if param.requires_grad:
+                assert param.grad is not None, f"Gradient for {name} should exist"
+
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+
+class TestMoELayerOffloading:
+    """Test MoE layer with offloading enabled (weights on CPU)."""
+
+    def setup_method(self, method):
+        pass
+
+    @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
+    @pytest.mark.parametrize("num_moe_experts", [2, 4])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (4, 2)])
+    def test_moe_layer_offloading_forward_backward(
+        self, num_moe_experts, moe_token_dispatcher_type, tp_size, ep_size
+    ):
+        """Test MoE layer forward and backward pass with offloading enabled."""
+        # The offloading experts shard over EP only, so the expert groups must be built with
+        # expert-tensor parallelism disabled, independently of the attention TP size.
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            expert_tensor_parallel_size=1,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+        hidden_size = 64
+        sequence_length = 32
+        micro_batch_size = 2
+
+        # One chunk per local expert, so the chunk-by-chunk prefetch pipeline is exercised
+        # whenever this rank owns more than one expert.
+        num_local_experts = num_moe_experts // ep_size
+
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            use_cpu_initialization=True,
+            moe_token_dispatcher_type=moe_token_dispatcher_type,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=False,
+            moe_ffn_hidden_size=256,
+            add_bias_linear=False,
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=tp_size > 1,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_use_offloading_experts=True,
+            moe_offloading_num_chunks=num_local_experts,
+            # Requirements of OffloadingExpertsMLP: it shards experts over EP only, computes
+            # a weighted SwiGLU, and accumulates wgrads into main_grad.
+            expert_tensor_parallel_size=1,
+            gated_linear_unit=True,
+            gradient_accumulation_fusion=True,
+        )
+
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+
+        moe_layer = MoELayer(transformer_config, submodules).cuda()
+
+        # The config flag must select the offloading experts, whose weights stay in pinned
+        # host memory even though the layer was moved to GPU.
+        assert isinstance(moe_layer.experts, OffloadingExpertsMLP)
+        expert_weights = list(moe_layer.experts.weight1) + list(moe_layer.experts.weight2)
+        assert len(expert_weights) == 2 * num_local_experts
+        for weight in expert_weights:
+            assert weight.device.type == "cpu", f"Expert weight on {weight.device}, expected CPU"
+            assert weight.is_pinned(), "Expert weight should be in pinned memory"
+
+        # gradient_accumulation_fusion accumulates expert wgrads straight into main_grad,
+        # which DDP allocates in real training; this test builds the layer without DDP.
+        for weight in expert_weights:
+            weight.main_grad = torch.zeros(
+                weight.shape, dtype=torch.float32, device=torch.cuda.current_device()
+            )
+
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            hidden_size,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        # Forward pass
+        output, _ = moe_layer(hidden_states)
+
+        assert output.dtype == torch.bfloat16, f"Expected bf16 output, got {output.dtype}"
+        assert output.shape == hidden_states.shape, "Output shape mismatch"
+
+        # Backward pass - this is where the expert weights are prefetched back from CPU
+        loss = output.sum()
+        loss.backward()
+
+        assert hidden_states.grad is not None, "Input gradients should exist"
+        assert (
+            hidden_states.grad.dtype == torch.bfloat16
+        ), f"Expected bf16 gradients, got {hidden_states.grad.dtype}"
+
+        # Expert wgrads land in main_grad (param.grad is only a placeholder marked as already
+        # added to main_grad), everything else follows the usual autograd path.
+        for weight in expert_weights:
+            assert weight.grad_added_to_main_grad, "Expert wgrad should be fused into main_grad"
+            assert torch.isfinite(weight.main_grad).all(), "Expert main_grad has non-finite values"
+            assert weight.main_grad.abs().sum() > 0, "Expert main_grad was not accumulated"
+
+        offloaded_params = {id(weight) for weight in expert_weights}
+        for name, param in moe_layer.named_parameters():
+            if param.requires_grad and id(param) not in offloaded_params:
                 assert param.grad is not None, f"Gradient for {name} should exist"
 
         Utils.destroy_model_parallel()

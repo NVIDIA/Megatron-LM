@@ -66,6 +66,11 @@ class BufferType(Enum):
     GRAD = 2
 
 
+# Peak GPU memory allowed for staging one host-resident param bucket through its all-gather
+# (see _ParamAndGradBucketGroup._all_gather_cpu_param_bucket).
+_CPU_PARAM_GATHER_STAGING_BYTES = 512 * 1024 * 1024
+
+
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     """
     Shard buffer into data_parallel_world_size chunks of equal size.
@@ -200,6 +205,16 @@ class _ParamAndGradBucketGroup:
     ):
         self.buckets = buckets
         self.ddp_config = ddp_config
+
+        # MoE expert offloading keeps some param buffers in pinned host memory. NCCL cannot
+        # gather into host memory, so those buckets are excluded from the coalescing manager
+        # in start_param_sync and gathered separately. The set is fixed for the lifetime of
+        # the group, so resolve it once here rather than re-testing on every param sync.
+        self.cpu_bucket_indices = [
+            i
+            for i, bucket in enumerate(self.buckets)
+            if bucket.param_data is not None and bucket.param_data.device.type == "cpu"
+        ]
 
         # overlap_param_gather covers the layer-wise optimizer case, which sets
         # overlap_param_gather=True without use_distributed_optimizer.
@@ -518,12 +533,27 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
+
+                    if bucket.param_data.device.type == "cpu":
+                        continue
+
                     dist_all_gather_func(
                         bucket.param_data,
                         local_data_view,
                         group=self.intra_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
+
+            # Gather the CPU-offloaded buckets (MoE expert offloading) separately. This runs
+            # synchronously and is deliberately not covered by _coalescing_manager.
+            for idx in self.cpu_bucket_indices:
+                self._all_gather_cpu_param_bucket(
+                    self.buckets[idx],
+                    self.cached_param_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ],
+                )
+
             if async_op:
                 self.param_gather_handle = cm
             else:
@@ -534,6 +564,61 @@ class _ParamAndGradBucketGroup:
         if force_sync and self.ddp_config.overlap_param_gather:
             self._post_param_sync()
         self.param_gather_dispatched = True
+
+    def _all_gather_cpu_param_bucket(
+        self, bucket: _ParamAndGradBucket, local_data_view: torch.Tensor
+    ):
+        """All-gather one CPU-offloaded param bucket through a bounded GPU staging buffer.
+
+        MoE expert offloading keeps expert weights in pinned host memory, but the collective
+        has to run on GPU. The local shard is moved to GPU, gathered, and copied back
+        to CPU. ``_CPU_PARAM_GATHER_STAGING_BYTES`` is used so peak GPU memory
+        stays bounded no matter how large the bucket is: a bucket that fits is gathered in a
+        single pass, a larger one is split.
+
+        The number of passes is derived only from values replicated across the group (shard
+        size, group size, dtype), never from per-rank state, so every rank issues the same
+        sequence of collectives with the same shapes.
+
+        Args:
+            bucket: the bucket to gather; ``bucket.param_data`` must be host-resident.
+            local_data_view: this rank's shard of ``bucket.param_data``.
+        """
+        world_size = self.intra_distributed_optimizer_instance_size
+        shard_numel = local_data_view.numel()
+        dtype = bucket.param_data.dtype
+        device = torch.cuda.current_device()
+
+        # Each pass stages one shard chunk plus the gathered result for all ranks.
+        max_chunk_numel = max(
+            1,
+            _CPU_PARAM_GATHER_STAGING_BYTES
+            // (bucket.param_data.element_size() * (world_size + 1)),
+        )
+        chunk_numel = min(shard_numel, max_chunk_numel)
+
+        send_buffer = torch.empty(chunk_numel, dtype=dtype, device=device)
+        recv_buffer = torch.empty(chunk_numel * world_size, dtype=dtype, device=device)
+
+        flat_param_data = bucket.param_data.view(-1)
+        flat_local_shard = local_data_view.view(-1)
+
+        for offset in range(0, shard_numel, chunk_numel):
+            numel = min(chunk_numel, shard_numel - offset)
+            send_view = send_buffer[:numel]
+            recv_view = recv_buffer[: numel * world_size]
+
+            send_view.copy_(flat_local_shard[offset : offset + numel])
+            torch.distributed.all_gather_into_tensor(
+                recv_view, send_view, group=self.intra_distributed_optimizer_instance_group
+            )
+
+            # Rank r's shard occupies [r * shard_numel, (r + 1) * shard_numel) in the bucket.
+            # copy the gathered shards back into the CPU param
+            recv_per_rank = recv_view.view(world_size, numel)
+            for rank in range(world_size):
+                dst = rank * shard_numel + offset
+                flat_param_data[dst : dst + numel].copy_(recv_per_rank[rank])
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
@@ -1054,6 +1139,13 @@ class _ParamAndGradBuffer:
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
 
+        # CPU expert params
+        self.use_cpu_param_data = False
+        if all(p.device == torch.device("cpu") for p in self.params) and all(
+            getattr(p, "is_cpu_offloaded_expert", False) for p in self.params
+        ):
+            self.use_cpu_param_data = True
+
         # Check that params are unique.
         unique_params = set()
         for param, _ in params_with_names:
@@ -1184,7 +1276,10 @@ class _ParamAndGradBuffer:
                     self.param_data = torch.zeros(
                         numel,
                         dtype=self.param_dtype,
-                        device=torch.cuda.current_device(),
+                        device=(
+                            torch.cuda.current_device() if not self.use_cpu_param_data else "cpu"
+                        ),
+                        pin_memory=self.use_cpu_param_data,
                         requires_grad=False,
                     )
                 self.grad_data = torch.zeros(

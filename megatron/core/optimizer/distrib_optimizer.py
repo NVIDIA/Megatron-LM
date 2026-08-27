@@ -398,7 +398,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_range = gbuf_range["param_map"][model_param]["param"]
 
                 # fp16, bf16 params.
-                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                if model_param.type() in [
+                    'torch.cuda.HalfTensor',
+                    'torch.cuda.BFloat16Tensor',
+                    'torch.BFloat16Tensor',
+                ]:
 
                     # Generate sharded model param.
                     if (
@@ -445,7 +449,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     param_range.start : param_range.end
                                 ]
                         else:
-                            shard_main_param = shard_model_param.clone().float()
+                            if model_param.type() == 'torch.BFloat16Tensor':
+                                # NOTE: For bfloat16 params on CPU, we keep main_param on GPU
+                                shard_main_param = (
+                                    shard_model_param.clone()
+                                    .to(torch.cuda.current_device())
+                                    .float()
+                                )
+                            else:
+                                shard_main_param = shard_model_param.clone().float()
 
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param

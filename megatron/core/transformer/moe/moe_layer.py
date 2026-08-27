@@ -14,6 +14,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.experts import OffloadingExpertsMLP
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -348,12 +349,17 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = self.submodules.experts(
-            self.num_local_experts,
-            self.config,
-            pg_collection=pg_collection,
-            name=(name + ".experts") if name is not None else None,
-        )
+        if self.config.moe_use_offloading_experts:
+            self.experts = OffloadingExpertsMLP(
+                self.num_local_experts, self.config, pg_collection=pg_collection
+            )
+        else:
+            self.experts = self.submodules.experts(
+                self.num_local_experts,
+                self.config,
+                pg_collection=pg_collection,
+                name=(name + ".experts") if name is not None else None,
+            )
 
         # Initialize shared experts
         if self.use_shared_expert:
