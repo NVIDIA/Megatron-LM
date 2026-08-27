@@ -258,6 +258,7 @@ class MoKMegakernel(MegakernelBackend):
     def quantized_routed_weights(self):
         """Prepare routed weights without copying their FP8/BF16 payloads."""
         if not self.native_single_grouped_weights:
+            # Non-single BF16/MXFP8: build per-expert data/scale descriptor tables.
             if self._prepared_routed_weight_cache is None:
                 prepared_fc1 = _native_split_weight_view(
                     self.routed_fc1_parameters,
@@ -273,6 +274,8 @@ class MoKMegakernel(MegakernelBackend):
                 )
                 self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc1, prepared_down)
             elif self.use_mxfp8_weights and self.is_first_microbatch:
+                # Non-single MXFP8: TE updates scales each optimizer iteration;
+                # refresh scale layouts while keeping data/descriptor addresses stable.
                 prepared_fc1, _, prepared_down = self._prepared_routed_weight_cache
                 _refresh_native_split_weight_scales(
                     prepared_fc1,
@@ -290,6 +293,7 @@ class MoKMegakernel(MegakernelBackend):
             return self._prepared_routed_weight_cache
 
         if not self.use_mxfp8_weights:
+            # Single-weight BF16: native grouped FC1/FC2 storage is already MOK-readable.
             self.is_first_microbatch = False
             return _native_single_grouped_weight_views(
                 self.routed_fc1_weight,
@@ -301,6 +305,8 @@ class MoKMegakernel(MegakernelBackend):
             )
 
         if self._prepared_routed_weight_cache is None or self.is_first_microbatch:
+            # Single-weight MXFP8: reuse TE's gathered FP8 payload and prepare the
+            # rowwise/columnwise scale layouts required by MOK forward/backward.
             native_gate, _, native_down = _native_single_grouped_weight_views(
                 self.routed_fc1_weight,
                 self.routed_fc2_weight,
