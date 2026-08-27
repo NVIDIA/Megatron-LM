@@ -854,7 +854,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size=local_cp_size,
         cp_group=cp_group,
         cp_partition_mode=cp_partition_mode,
-        pad_between_seqs=True,
+        pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
     )
 
     # Dummy metadata is appended after CP slicing as an ordinary sequence.

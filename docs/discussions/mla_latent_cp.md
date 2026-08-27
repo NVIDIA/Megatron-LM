@@ -341,8 +341,10 @@ per-sequence front/back indices and uses:
 
 These values are backend attention metadata only. They are never used to generate or apply RoPE.
 
-V1 rejects inter-sequence and tail padding. Padded cumulative lengths must be absent or exactly
-equal to valid cumulative lengths, and `T_r == cu_full[-1]`. This keeps P2P message sizes identical
+V1 rejects inter-sequence and tail padding. The data scheduler sets `pad_between_seqs` from the
+actual valid-versus-physical cumulative boundaries instead of conservatively claiming gaps for every
+THD batch. Padded cumulative lengths must be absent or exactly equal to valid cumulative lengths, and
+`T_r == cu_full[-1]`. This keeps P2P message sizes identical
 and makes all phase descriptors unambiguous.
 
 ## Numerical and online-softmax contract

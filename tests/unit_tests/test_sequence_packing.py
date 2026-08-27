@@ -428,6 +428,42 @@ class _MockCPGroup:
         return self._rank
 
 
+@pytest.mark.parametrize(
+    ("sequence_lengths", "padded_sequence_lengths", "expected"),
+    [
+        ([3, 5], [3, 5], False),
+        ([3, 5], [4, 5], True),
+    ],
+)
+def test_sequence_packing_reports_actual_inter_sequence_padding(
+    monkeypatch, sequence_lengths, padded_sequence_lengths, expected
+):
+    """Packed metadata must not claim gaps when valid and physical boundaries match."""
+    group = _MockCPGroup(size=1, rank=0)
+    pg_collection = SimpleNamespace(tp=group, pp=group, cp=group)
+    total_seq_length = sum(padded_sequence_lengths)
+    data_iterator = iter(
+        MockVariableLengthSequencePackingDataIterator(
+            total_seq_length=total_seq_length,
+            sequence_lengths=sequence_lengths,
+            padded_sequence_lengths=padded_sequence_lengths,
+            device="cpu",
+        )
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.cuda, "manual_seed", lambda *_: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *_: None)
+
+    *_, packed_seq_params, padding_mask = get_batch_on_this_rank_for_sequence_packing(
+        data_iterator=data_iterator, pg_collection=pg_collection
+    )
+
+    assert packed_seq_params.pad_between_seqs is expected
+    assert padding_mask.any().item() is expected
+
+
 def test_dsv4_thd_cp_slice_uses_static_partition_total():
     from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
 
