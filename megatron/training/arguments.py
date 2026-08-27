@@ -2009,6 +2009,10 @@ def validate_args(args, defaults={}):
     if args.mla_down_proj_fusion:
         assert args.multi_latent_attention, "--mla-down-proj-fusion requires --multi-latent-attention"
 
+    assert (
+        not args.moe_use_norm_before_up_proj or args.moe_latent_size is not None
+    ), "--moe-use-norm-before-up-proj requires --moe-latent-size to be set."
+
     # MoE latent projections
     if args.moe_latent_size is not None:
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
@@ -2398,6 +2402,9 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        "max_seqlen_per_dp_cp_rank",
+        "hybrid_context_parallel",
+        "sequence_packing_scheduler",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards

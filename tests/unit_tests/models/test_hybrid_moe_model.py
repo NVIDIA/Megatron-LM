@@ -206,6 +206,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_hybridep_num_blocks_unpermute": None,
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
+    "moe_use_norm_before_up_proj": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_ncclep_zero_copy": False,
@@ -359,6 +360,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
+    "sequence_packing_scheduler": None,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
     "sequence_packing_scheduler": None,
 }
