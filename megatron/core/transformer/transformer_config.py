@@ -3357,6 +3357,26 @@ class TransformerConfig(ModelParallelConfig):
             and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
         )
 
+        # Local graph warmup clones tensor kwargs into zero-initialized static inputs. Packed
+        # DSA with CP needs the real cu-seqlens to build its CP key reorder, so every local
+        # capture scope (including MLP-only) fails before capture with an empty reorder. CP=1
+        # does not need that layout and remains supported. Dynamic CP is already rejected with
+        # CUDA graphs by the training argument validation.
+        if (
+            self.experimental_attention_variant == "dsa"
+            and self.dsa_kernel_backend == "cudnn"
+            and self.sequence_packing_scheduler == "dp_balanced"
+            and self.context_parallel_size > 1
+            and self.cuda_graph_impl == "local"
+        ):
+            raise ValueError(
+                "Local CUDA graph capture is not supported for packed cuDNN DSA with context "
+                "parallelism: capture warmup cannot reconstruct the packed CP layout from its "
+                "zero-initialized cu-seqlens inputs. Full CUDA Graph support for packed DSA+CP "
+                "is deferred; set cuda_graph_impl='none' or choose a non-local graph "
+                "implementation supported by the requested capture scopes."
+            )
+
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
