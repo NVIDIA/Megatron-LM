@@ -391,6 +391,25 @@ class TransformerConfig(ModelParallelConfig):
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
+    # Compressed sparse attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    # TODO(#6402): consumed by DSv4 Hybrid attention orchestration, which selects the
+    # per-layer compression ratio and builds the compressed-KV rotary embedding.
+    # Neither field has a production reader in this primitive-only PR.
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
+
+    ####################
     # linear attention
     ####################
     linear_attention_freq: Optional[Union[int, List[int]]] = None
@@ -1008,6 +1027,10 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_use_norm_before_up_proj: bool = False
+    """Apply normalization before the latent-to-hidden MoE projection. Requires
+    ``moe_latent_size`` to be set."""
 
     gtp_remat_opt_in_modules: list[str] = field(default_factory=list)
     """Extra modules to apply GTP_remat weight sharding to, beyond the default set (attention,
@@ -2145,6 +2168,9 @@ class TransformerConfig(ModelParallelConfig):
                     "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
                 )
+
+        if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
+            raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit

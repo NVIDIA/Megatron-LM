@@ -3870,13 +3870,14 @@ def training_log(
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
         throughput = num_floating_point_operations(
             args,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
+        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -4047,6 +4048,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     args = get_args()
     if args.save is None:
         return
+    llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
     # Compute job throughput.
     # args.num_floating_point_operations_so_far keeps track of floating-point operations
@@ -4054,7 +4056,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     global _TRAIN_START_TIME
     job_throughput = (
         num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
-    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * llm_world_size)
 
     # Compute cumulative throughput since jobs of this world size were launched.
     # `get_start_time_from_progress_log` returns start time and number of floating-point
@@ -4063,7 +4065,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     elapsed_time = (datetime.now() - start_time).total_seconds()
     cumulative_throughput = (
         num_floating_point_operations_so_far - start_num_floating_point_operations
-    ) / (elapsed_time * 10**12 * args.world_size)
+    ) / (elapsed_time * 10**12 * llm_world_size)
 
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
@@ -4790,7 +4792,7 @@ def train(
             'total_flops_since_current_train_start': num_floating_point_operations_since_current_train_start,
             'num_floating_point_operations_so_far': num_floating_point_operations_so_far,
             'consumed_train_samples': args.consumed_train_samples,
-            'world_size': args.world_size,
+            'world_size': getattr(args, 'mimo_llm_world_size', args.world_size),
             'seq_length': args.seq_length,
         }
 
