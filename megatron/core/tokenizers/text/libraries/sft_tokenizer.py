@@ -83,7 +83,7 @@ class SFTTokenizer:
                 has_bos=False,
                 has_system_role=True,
             )
-        elif prompt_format == "identity":
+        elif prompt_format in ("identity", "identity_with_prompt_masking"):
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=0,
                 pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
@@ -163,7 +163,7 @@ class SFTTokenizer:
 
         target = tokens.copy()
 
-        # When using the default prompt format, we do not replace any tokens with IGNORE_INDEX.
+        # When using the default or identity prompt format, we do not replace any tokens with IGNORE_INDEX.
         # Instead, all token losses will be used for simplicity.
         if self._prompt_format == "default":
             return tokens, target

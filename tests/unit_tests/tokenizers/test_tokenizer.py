@@ -800,13 +800,52 @@ class TestBuildTokenizer:
 
 
 try:
-    from megatron.core.tokenizers.text.libraries.sft_tokenizer import SFTTokenizer
+    from megatron.core.tokenizers.text.libraries.sft_tokenizer import (
+        IGNORE_INDEX,
+        PromptConfig,
+        SFTTokenizer,
+        identity_template,
+    )
 
     HAVE_SFT_TOKENIZER = True
 except Exception:
     HAVE_SFT_TOKENIZER = False
 
 _IDS = [1, 2, 3, 4, 5]
+
+
+class _FakeIdentityTokenizer:
+    """Minimal tokenizer that encodes identity-template content as character IDs."""
+
+    def apply_chat_template(
+        self,
+        conversation,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_assistant_token_mask=False,
+        return_tensors=None,
+        chat_template=None,
+    ):
+        assert tokenize
+        assert not add_generation_prompt
+        assert not return_assistant_token_mask
+        assert chat_template == identity_template
+        ids = [ord(char) for message in conversation for char in message["content"]]
+        return np.array([ids]) if return_tensors == "np" else ids
+
+
+def _make_identity_sft_tokenizer(prompt_format):
+    tokenizer = SFTTokenizer.__new__(SFTTokenizer)
+    tokenizer._prompt_format = prompt_format
+    tokenizer._prompt_config = PromptConfig(
+        assistant_prefix_len=0,
+        pad_token_id=0,
+        custom_chat_template=identity_template,
+        has_bos=False,
+        has_system_role=True,
+    )
+    tokenizer._tokenizer = _FakeIdentityTokenizer()
+    return tokenizer
 
 
 @pytest.mark.skipif(not HAVE_SFT_TOKENIZER, reason="SFTTokenizer not importable")
@@ -851,6 +890,46 @@ class TestExtractTokenIds:
     # --- 2D raw ndarray (1, seq_len) — the bug fixed in this PR ---
     def test_2d_ndarray_batch1(self):
         self._check(np.array([_IDS]))  # shape (1, 5)
+
+
+@pytest.mark.skipif(not HAVE_SFT_TOKENIZER, reason="SFTTokenizer not importable")
+class TestIdentitySFTPromptMasking:
+    """Covers identity templating with and without prompt masking."""
+
+    conversation = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "UU"},
+        {"role": "assistant", "content": "AA"},
+        {"role": "user", "content": "V"},
+        {"role": "assistant", "content": "B"},
+    ]
+
+    def test_identity_keeps_all_targets(self):
+        tokenizer = _make_identity_sft_tokenizer("identity")
+
+        tokens, targets = tokenizer.tokenize_conversation(
+            self.conversation, return_target=True, add_generation_prompt=False
+        )
+
+        assert targets.tolist() == tokens.tolist()
+
+    def test_identity_with_prompt_masking_uses_identity_tokens_and_masks_prompts(self):
+        tokenizer = _make_identity_sft_tokenizer("identity_with_prompt_masking")
+
+        tokens, targets = tokenizer.tokenize_conversation(
+            self.conversation, return_target=True, add_generation_prompt=False
+        )
+
+        assert tokens.tolist() == [ord(char) for char in "SUUAAVB"]
+        assert targets.tolist() == [
+            IGNORE_INDEX,
+            IGNORE_INDEX,
+            IGNORE_INDEX,
+            ord("A"),
+            ord("A"),
+            IGNORE_INDEX,
+            ord("B"),
+        ]
 
 
 class TestAbstractTokenizerSpecialIdAliases:
