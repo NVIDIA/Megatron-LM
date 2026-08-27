@@ -161,7 +161,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 )
             input_layout_state = layout_manager.build_forward_state(layout_packed_seq_params)
             if input_layout_state is not None:
-                hidden_states, packed_seq_params = input_layout_state.prepare_layer(0, hidden_states)
+                hidden_states, packed_seq_params = input_layout_state.prepare_layer(
+                    0, hidden_states
+                )
 
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
@@ -204,7 +206,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
-            assert not self.config.deterministic_mode, "Packed sequence does not support deterministic mode."
+            assert (
+                not self.config.deterministic_mode
+            ), "Packed sequence does not support deterministic mode."
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
@@ -270,17 +274,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             nvtx_range_push(suffix="conv1d")
             qkv_sections = [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp]
             conv1d_weight = get_parameter_local_cp(
-                self.conv1d.weight,
-                dim=0,
-                cp_group=cp_group_headwise,
-                split_sections=qkv_sections,
+                self.conv1d.weight, dim=0, cp_group=cp_group_headwise, split_sections=qkv_sections
             )
             conv1d_bias = (
                 get_parameter_local_cp(
-                    self.conv1d.bias,
-                    dim=0,
-                    cp_group=cp_group_headwise,
-                    split_sections=qkv_sections,
+                    self.conv1d.bias, dim=0, cp_group=cp_group_headwise, split_sections=qkv_sections
                 )
                 if self.conv_bias
                 else None
@@ -340,15 +338,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
             def _norm_and_restore(core_attn_out, gate):
                 norm_out = self._apply_gated_norm(core_attn_out, gate)
-                norm_out = (
-                    norm_out.reshape(batch, kernel_seq_len, -1).transpose(0, 1).contiguous()
-                )
+                norm_out = norm_out.reshape(batch, kernel_seq_len, -1).transpose(0, 1).contiguous()
                 return a2a_hp_to_cp(
-                    norm_out,
-                    cp_size_headwise,
-                    cp_group_headwise,
-                    packed_seq_params,
-                    thd_cp_a2a_inv,
+                    norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
                 )
 
             if self.recompute_norm_out and self.training:
