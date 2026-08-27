@@ -238,6 +238,20 @@ class NCCLM2NCopyService(CopyService):
         self._is_source = is_source
         self._is_destination = is_destination
 
+    def set_plan(self, plan: object, *, transform: object | None = None) -> None:
+        """Adopt the plan's cross-rank-coordinated grouped-submission limit."""
+        if not isinstance(plan, ReshardPlan):
+            raise TypeError("NCCL M2N requires a ReshardPlan")
+        max_group_bytes = plan.execution_batch_bytes
+        if max_group_bytes is None:
+            return
+        if self._topology is not None and max_group_bytes != self._max_group_bytes:
+            raise RuntimeError(
+                "NCCL M2N grouped-submission limit changed while reusing a service; "
+                "close the service before using a plan with a different limit"
+            )
+        self._max_group_bytes = max_group_bytes
+
     def submit_send(
         self, src_tensor: torch.Tensor, dest_rank: int, task_id: int | None = None
     ) -> None:

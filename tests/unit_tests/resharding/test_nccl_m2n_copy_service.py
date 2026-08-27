@@ -130,6 +130,17 @@ def test_model_roles_cannot_change_while_reusing_service():
         service.set_model_roles(is_source=False, is_destination=True)
 
 
+def test_plan_overrides_local_group_limit_with_coordinated_value():
+    service = object.__new__(NCCLM2NCopyService)
+    service._topology = None
+    service._max_group_bytes = 256
+    plan = ReshardPlan([], [], execution_batch_bytes=128)
+
+    service.set_plan(plan)
+
+    assert service._max_group_bytes == 128
+
+
 def test_topology_is_collected_once(monkeypatch):
     service = object.__new__(NCCLM2NCopyService)
     service._device = torch.device("cpu")

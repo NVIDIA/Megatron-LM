@@ -809,10 +809,12 @@ class TestBuildPlanFromRosters:
 
         default_plans = _build_all(gathered)
         assert {plan.num_batches for plan in default_plans.values()} == {1}
+        assert {plan.execution_batch_bytes for plan in default_plans.values()} == {None}
 
         plans = _build_all(gathered, execution_batch_bytes=256 * 1024 * 1024)
 
         assert {plan.num_batches for plan in plans.values()} == {2}
+        assert {plan.execution_batch_bytes for plan in plans.values()} == {256 * 1024 * 1024}
         send_batches = {op.task_id: op.batch_id for op in plans[0].send_ops}
         recv_batches = {op.task_id: op.batch_id for op in plans[1].recv_ops}
         assert send_batches == recv_batches == {0: 0, 1: 1}
@@ -825,6 +827,7 @@ class TestBuildPlanFromRosters:
             for rank in dst_by_rank
         }
         assert {plan.num_batches for plan in larger_limit_plans.values()} == {1}
+        assert {plan.execution_batch_bytes for plan in larger_limit_plans.values()} == {400_000_000}
 
     def test_node_add_keeps_existing_task_ids_stable(self):
         """Appending a rank rebuilds locally without renumbering existing transfers."""

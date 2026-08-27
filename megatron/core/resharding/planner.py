@@ -759,7 +759,9 @@ def build_plan_from_rosters(
     batch_ids, num_batches = _build_execution_batch_ids(
         dst_param_metadata_by_rank, src_param_metadata, max_batch_bytes=execution_batch_bytes
     )
-    my_plan = ReshardPlan([], [], num_batches=num_batches)
+    my_plan = ReshardPlan(
+        [], [], num_batches=num_batches, execution_batch_bytes=execution_batch_bytes
+    )
     for (
         task_id,
         dst_rank,

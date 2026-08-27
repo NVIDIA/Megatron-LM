@@ -163,6 +163,10 @@ class ReshardPlan:
     # Number of globally coordinated batches in send_ops/recv_ops. Backends
     # that require one stable model-wide registration can opt out at execution.
     num_batches: int = 1
+    # Effective soft execution limit after ranks agree on the smallest
+    # configured value. Native backends may reuse this coordinated value for
+    # their own grouped submissions.
+    execution_batch_bytes: int | None = None
     # Lazily populated by the generic executor so cached plans validate and
     # group their immutable transfer schedule only once.
     _cached_execution_batches: tuple[tuple[int, list[TransferOp], list[TransferOp]], ...] | None = (
