@@ -7,11 +7,12 @@ import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
+from megatron.core.inference.config import ImageProcessingConfig
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
@@ -46,6 +47,142 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     """
     tensor = torch.tensor(tensor_as_list)
     return tensor
+
+
+def serialize_multimodal_data(
+    multi_modal_data: Any,
+) -> Optional[Dict[str, Union[List[bytes], Dict[str, Any]]]]:
+    """Serialize one request's vLLM-style multimodal dictionary.
+
+    Supported modalities:
+
+    Images:
+        ``"image"`` accepts raw image bytes, a list of raw image bytes, or a
+        preprocessed tensor dictionary containing ``imgs`` / ``imgs_sizes``
+        or ``imgs`` / ``num_tiles``.
+    Video:
+        Video does not yet have any supported data preprocessing or modeling
+        formats.
+    Audio:
+        Audio does not yet have any supported data preprocessing or modeling
+        formats.
+    """
+    if multi_modal_data is None:
+        return None
+    if not isinstance(multi_modal_data, dict):
+        raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
+
+    unsupported = set(multi_modal_data) - {"image"}
+    if unsupported:
+        raise NotImplementedError(
+            f"Unsupported multimodal modalities: {sorted(unsupported)}; "
+            "only 'image' is currently supported."
+        )
+    image_data = multi_modal_data.get("image")
+    if image_data is None:
+        return None
+
+    if isinstance(image_data, (bytes, bytearray)):
+        return {"image": [bytes(image_data)]}
+    if isinstance(image_data, list):
+        if any(not isinstance(item, (bytes, bytearray)) for item in image_data):
+            raise TypeError("multi_modal_data['image'] list must contain only bytes.")
+        return {"image": [bytes(item) for item in image_data]}
+    if not isinstance(image_data, dict):
+        raise TypeError(
+            "multi_modal_data['image'] must be bytes, list[bytes], or a "
+            f"preprocessed tensor dict; got {type(image_data)}."
+        )
+
+    wire: Dict[str, Any] = {}
+    for key in ("imgs", "imgs_sizes", "num_tiles"):
+        value = image_data.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"multi_modal_data['image'][{key!r}] must be a Tensor, " f"got {type(value)}."
+            )
+        wire[key] = serialize_tensor(value)
+    if "num_img_embeddings_per_tile" in image_data:
+        wire["num_img_embeddings_per_tile"] = int(image_data["num_img_embeddings_per_tile"])
+    return {"image": wire} if wire else None
+
+
+def resolve_multimodal_data_for_engine(
+    multi_modal_data: Any, *, image_preprocessing_config: Optional[ImageProcessingConfig] = None
+) -> Dict[str, Any]:
+    """Resolve wire-format multimodal data into dynamic-engine arguments.
+
+    Supported modalities:
+
+    Images:
+        Raw image bytes are preprocessed into model inputs. Serialized or
+        in-process preprocessed image tensor dictionaries are passed through
+        as dynamic-engine image arguments.
+    Video:
+        Video does not yet have any supported data preprocessing or modeling
+        formats.
+    Audio:
+        Audio does not yet have any supported data preprocessing or modeling
+        formats.
+    """
+    if multi_modal_data is None:
+        return {}
+    if not isinstance(multi_modal_data, dict):
+        raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
+
+    unsupported = set(multi_modal_data) - {"image"}
+    if unsupported:
+        raise NotImplementedError(
+            f"Unsupported multimodal modalities: {sorted(unsupported)}; "
+            "only 'image' is currently supported."
+        )
+    image_data = multi_modal_data.get("image")
+    if image_data is None:
+        return {}
+
+    if isinstance(image_data, list):
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501  # pylint: disable=line-too-long
+            preprocess_image_bytes_list,
+        )
+
+        if image_preprocessing_config is None:
+            raise RuntimeError("Raw image data require InferenceConfig.image_preprocessing_config.")
+        device = (
+            torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+        )
+        return preprocess_image_bytes_list(image_data, image_preprocessing_config, device=device)
+    if not isinstance(image_data, dict):
+        raise TypeError(
+            "Wire multi_modal_data['image'] must be list[bytes] or a serialized "
+            f"tensor dict; got {type(image_data)}."
+        )
+
+    kwargs: Dict[str, Any] = {}
+    for key in ("imgs", "imgs_sizes", "num_tiles"):
+        if key in image_data:
+            value = image_data[key]
+            kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
+    if "num_img_embeddings_per_tile" in image_data:
+        kwargs["num_img_embeddings_per_tile"] = int(image_data["num_img_embeddings_per_tile"])
+
+    # Reject incomplete static-tiling payloads. Static tiling (imgs +
+    # num_tiles, no imgs_sizes) needs num_img_embeddings_per_tile to size the
+    # image-token expansion; without it the engine defaults the count to
+    # zero, has_images silently becomes False, and neither the image-token
+    # expansion nor the vision encoder runs. Fail fast at the wire boundary
+    # instead of returning a text-only completion for what the client thinks
+    # is a multimodal request.
+    has_num_tiles = "num_tiles" in kwargs
+    has_imgs_sizes = "imgs_sizes" in kwargs
+    has_per_tile = kwargs.get("num_img_embeddings_per_tile", 0) > 0
+    if has_num_tiles and not has_imgs_sizes and not has_per_tile:
+        raise ValueError(
+            "Static-tiling image payload requires num_img_embeddings_per_tile > 0 "
+            "when num_tiles is provided without imgs_sizes."
+        )
+    return kwargs
 
 
 def serialize_ndarray(arr: np.ndarray) -> dict:
@@ -389,6 +526,10 @@ class DynamicInferenceRequest(InferenceRequest):
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
     num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
+    # Length of the leading run of this request's blocks that was obtained by hash
+    # match rather than computed. Accumulated across prefill chunks by the context,
+    # which uses it to avoid rewriting KV into blocks that already hold it.
+    num_matched_prefix_blocks: int = 0
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
@@ -396,6 +537,7 @@ class DynamicInferenceRequest(InferenceRequest):
     # KV handoff metadata describing this request's pinned prefill state.
     # Used by decode-side pulls and prefill-side pushes.
     # Shape: {"request_id", "block_ids", "kv_meta"}.
+    # Hybrid models may add kv_meta["ssm"] for recurrent state.
     disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):
@@ -706,7 +848,7 @@ class DynamicInferenceRequestRecord:
 
         # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
         # expanded prompt. The previous hash list may not include newly completed blocks.
-        new_request = DynamicInferenceRequest(
+        common_kwargs = dict(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
@@ -715,6 +857,21 @@ class DynamicInferenceRequestRecord:
             block_size_tokens=old_request.block_size_tokens,
             enable_prefix_caching=old_request.enable_prefix_caching,
         )
+        # Preserve the VLM subtype and multimodal fields so a suspend/resume
+        # cycle doesn't downcast the request to text-only and lose its imgs /
+        # embeddings / token mask.
+        if isinstance(old_request, DynamicVLMInferenceRequest):
+            new_request = DynamicVLMInferenceRequest(
+                **common_kwargs,
+                num_img_embeddings_per_tile=old_request.num_img_embeddings_per_tile,
+                imgs=old_request.imgs,
+                num_tiles=old_request.num_tiles,
+                decoder_seq_length=old_request.decoder_seq_length,
+                image_embeddings=old_request.image_embeddings,
+                image_token_mask=old_request.image_token_mask,
+            )
+        else:
+            new_request = DynamicInferenceRequest(**common_kwargs)
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
         if old_request.event_add_engine is not None:
@@ -851,3 +1008,16 @@ class VLMInferenceRequest(InferenceRequest):
     imgs: torch.Tensor
     num_tiles: torch.Tensor
     decoder_seq_length: int
+
+
+@dataclass(kw_only=True)
+class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
+    """Dynamic inference request for VLM models.
+
+    Combines DynamicInferenceRequest (for dynamic batching) with VLMInferenceRequest
+    (for multimodal fields). Also stores pre-computed image embeddings and the image
+    token mask produced by expand_image_tokens.
+    """
+
+    image_embeddings: Optional[torch.Tensor] = None  # [seq_img, 1, hidden]
+    image_token_mask: Optional[torch.Tensor] = None  # 1D, -1=text, >=0=image index
