@@ -57,6 +57,11 @@ recompute, fine-grained activation offload, CPU offloading, frozen output-projec
 the absorbed-MLA algorithm. It does not change standard
 attention, the legacy MLA path, TE, or TE's CP implementation.
 
+Before merge, MTP, FP8/FP4 (including MXFP8), outer/selective recompute, and fine-grained
+activation offload remain explicit implementation TODOs. Performance recipes must disable those
+features rather than relying on an implicit fallback. CUDA graph execution is simply outside the
+v1 contract and is disabled without a separate pre-merge TODO.
+
 ## Existing code reused, and the dependency boundary
 
 The new module subclasses `MLASelfAttention` from
@@ -69,7 +74,7 @@ linear primitive. It overrides `forward`, stops KV projection before `linear_kv_
 calls inherited `get_query_key_value_tensors` or `_run_core_attention`, because those functions
 construct full K/V before the current CP wrapper.
 
-The new module uses a short, new-file-local `_latent_cp_down_projection` helper and, only for layers
+The new module uses a short, feature-local `_latent_cp_down_projection` helper and, only for layers
 that enable RoPE, the public MCore `apply_rotary_pos_emb` export. It must not call the inherited
 `_qkv_down_projection`: that protected
 helper gathers Q with an omitted group and can therefore resolve the global tensor-parallel group.
@@ -406,7 +411,7 @@ extreme phase weights, and very negative LSE. An uncorrected cuDNN backward is n
 
 ### Autograd topology and gradient ownership
 
-`_LatentRingExchange`, local to the new file, is a `torch.autograd.Function` over one payload hop.
+`_LatentRingExchange`, local to `transport.py`, is a `torch.autograd.Function` over one payload hop.
 Forward and backward are:
 
 ```text
@@ -480,10 +485,11 @@ backward may remove attention-forward recompute or reduce partial-output storage
 v1 claim.
 
 To avoid ambiguous nested checkpoint/offload behavior, v1 requires
-`recompute_granularity is None`,
-`recompute_modules is None or recompute_modules == []`, and
-`fine_grained_activation_offloading=False`. It rejects outer full-layer recompute, selective
-`mla_up_proj`/`core_attn` recompute, and fine-grained activation offload at construction. Supporting
+`recompute_granularity is None` and `fine_grained_activation_offloading=False`. The inactive
+`recompute_modules` value is deliberately ignored because `TransformerConfig` normalizes an
+unspecified list to `["core_attn"]` even when recompute is disabled. The variant rejects outer
+full-layer recompute, selective `mla_up_proj`/`core_attn` recompute, and fine-grained activation
+offload at construction. Supporting
 any of them later requires explicit nested-checkpoint and saved-tensor/offload tests.
 
 ### V1 transport, lifetimes, and deadlock ordering
@@ -660,15 +666,35 @@ opt-in numerical probe.
 
 ## Feature-owned architecture and config-driven construction
 
-The algorithm and its dedicated tests live in:
+The algorithm lives in a same-name feature package, while its dedicated tests remain in one file:
 
 ```text
-megatron/core/transformer/experimental_attention_variant/mla_with_latent_cp.py
+megatron/core/transformer/experimental_attention_variant/mla_with_latent_cp/
+├── __init__.py
+├── backend.py
+├── cudnn_backend.py
+├── fa4_backend.py
+├── layout.py
+├── mla_with_latent_cp.py
+├── specs.py
+├── transport.py
+└── utils.py
 tests/unit_tests/transformer/experimental_attention_variant/test_mla_with_latent_cp.py
 ```
 
-The production file contains the module, phase planner, FP32 merger, direct adapters,
-differentiable synchronous ring transport, no-op zigzag layout adapter, and spec factory.
+The package boundaries follow runtime ownership: `mla_with_latent_cp.py` contains the MLA subclass,
+projection/forward path, and block preprocessing entry point; `layout.py` owns packed-zigzag
+validation and deterministic phase planning; `transport.py` owns the differentiable synchronous P2P
+ring; `fa4_backend.py` and `cudnn_backend.py` contain only their respective public backend adapters;
+`backend.py` owns exact runtime qualification and dispatch; `specs.py` owns non-mutating GPT/Hybrid
+spec transformations; and `utils.py` owns shared errors, immutable qualification constants, and
+backend-independent FP32 merge/correction helpers. `__init__.py` preserves the original package
+import surface without registration side effects.
+
+Dependencies point from the MLA module toward layout, transport, backend, and utilities; backend
+dispatch points toward the concrete adapters; spec integration points toward the MLA module.
+Concrete backends never import the MLA class or model-spec integration, preventing import cycles.
+
 Small integration changes add `TransformerConfig.mla_latent_cp`, generic dynamic-group consistency
 checks in the data scheduler, and one feature-spec initialization call in each of GPTModel and
 HybridModel. GPT/Hybrid layer-spec builders and training builders do not carry latent-CP branches.
