@@ -148,11 +148,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         over the grad-stats group is then exact, because every shard is held by exactly
         one rank in that group.
 
-        No duplicate filtering is needed here. ``get_grad_norm_fp32``'s shared/TP/GTP
-        filters exist to count replicas once along the model-parallel axes, and MFSDP v2
-        rejects TP, PP and CP sizes above 1 (see ``mcore_fsdp_adapter``), so those axes
-        are trivial and every parameter is unique. Revisit if v2 gains TP composability.
-
         ``get_grad_norm_fp32`` cannot do this: ``get_main_grads_for_grad_norm``
         replaces each DTensor with ``grad._local_tensor`` before it runs, so
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
