@@ -749,12 +749,18 @@ def vllm_fused_moe(
 
     topk_weights_flat = probs.reshape(-1).contiguous()
 
-    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    # SQUARED_RELU fuses into the GEMM epilogue (elementwise). SwiGLU pairs column c
-    # with c+N/2 across tiles and cannot, so FC1 runs unfused to the 2N-wide
-    # intermediate and gate/up is applied separately below.
+    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]. Outside
+    # batch-invariant mode, SQUARED_RELU fuses into the GEMM epilogue while
+    # SwiGLU runs separately. Batch-invariant mode runs both activations
+    # separately so their probability application and BF16 rounding match the
+    # training TEGroupedMLP path exactly.
     assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
     is_swiglu = activation_type == ActivationType.SWIGLU
+    fuse_squared_relu = not is_swiglu
+    if batch_invariant_mode:
+        # Apply the activation separately below to match training-side rounding.
+        fuse_squared_relu = False
+    
     intermediate1 = VllmFusedMoeBuffers.get(
         "intermediate1", (num_valid, N), hidden_states.dtype, hidden_states.device
     )
@@ -770,10 +776,11 @@ def vllm_fused_moe(
         top_k=topk,
         config=config,
         grid_size=grid_size_fc1,
-        fuse_squared_relu=not is_swiglu,
+        fuse_squared_relu=fuse_squared_relu,
     )
-    if is_swiglu:
-        if batch_invariant_mode:
+    if batch_invariant_mode:
+        live_rows = (valid_tokens * topk).to(torch.int32)
+        if is_swiglu:
             # Match training: routing probabilities multiply at the activation
             # (before FC2), with the training kernel's exact rounding sequence
             # (single bf16 round of fp32 silu(gate)*up*prob). The reduction
@@ -784,14 +791,21 @@ def vllm_fused_moe(
                 intermediate1, topk_weights_flat, bound_elems
             )
         else:
-            # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
-            # SiLU(gate) * up over the valid_tokens*topk live rows only.
-            n_rows = (valid_tokens * topk).to(torch.int32)
-            intermediate1 = bounded_silu_mul(intermediate1, n_rows)
+            # Nemotron-style weighted squared-ReLU rounds the squared BF16
+            # activation before its FP32 probability multiply, then rounds to
+            # BF16 again. Reuse the training-parity kernel with the flattened
+            # routing map as the live-row mask.
+            intermediate1 = batch_invariant.squared_relu_with_probs(
+                intermediate1, routing_map.reshape(-1), live_rows, topk_weights_flat
+            )
+    elif is_swiglu:
+        # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
+        # SiLU(gate) * up over the valid_tokens*topk live rows only.
+        intermediate1 = bounded_silu_mul(intermediate1, (valid_tokens * topk).to(torch.int32))
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
-    # Routing weights are applied in the reduction kernel to avoid an extra
-    # bf16 truncation of prob-scaled values before the topk summation.
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Batch-invariant mode
+    # already applied routing weights at the activation to match training;
+    # ordinary inference applies them in the reduction kernel.
     # Only local-expert blocks are processed; non-local positions are left
     # undefined and skipped by _moe_sum (which checks the routing map).
     intermediate3 = VllmFusedMoeBuffers.get(
@@ -815,6 +829,14 @@ def vllm_fused_moe(
     # Applies routing weights and accumulates in fp32, writes directly to
     # out (if provided), zeros rows beyond valid_tokens, and skips non-local
     # expert slots.
+    apply_routing_weights = True
+    accumulate_in_fp64 = False
+    if batch_invariant_mode:
+        # Probabilities were applied at the activation to mirror training. Use
+        # training's invariant within-rank accumulation for the unweighted sum.
+        apply_routing_weights = False
+        accumulate_in_fp64 = True
+
     return _moe_sum(
         intermediate3,
         probs,
@@ -826,9 +848,6 @@ def vllm_fused_moe(
         local_expert_start,
         num_local_experts,
         out=out,
-        # Batch-invariant mode: probs were already applied at the activation
-        # for SwiGLU (training parity), so the reduction uses unit weights;
-        # fp64 accumulation makes the topk sum order-independent by precision.
-        apply_weights=not (batch_invariant_mode and is_swiglu),
-        acc_fp64=batch_invariant_mode and is_swiglu,
+        apply_weights=apply_routing_weights,
+        acc_fp64=accumulate_in_fp64,
     )
