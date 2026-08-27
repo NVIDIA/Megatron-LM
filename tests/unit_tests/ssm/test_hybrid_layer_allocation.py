@@ -154,8 +154,8 @@ class TestValidateSegmentLayers:
 
     def test_all_layer_symbols_have_an_expected_config_class(self):
         assert Symbols.LAYER_CONFIG_MAP == _EXPECTED_LAYER_CONFIG_CLASSES
-        assert not layer_utils.is_valid_layer(Symbols.PIPE)
-        assert not layer_utils.is_valid_layer(Symbols.MTP_SEPARATOR)
+        assert not layer_utils.is_valid_symbol(Symbols.PIPE)
+        assert not layer_utils.is_valid_symbol(Symbols.MTP_SEPARATOR)
 
     def test_repeated_layers_receive_independent_config_copies(self):
         self.config.test_mutable_value = {"items": []}

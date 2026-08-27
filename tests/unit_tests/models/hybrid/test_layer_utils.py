@@ -35,17 +35,17 @@ class TestSymbols:
     @pytest.mark.parametrize(
         "layer_symbol", [layer_symbol for layer_symbol, _ in _EXPECTED_LAYER_CONFIG_TYPES]
     )
-    def test_is_valid_layer(self, layer_symbol):
-        assert layer_utils.is_valid_layer(layer_symbol)
+    def test_is_valid_symbol(self, layer_symbol):
+        assert layer_utils.is_valid_symbol(layer_symbol)
 
     @pytest.mark.parametrize(
         "layer_symbol", [layer_utils.Symbols.PIPE, layer_utils.Symbols.MTP_SEPARATOR, "X"]
     )
-    def test_is_not_valid_layer(self, layer_symbol):
-        assert not layer_utils.is_valid_layer(layer_symbol)
+    def test_is_not_valid_symbol(self, layer_symbol):
+        assert not layer_utils.is_valid_symbol(layer_symbol)
 
-    def test_is_valid_layer_allows_pipe(self):
-        assert layer_utils.is_valid_layer(layer_utils.Symbols.PIPE, allow_pipe=True)
+    def test_is_valid_symbol_allows_pipe(self):
+        assert layer_utils.is_valid_symbol(layer_utils.Symbols.PIPE, allow_pipe=True)
 
     def test_name_sorted_valid_layer_symbols(self):
         assert layer_utils.Symbols.name_sorted_valid_layer_symbols() == [
