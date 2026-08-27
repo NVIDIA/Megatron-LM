@@ -115,7 +115,10 @@ def test_vllm_attention_cp2_matches_cp1_forward_backward_and_saves_memory() -> N
     torch.cuda.reset_peak_memory_stats()
     baseline = torch.cuda.memory_allocated()
     full_input = full.detach().clone().requires_grad_(True)
-    cp1_output = attention(full_input, metadata=builder.build(positions, packed))
+    cp1_output = attention(
+        full_input,
+        metadata=builder.build(positions, packed, (0, seq_len), cp_size=1),
+    )
     (cp1_output * cotangent).sum().backward()
     cp1_peak = torch.cuda.max_memory_allocated() - baseline
     cp1_forward = cp1_output.detach().clone()
@@ -137,7 +140,10 @@ def test_vllm_attention_cp2_matches_cp1_forward_backward_and_saves_memory() -> N
     torch.cuda.reset_peak_memory_stats()
     baseline = torch.cuda.memory_allocated()
     cp2_output = attention(
-        local_input, metadata=builder.build(local_positions, packed)
+        local_input,
+        metadata=builder.build(
+            local_positions, packed, (0, seq_len), cp_size=2
+        ),
     )
     (cp2_output * cotangent[start : start + local_rows]).sum().backward()
     cp2_peak = torch.cuda.max_memory_allocated() - baseline
@@ -275,7 +281,12 @@ def test_vllm_attention_cp2_packed_requests_are_bitwise_batch_invariant() -> Non
         with torch.no_grad():
             output = attention(
                 local_hidden,
-                metadata=builder.build(local_positions, packed),
+                metadata=builder.build(
+                    local_positions,
+                    packed,
+                    tuple(boundaries),
+                    cp_size=cp_size,
+                ),
             )
         torch.cuda.synchronize()
         gathered = [torch.empty_like(output) for _ in range(cp_size)]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 
 import pytest
@@ -7,8 +8,16 @@ import torch
 import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
+    _VisibleSparseAttentionFunction,
     _default_sparse_backward,
 )
+
+
+def test_sparse_attention_backward_finite_checks_stay_on_device() -> None:
+    source = inspect.getsource(_VisibleSparseAttentionFunction.backward)
+    assert "torch._assert_async" in source
+    assert "bool(" not in source
+    assert ".item()" not in source
 
 
 @pytest.mark.gpus(1)

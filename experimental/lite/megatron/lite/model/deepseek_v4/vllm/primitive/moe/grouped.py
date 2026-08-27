@@ -2,28 +2,25 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
-import torch.nn.functional as F
 
 from megatron.lite.primitive.modules.experts import swiglu_with_probs
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
-    pack_grouped_block_fp8_weight,
+    DeploymentGroupedBlockFP8Adapter,
 )
 
 _M_ALIGNMENT = 128
-_EXPERTS_PER_FORWARD_GROUP = 4
-_BACKWARD_CHUNK_ROWS = 1024
 
 
-def _require_power_of_two_scales(name: str, scales: torch.Tensor) -> None:
-    if scales.dtype != torch.float32:
-        return
-    bits = scales.contiguous().view(torch.int32)
-    invalid = (bits & 0x807FFFFF) != 0
-    if bool(invalid.any().item()):
-        raise RuntimeError(
-            f"{name} contains {int(invalid.sum().item())} non-UE8M0 FP32 scales"
-        )
+@contextmanager
+def _nvtx_range(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def _pad_expert_rows(
@@ -132,6 +129,7 @@ def _vllm_grouped_forward(
     hidden_states: torch.Tensor,
     counts: tuple[int, ...],
     swiglu_limit: float,
+    weight_cache: DeploymentGroupedBlockFP8Adapter,
     w13: tuple[torch.Tensor, ...],
     w2: tuple[torch.Tensor, ...],
 ) -> torch.Tensor:
@@ -139,14 +137,14 @@ def _vllm_grouped_forward(
 
     if hidden_states.shape[0] == 0:
         return hidden_states.new_empty((0, hidden_states.shape[1]))
-    # Match Slime's bounded groups of four adjacent experts.
     compact_output = hidden_states.new_empty(
         (hidden_states.shape[0], w2[0].shape[0])
     )
     token_offset = 0
-    for expert_start in range(0, len(counts), _EXPERTS_PER_FORWARD_GROUP):
+    experts_per_group = len(counts)
+    for expert_start in range(0, len(counts), experts_per_group):
         expert_end = min(
-            expert_start + _EXPERTS_PER_FORWARD_GROUP,
+            expert_start + experts_per_group,
             len(counts),
         )
         group_counts = counts[expert_start:expert_end]
@@ -159,9 +157,10 @@ def _vllm_grouped_forward(
         )
         m_indices = _build_m_indices(padded_counts, hidden_states.device)
         packed_input = _vllm_quantize_contiguous_input(padded)
-        packed_w13 = pack_grouped_block_fp8_weight(w13[expert_start:expert_end])
-        _require_power_of_two_scales("grouped input", packed_input[1])
-        _require_power_of_two_scales("grouped w13", packed_w13.scales)
+        packed_w13 = weight_cache.pack_weight(
+            ("w13", expert_start),
+            w13[expert_start:expert_end],
+        )
         gate_up = hidden_states.new_empty((padded.shape[0], w13[0].shape[0]))
         m_grouped_fp8_gemm_nt_contiguous(
             packed_input,
@@ -179,9 +178,10 @@ def _vllm_grouped_forward(
             output=activated_q,
             swiglu_limit=swiglu_limit,
         )
-        packed_w2 = pack_grouped_block_fp8_weight(w2[expert_start:expert_end])
-        _require_power_of_two_scales("grouped activation", activated_scale)
-        _require_power_of_two_scales("grouped w2", packed_w2.scales)
+        packed_w2 = weight_cache.pack_weight(
+            ("w2", expert_start),
+            w2[expert_start:expert_end],
+        )
         group_output = hidden_states.new_empty(
             (padded.shape[0], w2[0].shape[0])
         )
@@ -203,6 +203,168 @@ def _vllm_grouped_forward(
     return compact_output
 
 
+def _te_grouped_gemm(
+    lhs: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    rhs: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    output: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+    *,
+    activation_dtype: torch.dtype,
+    layout: str = "TN",
+    m_splits: tuple[int, ...] | None = None,
+    single_output: bool = False,
+    grad: bool = False,
+    use_split_accumulator: bool = False,
+) -> None:
+    """Call TE's grouped GEMM primitive without constructing GroupedLinear."""
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+    outputs = [output] if isinstance(output, torch.Tensor) else list(output)
+    general_grouped_gemm(
+        list(lhs),
+        list(rhs),
+        outputs,
+        [None] * len(lhs),
+        activation_dtype,
+        single_output=single_output,
+        layout=layout,
+        m_splits=list(m_splits) if m_splits is not None else None,
+        grad=grad,
+        use_split_accumulator=use_split_accumulator,
+    )
+
+
+def _te_grouped_bf16_backward(
+    hidden_states: torch.Tensor,
+    grad_output: torch.Tensor,
+    counts: tuple[int, ...],
+    swiglu_limit: float,
+    w13: tuple[torch.Tensor, ...],
+    w2: tuple[torch.Tensor, ...],
+    *,
+    needs_hidden: bool,
+    needs_w13: tuple[bool, ...],
+    needs_w2: tuple[bool, ...],
+) -> tuple[
+    torch.Tensor | None,
+    tuple[torch.Tensor | None, ...],
+    tuple[torch.Tensor | None, ...],
+]:
+    """Recompute activation and run FC dgrad/wgrad with TE grouped GEMMs."""
+    activation_dtype = hidden_states.dtype
+    hidden_mats = tuple(torch.split(hidden_states, counts))
+    grad_output_mats = tuple(torch.split(grad_output.contiguous(), counts))
+
+    gate_up = hidden_states.new_empty(
+        (hidden_states.shape[0], w13[0].shape[0])
+    )
+    with _nvtx_range("moe_bwd/recompute_fc1"):
+        _te_grouped_gemm(
+            w13,
+            hidden_mats,
+            gate_up,
+            activation_dtype=activation_dtype,
+            m_splits=counts,
+            single_output=True,
+        )
+
+    with torch.enable_grad():
+        gate_up_graph = gate_up.detach().requires_grad_(True)
+        activated = swiglu_with_probs(
+            gate_up_graph,
+            None,
+            swiglu_limit,
+        )
+
+    grad_activated = torch.empty_like(activated)
+    with _nvtx_range("moe_bwd/fc2_dgrad"):
+        _te_grouped_gemm(
+            w2,
+            grad_output_mats,
+            grad_activated,
+            activation_dtype=activation_dtype,
+            layout="NN",
+            m_splits=counts,
+            single_output=True,
+            grad=True,
+            use_split_accumulator=True,
+        )
+
+    grad_w2: list[torch.Tensor | None] = [None] * len(w2)
+    if any(needs_w2):
+        computed_w2_packed = torch.empty(
+            (len(w2), *w2[0].shape),
+            dtype=activation_dtype,
+            device=hidden_states.device,
+        )
+        computed_w2 = tuple(computed_w2_packed.unbind(0))
+        activated_mats = tuple(torch.split(activated.detach(), counts))
+        with _nvtx_range("moe_bwd/fc2_wgrad"):
+            _te_grouped_gemm(
+                activated_mats,
+                grad_output_mats,
+                computed_w2,
+                activation_dtype=activation_dtype,
+                layout="NT",
+                m_splits=counts,
+                grad=True,
+                use_split_accumulator=True,
+            )
+        grad_w2 = [
+            gradient if needed else None
+            for gradient, needed in zip(computed_w2, needs_w2, strict=True)
+        ]
+
+    with _nvtx_range("moe_bwd/swiglu"):
+        (grad_gate_up,) = torch.autograd.grad(
+            activated,
+            gate_up_graph,
+            grad_activated,
+        )
+    grad_gate_up_mats = tuple(torch.split(grad_gate_up.contiguous(), counts))
+
+    grad_hidden = None
+    if needs_hidden:
+        grad_hidden = torch.empty_like(hidden_states)
+        with _nvtx_range("moe_bwd/fc1_dgrad"):
+            _te_grouped_gemm(
+                w13,
+                grad_gate_up_mats,
+                grad_hidden,
+                activation_dtype=activation_dtype,
+                layout="NN",
+                m_splits=counts,
+                single_output=True,
+                grad=True,
+                use_split_accumulator=True,
+            )
+
+    grad_w13: list[torch.Tensor | None] = [None] * len(w13)
+    if any(needs_w13):
+        computed_w13_packed = torch.empty(
+            (len(w13), *w13[0].shape),
+            dtype=activation_dtype,
+            device=hidden_states.device,
+        )
+        computed_w13 = tuple(computed_w13_packed.unbind(0))
+        with _nvtx_range("moe_bwd/fc1_wgrad"):
+            _te_grouped_gemm(
+                hidden_mats,
+                grad_gate_up_mats,
+                computed_w13,
+                activation_dtype=activation_dtype,
+                layout="NT",
+                m_splits=counts,
+                grad=True,
+                use_split_accumulator=True,
+            )
+        grad_w13 = [
+            gradient if needed else None
+            for gradient, needed in zip(computed_w13, needs_w13, strict=True)
+        ]
+
+    return grad_hidden, tuple(grad_w13), tuple(grad_w2)
+
+
 class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -210,6 +372,7 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
         hidden_states: torch.Tensor,
         tokens_per_expert: list[int] | tuple[int, ...],
         swiglu_limit: float,
+        weight_cache: DeploymentGroupedBlockFP8Adapter,
         *weights: torch.Tensor,
     ) -> torch.Tensor:
         counts = tuple(int(value) for value in tokens_per_expert)
@@ -220,7 +383,14 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
             raise ValueError("tokens_per_expert does not match expert-major rows")
         w13 = tuple(weights[:num_experts])
         w2 = tuple(weights[num_experts:])
-        output = _vllm_grouped_forward(hidden_states, counts, float(swiglu_limit), w13, w2)
+        output = _vllm_grouped_forward(
+            hidden_states,
+            counts,
+            float(swiglu_limit),
+            weight_cache,
+            w13,
+            w2,
+        )
         ctx.counts = counts
         ctx.swiglu_limit = float(swiglu_limit)
         ctx.save_for_backward(hidden_states, *weights)
@@ -230,33 +400,23 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         hidden_states, *weights = ctx.saved_tensors
         num_experts = len(ctx.counts)
-        w13 = weights[:num_experts]
-        w2 = weights[num_experts:]
-        grad_hidden = torch.empty_like(hidden_states) if ctx.needs_input_grad[0] else None
-        grad_w13 = [torch.zeros_like(weight) if ctx.needs_input_grad[3 + i] else None for i, weight in enumerate(w13)]
-        grad_w2 = [torch.zeros_like(weight) if ctx.needs_input_grad[3 + num_experts + i] else None for i, weight in enumerate(w2)]
-        offset = 0
-        for expert, count in enumerate(ctx.counts):
-            for start in range(0, count, _BACKWARD_CHUNK_ROWS):
-                end = min(start + _BACKWARD_CHUNK_ROWS, count)
-                row_slice = slice(offset + start, offset + end)
-                with torch.enable_grad():
-                    hidden = hidden_states[row_slice].detach().requires_grad_(True)
-                    fc1 = w13[expert].detach().requires_grad_(True)
-                    fc2 = w2[expert].detach().requires_grad_(True)
-                    gate_up = F.linear(hidden, fc1)
-                    activated = swiglu_with_probs(gate_up, None, ctx.swiglu_limit)
-                    recomputed = F.linear(activated, fc2)
-                    grad_h, grad_fc1, grad_fc2 = torch.autograd.grad(
-                        recomputed,
-                        (hidden, fc1, fc2),
-                        grad_output[row_slice],
-                    )
-                if grad_hidden is not None:
-                    grad_hidden[row_slice].copy_(grad_h)
-                if grad_w13[expert] is not None:
-                    grad_w13[expert].add_(grad_fc1)
-                if grad_w2[expert] is not None:
-                    grad_w2[expert].add_(grad_fc2)
-            offset += count
-        return grad_hidden, None, None, *grad_w13, *grad_w2
+        w13 = tuple(weights[:num_experts])
+        w2 = tuple(weights[num_experts:])
+        grad_hidden, grad_w13, grad_w2 = _te_grouped_bf16_backward(
+            hidden_states,
+            grad_output,
+            ctx.counts,
+            ctx.swiglu_limit,
+            w13,
+            w2,
+            needs_hidden=ctx.needs_input_grad[0],
+            needs_w13=tuple(
+                ctx.needs_input_grad[4 + expert]
+                for expert in range(num_experts)
+            ),
+            needs_w2=tuple(
+                ctx.needs_input_grad[4 + num_experts + expert]
+                for expert in range(num_experts)
+            ),
+        )
+        return grad_hidden, None, None, None, *grad_w13, *grad_w2

@@ -81,17 +81,25 @@ def test_builders_share_rope_by_ratio(monkeypatch) -> None:
 def test_training_metadata_has_only_local_packed_state(
     layer_idx: int, rows: int, expected_tokens: int
 ) -> None:
-    packed = object()
+    packed = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, rows], dtype=torch.int32),
+        max_seqlen_q=rows,
+    )
     positions = torch.arange(rows, dtype=torch.int64)
     builder = runtime.AttentionMetadataBuilder(
         _config(),
         layer_idx=layer_idx,
         cos_sin_cache=torch.zeros(8192, 128, dtype=torch.float32),
     )
-    metadata = builder.build(positions, packed)
+    metadata = builder.build(positions, packed, (0, rows), cp_size=1)
 
     assert metadata.positions is positions
     assert metadata.packed_seq_params is packed
+    assert metadata.sequence_boundaries == (0, rows)
+    expected_compressed = (0, rows // max(1, builder.ratio))
+    assert metadata.compressed_boundaries == (
+        expected_compressed if builder.ratio > 1 else (0, 0)
+    )
     assert not hasattr(metadata, "swa_cache")
     assert not hasattr(metadata, "kv_workspace")
     if expected_tokens == 0:
@@ -108,6 +116,20 @@ def test_training_metadata_has_only_local_packed_state(
         assert indexer.k_cache.shape[-1] == 132
     else:
         assert metadata.indexer_compressor_metadata is None
+
+
+def test_builder_rejects_host_geometry_shape_mismatch() -> None:
+    builder = runtime.AttentionMetadataBuilder(
+        _config(),
+        layer_idx=2,
+        cos_sin_cache=torch.zeros(8192, 128, dtype=torch.float32),
+    )
+    packed = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, 8], dtype=torch.int32),
+        max_seqlen_q=8,
+    )
+    with pytest.raises(ValueError, match="cu_seqlens shape"):
+        builder.build(torch.arange(8), packed, (0, 4, 8), cp_size=1)
 
 
 def _compressor_metadata(tokens: int = 4):

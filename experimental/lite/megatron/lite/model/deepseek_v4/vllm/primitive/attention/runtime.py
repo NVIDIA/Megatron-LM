@@ -22,6 +22,10 @@ from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
     _rope_and_qnorm,
 )
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.host_geometry import (
+    compressed_sequence_boundaries,
+    padded_sequence_boundaries,
+)
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -160,6 +164,9 @@ class AttentionKernelMetadata:
     positions: torch.Tensor
     cos_sin_cache: torch.Tensor
     packed_seq_params: Any
+    sequence_boundaries: tuple[int, ...]
+    compressed_boundaries: tuple[int, ...]
+    cp_size: int
     compressor_metadata: DS4CompressorMetadata | None
     indexer_compressor_metadata: DS4CompressorMetadata | None
 
@@ -321,11 +328,57 @@ class AttentionMetadataBuilder:
         self.ratio = max(1, config.compress_ratios[layer_idx])
         self.cos_sin_cache = cos_sin_cache
 
-    def build(self, positions: torch.Tensor, packed_seq_params: Any):
+    def build(
+        self,
+        positions: torch.Tensor,
+        packed_seq_params: Any,
+        sequence_boundaries: tuple[int, ...],
+        *,
+        cp_size: int,
+    ):
+        if cp_size < 1:
+            raise ValueError("cp_size must be positive")
+        if len(sequence_boundaries) < 2 or sequence_boundaries[0] != 0:
+            raise ValueError("sequence boundaries must start at zero and be non-empty")
+        sequence_lengths = tuple(
+            end - start
+            for start, end in zip(sequence_boundaries, sequence_boundaries[1:])
+        )
+        if any(length <= 0 for length in sequence_lengths):
+            raise ValueError("sequence boundaries must be strictly increasing")
+        total_tokens = sequence_boundaries[-1]
+        if total_tokens % cp_size:
+            raise ValueError("padded token count must be divisible by cp_size")
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+        if cu_seqlens is None:
+            cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+        if cu_seqlens is None:
+            raise ValueError("packed_seq_params must provide cu_seqlens_q")
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() != len(sequence_boundaries):
+            raise ValueError(
+                "host sequence boundaries do not match packed cu_seqlens shape"
+            )
+        if positions.numel() != total_tokens // cp_size:
+            raise ValueError(
+                "host sequence terminal does not match CP-local position rows"
+            )
+        packed_max = getattr(packed_seq_params, "max_seqlen_q", None)
+        if packed_max is not None and int(packed_max) != max(sequence_lengths):
+            raise ValueError(
+                "host sequence lengths do not match packed max_seqlen_q"
+            )
+        compressed_boundaries = (
+            compressed_sequence_boundaries(sequence_boundaries, ratio=self.ratio)
+            if self.ratio > 1
+            else (0,) * len(sequence_boundaries)
+        )
         return AttentionKernelMetadata(
             positions=positions,
             cos_sin_cache=self.cos_sin_cache,
             packed_seq_params=packed_seq_params,
+            sequence_boundaries=sequence_boundaries,
+            compressed_boundaries=compressed_boundaries,
+            cp_size=cp_size,
             compressor_metadata=_build_compressor_metadata(
                 self.config,
                 ratio=self.ratio,
@@ -510,36 +563,44 @@ def official_compact_compressed_visible(
     runtime_metadata,
     ratio: int,
     head_dim: int,
-    valid_groups: int | None = None,
+    compressed_boundaries: tuple[int, ...],
 ) -> torch.Tensor:
     """Evaluate compact CP groups with the official compressor kernel."""
-    groups = (
-        compressed_group_ids.numel()
-        if valid_groups is None
-        else min(int(valid_groups), compressed_group_ids.numel())
-    )
+    if (
+        len(compressed_boundaries) < 2
+        or compressed_boundaries[0] != 0
+        or any(
+            end < start
+            for start, end in zip(
+                compressed_boundaries, compressed_boundaries[1:]
+            )
+        )
+    ):
+        raise ValueError("compressed boundaries must be monotonic and start at zero")
+    groups = compressed_boundaries[-1]
+    if (
+        groups > compressed_group_ids.numel()
+        or groups > functional_k.shape[0]
+        or groups * ratio > compact_score.shape[0]
+    ):
+        raise ValueError("host compressed terminal exceeds compact GPU rows")
     if groups == 0:
         return functional_k[:0]
     functional_k = functional_k[:groups]
     compressed_group_ids = compressed_group_ids[:groups]
     # Each packed request needs an independent compressor state reset.
-    starts = torch.cat(
-        (
-            torch.zeros(1, dtype=torch.int64, device=compact_score.device),
-            torch.nonzero(compressed_group_ids[1:] == 0, as_tuple=False)
-            .flatten()
-            .add(1),
-        )
-    )
-    ends = torch.cat((starts[1:], torch.tensor([groups], device=compact_score.device)))
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
         dequantize_and_gather_k_cache_triton,
     )
 
     block_size = runtime_metadata.k_cache.shape[1]
     visible_parts = []
-    for group_start, group_end in zip(starts.tolist(), ends.tolist(), strict=True):
+    for group_start, group_end in zip(
+        compressed_boundaries, compressed_boundaries[1:]
+    ):
         segment_groups = group_end - group_start
+        if segment_groups == 0:
+            continue
         segment_tokens = segment_groups * ratio
         segment = copy(runtime_metadata)
         segment.state_slot_mapping = runtime_metadata.state_slot_mapping[
@@ -646,9 +707,9 @@ def official_indexer_topk(
     index_k_seq_major: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
     *,
+    sequence_boundaries: tuple[int, ...],
+    compressed_boundaries: tuple[int, ...],
     global_start: int,
     ratio: int,
     topk: int,
@@ -677,21 +738,29 @@ def official_indexer_topk(
         group_size=index_k_seq_major.shape[-1],
         use_ue8m0=True,
     )
+    if len(sequence_boundaries) != len(compressed_boundaries):
+        raise ValueError("sequence and compressed boundary counts must match")
+    if (
+        sequence_boundaries[0] != 0
+        or compressed_boundaries[0] != 0
+        or compressed_boundaries[-1] != index_k_seq_major.shape[0]
+    ):
+        raise ValueError("host boundaries do not match indexer GPU rows")
     if index_k_seq_major.shape[0] == 0:
         return output
     k_scale = k_scale.view(torch.float32).squeeze(-1)
     local_end = global_start + rows
-    for seq_idx in range(cu_seqlens.numel() - 1):
-        seq_start = int(cu_seqlens[seq_idx].item())
-        seq_end = int(cu_seqlens[seq_idx + 1].item())
+    for seq_idx, (seq_start, seq_end) in enumerate(
+        zip(sequence_boundaries, sequence_boundaries[1:])
+    ):
         query_start = max(global_start, seq_start)
         query_end = min(local_end, seq_end)
         if query_end <= query_start:
             continue
         q_start = query_start - global_start
         q_end = query_end - global_start
-        k_start = int(cu_seqlens_compressed[seq_idx].item())
-        k_end = int(cu_seqlens_compressed[seq_idx + 1].item())
+        k_start = compressed_boundaries[seq_idx]
+        k_end = compressed_boundaries[seq_idx + 1]
         if k_end <= k_start:
             continue
 

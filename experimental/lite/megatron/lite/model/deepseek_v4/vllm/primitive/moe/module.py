@@ -24,6 +24,7 @@ from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     DeploymentBlockFP8Adapter,
+    DeploymentGroupedBlockFP8Adapter,
     bind_source_scale_to_visible_weight,
 )
 
@@ -106,6 +107,18 @@ def _fixed_route_vjp(visible_op, logits, *, renormalize: bool, route_scale: floa
 
 
 class _VLLMVisibleExperts(Experts):
+    def __init__(
+        self,
+        config: DeepseekV4Config,
+        ps: ParallelState,
+        *,
+        cache_deployment_weights: bool,
+    ) -> None:
+        super().__init__(config, ps)
+        self.grouped_fp8 = DeploymentGroupedBlockFP8Adapter(
+            cache_weight=cache_deployment_weights
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -135,6 +148,7 @@ class _VLLMVisibleExperts(Experts):
             hidden_states,
             tuple(tokens_per_expert_list),
             self.swiglu_limit,
+            self.grouped_fp8,
             *w13,
             *w2,
         )
@@ -186,6 +200,7 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
             ) from exc
         object.__setattr__(self, "dispatcher_cls", dispatcher_cls)
         self._hybridep_max_tokens_per_rank = hybridep_max_tokens_per_rank
+        self._cache_deployment_weights = cache_deployment_weights
         ps = ps or ParallelState()
         super().__init__(
             config,
@@ -226,9 +241,14 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
     def clear_deployment_weight_cache(self) -> None:
         self.shared_gate_up_fp8.clear_cache()
         self.shared_down_fp8.clear_cache()
+        self.experts.grouped_fp8.clear_cache()
 
     def _build_experts(self, config: DeepseekV4Config, ps: ParallelState) -> nn.Module:
-        return _VLLMVisibleExperts(config, ps)
+        return _VLLMVisibleExperts(
+            config,
+            ps,
+            cache_deployment_weights=self._cache_deployment_weights,
+        )
 
     def _shared_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         bind_source_scale_to_visible_weight(

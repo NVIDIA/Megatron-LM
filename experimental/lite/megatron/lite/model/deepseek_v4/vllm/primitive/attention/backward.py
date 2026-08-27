@@ -271,8 +271,14 @@ class _VisibleSparseAttentionFunction(torch.autograd.Function):
             q, kv, out, grad_out, lse, sink, indices, ctx.scale, length
         )
         dkv = dkv.reshape_as(kv)
-        if not bool(torch.isfinite(dq).all()) or not bool(torch.isfinite(dkv).all()):
-            raise FloatingPointError("native CP sparse attention produced non-finite gradients")
+        torch._assert_async(
+            torch.isfinite(dq).all(),
+            "native CP sparse attention produced non-finite dq",
+        )
+        torch._assert_async(
+            torch.isfinite(dkv).all(),
+            "native CP sparse attention produced non-finite dkv",
+        )
         return None, None, None, dq, dkv, None, None, None
 
 

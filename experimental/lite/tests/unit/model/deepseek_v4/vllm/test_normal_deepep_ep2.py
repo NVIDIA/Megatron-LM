@@ -76,6 +76,7 @@ def _run_microbatch(
     expert_input, actual_counts, _route_weights = dispatcher.dispatch(
         hidden, topk_weights, topk_ids
     )
+    assert actual_counts.device.type == "cpu"
     assert actual_counts.numel() == 2
     assert int(actual_counts.sum()) == expert_input.shape[0]
     assert any(0 < int(count) < 128 for count in actual_counts)

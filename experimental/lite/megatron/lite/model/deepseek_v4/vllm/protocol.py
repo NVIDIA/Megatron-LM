@@ -30,6 +30,7 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
     build_attention_metadata_builders,
+    padded_sequence_boundaries,
 )
 from megatron.lite.model.protocol_utils import add_loss_context_kwargs
 from megatron.lite.primitive.bundle import ModelBundle
@@ -287,11 +288,25 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         seq_lens = getattr(batch, "seq_lens", None)
         if seq_lens is None:
             raise ValueError("DeepSeek V4 vLLM requires packed batch.seq_lens")
+        # This is the single forward-boundary D2H for request geometry. All
+        # attention layers consume immutable host boundaries derived from it.
+        host_seq_lens = tuple(
+            int(length) for length in seq_lens.detach().cpu().tolist()
+        )
+        model_ps = parallel_state_from_model(model) or parallel_state
+        sequence_boundaries = padded_sequence_boundaries(
+            host_seq_lens,
+            cp_size=model_ps.cp_size,
+            tp_size=model_ps.tp_size,
+        )
         forward_inputs, packed_seq_params = _prepare_cp_forward_inputs(model, batch)
         current_attention_builders = ensure_runtime_assets()
         attention_metadata = {
             layer_idx: current_attention_builders[layer_idx].build(
-                forward_inputs["position_ids"], packed_seq_params
+                forward_inputs["position_ids"],
+                packed_seq_params,
+                sequence_boundaries,
+                cp_size=model_ps.cp_size,
             )
             for layer_idx in selected_layers
         }

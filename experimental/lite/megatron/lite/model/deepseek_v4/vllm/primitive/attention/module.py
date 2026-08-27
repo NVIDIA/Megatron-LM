@@ -169,7 +169,7 @@ def _inverse_rope(o, positions, cache, nope_dim, rope_dim):
     sin = selected[..., rope_dim // 2 : rope_dim].unsqueeze(-2)
     even, odd = rope[..., 0::2].float(), rope[..., 1::2].float()
     rotated = torch.stack((even * cos + odd * sin, odd * cos - even * sin), dim=-1)
-    return torch.cat((prefix.float(), rotated.flatten(-2)), dim=-1)
+    return torch.cat((prefix.float(), rotated.flatten(-2)), dim=-1).to(o.dtype)
 
 
 def _o_projection(
@@ -189,9 +189,9 @@ def _o_projection(
     def functional(o_, wa_, wb_):
         inverse = _inverse_rope(o_, positions, cos_sin_cache, nope_dim, rope_dim)
         grouped = inverse.reshape(inverse.shape[0], n_groups, -1)
-        wa = wa_.float().reshape(n_groups, o_lora_rank, -1)
+        wa = wa_.to(grouped.dtype).reshape(n_groups, o_lora_rank, -1)
         z = torch.einsum("tgd,grd->tgr", grouped, wa)
-        return F.linear(z.flatten(1), wb_.float()).to(o_.dtype)
+        return F.linear(z.flatten(1), wb_.to(z.dtype)).to(o_.dtype)
 
     return visible_functional_vjp(
         visible_op, functional, (o, wo_a, wo_b), version_indices=(1, 2)
@@ -418,7 +418,21 @@ class VLLMAttention(CompressedSparseAttention):
         )
         if cu_seqlens is None:
             raise RuntimeError("DS4 packed attention requires cu_seqlens_q")
+        sequence_boundaries = metadata.sequence_boundaries
+        compressed_boundaries = metadata.compressed_boundaries
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() != len(
+            sequence_boundaries
+        ):
+            raise RuntimeError(
+                "DS4 host sequence boundaries do not match GPU cu_seqlens shape"
+            )
+        if metadata.cp_size != cp_size:
+            raise RuntimeError("DS4 host geometry CP size does not match model CP")
         l_local = hidden_states.shape[0]
+        if sequence_boundaries[-1] != l_local * cp_size:
+            raise RuntimeError(
+                "DS4 host sequence terminal does not match CP-local hidden rows"
+            )
         global_start = cp_rank * l_local
         positions = metadata.positions.reshape(-1).to(torch.int64)
         if positions.numel() != l_local:
@@ -471,6 +485,14 @@ class VLLMAttention(CompressedSparseAttention):
             hidden_compact = compression_geometry.hidden_compact
             group_ids = compression_geometry.compressed_group_ids
             seq_to_rank_row = compression_geometry.seq_to_rank_row
+            if cu_seqlens_compressed.numel() != len(compressed_boundaries):
+                raise RuntimeError(
+                    "DS4 host compressed boundaries do not match GPU metadata shape"
+                )
+            if compressed_boundaries[-1] > group_ids.numel():
+                raise RuntimeError(
+                    "DS4 host compressed terminal exceeds compact GPU rows"
+                )
             compact_score = fused_block_fp8_linear(
                 _fp32_linear,
                 hidden_compact,
@@ -504,7 +526,7 @@ class VLLMAttention(CompressedSparseAttention):
                     runtime_metadata=metadata.compressor_metadata,
                     ratio=ratio,
                     head_dim=self.config.head_dim,
-                    valid_groups=int(cu_seqlens_compressed[-1].item()),
+                    compressed_boundaries=compressed_boundaries,
                 )
                 compressed_local = compressed_graph
             else:
@@ -557,7 +579,7 @@ class VLLMAttention(CompressedSparseAttention):
                     runtime_metadata=metadata.indexer_compressor_metadata,
                     ratio=ratio,
                     head_dim=self.config.index_head_dim,
-                    valid_groups=int(cu_seqlens_compressed[-1].item()),
+                    compressed_boundaries=compressed_boundaries,
                 )
                 if cp_size > 1:
                     index_k_rank_major, index_k_seq_major = gather_cp_compressed_rows(
@@ -573,8 +595,8 @@ class VLLMAttention(CompressedSparseAttention):
                     index_k_seq_major,
                     positions,
                     metadata.cos_sin_cache,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
+                    sequence_boundaries=sequence_boundaries,
+                    compressed_boundaries=compressed_boundaries,
                     global_start=global_start,
                     ratio=ratio,
                     topk=width,
@@ -652,6 +674,10 @@ class VLLMAttention(CompressedSparseAttention):
                 raise RuntimeError(
                     "DS4 request-local compressed metadata must be jointly present"
                 )
+            if cu_seqlens_compressed.numel() != len(compressed_boundaries):
+                raise RuntimeError(
+                    "DS4 request-local host and GPU boundary counts differ"
+                )
             from .request_local_layout import build_request_local_layout
 
             request_indices, workspace_row_map = build_request_local_layout(
@@ -663,23 +689,22 @@ class VLLMAttention(CompressedSparseAttention):
                 l_local=l_local,
                 d_window=d_window,
                 physical_workspace_rows=workspace.shape[0],
-            )
-            sequence_boundaries = cu_seqlens.detach().cpu().tolist()
-            compressed_boundaries = (
-                cu_seqlens_compressed.detach().cpu().tolist()
+                total_capacity=(
+                    sequence_boundaries[-1] + compressed_boundaries[-1]
+                ),
             )
             result = torch.empty_like(q_visible)
-            for seq_idx in range(cu_seqlens.numel() - 1):
-                seq_start = int(sequence_boundaries[seq_idx])
-                seq_end = int(sequence_boundaries[seq_idx + 1])
+            for seq_idx in range(len(sequence_boundaries) - 1):
+                seq_start = sequence_boundaries[seq_idx]
+                seq_end = sequence_boundaries[seq_idx + 1]
                 token_start = max(0, seq_start - global_start)
                 token_end = min(l_local, seq_end - global_start)
                 if token_end <= token_start:
                     continue
 
                 local_indices = request_indices[token_start:token_end].clone()
-                request_start = seq_start + int(compressed_boundaries[seq_idx])
-                request_end = seq_end + int(compressed_boundaries[seq_idx + 1])
+                request_start = seq_start + compressed_boundaries[seq_idx]
+                request_end = seq_end + compressed_boundaries[seq_idx + 1]
                 local_row_map = workspace_row_map[request_start:request_end]
                 valid_workspace_rows = local_row_map < workspace.shape[0]
                 local_workspace = workspace.index_select(

@@ -50,17 +50,17 @@ def check_parameter_versions(
         )
 
 
-def fp32_linear_vjp(
+def native_linear_vjp(
     grad_output: torch.Tensor,
     value: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    x2d = value.reshape(-1, value.shape[-1]).float()
-    dy2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
+    x2d = value.reshape(-1, value.shape[-1])
+    dy2d = grad_output.reshape(-1, grad_output.shape[-1]).to(value.dtype)
     if grad_output.shape[:-1] != value.shape[:-1]:
         raise RuntimeError("linear bridge received incompatible grad_output shape")
     return (
-        torch.mm(dy2d, weight.float()).to(value.dtype).reshape(value.shape),
+        torch.mm(dy2d, weight.to(dy2d.dtype)).to(value.dtype).reshape(value.shape),
         torch.mm(dy2d.T, x2d).to(weight.dtype),
     )
 
@@ -172,7 +172,7 @@ class _VisibleLinear(torch.autograd.Function):
         check_parameter_versions(ctx.weights, ctx.versions)
         (value,) = ctx.saved_tensors
         fused = torch.cat(ctx.weights, dim=0)
-        grad_value, grad_weight = fp32_linear_vjp(grad_output, value, fused)
+        grad_value, grad_weight = native_linear_vjp(grad_output, value, fused)
         return (
             None,
             grad_value,

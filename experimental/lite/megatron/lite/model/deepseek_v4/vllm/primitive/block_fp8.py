@@ -214,3 +214,33 @@ class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
 
     def __call__(self, x, *weights):
         return fp8_gemm_nt(x, self.pack_weight(weights))
+
+
+class DeploymentGroupedBlockFP8Adapter:
+    """Versioned per-group cache for routed expert deployment weights."""
+
+    def __init__(self, *, cache_weight: bool = False):
+        self.cache_weight = cache_weight
+        self._cached_weights: dict[object, PackedBlockFP8Weight] = {}
+
+    def clear_cache(self) -> None:
+        self._cached_weights.clear()
+
+    def pack_weight(
+        self,
+        slot: object,
+        weights: Iterable[nn.Parameter],
+    ) -> PackedBlockFP8Weight:
+        weights = tuple(weights)
+        key = tuple(_key(weight) for weight in weights)
+        cached = self._cached_weights.get(slot)
+        if (
+            self.cache_weight
+            and cached is not None
+            and cached.cache_key == key
+        ):
+            return cached
+        packed = pack_grouped_block_fp8_weight(weights)
+        if self.cache_weight:
+            self._cached_weights[slot] = packed
+        return packed

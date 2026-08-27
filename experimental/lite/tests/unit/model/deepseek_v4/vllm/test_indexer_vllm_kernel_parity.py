@@ -101,7 +101,7 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
         runtime_metadata=metadata,
         ratio=ratio,
         head_dim=128,
-        valid_groups=groups,
+        compressed_boundaries=(0, groups),
     )
 
     direct = copy(metadata)
@@ -129,18 +129,14 @@ def test_indexer_compressor_and_topk_use_vllm_kernels_bitwise(
     positions = torch.tensor([2047, 2048, 2049, 2654], device=device)
     index_q = torch.randn(4, 64, 128, dtype=torch.bfloat16, device=device)
     index_weights = torch.randn(4, 64, dtype=torch.bfloat16, device=device)
-    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32, device=device)
-    cu_seqlens_compressed = torch.tensor(
-        [0, groups], dtype=torch.int32, device=device
-    )
     actual_topk = official_indexer_topk(
         index_q,
         index_weights,
         actual_k,
         positions,
         cos_sin,
-        cu_seqlens,
-        cu_seqlens_compressed,
+        sequence_boundaries=(0, 4),
+        compressed_boundaries=(0, groups),
         global_start=0,
         ratio=ratio,
         topk=512,

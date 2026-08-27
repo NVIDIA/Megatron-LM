@@ -210,6 +210,7 @@ def build_request_local_layout(
     l_local: int,
     d_window: int,
     physical_workspace_rows: int,
+    total_capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return remapped indices and one all-request physical workspace row map."""
     _cp_layout._require_cute(
@@ -262,9 +263,8 @@ def build_request_local_layout(
         ),
     )
 
-    total_capacity = int(
-        (cu_seqlens[-1] + cu_seqlens_compressed[-1]).item()
-    )
+    if total_capacity < 1:
+        raise ValueError("request-local workspace capacity must be positive")
     workspace_row_map = torch.empty(
         total_capacity,
         dtype=torch.int32,

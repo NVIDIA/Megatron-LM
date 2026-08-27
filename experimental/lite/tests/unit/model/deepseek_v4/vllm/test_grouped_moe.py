@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -25,6 +27,10 @@ def _reference(
         outputs.append(F.linear(swiglu_with_probs(gate_up, None, limit), fc2))
         offset += count
     return torch.cat(outputs)
+
+
+def _visible_reference(hidden, counts, limit, _weight_cache, w13, w2):
+    return _reference(hidden, counts, limit, w13, w2)
 
 
 @pytest.mark.parametrize(
@@ -134,6 +140,41 @@ def test_vllm_visible_silu_quant_preserves_ds4_clamp(monkeypatch):
     assert calls[0][1]["masked_m"] is None
 
 
+def test_grouped_weight_cache_reuses_only_matching_parameter_versions(
+    monkeypatch,
+) -> None:
+    from megatron.lite.model.deepseek_v4.vllm.primitive import block_fp8
+
+    calls = []
+
+    def pack(weights):
+        weights = tuple(weights)
+        calls.append(weights)
+        return block_fp8.PackedBlockFP8Weight(
+            weights[0],
+            torch.ones(1),
+            tuple(block_fp8._key(weight) for weight in weights),
+        )
+
+    monkeypatch.setattr(block_fp8, "pack_grouped_block_fp8_weight", pack)
+    cache = block_fp8.DeploymentGroupedBlockFP8Adapter(cache_weight=True)
+    weights = (torch.nn.Parameter(torch.ones(2, 2)),)
+    first = cache.pack_weight(("w13", 0), weights)
+    assert cache.pack_weight(("w13", 0), weights) is first
+    assert len(calls) == 1
+
+    with torch.no_grad():
+        weights[0].add_(1)
+    assert cache.pack_weight(("w13", 0), weights) is not first
+    assert len(calls) == 2
+
+
+def test_grouped_forward_has_no_synchronous_scale_scan() -> None:
+    source = inspect.getsource(vllm_grouped_moe._vllm_grouped_forward)
+    assert "_require_power_of_two_scales" not in source
+    assert ".item()" not in source
+
+
 def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     monkeypatch,
 ) -> None:
@@ -144,11 +185,54 @@ def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     w13 = tuple((torch.randn(6, 4) * 3).requires_grad_(True) for _ in counts)
     w2 = tuple(torch.randn(4, 3).requires_grad_(True) for _ in counts)
     tokens_per_expert = torch.tensor(counts, dtype=torch.int32)
-    monkeypatch.setattr(vllm_grouped_moe, "_vllm_grouped_forward", _reference)
+    monkeypatch.setattr(
+        vllm_grouped_moe,
+        "_vllm_grouped_forward",
+        _visible_reference,
+    )
+    weight_cache = Mock()
+
+    def reference_backward(
+        hidden_states,
+        grad_output,
+        expert_counts,
+        swiglu_limit,
+        fc1_weights,
+        fc2_weights,
+        **_needs,
+    ):
+        with torch.enable_grad():
+            hidden_ref = hidden_states.detach().requires_grad_(True)
+            fc1_ref = tuple(weight.detach().requires_grad_(True) for weight in fc1_weights)
+            fc2_ref = tuple(weight.detach().requires_grad_(True) for weight in fc2_weights)
+            output_ref = _reference(
+                hidden_ref,
+                expert_counts,
+                swiglu_limit,
+                fc1_ref,
+                fc2_ref,
+            )
+            gradients = torch.autograd.grad(
+                output_ref,
+                (hidden_ref, *fc1_ref, *fc2_ref),
+                grad_output,
+            )
+        return (
+            gradients[0],
+            tuple(gradients[1 : 1 + len(expert_counts)]),
+            tuple(gradients[1 + len(expert_counts) :]),
+        )
+
+    monkeypatch.setattr(
+        vllm_grouped_moe,
+        "_te_grouped_bf16_backward",
+        reference_backward,
+    )
     output = vllm_grouped_moe.VLLMGroupedMoEWithBF16Backward.apply(
         hidden,
         tokens_per_expert,
         limit,
+        weight_cache,
         *w13,
         *w2,
     )
@@ -172,6 +256,58 @@ def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     )
     for actual, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual, expected_grad)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and TE")
+def test_te_grouped_bf16_backward_matches_reference_bitwise(monkeypatch) -> None:
+    torch.manual_seed(17)
+    counts = (64, 32)
+    limit = 10.0
+    hidden = (
+        torch.randn(sum(counts), 128, device="cuda", dtype=torch.bfloat16) * 2
+    ).requires_grad_(True)
+    w13 = tuple(
+        torch.nn.Parameter(
+            torch.randn(256, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+        )
+        for _ in counts
+    )
+    w2 = tuple(
+        torch.nn.Parameter(
+            torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+        )
+        for _ in counts
+    )
+    monkeypatch.setattr(
+        vllm_grouped_moe,
+        "_vllm_grouped_forward",
+        _visible_reference,
+    )
+    weight_cache = Mock()
+    output = vllm_grouped_moe.VLLMGroupedMoEWithBF16Backward.apply(
+        hidden,
+        torch.tensor(counts, device="cuda", dtype=torch.int32),
+        limit,
+        weight_cache,
+        *w13,
+        *w2,
+    )
+    grad_output = torch.randn_like(output)
+    output.backward(grad_output)
+    actual_grads = (hidden.grad, *(weight.grad for weight in w13 + w2))
+
+    ref_hidden = hidden.detach().requires_grad_(True)
+    ref_w13 = tuple(weight.detach().requires_grad_(True) for weight in w13)
+    ref_w2 = tuple(weight.detach().requires_grad_(True) for weight in w2)
+    ref_output = _reference(ref_hidden, counts, limit, ref_w13, ref_w2)
+    expected_grads = torch.autograd.grad(
+        ref_output,
+        (ref_hidden, *ref_w13, *ref_w2),
+        grad_output,
+    )
+    for actual, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual, expected_grad, rtol=0, atol=0)
 
 
 def test_visible_experts_forward_preserves_model_clamp(monkeypatch) -> None:
@@ -200,6 +336,7 @@ def test_visible_experts_forward_preserves_model_clamp(monkeypatch) -> None:
     experts.swiglu_limit = 10.0
     experts.fc1 = _Weights()
     experts.fc2 = _Weights()
+    experts.grouped_fp8 = object()
     monkeypatch.setattr(moe_module, "VLLMGroupedMoEWithBF16Backward", _Grouped)
     monkeypatch.setattr(
         moe_module,
@@ -223,6 +360,10 @@ def test_visible_experts_forward_preserves_model_clamp(monkeypatch) -> None:
 def test_real_grouped_deepgemm_forward_has_bf16_master_vjp() -> None:
     from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 
+    from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
+        DeploymentGroupedBlockFP8Adapter,
+    )
+
     DeepGemmQuantScaleFMT.init_oracle_cache()
     torch.manual_seed(11)
     counts = (2, 1)
@@ -245,6 +386,7 @@ def test_real_grouped_deepgemm_forward_has_bf16_master_vjp() -> None:
         hidden,
         tokens_per_expert,
         limit,
+        DeploymentGroupedBlockFP8Adapter(cache_weight=True),
         *w13,
         *w2,
     )

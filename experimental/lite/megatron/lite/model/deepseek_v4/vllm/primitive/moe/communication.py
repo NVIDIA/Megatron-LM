@@ -939,9 +939,7 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             if received_per_expert_cpu.device.type != "cpu":
                 raise RuntimeError("DeepEP expert counts must remain CPU metadata")
             self._local_tpe_list = received_per_expert_cpu.tolist()
-            received_per_expert = received_per_expert_cpu.to(
-                device=received_hidden.device
-            )
+            received_per_expert = received_per_expert_cpu
             (
                 received_fingerprints,
                 received_route_indices,
