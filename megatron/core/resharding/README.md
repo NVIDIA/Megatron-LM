@@ -1,7 +1,7 @@
 # Resharding (Refit)
 
 Transfer model weights between different parallelism configurations
-(TP, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
+(TP, GTP, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
 Used primarily in RL loops to move weights from a training model to an
 inference model that may use a different parallelism layout.
 
@@ -12,6 +12,7 @@ refit.py            High-level API: swap_model_weights, caching, MXFP8 auto-dete
     |
 planner.py          Local plan builder (every rank all-gathers metadata, replays
                     the same deterministic schedule, keeps only its own ops)
+shard_planner.py    Logical-coordinate planner for TP x GTP weight shards
     |
 execution.py        Submits send/recv ops to a CopyService, handles writebacks
     |
@@ -133,7 +134,9 @@ wire padding. The logical transfer size is
 `peer_count * max_pair_bytes`. The staging tensor is returned to PyTorch's
 caching allocator after each refit rather than retained by the service. Model
 parameter storage itself is not replaced. Supported mesh sizes are validated
-by `nccl-extensions`.
+by `nccl-extensions`. GTP-sharded parameters currently use the generic `nccl`,
+`gloo`, `nvshmem`, or `nixl` slice-transfer path; `nccl_m2n` rejects such plans
+before communication instead of treating a GTP shard as a complete weight.
 
 The built-in RL loop currently creates its training and inference models on the
 same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public
@@ -148,8 +151,11 @@ API or the ReFIT benchmark.
    (`_iter_global_transfer_ops`):
    - Iterate destination ranks, then each rank's destination params in gathered
      order; for each destination param, find the matching source param(s) by name.
-   - Route to a dimension-specific planner (LCM tiling for standard TP,
-     block-interleaved for partitioned params like Mamba `in_proj`).
+   - Preserve the established LCM/block-interleaved planner for non-GTP
+     parameters. For a GTP parameter, map every local TP x GTP shard into
+     logical global weight coordinates and intersect it with the destination
+     shard. This excludes GTP alignment padding while composing with column,
+     row, strided, and packed TP layouts.
    - Assign a monotonic `task_id` per sub-op.  Because the iteration order and
      counter are a pure function of the gathered metadata, the send op computed
      on the sender and the recv op computed on the receiver get the **same**
@@ -187,7 +193,7 @@ across refits.
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
 | `_service_cache` | Backend name + process-group identity + M2N execution limit | `CopyService` instance | Avoid re-creating backend communicators and buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts, execution limit) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits |
+| `_plan_cache` | (rank, src_config, dst_config, num_experts, execution limit) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP-remat sizes |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.
@@ -204,6 +210,8 @@ attribute with the following groups:
 | `pp` | If PP > 1 | Pipeline stage / layer index remapping |
 | `ep` | If MoE | Expert parallelism routing |
 | `expt_tp` | If expert TP | Expert-specific tensor parallelism |
+| `gtp_remat` | If dense GTP | Dense weight-rematerialization shards |
+| `expt_gtp_remat` | If expert GTP | Expert weight-rematerialization shards |
 
 ## File Reference
 
@@ -211,6 +219,7 @@ attribute with the following groups:
 |------|------|
 | `refit.py` | Public API, caching, MXFP8 auto-detection |
 | `planner.py` | Local deterministic plan builder (metadata, LCM/block-interleaved planners) |
+| `shard_planner.py` | Logical-coordinate TP x GTP shard planner |
 | `execution.py` | Plan executor (send/recv submission, writeback, format conversion) |
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |
