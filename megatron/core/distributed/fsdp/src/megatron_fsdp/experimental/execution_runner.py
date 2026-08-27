@@ -38,13 +38,14 @@ State machine::
        ^                                                          |
        +----------------------(complete_trace)--------------------+
 
-Four per-op interfaces:
+Three per-op interfaces:
 
 - ``record_unshard(module, orientation)`` / ``record_reshard(module)``:
   trace path — record the real event, or during replay validate it against
   the traced cycle and advance the cursor.
-- ``suggest_prefetch()``: optimization path — the next traced unshard
-  (skipping reshard events) to all-gather ahead, or ``None`` while tracing.
+- ``suggest_prefetch_plan()``: optimization path — the configured future
+  traced unshard occurrence and its parameter-lifetime gate, or ``None``
+  while tracing or near the global-batch boundary.
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
   orientation, keeping the storage resident.
@@ -95,6 +96,16 @@ class RunnerEvent:
     orientation: str | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class _PrefetchSuggestion:
+    """One traced prefetch target and its last intervening physical reshard."""
+
+    module: "FsdpModule"
+    orientation: str
+    release_after_reshard_index: int | None = None
+    target_unshard_index: int | None = None
+
+
 class FsdpExecutionRunner:
     """Record the fine-grained execution and plan prefetches.
 
@@ -118,6 +129,14 @@ class FsdpExecutionRunner:
         self._phase = RunnerPhase.TRACING
         self._trace: list[RunnerEvent] = []
         self._replay_index = 0
+        self._unshard_count = 0
+        self._skipped_reshard_indices: set[int] = set()
+        # A deep target may already be materialized for an earlier occurrence.
+        # In that case its prefetch is a reservation: retain the storage at the
+        # last intervening physical reshard, then consume it at the exact target.
+        self._pending_prefetches: dict[int, list[_PrefetchSuggestion]] = {}
+        self._retained_prefetches: dict[int, _PrefetchSuggestion] = {}
+        self._resident_prefetches: dict[int, _PrefetchSuggestion] = {}
         self._cycles_observed = 0
         # Modules consumed in the current round. The fine-grained schedule
         # fires one hook per sub-module (dense, experts), so the same module
@@ -155,29 +174,48 @@ class FsdpExecutionRunner:
     # Interface 1: record execution events (consume, reshard)
     # ------------------------------------------------------------------
 
-    def record_unshard(self, module: "FsdpModule", orientation: str) -> None:
+    def record_unshard(self, module: "FsdpModule", orientation: str) -> bool:
         """Record (tracing) or validate (replay) an unshard event.
 
         The fine-grained schedule fires one hook per sub-module (dense,
         experts), so the same module can arrive several times within a round;
         only the first arrival is a real unshard for the trace. Call
-        ``suggest_prefetch()`` right after this returns to get the prefetch
-        target (replay only).
+        ``suggest_prefetch_plan()`` right after this returns to get the
+        prefetch target (replay only).
 
         Args:
             module: The FSDP module being unsharded for compute.
             orientation: Payload orientation (``"rowwise"`` forward,
                 ``"colwise"`` backward).
+
+        Returns:
+            Whether this is the first fine-grained hook for the occurrence.
         """
         if not self._use_trace_replay:
-            return
+            return True
         if module in self._consumed_this_round:
-            return
+            return False
         self._consumed_this_round.add(module)
         self._last_orientation[module] = orientation
-        self._validate_and_advance(EventKind.UNSHARD, module, orientation)
+        replayed_index = self._validate_and_advance(EventKind.UNSHARD, module, orientation)
+        if replayed_index is not None:
+            retained = self._retained_prefetches.pop(replayed_index, None)
+            resident = self._resident_prefetches.pop(replayed_index, None)
+            suggestion = retained or resident
+            if retained is not None and resident is not None:
+                raise RuntimeError("FSDP target has duplicate speculative prefetches.")
+            if suggestion is not None:
+                if suggestion.module is not module or suggestion.orientation != orientation:
+                    raise RuntimeError("Speculative FSDP prefetch does not match its traced target.")
+                module_name = module.name if module.name else "<root>"
+                reuse_kind = "retained" if retained is not None else "resident"
+                torch.cuda.nvtx.range_push(
+                    f"MFSDP AG {reuse_kind} reuse target={module_name} orientation={orientation}"
+                )
+                torch.cuda.nvtx.range_pop()
+        return True
 
-    def record_reshard(self, module: "FsdpModule") -> None:
+    def record_reshard(self, module: "FsdpModule") -> int | None:
         """Record (tracing) or validate (replay) a reshard event.
 
         The reshard ends the module's current unshard round: it clears the
@@ -188,49 +226,143 @@ class FsdpExecutionRunner:
 
         Args:
             module: The FSDP module whose unsharded storage is released.
+
+        Returns:
+            The exact replay trace index, or ``None`` outside validated replay.
         """
         if not self._use_trace_replay:
-            return
+            return None
         # The reshard ends the module's unshard round; discard its dedup
         # entry so the next unshard (e.g. backward after forward) records a
         # fresh event.
         self._consumed_this_round.discard(module)
-        self._validate_and_advance(EventKind.RESHARD, module, None)
+        return self._validate_and_advance(EventKind.RESHARD, module, None)
 
     # ------------------------------------------------------------------
     # Interface 2: prefetch suggestion
     # ------------------------------------------------------------------
 
-    def suggest_prefetch(
-        self, module: "FsdpModule", orientation: str
-    ) -> tuple["FsdpModule", str] | None:
-        """Return the next module to all-gather ahead of this unshard.
-
-        In default mode, resolves the static ``forward_order`` /
-        ``backward_order`` successor. In trace-replay mode, returns the next
-        traced unshard (skipping reshard events) with its recorded
-        orientation.
-
-        Args:
-            module: The FSDP module just unsharded for compute.
-            orientation: Payload orientation (``"rowwise"`` forward,
-                ``"colwise"`` backward).
-
-        Returns:
-            ``(module, orientation)`` to prefetch, or ``None`` while tracing,
-            after a divergence, or at the end of the static order.
-        """
+    def suggest_prefetch_plan(
+        self, module: "FsdpModule", orientation: str, *, depth: int = 1
+    ) -> _PrefetchSuggestion | None:
+        """Return the depth-th future consume and its parameter-lifetime gate."""
+        if depth < 1:
+            raise ValueError(f"Prefetch depth must be positive, got {depth}.")
         if not self._use_trace_replay:
-            return self._static_successor(module, orientation)
-        # Tracing and divergence (re-trace) both disable prefetch; only a
-        # validated replay cycle suggests a prefetch target.
+            if depth != 1:
+                raise ValueError("Prefetch depth greater than one requires trace replay.")
+            successor = self._static_successor(module, orientation)
+            return _PrefetchSuggestion(*successor) if successor is not None else None
         if self._phase is not RunnerPhase.REPLAYING or not self._trace:
             return None
-        for i in range(len(self._trace)):
-            event = self._trace[(self._replay_index + i) % len(self._trace)]
+        if depth > self._unshard_count:
+            raise ValueError(
+                f"Prefetch depth {depth} exceeds the {self._unshard_count} "
+                "UNSHARD occurrences in the replay trace."
+            )
+
+        remaining = depth
+        target_index = None
+        target_event = None
+        # Deliberately do not wrap: a gather may not cross the optimizer/global-
+        # batch boundary because the materialized weights would become stale.
+        for index in range(self._replay_index, len(self._trace)):
+            event = self._trace[index]
             if event.kind is EventKind.UNSHARD:
-                return event.module, event.orientation
-        return None
+                remaining -= 1
+                if remaining == 0:
+                    target_index = index
+                    target_event = event
+                    break
+        if target_event is None:
+            return None
+
+        release_after_reshard_index = None
+        for index in range(self._replay_index, target_index):
+            event = self._trace[index]
+            if (
+                event.kind is EventKind.RESHARD
+                and event.module is target_event.module
+                and index not in self._skipped_reshard_indices
+            ):
+                release_after_reshard_index = index
+        assert target_event.orientation is not None
+        return _PrefetchSuggestion(
+            target_event.module,
+            target_event.orientation,
+            release_after_reshard_index,
+            target_index,
+        )
+
+    def defer_prefetch(self, suggestion: _PrefetchSuggestion) -> None:
+        """Reserve an existing materialization for a later traced occurrence."""
+        gate = suggestion.release_after_reshard_index
+        if gate is None or suggestion.target_unshard_index is None:
+            raise ValueError("Only a gated prefetch can be deferred.")
+        self._pending_prefetches.setdefault(gate, []).append(suggestion)
+        module_name = suggestion.module.name if suggestion.module.name else "<root>"
+        torch.cuda.nvtx.range_push(
+            f"MFSDP AG queued target={module_name} orientation={suggestion.orientation} "
+            f"reshard_index={gate} target_index={suggestion.target_unshard_index}"
+        )
+        torch.cuda.nvtx.range_pop()
+
+    def track_prefetch(self, suggestion: _PrefetchSuggestion) -> None:
+        """Track an immediately submitted gather until its exact traced demand."""
+        target_index = suggestion.target_unshard_index
+        if target_index is None:
+            # Static-order prefetch has no replay boundary or occurrence token.
+            return
+        if suggestion.release_after_reshard_index is not None:
+            raise ValueError("A gated prefetch must be deferred instead of tracked as resident.")
+        if target_index in self._resident_prefetches:
+            raise RuntimeError("Duplicate immediate FSDP prefetch for one trace occurrence.")
+        self._resident_prefetches[target_index] = suggestion
+
+    def retain_prefetches_across_reshard(
+        self, module: "FsdpModule", reshard_index: int | None
+    ) -> bool:
+        """Retain storage when this exact reshard gates a future depth target."""
+        if reshard_index is not None:
+            suggestions = self._pending_prefetches.pop(reshard_index, [])
+            for suggestion in suggestions:
+                if suggestion.module is not module or suggestion.target_unshard_index is None:
+                    raise RuntimeError("FSDP prefetch reservation reached the wrong reshard.")
+                # Ordinary groups ignore orientation, while MXFP8 groups materialize
+                # both rowwise and colwise payloads in one unshard. The current
+                # storage can therefore satisfy a future occurrence of either phase.
+                self._retained_prefetches[suggestion.target_unshard_index] = suggestion
+            if suggestions:
+                return True
+        # A direct prefetch is expected to remain resident until its target. If
+        # divergence instead reaches a physical reshard first, discard the
+        # occurrence token and let the caller release that storage normally.
+        resident_indices = [
+            target_index
+            for target_index, suggestion in self._resident_prefetches.items()
+            if suggestion.module is module
+        ]
+        for target_index in resident_indices:
+            del self._resident_prefetches[target_index]
+        # A retained target may encounter a replay divergence before its demand.
+        # Keep its live storage until it is consumed or explicitly flushed.
+        return any(suggestion.module is module for suggestion in self._retained_prefetches.values())
+
+    def release_speculative_prefetches(self) -> None:
+        """Release unconsumed gathers before optimizer-side parameter updates."""
+        self._pending_prefetches.clear()
+        speculative = tuple(self._retained_prefetches.values()) + tuple(
+            self._resident_prefetches.values()
+        )
+        self._retained_prefetches.clear()
+        self._resident_prefetches.clear()
+        released: set[int] = set()
+        for suggestion in speculative:
+            key = id(suggestion.module)
+            if key in released:
+                continue
+            released.add(key)
+            suggestion.module._reshard_parameter_groups(record_execution=False)
 
     # ------------------------------------------------------------------
     # Interface 3: reshard-skip suggestion
@@ -254,7 +386,8 @@ class FsdpExecutionRunner:
         """
         if not self._use_trace_replay or self._phase is RunnerPhase.TRACING:
             return False
-        if not self._trace:
+        if not self._trace or self._replay_index >= len(self._trace):
+            # Never retain full parameters across the optimizer boundary.
             return False
         next_event = self._trace[self._replay_index]
         return (
@@ -278,8 +411,23 @@ class FsdpExecutionRunner:
         if not self._use_trace_replay:
             return
         self._complete_trace_calls += 1
+        if self._phase is RunnerPhase.REPLAYING and self._replay_index != len(self._trace):
+            self._divergences += 1
+            logger.warning(
+                "FsdpExecutionRunner: replay ended at index %d of %d at the global-batch "
+                "boundary. Re-tracing the next batch (divergence #%d).",
+                self._replay_index,
+                len(self._trace),
+                self._divergences,
+            )
+            self._phase = RunnerPhase.TRACING
+            self._trace.clear()
+            self._unshard_count = 0
+            self._skipped_reshard_indices.clear()
+            self._pending_prefetches.clear()
         if self._phase is RunnerPhase.TRACING and self._trace:
             self._phase = RunnerPhase.REPLAYING
+            self._compile_trace()
             logger.info(
                 "FsdpExecutionRunner: compiled %d-event trace, entering replay.",
                 len(self._trace),
@@ -348,7 +496,7 @@ class FsdpExecutionRunner:
         kind: EventKind,
         module: "FsdpModule",
         orientation: str | None,
-    ) -> None:
+    ) -> int | None:
         """Trace (append) or validate-and-advance (replay) one event.
 
         The trace path records the real op stream (consume/reshard). During
@@ -364,7 +512,17 @@ class FsdpExecutionRunner:
         """
         if self._phase is RunnerPhase.TRACING:
             self._trace.append(RunnerEvent(kind=kind, module=module, orientation=orientation))
-            return
+            return None
+
+        if self._replay_index >= len(self._trace):
+            self._divergences += 1
+            logger.warning(
+                "FsdpExecutionRunner: replay emitted an event beyond the traced "
+                "global-batch boundary. Re-tracing from this event (divergence #%d).",
+                self._divergences,
+            )
+            self._retrace(kind, module, orientation)
+            return None
 
         expected = self._trace[self._replay_index]
         if (
@@ -387,10 +545,32 @@ class FsdpExecutionRunner:
                 self._divergences,
             )
             self._retrace(kind, module, orientation)
-            return
+            return None
 
+        replayed_index = self._replay_index
         self._replayed_occurrences += 1
-        self._replay_index = (self._replay_index + 1) % len(self._trace)
+        self._replay_index += 1
+        return replayed_index
+
+    def _compile_trace(self) -> None:
+        """Cache occurrence count and logical reshard skips for replay."""
+        self._unshard_count = sum(event.kind is EventKind.UNSHARD for event in self._trace)
+        self._skipped_reshard_indices.clear()
+        last_orientation: dict[FsdpModule, str] = {}
+        for index, event in enumerate(self._trace):
+            if event.kind is EventKind.UNSHARD:
+                assert event.orientation is not None
+                last_orientation[event.module] = event.orientation
+                continue
+            if index + 1 >= len(self._trace):
+                continue
+            next_event = self._trace[index + 1]
+            if (
+                next_event.kind is EventKind.UNSHARD
+                and next_event.module is event.module
+                and next_event.orientation == last_orientation.get(event.module)
+            ):
+                self._skipped_reshard_indices.add(index)
 
     def _retrace(
         self,
@@ -402,6 +582,9 @@ class FsdpExecutionRunner:
         self._phase = RunnerPhase.TRACING
         self._trace = [RunnerEvent(kind=kind, module=module, orientation=orientation)]
         self._replay_index = 0
+        self._unshard_count = 0
+        self._skipped_reshard_indices.clear()
+        self._pending_prefetches.clear()
         self._cycles_observed = 0
         # The divergence event ends the aborted replay round; dedup entries
         # from it must not suppress the re-traced remainder of the batch.

@@ -110,6 +110,7 @@ class FsdpParameterGroup:
     _persistent_model_weight: bool
     grad_divisor: int
     fuse_wgrad_accumulation: bool
+    fused_wgrad_is_complete: bool
     _model_weight_placements: tuple[Placement, ...]
     _partial_grad_dtype: torch.dtype | None
     _fused_wgrad_buffer: DBuffer | None
@@ -136,6 +137,7 @@ class FsdpParameterGroup:
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
         fuse_wgrad_accumulation: bool = False,
+        fused_wgrad_is_complete: bool = False,
         trace_pool_allocator: TracePoolAllocator | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
@@ -158,6 +160,8 @@ class FsdpParameterGroup:
                 averaging. See ``fully_shard``.
             fuse_wgrad_accumulation: Let TE write full weight gradients directly into
                 the reduce-scatter input buffer.
+            fused_wgrad_is_complete: Every contribution is already present in the
+                fused buffer, so no ordinary-gradient packing is required.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -165,6 +169,12 @@ class FsdpParameterGroup:
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
         if use_symmetric_memory and fuse_wgrad_accumulation:
             raise ValueError("MFSDP v2 fused wgrad does not yet support symmetric-memory buffers.")
+        if fused_wgrad_is_complete and not fuse_wgrad_accumulation:
+            raise ValueError("A complete fused-wgrad buffer requires fused wgrad accumulation.")
+        if fused_wgrad_is_complete and any(
+            getattr(parameter, "zero_out_wgrad", False) for parameter in parameters.values()
+        ):
+            raise ValueError("A complete fused-wgrad buffer cannot have tied-weight contributions.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -181,6 +191,7 @@ class FsdpParameterGroup:
         self.mesh = mesh
         self.grad_divisor = grad_divisor
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        self.fused_wgrad_is_complete = fused_wgrad_is_complete
         self._trace_pool_allocator = trace_pool_allocator
         self._unsharded_allocation_key = (id(self), "unsharded_model_weight")
         self._partial_grad_allocation_key = (id(self), "partial_grad")
@@ -615,9 +626,26 @@ class FsdpParameterGroup:
         partial_grad = self._fused_wgrad_buffer
         if partial_grad is None:
             raise RuntimeError("FSDP fused-wgrad buffer is missing at gradient reduction.")
+        if self.fused_wgrad_is_complete:
+            missing_fqns = [
+                fsdp_parameter.fqns
+                for fsdp_parameter in self.fsdp_parameters
+                if not getattr(fsdp_parameter.unsharded, "grad_added_to_main_grad", False)
+            ]
+            if missing_fqns:
+                raise RuntimeError(
+                    "Complete fused-wgrad group did not receive every direct gradient; "
+                    f"missing parameters: {missing_fqns!r}."
+                )
         self._fused_wgrad_buffer = None
         for fsdp_parameter in self.fsdp_parameters:
-            fsdp_parameter.unsharded.main_grad = None
+            parameter = fsdp_parameter.unsharded
+            parameter.main_grad = None
+            if self.fused_wgrad_is_complete:
+                # TE supplies a dummy autograd gradient only to run hooks. The
+                # actual contribution is already in the fused staging buffer.
+                parameter.grad = None
+                parameter.grad_added_to_main_grad = False
         return partial_grad
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
@@ -886,6 +914,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
         fuse_wgrad_accumulation: bool = False,
+        fused_wgrad_is_complete: bool = False,
         trace_pool_allocator: TracePoolAllocator | None = None,
     ) -> None:
         # Keep the subclass constructor aligned with FsdpParameterGroup. The
@@ -911,6 +940,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             grad_divisor=grad_divisor,
             use_symmetric_memory=False,
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+            fused_wgrad_is_complete=fused_wgrad_is_complete,
             trace_pool_allocator=trace_pool_allocator,
         )
         self._unsharded_rowwise_allocation_key = (id(self), "unsharded_rowwise")

@@ -1,6 +1,6 @@
 # FsdpExecutionRunner: Trace Path and Optimization Path
 
-**Status:** Design proposal for the M-FSDP v2 execution-order runner.
+**Status:** Implemented design for the M-FSDP v2 execution-order runner.
 
 **Audience:** Distributed-training developers working on Megatron-FSDP v2 with
 pipeline (PP/VPP) and expert-parallel combined-1F1B schedules.
@@ -81,11 +81,17 @@ directive:
 
 - `record_unshard(module, orientation)` — validates the unshard against
   the traced event, advances the cursor, and
-  `suggest_prefetch(module, orientation)` then returns the next **unshard**
-  event (skipping intervening reshard events) as the prefetch target.
+  `suggest_prefetch_plan(module, orientation, depth=N)` then returns the
+  Nth future **unshard** occurrence (skipping reshard events).
 - `record_reshard(module)` — validates the reshard and advances the cursor;
   `suggest_skip_reshard(module)` then returns whether the actual reshard can
   be **skipped** so the storage stays resident.
+
+Lookahead never wraps across the global-batch boundary. If a deep target has
+an earlier physical occurrence, the plan reserves that materialization at its
+last intervening reshard instead of issuing an all-gather that would be
+released before the target. Immediate and reserved prefetches are tracked
+until their exact target occurrence and flushed before optimizer work.
 
 A mismatch (wrong event kind, module, or orientation) is a divergence:
 the runner clears the trace, re-traces from that event, and degrades to
@@ -108,13 +114,12 @@ the storage is re-consumed immediately, so the reshard is unnecessary.
 storage resident. The following consume then finds the storage already
 materialized and skips the all-gather.
 
-### 3.2 Why same orientation?
+### 3.2 Orientation and deep retention
 
-M-FSDP v2 MXFP8 parameter groups keep separate row-wise (forward GEMM) and
-column-wise (backward GEMM) payloads. Keeping storage resident across an
-orientation change would leave the wrong payload materialized, so the
-optimization only applies when the immediate re-consume uses the same
-orientation.
+The immediate reshard-skip rule remains conservative and requires the same
+orientation. A deep reservation may target the other phase: ordinary groups
+ignore orientation, while an MXFP8 unshard materializes and binds both the
+row-wise and column-wise payloads.
 
 ### 3.3 When not applied
 
@@ -123,6 +128,7 @@ orientation.
 - Default mode (`use_trace_replay=False`): the runner stays idle and every
   reshard is executed normally.
 - Tracing phase or after a divergence.
+- A target would cross the optimizer/global-batch boundary.
 
 ### 3.4 Example
 
@@ -154,8 +160,10 @@ Public API of `FsdpExecutionRunner` (owned by `FsdpContext`):
 |---|---|---|
 | `record_unshard(module, orientation)` | trace | record/validate an unshard event |
 | `record_reshard(module)` | trace | record/validate a reshard event; clears the module's unshard round |
-| `suggest_prefetch(module, orientation)` | optimization | next module to all-gather ahead |
+| `suggest_prefetch_plan(module, orientation, depth)` | optimization | depth-N target and any intervening reshard gate |
+| `defer_prefetch(plan)` / `track_prefetch(plan)` | optimization | track gated or immediately submitted speculative gathers |
 | `suggest_skip_reshard(module) -> bool` | optimization | whether to keep storage resident |
+| `release_speculative_prefetches()` | lifecycle | release unconsumed full parameters before the optimizer |
 | `complete_trace()` | trace | compile the cycle at the batch boundary |
 | `report()` | diagnostics | replay statistics |
 | `phase`, `is_tracing`, `use_trace_replay` | — | runner state |
@@ -164,15 +172,24 @@ Public API of `FsdpExecutionRunner` (owned by `FsdpContext`):
 
 ```python
 # unshard_parameters (unshard entry point)
-self.context.runner.record_unshard(self, orientation)
-prefetch = self.context.runner.suggest_prefetch(self, orientation)
-if prefetch is not None:
-    next_module, next_orientation = prefetch
-    next_module._unshard_parameter_groups(next_orientation)
+runner = self.context.runner
+if runner.record_unshard(self, orientation):
+    prefetch = runner.suggest_prefetch_plan(
+        self, orientation, depth=self.context.prefetch_depth
+    )
+    if prefetch is not None:
+        if prefetch.release_after_reshard_index is not None:
+            runner.defer_prefetch(prefetch)
+        else:
+            prefetch.module._unshard_parameter_groups(prefetch.orientation)
+            runner.track_prefetch(prefetch)
 
 # _reshard_parameter_groups (release entry point)
-self.context.runner.record_reshard(self)
-if self.context.runner.suggest_skip_reshard(self):
+runner = self.context.runner
+reshard_index = runner.record_reshard(self)
+if runner.suggest_skip_reshard(self):
+    return
+if runner.retain_prefetches_across_reshard(self, reshard_index):
     return  # storage stays resident
 for group in self._parameter_groups:
     group.reshard_parameters()
@@ -186,23 +203,22 @@ for group in self._parameter_groups:
 - **Reshard skip** is safe only for an immediate same-module,
   same-orientation re-consume, so the materialized payload is always the one
   the next compute reads.
+- **Optimizer boundary** lookahead does not wrap, all speculative gathers are
+  released before optimizer work, and an incomplete replay forces re-tracing.
 - **Dedup** (`_consumed_this_round`) keeps the trace at one unshard per module
   per round despite per-sub-module hooks; `record_reshard` clears the module's
   dedup entry so the next round records a fresh unshard.
-- **Memory** is bounded: skipping a reshard keeps at most one extra module's
-  storage resident, and only while it is immediately reused.
+- **Memory** is explicit: prefetch depth determines the number of future
+  full-parameter lifetimes, and every lifetime is tied to an exact trace
+  occurrence or intervening reshard gate.
 
 ## 6. Open questions
 
 1. Should the reshard-skip policy be extended to a *window* (keep resident if
    re-consumed within N events) instead of strictly immediate? This trades
    memory for fewer all-gathers and needs a residency budget.
-2. Should the optimization path also skip the all-gather for a module that is
-   resident but whose reshard was *not* skipped (e.g. prefetched modules)?
-3. How should the optimization path interact with the MXFP8 scale-inverse
-   grids when a payload is kept resident across optimizer steps?
-4. Should `complete_trace()` compile a more elaborate plan with residency
-   windows and configurable prefetch distances instead of the event cursor?
+2. Should a future version add a byte budget in addition to the occurrence
+   depth, without reintroducing policy machinery on the default hot path?
 
 ## 7. Sources
 

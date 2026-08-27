@@ -754,6 +754,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
+
+        def complete_fused_wgrad(module: torch.nn.Module) -> bool:
+            """Whether TE supplies every gradient contribution for this FSDP unit."""
+            return (
+                config.gradient_accumulation_fusion
+                and not config.add_bias_linear
+                and isinstance(module, TEGroupedMLP)
+            )
+
         reset_before_shard = partial(
             self._reset_meta_parameters_before_fully_shard,
             device=torch.device(device) if device is not None else torch.device("cuda"),
@@ -769,6 +778,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             use_trace_replay=fine_grained,
             use_symmetric_memory=ddp_config.nccl_ub,
             enable_trace_pool=ddp_config.fsdp_trace_pool,
+            prefetch_depth=ddp_config.fsdp_prefetch_depth,
         ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -789,6 +799,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                                 config.gradient_accumulation_fusion
                                 and isinstance(submodule.experts, TEGroupedMLP)
                             ),
+                            fused_wgrad_is_complete=complete_fused_wgrad(submodule.experts),
                             grad_divisor=config.expert_model_parallel_size,
                         )
                         self._copy_mcore_attributes_to_sharded_parameters(submodule.experts)
@@ -811,6 +822,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             config.gradient_accumulation_fusion
                             and isinstance(submodule, TEGroupedMLP)
                         ),
+                        fused_wgrad_is_complete=complete_fused_wgrad(submodule),
                     )
                     self._copy_mcore_attributes_to_sharded_parameters(submodule)
                 elif isinstance(submodule, TEGroupedMLP) and not isinstance(submodule, FsdpModule):
@@ -838,6 +850,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             config.gradient_accumulation_fusion
                             and isinstance(submodule, TEGroupedMLP)
                         ),
+                        fused_wgrad_is_complete=complete_fused_wgrad(submodule),
                     )
                     self._copy_mcore_attributes_to_sharded_parameters(submodule)
             if config.init_model_with_meta_device:
@@ -852,6 +865,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 fuse_wgrad_accumulation=(
                     config.gradient_accumulation_fusion and isinstance(module, TEGroupedMLP)
                 ),
+                fused_wgrad_is_complete=complete_fused_wgrad(module),
             )
             self._copy_mcore_attributes_to_sharded_parameters(module)
         super().__init__(config=config, module=module)
@@ -1101,8 +1115,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         manually and deliberately skips that callback, so its reduce-scatters may
         still be in flight when ``finalize_model_grads`` reaches this method.
         """
-        context = self.module.context
-        context.current_stream().wait_stream(context.reduce_scatter_stream)
+        self.module.context.finish_grad_sync()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
