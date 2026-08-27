@@ -554,6 +554,19 @@ class TopKRouter(Router):
         )
         return probs
 
+    def _get_metric_layer_number(self) -> tuple[int, int]:
+        """Return the 1-based metric index and the total number of metric slots."""
+        num_layers = self.config.num_layers + (self.config.mtp_num_layers or 0)
+        if not self.is_mtp_layer:
+            return self.layer_number, num_layers
+
+        # Hybrid MTP depths can contain multiple internal sublayers (for example `/WE`).
+        # Metrics are allocated per MTP depth, not per internal hybrid sublayer.
+        mtp_layer_number = getattr(self, 'mtp_layer_number', None) or self.layer_number
+        if self.config.mtp_num_layers is not None:
+            mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
+        return self.config.num_layers + mtp_layer_number, num_layers
+
     def attach_and_log_load_balancing_loss(
         self,
         activation: torch.Tensor,
@@ -591,14 +604,7 @@ class TopKRouter(Router):
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
         # results and the reduced load_balancing_loss logging value.
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
-
-        if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
-        else:
-            layer_number = self.layer_number
+        layer_number, num_layers = self._get_metric_layer_number()
 
         get_moe_metrics_tracker().record(
             aux_loss_name,
@@ -694,14 +700,7 @@ class TopKRouter(Router):
             ):
                 z_loss = z_loss / self.config.mtp_num_layers
 
-            num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                num_layers += self.config.mtp_num_layers
-
-            if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
-            else:
-                layer_number = self.layer_number
+            layer_number, num_layers = self._get_metric_layer_number()
 
             get_moe_metrics_tracker().record(
                 "z_loss",

@@ -43,10 +43,12 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
+    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
+    build_cp_context = None
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
@@ -58,9 +60,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GatedDeltaNetSubmodules:
-    """
-    Contains the module specs for the input linear, output norm, and output linear layers.
-    """
+    """Module specs shared by GDN-family layers."""
 
     in_proj: Union[ModuleSpec, type] = IdentityOp
     out_norm: Union[ModuleSpec, type] = IdentityOp
@@ -124,13 +124,14 @@ class _GDNBase(MegatronModule):
         *,
         name: str | None = None,
         cp_comm_type: str | None = None,
-        pp_layer_offset: int = 0,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         """
         Args:
             config: The config of the model.
             submodules: Contains the module specs for the input and output linear layers.
-            layer_number: The layer number of this GDN layer.
+            layer_number: The layer number of this GDN-family layer.
             bias: Whether to use bias in the linear layers.
             conv_bias: Whether to use bias in the causal convolution.
             conv_init: The initialization range for the causal convolution weights.
@@ -143,6 +144,7 @@ class _GDNBase(MegatronModule):
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
             pp_layer_offset: Offset of this pipeline stage's first global layer.
+            is_mtp_layer: Whether this module is inside an MTP prediction depth.
         """
         if not HAVE_FLA:
             raise ImportError(
@@ -154,6 +156,8 @@ class _GDNBase(MegatronModule):
 
         # Attributes from arguments
         self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
         self.pp_layer_offset = pp_layer_offset
         self.bias = bias
         self.conv_bias = conv_bias
@@ -161,7 +165,7 @@ class _GDNBase(MegatronModule):
         assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
         self.A_init_range = A_init_range
         self.use_qk_l2norm = use_qk_l2norm
-        assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
+        assert pg_collection is not None, "pg_collection must be provided for a GDN-family layer"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
@@ -183,6 +187,21 @@ class _GDNBase(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
+        # Headwise CP shards heads over the CP group; chunkwise CP keeps heads local.
+        if self.config.linear_cp_mode == "headwise":
+            num_key_heads_per_tp = self.num_key_heads // self.tp_size
+            num_value_heads_per_tp = self.num_value_heads // self.tp_size
+            assert num_key_heads_per_tp % self.cp_size == 0, (
+                f"GDN-family head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+                f"to evenly divide num_key_heads per TP rank ({num_key_heads_per_tp}); "
+                f"all runtime dynamic cp_size values divide the static one and so will also divide."
+            )
+            assert num_value_heads_per_tp % self.cp_size == 0, (
+                f"GDN-family head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+                f"to evenly divide num_value_heads per TP rank ({num_value_heads_per_tp}); "
+                f"all runtime dynamic cp_size values divide the static one and so will also divide."
+            )
+
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
@@ -197,7 +216,10 @@ class _GDNBase(MegatronModule):
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
-            assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
+            assert hasattr(self, attr), f"Attribute {attr} for the GDN-family variant is not set"
+            assert (
+                getattr(self, attr) is not None
+            ), f"Attribute {attr} for the GDN-family variant is not set"
         # QK, V, gate, shared across all variants
         self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
@@ -205,7 +227,7 @@ class _GDNBase(MegatronModule):
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
-                "For FP8, the innermost dimension of the GDN layer "
+                "For FP8, the innermost dimension of the GDN-family layer "
                 "input projection output tensor must be a multiple of 16."
             )
         self.in_proj = build_module(
@@ -245,7 +267,9 @@ class _GDNBase(MegatronModule):
 
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.dt_bias_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
@@ -253,7 +277,9 @@ class _GDNBase(MegatronModule):
 
         self.A_log = nn.Parameter(
             torch.empty(
-                self.a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.a_log_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
@@ -268,8 +294,10 @@ class _GDNBase(MegatronModule):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
-        if self.config.recompute_granularity == "selective":
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -289,9 +317,9 @@ class _GDNBase(MegatronModule):
         self.reset_parameters()
 
     def _setup_variant_attrs(self):
-        """Set variant specifics on the module. Called once from ``__init__``.
+        """Set variant projection sections, gate parameter sizes, and kernel callable.
 
-        Must set:
+        Called once from ``__init__``. Must set:
         - ``in_proj_dim``
         - ``in_proj_split_names``
         - ``in_proj_split_sections``
@@ -324,9 +352,7 @@ class _GDNBase(MegatronModule):
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                 self._reset_dt_bias()
                 A = torch.empty(
-                    self.A_log.shape[0],
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
+                    self.A_log.shape[0], dtype=self.A_log.dtype, device=self.A_log.device
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
@@ -338,6 +364,7 @@ class _GDNBase(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -389,6 +416,7 @@ class _GDNBase(MegatronModule):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        cp_size_headwise: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -402,11 +430,11 @@ class _GDNBase(MegatronModule):
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
+        cp_size = 1 if cp_size_headwise is None else cp_size_headwise
+
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
+            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
         )
 
         # Reshape query_key and value
@@ -418,7 +446,7 @@ class _GDNBase(MegatronModule):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
@@ -647,7 +675,7 @@ def _build_head_perm_for_split_sections(
 def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
@@ -655,7 +683,8 @@ def get_parameter_local_cp(
     Args:
         param (torch.Tensor): The entire parameter to get the local parameter for.
         dim (int): The dimension to split the parameter along. Usually the dimension of head.
-        cp_group (torch.distributed.ProcessGroup): The context parallel group.
+        cp_group (torch.distributed.ProcessGroup | None): The context parallel group, or None
+            when no headwise sharding is active.
         split_sections (Optional[list[int]]): If not None,
             first split the parameter along the dimension dim into sections,
             then get the local hidden parallel weights separately,
@@ -664,6 +693,9 @@ def get_parameter_local_cp(
     Returns:
         torch.Tensor: The local parameter for the current context parallel rank.
     """
+
+    if cp_group is None:
+        return param
 
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
@@ -842,6 +874,9 @@ def a2a_cp_to_hp(
         The hidden-parallel tensor and the sequence-dim inverse permutation to hand to
         :func:`a2a_hp_to_cp` (``None`` outside the ``thd`` + CP>1 case).
     """
+    if cp_size == 1:
+        return qkvzba, None
+
     if cp_size > 1:
         # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
         head_perm = _build_head_perm_for_split_sections(
@@ -887,6 +922,9 @@ def a2a_hp_to_cp(
     Returns:
         The context-parallel tensor, matching the layout of the GDN module input.
     """
+    if cp_size == 1:
+        return norm_out
+
     if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
         if cp_size > 1:
             assert thd_cp_a2a_inv is not None

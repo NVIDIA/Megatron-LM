@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias,
     router_gating_linear,
@@ -147,6 +148,27 @@ class TestTop2Router:
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
+
+    @pytest.mark.internal
+    def test_nested_hybrid_mtp_z_loss_uses_mtp_depth_for_metric_index(self, monkeypatch):
+        self.router.config.moe_z_loss_coeff = 1.0
+        self.router.config.mtp_num_layers = 1
+        self.router.is_mtp_layer = True
+        self.router.layer_number = 2
+        self.router.mtp_layer_number = 1
+
+        tracker = MoEMetricsTracker()
+        monkeypatch.setattr(
+            "megatron.core.transformer.moe.router.get_moe_metrics_tracker", lambda: tracker
+        )
+        logits = torch.randn(8, self.router.config.num_moe_experts, requires_grad=True)
+
+        self.router.apply_z_loss(logits)
+
+        values = tracker.metrics["z_loss"].values
+        assert values.shape == (self.router.config.num_layers + 1,)
+        assert torch.count_nonzero(values[:-1]) == 0
+        assert values[-1] > 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

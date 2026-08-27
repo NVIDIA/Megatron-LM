@@ -480,6 +480,9 @@ def _test_parallel_attention_correctness(
     sequence_length=256,
     micro_batch_size=4,
     sequence_packing=False,
+    cp_partition_mode="zigzag",
+    input_grad_atol=None,
+    input_grad_rtol=None,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -559,9 +562,11 @@ def _test_parallel_attention_correctness(
         transformer_config.context_parallel_size = cp
         transformer_config.tensor_model_parallel_size = tp
         transformer_config.sequence_parallel = sp
+        transformer_config.cp_partition_mode = cp_partition_mode
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
+        mock_args.cp_partition_mode = cp_partition_mode
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
@@ -585,6 +590,7 @@ def _test_parallel_attention_correctness(
         if sequence_packing:
             cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            packed_seq_params.cp_partition_mode = cp_partition_mode
         else:
             packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
@@ -640,8 +646,8 @@ def _test_parallel_attention_correctness(
         torch.testing.assert_close(
             input_grad_baseline,
             input_grad_parallel,
-            atol=atol,
-            rtol=rtol,
+            atol=atol if input_grad_atol is None else input_grad_atol,
+            rtol=rtol if input_grad_rtol is None else input_grad_rtol,
             msg=lambda msg: f"Mismatch in input_grad: {msg}",
         )
         if has_bias:

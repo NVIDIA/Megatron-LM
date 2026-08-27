@@ -677,6 +677,24 @@ class TestMegatronNetworkArgumentGeneration:
         for field_name in callback_fields:
             assert not hasattr(args, field_name)
 
+    def test_hybrid_layer_pattern_help_lists_every_public_symbol(self):
+        """The public help must describe every symbol accepted by the pattern parser."""
+        from megatron.training.arguments import _add_experimental_args
+
+        parser = _add_experimental_args(ArgumentParser())
+        action = next(action for action in parser._actions if action.dest == "hybrid_layer_pattern")
+        for symbol_and_name in (
+            "M (mamba)",
+            "G (gdn)",
+            "K (kda)",
+            "* (attention)",
+            "D (dsa)",
+            "+ (mla)",
+            "- (mlp)",
+            "E (moe)",
+        ):
+            assert symbol_and_name in action.help
+
 
 class TestMegatronMixedPrecisionArguments:
     """Test language-model logit dtype CLI choices."""

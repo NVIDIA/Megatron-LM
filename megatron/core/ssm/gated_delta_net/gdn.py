@@ -5,22 +5,26 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
+from dataclasses import replace
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel import ContextParallelLayoutManager
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
+    a2a_hp_to_cp,
+    build_cp_context,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
@@ -38,7 +42,8 @@ except ImportError:
 
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
-    # pylint: disable=missing-class-docstring
+    """Gated DeltaNet with a head-wise scalar memory-decay gate."""
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         # alpha, beta
@@ -56,11 +61,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             self.num_value_heads // self.tp_size,  # beta
             self.num_value_heads // self.tp_size,  # alpha
         )
-        self.feat_dim_split = (
-            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,  # qkv
-            self.v_dim_local_tp // self.cp_size,  # gate (z)
-            self.num_value_heads // self.tp_size // self.cp_size,  # beta
-            self.num_value_heads // self.tp_size // self.cp_size,  # alpha
+        self.feat_dim_split = self._get_feat_dim_split(
+            self.cp_size if self.config.linear_cp_mode == "headwise" else 1
         )
 
         self.dt_bias_dim = self.num_v_heads_local_tp
@@ -71,6 +73,15 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
         self.chunk_size = 64
+
+    def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
+        """Return GDN projection split sizes for runtime headwise CP."""
+        return (
+            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,
+            self.v_dim_local_tp // cp_size_headwise,
+            self.num_value_heads // self.tp_size // cp_size_headwise,
+            self.num_value_heads // self.tp_size // cp_size_headwise,
+        )
 
     @jit_fuser
     def _compute_gates(
@@ -96,20 +107,65 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Perform a forward pass through the GDN module.
-
-        Return:
-            (tuple[torch.Tensor, torch.Tensor]) GDN output and bias.
-        """
-
+        """Perform a forward pass through the GDN module."""
+        del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
+        active_pg_collection = pg_collection if pg_collection is not None else self.pg_collection
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None
+            else active_pg_collection.cp
+        )
+        if self.config.linear_cp_mode == "chunkwise":
+            cp_group_chunkwise = cp_group
+            cp_group_headwise = None
+        elif self.config.linear_cp_mode == "headwise":
+            cp_group_chunkwise = None
+            cp_group_headwise = cp_group
+        elif cp_group.size() == 1:
+            cp_group_chunkwise = None
+            cp_group_headwise = None
+        else:
+            raise ValueError(
+                f"Unsupported linear_cp_mode {self.config.linear_cp_mode!r}; "
+                "expected 'headwise' or 'chunkwise'."
+            )
+        cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
+        cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
+        cp_size_runtime = cp_group.size()
+
+        input_layout_state = None
+        if (
+            self.config.linear_cp_mode == "chunkwise"
+            and self.config.linear_cp_layout == "zigzag"
+            and cp_size_chunkwise > 1
+        ):
+            layout_manager = ContextParallelLayoutManager(
+                layer_layouts=("contiguous",),
+                boundary_layout="zigzag",
+                sequence_parallel=self.config.sequence_parallel,
+                cp_group=cp_group_chunkwise,
+                tp_group=self.tp_group,
+                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
+            )
+            layout_packed_seq_params = packed_seq_params
+            if packed_seq_params is not None and packed_seq_params.total_tokens is None:
+                layout_packed_seq_params = replace(
+                    packed_seq_params,
+                    total_tokens=hidden_states.shape[0] * cp_size_runtime * self.sp_size,
+                )
+            input_layout_state = layout_manager.build_forward_state(layout_packed_seq_params)
+            if input_layout_state is not None:
+                hidden_states, packed_seq_params = input_layout_state.prepare_layer(0, hidden_states)
+
+        seq_len_local, batch, _ = hidden_states.shape
+        seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
+        seq_len_global = seq_len_post_headwise * cp_size_chunkwise
 
         if inference_context is not None:
             if inference_context.is_dynamic_batching():
@@ -120,7 +176,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     not self.config.batch_invariant_mode
                 ), "GDN dynamic inference does not support batch-invariant mode."
                 assert (
-                    self.cp_size == 1
+                    cp_size_runtime == 1
                 ), "Context parallelism is not supported for GDN dynamic inference."
                 assert (
                     inference_context.num_speculative_tokens == 0
@@ -133,159 +189,186 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("GDN static-batching inference is not supported.")
 
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            assert batch == 1, "Packed sequence expects batch dimension to be 1"
-            assert (
-                not self.config.deterministic_mode
-            ), "Packed sequence does not support deterministic mode."
+        if cp_size_headwise > 1 and (
+            (
+                packed_seq_params is not None
+                and packed_seq_params.qkv_format == "thd"
+                and getattr(packed_seq_params, "cp_partition_mode", "zigzag") != "zigzag"
+            )
+            or (
+                (packed_seq_params is None or packed_seq_params.qkv_format != "thd")
+                and self.config.linear_cp_layout != "zigzag"
+            )
+        ):
+            raise ValueError("GatedDeltaNet with headwise CP requires zigzag layout.")
 
-            # Resolve cu_seqlens with alignment padding handling.
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            assert batch == 1, "Packed sequence expects batch dimension to be 1"
+            assert not self.config.deterministic_mode, "Packed sequence does not support deterministic mode."
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
-                seq_len,
+                seq_len_global,
                 "cu_seqlens_q",
-                cp_size=self.cp_size,
+                cp_size=cp_size_runtime,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
-                seq_len,
+                seq_len_global,
                 "cu_seqlens_kv",
-                cp_size=self.cp_size,
+                cp_size=cp_size_runtime,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
-            num_packed_seqs = cu_seqlens_q.shape[0] - 1
-            assert num_packed_seqs > 0, (
-                "Number of packed sequences must be greater than 0, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
         else:
             cu_seqlens_q = None
-            cu_seqlens_kv = None
 
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
-
-        qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
-            qkvzba,
-            self.in_proj_split_sections,
-            self.cp_size,
-            self.pg_collection.cp,
-            cu_seqlens_q,
-            seq_len,
-            packed_seq_params,
-        )
-
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
-
-        # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
-        # (beta, alpha for GDN; f, b, w for GDN2)
-        qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
-
-        # Convolution on qkv
-        nvtx_range_push(suffix="conv1d")
-        seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
+        if cp_size_chunkwise > 1:
+            if cu_seqlens_q is None:
+                cu_seqlens_q = (
+                    torch.arange(batch + 1, device=torch.cuda.current_device(), dtype=torch.long)
+                    * seq_len_global
+                )
+            chunkwise_cp_context = build_cp_context(
+                cu_seqlens=cu_seqlens_q,
+                group=cp_group_chunkwise,
+                conv1d_kernel_size=self.conv_kernel_dim,
             )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
+            chunkwise_cp_context = None
+
+        if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
+            raise ValueError(
+                "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
+                "when cp_context is used. Use packed THD input or micro_batch_size=1."
+            )
+        if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
+            raise ValueError("gdn_conv_pad_alignment is incompatible with GDN chunkwise CP.")
+
+        def _compute(hidden_states):
+            nvtx_range_push(suffix="in_proj")
+            projected, _ = self.in_proj(hidden_states)
+            nvtx_range_pop(suffix="in_proj")
+            projected, thd_cp_a2a_inv = a2a_cp_to_hp(
+                projected,
+                self.in_proj_split_sections,
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                seq_len_post_headwise,
+                packed_seq_params,
+            )
+            projected = projected.transpose(0, 1)
+            qkv, gate, beta, alpha = torch.split(
+                projected, self._get_feat_dim_split(cp_size_headwise), dim=-1
+            )
+            gate = gate.reshape(batch, seq_len_post_headwise, -1, self.value_head_dim)
+
+            nvtx_range_push(suffix="conv1d")
+            qkv_sections = [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp]
+            conv1d_weight = get_parameter_local_cp(
+                self.conv1d.weight,
+                dim=0,
+                cp_group=cp_group_headwise,
+                split_sections=qkv_sections,
+            )
+            conv1d_bias = (
+                get_parameter_local_cp(
+                    self.conv1d.bias,
+                    dim=0,
+                    cp_group=cp_group_headwise,
+                    split_sections=qkv_sections,
+                )
+                if self.conv_bias
+                else None
+            )
+            kernel_seq_len = qkv.shape[1]
+            if self.config.deterministic_mode:
+                qkv = qkv.transpose(1, 2).contiguous()
+                qkv = self.act_fn(
+                    F.conv1d(
+                        input=qkv,
+                        weight=conv1d_weight,
+                        bias=conv1d_bias,
+                        stride=self.conv1d.stride,
+                        padding=self.conv1d.padding,
+                        dilation=self.conv1d.dilation,
+                        groups=self.conv_dim_local_tp // cp_size_headwise,
+                    )[..., :kernel_seq_len]
+                ).transpose(1, 2)
+            else:
+                assert self.activation in ["silu", "swish"]
+                qkv, _ = causal_conv1d(
+                    x=qkv.contiguous(),
+                    weight=conv1d_weight.squeeze(1),
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens_q,
+                    cp_context=chunkwise_cp_context,
+                )
+            nvtx_range_pop(suffix="conv1d")
+
+            A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
+            dt_bias_local_cp = get_parameter_local_cp(
+                self.dt_bias, dim=0, cp_group=cp_group_headwise
+            )
+            kernel_inputs = self._prepare_input_for_gated_delta_rule(
+                qkv,
+                gate,
+                A_log_local_cp,
+                dt_bias_local_cp,
+                batch,
+                kernel_seq_len,
+                beta,
+                alpha,
+                cp_size_headwise=cp_size_headwise,
+            )
+            gate = kernel_inputs.pop("gate")
+            core_attn_out, _ = self.gated_delta_rule(
+                **kernel_inputs,
                 initial_state=None,
                 output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
                 cu_seqlens=cu_seqlens_q,
+                cp_context=chunkwise_cp_context,
             )
-        nvtx_range_pop(suffix="conv1d")
 
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
+            def _norm_and_restore(core_attn_out, gate):
+                norm_out = self._apply_gated_norm(core_attn_out, gate)
+                norm_out = (
+                    norm_out.reshape(batch, kernel_seq_len, -1).transpose(0, 1).contiguous()
+                )
+                return a2a_hp_to_cp(
+                    norm_out,
+                    cp_size_headwise,
+                    cp_group_headwise,
+                    packed_seq_params,
+                    thd_cp_a2a_inv,
+                )
 
-        # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
-        nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
-        )
-        gate = kernel_inputs.pop("gate")
-        nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+            if self.recompute_norm_out and self.training:
+                self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                norm_out = self.norm_out_checkpoint.checkpoint(
+                    _norm_and_restore, core_attn_out, gate
+                )
+            else:
+                norm_out = _norm_and_restore(core_attn_out, gate)
+            out, out_bias = self.out_proj(norm_out)
+            if self.recompute_norm_out and self.training:
+                self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+            return out, out_bias
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_func = partial(
-                self._gated_norm_and_a2a,
-                thd_cp_a2a_inv=thd_cp_a2a_inv,
-                batch=batch,
-                seq_len=seq_len,
-                packed_seq_params=packed_seq_params,
-            )
-            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
+        if self.recompute_gdn and self.training:
+            out, out_bias = tensor_parallel.checkpoint(_compute, False, hidden_states)
         else:
-            norm_out = self._gated_norm_and_a2a(
-                core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
-            )
-
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
+            out, out_bias = _compute(hidden_states)
+        if input_layout_state is not None:
+            out = input_layout_state.finalize_layer(0, out)
         return out, out_bias
 
     def _split_projection(
@@ -425,22 +508,20 @@ def torch_chunk_gated_delta_rule(
     v,
     g,
     beta,
-    scale=None,
     chunk_size=64,
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
-    **kwargs,
+    cp_context=None,
+    scale=None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # pylint: disable=line-too-long
     '''
     Torch-native implementation of chunked gated delta rule for deterministic mode.
     Need this because FLA is not deterministic.
 
-    ``scale`` defaults to ``1 / sqrt(K)``, matching the FLA kernel. Extra keyword
-    arguments are accepted and ignored so this stays interchangeable with the FLA
-    kernel, which takes several options this implementation does not model.
+    ``scale`` defaults to ``1 / sqrt(K)``, matching the FLA kernel.
 
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
     '''
@@ -448,6 +529,9 @@ def torch_chunk_gated_delta_rule(
     assert (
         cu_seqlens is None
     ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
+    assert (
+        cp_context is None
+    ), "cp_context is not supported for torch_chunk_gated_delta_rule for now."
 
     query, key, value = q, k, v
     initial_dtype = query.dtype

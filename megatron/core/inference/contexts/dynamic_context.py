@@ -456,9 +456,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
             # one map in global layer order; independently generated per-symbol maps both
             # start at zero and would alias if they were simply unioned.
+            layer_maps = get_layer_maps_from_layer_type_list(
+                mamba_inference_state_config.layer_type_list
+            )
             attention_layer_map, dsa_layer_map = operator.itemgetter(
                 Symbols.ATTENTION, Symbols.DS_ATTENTION
-            )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+            )(layer_maps)
+            if layer_maps[Symbols.KDA]:
+                raise NotImplementedError("KDA layers are not supported for inference.")
             recurrent_layer_map = {}
             for global_layer_idx, layer_type in enumerate(
                 mamba_inference_state_config.layer_type_list

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -787,6 +787,8 @@ def validate_args(args, defaults={}):
         args.mtp_hybrid_override_pattern = None
         print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
 
+    parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+
     if args.hybrid_layer_pattern is not None:
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
@@ -866,9 +868,8 @@ def validate_args(args, defaults={}):
 
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
-        parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
-        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-            inferred_mtp_num_layers = parsed.mtp_num_depths
+        if parsed_hybrid_pattern.mtp_pattern and parsed_hybrid_pattern.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed_hybrid_pattern.mtp_num_depths
             if args.mtp_num_layers is None:
                 args.mtp_num_layers = inferred_mtp_num_layers
             elif args.mtp_num_layers != inferred_mtp_num_layers:
@@ -918,10 +919,12 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and (
-            Symbols.MLA in args.hybrid_layer_pattern
-            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    # Infer use of MLA from the parsed main and MTP patterns before config-class selection.
+    if any(
+        symbol in pattern
+        for pattern in (parsed_hybrid_pattern.main_pattern, parsed_hybrid_pattern.mtp_pattern)
+        if pattern is not None
+        for symbol in Symbols.MLA_ATTENTION
     ):
         args.multi_latent_attention = True
 
@@ -3678,28 +3681,43 @@ def _add_heterogeneous_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--enable-experimental', action='store_true',
-                       help='Enable experimental features.')
-    group.add_argument('--spec', type=str, default=None, nargs='*',
-                       help='Specify the <module_location function_name> pair '
-                       'that returns a spec to customize a model, transformer '
-                       'block, or transformer layer, depending on the use case.'
-                       'To use local spec specify local as the argument.'
-                       'For more details, see the model class, '
-                       '`transformer_block.py`, or `transformer_layer.py`')
-    group.add_argument('--hybrid-layer-pattern', type=str, default=None,
-                       help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
-                       'stage boundaries for flexible virtual pipeline parallel (fVPP). '
-                       'Use / to separate MTP patterns. '
-                       'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
-                       'When this flag is used, it is the sole indicator that a hybrid model '
-                       'is being run.')
-    group.add_argument('--hybrid-override-pattern', type=str, default=None,
-                       help='Deprecated. Use --hybrid-layer-pattern instead. '
-                       'If specified, its value will be forwarded to --hybrid-layer-pattern.')
-    group.add_argument('--yaml-cfg', type=str, default=None,
-                       help = 'Config file to add additional arguments')
+    group.add_argument(
+        '--enable-experimental', action='store_true', help='Enable experimental features.'
+    )
+    group.add_argument(
+        '--spec',
+        type=str,
+        default=None,
+        nargs='*',
+        help='Specify the <module_location function_name> pair '
+        'that returns a spec to customize a model, transformer '
+        'block, or transformer layer, depending on the use case.'
+        'To use local spec specify local as the argument.'
+        'For more details, see the model class, '
+        '`transformer_block.py`, or `transformer_layer.py`',
+    )
+    group.add_argument(
+        '--hybrid-layer-pattern',
+        type=str,
+        default=None,
+        help='Specify a hybrid layer pattern using M (mamba), G (gdn), K (kda), '
+        '* (attention), D (dsa), + (mla), - (mlp), E (moe). Use | to define pipeline '
+        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
+        'Use / to separate MTP patterns. '
+        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+        'When this flag is used, it is the sole indicator that a hybrid model '
+        'is being run.',
+    )
+    group.add_argument(
+        '--hybrid-override-pattern',
+        type=str,
+        default=None,
+        help='Deprecated. Use --hybrid-layer-pattern instead. '
+        'If specified, its value will be forwarded to --hybrid-layer-pattern.',
+    )
+    group.add_argument(
+        '--yaml-cfg', type=str, default=None, help='Config file to add additional arguments'
+    )
 
     # Args of precision-aware optimizer.
     group.add_argument('--use-precision-aware-optimizer', action='store_true',
