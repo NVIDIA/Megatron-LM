@@ -263,13 +263,10 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
         ValueError: If pattern contains invalid symbols
     """
     for char in pattern:
-        if not layer_utils.is_valid_layer(char, allow_pipe=allow_pipe):
-            valid_chars = set(Symbols.LAYER_CONFIG_MAP)
-            if allow_pipe:
-                valid_chars.add(Symbols.PIPE)
+        if not layer_utils.is_valid_symbol(char, allow_pipe=allow_pipe):
             raise ValueError(
                 f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
-                f"Valid symbols are: {valid_chars}"
+                f"Valid symbols are: {Symbols.LAYER_CONFIG_MAP.keys()}"
             )
 
     # Disallow Attention + MLA/DSA hybridity.
@@ -280,7 +277,7 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
 def _validate_segment_layer_symbols(segment: str) -> None:
     """Validate the layer symbols in a single pipeline segment."""
     for layer_symbol in segment:
-        if not layer_utils.is_valid_layer(layer_symbol):
+        if not layer_utils.is_valid_symbol(layer_symbol):
             raise ValueError(
                 f"In hybrid layer pattern segment, '{layer_symbol}' is not "
                 f"one of {set(Symbols.LAYER_CONFIG_MAP)}"

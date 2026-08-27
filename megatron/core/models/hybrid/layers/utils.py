@@ -38,13 +38,13 @@ class Symbols:
         """Return valid layer symbols sorted by their public attribute names."""
         valid_layer_attrs = []
         for name, value in vars(cls).items():
-            if not name.startswith('_') and isinstance(value, str) and is_valid_layer(value):
+            if not name.startswith('_') and isinstance(value, str) and is_valid_symbol(value):
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
 
 
-def is_valid_layer(layer_symbol: str, allow_pipe: bool = False) -> bool:
+def is_valid_symbol(layer_symbol: str, allow_pipe: bool = False) -> bool:
     """Return whether ``layer_symbol`` identifies a supported layer or allowed pipe.
 
     Args:
@@ -67,7 +67,7 @@ def create_layer_config(config: TransformerConfig, layer_symbol: str) -> Transfo
     Raises:
         ValueError: If ``layer_symbol`` does not identify a supported hybrid layer.
     """
-    if not is_valid_layer(layer_symbol):
+    if not is_valid_symbol(layer_symbol):
         raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
     return Symbols.LAYER_CONFIG_MAP[layer_symbol].from_config(config)
 
