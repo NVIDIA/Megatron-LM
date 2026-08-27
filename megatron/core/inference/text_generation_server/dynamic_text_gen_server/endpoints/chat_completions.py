@@ -3,8 +3,8 @@
 import asyncio
 import base64
 import binascii
-import http.client
 import functools
+import http.client
 import ipaddress
 import json
 import logging
