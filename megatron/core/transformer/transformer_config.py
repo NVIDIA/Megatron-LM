@@ -2083,9 +2083,10 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_megakernel_backend == "mok":
-            if self.moe_single_grouped_weight and not self.gradient_accumulation_fusion:
+            # TODO: Add a materialized-wgrad adapter for non-fused accumulation.
+            if not self.gradient_accumulation_fusion:
                 raise ValueError(
-                    "MOK with native grouped weights requires " "gradient_accumulation_fusion=True"
+                    "MOK currently requires gradient_accumulation_fusion=True"
                 )
             mok_bf16 = self.fp8 is None and not self.fp8_param
             mok_mxfp8 = (

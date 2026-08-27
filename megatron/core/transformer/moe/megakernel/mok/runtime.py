@@ -52,12 +52,13 @@ class _MoKAutograd(torch.autograd.Function):
         )
         prepared_gate, prepared_up, prepared_down = module.quantized_routed_weights()
         if module.use_mxfp8_weights and module.native_single_grouped_weights:
+            # Single-weight MXFP8 forward consumes only rowwise data and scale.
             gate_forward = prepared_gate[:2]
             up_forward = prepared_up[:2]
             down_forward = prepared_down[:2]
         else:
-            # BF16 single-weight and all non-single representations are already
-            # directly consumable by MOK; only single-weight MXFP8 needs tuple slicing.
+            # Single-weight BF16 has no separate rowwise/columnwise physical tuple.
+            # Non-single BF16/MXFP8 use SplitRoutedWeight objects consumed directly by MOK.
             gate_forward = prepared_gate
             up_forward = prepared_up
             down_forward = prepared_down
@@ -103,21 +104,8 @@ class _MoKAutograd(torch.autograd.Function):
             backward_gate = prepared_gate
             backward_up = prepared_up
             backward_down = prepared_down
-        direct_wgrad_accumulation = ctx.module.fuse_wgrad_accumulation
-        main_grads = None
-        main_grad_storage_tables = None
-        if direct_wgrad_accumulation:
-            main_grads, main_grad_storage_tables = ctx.module.main_grad_arguments()
-        (
-            d_x,
-            d_router_weights,
-            d_routed_gate,
-            d_routed_up,
-            d_routed_down,
-            d_shared_gate,
-            d_shared_up,
-            d_shared_down,
-        ) = functional.backward(
+        main_grads, main_grad_storage_tables = ctx.module.main_grad_arguments()
+        d_x, d_router_weights, *_ = functional.backward(
             ctx.module.mok_config,
             ctx.workspace,
             ctx.schedule,
@@ -136,16 +124,9 @@ class _MoKAutograd(torch.autograd.Function):
             main_grad_storage_tables=main_grad_storage_tables,
         )
 
-        if ctx.module.fuse_wgrad_accumulation:
-            routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
-            d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
-            d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
-        else:
-            # Materialized routed gradients are only supported by the original
-            # dense/single-grouped interface.
-            routed_parameter_grads = (d_routed_gate, d_routed_down)
-            d_shared_fc1 = torch.cat((d_shared_gate, d_shared_up), dim=0)
-            d_shared_fc2 = d_shared_down
+        routed_parameter_grads = ctx.module.finish_routed_weight_gradients()
+        d_shared_fc1 = _finish_weight_gradient(ctx.module.shared_fc1_weight)
+        d_shared_fc2 = _finish_weight_gradient(ctx.module.shared_fc2_weight)
 
         ctx.module = None
         ctx.workspace = None

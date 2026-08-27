@@ -86,6 +86,14 @@ def test_mok_backend_accepts_bf16_routed_parameters():
     assert not config.fp8_param
 
 
+@pytest.mark.parametrize("single_grouped", [False, True])
+def test_mok_backend_rejects_non_fused_gradient_accumulation(single_grouped):
+    with pytest.raises(ValueError, match="gradient_accumulation_fusion=True"):
+        _mok_transformer_config(
+            moe_single_grouped_weight=single_grouped, gradient_accumulation_fusion=False
+        )
+
+
 def test_mok_backend_accepts_native_mxfp8_parameters():
     config = _mok_transformer_config(fp8="hybrid", fp8_recipe="mxfp8", fp8_param=True)
 

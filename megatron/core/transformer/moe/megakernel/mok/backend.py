@@ -55,8 +55,9 @@ class MoKMegakernel(MegakernelBackend):
                 "on PYTHONPATH"
             ) from exc
 
+        # TODO: Add a materialized-wgrad adapter before allowing non-fused accumulation.
         if not config.gradient_accumulation_fusion:
-            raise ValueError("MOK native routed weights require gradient_accumulation_fusion=True")
+            raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
         if config.moe_mlp_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native MCore routed FC1 weights")
         if config.moe_shared_expert_glu_interleave_size is not None:
@@ -85,7 +86,6 @@ class MoKMegakernel(MegakernelBackend):
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
-        self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
         self.mok_config = MoKConfig(
             fwd_num_comm_sms=config.mok_fwd_num_comm_sms,
@@ -266,17 +266,17 @@ class MoKMegakernel(MegakernelBackend):
                     columns=self.hidden_size,
                     use_mxfp8=self.use_mxfp8_weights,
                 )
-                prepared_down = _native_split_weight_view(
+                prepared_fc2 = _native_split_weight_view(
                     self.routed_fc2_parameters,
                     rows=self.hidden_size,
                     columns=self.intermediate_size,
                     use_mxfp8=self.use_mxfp8_weights,
                 )
-                self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc1, prepared_down)
+                self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc1, prepared_fc2)
             elif self.use_mxfp8_weights and self.is_first_microbatch:
                 # Non-single MXFP8: TE updates scales each optimizer iteration;
                 # refresh scale layouts while keeping data/descriptor addresses stable.
-                prepared_fc1, _, prepared_down = self._prepared_routed_weight_cache
+                prepared_fc1, _, prepared_fc2 = self._prepared_routed_weight_cache
                 _refresh_native_split_weight_scales(
                     prepared_fc1,
                     self.routed_fc1_parameters,
@@ -284,11 +284,13 @@ class MoKMegakernel(MegakernelBackend):
                     columns=self.hidden_size,
                 )
                 _refresh_native_split_weight_scales(
-                    prepared_down,
+                    prepared_fc2,
                     self.routed_fc2_parameters,
                     rows=self.hidden_size,
                     columns=self.intermediate_size,
                 )
+            # There is deliberately no BF16 refresh branch: optimizer steps update
+            # payloads in place, and cached TMA descriptors keep pointing at that storage.
             self.is_first_microbatch = False
             return self._prepared_routed_weight_cache
 
