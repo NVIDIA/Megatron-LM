@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -41,6 +41,9 @@ class CopyService(ABC):
     # process-group rendezvous after run(). Backends whose run() protocol already
     # establishes completion across every participating peer can opt out.
     requires_process_group_barrier = True
+    # Point-to-point transports tolerate ranks with no local operations. Collective
+    # transports whose mesh must cover the whole process group can opt out.
+    supports_idle_ranks = True
 
     def __init__(self, group=None):
         self.group = group
@@ -65,7 +68,40 @@ class CopyService(ABC):
         ...
 
     def close(self) -> None:
-        """Release backend-owned resources.  Default no-op; NVSHMEM overrides."""
+        """Release backend-owned resources. The default implementation is a no-op."""
+
+    def set_model_roles(self, *, is_source: bool, is_destination: bool) -> None:
+        """Provide this rank's model participation to topology-aware backends.
+
+        Point-to-point backends infer everything they need from submitted
+        operations and keep this default no-op. Collective cross-group
+        backends may override it to construct their source/destination meshes.
+        """
+
+    def set_plan(self, plan: object, *, transform: object | None = None) -> None:
+        """Associate subsequent submissions with an immutable reshard plan.
+
+        Backends may use this identity to cache collective setup that is valid
+        for the lifetime of the plan and transform. Point-to-point backends do
+        not require per-plan setup and keep this default no-op.
+        """
+
+    def execute_plan(
+        self,
+        plan: object,
+        src_tensors: Mapping[str, torch.Tensor],
+        dst_tensors: Mapping[str, torch.Tensor],
+        *,
+        transform: object | None = None,
+    ) -> bool:
+        """Execute a plan natively, returning whether it was handled.
+
+        The default keeps the established submit/run path. Backends whose
+        native primitive needs whole tensors and mesh metadata can override
+        this hook without changing the public ReFIT API or the slice-copy
+        contract used by other transports.
+        """
+        return False
 
 
 def match_local_ops_by_task_id(
