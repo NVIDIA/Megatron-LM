@@ -211,9 +211,6 @@ class TEGroupedMLP(MegatronModule):
         self.tp_group = pg_collection.expt_tp
 
         if self.config.moe_flex_dispatcher_backend == "replica_hybridep":
-            # Replica-HybridEP keeps optimizer-owned expert weights discrete. Its
-            # execution-only fused op may still pack runtime weights internally.
-            os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "0"
             # The replica bridge owns the runtime grouped weights and uses the registered
             # weight parameters' main_grad buffers as its source of truth for optimizer state.
             os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
@@ -506,26 +503,17 @@ class TEGroupedMLP(MegatronModule):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
         def register_replica_weights(
-            op: torch.nn.Module,
-            runtime_weights: tuple[torch.nn.Parameter, ...],
-            *,
-            single_grouped_weight: bool,
+            op: torch.nn.Module, runtime_weights: tuple[torch.nn.Parameter, ...]
         ) -> None:
-            """Attach unregistered native-plus-replica weights to a TE op shell."""
-            expected_weights = 1 if single_grouped_weight else op.num_groups
-            if len(runtime_weights) != expected_weights:
+            """Attach discrete native-plus-replica weights to a TE op shell."""
+            if len(runtime_weights) != op.num_groups:
                 raise ValueError(
-                    f"Expected {expected_weights} replica runtime weights, got "
+                    f"Expected {op.num_groups} replica runtime weights, got "
                     f"{len(runtime_weights)}."
                 )
-            if single_grouped_weight:
-                op.register_parameter("weight", runtime_weights[0])
-                for idx in range(op.num_groups):
-                    op.register_parameter(f"weight{idx}", None)
-            else:
-                op.register_parameter("weight", None)
-                for idx, runtime_weight in enumerate(runtime_weights):
-                    op.register_parameter(f"weight{idx}", runtime_weight)
+            op.register_parameter("weight", None)
+            for idx, runtime_weight in enumerate(runtime_weights):
+                op.register_parameter(f"weight{idx}", runtime_weight)
 
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
@@ -573,20 +561,8 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
-        # In single grouped mode, clear stale per-expert meta params so TE does not reset
-        # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         if replica_bridge is not None:
-            # The source model intentionally keeps discrete optimizer parameters, so
-            # Megatron sets TE's process-wide single-param gate to false. Large replica
-            # runtimes still need a packed execution-only parameter to avoid TE's
-            # 64-member discrete GEMM limit. Switch just this meta op shell after its
-            # construction instead of changing the process-wide source-weight policy.
-            op.single_grouped_weight = replica_bridge.uses_packed_runtime_weights
-            register_replica_weights(
-                op,
-                replica_bridge.runtime_fc1_weights,
-                single_grouped_weight=replica_bridge.uses_packed_runtime_weights,
-            )
+            register_replica_weights(op, replica_bridge.runtime_fc1_weights)
             self._install_fused_fc1_prefetch_wait(op, replica_bridge)
         else:
             register_grouped_linear_params(
@@ -697,15 +673,8 @@ class TEGroupedMLP(MegatronModule):
             **fc2_bias_kwargs,
         )
 
-        # In single grouped mode, clear stale per-expert meta params so TE does not reset
-        # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
         if replica_bridge is not None:
-            op.single_grouped_weight = replica_bridge.uses_packed_runtime_weights
-            register_replica_weights(
-                op,
-                replica_bridge.runtime_fc2_weights,
-                single_grouped_weight=replica_bridge.uses_packed_runtime_weights,
-            )
+            register_replica_weights(op, replica_bridge.runtime_fc2_weights)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
