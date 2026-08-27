@@ -2107,6 +2107,9 @@ class CompressedSparseAttention(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
         boundary_hidden: Optional[torch.Tensor] = None,
         boundary_kv: Optional[torch.Tensor] = None,
+        indexer_x_local: Optional[torch.Tensor] = None,
+        indexer_qr_local: Optional[torch.Tensor] = None,
+        tp_local_indexer_q: bool = False,
     ) -> torch.Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -2144,7 +2147,16 @@ class CompressedSparseAttention(MegatronModule):
                     query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
                 )
             else:
-                output = self._forward_thd(query, key, x, qr, packed_seq_params)
+                output = self._forward_thd(
+                    query,
+                    key,
+                    x,
+                    qr,
+                    packed_seq_params,
+                    indexer_x_local=indexer_x_local,
+                    indexer_qr_local=indexer_qr_local,
+                    tp_local_indexer_q=tp_local_indexer_q,
+                )
             self.pg_collection.cp = _orig_cp_group
             nvtx_range_pop("compressed_sparse_attn")
             return output
@@ -2159,6 +2171,7 @@ class CompressedSparseAttention(MegatronModule):
         has_indexer_compressed = (
             self.compress_ratio > 1 and n_compressed > 0 and self.indexer is not None
         )
+        has_indexer_loss = (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0
 
         indexer_loss = None
 
@@ -2174,7 +2187,12 @@ class CompressedSparseAttention(MegatronModule):
                 window_idxs,
                 packed_seq_params,
             )
-        elif has_indexer_compressed and self.training and torch.is_grad_enabled():
+        elif (
+            has_indexer_compressed
+            and self.training
+            and torch.is_grad_enabled()
+            and has_indexer_loss
+        ):
             output, indexer_loss = self._forward_fused_indexer_training(
                 query, x, qr, kv_full, n_compressed, offset, window_idxs, packed_seq_params
             )
@@ -2413,6 +2431,10 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_q: int,
         max_seqlen_compressed_idx: int,
         max_seqlen_kv: int,
+        *,
+        indexer_x_local: Optional[torch.Tensor] = None,
+        indexer_qr_local: Optional[torch.Tensor] = None,
+        tp_local_indexer_q: bool = False,
     ) -> torch.Tensor:
         """Path C (THD): separate indexer forward (no loss) + fused sparse attn (compact).
 
@@ -2421,9 +2443,27 @@ class CompressedSparseAttention(MegatronModule):
         x_det = x.detach()
         qr_det = qr.detach()
 
-        q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
-            self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
-        )
+        # With a zero teacher-loss coefficient the Indexer route is a discrete
+        # routing decision only.  No Indexer activation can contribute a
+        # gradient, so do not build a parameter autograd graph for Q/K/weights.
+        with torch.no_grad():
+            if tp_local_indexer_q:
+                if indexer_x_local is None or indexer_qr_local is None:
+                    raise RuntimeError(
+                        "TP-local Indexer Q path requires local hidden and compressed-query inputs."
+                    )
+                q_indexer, weights_indexer = self._forward_indexer_q_weights_tp_local(
+                    indexer_x_local.detach(),
+                    indexer_qr_local.detach(),
+                    packed_seq_params,
+                )
+                k_indexer, cu_seqlens_compressed_idx = self.indexer.compressor(
+                    x_det, packed_seq_params=packed_seq_params
+                )
+            else:
+                q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
+                    self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
+                )
         q_thd = q_indexer.squeeze(1)
         w_thd = weights_indexer.squeeze(1)
         if k_indexer is None:
@@ -2474,6 +2514,73 @@ class CompressedSparseAttention(MegatronModule):
             is_thd=True,
         )
         return output.unsqueeze(1)
+
+    def _forward_indexer_q_weights_tp_local(
+        self,
+        x_local: torch.Tensor,
+        qr_local: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute duplicated Indexer Q/weights on TP-local sequence rows.
+
+        The Indexer compressor K remains on the legacy global-row path because
+        every TP rank needs the complete compressed-K buffer.  Q and weights are
+        token-wise and are only used to form a non-differentiable top-k when the
+        Indexer teacher-loss coefficient is zero, so computing them once on the
+        rank owning each sequence row and then gathering the results is exact.
+        """
+        tp_group = self.pg_collection.tp
+        if tp_group is None or tp_group.size() <= 1:
+            raise RuntimeError("TP-local Indexer Q path requires a TP group larger than one.")
+        if (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0:
+            raise RuntimeError(
+                "TP-local Indexer Q is only enabled when dsa_indexer_loss_coeff == 0; "
+                "the teacher-loss gradient path still requires a dedicated implementation."
+            )
+
+        indexer = self.indexer
+        local_rows = x_local.shape[0]
+        if x_local.ndim != 3 or x_local.shape[1] != 1:
+            raise RuntimeError(
+                f"TP-local Indexer Q expects x_local [rows,1,hidden], got {tuple(x_local.shape)}"
+            )
+        cu_seqlens_q = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        max_seqlen_q = int(packed_seq_params.max_seqlen_q)
+        with torch.no_grad():
+            q_indexer, _ = indexer.linear_wq_b(qr_local)
+            q_indexer = q_indexer.reshape(
+                local_rows, 1, indexer.index_n_heads, indexer.index_head_dim
+            )
+            # Gather the raw token-wise projection before RoPE.  Applying RoPE
+            # to local slices changes a few BF16 ulps in the fused kernel; the
+            # Indexer top-k is discrete and those ulps can flip many routes.
+            # Keeping the existing global RoPE call makes the top-k bitwise
+            # equivalent while still removing the duplicated GEMM work.
+            q_indexer = gather_from_sequence_parallel_region(q_indexer, group=tp_group)
+            q_indexer = _apply_rope(
+                q_indexer,
+                indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                indexer.qk_pos_emb_head_dim,
+                indexer.rotary_pos_emb,
+                self.config,
+                rotary_seq_len=q_indexer.shape[0],
+                ratio=1,
+                cp_group=self.pg_collection.cp,
+                cu_seqlens=cu_seqlens_q,
+                max_seqlen_rope=max_seqlen_q,
+            )
+            q_indexer = rotate_activation(q_indexer)
+            weights_indexer, _ = indexer.linear_weights_proj(x_local)
+            weights_indexer = weights_indexer * (indexer.index_n_heads**-0.5)
+
+            weights_indexer = gather_from_sequence_parallel_region(
+                weights_indexer, group=tp_group
+            )
+        return q_indexer, weights_indexer
 
     def _forward_fused_indexer_training_thd(
         self,
@@ -2784,7 +2891,13 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_kv_local.squeeze(1), group=cp_group
                 )
 
-        use_indexer_loss = training_with_grad and compressed_topk is not None
+        # A zero coefficient still needs Indexer top-k for sparse attention,
+        # but it must not enter the dense/sparse teacher-loss autograd path.
+        # That path allocates large score/recompute workspaces even when its
+        # contribution is mathematically zero (especially at 256K).
+        use_indexer_loss = (
+            training_with_grad and compressed_topk is not None and indexer_loss_coeff > 0
+        )
         # ``use_indexer_loss`` implies the RS consumer edges above were built,
         # so the fused indexer-loss path always runs with backward overlap.
         overlap_cp_backward = use_indexer_loss and self.use_fused_kernels
@@ -2932,6 +3045,10 @@ class CompressedSparseAttention(MegatronModule):
         x: torch.Tensor,  # (total_q, 1, hidden_size)
         qr: torch.Tensor,  # (total_q, 1, q_lora_rank)
         packed_seq_params: PackedSeqParams,
+        *,
+        indexer_x_local: Optional[torch.Tensor] = None,
+        indexer_qr_local: Optional[torch.Tensor] = None,
+        tp_local_indexer_q: bool = False,
     ) -> torch.Tensor:
         """THD-packed branch of :meth:`forward`. See class docstring for layout.
 
@@ -3011,6 +3128,7 @@ class CompressedSparseAttention(MegatronModule):
         has_indexer = (
             self.compress_ratio > 1 and n_compressed_total > 0 and self.indexer is not None
         )
+        has_indexer_loss = (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0
 
         indexer_loss = None
 
@@ -3033,7 +3151,7 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_compressed_idx,
                 packed_seq_params,
             )
-        elif has_indexer and is_training:
+        elif has_indexer and is_training and has_indexer_loss:
             output, indexer_loss = self._forward_fused_indexer_training_thd(
                 query,
                 x,
@@ -3065,6 +3183,9 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_q,
                 max_seqlen_compressed_idx,
                 max_seqlen_kv,
+                indexer_x_local=indexer_x_local,
+                indexer_qr_local=indexer_qr_local,
+                tp_local_indexer_q=tp_local_indexer_q,
             )
         else:
             output = self._forward_fused_no_indexer_thd(
