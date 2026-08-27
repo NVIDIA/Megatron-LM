@@ -199,14 +199,11 @@ class TestInferenceConfig:
 
         assert inference_config.offset_sampling_seed_by_dp_rank is False
 
-    def test_mamba_state_config_accepts_layer_config_subclasses(self, monkeypatch):
-        """Model-derived Mamba metadata recognizes layer config subclasses."""
-
-        class CustomMambaLayerConfig(MambaLayerConfig):
-            pass
+    def test_mamba_state_config_uses_exact_layer_config_types(self, monkeypatch):
+        """Model-derived Mamba metadata comes from exact layer config types."""
 
         attention_config = object.__new__(AttentionLayerConfig)
-        mamba_layer_config = object.__new__(CustomMambaLayerConfig)
+        mamba_layer_config = object.__new__(MambaLayerConfig)
         decoder = SimpleNamespace(
             layer_config_list=[attention_config, mamba_layer_config],
             layers=[

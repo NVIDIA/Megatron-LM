@@ -101,9 +101,9 @@ def ssm_chunking(
     for layer_idx, (layer_config, layer) in enumerate(zip(layer_config_list, layers, strict=True)):
         # Mamba-family mixers (including Gated Delta Product) hang off `.mixer`;
         # Gated Delta Net registers its recurrent mixer in the attention slot.
-        if isinstance(layer_config, MambaLayerConfig):
+        if type(layer_config) is MambaLayerConfig:
             mixer = getattr(layer, 'mixer', None)
-        elif isinstance(layer_config, GDNLayerConfig):
+        elif type(layer_config) is GDNLayerConfig:
             mixer = getattr(layer, 'self_attention', None)
         else:
             continue

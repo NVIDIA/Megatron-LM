@@ -99,10 +99,10 @@ class MambaInferenceStateConfig:
         layer_config_list = getattr(decoder, "layer_config_list", None)
         if layer_config_list is not None:
             has_mamba = any(
-                isinstance(layer_config, MambaLayerConfig) for layer_config in layer_config_list
+                type(layer_config) is MambaLayerConfig for layer_config in layer_config_list
             )
             has_gdn = any(
-                isinstance(layer_config, GDNLayerConfig) for layer_config in layer_config_list
+                type(layer_config) is GDNLayerConfig for layer_config in layer_config_list
             )
             if has_mamba and has_gdn:
                 raise ValueError(
