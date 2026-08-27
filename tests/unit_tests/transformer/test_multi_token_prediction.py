@@ -154,19 +154,11 @@ class TestMultiTokenPredictionLayer:
         )
 
         assert mtp_on_this_rank(
-            mtp_num_layers=1,
-            ignore_virtual=False,
-            vp_stage=0,
-            pp_group=pp_group,
-            vp_size=1,
+            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_group=pp_group, vp_size=1
         )
         pp_rank = 0
         assert not mtp_on_this_rank(
-            mtp_num_layers=1,
-            ignore_virtual=False,
-            vp_stage=0,
-            pp_group=pp_group,
-            vp_size=1,
+            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_group=pp_group, vp_size=1
         )
 
         config = TransformerConfig(

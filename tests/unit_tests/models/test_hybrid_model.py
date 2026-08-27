@@ -295,9 +295,7 @@ class TestHybridModel:
         input_ids = torch.arange(sequence_length, device="cuda").repeat(micro_batch_size, 1)
         position_ids = input_ids.clone()
         attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length),
-            dtype=torch.bool,
-            device="cuda",
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=torch.bool, device="cuda"
         )
         labels = input_ids.clone()
         loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
