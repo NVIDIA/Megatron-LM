@@ -123,9 +123,9 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     def fake_native_views(*args, **kwargs):
         del args, kwargs
         native_calls.append(True)
-        gate = (object(),)
-        down = (object(),)
-        return gate, gate, down
+        fc1 = (object(),)
+        fc2 = (object(),)
+        return fc1, fc2
 
     def fake_prepare(native, *, rows, columns):
         prepare_calls.append((rows, columns))
@@ -138,7 +138,6 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     second = module.quantized_routed_weights()
 
     assert second is first
-    assert first[0] is first[1]
     assert len(native_calls) == 1
     assert prepare_calls == [(256, 256), (256, 128)]
 
@@ -146,7 +145,6 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     third = module.quantized_routed_weights()
 
     assert third is not first
-    assert third[0] is third[1]
     assert len(native_calls) == 2
     assert prepare_calls == [(256, 256), (256, 128)] * 2
 
@@ -204,7 +202,6 @@ def test_bf16_split_descriptors_are_cached(monkeypatch):
     second = module.quantized_routed_weights()
 
     assert second is first
-    assert first[0] is first[1]
     assert [(rows, columns, use_mxfp8) for _, rows, columns, use_mxfp8 in calls] == [
         (8, 8, False),
         (8, 4, False),
@@ -238,11 +235,10 @@ def test_mxfp8_split_scale_and_descriptor_cache_refreshes_per_iteration(monkeypa
     third = module.quantized_routed_weights()
 
     assert third is first
-    assert third[0] is third[1]
     assert len(build_calls) == 2
     assert [(prepared, rows, columns) for prepared, _, rows, columns in refresh_calls] == [
         (first[0], 8, 8),
-        (first[2], 8, 4),
+        (first[1], 8, 4),
     ]
 
 
@@ -350,7 +346,7 @@ def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
         torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16)
     )
 
-    gate, up, down = mok_weights._native_single_grouped_weight_views(
+    fc1_view, fc2_view = mok_weights._native_single_grouped_weight_views(
         fc1,
         fc2,
         num_experts=num_experts,
@@ -359,9 +355,8 @@ def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
         use_mxfp8=False,
     )
 
-    assert gate is fc1
-    assert up is fc1
-    assert down is fc2
+    assert fc1_view is fc1
+    assert fc2_view is fc2
 
 
 def test_native_single_grouped_bf16_views_use_rowwise_storage(monkeypatch):
@@ -382,7 +377,7 @@ def test_native_single_grouped_bf16_views_use_rowwise_storage(monkeypatch):
 
     monkeypatch.setattr(mok_weights, "_storage_view", fake_storage_view)
 
-    gate, up, down = mok_weights._native_single_grouped_weight_views(
+    fc1_view, fc2_view = mok_weights._native_single_grouped_weight_views(
         fc1,
         fc2,
         num_experts=num_experts,
@@ -391,9 +386,8 @@ def test_native_single_grouped_bf16_views_use_rowwise_storage(monkeypatch):
         use_mxfp8=False,
     )
 
-    assert gate.data_ptr() == fc1.rowwise_data.data_ptr()
-    assert up.data_ptr() == gate.data_ptr()
-    assert down.data_ptr() == fc2.rowwise_data.data_ptr()
+    assert fc1_view.data_ptr() == fc1.rowwise_data.data_ptr()
+    assert fc2_view.data_ptr() == fc2.rowwise_data.data_ptr()
     assert [call[1] for call in storage_calls] == [
         (num_experts, 2 * intermediate_size, hidden_size),
         (num_experts, hidden_size, intermediate_size),
@@ -419,37 +413,29 @@ def _shared_adapter(intermediate_size=2, hidden_size=3):
 
 def test_register_shared_weights_reuses_native_bf16_combined_parameters():
     fc1 = torch.nn.Parameter(torch.randn((4, 3), dtype=torch.bfloat16))
-    down = torch.nn.Parameter(torch.randn((3, 2), dtype=torch.bfloat16))
-    shared = _shared_module(fc1, down)
+    fc2 = torch.nn.Parameter(torch.randn((3, 2), dtype=torch.bfloat16))
+    shared = _shared_module(fc1, fc2)
     module = _shared_adapter()
 
     module._register_shared_weights(shared)
-    gate, up, actual_down = module.shared_weight_views()
 
     assert module.shared_fc1_weight is fc1
-    assert module.shared_fc2_weight is down
+    assert module.shared_fc2_weight is fc2
     assert shared.linear_fc1.weight is fc1
-    assert shared.linear_fc2.weight is down
-    assert gate.untyped_storage().data_ptr() == fc1.untyped_storage().data_ptr()
-    assert up.untyped_storage().data_ptr() == fc1.untyped_storage().data_ptr()
-    assert gate.storage_offset() == 0
-    assert up.storage_offset() == fc1.shape[1] * module.intermediate_size
-    assert actual_down is down
-    torch.testing.assert_close(gate, fc1[:2])
-    torch.testing.assert_close(up, fc1[2:])
+    assert shared.linear_fc2.weight is fc2
 
 
 def test_register_shared_weights_rejects_non_bf16_parameters():
     fc1 = torch.nn.Parameter(torch.randn((4, 3), dtype=torch.float32))
-    down = torch.nn.Parameter(torch.randn((3, 2), dtype=torch.float32))
-    shared = _shared_module(fc1, down)
+    fc2 = torch.nn.Parameter(torch.randn((3, 2), dtype=torch.float32))
+    shared = _shared_module(fc1, fc2)
     module = _shared_adapter()
 
     with pytest.raises(RuntimeError, match="native BF16"):
         module._register_shared_weights(shared)
 
 
-def test_combined_shared_main_grad_is_split_into_zero_copy_mok_views(monkeypatch):
+def test_combined_shared_main_grad_uses_canonical_fc1_fc2_buffers(monkeypatch):
     from mok import ops
 
     module = _split_module(use_mxfp8_weights=False)
@@ -466,12 +452,8 @@ def test_combined_shared_main_grad_is_split_into_zero_copy_mok_views(monkeypatch
     assert main_grads[0].untyped_storage().data_ptr() == (
         shared_fc1_grad.untyped_storage().data_ptr()
     )
-    assert main_grads[2].untyped_storage().data_ptr() == (
-        shared_fc1_grad.untyped_storage().data_ptr()
-    )
-    assert main_grads[0].storage_offset() == 0
-    assert main_grads[2].storage_offset() == 4 * 8
-    assert main_grads[4] is module.shared_fc2_weight.main_grad
+    assert main_grads[0] is shared_fc1_grad
+    assert main_grads[2] is module.shared_fc2_weight.main_grad
 
 
 @pytest.mark.parametrize("single_grouped", [False, True])

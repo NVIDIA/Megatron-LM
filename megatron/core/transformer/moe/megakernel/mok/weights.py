@@ -151,7 +151,7 @@ def _native_single_grouped_weight_views(
     hidden_size: int,
     use_mxfp8: bool,
 ):
-    """Build MOK gate/up/down views directly over native TE grouped parameters."""
+    """Build MOK FC1/FC2 views directly over native TE grouped parameters."""
     e, i, h = num_experts, intermediate_size, hidden_size
     if tuple(fc1.shape) != (e, 2 * i, h) or tuple(fc2.shape) != (e, h, i):
         raise RuntimeError(
@@ -184,8 +184,8 @@ def _native_single_grouped_weight_views(
             fc2_view = _storage_view(
                 fc2_storage, (e, h, i), dtype=torch.bfloat16, name="FC2 BF16 rowwise"
             )
-            return fc1_view, fc1_view, fc2_view
-        return fc1, fc1, fc2
+            return fc1_view, fc2_view
+        return fc1, fc2
 
     from megatron.core.fp8_utils import is_grouped_mxfp8tensor
 
@@ -226,7 +226,7 @@ def _native_single_grouped_weight_views(
     # explicit [E, K, M] transpose on every backward.
     fc1_views = (fc1_row, fc1_row_sc, fc1_col, fc1_col_sc, True)
     fc2_views = (fc2_row, fc2_row_sc, fc2_col, fc2_col_sc, True)
-    return fc1_views, fc1_views, fc2_views
+    return fc1_views, fc2_views
 
 
 def _mok_mxfp8_backward_weight_views(
