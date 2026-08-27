@@ -10,6 +10,9 @@ import zmq
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
+    abort_requests,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -139,3 +142,66 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert payload[4] == {"agent": "prefill"}
     assert payload[5] == [10, 11]
     future.cancel()
+
+
+async def test_add_request_with_id_returns_the_id_abort_needs():
+    """The id handed back is the one that reaches the coordinator as ABORT_REQUEST.
+
+    A non-streaming HTTP response writes nothing to the socket while it
+    generates, so a client that disconnects mid-generation is never discovered
+    as a broken pipe. The handler has to abort explicitly, and abort_request
+    takes an id -- with only the future in hand there is nothing to name, and
+    cancelling the future alone leaves the engine generating.
+    """
+    client, _, fake_socket = _make_client()
+
+    request_id, future = client.add_request_with_id("hello", SamplingParams())
+
+    assert isinstance(future, asyncio.Future)
+    assert client.completion_futures == {request_id: future}
+    submitted = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert submitted[0] == Headers.SUBMIT_REQUEST.value
+    assert submitted[1] == request_id
+
+    client.abort_request(request_id)
+
+    aborted = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert aborted == [Headers.ABORT_REQUEST.value, request_id]
+    # The abort has to drop local state too, or the handler leaks a future that
+    # nothing will ever resolve.
+    assert request_id not in client.completion_futures
+    assert request_id in client.aborted_request_ids
+
+
+async def test_add_request_delegates_to_add_request_with_id():
+    """add_request keeps returning only a future, drawing from the same id sequence."""
+    client, _, _ = _make_client()
+
+    first = client.add_request("a", SamplingParams())
+    second_id, second = client.add_request_with_id("b", SamplingParams())
+
+    assert isinstance(first, asyncio.Future)
+    assert second_id == 1, "add_request must consume an id from the same counter"
+    assert client.completion_futures == {0: first, 1: second}
+
+    first.cancel()
+    second.cancel()
+
+
+async def test_abort_requests_helper_is_best_effort():
+    """One failing abort must not stop the others, and must not raise.
+
+    abort_requests runs on paths that are already unwinding -- a handler
+    cancelled by client disconnect, or one returning a 500 -- where letting a
+    second exception escape would replace the real one.
+    """
+    client = MagicMock()
+    client.abort_request.side_effect = [None, RuntimeError("coordinator gone"), None]
+
+    abort_requests(client, [7, 8, 9], "client disconnected")
+
+    assert [call.args[0] for call in client.abort_request.call_args_list] == [7, 8, 9]
+
+    client.reset_mock(side_effect=True)
+    abort_requests(client, [], "client disconnected")
+    client.abort_request.assert_not_called()

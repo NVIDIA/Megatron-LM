@@ -10,6 +10,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import openai_stream
+from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,9 @@ try:
                 return str(error), 400
 
         tasks = []
+        # Populated on the non-streaming path only; the streaming path aborts
+        # through the AsyncStream callback its generator already owns.
+        request_ids = []
         for prompt_tokens in prompts_as_tokens:
             per_req_params = SamplingParams(
                 temperature=sampling_params.temperature,
@@ -169,11 +173,14 @@ try:
                     )
                 )
             else:
-                tasks.append(
-                    client.add_request(
-                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
-                    )
+                # add_request_with_id, not add_request: a non-streaming response
+                # writes nothing to the socket while generating, so a disconnect
+                # is never discovered as a broken pipe. Aborting needs the ids.
+                request_id, future = client.add_request_with_id(
+                    prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
                 )
+                request_ids.append(request_id)
+                tasks.append(future)
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
@@ -198,7 +205,19 @@ try:
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
+            # gather leaves siblings running when one child raises, so the
+            # others would leak the same way while we return a 500.
+            abort_requests(client, request_ids, f"inference error: {e}")
             return f"Error during inference: {e}", 500
 
         if current_app.config['verbose']:

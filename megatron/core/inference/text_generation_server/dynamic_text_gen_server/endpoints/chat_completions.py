@@ -25,6 +25,7 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import StreamingChatParser, openai_stream
+from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
@@ -910,21 +911,38 @@ try:
             response.timeout = None
             return response
 
-        tasks = [
-            client.add_request(
+        # add_request_with_id, not add_request: a non-streaming response writes
+        # nothing to the socket while generating, so a disconnect is never
+        # discovered as a broken pipe. Aborting needs the request ids.
+        submissions = [
+            client.add_request_with_id(
                 prompt_tokens,
                 sampling_params,
                 multi_modal_data=({"image": image_bytes_list} if image_bytes_list else None),
             )
             for _ in range(n)
         ]
+        request_ids = [request_id for request_id, _ in submissions]
+        tasks = [future for _, future in submissions]
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
+            # gather leaves siblings running when one child raises, so the
+            # others would leak the same way while we return a 500.
+            abort_requests(client, request_ids, f"inference error: {e}")
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
 

@@ -4,7 +4,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import (
@@ -127,6 +127,35 @@ class InferenceClient:
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
         """
+        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
+            1
+        ]
+
+    def add_request_with_id(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data=None,
+    ) -> Tuple[int, asyncio.Future]:
+        """Submit a request and return its id alongside its completion future.
+
+        Same submission as add_request, which delegates here. The id is what
+        abort_request takes, so a caller that may need to cancel -- an HTTP
+        handler whose client can disconnect mid-generation, for instance -- has
+        to use this form. With only the future in hand there is no way to name
+        the request to the coordinator, and cancelling the future alone leaves
+        the engine generating.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the request.
+            multi_modal_data: Optional vLLM-style modality dictionary; see
+                add_request.
+
+        Returns:
+            Tuple[int, asyncio.Future]: The request id and its completion future.
+        """
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [
@@ -136,7 +165,7 @@ class InferenceClient:
             sampling_params.serialize(),
             serialize_multimodal_data(multi_modal_data),
         ]
-        return self._submit_request(payload, request_id)
+        return request_id, self._submit_request(payload, request_id)
 
     def _make_kv_handoff_request(
         self,
