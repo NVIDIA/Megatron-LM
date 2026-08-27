@@ -1301,13 +1301,16 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'te', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
       block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
       for refit and also stores a padded TRT-LLM Major-K copy, increasing
       expert-weight memory relative to the torch backend.
+    - 'te': Uses Transformer Engine's native device-metadata grouped quantization and
+      grouped GEMM for MXFP8. Expert weights stay in TE's native MXFP8 format; non-empty
+      expert token segments are zero-padded to 256 rows. Requires fp8_recipe='mxfp8'.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
     - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
@@ -1317,8 +1320,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
-    fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
-    launches (useful for debugging)."""
+    fp8_recipe='mxfp8' with inference_grouped_gemm_backend='torch'; the native TE
+    backend ignores this option. Set to True to disable fusion and use separate
+    kernel launches (useful for debugging)."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
@@ -1735,6 +1739,16 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
+            try:
+                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
+                    self.inference_grouped_gemm_backend
+                )
+            except ValueError:
+                raise ValueError(
+                    "inference_grouped_gemm_backend must be 'flashinfer', 'te', 'torch', or "
+                    f"'vllm', got '{self.inference_grouped_gemm_backend}'"
+                )
+
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
             if self.expert_tensor_parallel_size > 1:
                 raise ValueError(
@@ -1753,15 +1767,17 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vllm
-            # grouped-GEMM backends only.
+            # Gated linear units (SwiGLU/GeGLU) are supported by the TE, torch, and
+            # vLLM grouped-GEMM backends.
             if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
-                "torch",
-                "vllm",
+                InferenceGroupedGemmBackend.TE,
+                InferenceGroupedGemmBackend.TORCH,
+                InferenceGroupedGemmBackend.VLLM,
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
-                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend te, torch, "
+                    "or vllm, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
@@ -1773,14 +1789,13 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            try:
-                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
-                    self.inference_grouped_gemm_backend
-                )
-            except ValueError:
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE
+                and not mxfp8_enabled
+            ):
                 raise ValueError(
-                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'vllm', "
-                    f"got '{self.inference_grouped_gemm_backend}'"
+                    "The TE inference grouped-GEMM backend requires fp8_recipe='mxfp8' "
+                    "with FP8 enabled."
                 )
 
             if (
@@ -1789,7 +1804,7 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "vLLM Triton fused MoE only supports BF16. "
-                    "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
+                    "Set inference_grouped_gemm_backend to 'te' or 'torch' for MXFP8."
                 )
 
             if (
@@ -1800,7 +1815,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "FlashInfer routed MXFP8 MoE currently supports only non-gated "
                     "squared-ReLU experts. Set activation_func=squared_relu and "
-                    "gated_linear_unit=False, or select inference_grouped_gemm_backend='torch'."
+                    "gated_linear_unit=False, or select inference_grouped_gemm_backend "
+                    "'te' or 'torch'."
                 )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
