@@ -1599,23 +1599,6 @@ class ChainedOptimizer(MegatronOptimizer):
         for idx, optimizer in enumerate(self.chained_optimizers):
             optimizer.reload_model_params(state_dict=state_dicts[idx])
 
-    def _unique_model_chunks(self) -> List[torch.nn.Module]:
-        """Model chunks owned by the chained optimizers, each listed once.
-
-        Chained optimizers (e.g. a dense and an expert optimizer) commonly share the same
-        DDP model chunk, so per-chunk work must not be repeated per optimizer.
-        """
-        model_chunks = []
-        seen = set()
-        for optimizer in self.chained_optimizers:
-            if getattr(optimizer, 'is_stub_optimizer', False):
-                continue
-            for model_chunk in getattr(optimizer, 'model_chunks', []):
-                if id(model_chunk) not in seen:
-                    seen.add(id(model_chunk))
-                    model_chunks.append(model_chunk)
-        return model_chunks
-
     @override
     def _stage_model_params_from_main_params(self) -> None:
         # A ChainedOptimizer can itself be a member of another chain -- a
@@ -1635,10 +1618,13 @@ class ChainedOptimizer(MegatronOptimizer):
         # self.config unset in that case, so nothing here may read it.
         if self.is_stub_optimizer:
             return
-        model_chunks = self._unique_model_chunks()
         for optimizer in self.chained_optimizers:
             optimizer._stage_model_params_from_main_params()
-        for model_chunk in model_chunks:
+        # self.model_chunks, not a walk over the members: __init__ collects chunks only from
+        # members that expose a model_chunks attribute, which Float16OptimizerWithFloat16Params
+        # does not. LayerWiseDistributedOptimizer therefore reassigns self.model_chunks after
+        # super().__init__(), and recomputing here would discard that and gather nothing.
+        for model_chunk in self.model_chunks:
             model_chunk.start_param_sync(force_sync=True)
 
     def state_dict(self):

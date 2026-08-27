@@ -113,13 +113,50 @@ def test_the_refresh_never_zeroes_the_grad_buffer(reuse_grad_buf):
     assert log.count(('sync', 'chunk_a', True)) == 1, log
 
 
-def test_stub_optimizers_contribute_no_chunks_and_stage_nothing():
+def test_stub_optimizers_stage_nothing():
+    """A stub member has no main params to re-derive from, so it must not stage."""
     optimizer, log = _build(reuse_grad_buf=True, with_stub=True)
 
     optimizer.quantize_and_sync_model_params_from_main_params()
 
-    assert not [entry for entry in log if entry[1] == 'stub_chunk'], log
     assert ('stage', 'stub') not in log, log
+    assert [entry[1] for entry in log if entry[0] == 'stage'] == ['dense', 'expert'], log
+
+
+def test_gather_uses_the_chain_s_own_model_chunks():
+    """The gather must read self.model_chunks, not re-walk the members.
+
+    ChainedOptimizer.__init__ collects chunks only from members exposing a model_chunks
+    attribute. LayerWiseDistributedOptimizer's members are Float16OptimizerWithFloat16Params,
+    which do not have one, so __init__ leaves the list empty and LayerWise reassigns
+    self.model_chunks afterwards. Recomputing from the members here would discard that
+    and silently gather nothing on the whole Muon path.
+    """
+    log = []
+    config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=True)
+
+    class _MemberWithoutChunks:
+        """Stands in for Float16OptimizerWithFloat16Params: no model_chunks attribute."""
+
+        def __init__(self, name):
+            self._name = name
+            self.config = config
+            self.is_stub_optimizer = False
+
+        def _stage_model_params_from_main_params(self):
+            log.append(('stage', self._name))
+
+    chained = ChainedOptimizer([_MemberWithoutChunks('a'), _MemberWithoutChunks('b')])
+    assert chained.model_chunks == [], "members expose no chunks, so __init__ finds none"
+
+    # What LayerWiseDistributedOptimizer.__init__ does after super().__init__().
+    chunk = _FakeModelChunk(log, 'layerwise_chunk')
+    chained.model_chunks = [chunk]
+
+    chained.quantize_and_sync_model_params_from_main_params()
+
+    assert [e[1] for e in log if e[0] == 'stage'] == ['a', 'b'], log
+    assert log.count(('sync', 'layerwise_chunk', True)) == 1, log
 
 
 def test_a_nested_chained_optimizer_stages_its_own_members():
