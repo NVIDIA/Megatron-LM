@@ -55,6 +55,7 @@ class TestHybridBlock:
                 'pp',
                 'embd',
                 'cp',
+                'dp_cp',
                 'ep',
                 'expt_tp',
                 'expt_dp',
