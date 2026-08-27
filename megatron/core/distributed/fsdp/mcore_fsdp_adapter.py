@@ -87,10 +87,12 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
 
 
 def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:
-    """Materialize meta parameters reachable from one FSDP unit."""
-    # PyTorch and Transformer Engine differ in reset_parameters(): PyTorch typically initializes
-    # existing Parameters in place, while TE may replace a Parameter via setattr(). Run resets
-    # before fully_shard() so FSDP sees the final Parameter objects.
+    """Materialize meta parameters reachable from one FSDP unit.
+
+    PyTorch and Transformer Engine differ in reset_parameters(): PyTorch typically initializes
+    existing Parameters in place, while TE may replace a Parameter via setattr(). Run resets
+    before fully_shard() so FSDP sees the final Parameter objects.
+    """
     for submodule in module.modules():
         _materialize_meta_module(submodule, device)
 
