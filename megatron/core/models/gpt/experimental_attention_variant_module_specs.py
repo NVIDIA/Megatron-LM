@@ -84,6 +84,7 @@ def get_gated_delta_net_module_spec(
     )
     attention = ModuleSpec(
         module=gdn_module,
+        params={"use_qk_l2norm_in_kernel": config.use_qk_l2norm_in_kernel},
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),

@@ -71,6 +71,7 @@ def _make_config(**overrides):
         transformer_impl="transformer_engine",
         use_kitchen=False,
         experimental_attention_variant=None,
+        use_qk_l2norm_in_kernel=False,
         linear_attention_freq=None,
         moe_layer_freq=1,
         num_moe_experts=None,
@@ -245,7 +246,20 @@ class TestGetGatedDeltaNetModuleSpec:
 
         assert isinstance(spec, ModuleSpec)
         assert spec.module is GatedDeltaNet
+        assert spec.params == {"use_qk_l2norm_in_kernel": False}
         assert spec.metainfo == {"fuse_input_layernorm": True}
+
+    @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
+    def test_forwards_qk_l2norm_knob_in_module_spec(self, use_qk_l2norm_in_kernel):
+        """Verify the config knob is forwarded through ModuleSpec construction params."""
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_gated_delta_net_module_spec,
+        )
+
+        cfg = _make_config(use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
+        spec = get_gated_delta_net_module_spec(cfg, backend=_make_backend())
+
+        assert spec.params["use_qk_l2norm_in_kernel"] is use_qk_l2norm_in_kernel
 
     def test_submodules_use_backend_modules(self):
         """Verify backend-provided projection/norm modules are wired into submodules."""
