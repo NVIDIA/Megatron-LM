@@ -75,10 +75,7 @@ def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) 
 
 
 def _validate_hash_moe_pipeline_placement(
-    layer_type_list: list[str],
-    layer_offset: int,
-    hash_moe_layer_threshold: int,
-    pre_process: bool,
+    layer_type_list: list[str], layer_offset: int, hash_moe_layer_threshold: int, pre_process: bool
 ) -> None:
     """Reject local hash-MoE layers on a stage that does not own the token IDs."""
     if hash_moe_layer_threshold <= 0 or pre_process:
@@ -268,10 +265,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             **logging_pg_kwargs,
         )
         _validate_hash_moe_pipeline_placement(
-            layer_type_list,
-            layer_offset,
-            hash_layer_threshold,
-            self.pre_process,
+            layer_type_list, layer_offset, hash_layer_threshold, self.pre_process
         )
 
         # Determine if MTP is needed (based on pattern parsing)

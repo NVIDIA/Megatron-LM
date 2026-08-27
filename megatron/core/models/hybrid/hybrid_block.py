@@ -455,9 +455,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         if layer.recompute_pre_mlp_layernorm or (
             mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
         ):
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
-                output_with_bias[0]
-            )
+            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output_with_bias[0])
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]
