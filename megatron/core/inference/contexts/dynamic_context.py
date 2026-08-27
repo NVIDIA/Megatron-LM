@@ -345,8 +345,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # counter is not overloaded with cache-eviction semantics.
         self.prefix_cache_lru_clock = 0
 
-        # Bounded-staleness lease length, in epochs, for cached KV blocks and the
-        # Mamba states hanging off them. 0 disables lease-based eviction.
+        # Epochs of staleness tolerated by cached KV blocks and the Mamba states
+        # hanging off them. None disables lease-based eviction.
         self.prefix_caching_lease_epochs = inference_config.prefix_caching_lease_epochs
 
         # Epoch counter for bounded staleness. One epoch is one suspend/resume
@@ -3276,7 +3276,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_expired = self.kv_block_allocator.expire_leased_blocks()
         if num_expired:
             logging.info(
-                "Prefix cache: epoch %d expired %d block(s) past their %d-epoch lease.",
+                "Prefix cache: epoch %d expired %d block(s) past their %d-epoch staleness lease.",
                 epoch,
                 num_expired,
                 self.prefix_caching_lease_epochs,

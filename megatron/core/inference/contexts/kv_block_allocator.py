@@ -27,8 +27,8 @@ class KVBlockAllocator:
         pool_size (int): Number of blocks in the pool, including the dummy block.
         paused_limit (int): Paused-request block retention limit. Must leave at
             least one non-dummy block outside the limit.
-        prefix_caching_lease_epochs (int): Bounded-staleness lease length in
-            epochs; 0 disables lease-based eviction entirely.
+        prefix_caching_lease_epochs (Optional[int]): Epochs of staleness a cached
+            entry may carry; None disables lease-based eviction entirely.
     """
 
     def __init__(
@@ -40,19 +40,23 @@ class KVBlockAllocator:
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.REF_ZERO
         ),
-        prefix_caching_lease_epochs: int = 0,
+        prefix_caching_lease_epochs: Optional[int] = None,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
-        assert prefix_caching_lease_epochs >= 0, "prefix cache lease length must be non-negative"
-        # Lease-based (bounded staleness) eviction is opt-in; 0 leaves every code
-        # path below untouched, including the extra per-block bookkeeping.
+        assert (
+            prefix_caching_lease_epochs is None or prefix_caching_lease_epochs >= 0
+        ), "prefix cache lease length must be non-negative"
+        # Lease-based (bounded staleness) eviction is opt-in; None leaves every
+        # code path below untouched, including the extra per-block bookkeeping.
+        # A lease of 0 is meaningful and distinct: it tolerates no staleness, so
+        # entries are dropped at the very next epoch.
         self.prefix_caching_lease_epochs = (
-            prefix_caching_lease_epochs if enable_prefix_caching else 0
+            prefix_caching_lease_epochs if enable_prefix_caching else None
         )
-        self.lease_enabled = self.prefix_caching_lease_epochs > 0
+        self.lease_enabled = self.prefix_caching_lease_epochs is not None
         # Prefix-chain bookkeeping is needed by LRU's leaf peel and by lease
         # expiry's subtree closure, so either feature turns it on.
         self.track_prefix_chain = (
@@ -723,17 +727,18 @@ class KVBlockAllocator:
     # =========================================================================
 
     def get_block_remaining_lease(self, block_id: int) -> Optional[int]:
-        """Epochs of lease left on a cached block, or None if it has no lease.
+        """Further epochs a cached block may survive, or None if it has no lease.
 
-        Counts down from `prefix_caching_lease_epochs` at registration to 0, at
-        which point the block is expired by the next `expire_leased_blocks`.
+        Counts down from `prefix_caching_lease_epochs` at registration. At 0 the
+        block is still usable, having reached the oldest staleness the lease
+        tolerates; the next epoch evicts it.
 
         Args:
             block_id: The block ID to query.
 
         Returns:
-            Remaining lease in epochs, or None when leasing is disabled or the
-            block is not registered in the prefix cache.
+            Remaining tolerated staleness in epochs, or None when leasing is
+            disabled or the block is not registered in the prefix cache.
         """
         if not self.lease_enabled:
             return None
@@ -746,11 +751,11 @@ class KVBlockAllocator:
     def expire_leased_blocks(self) -> int:
         """Evict cached blocks whose bounded-staleness lease has run out.
 
-        A block registered in epoch `e` expires once the current epoch reaches
-        `e + prefix_caching_lease_epochs`: the KV (and, through the
-        deregistration callback, Mamba) state it holds was produced by model
-        weights that many updates ago, so it is no longer a valid substitute for
-        recomputing that prefix.
+        A block registered in epoch `e` stays usable while the current epoch is
+        at most `e + prefix_caching_lease_epochs`, and expires past that: the KV
+        (and, through the deregistration callback, Mamba) state it holds was
+        produced by model weights more updates ago than the lease tolerates, so
+        it is no longer a valid substitute for recomputing that prefix.
 
         Expiry propagates down the prefix chain. Hashes are parent-chained and
         `_find_kv_match_count` relies on a cached block always having all of its
@@ -774,13 +779,15 @@ class KVBlockAllocator:
         # Nothing registered, or even the oldest block is still within its lease.
         if (
             self._min_lease_epoch is None
-            or epoch - self._min_lease_epoch < self.prefix_caching_lease_epochs
+            or epoch - self._min_lease_epoch <= self.prefix_caching_lease_epochs
         ):
             return 0
 
+        # An entry survives while its age is within the tolerated lag, so a lease
+        # of N covers ages 0..N and eviction starts at N + 1.
         registered_mask = self.block_lease_epoch >= 0
         expired_mask = registered_mask & (
-            (epoch - self.block_lease_epoch) >= self.prefix_caching_lease_epochs
+            (epoch - self.block_lease_epoch) > self.prefix_caching_lease_epochs
         )
 
         # Children of each registered block, so the sweep can walk from expired

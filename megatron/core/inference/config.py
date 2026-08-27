@@ -398,19 +398,22 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True.
     """
 
-    prefix_caching_lease_epochs: int = 0
-    """Bounded-staleness lease for cached KV blocks and Mamba states, in epochs.
+    prefix_caching_lease_epochs: Optional[int] = None
+    """How many epochs of staleness a cached KV block or Mamba state may carry.
 
     An epoch is one model-weight update in an RL post-training loop. Epochs come
     from the trainer's `SET_GENERATION_EPOCH` control signal, falling back to
-    counting suspend/resume cycles on engines that never receive it. A block
-    cached during epoch `e` is evicted once the epoch reaches
-    `e + prefix_caching_lease_epochs`, because its contents were produced by
-    weights that are now that many updates stale.
+    counting suspend/resume cycles on engines that never receive it. An entry
+    cached during epoch `e` stays usable while the current epoch is at most
+    `e + prefix_caching_lease_epochs`, and is evicted beyond that, because its
+    contents were produced by weights that are by then too many updates stale.
 
-    `0` (default) disables the lease, so cached entries live until they are
-    evicted by the configured eviction policy. `1` drops everything at every
-    weight update, i.e. no cache entry outlives the weights that produced it.
+    So the value is the tolerated lag: `2` keeps an entry across two weight
+    updates and drops it on the third. `0` tolerates no staleness at all, so no
+    cache entry outlives the weights that produced it.
+
+    `None` (default) disables lease-based eviction entirely, leaving cached
+    entries to the configured eviction policy.
 
     Only applies when enable_prefix_caching is True. Not supported alongside
     disaggregated KV handoff.

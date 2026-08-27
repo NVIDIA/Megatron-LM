@@ -42,11 +42,13 @@ from megatron.core import parallel_state
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
+    KVCacheManagementMode,
     MambaInferenceStateConfig,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -197,7 +199,8 @@ class TestMambaPrefixCachingE2E:
         max_tokens=None,
         max_requests=None,
         async_sched_mode=AsyncScheduleMode.LEGACY,
-        prefix_caching_lease_epochs=0,
+        prefix_caching_lease_epochs=None,
+        kv_cache_management_mode=None,
     ):
         set_rounder(request_rounder)
         inference_config_kwargs = dict(
@@ -217,6 +220,8 @@ class TestMambaPrefixCachingE2E:
             inference_config_kwargs["max_tokens"] = max_tokens
         if max_requests is not None:
             inference_config_kwargs["max_requests"] = max_requests
+        if kv_cache_management_mode is not None:
+            inference_config_kwargs["kv_cache_management_mode"] = kv_cache_management_mode
         if enable_prefix_caching:
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
@@ -821,9 +826,15 @@ class TestMambaPrefixCachingE2E:
         assert alloc.get_block_remaining_lease(alloc.kv_hash_to_block_id[seed_hash]) == 1
         self._assert_cache_consistent(engine)
 
-        # New weights land: the one-epoch lease is up, so everything cached under
+        # One weight update: within the one-epoch tolerance, so the entry stays.
+        assert ctx.set_prefix_cache_epoch(1) == 0
+        assert seed_hash in alloc.kv_hash_to_block_id
+        assert alloc.get_block_remaining_lease(alloc.kv_hash_to_block_id[seed_hash]) == 0
+        self._assert_cache_consistent(engine)
+
+        # A second update puts it past the lease, so everything cached under
         # epoch 0 goes, KV and Mamba alike, and the memory comes back.
-        num_expired = ctx.set_prefix_cache_epoch(1)
+        num_expired = ctx.set_prefix_cache_epoch(2)
         assert num_expired > 0
         assert alloc.kv_hash_to_block_id == {}
         assert ctx.mamba_slot_allocator.hash_to_block_id == {}
@@ -839,7 +850,7 @@ class TestMambaPrefixCachingE2E:
         assert finished[0] == finished[1]
         # It re-registers under the current epoch, starting a fresh lease.
         repeat_hash = req_repeat.precomputed_block_hashes[0]
-        assert alloc.block_lease_epoch[alloc.kv_hash_to_block_id[repeat_hash]].item() == 1
+        assert alloc.block_lease_epoch[alloc.kv_hash_to_block_id[repeat_hash]].item() == 2
 
     @torch.inference_mode()
     def test_prefix_cache_lease_survives_until_it_expires_e2e(self):
@@ -863,8 +874,8 @@ class TestMambaPrefixCachingE2E:
         seed_hash = req_seed.precomputed_block_hashes[0]
         seed_block = alloc.kv_hash_to_block_id[seed_hash]
 
-        # Two weight updates inside a three-epoch lease change nothing.
-        for epoch in (1, 2):
+        # Three weight updates are exactly what a three-epoch lease tolerates.
+        for epoch in (1, 2, 3):
             assert ctx.set_prefix_cache_epoch(epoch) == 0
             assert seed_hash in alloc.kv_hash_to_block_id
             assert seed_hash in ctx.mamba_slot_allocator.hash_to_block_id
@@ -880,8 +891,8 @@ class TestMambaPrefixCachingE2E:
         self._drain(engine, finished)
         assert req_hit._mamba_num_matched_blocks > 0, "a live lease failed to match"
 
-        # Third epoch: the seed's lease is up.
-        assert ctx.set_prefix_cache_epoch(3) > 0
+        # One past the tolerated staleness: the seed's lease is up.
+        assert ctx.set_prefix_cache_epoch(4) > 0
         assert seed_hash not in alloc.kv_hash_to_block_id
         self._assert_cache_consistent(engine)
 
@@ -937,7 +948,7 @@ class TestMambaPrefixCachingE2E:
 
         # Blocks pinned by in-flight requests at expiry time were unregistered in
         # place; once their owners finished they must all be back in the pool.
-        ctx.set_prefix_cache_epoch(epoch + 1)
+        ctx.set_prefix_cache_epoch(epoch + 2)
         assert alloc.kv_hash_to_block_id == {}
         assert ctx.mamba_slot_allocator.hash_to_block_id == {}
         assert alloc.pool_avail == pool_avail_empty, "blocks leaked across lease expiry"
@@ -1006,14 +1017,14 @@ class TestMambaPrefixCachingE2E:
             self._assert_cache_consistent(engine)
             oldest_allowed = ctx.prefix_cache_epoch - lease_epochs
             for block_id in alloc.kv_hash_to_block_id.values():
-                assert alloc.block_lease_epoch[block_id].item() > oldest_allowed, (
+                assert alloc.block_lease_epoch[block_id].item() >= oldest_allowed, (
                     f"round {round_idx}: block {block_id} outlived its {lease_epochs}-epoch "
                     f"lease (stamped {alloc.block_lease_epoch[block_id].item()}, "
                     f"epoch {ctx.prefix_cache_epoch})"
                 )
 
         # Draining the cache past the lease must return every block.
-        ctx.set_prefix_cache_epoch(ctx.prefix_cache_epoch + lease_epochs)
+        ctx.set_prefix_cache_epoch(ctx.prefix_cache_epoch + lease_epochs + 1)
         assert alloc.kv_hash_to_block_id == {}
         assert ctx.mamba_slot_allocator.hash_to_block_id == {}
         assert alloc.pool_avail == pool_avail_empty, "blocks leaked over the stress run"
@@ -1050,7 +1061,9 @@ class TestMambaPrefixCachingE2E:
             enable_chunked_prefill=True,
             max_tokens=300,
             max_requests=4,
-            prefix_caching_lease_epochs=1,
+            # No tolerated staleness, so the epoch below expires the opening
+            # chunk's blocks while the request still holds them.
+            prefix_caching_lease_epochs=0,
         )
         ctx = engine.context
         finished = {}
@@ -1083,3 +1096,131 @@ class TestMambaPrefixCachingE2E:
             assert (
                 len(finished[req_id]) == num_tokens
             ), f"req {req_id} produced {len(finished[req_id])} tokens"
+
+    # ------------------------------------------------------------------
+    # PERSIST mode: the case the lease exists for
+    # ------------------------------------------------------------------
+
+    def _seed_and_cycle(self, engine, prompt):
+        """Run one request to completion, then suspend and resume the engine.
+
+        Returns (generated tokens, seed block hash, KV buffer address before the
+        cycle). PERSIST keeps the KV and Mamba tensors on the GPU across the
+        cycle, so anything still registered afterwards would be served from state
+        the pre-suspend weights produced.
+        """
+        ctx = engine.context
+        finished = {}
+        req = self._make_request(0, prompt, True, num_tokens=2)
+        engine._add_request(req)
+        self._drain(engine, finished)
+
+        seed_hash = req.precomputed_block_hashes[0]
+        assert seed_hash in ctx.kv_block_allocator.kv_hash_to_block_id
+        assert seed_hash in ctx.mamba_slot_allocator.hash_to_block_id
+
+        addr_before = ctx.memory_buffer.data_ptr()
+        assert engine.state != EngineState.SUSPENDED
+        engine.suspend()
+        assert engine.state == EngineState.SUSPENDED
+        engine.resume()
+        assert engine.state != EngineState.SUSPENDED
+
+        # PERSIST neither frees nor moves the KV buffer, which is exactly why a
+        # surviving cache entry would be stale rather than merely unbacked.
+        assert ctx.memory_buffer.data_ptr() == addr_before
+        assert ctx.is_tensor_state_allocated
+        return finished[0], seed_hash, addr_before
+
+    @pytest.mark.parametrize(
+        "lease_epochs,survives", [(None, True), (0, False)], ids=["no_lease", "lease_0"]
+    )
+    @torch.inference_mode()
+    def test_prefix_cache_lease_across_persist_suspend_resume_e2e(self, lease_epochs, survives):
+        """A suspend/resume cycle is a weight update in an RL loop, and PERSIST
+        carries the whole cache across it.
+
+        Without a lease the cached KV and Mamba state survives and would be
+        served against the new weights; with a zero-epoch lease (no tolerated
+        staleness) the resume drops it. The lease is the only variable between
+        the two parameterisations.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        prompts = self._create_eviction_prompts()
+
+        engine = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            prefix_caching_lease_epochs=lease_epochs,
+            kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        )
+        ctx = engine.context
+        alloc = ctx.kv_block_allocator
+
+        seed_tokens, seed_hash, _ = self._seed_and_cycle(engine, prompts[0])
+
+        # The engine has no coordinator, so it never receives SET_GENERATION_EPOCH
+        # and the resume itself counts the epoch.
+        assert ctx.prefix_cache_epoch == 1
+
+        if survives:
+            assert seed_hash in alloc.kv_hash_to_block_id
+            assert seed_hash in ctx.mamba_slot_allocator.hash_to_block_id
+            return
+
+        assert alloc.kv_hash_to_block_id == {}
+        assert ctx.mamba_slot_allocator.hash_to_block_id == {}
+        self._assert_cache_consistent(engine)
+
+        # With the cache dropped, the identical prompt recomputes from scratch.
+        # Both runs start from an empty cache, so their tokens must agree exactly.
+        finished = {}
+        req_repeat = self._make_request(1, prompts[2], True, num_tokens=2)
+        engine._add_request(req_repeat)
+        self._drain(engine, finished)
+        assert req_repeat._mamba_num_matched_blocks == 0, "restored state from an expired lease"
+        assert finished[1] == seed_tokens
+        # Re-registered under the post-resume epoch, on a fresh lease.
+        repeat_hash = req_repeat.precomputed_block_hashes[0]
+        assert alloc.block_lease_epoch[alloc.kv_hash_to_block_id[repeat_hash]].item() == 1
+
+    @torch.inference_mode()
+    def test_prefix_cache_lease_spans_multiple_persist_cycles_e2e(self):
+        """A one-epoch lease survives one suspend/resume cycle and is dropped by
+        the second, so the bound holds in units of real weight updates rather
+        than only in the directly driven epoch tests."""
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        prompts = self._create_eviction_prompts()
+
+        engine = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            prefix_caching_lease_epochs=1,
+            kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        )
+        ctx = engine.context
+        alloc = ctx.kv_block_allocator
+
+        _, seed_hash, _ = self._seed_and_cycle(engine, prompts[0])
+
+        # One cycle in: exactly the staleness a one-epoch lease tolerates, so the
+        # entry is still matchable and is now in its final epoch.
+        assert ctx.prefix_cache_epoch == 1
+        assert seed_hash in alloc.kv_hash_to_block_id
+        assert seed_hash in ctx.mamba_slot_allocator.hash_to_block_id
+        assert alloc.get_block_remaining_lease(alloc.kv_hash_to_block_id[seed_hash]) == 0
+        self._assert_cache_consistent(engine)
+
+        # Second cycle: the lease is up.
+        engine.suspend()
+        engine.resume()
+        assert ctx.prefix_cache_epoch == 2
+        assert alloc.kv_hash_to_block_id == {}
+        assert ctx.mamba_slot_allocator.hash_to_block_id == {}
+        self._assert_cache_consistent(engine)

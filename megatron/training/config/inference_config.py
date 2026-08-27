@@ -24,7 +24,7 @@ from this declarative config plus the runtime artifacts. This mirrors the
 ``GPTModelConfig -> TransformerConfig`` relationship.
 """
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 if TYPE_CHECKING:
     from megatron.core.inference.config import InferenceConfig
@@ -184,12 +184,12 @@ class InferenceSetupConfig:
     the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
     space is needed."""
 
-    inference_dynamic_batching_prefix_caching_lease_epochs: int = 0
-    """Bounded-staleness lease for cached KV blocks and Mamba states, in generation epochs (one
-    engine suspend/resume cycle, i.e. one model-weight update in an RL post-training loop). A block
-    cached during epoch `e` is evicted once the epoch reaches `e + lease`, because the weights that
-    produced it are that many updates stale. 0 (default) disables lease-based eviction, leaving
-    entries to the configured eviction policy."""
+    inference_dynamic_batching_prefix_caching_lease_epochs: Optional[int] = None
+    """Epochs of staleness tolerated by cached KV blocks and Mamba states, where an epoch is one
+    model-weight update in an RL post-training loop. An entry cached during epoch `e` stays usable
+    while the epoch is at most `e + lease` and is evicted beyond that. So `2` keeps an entry across
+    two weight updates and drops it on the third, and `0` tolerates no staleness at all. None
+    (default) disables lease-based eviction, leaving entries to the configured eviction policy."""
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
         "longest_prefix", "first_prefix_block", "load_balanced"
