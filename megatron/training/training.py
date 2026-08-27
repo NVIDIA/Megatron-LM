@@ -1328,6 +1328,20 @@ def num_floating_point_operations(
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
+            gate_projection_size = 0
+            if args.attention_output_gate:
+                gate_granularity = getattr(
+                    args, "gated_attention_proj_granularity", "elementwise"
+                )
+                if gate_granularity == "elementwise":
+                    gate_projection_size = args.num_attention_heads * args.v_head_dim
+                elif gate_granularity == "headwise":
+                    gate_projection_size = args.num_attention_heads
+                else:
+                    raise ValueError(
+                        "gated_attention_proj_granularity must be either 'elementwise' or "
+                        f"'headwise', got {gate_granularity!r}."
+                    )
             # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
@@ -1342,40 +1356,11 @@ def num_floating_point_operations(
                         + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
                         + 1
                     )
-                gate_projection_size = 0
-                if args.attention_output_gate:
-                    gate_granularity = getattr(
-                        args, "gated_attention_proj_granularity", "elementwise"
-                    )
-                    if gate_granularity == "elementwise":
-                        gate_projection_size = args.num_attention_heads * args.v_head_dim
-                    elif gate_granularity == "headwise":
-                        gate_projection_size = args.num_attention_heads
-                    else:
-                        raise ValueError(
-                            "gated_attention_proj_granularity must be either 'elementwise' or "
-                            f"'headwise', got {gate_granularity!r}."
-                        )
-                # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
-                standard_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## q lora + rope + q norm
-                        q_term
-                        ## kv lora + rope + kv norm
-                        + args.kv_lora_rank
-                        * (
-                            args.hidden_size
-                            + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
-                            + 1
-                        )
-                        + args.hidden_size * args.qk_pos_emb_head_dim
-                        ## o proj
-                        + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-                        ## output gate proj
-                        + gate_projection_size * args.hidden_size
-                    )
+                    + args.hidden_size * args.qk_pos_emb_head_dim
+                    ## o proj
+                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                    ## output gate proj
+                    + gate_projection_size * args.hidden_size
                 )
             )
             # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
@@ -1628,7 +1613,6 @@ def num_floating_point_operations(
                 f"got {num_attn_layers} attention layers but only "
                 f"{dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128} are W/C/H."
             )
-        )
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:

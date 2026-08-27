@@ -21,6 +21,10 @@ from megatron.core.ssm.gated_delta_net import (
     KimiDeltaAttention,
     KimiDeltaAttentionSubmodules,
 )
+from megatron.core.ssm.gated_delta_product import (
+    GatedDeltaProductMixer,
+    GatedDeltaProductMixerSubmodules,
+)
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer

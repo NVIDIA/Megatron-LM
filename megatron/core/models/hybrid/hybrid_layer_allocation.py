@@ -28,6 +28,7 @@ class Symbols:
     PIPE = '|'
     MTP_SEPARATOR = "/"
     VALID_LAYERS = {MAMBA, GDN, KDA, ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW, MLP, MOE}
+    ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW}
     # MLA-based attention layers (incompatible with standard '*' attention in one model).
     MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
 

@@ -323,6 +323,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_all_layer_types(self):
@@ -335,6 +339,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 1,
             'E': 1,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("MGD-E") == {
             '*': 0,
@@ -344,6 +352,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 1,
             'E': 1,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("MG+-E") == {
             '*': 0,
@@ -353,6 +365,10 @@ class TestGetHybridLayerCounts:
             '+': 1,
             '-': 1,
             'E': 1,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_with_pipes(self):
@@ -365,6 +381,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
             '*': 1,
@@ -374,6 +394,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 4,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_with_mtp(self):
@@ -386,6 +410,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_with_pipes_and_mtp(self):
@@ -399,6 +427,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 4,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_moe_pattern(self):
@@ -410,6 +442,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 2,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_mtp_with_attention(self):
@@ -422,6 +458,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_gdn_pattern(self):
@@ -433,6 +473,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_gdn_hybrid_pattern(self):
@@ -445,6 +489,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_dsa_pattern(self):
@@ -456,6 +504,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_mla_pattern(self):
@@ -467,6 +519,10 @@ class TestGetHybridLayerCounts:
             '+': 2,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
     def test_empty_pattern(self):
@@ -478,6 +534,10 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'C': 0,
+            'H': 0,
+            'K': 0,
+            'W': 0,
         }
 
 
@@ -761,7 +821,7 @@ class TestGetLayerMapsFromLayerTypeList:
         """Standard symbols each produce a single-entry map at local index 0."""
         maps = get_layer_maps_from_layer_type_list(["*", "M", "-", "E"])
         # We always get all symbols returned, not only those contained in the pattern.
-        assert len(maps) == 7
+        assert len(maps) == len(Symbols.VALID_LAYERS)
         attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
             Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
         )(maps)
