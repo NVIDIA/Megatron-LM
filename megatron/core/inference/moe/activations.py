@@ -318,4 +318,6 @@ def squared_relu_and_quantize_mxfp8(
         NUM_BLOCKS=NUM_BLOCKS,
     )
 
-    return MXFP8Tensor(data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), backend="triton")
+    return MXFP8Tensor(
+        data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), dtype=x.dtype, backend="triton"
+    )
