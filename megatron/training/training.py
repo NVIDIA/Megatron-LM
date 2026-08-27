@@ -410,10 +410,10 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
     mean_seqlen = seqlen_squared_sum / total_real_tokens
     # Average attended KV entries per query: ``min(i, topk)`` averaged over the
     # sequence, approximated as ``eff * (1 - eff / (2 * L))`` with
-    # ``eff = min(topk, floor(L))``. The exact discrete average has ``eff + 1``
+    # ``eff = min(topk, floor(L))``. The exact discrete average has ``eff - 1``
     # in the correction term; the O(1/L) difference is below the precision of
     # this estimate.
-    eff = min(dsa_indexer_topk, mean_seqlen // 1)
+    eff = min(dsa_indexer_topk, math.floor(mean_seqlen))
     attended = eff * (1 - eff / (2 * mean_seqlen))
     # Dense causal attention averages ~``mean_seqlen / 2`` keys per query.
     return attended / (mean_seqlen / 2)
@@ -1369,11 +1369,20 @@ def num_floating_point_operations(
         # implemented on the standard-model path in ``transformer_flops``. A
         # 'D' pattern here would silently fall through to the dense full-MLA
         # estimate below -- overcounting core attention at long context and
-        # dropping the indexer entirely -- so fail loud instead.
-        assert args.experimental_attention_variant != "dsa", (
-            "num_floating_point_operations does not support "
-            "experimental_attention_variant='dsa' on the hybrid-model path "
-            "(--hybrid-layer-pattern); express the model without a layer pattern."
+        # dropping the indexer entirely -- so fail loud instead. Key off the
+        # layer pattern itself, not just ``args.experimental_attention_variant``:
+        # on the hybrid path a 'D' pattern sets the variant only in the config
+        # kwargs (``arguments.py``/``argument_utils.py`` write it into
+        # ``kw_args``, never back onto ``args``), so the attribute alone misses
+        # exactly the runs this guard exists for.
+        assert (
+            args.experimental_attention_variant != "dsa"
+            and layer_counts[Symbols.DS_ATTENTION] == 0
+        ), (
+            "num_floating_point_operations does not support DSA "
+            "('D' layers / experimental_attention_variant='dsa') on the "
+            "hybrid-model path (--hybrid-layer-pattern); express the model "
+            "without a layer pattern."
         )
 
         mtp_num_layers = args.mtp_num_layers

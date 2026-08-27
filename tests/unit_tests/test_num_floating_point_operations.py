@@ -1283,3 +1283,20 @@ class TestDSAHelperEdgeCases:
 
         with pytest.raises(AssertionError, match="hybrid-model path"):
             num_floating_point_operations(args, 2)
+
+    def test_hybrid_dsa_rejected_without_variant_attribute(self):
+        """The guard must key off the 'D' symbols in the layer pattern, not
+        just ``args.experimental_attention_variant``: on the hybrid path a
+        'D' pattern sets the variant only in the config kwargs (never back
+        onto ``args``), so a real ``--hybrid-layer-pattern "D..."`` launch
+        reaches this code with the attribute still ``None``."""
+        args = _make_dsa_args()
+        args.experimental_attention_variant = None
+        args.hybrid_layer_pattern = "D-D-"
+        args.mamba_state_dim = 128
+        args.mamba_head_dim = 64
+        args.mamba_num_groups = 8
+        args.mamba_num_heads = 128
+
+        with pytest.raises(AssertionError, match="hybrid-model path"):
+            num_floating_point_operations(args, 2)
