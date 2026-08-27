@@ -59,6 +59,7 @@ def _make_bounded_mxfp8_config(**overrides):
         moe_router_dtype="fp32",
         transformer_impl="inference_optimized",
         normalization="RMSNorm",
+        add_bias_linear=False,
         expert_model_parallel_size=2,
         expert_tensor_parallel_size=1,
         inference_grouped_gemm_backend="flashinfer",
