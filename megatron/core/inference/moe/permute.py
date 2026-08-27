@@ -295,6 +295,30 @@ def _permute_tokens_kernel(
                     tl.store(inverse_map_ptr + tok * num_local_experts + lid, pos)
 
 
+@triton.jit
+def _zero_permutation_padding_kernel(
+    hidden_ptr,
+    permutation_map_ptr,
+    n_used_ptr,
+    hidden_dim,
+    max_rows,
+    BLOCK_H: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """Zero aligned padding rows without touching the unused buffer suffix."""
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(permutation_map_ptr + row) < 0:
+                for h in tl.range(0, hidden_dim, BLOCK_H):
+                    offsets = h + tl.arange(0, BLOCK_H)
+                    mask = offsets < hidden_dim
+                    tl.store(hidden_ptr + row * hidden_dim + offsets, 0.0, mask=mask)
+
+
 def permute_tokens(
     hidden_states: torch.Tensor,
     probs: torch.Tensor,
@@ -305,6 +329,7 @@ def permute_tokens(
     alignment: int = 1,
     return_batch_invariant_inverse_map: bool = False,
     row_alignment: int = 1,
+    zero_padding: bool = False,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -324,6 +349,9 @@ def permute_tokens(
         return_batch_invariant_inverse_map: if True, also return the map used by
             batch-invariant unpermute.
         row_alignment: alignment for the fixed output-buffer row count (default 1).
+        zero_padding: explicitly zero alignment-padding rows inside the used prefix.
+            Rows beyond the used prefix remain undefined. This is required by grouped
+            GEMM backends that consume padding values rather than masking them.
 
     Returns:
         By default, returns the original 4-tuple:
@@ -401,6 +429,17 @@ def permute_tokens(
         NUM_BLOCKS=NUM_BLOCKS,
         HAS_INVERSE=batch_invariant_inverse_map is not None,
     )
+    if zero_padding:
+        zero_blocks = min(output_size, 512)
+        _zero_permutation_padding_kernel[(zero_blocks,)](
+            permuted_hidden,
+            permutation_map,
+            inclusive_expert_offsets[-1:],
+            hidden_dim,
+            output_size,
+            BLOCK_H=BLOCK_H,
+            NUM_BLOCKS=zero_blocks,
+        )
     if return_batch_invariant_inverse_map:
         return (
             permuted_hidden,

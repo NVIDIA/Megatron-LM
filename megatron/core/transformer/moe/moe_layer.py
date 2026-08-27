@@ -10,7 +10,7 @@ import torch
 
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe import HAVE_TE_GROUPED_MXFP8, InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -395,6 +395,11 @@ class MoELayer(BaseMoELayer):
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
+                )
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE:
+                assert HAVE_TE_GROUPED_MXFP8, (
+                    "inference_grouped_gemm_backend='te' requires Transformer Engine with "
+                    "device-metadata MXFP8 group_quantize and grouped-GEMM APIs."
                 )
             elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
