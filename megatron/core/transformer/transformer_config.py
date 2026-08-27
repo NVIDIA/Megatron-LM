@@ -360,6 +360,25 @@ class TransformerConfig(ModelParallelConfig):
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
+    # Compressed sparse attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    # TODO(#6402): consumed by DSv4 Hybrid attention orchestration, which selects the
+    # per-layer compression ratio and builds the compressed-KV rotary embedding.
+    # Neither field has a production reader in this primitive-only PR.
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
+
+    ####################
     # linear attention
     ####################
     linear_attention_freq: Optional[Union[int, List[int]]] = None
@@ -957,6 +976,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    moe_use_norm_before_up_proj: bool = False
+    """Apply normalization before the latent-to-hidden MoE projection. Requires
+    ``moe_latent_size`` to be set."""
+
     gtp_remat_opt_in_modules: list[str] = field(default_factory=list)
     """Extra modules to apply GTP_remat weight sharding to, beyond the default set (attention,
     Mamba, MLP, expert linears, embeddings). Allowed values:
@@ -1162,6 +1185,23 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    use_fused_mhc: bool = False
+    """Use fused kernels for mHC operations when supported.
+
+    With the default ``auto`` backend policy, selection is operation-specific
+    and unavailable accelerated implementations fall back to native torch.
+    Set ``mhc_fused_backend`` to request an explicit backend policy.
+    """
+
+    mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
+    """Backend policy for fused mHC operations.
+
+    ``auto`` selects the fastest available implementation for each operation.
+    Explicit policies require the requested dependency and device support, and
+    never select a different accelerated backend. Operations without an
+    implementation in the selected backend retain their native implementation.
+    """
+
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
 
@@ -1206,6 +1246,16 @@ class TransformerConfig(ModelParallelConfig):
     dependencies, and the configuration verified bitwise-identical to the TE
     training forward), "deepgemm" (DeepGEMM bf16 kernels), or "triton"
     (persistent Triton matmul; any dtype)."""
+
+    batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
+    """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
+    (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
+    deterministic by construction on any hardware. "multimem" keeps the native
+    NVLS in-switch reduce-scatter: measured to return the correctly-rounded
+    exact fp32 sum (bitwise-equal to an fp64 reference over 16.7M adversarial
+    channels on B200), deterministic and batch-invariant, with better scaling
+    at large NVLink domains; software paths that must match it bitwise should
+    accumulate in fp64."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -1859,6 +1909,9 @@ class TransformerConfig(ModelParallelConfig):
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
                 )
 
+        if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
+            raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
+
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
         # moe_flex_dispatcher_num_sms takes precedence) and warn.
@@ -2129,12 +2182,17 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute to reduce activation memory."
             )
 
-        # Validation for hyper_connections with MTP
-        if self.enable_mhc_connections and self.mtp_num_layers is not None:
+        if self.use_fused_mhc and not self.enable_mhc_connections:
+            raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
+
+        valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
+        if self.mhc_fused_backend not in valid_mhc_fused_backends:
             raise ValueError(
-                "enable_mhc_connections is not compatible with Multi-Token Prediction (MTP). "
-                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+                f"Unknown mhc_fused_backend {self.mhc_fused_backend!r}; expected one of "
+                f"{valid_mhc_fused_backends}."
             )
+        if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
+            raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
 
         if self.enable_mhc_connections and self.recompute_granularity == "full":
             raise NotImplementedError(
@@ -2158,7 +2216,7 @@ class TransformerConfig(ModelParallelConfig):
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
             # the stage holding the final layernorm, so every intermediate pipeline stage
             # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.
-            # Pipeline support lands in the follow-up mHC split, which lifts this guard.
+            # Pipeline support must resize the p2p buffers before this guard can be lifted.
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
                     "enable_mhc_connections does not support pipeline_model_parallel_size > 1 "
@@ -3044,7 +3102,9 @@ class TransformerConfig(ModelParallelConfig):
                         "full-iteration CUDA graphs"
                     )
 
-        if self.moe_token_dispatcher_type in ["allgather"]:
+        # Only meaningful for MoE models; dense models never dispatch tokens,
+        # so the (unused) dispatcher default must not fail validation.
+        if self.num_moe_experts is not None and self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
@@ -3341,6 +3401,35 @@ class TransformerConfig(ModelParallelConfig):
                 ), (
                     "Batch-invariant MoE supports dynamic dropless routing only. "
                     "Disable MoE capacity/expert padding."
+                )
+
+        # Scheduler-value, max-seqlen, and variable_seq_lengths handling live in
+        # ModelParallelConfig.__post_init__ next to the field definitions; only the
+        # transformer-stack requirements are validated here.
+        if self.sequence_packing_scheduler is not None:
+            # Check TE version.
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            # TODO: remove this after we fix the convergence issue with TE < 2.9.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
+
+            # TODO(tailaim): add support for other dispatcher types
+            # Only relevant for MoE models; dense models never dispatch tokens,
+            # so the (unused) dispatcher default must not fail validation. For
+            # allgather specifically, the general variable_seq_lengths check
+            # above raises first (packing derives variable_seq_lengths=True).
+            if self.num_moe_experts is not None:
+                assert self.moe_token_dispatcher_type == "alltoall", (
+                    f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
+                    f"got '{self.moe_token_dispatcher_type}'"
                 )
 
 
