@@ -874,9 +874,10 @@ class CheckpointWithoutOutput(object):
                  it changes FP8 numerics and needs its own PR with FP8
                  functional-test evidence.
             ckpt_manager: Optional CheckpointWithoutOutputManager instance. When provided,
-                         checkpoint() will auto-register to the manager, and
-                         discard_output_and_register_recompute() will only discard
-                         output without registering individual hooks.
+                         checkpoint() automatically registers this checkpoint with the
+                         manager, and discard_output_and_register_recompute() becomes a
+                         no-op. The caller must use the manager to discard all registered
+                         outputs and install one ordered replay hook.
             retain_input_tensors: Whether outputs sharing storage with checkpoint inputs
                                   should be retained when discarding outputs.
         """
