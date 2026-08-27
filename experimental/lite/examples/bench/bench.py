@@ -53,6 +53,9 @@ class BenchCliConfig:
     same_data_across_dp: bool = False
     no_optimizer: bool = False
     forward_only: bool = False
+    empty_cache_between_steps: bool = False
+    enforce_steady_memory: bool = False
+    max_steady_peak_growth: float = 0.02
     skip_load_hf_weights: bool = False
     skip_optimizer_build: bool = False
     keep_experts: int | None = None
@@ -318,6 +321,8 @@ def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
         same_data_across_dp=cfg.same_data_across_dp,
         no_optimizer=cfg.no_optimizer,
         forward_only=cfg.forward_only,
+        empty_cache_between_steps=cfg.empty_cache_between_steps,
+        max_steady_peak_growth=cfg.max_steady_peak_growth,
     )
 
 
@@ -387,7 +392,9 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
         step_reporter=_step_reporter,
     )
     artifact = result.to_dict()
-    rt.close(handle)
+    close = getattr(rt, "close", None)
+    if close is not None:
+        close(handle)
     return artifact
 
 
@@ -417,6 +424,17 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run the public runtime's eval/no-grad forward-only schedule.",
     )
+    parser.add_argument(
+        "--empty-cache-between-steps",
+        action="store_true",
+        help="Diagnostic allocator A/B only; never enable for production timing.",
+    )
+    parser.add_argument(
+        "--enforce-steady-memory",
+        action="store_true",
+        help="Exit nonzero unless all-rank measured peak growth stays below the limit.",
+    )
+    parser.add_argument("--max-steady-peak-growth", type=float, default=0.02)
     parser.add_argument("--skip-load-hf-weights", action="store_true")
     parser.add_argument("--skip-optimizer-build", action="store_true")
     parser.add_argument("--keep-experts", type=int, default=None)
@@ -449,6 +467,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             output_path = Path(cfg.output_json)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(text + "\n", encoding="utf-8")
+    memory_gate = artifact.get("result", {}).get("metadata", {}).get("memory_gate", {})
+    if cfg.enforce_steady_memory and not memory_gate.get("passed", False):
+        raise SystemExit(
+            "all-rank steady memory gate failed: "
+            f"growth={memory_gate.get('max_steady_peak_growth')} "
+            f"limit={memory_gate.get('limit')}"
+        )
     return artifact
 
 

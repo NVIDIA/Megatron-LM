@@ -621,6 +621,11 @@ class MegatronLiteRuntime(RuntimeBase):
         for chunk in handle._extras.get("model_chunks", [handle._model]):
             if hasattr(chunk, "zero_grad_buffer"):
                 chunk.zero_grad_buffer()
+            elif handle._optimizer is None:
+                # Forward/backward benchmarks may intentionally omit an
+                # optimizer.  Ordinary Parameters still own .grad in that
+                # mode and must not accumulate across measured iterations.
+                chunk.zero_grad(set_to_none=True)
         if handle._optimizer is not None:
             handle._optimizer.zero_grad()
 

@@ -6,6 +6,8 @@ import torch
 from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
+    _inverse_rope,
+    _o_projection,
     o_projection_visible,
 )
 
@@ -101,3 +103,84 @@ def test_official_vllm_o_projection_is_bitwise_through_candidate_callable() -> N
         o_lora_rank=128,
     )
     torch.testing.assert_close(candidate_value, reference, rtol=0, atol=0)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_o_projection_explicit_grouped_gemm_vjp_matches_functional_gradients() -> None:
+    torch.manual_seed(31)
+    device = "cuda"
+    tokens = 7
+    n_groups = 2
+    heads_per_group = 2
+    nope_dim = 64
+    rope_dim = 64
+    head_dim = nope_dim + rope_dim
+    o_lora_rank = 128
+    hidden_size = 256
+
+    positions = torch.arange(tokens, dtype=torch.int64, device=device)
+    cos_sin = torch.randn(32, rope_dim, dtype=torch.float32, device=device)
+    o = torch.randn(
+        tokens,
+        n_groups * heads_per_group,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+        requires_grad=True,
+    )
+    wo_a = nn.Parameter(
+        torch.randn(
+            n_groups * o_lora_rank,
+            heads_per_group * head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    )
+    wo_b = nn.Parameter(
+        torch.randn(
+            hidden_size,
+            n_groups * o_lora_rank,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+    )
+
+    def functional(o_, wa_, wb_):
+        inverse = _inverse_rope(o_, positions, cos_sin, nope_dim, rope_dim)
+        grouped = inverse.reshape(tokens, n_groups, -1)
+        wa = wa_.reshape(n_groups, o_lora_rank, -1)
+        z = torch.einsum("tgd,grd->tgr", grouped, wa)
+        return z.flatten(1) @ wb_.T
+
+    reference_o = o.detach().clone().requires_grad_(True)
+    reference_a = wo_a.detach().clone().requires_grad_(True)
+    reference_b = wo_b.detach().clone().requires_grad_(True)
+    reference = functional(reference_o, reference_a, reference_b)
+
+    candidate = _o_projection(
+        functional,
+        o,
+        wo_a,
+        wo_b,
+        positions=positions,
+        cos_sin_cache=cos_sin,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        o_lora_rank=o_lora_rank,
+    )
+    torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
+
+    grad_output = torch.randn_like(candidate)
+    reference.backward(grad_output)
+    candidate.backward(grad_output)
+    for actual, expected in (
+        (o.grad, reference_o.grad),
+        (wo_a.grad, reference_a.grad),
+        (wo_b.grad, reference_b.grad),
+    ):
+        assert actual is not None
+        assert expected is not None
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)

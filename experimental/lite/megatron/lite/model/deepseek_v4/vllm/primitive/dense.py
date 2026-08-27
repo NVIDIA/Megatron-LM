@@ -266,6 +266,35 @@ def _post_graph(x, residual, post, comb):
     return HyperConnection.post(x, residual, post.squeeze(-1), comb)
 
 
+class _MHCPostVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible_op: Callable, x, residual, post, comb):
+        output = visible_op(x, residual, post, comb)
+        ctx.save_for_backward(x, residual, post, comb)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, residual, post, comb = ctx.saved_tensors
+        dtype = x.dtype
+        grad = grad_output.to(dtype)
+        post_value = post.squeeze(-1).to(dtype)
+        comb_value = comb.to(dtype)
+        residual_value = residual.to(dtype)
+
+        grad_x = (grad * post_value.unsqueeze(-1)).sum(dim=-2).to(x.dtype)
+        grad_post = (grad * x.to(dtype).unsqueeze(-2)).sum(dim=-1)
+        if post.ndim == grad_post.ndim + 1:
+            grad_post = grad_post.unsqueeze(-1)
+        grad_residual = torch.matmul(
+            comb_value.transpose(-2, -1), grad
+        ).to(residual.dtype)
+        grad_comb = torch.matmul(
+            grad, residual_value.transpose(-2, -1)
+        ).to(comb.dtype)
+        return None, grad_x, grad_residual, grad_post.to(post.dtype), grad_comb
+
+
 def mhc_pre_broadcast(
     visible_op: Callable,
     x: torch.Tensor,
@@ -295,7 +324,9 @@ def mhc_pre_broadcast(
 
 
 def mhc_post(visible_op: Callable, x, residual, post, comb):
-    return visible_functional_vjp(visible_op, _post_graph, (x, residual, post, comb))
+    if not torch.is_grad_enabled():
+        return visible_op(x, residual, post, comb)
+    return _MHCPostVJP.apply(visible_op, x, residual, post, comb)
 
 
 def mhc_head(visible_op: Callable, x, fn, scale, base, *, eps: float):

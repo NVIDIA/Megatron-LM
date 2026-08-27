@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from contextlib import contextmanager
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -51,7 +52,10 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     visible_linear,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
+    check_parameter_versions,
     fused_qkv_rms_norm,
+    native_linear_vjp,
+    parameter_versions,
     visible_functional_vjp,
 )
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
@@ -172,6 +176,189 @@ def _inverse_rope(o, positions, cache, nope_dim, rope_dim):
     return torch.cat((prefix.float(), rotated.flatten(-2)), dim=-1).to(o.dtype)
 
 
+def _inverse_rope_vjp(
+    grad_inverse: torch.Tensor,
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    grad_prefix = grad_inverse[..., :nope_dim]
+    grad_rope = grad_inverse[..., nope_dim : nope_dim + rope_dim]
+    selected = cache.index_select(0, positions.long()).float()
+    cos = selected[..., : rope_dim // 2].unsqueeze(-2)
+    sin = selected[..., rope_dim // 2 : rope_dim].unsqueeze(-2)
+    grad_even = grad_rope[..., 0::2].float()
+    grad_odd = grad_rope[..., 1::2].float()
+    original_even = grad_even * cos - grad_odd * sin
+    original_odd = grad_even * sin + grad_odd * cos
+    original_rope = torch.stack((original_even, original_odd), dim=-1).flatten(-2)
+    return torch.cat((grad_prefix.float(), original_rope), dim=-1).to(
+        grad_inverse.dtype
+    )
+
+
+def _te_grouped_gemm(
+    lhs: tuple[torch.Tensor, ...],
+    rhs: tuple[torch.Tensor, ...],
+    output: torch.Tensor | tuple[torch.Tensor, ...],
+    *,
+    activation_dtype: torch.dtype,
+    layout: str = "TN",
+    m_splits: tuple[int, ...] | None = None,
+    single_output: bool = False,
+    grad: bool = False,
+    use_split_accumulator: bool = False,
+) -> None:
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+    outputs = [output] if isinstance(output, torch.Tensor) else list(output)
+    general_grouped_gemm(
+        list(lhs),
+        list(rhs),
+        outputs,
+        [None] * len(lhs),
+        activation_dtype,
+        single_output=single_output,
+        layout=layout,
+        m_splits=list(m_splits) if m_splits is not None else None,
+        grad=grad,
+        use_split_accumulator=use_split_accumulator,
+    )
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    if not torch.cuda.is_available():
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+class _OProjectionVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        visible_op: Callable,
+        o: torch.Tensor,
+        wo_a: torch.Tensor,
+        wo_b: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        n_groups: int,
+        nope_dim: int,
+        rope_dim: int,
+        o_lora_rank: int,
+    ) -> torch.Tensor:
+        output = visible_op(o, wo_a, wo_b)
+        ctx.save_for_backward(o, wo_a, wo_b, positions, cos_sin_cache)
+        ctx.versions = parameter_versions((wo_a, wo_b))
+        ctx.n_groups = n_groups
+        ctx.nope_dim = nope_dim
+        ctx.rope_dim = rope_dim
+        ctx.o_lora_rank = o_lora_rank
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):
+        with _nvtx_range("o_projection_backward"):
+            return _OProjectionVJP._backward_impl(ctx, grad_output)
+
+    @staticmethod
+    def _backward_impl(ctx: Any, grad_output: torch.Tensor):
+        o, wo_a, wo_b, positions, cos_sin_cache = ctx.saved_tensors
+        check_parameter_versions((wo_a, wo_b), ctx.versions)
+        n_groups = ctx.n_groups
+        rank = ctx.o_lora_rank
+        tokens = o.shape[0]
+        activation_dtype = o.dtype
+
+        inverse = _inverse_rope(
+            o, positions, cos_sin_cache, ctx.nope_dim, ctx.rope_dim
+        )
+        grouped = inverse.reshape(tokens, n_groups, -1)
+        grouped_packed = grouped.transpose(0, 1).contiguous()
+        grouped_mats = tuple(grouped_packed.unbind(0))
+        wa_packed = wo_a.reshape(n_groups, rank, -1).contiguous()
+        wa_mats = tuple(wa_packed.unbind(0))
+        splits = (tokens,) * n_groups
+
+        with _nvtx_range("o_projection_backward/recompute"):
+            z_packed = o.new_empty((n_groups, tokens, rank))
+            _te_grouped_gemm(
+                wa_mats,
+                grouped_mats,
+                z_packed.view(n_groups * tokens, rank),
+                activation_dtype=activation_dtype,
+                m_splits=splits,
+                single_output=True,
+            )
+            z = z_packed.transpose(0, 1).contiguous().reshape(tokens, -1)
+        with _nvtx_range("o_projection_backward/wo_b_vjp"):
+            grad_z, grad_wo_b = native_linear_vjp(
+                grad_output.reshape(tokens, -1),
+                z,
+                wo_b,
+            )
+        grad_z_packed = (
+            grad_z.reshape(tokens, n_groups, rank).transpose(0, 1).contiguous()
+        )
+        grad_z_mats = tuple(grad_z_packed.unbind(0))
+
+        grad_grouped_packed = torch.empty_like(grouped_packed)
+        with _nvtx_range("o_projection_backward/wo_a_dgrad"):
+            _te_grouped_gemm(
+                wa_mats,
+                grad_z_mats,
+                grad_grouped_packed.view(n_groups * tokens, -1),
+                activation_dtype=activation_dtype,
+                layout="NN",
+                m_splits=splits,
+                single_output=True,
+                grad=True,
+                use_split_accumulator=True,
+            )
+        grad_inverse = (
+            grad_grouped_packed.transpose(0, 1).contiguous().reshape(inverse.shape)
+        )
+        grad_o = _inverse_rope_vjp(
+            grad_inverse,
+            positions,
+            cos_sin_cache,
+            ctx.nope_dim,
+            ctx.rope_dim,
+        )
+
+        grad_wo_a_packed = torch.empty_like(wa_packed)
+        with _nvtx_range("o_projection_backward/wo_a_wgrad"):
+            _te_grouped_gemm(
+                grouped_mats,
+                grad_z_mats,
+                tuple(grad_wo_a_packed.unbind(0)),
+                activation_dtype=activation_dtype,
+                layout="NT",
+                m_splits=splits,
+                grad=True,
+                use_split_accumulator=True,
+            )
+        return (
+            None,
+            grad_o,
+            grad_wo_a_packed.reshape_as(wo_a),
+            grad_wo_b,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def _o_projection(
     visible_op: Callable,
     o: torch.Tensor,
@@ -186,15 +373,32 @@ def _o_projection(
     rope_dim: int,
     o_lora_rank: int,
 ):
-    def functional(o_, wa_, wb_):
-        inverse = _inverse_rope(o_, positions, cos_sin_cache, nope_dim, rope_dim)
-        grouped = inverse.reshape(inverse.shape[0], n_groups, -1)
-        wa = wa_.to(grouped.dtype).reshape(n_groups, o_lora_rank, -1)
-        z = torch.einsum("tgd,grd->tgr", grouped, wa)
-        return F.linear(z.flatten(1), wb_.to(z.dtype)).to(o_.dtype)
+    if not o.is_cuda:
+        def functional(o_, wa_, wb_):
+            inverse = _inverse_rope(
+                o_, positions, cos_sin_cache, nope_dim, rope_dim
+            )
+            grouped = inverse.reshape(inverse.shape[0], n_groups, -1)
+            wa = wa_.to(grouped.dtype).reshape(n_groups, o_lora_rank, -1)
+            z = torch.einsum("tgd,grd->tgr", grouped, wa)
+            return F.linear(z.flatten(1), wb_.to(z.dtype)).to(o_.dtype)
 
-    return visible_functional_vjp(
-        visible_op, functional, (o, wo_a, wo_b), version_indices=(1, 2)
+        return visible_functional_vjp(
+            visible_op, functional, (o, wo_a, wo_b), version_indices=(1, 2)
+        )
+    if not torch.is_grad_enabled():
+        return visible_op(o, wo_a, wo_b)
+    return _OProjectionVJP.apply(
+        visible_op,
+        o,
+        wo_a,
+        wo_b,
+        positions,
+        cos_sin_cache,
+        n_groups,
+        nope_dim,
+        rope_dim,
+        o_lora_rank,
     )
 
 

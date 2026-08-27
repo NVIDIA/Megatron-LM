@@ -231,8 +231,34 @@ def test_mhc_visible_values_use_functional_vjps() -> None:
         for value in (outputs[3], outputs[0], outputs[1], outputs[2])
     )
     post = mhc_post(lambda *values: _post_graph(*values) + 0.125, *post_inputs)
-    post.backward(_grad_like(post))
-    assert all(value.grad is not None for value in post_inputs)
+    post_grad = _grad_like(post)
+    post.backward(post_grad)
+    post_refs = tuple(value.detach().requires_grad_(True) for value in post_inputs)
+    _post_graph(*post_refs).backward(post_grad)
+    for actual, reference in zip(post_inputs, post_refs, strict=True):
+        assert actual.grad is not None
+        torch.testing.assert_close(actual.grad, reference.grad, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_mhc_post_cuda_vjp_matches_reference() -> None:
+    torch.manual_seed(33)
+    inputs = (
+        torch.randn(129, 256, device="cuda", dtype=torch.bfloat16),
+        torch.randn(129, 4, 256, device="cuda", dtype=torch.bfloat16),
+        torch.randn(129, 4, 1, device="cuda", dtype=torch.bfloat16),
+        torch.randn(129, 4, 4, device="cuda", dtype=torch.bfloat16),
+    )
+    candidates = tuple(value.requires_grad_(True) for value in inputs)
+    references = tuple(value.detach().clone().requires_grad_(True) for value in inputs)
+    candidate = mhc_post(_post_graph, *candidates)
+    reference = _post_graph(*references)
+    grad = _grad_like(reference)
+    candidate.backward(grad)
+    reference.backward(grad)
+    for actual, expected in zip(candidates, references, strict=True):
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-2, atol=1e-2)
 
 
 def test_mhc_head_and_o_projection_cover_parameters() -> None:

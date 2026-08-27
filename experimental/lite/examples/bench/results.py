@@ -17,6 +17,11 @@ class StepTrace:
     grad_norm: float
     step_ms: float
     peak_mem_gb: float | None = None
+    peak_allocated_bytes: int | None = None
+    post_allocated_bytes: int | None = None
+    peak_reserved_bytes: int | None = None
+    post_reserved_bytes: int | None = None
+    active_bytes: int | None = None
     tflops_per_gpu: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -28,6 +33,16 @@ class StepTrace:
         }
         if self.peak_mem_gb is not None:
             result["peak_mem_gb"] = self.peak_mem_gb
+        for name in (
+            "peak_allocated_bytes",
+            "post_allocated_bytes",
+            "peak_reserved_bytes",
+            "post_reserved_bytes",
+            "active_bytes",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                result[name] = value
         if self.tflops_per_gpu is not None:
             result["tflops_per_gpu"] = self.tflops_per_gpu
         return result

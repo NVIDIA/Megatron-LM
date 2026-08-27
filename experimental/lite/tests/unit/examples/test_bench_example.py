@@ -139,7 +139,15 @@ class _FakeRuntime:
     def zero_grad(self, handle) -> None:
         pass
 
-    def forward_backward(self, handle, data, loss_fn, *, num_microbatches: int = 1):
+    def forward_backward(
+        self,
+        handle,
+        data,
+        loss_fn,
+        *,
+        num_microbatches: int = 1,
+        forward_only: bool = False,
+    ):
         self.loss += 1
         return ForwardResult(model_output=ModelOutputs(loss=torch.tensor(float(self.loss))))
 
@@ -176,6 +184,27 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
     assert len(result.step_traces) == 2
     assert [trace.loss for trace in result.step_traces] == [2.0, 3.0]
     assert result.step_traces[0].grad_norm == 3.5
+    assert result.step_traces[0].peak_allocated_bytes == 0
+    assert result.step_traces[0].post_reserved_bytes == 0
+    assert result.metadata["memory_gate"] == {
+        "all_rank_max": True,
+        "max_steady_peak_growth": 0.0,
+        "limit": 0.02,
+        "passed": True,
+        "empty_cache_between_steps": False,
+    }
+
+
+def test_no_optimizer_grad_norm_reports_real_gradients_without_mutation():
+    from examples.bench.session import _global_grad_norm_without_step
+
+    model = torch.nn.Linear(3, 2, bias=False)
+    model.weight.grad = torch.full_like(model.weight, 2.0)
+    original = model.weight.grad.clone()
+    handle = ModelHandle(model=model, _extras={"model_chunks": [model]})
+
+    assert _global_grad_norm_without_step(handle) == pytest.approx(24.0**0.5)
+    torch.testing.assert_close(model.weight.grad, original, rtol=0, atol=0)
 
 
 def test_bench_main_writes_dry_run_output_json(tmp_path):

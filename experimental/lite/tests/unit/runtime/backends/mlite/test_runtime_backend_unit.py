@@ -44,6 +44,21 @@ def test_runtime_returns_loss_separately_from_microbatch_metrics():
     assert result.model_output.loss is not None
 
 
+def test_zero_grad_without_optimizer_clears_parameter_gradients():
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    model = nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.ones_like(model.weight)
+    handle = ModelHandle(
+        model=model,
+        optimizer=None,
+        _extras={"model_chunks": [model]},
+    )
+
+    runtime.zero_grad(handle)
+
+    assert model.weight.grad is None
+
+
 def test_post_step_scale_invalidation_requires_a_successful_optimizer_update():
     calls = []
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)

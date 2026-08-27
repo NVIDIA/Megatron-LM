@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ class PretrainSessionConfig:
     same_data_across_dp: bool = False
     no_optimizer: bool = False
     forward_only: bool = False
+    empty_cache_between_steps: bool = False
+    max_steady_peak_growth: float = 0.02
 
 
 def _is_cuda_device(device: str) -> bool:
@@ -44,16 +47,60 @@ def _reset_peak_memory(device: str) -> None:
         torch.cuda.reset_peak_memory_stats()
 
 
-def _peak_memory_gb(device: str) -> float:
-    if _is_cuda_device(device):
-        return torch.cuda.max_memory_allocated() / 1e9
-    return 0.0
+def _memory_snapshot(device: str) -> dict[str, int]:
+    if not _is_cuda_device(device):
+        return {
+            "peak_allocated_bytes": 0,
+            "post_allocated_bytes": 0,
+            "peak_reserved_bytes": 0,
+            "post_reserved_bytes": 0,
+            "active_bytes": 0,
+        }
+    stats = torch.cuda.memory_stats()
+    values = {
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "post_allocated_bytes": torch.cuda.memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        "post_reserved_bytes": torch.cuda.memory_reserved(),
+        "active_bytes": stats["active_bytes.all.current"],
+    }
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        packed = torch.tensor(
+            list(values.values()), dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.MAX)
+        values = dict(zip(values, packed.cpu().tolist(), strict=True))
+    return values
 
 
 def _world_size() -> int:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_world_size()
     return 1
+
+
+def _global_grad_norm_without_step(handle: ModelHandle) -> float:
+    """Report the runtime-aligned global norm without mutating weights or grads."""
+    from megatron.lite.primitive.train_step import compute_global_grad_norm
+
+    ps = handle._parallel_state
+    chunks = handle._extras.get("model_chunks", [handle._model])
+    protocol = handle._extras.get("protocol")
+    is_expert_param = getattr(protocol, "is_expert_param", None)
+    if ps is None or is_expert_param is None:
+        total = None
+        for chunk in chunks:
+            for parameter in chunk.parameters():
+                if parameter.grad is not None:
+                    squared = parameter.grad.detach().float().norm().square()
+                    total = squared if total is None else total + squared
+        return 0.0 if total is None else float(total.sqrt().item())
+
+    squared_norms = [
+        compute_global_grad_norm(chunk, ps, is_expert_param=is_expert_param).square()
+        for chunk in chunks
+    ]
+    return float(torch.stack(squared_norms).sum().sqrt().item())
 
 
 def _resolve_vocab_size(handle: ModelHandle) -> int:
@@ -167,6 +214,8 @@ def run_pretrain_session(
         raise ValueError("warmup must satisfy 0 <= warmup < steps")
     if cfg.num_microbatches < 1:
         raise ValueError("num_microbatches must be >= 1")
+    if cfg.max_steady_peak_growth < 0:
+        raise ValueError("max_steady_peak_growth must be >= 0")
 
     if data_iter is None:
         data_iter = _make_data_iter(handle, cfg)
@@ -182,8 +231,9 @@ def run_pretrain_session(
     mode = rt.eval_mode(handle) if cfg.forward_only else rt.train_mode(handle)
     with mode:
         for step in range(cfg.steps):
-            if step == cfg.warmup:
-                _reset_peak_memory(cfg.device)
+            if cfg.empty_cache_between_steps and _is_cuda_device(cfg.device):
+                torch.cuda.empty_cache()
+            _reset_peak_memory(cfg.device)
 
             if not cfg.forward_only:
                 rt.zero_grad(handle)
@@ -196,14 +246,25 @@ def run_pretrain_session(
                 num_microbatches=cfg.num_microbatches,
                 forward_only=cfg.forward_only,
             )
-            if cfg.forward_only or cfg.no_optimizer:
-                grad_norm = 0.0
-            else:
+            if not cfg.forward_only and not cfg.no_optimizer:
                 _, grad_norm, _ = rt.optimizer_step(handle)
                 rt.lr_scheduler_step(handle)
+            else:
+                grad_norm = 0.0
             _sync(cfg.device)
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
+            memory = _memory_snapshot(cfg.device)
+            if cfg.no_optimizer and not cfg.forward_only:
+                # Keep this correctness check outside the timed/memory window:
+                # it performs benchmark-only reductions but does not mutate grads.
+                grad_norm = _global_grad_norm_without_step(handle)
+            if not cfg.forward_only and (
+                not math.isfinite(float(grad_norm)) or float(grad_norm) <= 0.0
+            ):
+                raise RuntimeError(
+                    f"training benchmark produced invalid grad_norm={grad_norm}"
+                )
             tflops_per_gpu = _calc_tflops_per_gpu(
                 num_floating_point_operations=step_flops,
                 activated_params=activated_params,
@@ -213,10 +274,16 @@ def run_pretrain_session(
             )
             trace = StepTrace(
                 step=step,
-                loss=float(result.metrics.get("loss", result.model_output.loss) or 0.0),
+                loss=float(
+                    (
+                        result.metrics.get("loss", result.model_output.loss)
+                        or torch.tensor(0.0)
+                    ).detach()
+                ),
                 grad_norm=float(grad_norm),
                 step_ms=elapsed_ms,
-                peak_mem_gb=_peak_memory_gb(cfg.device),
+                peak_mem_gb=memory["peak_allocated_bytes"] / 1e9,
+                **memory,
                 tflops_per_gpu=tflops_per_gpu,
             )
             if step_reporter is not None:
@@ -236,6 +303,23 @@ def run_pretrain_session(
         step_s=avg_step_s,
         world_size=world_size,
     )
+    measured_peaks = [
+        trace.peak_allocated_bytes or 0 for trace in step_traces
+    ]
+    growth_rates = [
+        (current - previous) / previous
+        for previous, current in zip(measured_peaks, measured_peaks[1:])
+        if previous > 0
+    ]
+    max_growth = max([0.0, *growth_rates])
+    memory_gate = {
+        "all_rank_max": True,
+        "max_steady_peak_growth": max_growth,
+        "limit": cfg.max_steady_peak_growth,
+        "passed": len(measured_peaks) >= 2
+        and max_growth < cfg.max_steady_peak_growth,
+        "empty_cache_between_steps": cfg.empty_cache_between_steps,
+    }
 
     config = handle.config
     parallel = config.parallel
@@ -258,11 +342,16 @@ def run_pretrain_session(
         num_microbatches=cfg.num_microbatches,
         step_traces=step_traces,
         avg_step_ms=avg_step_ms,
-        peak_mem_gb=_peak_memory_gb(cfg.device),
+        peak_mem_gb=max(measured_peaks, default=0) / 1e9,
         tok_per_s=tok_per_s,
         tok_per_s_per_gpu=tok_per_s / world_size,
         tflops_per_gpu=avg_tflops,
-        metadata={"warmup": cfg.warmup, "device": cfg.device, "use_thd": cfg.use_thd},
+        metadata={
+            "warmup": cfg.warmup,
+            "device": cfg.device,
+            "use_thd": cfg.use_thd,
+            "memory_gate": memory_gate,
+        },
     )
 
 
