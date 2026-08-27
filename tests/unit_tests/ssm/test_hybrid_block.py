@@ -849,3 +849,159 @@ class TestHybridBlock:
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLA + Symbols.MAMBA
         with pytest.raises(ValueError):
             self.get_mla_hybrid_block(layer_pattern)
+
+@pytest.mark.internal
+class TestAttnResHybridBlock:
+    """Attention residuals in hybrid stacks (AttnResHybridLayer + HybridStack)."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def get_pg_collection(self):
+        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
+    def _make_config(self, num_layers, block_layers=1, enable=True, eps=1e-6):
+        attn_res_kwargs = (
+            {"enable_attention_residuals": True, "attn_res_block_layers": block_layers}
+            if enable
+            else {}
+        )
+        return TransformerConfig(
+            hidden_size=256,
+            num_layers=num_layers,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            layernorm_epsilon=eps,
+            **attn_res_kwargs,
+        )
+
+    def _make_stack(self, config, layer_type_list, pp_layer_offset=0, pre=True, post=True):
+        return HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=pp_layer_offset,
+            pre_process=pre,
+            post_process=post,
+            pg_collection=self.get_pg_collection(),
+        )
+
+    def test_layer_wrappers_and_boundaries(self):
+        from megatron.core.models.hybrid.hybrid_block import AttnResHybridLayer
+
+        layer_type_list = validate_segment_layers(
+            Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION
+        )
+        config = self._make_config(len(layer_type_list), block_layers=2)
+        block = self._make_stack(config, layer_type_list)
+        assert all(isinstance(layer, AttnResHybridLayer) for layer in block.layers)
+        # k=2 entries per block: boundaries at entries 1 and 3.
+        assert [layer.attn_res_is_block_start for layer in block.layers] == [
+            True,
+            False,
+            True,
+            False,
+        ]
+        assert [layer.attn_res_num_sources for layer in block.layers] == [1, 1, 2, 2]
+        assert isinstance(block.final_attn_res, torch.nn.Module)
+
+    def test_gpu_forward(self):
+        layer_type_list = validate_segment_layers(Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP)
+        config = self._make_config(len(layer_type_list), block_layers=1)
+        block = self._make_stack(config, layer_type_list).cuda()
+        sequence_length, micro_batch_size = 32, 2
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, config.hidden_size), device='cuda'
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device='cuda'
+        )
+        output = block(hidden_states, attention_mask=attention_mask)
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+    def test_init_equivalence_forward(self):
+        """Zero-init AttnRes hybrid stack matches the baseline at the first forward.
+
+        Zero pseudo-queries make every aggregation the exact mean of the depth
+        sources, which partition the baseline residual sum; all consumers are
+        (scale-invariant up to eps) norms, and the wrapper's delta
+        reconstruction is exact — so with a tiny eps the outputs must agree.
+        """
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION
+        layer_type_list = validate_segment_layers(layer_pattern)
+
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        baseline = self._make_stack(
+            self._make_config(len(layer_type_list), enable=False, eps=1e-12), layer_type_list
+        ).cuda()
+
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        attnres = self._make_stack(
+            self._make_config(len(layer_type_list), block_layers=1, eps=1e-12), layer_type_list
+        ).cuda()
+
+        # The wrapper nests inner-layer keys under `inner_layer.`; remap the
+        # baseline state dict accordingly and copy the shared weights.
+        remapped = {}
+        for key, value in baseline.state_dict().items():
+            if key.startswith("layers."):
+                prefix, rest = key.split(".", 2)[0:2], key.split(".", 2)[2]
+                remapped[f"{prefix[0]}.{prefix[1]}.inner_layer.{rest}"] = value
+            else:
+                remapped[key] = value
+        missing, unexpected = attnres.load_state_dict(remapped, strict=False)
+        assert not unexpected, unexpected
+        assert missing and all("attn_res" in key for key in missing), missing
+
+        sequence_length, micro_batch_size = 32, 2
+        torch.manual_seed(7)
+        hidden_states = torch.randn((sequence_length, micro_batch_size, 256), device='cuda')
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device='cuda'
+        )
+
+        with torch.no_grad():
+            out_base = baseline(hidden_states.clone(), attention_mask=attention_mask)
+            out_attn = attnres(hidden_states.clone(), attention_mask=attention_mask)
+
+        torch.testing.assert_close(out_attn, out_base, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("block_layers", [1, 2])
+    def test_pipeline_boundary_payload_shapes(self, block_layers):
+        """Depth sources + partial cross PP boundaries as one seq-dim-concat payload."""
+        from megatron.core.transformer.attention_residual import attn_res_num_payload_slices
+
+        stage0_types = validate_segment_layers(Symbols.MAMBA + Symbols.ATTENTION)
+        stage1_types = validate_segment_layers(Symbols.MLP + Symbols.ATTENTION)
+        config = self._make_config(4, block_layers=block_layers)
+
+        first_stage = self._make_stack(
+            config, stage0_types, pp_layer_offset=0, pre=True, post=False
+        ).cuda()
+        last_stage = self._make_stack(
+            config, stage1_types, pp_layer_offset=2, pre=False, post=True
+        ).cuda()
+
+        sequence_length, micro_batch_size = 32, 2
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, config.hidden_size), device='cuda'
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device='cuda'
+        )
+
+        payload = first_stage(hidden_states, attention_mask=attention_mask)
+        num_slices = attn_res_num_payload_slices(2, block_layers)
+        assert payload.shape == (num_slices * sequence_length, micro_batch_size, config.hidden_size)
+
+        last_stage.set_input_tensor(payload.detach())
+        output = last_stage(hidden_states, attention_mask=attention_mask)
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)

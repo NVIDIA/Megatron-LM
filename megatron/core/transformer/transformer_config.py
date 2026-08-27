@@ -1339,6 +1339,13 @@ class TransformerConfig(ModelParallelConfig):
     CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200 at small hidden
     sizes — so 'compile' is strongly recommended for training runs."""
 
+    hybrid_layer_pattern: Optional[str] = None
+    """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
+    automatically by the argument bridge). Consumed by config-only consumers that need the
+    hybrid pipeline segmentation — currently the attention-residual pipeline payload widths,
+    whose per-boundary slice counts derive from the cumulative '|' segment lengths. The
+    HybridModel itself keeps receiving the pattern through its constructor argument."""
+
     ####################
     # miscellaneous
     ####################
@@ -1624,6 +1631,28 @@ class TransformerConfig(ModelParallelConfig):
             # that runs MTP; the depth-source hand-off does not cross that
             # boundary yet.
             unsupported.append("MTP together with account_for_embedding/loss_in_pipeline_split")
+        if self.is_hybrid_model:
+            if self.mtp_num_layers is not None:
+                # Hybrid MTP depths run a nested HybridStack; the depth-source
+                # hand-off into that stack is a follow-up.
+                unsupported.append("hybrid MTP (a '/' depth in the hybrid layer pattern)")
+            if self.pipeline_model_parallel_size > 1:
+                if not self.hybrid_layer_pattern:
+                    raise ValueError(
+                        "enable_attention_residuals with a hybrid model and pipeline "
+                        "parallelism requires hybrid_layer_pattern (the pipeline payload "
+                        "widths derive from the pattern's '|' segmentation)."
+                    )
+                main_pattern = self.hybrid_layer_pattern.split('/')[0]
+                if '|' in main_pattern:
+                    num_segments = main_pattern.count('|') + 1
+                    if num_segments != self.pipeline_model_parallel_size:
+                        # Segments > pp_size implies pattern-derived interleaved VPP,
+                        # which attention residuals reject like explicit VPP.
+                        unsupported.append(
+                            f"hybrid pattern with {num_segments} pipe segments != "
+                            f"pipeline_model_parallel_size={self.pipeline_model_parallel_size}"
+                        )
         if unsupported:
             raise ValueError(
                 "enable_attention_residuals is not yet supported with: " + "; ".join(unsupported)
