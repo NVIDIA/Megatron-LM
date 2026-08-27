@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
@@ -580,6 +581,14 @@ class _CudagraphGlobalRecord:
     cudagraph_inference_record: list[tuple] = []
     _saved_tensors_observer = None
 
+    # Every runner ever constructed and still alive. 'create_cudagraphs' clears
+    # 'cudagraph_record', so after creation it no longer reaches the runners whose
+    # graphs exist; 'delete_cuda_graphs' needs them to actually release the graphs
+    # (a captured graph keeps its NCCL communicators alive, and destroying such a
+    # communicator deadlocks - pytorch#115388). Weak references so the registry
+    # doesn't extend runner lifetime.
+    all_runners: "weakref.WeakSet" = weakref.WeakSet()
+
     @classmethod
     def _enable_saved_tensors_observer(cls):
         """Observe Python 'save_for_backward' calls while recording and capturing graphs."""
@@ -779,7 +788,18 @@ def delete_cuda_graphs():
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
-    # Reset runners.
+    # Reset every live runner, not just the pending records: create_cudagraphs()
+    # empties 'cudagraph_record' after capture, so created graphs are reachable
+    # only through the runners themselves. Releasing them here is what lets the
+    # captured communicators be destroyed without deadlocking (pytorch#115388).
+    for runner in list(_CudagraphGlobalRecord.all_runners):
+        runner.cudagraph_created = False
+        runner.fwd_graph_recorded = False
+        runner.bwd_graph_recorded = False
+        runner.fwd_graph = None
+        runner.bwd_graph = None
+        runner.mempool = None
+
     for record in [
         *_CudagraphGlobalRecord.cudagraph_record,
         *_CudagraphGlobalRecord.cudagraph_inference_record,
@@ -1005,6 +1025,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = None
         self.bwd_graph = None
         self.bwd_graph_replay_complete_event = torch.cuda.Event()
+        _CudagraphGlobalRecord.all_runners.add(self)
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
