@@ -8,10 +8,17 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -103,6 +110,150 @@ class TestMcoreAdapterDense:
         }
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
+
+    def test_fine_grained_hooks_run_for_direct_submodule(self, monkeypatch):
+        """MCore-owned hooks materialize an FSDP unit called below its root."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)).to(device)
+        module_names = tuple(name for name, _ in model.named_modules())
+
+        with fully_shard_context(device=device):
+            fully_shard(model, mesh=mesh, placements=placements, skip_forward_backward_hooks=True)
+            assert isinstance(model, FsdpModule)
+            mcore_fsdp_adapter._register_fine_grained_hooks(model)
+
+        assert tuple(name for name, _ in model.named_modules()) == module_names
+
+        unshard_calls = []
+        original_unshard = model._unshard_parameter_groups
+
+        def record_unshard():
+            unshard_calls.append(None)
+            original_unshard()
+
+        pre_backward_calls = []
+        original_pre_backward = model.pre_backward
+
+        def record_pre_backward(register_final_callback=True):
+            pre_backward_calls.append(register_final_callback)
+            original_pre_backward(register_final_callback=register_final_callback)
+
+        monkeypatch.setattr(model, "_unshard_parameter_groups", record_unshard)
+        monkeypatch.setattr(model, "pre_backward", record_pre_backward)
+
+        inputs = torch.randn(2, 4, device=device, requires_grad=True)
+        output = model[0](inputs)
+        assert len(unshard_calls) == 1
+
+        output.sum().backward()
+        assert pre_backward_calls == [False]
+        assert model.phase is FsdpModule.Phase.BACKWARD
+
+        model.post_backward()
+        assert model.phase is FsdpModule.Phase.RESTING
+
+    def test_overlap_release_finalizes_nested_fsdp_units_once(self, monkeypatch):
+        """Adapter release recursively finalizes a schedule unit and is idempotent."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)),
+            torch.nn.Linear(4, 4, bias=False),
+        ).to(device)
+
+        with fully_shard_context(device=device):
+            fully_shard(
+                model[0][0], mesh=mesh, placements=placements, skip_forward_backward_hooks=True
+            )
+            fully_shard(
+                model[0], mesh=mesh, placements=placements, skip_forward_backward_hooks=True
+            )
+            fully_shard(model, mesh=mesh, placements=placements, skip_forward_backward_hooks=True)
+
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = model
+        adapter._setup_1f1b_overlap_interface()
+
+        # Leaving a nested FSDP subtree must restore the parent owner for later siblings.
+        assert mcore_fsdp_adapter._find_fsdp_target(model[0][0]) is model[0][0]
+        assert mcore_fsdp_adapter._find_fsdp_target(model[1]) is model
+
+        model.pre_backward(register_final_callback=False)
+        model[0].pre_backward(register_final_callback=False)
+        model[0][0].pre_backward(register_final_callback=False)
+
+        calls = []
+        named_modules = (("root", model), ("layer", model[0]), ("expert", model[0][0]))
+        for name, module in named_modules:
+            monkeypatch.setattr(
+                module,
+                "_reshard_parameter_groups",
+                lambda name=name: calls.append((name, "reshard")),
+            )
+            monkeypatch.setattr(
+                module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
+            )
+            module._num_ready_grad_parameters = module._num_trainable_parameters
+
+        # The layer callback releases the nested expert first. The final root sweep
+        # releases only the root and safely revisits the already-resting layer subtree.
+        adapter.post_backward_release_module(model[0])
+        adapter.post_backward()
+        adapter.post_backward()
+
+        assert calls == [
+            ("expert", "reduce"),
+            ("expert", "reshard"),
+            ("layer", "reduce"),
+            ("layer", "reshard"),
+            ("root", "reduce"),
+            ("root", "reshard"),
+        ]
+        for _, module in named_modules:
+            assert module.phase is FsdpModule.Phase.RESTING
+            assert module._num_ready_grad_parameters == 0
+
+    def test_finish_grad_sync_waits_for_reduce_scatter(self):
+        """Gradient consumers should wait for the final asynchronous reduce-scatter."""
+
+        class RecordingStream:
+            def __init__(self) -> None:
+                self.waited_streams = []
+
+            def wait_stream(self, stream) -> None:
+                self.waited_streams.append(stream)
+
+        current_stream = RecordingStream()
+        reduce_scatter_stream = object()
+
+        class Context:
+            def __init__(self) -> None:
+                self.reduce_scatter_stream = reduce_scatter_stream
+
+            def current_stream(self):
+                return current_stream
+
+        module = torch.nn.Module()
+        module.context = Context()
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = module
+
+        adapter.finish_grad_sync()
+
+        assert current_stream.waited_streams == [reduce_scatter_stream]
 
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(

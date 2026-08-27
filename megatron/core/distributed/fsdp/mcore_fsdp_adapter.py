@@ -14,7 +14,10 @@
 
 import logging
 import random
-from typing import Dict, List, Optional, Tuple, Type
+from contextlib import contextmanager
+from functools import partial
+from typing import Dict, List, Optional, Tuple, Type, cast
+from weakref import ref
 
 __all__ = ["FullyShardedDataParallel"]
 
@@ -54,6 +57,7 @@ try:
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -61,6 +65,61 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+_FSDP_PARENT_MODULE_REF_ATTR = "_fsdp_parent_module_ref"
+
+
+def _find_fsdp_target(submodule: nn.Module) -> FsdpModule | None:
+    """Return the nearest parent FsdpModule for a fine-grained schedule module."""
+    if isinstance(submodule, FsdpModule):
+        return submodule
+    parent_ref = getattr(submodule, _FSDP_PARENT_MODULE_REF_ATTR, None)
+    return parent_ref() if parent_ref is not None else None
+
+
+def _fine_grained_pre_forward_hook(submodule: nn.Module, _args, _kwargs) -> None:
+    """Materialize the owning FSDP unit before a schedule sub-module runs."""
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    target._unshard_parameter_groups()
+    if target._unshard_event is not None:
+        target.context.current_stream().wait_event(target._unshard_event)
+
+    # Fine-grained schedules bypass FsdpModule.pre_forward(), so issue the same
+    # one-module lookahead here. Activation recomputation runs inside backward and
+    # must not restart forward-order prefetch after a later module was finalized.
+    is_recomputing = (
+        target.phase is FsdpModule.Phase.BACKWARD or torch._C._current_graph_task_id() != -1
+    )
+    if not is_recomputing:
+        next_module = target.context.forward_order.next_item(target)
+        if next_module is not None:
+            next_module._unshard_parameter_groups()
+
+
+def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
+    """Enter the owning FSDP unit's backward lifecycle before sub-module backward."""
+    target = _find_fsdp_target(submodule)
+    if target is not None and target.phase is FsdpModule.Phase.RESTING:
+        target.pre_backward(register_final_callback=False)
+
+
+def _register_fine_grained_hooks(module: FsdpModule) -> None:
+    """Install the sub-module hooks required by MCore combined 1F1B."""
+    def register_hooks(submodule: nn.Module, owner: FsdpModule) -> None:
+        """Register hooks recursively while preserving the nearest FSDP owner."""
+        if isinstance(submodule, FsdpModule):
+            owner = submodule
+        object.__setattr__(submodule, _FSDP_PARENT_MODULE_REF_ATTR, ref(owner))
+        submodule.register_forward_pre_hook(
+            _fine_grained_pre_forward_hook, prepend=True, with_kwargs=True
+        )
+        submodule.register_full_backward_pre_hook(_fine_grained_pre_backward_hook)
+        for child in submodule.children():
+            register_hooks(child, owner)
+
+    register_hooks(module, module)
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -562,6 +621,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         placements = Placements(
             dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
         )
+        overlap_moe_expert_parallel = config.overlap_moe_expert_parallel_comm
+        common_fully_shard_kwargs = dict(
+            placements=placements,
+            mixed_precision_policy=self.mp_policy,
+            skip_forward_backward_hooks=overlap_moe_expert_parallel,
+        )
+
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
@@ -576,9 +642,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
-                            placements=placements,
-                            mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
+                            **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -586,16 +651,73 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
-                    fully_shard(
-                        submodule,
-                        mesh=dp_mesh,
-                        placements=placements,
-                        mixed_precision_policy=self.mp_policy,
-                    )
-            fully_shard(
-                module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
-            )
+                    fully_shard(submodule, mesh=dp_mesh, **common_fully_shard_kwargs)
+            fully_shard(module, mesh=dp_mesh, **common_fully_shard_kwargs)
         super().__init__(config=config, module=module)
+        if overlap_moe_expert_parallel:
+            self._setup_1f1b_overlap_interface()
+
+    def _setup_1f1b_overlap_interface(self) -> None:
+        """Expose the parameter lifecycle callbacks used by combined 1F1B.
+
+        All callbacks live on the adapter rather than on ``FsdpModule`` so the
+        experimental module API stays schedule-agnostic; the schedule-facing
+        surface is assembled here.
+        """
+
+        def _require_fsdp_module(module: torch.nn.Module) -> FsdpModule:
+            if not isinstance(module, FsdpModule):
+                raise TypeError(
+                    "MFSDP v2 combined 1F1B callbacks require an experimental FsdpModule, "
+                    f"got {type(module).__name__}."
+                )
+            return module
+
+        def finalize_backward(module: torch.nn.Module) -> None:
+            """Finalize one schedule unit and any nested FSDP units exactly once."""
+            module = _require_fsdp_module(module)
+            for fsdp_module in reversed(list(cast(nn.Module, module).modules())):
+                if not isinstance(fsdp_module, FsdpModule):
+                    continue
+                if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
+                    continue
+                fsdp_module._original_post_backward()
+                # 1F1B cooldown can run consecutive backward passes without an intervening
+                # pre_forward(), so reset the hook counter as soon as this pass is finalized.
+                fsdp_module._num_ready_grad_parameters = 0
+
+        def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
+            module = _require_fsdp_module(module)
+            if reduce_grad:
+                finalize_backward(module)
+            else:
+                module._reshard_parameter_groups()
+
+        def _replace_param_with_raw_if_needed() -> None:
+            """Initialize the root context before a fine-grained schedule runs.
+
+            The experimental API stores raw tensors backed by DBuffer at all
+            times, so no parameter swap is needed, but finalizing the context
+            here ensures a child FSDP unit cannot mistake itself for the root
+            when it executes first.
+            """
+            self.module.context.ensure_finalized()
+
+        # Replace FsdpModule post_backward to defensive post backward to prevent
+        # some post-backward hooks from failing to trigger due to the special
+        # scheduling of 1F1B EP overlap.
+        for fsdp_module in self.module.modules():
+            if isinstance(fsdp_module, FsdpModule):
+                fsdp_module._original_post_backward = fsdp_module.post_backward
+                fsdp_module.post_backward = partial(finalize_backward, fsdp_module)
+
+        self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
+        self.post_forward_release_module = partial(release_module, reduce_grad=False)
+        self.post_backward_release_module = partial(release_module, reduce_grad=True)
+        self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
+        self.post_backward = partial(finalize_backward, self.module)
+
+        _register_fine_grained_hooks(self.module)
 
     @staticmethod
     def _validate_config(
@@ -687,8 +809,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
-        if ddp_config.delay_wgrad_compute:
-            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
+        if ddp_config.delay_wgrad_compute and not config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "MFSDP v2 only supports delay_wgrad_compute with "
+                "overlap_moe_expert_parallel_comm."
+            )
         if ddp_config.suggested_communication_unit_size is not None:
             raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
         if ddp_config.num_buckets is not None:
@@ -702,6 +827,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if ddp_config.megatron_fsdp_max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
 
+    @contextmanager
+    def no_sync(self):
+        """Suppress gradient finalization for non-final microbatches.
+
+        Toggles ``is_last_microbatch`` on this model's ``FsdpContext`` so gradient
+        reduce-scatters accumulate between microbatches rather than finalizing
+        on every backward. Called by the training loop via
+        ``config.no_sync_func`` and the 1F1B overlap schedule.
+        """
+        self.module.context.ensure_finalized()
+        context = self.module.context
+        previous_state = context.is_last_microbatch
+        context.is_last_microbatch = False
+        try:
+            yield
+        finally:
+            context.is_last_microbatch = previous_state
+
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
 
@@ -709,7 +852,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
+        """Wait for backward reduce-scatters before gradient consumers run."""
+        context = self.module.context
+        context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

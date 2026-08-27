@@ -137,6 +137,24 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
+def test_skip_forward_backward_hooks(distributed_setup):
+    """Integrations may replace the standard FSDP module lifecycle hooks."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model, mesh=mesh, placements=_flat_placements(), skip_forward_backward_hooks=True
+        )
+
+    assert not model._forward_pre_hooks
+    assert not model._forward_hooks
+    assert not model._backward_pre_hooks
+    assert not model._backward_hooks
+
+
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
@@ -234,3 +252,38 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.inner.context is first_context
+
+
+def test_multiple_forwards_before_backwards_reset_gradient_readiness(
+    distributed_setup, monkeypatch
+):
+    """Consecutive pipeline backwards should each finalize gradient reduction."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    reduce_calls = []
+    original_reduce_gradient_groups = model._reduce_gradient_groups
+
+    def record_reduce_gradient_groups() -> None:
+        reduce_calls.append(None)
+        original_reduce_gradient_groups()
+
+    monkeypatch.setattr(model, "_reduce_gradient_groups", record_reduce_gradient_groups)
+
+    # Pipeline warmup may run multiple forwards before cooldown runs consecutive
+    # backwards. Each backward must reset the parameter-completion counter.
+    losses = [model(torch.ones(2, 4, device=device)).sum() for _ in range(2)]
+    for loss in reversed(losses):
+        loss.backward()
+
+    assert len(reduce_calls) == 2
+    assert model._num_ready_grad_parameters == 0
+    assert model.phase is model.Phase.RESTING
+
+    # A schedule fallback may revisit an already released unit.
+    model.post_backward()
+    assert len(reduce_calls) == 2

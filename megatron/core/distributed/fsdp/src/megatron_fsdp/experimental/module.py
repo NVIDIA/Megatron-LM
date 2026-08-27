@@ -178,6 +178,7 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        skip_forward_backward_hooks: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -215,7 +216,7 @@ class FsdpModule:
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
-        self._register_hooks()
+        self._register_hooks(skip_forward_backward_hooks=skip_forward_backward_hooks)
         context.register_module(self)
 
     @property
@@ -253,9 +254,12 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self._is_root
 
-    def _register_hooks(self) -> None:
+    def _register_hooks(self, skip_forward_backward_hooks: bool = False) -> None:
         module = cast(nn.Module, self)
         module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
+        if skip_forward_backward_hooks:
+            return
+
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.
         module.register_forward_pre_hook(
@@ -399,14 +403,22 @@ class FsdpModule:
                 group.release_unsharded_storage()
             self._unshard_event = None
 
-    def pre_backward(self) -> None:
-        """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+    def pre_backward(self, register_final_callback: bool = True) -> None:
+        """Prepare full parameters and prefetch the next FsdpModule in backward order.
+
+        Args:
+            register_final_callback: Whether to finalize through the autograd engine.
+                Manual backward schedules (e.g. 1F1B EP overlap schedule) finalize
+                explicitly in ``post_backward()``, so they pass False to avoid
+                installing an autograd callback outside the backward pass.
+        """
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            context.register_post_backward_final_callback()
+            if register_final_callback:
+                context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
             # part of any active CUDA-graph capture. A stream only joins the
