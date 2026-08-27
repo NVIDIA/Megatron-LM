@@ -11,8 +11,14 @@ Reshard transforms for custom send/recv/writeback during weight transfer.
 
 import torch
 
-from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor, is_mxfp8tensor
+from megatron.core.inference.quantization.mxfp8_tensor import (
+    MXFP8Backend,
+    MXFP8Tensor,
+    ensure_mxfp8_scale_dtype,
+    validate_mxfp8_tensor,
+)
+from megatron.core.tensor_parallel import gtp_api
 
 
 class ReshardTransform:
@@ -105,6 +111,12 @@ def _ensure_sendable(param: torch.Tensor) -> torch.Tensor:
     dequantized to their original precision (usually BF16).  Standard
     parameters are returned via ``.data`` (unwrapped from autograd).
     """
+    if gtp_api.HAVE_GTP and gtp_api.is_gtp_param(param) and is_float8tensor(param):
+        # Native quantized GTP parameters use a dynamic GTP_<QuantizedTensor>
+        # subclass. Transformer Engine dispatches dequantization on the exact
+        # base class, so use GTP's temporary reclassification helper. Despite
+        # its name, the helper handles both native FP8 and NVFP4 parameters.
+        return gtp_api.dequantize_gtp_native_fp8(param)
     if is_mxfp8tensor(param):
         return dequantize_fp8_tensor(param)
     return param.data
