@@ -3360,17 +3360,16 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
-        if self.dsa_mtp_index_kv_share and self.cuda_graph_impl != "none":
-            captures_attention = (
-                self.cuda_graph_impl == "full_iteration"
-                or not self.cuda_graph_modules
-                or CudaGraphModule.attn in self.cuda_graph_modules
+        if (
+            self.dsa_mtp_index_kv_share
+            and cuda_graph_captures_attention
+            and self.cuda_graph_impl != "full_iteration"
+        ):
+            raise ValueError(
+                "dsa_mtp_index_kv_share does not support per-layer CUDA graph scopes "
+                "that capture attention. Use a MoE-only scope or a graph scope that "
+                "contains the complete MTP producer-consumer chain."
             )
-            if captures_attention:
-                raise ValueError(
-                    "dsa_mtp_index_kv_share does not yet support CUDA graph scopes "
-                    "that capture attention. MoE-only CUDA graph scopes remain supported."
-                )
 
         if self.cuda_graph_impl != "none":
 

@@ -97,7 +97,11 @@ def _make_config(**overrides) -> MLATransformerConfig:
         ({"mtp_num_layers": 1}, "requires mtp_num_layers > 1"),
         (
             {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": ["attn"]},
-            "does not yet support CUDA graph scopes that capture attention",
+            "does not support per-layer CUDA graph scopes that capture attention",
+        ),
+        (
+            {"cuda_graph_impl": "local", "cuda_graph_modules": []},
+            "does not support per-layer CUDA graph scopes that capture attention",
         ),
     ],
 )
@@ -114,6 +118,12 @@ def test_iteration_sharing_accepts_moe_only_cuda_graph_scope():
     )
 
     assert config.cuda_graph_modules == [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess]
+
+
+def test_iteration_sharing_accepts_full_iteration_cuda_graph_scope():
+    config = _make_config(cuda_graph_impl="full_iteration", cuda_graph_modules=[])
+
+    assert config.cuda_graph_impl == "full_iteration"
 
 
 def test_iteration_sharing_accepts_selective_mla_up_projection_recompute():
