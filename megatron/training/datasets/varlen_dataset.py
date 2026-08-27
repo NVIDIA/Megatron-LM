@@ -29,8 +29,9 @@ Compared to :class:`SFTDataset`, this dataset adds:
         ``instruction|prompt|query|question`` + one of
         ``output|response|completion|answer``, plus optional context field
         ``input|context``.
-      * **pretrain-text** — column ``text``; returns the raw string (no
-        messages list, no role masking), tokenized as plain pretraining text.
+      * **pretrain-text** — column ``text``, ``raw_content`` (RedPajama V2 /
+        RP2), or ``content`` (CodeForge); returns the raw string (no messages
+        list, no role masking), tokenized as plain pretraining text.
 
   * **Mock variant** — :class:`MockVarlenDataset` mirrors
     :class:`MockSFTDataset` end-to-end (synthetic lognormal sequence-length
@@ -82,6 +83,9 @@ _INSTRUCTION_FIELDS: Tuple[str, ...] = ("instruction", "prompt", "query", "quest
 _OUTPUT_FIELDS: Tuple[str, ...] = ("output", "response", "completion", "answer")
 # Supplementary user-turn context: Stanford Alpaca's "input", Dolly's "context".
 _EXTRA_INPUT_FIELDS: Tuple[str, ...] = ("input", "context")
+# Raw pretraining text: canonical datasets use "text", RedPajama V2 uses
+# "raw_content", and CodeForge uses "content".
+_PRETRAIN_TEXT_FIELDS: Tuple[str, ...] = ("text", "raw_content", "content")
 
 # ShareGPT "from" value -> chat-template "role". Unknown values fall back to
 # "user" so downstream tokenization does not crash on unfamiliar speakers.
@@ -126,15 +130,15 @@ def _looks_like_hf_id(path: str) -> bool:
 
 def _first_present(sample: Dict[str, Any], fields: Iterable[str]) -> Optional[str]:
     """Return the first non-empty string value among the given fields, or None."""
-    for f in fields:
-        v = sample.get(f)
-        if v in (None, ""):
+    for field_name in fields:
+        value = sample.get(field_name)
+        if value in (None, ""):
             continue
-        if not isinstance(v, str):
+        if not isinstance(value, str):
             raise ValueError(
-                f"VarlenDataset: field '{f}' must be a string, " f"got {type(v).__name__}."
+                f"VarlenDataset: field '{field_name}' must be a string, got {type(value).__name__}."
             )
-        return v
+        return value
     return None
 
 
@@ -307,7 +311,7 @@ def _messages_passthrough(sample: Dict[str, Any]) -> ChatTemplateSample:
     for index, m in enumerate(raw):
         if not isinstance(m, dict):
             raise ValueError(
-                f"VarlenDataset: messages[{index}] must be an object, " f"got {type(m).__name__}."
+                f"VarlenDataset: messages[{index}] must be an object, got {type(m).__name__}."
             )
         role = str(m.get("role") or "user").lower()
         role = role_map.get(role, role)
@@ -371,29 +375,23 @@ def _messages_passthrough(sample: Dict[str, Any]) -> ChatTemplateSample:
 
 
 def _raw_text_loader(sample: Dict[str, Any]) -> str:
-    """Return the ``text`` column unchanged for pretrain-style packed runs.
+    """Return a recognized raw-text column unchanged for pretrain-style packed runs.
 
     Unlike the SFT schemas this returns a plain string (no messages list).
     :class:`VarlenDataset.__getitem__` dispatches on the return type to pick
     a tokenization path that skips chat templating and prompt masking.
     """
-    text = sample.get("text") or ""
-    if not isinstance(text, str):
-        raise ValueError(
-            f"VarlenDataset (pretrain-text schema): 'text' must be a string, "
-            f"got {type(text).__name__}."
-        )
-    return text
+    return _first_present(sample, _PRETRAIN_TEXT_FIELDS) or ""
 
 
 def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]], Any], str]:
     """Pick a sample converter based on dataset column names.
 
     Priority (most explicit first): openai-messages > sharegpt > alpaca/dolly
-    > pretrain-text. ``pretrain-text`` is the fallback for datasets that
-    only carry a single ``text`` column (e.g. Dolma / OLMo midtraining
-    corpora) — long-context pretraining packed through the same THD path
-    as SFT.
+    > pretrain-text. ``pretrain-text`` is the fallback for datasets whose
+    document body is stored in ``text`` (e.g. Dolma / OLMo), ``raw_content``
+    (RedPajama V2 / RP2), or ``content`` (CodeForge) — long-context
+    pretraining packed through the same THD path as SFT.
     """
     cols = set(column_names)
     if "messages" in cols:
@@ -404,7 +402,7 @@ def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]
     has_out = any(f in cols for f in _OUTPUT_FIELDS)
     if has_instr and has_out:
         return _alpaca_to_messages, "alpaca"
-    if "text" in cols:
+    if any(field in cols for field in _PRETRAIN_TEXT_FIELDS):
         return _raw_text_loader, "pretrain-text"
     raise ValueError(
         "VarlenDataset cannot infer schema from columns "
@@ -412,7 +410,7 @@ def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]
         f"alpaca/dolly ({'|'.join(_INSTRUCTION_FIELDS)} + "
         f"{'|'.join(_OUTPUT_FIELDS)} [+ optional {'|'.join(_EXTRA_INPUT_FIELDS)}]), "
         "sharegpt (conversations), openai-messages (messages), "
-        "pretrain-text (text)."
+        f"pretrain-text ({'|'.join(_PRETRAIN_TEXT_FIELDS)})."
     )
 
 

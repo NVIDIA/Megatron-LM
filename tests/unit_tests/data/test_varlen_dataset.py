@@ -378,9 +378,10 @@ def test_sharegpt_rejects_list_value():
 # ----------------------------------------------------------------------------
 
 
-def test_raw_text_loader_returns_string():
-    """``text``-column samples are returned as plain strings (not messages)."""
-    out = _raw_text_loader({"text": "Once upon a time...", "id": "doc-1"})
+@pytest.mark.parametrize("field", ["text", "raw_content", "content"])
+def test_raw_text_loader_returns_string(field):
+    """Recognized pretraining columns are returned as plain strings (not messages)."""
+    out = _raw_text_loader({field: "Once upon a time...", "id": "doc-1"})
     assert isinstance(out, str)
     assert out == "Once upon a time..."
 
@@ -390,9 +391,15 @@ def test_raw_text_loader_handles_empty():
     assert _raw_text_loader({}) == ""
 
 
-def test_raw_text_rejects_non_string():
-    with pytest.raises(ValueError, match="must be a string"):
-        _raw_text_loader({"text": [1, 2, 3]})
+def test_raw_text_loader_uses_first_non_empty_alias():
+    sample = {"text": "", "raw_content": "RP2 body", "content": "CodeForge body"}
+    assert _raw_text_loader(sample) == "RP2 body"
+
+
+@pytest.mark.parametrize("field", ["text", "raw_content", "content"])
+def test_raw_text_rejects_non_string(field):
+    with pytest.raises(ValueError, match=rf"field '{field}' must be a string"):
+        _raw_text_loader({field: [1, 2, 3]})
 
 
 # ----------------------------------------------------------------------------
@@ -458,15 +465,30 @@ def test_select_converter_pretrain_text_with_metadata():
     assert name == "pretrain-text"
 
 
-def test_select_converter_alpaca_beats_pretrain_text():
-    """When both ``instruction``/``output`` and ``text`` are present (rare),
-    the alpaca schema is more specific and should win."""
-    fn, name = _select_converter(["text", "instruction", "output"])
+@pytest.mark.parametrize(
+    "columns",
+    [
+        ["raw_content", "doc_id", "meta", "quality_signals"],
+        ["content", "commit_id", "rel_path", "language"],
+    ],
+)
+def test_select_converter_pretrain_text_dataset_aliases(columns):
+    """RP2 and CodeForge expose non-canonical names for their document bodies."""
+    fn, name = _select_converter(columns)
+    assert name == "pretrain-text"
+    assert fn is _raw_text_loader
+
+
+@pytest.mark.parametrize("raw_text_field", ["text", "raw_content", "content"])
+def test_select_converter_alpaca_beats_pretrain_text(raw_text_field):
+    """Alpaca fields are more specific than any raw pretraining-text alias."""
+    fn, name = _select_converter([raw_text_field, "instruction", "output"])
     assert name == "alpaca"
 
 
-def test_select_converter_messages_beats_pretrain_text():
-    fn, name = _select_converter(["text", "messages"])
+@pytest.mark.parametrize("raw_text_field", ["text", "raw_content", "content"])
+def test_select_converter_messages_beats_pretrain_text(raw_text_field):
+    fn, name = _select_converter([raw_text_field, "messages"])
     assert name == "openai-messages"
 
 
@@ -584,6 +606,53 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     # Each item is a raw string, NOT a messages list.
     assert ll[0] == "Doc one body..."
     assert ll[1] == "Doc two body..."
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [
+        (
+            [
+                {
+                    "raw_content": "RP2 document one",
+                    "doc_id": "rp2-1",
+                    "meta": "{}",
+                    "quality_signals": "{}",
+                },
+                {
+                    "raw_content": "RP2 document two",
+                    "doc_id": "rp2-2",
+                    "meta": "{}",
+                    "quality_signals": "{}",
+                },
+            ],
+            ["RP2 document one", "RP2 document two"],
+        ),
+        (
+            [
+                {
+                    "content": "CodeForge source one",
+                    "commit_id": "abc1234",
+                    "rel_path": "one.py",
+                    "language": "Python",
+                },
+                {
+                    "content": "CodeForge source two",
+                    "commit_id": "def5678",
+                    "rel_path": "two.cpp",
+                    "language": "C++",
+                },
+            ],
+            ["CodeForge source one", "CodeForge source two"],
+        ),
+    ],
+)
+def test_low_level_loads_jsonl_pretrain_text_dataset_aliases(tmp_path, rows, expected):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    low_level = VarlenLowLevelDataset(_write_jsonl(tmp_path, rows))
+    assert low_level.schema_name == "pretrain-text"
+    assert [low_level[index] for index in range(len(low_level))] == expected
 
 
 class _FakeHubDataset:
