@@ -900,14 +900,18 @@ class TestMTPHiddenStateRollUnderParallelism:
 
     @classmethod
     def _local_global_positions(
-        cls, cp_group, tp_group, sequence_parallel, cu_seqlens, cu_seqlens_padded=None
+        cls,
+        cp_group,
+        tp_group,
+        sequence_parallel,
+        cu_seqlens,
+        cu_seqlens_padded=None,
+        cp_layout="zigzag",
     ):
         """Return the global token positions this rank owns, in local order.
 
-        Reproduces the production sharding: ``get_batch_on_this_cp_rank`` applies the
-        context-parallel layout (per-sequence zigzag, or per-document zigzag when the
-        batch is packed), then the sequence-parallel scatter keeps a contiguous 1/tp
-        slice of what remains (``tensor_parallel.mappings._split_along_first_dim``).
+        Reproduces the production CP layout, then keeps the sequence-parallel rank's
+        contiguous 1/tp slice of the local result.
         """
         positions = torch.arange(cls.SEQ_LENGTH, device="cuda").view(1, cls.SEQ_LENGTH)
         batch = {
@@ -917,7 +921,12 @@ class TestMTPHiddenStateRollUnderParallelism:
                 None if cu_seqlens_padded is None else cu_seqlens_padded.view(1, -1)
             ),
         }
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(
+            batch,
+            is_hybrid_cp=False,
+            cp_group=cp_group,
+            use_contiguous_cp=cp_layout == "contiguous",
+        )
         positions = batch["tokens"][0]
         if sequence_parallel:
             positions = positions.chunk(get_pg_size(tp_group))[get_pg_rank(tp_group)]
@@ -1319,6 +1328,90 @@ class TestMTPHiddenStateRollUnderParallelism:
             cu_seqlens=cu_seqlens,
             sequence_parallel=sequence_parallel,
             num_depths=self.MTP_NUM_LAYERS,
+        )
+
+    @pytest.mark.parametrize(
+        ("packed", "padded", "sequence_parallel"),
+        [
+            (False, False, False),
+            (True, False, False),
+            (True, True, False),
+            (True, False, True),
+            (True, True, True),
+        ],
+    )
+    def test_hsm_roll_supports_contiguous_cp(self, monkeypatch, packed, padded, sequence_parallel):
+        """Contiguous CP keeps HSM candidates aligned, including packed SP shards."""
+        tp, cp = (2 if sequence_parallel else 1), 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp} x CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_heads=self.HIDDEN_SIZE,
+            mtp_num_layers=self.MTP_NUM_LAYERS,
+            mtp_hsm=True,
+            tensor_model_parallel_size=tp,
+            context_parallel_size=cp,
+            sequence_parallel=sequence_parallel,
+            linear_cp_layout="contiguous",
+        )
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        cu_seqlens = None
+        cu_seqlens_padded = None
+        packed_seq_params = None
+        if packed:
+            final_cu_seqlen = 20 if padded else self.SEQ_LENGTH
+            cu_seqlens = torch.tensor([0, 10, final_cu_seqlen], dtype=torch.int32, device="cuda")
+            if padded:
+                cu_seqlens_padded = torch.tensor(
+                    [0, 16, self.SEQ_LENGTH], dtype=torch.int32, device="cuda"
+                )
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                qkv_format="thd",
+            )
+
+        global_positions = self._local_global_positions(
+            cp_group,
+            tp_group,
+            sequence_parallel,
+            cu_seqlens,
+            cu_seqlens_padded=cu_seqlens_padded,
+            cp_layout="contiguous",
+        )
+        batch_size = 1
+        hidden_states = self._base_values(global_positions, batch_size)
+        rolled_history, mixed_states, layer_inputs, output = self._run_hsm_block(
+            monkeypatch,
+            config,
+            hidden_states,
+            cp_group,
+            tp_group,
+            sequence_parallel,
+            packed_seq_params=packed_seq_params,
+            force_oldest_selection=True,
+        )
+
+        self._assert_history_stays_aligned(
+            rolled_history,
+            mixed_states,
+            layer_inputs,
+            output,
+            hidden_states,
+            global_positions,
+            batch_size,
+            cu_seqlens,
+            sequence_parallel,
+            self.MTP_NUM_LAYERS,
+            cu_seqlens_padded=cu_seqlens_padded,
         )
 
     def test_shard_boundary_translation_handles_production_packed_params(self):
@@ -2297,6 +2390,72 @@ class TestMultiTokenPrediction:
         ).cuda()
         assert torch.equal(rolled, expected)
         Utils.destroy_model_parallel()
+
+    def test_roll_tensor_with_contiguous_cp(self):
+        """Contiguous CP receives the next rank's first token at each shard boundary."""
+        cp = 4
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+
+        global_tensor = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14, 15, 16, 17, 18]], device="cuda"
+        )
+        local_tensor = global_tensor.chunk(cp, dim=-1)[cp_rank].contiguous()
+        expected = torch.roll(global_tensor, shifts=-1, dims=-1)
+        expected[:, -1] = 0
+        expected = expected.chunk(cp, dim=-1)[cp_rank]
+
+        rolled, rolled_sum = roll_tensor(
+            local_tensor, shifts=-1, dims=-1, cp_group=cp_group, cp_layout="contiguous"
+        )
+
+        torch.testing.assert_close(rolled, expected)
+        torch.testing.assert_close(rolled_sum, expected.sum())
+
+    @pytest.mark.parametrize("padded", [False, True])
+    def test_roll_tensor_with_contiguous_cp_packed_sequences(self, padded):
+        """Packed contiguous CP stops at document ends and ignores physical padding."""
+        cp = 4
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+
+        if padded:
+            global_tensor = torch.tensor([1, 2, 3, 4, 5, 99, 11, 12], device="cuda")
+            cu_seqlens = torch.tensor([0, 5, 7], dtype=torch.int32, device="cuda")
+            physical_cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32, device="cuda")
+            expected = torch.tensor([2, 3, 4, 5, 0, 0, 12, 0], device="cuda")
+        else:
+            global_tensor = torch.tensor([1, 2, 3, 4, 5, 6, 11, 12], device="cuda")
+            cu_seqlens = torch.tensor([0, 6, 8], dtype=torch.int32, device="cuda")
+            physical_cu_seqlens = None
+            expected = torch.tensor([2, 3, 4, 5, 6, 0, 12, 0], device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=physical_cu_seqlens,
+            cu_seqlens_kv_padded=physical_cu_seqlens,
+            qkv_format="thd",
+        )
+        local_tensor = global_tensor.chunk(cp)[cp_rank].contiguous()
+        expected = expected.chunk(cp)[cp_rank]
+
+        rolled, rolled_sum = roll_tensor(
+            local_tensor,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            cp_layout="contiguous",
+        )
+
+        torch.testing.assert_close(rolled, expected)
+        torch.testing.assert_close(rolled_sum, expected.sum())
 
     def test_process_mtp_loss_skips_when_no_labels_and_no_input_ids(self):
         """When labels and input_ids are both None, MTP loss is skipped (early return)."""

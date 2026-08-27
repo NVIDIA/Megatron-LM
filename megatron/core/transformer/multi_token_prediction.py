@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.context_parallel import CPLayout
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -212,7 +213,15 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None, return_sum=True):
+def roll_tensor(
+    tensor,
+    shifts=-1,
+    dims=-1,
+    cp_group=None,
+    packed_seq_params=None,
+    return_sum=True,
+    cp_layout: CPLayout = "zigzag",
+):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -221,8 +230,8 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     boundary conditions.
 
     For CP=1 (default behavior): Uses standard torch.roll with zero padding
-    For CP>1: Splits tensor into chunks, performs rolling within each chunk, then exchanges
-    boundary elements between adjacent CP ranks to maintain sequence continuity.
+    For CP>1: Rolls within each local shard and exchanges boundary elements between adjacent
+    CP ranks according to the configured layout.
 
     For packed sequences: Respects sequence boundaries when rolling to avoid mixing tokens
     from different sequences.
@@ -237,6 +246,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
                                             If provided, respects sequence boundaries.
         return_sum (bool): Whether to calculate and return the rolled tensor sum.
                            Defaults to True.
+        cp_layout (CPLayout): Layout of the context-parallel sequence shards.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor). The sum is None when disabled.
     """
@@ -246,13 +256,24 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     # Handle packed sequences cases
     if packed_seq_params is not None:
         return _roll_tensor_packed_seq(
-            tensor, shifts, dims, packed_seq_params, cp_group, return_sum=return_sum
+            tensor,
+            shifts,
+            dims,
+            packed_seq_params,
+            cp_group,
+            return_sum=return_sum,
+            cp_layout=cp_layout,
         )
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
         rolled_tensor.select(dims, shifts).fill_(0)
+        rolled_sum = rolled_tensor.sum() if return_sum else None
+        return rolled_tensor, rolled_sum
+
+    if cp_layout == "contiguous":
+        rolled_tensor = _roll_tensor_contiguous_cp(tensor, shifts, dims, cp_group)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
@@ -319,8 +340,36 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     return rolled_tensor, rolled_sum
 
 
+def _roll_tensor_contiguous_cp(tensor, shifts, dims, cp_group):
+    """Roll a contiguous CP shard and receive its continuation from the next rank."""
+    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+    send_tensor = tensor.select(dims, 0).contiguous()
+    recv_tensor = torch.empty_like(send_tensor)
+
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = get_pg_rank(cp_group)
+    ops = []
+    if local_rank != 0:
+        ops.append(torch.distributed.isend(tensor=send_tensor, dst=global_ranks[local_rank - 1]))
+    if local_rank != len(global_ranks) - 1:
+        ops.append(torch.distributed.irecv(tensor=recv_tensor, src=global_ranks[local_rank + 1]))
+    else:
+        recv_tensor.zero_()
+    for op in ops:
+        op.wait()
+
+    rolled_tensor.select(dims, shifts).copy_(recv_tensor)
+    return rolled_tensor
+
+
 def _roll_tensor_packed_seq(
-    tensor, shifts, dims, packed_seq_params, cp_group=None, return_sum=True
+    tensor,
+    shifts,
+    dims,
+    packed_seq_params,
+    cp_group=None,
+    return_sum=True,
+    cp_layout: CPLayout = "zigzag",
 ):
     """Roll tensor with packed sequence support.
     This function handles rolling for packed sequences by respecting sequence boundaries
@@ -335,9 +384,13 @@ def _roll_tensor_packed_seq(
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
 
-    rolled_tensor = tensor.clone()
-
     cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_layout == "contiguous":
+        return _roll_tensor_packed_seq_contiguous(
+            tensor, shifts, dims, packed_seq_params, cp_group, return_sum
+        )
+
+    rolled_tensor = tensor.clone()
     if cp_size == 1:
         # CP disabled: roll each packed sequence independently within its boundaries
         for i in range(len(cu_seqlens) - 1):
@@ -427,11 +480,56 @@ def _roll_tensor_packed_seq(
     return rolled_tensor, rolled_sum
 
 
+def _roll_tensor_packed_seq_contiguous(
+    tensor, shifts, dims, packed_seq_params, cp_group, return_sum
+):
+    """Roll contiguous CP shards without crossing packed-sequence boundaries."""
+    cp_size = get_pg_size(cp_group)
+    if cp_size == 1:
+        rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+        rolled_tensor.select(dims, shifts).zero_()
+    else:
+        rolled_tensor = _roll_tensor_contiguous_cp(tensor, shifts, dims, cp_group)
+    cu_seqlens = packed_seq_params.cu_seqlens_q.to(device=tensor.device)
+    physical_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+    if physical_cu_seqlens is None:
+        physical_cu_seqlens = cu_seqlens
+    else:
+        physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
+
+    cp_rank = get_pg_rank(cp_group)
+    local_token_count = tensor.size(dims)
+    global_positions = torch.arange(
+        cp_rank * local_token_count,
+        (cp_rank + 1) * local_token_count,
+        dtype=physical_cu_seqlens.dtype,
+        device=tensor.device,
+    )
+    physical_starts = physical_cu_seqlens[:-1]
+    physical_ends = physical_cu_seqlens[1:]
+    valid_ends = physical_starts + cu_seqlens[1:] - cu_seqlens[:-1]
+    document_indices = torch.searchsorted(physical_ends, global_positions, right=True)
+    within_packed_tokens = document_indices < physical_starts.numel()
+    document_indices = document_indices.clamp_max(physical_starts.numel() - 1)
+    has_continuation = (
+        within_packed_tokens
+        & (global_positions >= physical_starts[document_indices])
+        & (global_positions + 1 < valid_ends[document_indices])
+    )
+    mask_shape = [1] * tensor.dim()
+    mask_shape[dims] = local_token_count
+    rolled_tensor.masked_fill_(~has_continuation.view(mask_shape), 0)
+
+    rolled_sum = rolled_tensor.sum() if return_sum else None
+    return rolled_tensor, rolled_sum
+
+
 def _packed_seq_params_for_local_hsm_roll(
     packed_seq_params: PackedSeqParams,
     local_seq_length: int,
     cp_group: Optional[torch.distributed.ProcessGroup],
     tp_group: Optional[torch.distributed.ProcessGroup],
+    cp_layout: CPLayout = "zigzag",
 ) -> Optional[PackedSeqParams]:
     """Re-express packed document boundaries in this HSM roll's local frame.
 
@@ -455,6 +553,38 @@ def _packed_seq_params_for_local_hsm_roll(
     if cu_seqlens is None:
         return None
     padded = packed_seq_params.cu_seqlens_q_padded
+    if cp_layout == "contiguous":
+        physical_cu_seqlens = padded if padded is not None else cu_seqlens
+        physical_starts = physical_cu_seqlens[:-1]
+        physical_ends = physical_cu_seqlens[1:]
+        valid_ends = physical_cu_seqlens[:-1] + cu_seqlens[1:] - cu_seqlens[:-1]
+        tp_size = get_pg_size(tp_group)
+        shard_rank = get_pg_rank(cp_group) * tp_size + get_pg_rank(tp_group)
+        window_start = shard_rank * local_seq_length
+        window_end = window_start + local_seq_length
+        local_physical_lengths = (
+            torch.minimum(physical_ends, physical_ends.new_tensor(window_end))
+            - torch.maximum(physical_starts, physical_starts.new_tensor(window_start))
+        ).clamp_min(0)
+        local_valid_lengths = (
+            torch.minimum(valid_ends, valid_ends.new_tensor(window_end))
+            - torch.maximum(physical_starts, physical_starts.new_tensor(window_start))
+        ).clamp_min(0)
+        zero = cu_seqlens.new_zeros(1)
+        local_cu_seqlens = torch.cat((zero, local_valid_lengths.cumsum(0, dtype=cu_seqlens.dtype)))
+        local_cu_seqlens_padded = torch.cat(
+            (zero, local_physical_lengths.cumsum(0, dtype=cu_seqlens.dtype))
+        )
+        return replace(
+            packed_seq_params,
+            cu_seqlens_q=local_cu_seqlens,
+            cu_seqlens_kv=local_cu_seqlens,
+            cu_seqlens_q_padded=local_cu_seqlens_padded,
+            cu_seqlens_kv_padded=local_cu_seqlens_padded,
+            total_tokens=None,
+            seq_idx=None,
+        )
+
     if padded is not None and padded is not cu_seqlens:
         cp_size = get_pg_size(cp_group)
         cp_rank = get_pg_rank(cp_group)
@@ -987,7 +1117,12 @@ def process_mtp_loss(
         if input_ids is None:
             return hidden_states
         labels, _ = roll_tensor(
-            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            input_ids,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            cp_layout=config.linear_cp_layout,
         )
         derived_labels_from_input_ids = True
 
@@ -1005,7 +1140,12 @@ def process_mtp_loss(
         # label is fabricated (zeroed). Roll loss_mask in lockstep with the
         # input_ids -> labels shift so that boundary position is masked.
         loss_mask, _ = roll_tensor(
-            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            loss_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            cp_layout=config.linear_cp_layout,
         )
 
     # Store the original number of tokens before rolling for proper normalization
@@ -1022,10 +1162,20 @@ def process_mtp_loss(
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
-            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            mtp_labels,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            cp_layout=config.linear_cp_layout,
         )
         loss_mask, num_tokens = roll_tensor(
-            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            loss_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            cp_layout=config.linear_cp_layout,
         )
 
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
@@ -1331,6 +1481,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             dims=-1,
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
+            cp_layout=self.config.linear_cp_layout,
         )
         position_ids, _ = roll_tensor(
             position_ids,
@@ -1338,6 +1489,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             dims=-1,
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
+            cp_layout=self.config.linear_cp_layout,
         )
         if padding_mask is not None:
             padding_mask, _ = roll_tensor(
@@ -1346,6 +1498,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
+                cp_layout=self.config.linear_cp_layout,
             )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
@@ -2165,13 +2318,16 @@ class MultiTokenPredictionBlock(MegatronModule):
                         padded_cu_seqlens is not None
                         and padded_cu_seqlens is not packed_seq_params.cu_seqlens_q
                     )
-                    use_local_packed_roll = use_local_packed_roll or genuinely_padded
+                    use_local_packed_roll = use_local_packed_roll or (
+                        genuinely_padded and self.config.linear_cp_layout == "zigzag"
+                    )
                 if use_local_packed_roll and packed_seq_params is not None:
                     shard_params = _packed_seq_params_for_local_hsm_roll(
                         packed_seq_params,
                         local_seq_length=sequence_length,
                         cp_group=self.cp_group,
                         tp_group=self.tp_group if self.sequence_parallel else None,
+                        cp_layout=self.config.linear_cp_layout,
                     )
                     if shard_params is not None:
                         roll_packed_seq_params = shard_params
@@ -2182,6 +2338,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     cp_group=None if use_local_packed_roll else self.cp_group,
                     packed_seq_params=roll_packed_seq_params,
                     return_sum=False,
+                    cp_layout=self.config.linear_cp_layout,
                 )
                 rolled_older_hidden_states = rolled.reshape(
                     num_entries, batch_size, hidden_size, sequence_length
