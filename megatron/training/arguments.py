@@ -2237,6 +2237,29 @@ def _add_inference_args(parser):
                        'score = alpha * match + (1 - alpha) * normalized_load. '
                        'Higher alpha favors prefix cache hits; lower alpha '
                        'favors load balance. Default: 0.5.')
+    group.add_argument('--inference-dynamic-batching-media-cache-coordinator-policy',
+                       type=str, default='affinity',
+                       choices=['affinity', 'load_balanced'],
+                       dest='inference_dynamic_batching_media_cache_coordinator_policy',
+                       help='Coordinator routing policy for media caching. '
+                       '"affinity" prefers a rank assigned the same media; '
+                       '"load_balanced" ignores standalone media affinity.')
+    group.add_argument('--inference-dynamic-batching-media-cache-routing-weight',
+                       type=float, default=1.0,
+                       dest='inference_dynamic_batching_media_cache_routing_weight',
+                       help='Media-cache hit weight in equivalent compact-prompt blocks. '
+                       'Default: 1.0.')
+    group.add_argument('--inference-dynamic-batching-vision-embedding-cache-max-bytes',
+                       type=int, default=0,
+                       dest='inference_dynamic_batching_vision_embedding_cache_max_bytes',
+                       help='Maximum GPU bytes retained per engine for reusable vision '
+                       'embeddings. Zero disables the cache. Default: 0.')
+    group.add_argument('--inference-dynamic-batching-allow-stale-multimodal-embeddings',
+                       action='store_true',
+                       dest='inference_dynamic_batching_allow_stale_multimodal_embeddings',
+                       help='Allow request-local and cached multimodal embeddings to survive '
+                       'suspend/resume and generation-epoch changes. Use only when model '
+                       'weights do not change across these boundaries.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
                        type=float, default=None,
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',

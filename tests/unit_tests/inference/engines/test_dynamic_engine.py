@@ -39,8 +39,10 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     Status,
     compute_block_hashes_batched,
+    compute_media_cache_key,
 )
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -88,6 +90,206 @@ try:
     HAVE_GDP_DEPS = True
 except ImportError:
     HAVE_GDP_DEPS = False
+
+
+class _ImageOnlyCapabilityWrapper:
+    supports_text = True
+    supports_image = True
+    supports_video = False
+    supports_audio = False
+    validate_input_modalities = GPTInferenceWrapper.validate_input_modalities
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "modality"),
+    [
+        ({"imgs": torch.ones(1)}, "image"),
+        ({"imgs": torch.ones(1), "num_frames": torch.ones(1, dtype=torch.int64)}, "video"),
+    ],
+)
+def test_add_request_rejects_unsupported_media_before_tokenization(kwargs, modality):
+    engine = object.__new__(DynamicInferenceEngine)
+    wrapper = _ImageOnlyCapabilityWrapper()
+    if modality == "image":
+        wrapper.supports_image = False
+    engine.controller = mock.Mock(inference_wrapped_model=wrapper)
+
+    with pytest.raises(
+        ValueError, match=rf"_ImageOnlyCapabilityWrapper does not support {modality} inputs"
+    ):
+        engine.add_request(request_id=1, prompt=[1], **kwargs)
+
+    engine.controller.tokenize_prompt.assert_not_called()
+
+
+def test_validate_input_modalities_rejects_unsupported_audio():
+    wrapper = _ImageOnlyCapabilityWrapper()
+
+    with pytest.raises(ValueError, match="does not support audio inputs"):
+        wrapper.validate_input_modalities("audio")
+
+
+def _build_mock_vlm_engine(image_embeddings):
+    engine = object.__new__(DynamicInferenceEngine)
+    wrapper = mock.Mock()
+    wrapper._forward_vision_encoder.return_value = image_embeddings
+    wrapper.resolve_media_token_id.return_value = 99
+    controller = mock.Mock()
+    controller.pp_group = None
+    controller.inference_wrapped_model = wrapper
+    engine.controller = controller
+    engine.context = mock.Mock(block_size_tokens=256, enable_prefix_caching=False)
+    engine._get_cached_vision_embedding = mock.Mock(return_value=None)
+    engine._cache_vision_embedding = mock.Mock()
+    return engine, wrapper
+
+
+def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded):
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        return engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            imgs=torch.ones(1, 2, 4),
+            num_tiles=None,
+            num_img_embeddings_per_tile=0,
+            imgs_sizes=torch.tensor([[2, 2]]),
+            media_tokens_preexpanded=media_tokens_preexpanded,
+        )
+
+
+@pytest.mark.parametrize(
+    ("media_kwargs", "error"),
+    [
+        (
+            {"num_frames": torch.tensor([2])},
+            "Video input requires imgs, imgs_sizes, and num_frames",
+        ),
+        (
+            {"imgs_sizes": torch.tensor([[2, 2]])},
+            "Dynamic-resolution image input requires imgs and imgs_sizes",
+        ),
+        (
+            {"imgs": torch.ones(1, 2, 4), "num_tiles": torch.tensor([1])},
+            "Static-tiling image input requires imgs, num_tiles",
+        ),
+    ],
+)
+def test_build_vlm_request_rejects_incomplete_media(media_kwargs, error):
+    engine, _ = _build_mock_vlm_engine(torch.ones(2, 4))
+    kwargs = {
+        "imgs": None,
+        "num_tiles": None,
+        "num_img_embeddings_per_tile": 0,
+        "imgs_sizes": None,
+        "num_frames": None,
+    }
+    kwargs.update(media_kwargs)
+
+    with pytest.raises(ValueError, match=error):
+        engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=torch.tensor([10, 20], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            **kwargs,
+        )
+
+
+def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    tokens = torch.tensor([10, 99, 99, 20], dtype=torch.int64)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+
+    request = _call_build_vlm_request(engine, tokens, media_tokens_preexpanded=True)
+
+    assert torch.equal(request.prompt_tokens, tokens)
+    assert request.compact_prompt_tokens is None
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    wrapper.expand_image_tokens.assert_not_called()
+    wrapper.resolve_media_token_id.assert_not_called()
+    wrapper.build_preexpanded_media_token_mask.assert_called_once_with(tokens, "image")
+
+
+def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(1, 4))
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+
+    with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
+        _call_build_vlm_request(
+            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+        )
+
+
+def test_build_vlm_request_validates_cached_embedding_count_once():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine._get_cached_vision_embedding.return_value = torch.ones(1, 4)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+
+    with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
+        _call_build_vlm_request(
+            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+        )
+
+    wrapper._forward_vision_encoder.assert_not_called()
+
+
+def test_build_vlm_request_keeps_compact_expansion_path():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    compact_tokens = torch.tensor([10, 42, 20], dtype=torch.int64)
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
+
+    wrapper.expand_image_tokens.assert_called_once()
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert torch.equal(encoder_args[0], torch.ones(1, 2, 4))
+    assert encoder_kwargs["num_image_tiles"] is None
+    assert torch.equal(encoder_kwargs["imgs_sizes"], torch.tensor([[2, 2]]))
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+
+def test_build_vlm_request_preserves_adjacent_compact_media_placeholders():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    compact_tokens = torch.tensor([10, 42, 42, 20], dtype=torch.int64)
+    # The expanded sequence is structurally ambiguous: it could also represent
+    # one placeholder expanded to two positions. The saved compact prompt is
+    # therefore required for lossless multi-turn reconstruction.
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
+
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
+
+
+def test_build_vlm_request_enables_media_salted_prefix_caching():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine.context.enable_prefix_caching = True
+    engine.context.block_size_tokens = 2
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
+    )
+
+    media_cache_key = compute_media_cache_key(
+        "image", {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}
+    )
+    assert request.enable_prefix_caching
+    assert request.block_hash_salt == media_cache_key
+    assert request.precomputed_block_hashes == compute_block_hashes_batched(
+        request.prompt_tokens, block_size=2, cache_salt=media_cache_key
+    )
 
 
 def teardown_module(module):
@@ -789,6 +991,8 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
     engine._add_request = mock.Mock()
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
@@ -814,6 +1018,87 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed
+
+
+def test_vision_state_invalidation_marks_request_local_embeddings_stale():
+    request = DynamicVLMInferenceRequest(
+        request_id=31,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(2, 1, 4),
+        image_token_mask=torch.tensor([0, 1, -1]),
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_multimodal_embeddings = False
+    engine._vision_embedding_cache = {"media": request.image_embeddings}
+    engine._vision_embedding_cache_bytes = request.image_embeddings.numel() * 4
+    engine.requests = {
+        request.request_id: types.SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(request)
+        )
+    }
+
+    engine._invalidate_vision_state()
+
+    assert not engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 0
+    assert request.image_embeddings is None
+    assert request.image_token_mask is None
+
+
+def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_multimodal_embeddings = True
+    engine._vision_embedding_cache = {"media": torch.ones(1)}
+    engine._vision_embedding_cache_bytes = 4
+    engine.requests = {}
+
+    engine._invalidate_vision_state()
+
+    assert "media" in engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 4
+
+
+def test_refresh_vlm_request_recomputes_embeddings_and_mask():
+    request = DynamicVLMInferenceRequest(
+        request_id=32,
+        prompt_tokens=torch.tensor([99, 99, 5, 7]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        block_hash_salt="media",
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=None,
+        image_token_mask=None,
+    )
+    wrapper = types.SimpleNamespace(
+        resolve_media_token_id=mock.Mock(return_value=99),
+        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
+    engine._cache_vision_embedding = mock.Mock()
+
+    engine._refresh_vlm_request_data(request)
+
+    assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
+    assert request.image_token_mask.tolist() == [0, 1, -1, -1]
+    engine.context.add_vlm_request_data.assert_called_once_with(
+        request.request_id,
+        image_embeddings=request.image_embeddings,
+        image_token_mask=request.image_token_mask,
+    )
 
 
 def test_streaming_partials_are_sent():
