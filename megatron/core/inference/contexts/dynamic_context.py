@@ -3213,9 +3213,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_skip_tokens > 0
             ):
                 usable = self._find_mamba_match_count(
-                    req=req,
-                    start_block=0,
-                    end_block=prefix_skip_tokens // self.block_size_tokens,
+                    req=req, start_block=0, end_block=prefix_skip_tokens // self.block_size_tokens
                 )
                 prefix_skip_tokens = usable * self.block_size_tokens
 
