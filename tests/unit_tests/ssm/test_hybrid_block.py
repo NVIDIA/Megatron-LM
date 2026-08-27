@@ -53,6 +53,7 @@ class TestHybridBlock:
             required_pgs=[
                 'tp',
                 'pp',
+                'embd',
                 'cp',
                 'ep',
                 'expt_tp',
