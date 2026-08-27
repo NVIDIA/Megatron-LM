@@ -22,29 +22,31 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
+    LAYER_CONFIG_MAP = {
+        MAMBA: MambaLayerConfig,
+        GDN: GDNLayerConfig,
+        ATTENTION: AttentionLayerConfig,
+        DS_ATTENTION: DSALayerConfig,
+        MLA: MLALayerConfig,
+        MLP: MLPLayerConfig,
+        MOE: MoELayerConfig,
+    }
     ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA}
+
+    @classmethod
+    def is_valid_layer(cls, layer_symbol: str) -> bool:
+        """Return whether ``layer_symbol`` identifies a supported hybrid layer."""
+        return layer_symbol in cls.LAYER_CONFIG_MAP
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
         """Return valid layer symbols sorted by their public attribute names."""
         valid_layer_attrs = []
         for name, value in vars(cls).items():
-            if not name.startswith('_') and value in cls.VALID_LAYERS:
+            if not name.startswith('_') and isinstance(value, str) and cls.is_valid_layer(value):
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
-
-
-_LAYER_CONFIG_TYPES = (
-    (Symbols.MAMBA, MambaLayerConfig),
-    (Symbols.GDN, GDNLayerConfig),
-    (Symbols.ATTENTION, AttentionLayerConfig),
-    (Symbols.DS_ATTENTION, DSALayerConfig),
-    (Symbols.MLA, MLALayerConfig),
-    (Symbols.MLP, MLPLayerConfig),
-    (Symbols.MOE, MoELayerConfig),
-)
 
 
 def create_layer_config(config: TransformerConfig, layer_symbol: str) -> TransformerConfig:
@@ -60,10 +62,9 @@ def create_layer_config(config: TransformerConfig, layer_symbol: str) -> Transfo
     Raises:
         ValueError: If ``layer_symbol`` does not identify a supported hybrid layer.
     """
-    for symbol, config_type in _LAYER_CONFIG_TYPES:
-        if layer_symbol == symbol:
-            return config_type.from_config(config)
-    raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
+    if not Symbols.is_valid_layer(layer_symbol):
+        raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
+    return Symbols.LAYER_CONFIG_MAP[layer_symbol].from_config(config)
 
 
 def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
@@ -78,7 +79,7 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     Raises:
         ValueError: If the exact config type is unsupported.
     """
-    for symbol, config_type in _LAYER_CONFIG_TYPES:
+    for symbol, config_type in Symbols.LAYER_CONFIG_MAP.items():
         if type(layer_config) is config_type:
             return symbol
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")

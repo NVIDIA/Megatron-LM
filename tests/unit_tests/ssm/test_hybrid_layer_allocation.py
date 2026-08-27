@@ -152,9 +152,9 @@ class TestValidateSegmentLayers:
         _assert_layer_config_types(layer_config_list, layer_symbol)
 
     def test_all_layer_symbols_have_an_expected_config_class(self):
-        assert set(_EXPECTED_LAYER_CONFIG_CLASSES) == Symbols.VALID_LAYERS
-        assert Symbols.PIPE not in _EXPECTED_LAYER_CONFIG_CLASSES
-        assert Symbols.MTP_SEPARATOR not in _EXPECTED_LAYER_CONFIG_CLASSES
+        assert Symbols.LAYER_CONFIG_MAP == _EXPECTED_LAYER_CONFIG_CLASSES
+        assert not Symbols.is_valid_layer(Symbols.PIPE)
+        assert not Symbols.is_valid_layer(Symbols.MTP_SEPARATOR)
 
     def test_repeated_layers_receive_independent_config_copies(self):
         self.config.test_mutable_value = {"items": []}
@@ -925,7 +925,7 @@ class TestGetLayerMapsFromLayerTypeList:
             [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
         )
         # We always get all symbols, not only those contained in the pattern.
-        assert len(maps) == len(Symbols.VALID_LAYERS)
+        assert len(maps) == len(Symbols.LAYER_CONFIG_MAP)
         attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
             Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
         )(maps)
