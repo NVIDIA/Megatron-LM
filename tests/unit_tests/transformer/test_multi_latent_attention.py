@@ -438,6 +438,66 @@ class TestParallelMLAAttention:
                 assert output.shape[2] == transformer_config.hidden_size
                 assert bias.shape[0] == transformer_config.hidden_size
 
+    @pytest.mark.parametrize("pad_unpacked", [False, True])
+    def test_gpu_forward_qv_head_dim_mismatch_unpacked(self, pad_unpacked):
+        """Test the unpacked MLA path when q and v head dimensions differ."""
+        if is_te_min_version("1.10.0"):
+            transformer_config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=64,
+                qk_pos_emb_head_dim=64,
+                mla_pad_v_head_dim_unpacked=pad_unpacked,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=self.transformer_config.rotary_base,
+                original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
+            )
+            mismatch_attention = MLASelfAttention(
+                transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            sequence_length = 32
+            micro_batch_size = 1
+
+            mismatch_attention.cuda().bfloat16()
+
+            # [sequence length, batch size, hidden size]
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, transformer_config.hidden_size)
+            )
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            query, key, value, _, _ = mismatch_attention.get_query_key_value_tensors(
+                hidden_states, None, None, None, None
+            )
+            assert query.shape[-1] != value.shape[-1]
+
+            prepared_value, need_v_pad, orig_v_dim, padded_v_dim = (
+                mla_module._prepare_mla_core_attention_value(
+                    mismatch_attention, query, value, None
+                )
+            )
+            assert need_v_pad == pad_unpacked
+            assert prepared_value.shape[-1] == (
+                query.shape[-1] if pad_unpacked else value.shape[-1]
+            )
+            assert orig_v_dim == transformer_config.v_head_dim
+
+            output, bias = mismatch_attention(hidden_states, None)
+
+            assert output.shape[0] == sequence_length
+            assert output.shape[1] == micro_batch_size
+            assert output.shape[2] == transformer_config.hidden_size
+            assert bias.shape[0] == transformer_config.hidden_size
+
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
             transformer_config = self.transformer_config

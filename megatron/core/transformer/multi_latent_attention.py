@@ -83,12 +83,12 @@ if TYPE_CHECKING:
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
-    """Prepare value tensor for MLA core attention THD execution."""
+    """Prepare value tensor for MLA core attention execution."""
     orig_v_dim = value.shape[-1] if value is not None else None
     padded_v_dim = orig_v_dim
+    is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
     need_v_pad = (
-        packed_seq_params is not None
-        and packed_seq_params.qkv_format == "thd"
+        (is_thd or parallel_attention.config.mla_pad_v_head_dim_unpacked)
         and parallel_attention.config.experimental_attention_variant is None
         and value is not None
         and query.shape[-1] != orig_v_dim
@@ -100,12 +100,16 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
 
 
 def _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim):
-    """Trim THD MLA core attention output back to the original V dimension."""
-    if need_v_pad:
-        if core_attn_out.ndim == 2:
-            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-1], -1, padded_v_dim)
-        core_attn_out = core_attn_out[..., :orig_v_dim]
-    return core_attn_out
+    """Trim MLA core attention output back to the original V dimension."""
+    if not need_v_pad:
+        return core_attn_out
+    if core_attn_out.ndim == 2:
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-1], -1, padded_v_dim)
+        return core_attn_out[..., :orig_v_dim]
+    # [s, b, h * padded_v_dim]: split the head dim out, or the slice cuts across heads.
+    core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-1], -1, padded_v_dim)
+    core_attn_out = core_attn_out[..., :orig_v_dim]
+    return core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
 
 @dataclass
@@ -260,7 +264,7 @@ class MultiLatentAttention(Attention):
         attn_mask_type=None,
         **extra_kwargs,
     ):
-        """Run MLA core attention with the THD value pad/trim workaround."""
+        """Run MLA core attention with the value pad/trim workaround."""
         value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
             self, query, value, packed_seq_params
         )

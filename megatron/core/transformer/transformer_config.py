@@ -3429,6 +3429,11 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    mla_pad_v_head_dim_unpacked: bool = False
+    """Pad V up to the QK head dim on the unpacked path, as the packed (thd) path already does.
+       Below compute capability 9.0 no attention backend has a kernel for unequal QK and V head
+       dims, so an unpadded MLA layer falls back to the unfused path."""
+
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
