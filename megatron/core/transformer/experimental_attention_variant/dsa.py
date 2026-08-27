@@ -296,8 +296,17 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        # MTP layers use global layer numbers beyond the decoder-layer count. Grow the
+        # tracker to the largest observed layer number so those losses remain addressable.
+        needed = max(num_layers, layer_number)
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < needed:
+            grown = torch.zeros(
+                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
@@ -312,16 +321,41 @@ class DSAIndexerLossLoggingHelper:
         tracker["avg_group"] = None
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(num_layers: Optional[int] = None):
+        """Collect and reduce the indexer losses across ranks.
+
+        Pipeline ranks can observe different highest layer numbers when MTP is placed on
+        only one stage. Negotiate one tracker size before reducing the loss values so every
+        rank enters the collective with the same tensor shape.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        if tracker.get("agreed_size") is not None:
+            size = tracker["agreed_size"]
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_tensor = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(
+                size_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
+            )
+            size = int(size_tensor.item())
+            tracker["agreed_size"] = size
+        if size == 0:
             return
+        if "values" not in tracker:
+            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -1554,23 +1588,31 @@ class DSAttention(MegatronModule):
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
 
-        self.layer_number = layer_number
+        self.layer_number = layer_number + self.config.num_layers if is_mtp_layer else layer_number
         self.index_topk = self.config.dsa_indexer_topk
         self.index_topk_freq = self.config.dsa_indexer_topk_freq or 1
         self.index_skip_topk_offset = self.config.dsa_indexer_skip_topk_offset or 0
         self.index_share = self.index_topk_freq > 1
         self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
-            layer_number, self.index_skip_topk_offset, self.index_topk_freq
+            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
+        self.mtp_index_share = self.config.dsa_mtp_index_kv_share and is_mtp_layer
+        if self.mtp_index_share and self.skip_topk:
+            raise ValueError(
+                "dsa_mtp_index_kv_share requires the repeated MTP layer to compute "
+                "its own top-k. Adjust dsa_indexer_skip_topk_offset/topk_freq so MTP layer "
+                f"{self.layer_number} is a computing layer."
+            )
         self.source_layer = (
             source_dsa_compute_layer(
-                layer_number, self.index_skip_topk_offset, self.index_topk_freq
+                self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
             )
             if self.index_share
-            else layer_number
+            else self.layer_number
         )
 
         if pg_collection is None:
@@ -1637,6 +1679,7 @@ class DSAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         up_v_weight: Optional[torch.Tensor] = None,
+        mtp_dsa_context=None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -1656,6 +1699,16 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        if self.mtp_index_share and mtp_dsa_context is None:
+            raise RuntimeError(
+                "The repeated MTP DSA layer requires an explicit per-iteration sharing context."
+            )
+        if not self.mtp_index_share and mtp_dsa_context is not None:
+            raise RuntimeError(
+                "Received an MTP DSA sharing context for an attention layer that is not "
+                "configured for MTP iteration sharing."
+            )
+        reuse_mtp_source = bool(mtp_dsa_context is not None and mtp_dsa_context.reuses_source)
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -1779,8 +1832,16 @@ class DSAttention(MegatronModule):
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
 
+        shared_key_is_tp_cp_global = (
+            reuse_mtp_source
+            and sequence_parallel_tp
+            and cp_size > 1
+            and key.size(0) == sequence_parallel_tp_full_rows * cp_size
+        )
         if sequence_parallel_tp:
-            if key.size(0) == local_sequence_rows:
+            if shared_key_is_tp_cp_global:
+                pass
+            elif key.size(0) == local_sequence_rows:
                 key = gather_from_sequence_parallel_region(key, group=tp_group)
             elif key.size(0) != sequence_parallel_tp_full_rows:
                 raise RuntimeError(
@@ -1864,6 +1925,11 @@ class DSAttention(MegatronModule):
 
         skv = key.size(0)
 
+        if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+            source_key = key
+        else:
+            source_key = None
+
         if not packed_thd and sequence_parallel_query_is_local:
             nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
                 position_ids, sq, query.device
@@ -1888,7 +1954,7 @@ class DSAttention(MegatronModule):
         qr = qr.detach()
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
-        computes_topk = not self.skip_topk
+        computes_topk = not self.skip_topk and not reuse_mtp_source
         use_indexer_loss = (
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
@@ -1958,7 +2024,15 @@ class DSAttention(MegatronModule):
             local_packed_cp_query_start = sequence_parallel_tp_row_start
             local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
-        if self.skip_topk:
+        if reuse_mtp_source:
+            if mtp_dsa_context.shared_tensors is None:
+                raise RuntimeError(
+                    f"MTP iteration {mtp_dsa_context.iteration} requires iteration-0 "
+                    "DSA KV/top-k tensors."
+                )
+            topk_indices = mtp_dsa_context.shared_tensors.topk_indices
+            topk_length = mtp_dsa_context.shared_tensors.optional_topk_length()
+        elif self.skip_topk:
             assert topk_holder is not None
             if self.source_layer not in topk_holder:
                 raise RuntimeError(
@@ -2034,7 +2108,7 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if use_fused_kernels and not self.index_share and not self.mtp_index_share:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2216,6 +2290,10 @@ class DSAttention(MegatronModule):
             topk_holder[self.layer_number] = topk_indices
             if topk_length_holder is not None and topk_length is not None:
                 topk_length_holder[self.layer_number] = topk_length
+
+        if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+            assert source_key is not None and topk_indices is not None
+            mtp_dsa_context.capture(source_key, topk_indices, topk_length)
 
         # ===================================
         # Run sparse attention kernel

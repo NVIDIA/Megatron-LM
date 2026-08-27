@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+    from megatron.core.transformer.multi_token_prediction import MTPDSAIterationContext
 
 import torch
 import torch.distributed
@@ -391,13 +392,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
             attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
+        self_attention_optional_kwargs = dict(attention_optional_kwargs)
+        if is_mtp_layer and config.dsa_mtp_index_kv_share:
+            self_attention_optional_kwargs["is_mtp_layer"] = True
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
             submodules.self_attention,
             config=self.config,
             layer_number=self.layer_number,
-            **attention_optional_kwargs,
+            **self_attention_optional_kwargs,
             name=(name + ".self_attention") if name is not None else None,
         )
 
@@ -627,6 +631,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        mtp_dsa_context: Optional[MTPDSAIterationContext] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -669,6 +674,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self._set_proj_residual(residual)
 
         nvtx_range_push(suffix="self_attention")
+        attention_variant_kwargs = {}
+        if mtp_dsa_context is not None:
+            attention_variant_kwargs["mtp_dsa_context"] = mtp_dsa_context
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
             attention_output_with_bias = self.self_attention(
                 input_layernorm_output,
@@ -681,6 +689,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **attention_variant_kwargs,
             )
         nvtx_range_pop(suffix="self_attention")
 

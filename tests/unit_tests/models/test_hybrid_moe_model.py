@@ -99,6 +99,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_topk_freq": 1,
     "dsa_indexer_use_sparse_loss": False,
     "dsa_kernel_backend": "none",
+    "dsa_mtp_index_kv_share": False,
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
