@@ -125,7 +125,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         conversation: List[Dict],
         return_target: bool,
         add_generation_prompt: bool,
-        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        chat_template_kwargs: Dict[str, Any] | None = None,
     ):
         """Convert a conversation to tokens. Needed for SFTTokenizer.
 
@@ -139,7 +139,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
-            chat_template_kwargs (Optional[Dict[str, Any]]): Additional keyword arguments passed
+            chat_template_kwargs (Dict[str, Any] | None): Additional keyword arguments passed
                 to the tokenizer's chat template.
         """
 
