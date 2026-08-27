@@ -125,6 +125,8 @@ def _has_nccl_cuda_backend(group: Any) -> bool:
         return True
     if group is None:
         return False
+    # NeMo RL's cross-world refit group keeps Gloo as its default for CPU
+    # object collectives and registers NCCL specifically for CUDA tensors.
     try:
         cuda_backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
     except RuntimeError:
