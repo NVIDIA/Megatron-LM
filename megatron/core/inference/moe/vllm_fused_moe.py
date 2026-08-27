@@ -231,9 +231,10 @@ class VllmFusedMoeBuffers:
 
     Allocated once at engine init (from DynamicInferenceContext) so the hot
     path performs no allocations inside CUDA graph capture, and every MoE
-    layer's graph shares this single buffer set. Without this, the intermediates are allocated inside each layer's
-    capture and recycled by the shared graph mempool's free-list reuse — same net
-    memory, but addresses then depend on allocator policy rather than being fixed.
+    layer's graph shares this single buffer set. Without this, the
+    intermediates are allocated inside each layer's capture and recycled by
+    the shared graph mempool's free-list reuse — same net memory, but
+    addresses then depend on allocator policy rather than being fixed.
 
     Sharing one set across all layers/graphs is safe because graph replays are
     serialized on one stream and each buffer is fully rewritten (gated by the
@@ -760,7 +761,7 @@ def vllm_fused_moe(
     if batch_invariant_mode:
         # Apply the activation separately below to match training-side rounding.
         fuse_squared_relu = False
-    
+
     intermediate1 = VllmFusedMoeBuffers.get(
         "intermediate1", (num_valid, N), hidden_states.dtype, hidden_states.device
     )
