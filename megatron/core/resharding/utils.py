@@ -53,6 +53,14 @@ class ParameterMetadata:
     # interleaves these blocks rather than doing a simple contiguous concat.
     partition_sizes: list[int] | None = None
 
+    # GTP shards dim 0 after any TP-local layout has been formed.
+    is_gtp: bool = False
+    # Ordered global ranks that own contiguous dim-0 shards. The list position
+    # determines each owner's GTP rank and therefore its shard offset.
+    gtp_remat_group_ranks: list[int] | None = None
+    # Alignment-only rows at the tail of the TP-local layout.
+    gtp_pad_length: int = 0
+
     # EP sharding info (fused/grouped MoE)
     is_ep: bool = False
     num_experts: Optional[int] = None
@@ -373,6 +381,12 @@ def extract_param_metadata(
     if partition_sizes is not None:
         partition_sizes = list(partition_sizes)
 
+    # GTP parameters carry their actual dense/expert rematerialization group
+    # directly. Prefer that over selecting a group by parameter name or model
+    # type because it is authoritative for both GTP and expert GTP.
+    is_gtp = bool(getattr(param, 'is_gtp_weight_remat', False))
+    gtp_pad_length = int(getattr(param, 'pad_length', 0)) if is_gtp else 0
+
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
 
@@ -386,6 +400,7 @@ def extract_param_metadata(
     )
 
     tensor_parallel_group_ranks: list[int] | None = None
+    gtp_remat_group_ranks: list[int] | None = None
     expert_parallel_group_ranks: list[int] | None = None
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
@@ -406,6 +421,12 @@ def extract_param_metadata(
     def _offset_ranks(ranks: list[int]) -> list[int]:
         result = [r + rank_offset for r in ranks] if rank_offset else ranks
         return _dedup_ranks(result)
+
+    if is_gtp:
+        gtp_group = getattr(param, 'group', None)
+        if gtp_group is None:
+            raise ValueError(f"GTP parameter {param_name!r} is missing its rematerialization group")
+        gtp_remat_group_ranks = _offset_ranks(dist.get_process_group_ranks(gtp_group))
 
     if is_ep or is_expert_param:
         if is_ep:
@@ -463,6 +484,9 @@ def extract_param_metadata(
         partition_dim=partition_dim,
         partition_stride=partition_stride,
         partition_sizes=partition_sizes,
+        is_gtp=is_gtp,
+        gtp_remat_group_ranks=gtp_remat_group_ranks,
+        gtp_pad_length=gtp_pad_length,
         is_ep=is_ep,
         num_experts=num_experts,
         owner_rank=owner_rank,

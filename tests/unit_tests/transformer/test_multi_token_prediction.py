@@ -31,6 +31,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
+from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
@@ -3078,3 +3079,52 @@ class TestMultiTokenPredictionHybrid:
                 pytest.fail(f"Attention mask validation failed for Mamba hybrid model: {e}")
             else:
                 raise
+
+
+class TestLearnedOutputContract:
+    """Tests for the learned n-stream to one-stream mHC contraction."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(_SEED)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_shape_and_dtype(self, dtype):
+        hidden_size, n_streams = 32, 4
+        hidden_states = torch.randn(8, 2, n_streams * hidden_size, device="cuda", dtype=dtype)
+        head_fn = torch.randn(n_streams, n_streams * hidden_size, device="cuda")
+        base = torch.zeros(n_streams, device="cuda")
+        scale = torch.ones(1, device="cuda")
+
+        output = learned_output_contract(hidden_states, head_fn, base, scale, n_streams, eps=1e-6)
+
+        assert output.shape == (8, 2, hidden_size)
+        assert output.dtype == dtype
+
+    def test_gradient_and_reference(self):
+        hidden_size, n_streams, eps = 8, 2, 1e-6
+        hidden_states = torch.randn(
+            2, 1, n_streams * hidden_size, device="cuda", dtype=torch.float32, requires_grad=True
+        )
+        head_fn = torch.randn(n_streams, n_streams * hidden_size, device="cuda", requires_grad=True)
+        base = torch.zeros(n_streams, device="cuda", requires_grad=True)
+        scale = torch.ones(1, device="cuda", requires_grad=True)
+
+        output = learned_output_contract(hidden_states, head_fn, base, scale, n_streams, eps)
+        rsqrt = torch.rsqrt(hidden_states.square().mean(-1, keepdim=True) + eps)
+        mixes = torch.nn.functional.linear(hidden_states, head_fn) * rsqrt
+        weights = torch.sigmoid(mixes * scale + base) + eps
+        expected = torch.sum(
+            weights.unsqueeze(-1)
+            * hidden_states.view(*hidden_states.shape[:-1], n_streams, hidden_size),
+            dim=-2,
+        )
+        torch.testing.assert_close(output, expected)
+
+        output.sum().backward()
+        for tensor in (hidden_states, head_fn, base, scale):
+            assert tensor.grad is not None
+            assert torch.count_nonzero(tensor.grad) > 0

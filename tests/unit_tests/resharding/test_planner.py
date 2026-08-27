@@ -8,8 +8,10 @@ isolation without requiring distributed init or GPU.
 """
 
 import math
+from itertools import product
 
 import pytest
+import torch
 
 import megatron.core.resharding.planner as planner
 from megatron.core.resharding.planner import (
@@ -20,6 +22,7 @@ from megatron.core.resharding.planner import (
     build_plan_from_rosters,
     index_metadata_rosters,
 )
+from megatron.core.resharding.shard_planner import plan_sharded_transfer
 from megatron.core.resharding.utils import ParameterMetadata, ShardingDescriptor
 
 # ---------------------------------------------------------------------------
@@ -38,11 +41,12 @@ def _meta(
     tp_ranks=None,
     dp_ranks=None,
     ep_ranks=None,
+    is_gtp=False,
+    gtp_ranks=None,
+    gtp_pad_length=0,
     resolved_name=None,
 ):
     """Create a ParameterMetadata for testing."""
-    import torch
-
     return ParameterMetadata(
         name=name,
         shape=shape,
@@ -52,12 +56,31 @@ def _meta(
         partition_dim=partition_dim,
         partition_stride=partition_stride,
         partition_sizes=partition_sizes,
+        is_gtp=is_gtp,
+        gtp_remat_group_ranks=gtp_ranks,
+        gtp_pad_length=gtp_pad_length,
         owner_rank=owner_rank,
         tensor_parallel_group_ranks=tp_ranks,
         data_parallel_group_ranks=dp_ranks,
         expert_parallel_group_ranks=ep_ranks,
         resolved_name=resolved_name or name,
     )
+
+
+def _tp_metadata(shape, partition_dim, tp_ranks, **kwargs):
+    """Create metadata for every rank in one TP group."""
+    return [
+        _meta(
+            shape=shape,
+            is_tp=len(tp_ranks) > 1,
+            partition_dim=partition_dim,
+            owner_rank=rank,
+            tp_ranks=tp_ranks,
+            dp_ranks=[rank],
+            **kwargs,
+        )
+        for rank in tp_ranks
+    ]
 
 
 def _tp_descriptor(dim, src_ranks, dst_ranks, src_stride=1, dst_stride=1):
@@ -84,6 +107,322 @@ def _verify_full_coverage(ops, dim, expected_full_len):
         f"Expected coverage [0, {expected_full_len}), got gaps: "
         f"{set(range(expected_full_len)) - covered}"
     )
+
+
+def _verify_nd_coverage(ops, expected_shape):
+    """Verify that destination slices cover each logical local element once."""
+    covered = set()
+    for _, _, dst_slice in ops:
+        ranges = [range(part.start, part.stop) for part in dst_slice]
+        for index in product(*ranges):
+            assert index not in covered, f"Duplicate coverage at destination index {index}"
+            covered.add(index)
+    assert len(covered) == math.prod(expected_shape)
+
+
+def _tp_global_index(local_index, tp_rank, tp_size, local_size, stride):
+    """Map one plain/strided TP-local index to its logical global index."""
+    segment_size = local_size // stride
+    segment, offset = divmod(local_index, segment_size)
+    return segment * segment_size * tp_size + tp_rank * segment_size + offset
+
+
+class TestLogicalShardPlanner:
+    """One algorithm covers replicated, TP, packed, strided, and GTP layouts."""
+
+    @staticmethod
+    def _tp2_gtp2_metadata(shape, partition_dim, **kwargs):
+        topology = {
+            0: ([0, 1], [0, 2]),
+            1: ([0, 1], [1, 3]),
+            2: ([2, 3], [0, 2]),
+            3: ([2, 3], [1, 3]),
+        }
+        return [
+            _meta(
+                shape=shape,
+                is_tp=True,
+                partition_dim=partition_dim,
+                owner_rank=rank,
+                tp_ranks=tp_ranks,
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=gtp_ranks,
+                **kwargs,
+            )
+            for rank, (tp_ranks, gtp_ranks) in topology.items()
+        ]
+
+    def test_replicated_transfer(self):
+        src = [_meta(owner_rank=2, dp_ranks=[2, 3])]
+        dst = _meta(owner_rank=4, dp_ranks=[4, 5])
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert ops == [(2, (slice(0, 64), slice(0, 128)), (slice(0, 64), slice(0, 128)))]
+
+    def test_tp2_to_unsharded(self):
+        src = _tp_metadata(shape=(64, 64), partition_dim=1, tp_ranks=[0, 1])
+        dst = _meta(shape=(64, 128), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert ops == [
+            (0, (slice(0, 64), slice(0, 64)), (slice(0, 64), slice(0, 64))),
+            (1, (slice(0, 64), slice(0, 64)), (slice(0, 64), slice(64, 128))),
+        ]
+
+    def test_unsharded_to_tp2(self):
+        src = [_meta(shape=(64, 128), owner_rank=0, tp_ranks=[0], dp_ranks=[0])]
+        dst_group = [1, 2]
+
+        for tp_rank, rank in enumerate(dst_group):
+            dst = _meta(
+                shape=(64, 64),
+                is_tp=True,
+                partition_dim=1,
+                owner_rank=rank,
+                tp_ranks=dst_group,
+                dp_ranks=[rank],
+            )
+            ops = plan_sharded_transfer("weight", src, src[0], dst)
+            assert ops == [
+                (
+                    0,
+                    (slice(0, 64), slice(tp_rank * 64, (tp_rank + 1) * 64)),
+                    (slice(0, 64), slice(0, 64)),
+                )
+            ]
+
+    def test_tp2_to_tp4(self):
+        src = _tp_metadata(shape=(64, 64), partition_dim=1, tp_ranks=[0, 1])
+        dst_group = [2, 3, 4, 5]
+
+        for rank in dst_group:
+            dst = _meta(
+                shape=(64, 32),
+                is_tp=True,
+                partition_dim=1,
+                owner_rank=rank,
+                tp_ranks=dst_group,
+                dp_ranks=[rank],
+            )
+            ops = plan_sharded_transfer("weight", src, src[0], dst)
+            _verify_nd_coverage(ops, (64, 32))
+
+    @pytest.mark.parametrize(
+        ("partition_dim", "src_size", "dst_size", "src_stride", "dst_stride"),
+        [(0, 2, 1, 1, 1), (1, 4, 2, 1, 1), (0, 3, 4, 1, 1), (1, 2, 3, 2, 3), (0, 4, 2, 3, 2)],
+    )
+    def test_tp_layouts_preserve_logical_indices(
+        self, partition_dim, src_size, dst_size, src_stride, dst_stride
+    ):
+        global_size = 144
+        src_group = list(range(src_size))
+        dst_group = list(range(100, 100 + dst_size))
+        src_shape = [6, 6]
+        dst_shape = [6, 6]
+        src_shape[partition_dim] = global_size // src_size
+        dst_shape[partition_dim] = global_size // dst_size
+        src = _tp_metadata(
+            shape=tuple(src_shape),
+            partition_dim=partition_dim,
+            partition_stride=src_stride,
+            tp_ranks=src_group,
+        )
+
+        for dst_tp_rank, dst_rank in enumerate(dst_group):
+            dst = _meta(
+                shape=tuple(dst_shape),
+                is_tp=dst_size > 1,
+                partition_dim=partition_dim,
+                partition_stride=dst_stride,
+                owner_rank=dst_rank,
+                tp_ranks=dst_group,
+                dp_ranks=[dst_rank],
+            )
+            ops = plan_sharded_transfer("weight", src, src[0], dst)
+            _verify_nd_coverage(ops, tuple(dst_shape))
+            for src_rank, src_slice, dst_slice in ops:
+                for src_index, dst_index in zip(
+                    range(src_slice[partition_dim].start, src_slice[partition_dim].stop),
+                    range(dst_slice[partition_dim].start, dst_slice[partition_dim].stop),
+                ):
+                    src_global = _tp_global_index(
+                        src_index, src_rank, src_size, src_shape[partition_dim], src_stride
+                    )
+                    dst_global = _tp_global_index(
+                        dst_index, dst_tp_rank, dst_size, dst_shape[partition_dim], dst_stride
+                    )
+                    assert src_global == dst_global
+
+    def test_strided_tp(self):
+        src = _tp_metadata(shape=(64, 32), partition_dim=1, partition_stride=2, tp_ranks=[0, 1])
+        dst = _meta(shape=(64, 64), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 1, 0, 1]
+        _verify_nd_coverage(ops, (64, 64))
+
+    def test_packed_tp2_to_tp4(self):
+        src = _tp_metadata(
+            shape=(64, 28), partition_dim=1, partition_sizes=[16, 8, 4], tp_ranks=[0, 1]
+        )
+        dst_group = [2, 3, 4, 5]
+
+        for rank in dst_group:
+            dst = _meta(
+                shape=(64, 14),
+                is_tp=True,
+                partition_dim=1,
+                partition_sizes=[8, 4, 2],
+                owner_rank=rank,
+                tp_ranks=dst_group,
+                dp_ranks=[rank],
+            )
+            ops = plan_sharded_transfer("weight", src, src[0], dst)
+            _verify_nd_coverage(ops, (64, 14))
+
+    def test_logical_shape_mismatch_raises(self):
+        src = _tp_metadata(shape=(64, 64), partition_dim=1, tp_ranks=[0, 1])
+        dst = _meta(shape=(64, 100), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        with pytest.raises(RuntimeError, match="logical shape mismatch"):
+            plan_sharded_transfer("weight", src, src[0], dst)
+
+    def test_overlapping_source_metadata_raises(self):
+        src = [
+            _meta(
+                shape=(4, 3),
+                owner_rank=rank,
+                tp_ranks=[rank],
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=group,
+            )
+            for rank, group in ((0, [0, 1]), (1, [1, 0]))
+        ]
+        dst = _meta(shape=(8, 3), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        with pytest.raises(RuntimeError, match="overlapping destination coverage"):
+            plan_sharded_transfer("weight", src, src[0], dst)
+
+    def test_missing_tp_group_raises(self):
+        src = [_meta(shape=(64, 64), is_tp=True, partition_dim=1, owner_rank=0)]
+        dst = _meta(shape=(64, 128), owner_rank=1)
+
+        with pytest.raises(RuntimeError, match="missing tensor-parallel group"):
+            plan_sharded_transfer("weight", src, src[0], dst)
+
+    def test_gtp2_to_unsharded(self):
+        src = [
+            _meta(
+                shape=(4, 3),
+                owner_rank=rank,
+                tp_ranks=[rank],
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=[0, 1],
+            )
+            for rank in (0, 1)
+        ]
+        dst = _meta(shape=(8, 3), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 1]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_uses_only_selected_source_replica(self):
+        src = []
+        for group in ([0, 1], [2, 3]):
+            src.extend(
+                _meta(
+                    shape=(4, 3),
+                    owner_rank=rank,
+                    tp_ranks=[rank],
+                    dp_ranks=[rank % 2, rank % 2 + 2],
+                    is_gtp=True,
+                    gtp_ranks=group,
+                )
+                for rank in group
+            )
+        dst = _meta(shape=(8, 3), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_sharded_transfer("weight", src, src[2], dst)
+
+        assert [rank for rank, _, _ in ops] == [2, 3]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_unsharded_to_padded_gtp2(self):
+        src = [_meta(shape=(6, 2), owner_rank=0, tp_ranks=[0], dp_ranks=[0])]
+        dst = _meta(
+            shape=(4, 2),
+            owner_rank=2,
+            tp_ranks=[2],
+            dp_ranks=[2],
+            is_gtp=True,
+            gtp_ranks=[1, 2],
+            gtp_pad_length=2,
+        )
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert ops == [(0, (slice(4, 6), slice(0, 2)), (slice(0, 2), slice(0, 2)))]
+
+    def test_column_tp2_gtp2_to_unsharded(self):
+        src = self._tp2_gtp2_metadata(shape=(2, 3), partition_dim=0)
+        dst = _meta(shape=(8, 3), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 2, 1, 3]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_row_tp2_gtp2_to_unsharded(self):
+        src = self._tp2_gtp2_metadata(shape=(4, 4), partition_dim=1)
+        dst = _meta(shape=(8, 8), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert len(ops) == 4
+        assert {rank for rank, _, _ in ops} == {0, 1, 2, 3}
+        _verify_nd_coverage(ops, (8, 8))
+
+    def test_strided_tp_gtp_to_unsharded(self):
+        src = self._tp2_gtp2_metadata(shape=(2, 3), partition_dim=0, partition_stride=2)
+        dst = _meta(shape=(8, 3), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 1, 2, 3]
+        assert [dst_slice[0] for _, _, dst_slice in ops] == [
+            slice(0, 2),
+            slice(2, 4),
+            slice(4, 6),
+            slice(6, 8),
+        ]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_packed_tp_gtp_layout_with_padding(self):
+        src = self._tp2_gtp2_metadata(
+            shape=(2, 2), partition_dim=0, partition_sizes=[2, 1], gtp_pad_length=1
+        )
+        dst = _meta(
+            shape=(6, 2),
+            is_tp=True,
+            partition_dim=0,
+            partition_sizes=[4, 2],
+            owner_rank=4,
+            tp_ranks=[4],
+            dp_ranks=[4],
+        )
+
+        ops = plan_sharded_transfer("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 1, 2, 3]
+        _verify_nd_coverage(ops, (6, 2))
 
 
 # ===========================================================================
@@ -397,6 +736,27 @@ def _recv_sig(plan):
 class TestBuildPlanFromRosters:
     """Local plan building replayed independently per rank."""
 
+    def test_gtp_schedule_matches_across_ranks(self):
+        """Every GTP shard send has the matching deterministic receive."""
+        src = [
+            _meta(
+                shape=(4, 3),
+                owner_rank=rank,
+                tp_ranks=[rank],
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=[0, 1],
+            )
+            for rank in (0, 1)
+        ]
+        dst = _meta(shape=(8, 3), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+        plans = _build_all([([src[0]], []), ([src[1]], []), ([], [dst])])
+
+        sends, recvs = _plan_edges(plans)
+        assert sends == recvs
+        assert {(src_rank, dst_rank) for _, src_rank, dst_rank in sends} == {(0, 2), (1, 2)}
+        assert [op.my_slice[0] for op in plans[2].recv_ops] == [slice(0, 4), slice(4, 8)]
+
     def test_task_ids_match_across_ranks(self):
         """Sender and receiver, planned independently, agree on task_id per transfer.
 
@@ -584,6 +944,28 @@ class TestTensorReshardSpecs:
 
         assert specs is None
         assert "partition_stride=2" in error
+
+    def test_gtp_layout_records_reason(self):
+        """Native M2N specs must never reinterpret a GTP shard as a full weight."""
+        src = {
+            "weight": [
+                _meta(
+                    shape=(4, 3),
+                    owner_rank=rank,
+                    tp_ranks=[rank],
+                    dp_ranks=[rank],
+                    is_gtp=True,
+                    gtp_ranks=[0, 1],
+                )
+                for rank in (0, 1)
+            ]
+        }
+        dst = {2: {"weight": _meta(shape=(8, 3), owner_rank=2, tp_ranks=[2], dp_ranks=[2])}}
+
+        specs, error = _build_tensor_reshard_specs(dst, src, my_global_rank=0)
+
+        assert specs is None
+        assert error == "weight: GTP shards are unsupported by native resharding"
 
     def test_block_interleaved_parameter_becomes_regular_component_specs(self):
         src_mesh = [0, 1]
