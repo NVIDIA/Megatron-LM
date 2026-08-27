@@ -115,7 +115,7 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
         Total number of layers in the main decoder pattern.
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
-    _validate_pattern(main_pattern, "main", allow_pipe=True)
+    _validate_pattern(main_pattern, allow_pipe=True)
     return len(main_pattern.replace(Symbols.PIPE, ''))
 
 
@@ -215,13 +215,13 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if len(parts) == 1:
         # No MTP separator found - pattern is main decoder only
         main_pattern = parts[0]
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, allow_pipe=True)
         return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
 
     # First part is main decoder pattern
     main_pattern = parts[0]
     if main_pattern:
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, allow_pipe=True)
 
     # Remaining parts are MTP patterns (one per depth)
     mtp_parts = parts[1:]
@@ -242,7 +242,7 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
                 f"Full pattern: '{pattern}'"
             )
 
-    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False)
+    _validate_pattern(mtp_pattern)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
@@ -251,12 +251,11 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     )
 
 
-def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False) -> None:
+def _validate_pattern(pattern: str, allow_pipe: bool = False) -> None:
     """Validate that a pattern contains only valid layer symbols.
 
     Args:
         pattern: Layer pattern string to validate
-        pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
         allow_pipe: Whether to allow the pipe '|' separator (for main patterns)
 
     Raises:
@@ -265,26 +264,12 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
     for char in pattern:
         if not layer_utils.is_valid_symbol(char, allow_pipe=allow_pipe):
             raise ValueError(
-                f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
+                f"'{char}' is not a valid layer symbol. "
                 f"Valid symbols are: {Symbols.LAYER_CONFIG_MAP.keys()}"
             )
 
     # Disallow Attention + MLA/DSA hybridity.
     if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
-
-
-def _validate_segment_layer_symbols(segment: str) -> None:
-    """Validate the layer symbols in a single pipeline segment."""
-    for layer_symbol in segment:
-        if not layer_utils.is_valid_symbol(layer_symbol):
-            raise ValueError(
-                f"In hybrid layer pattern segment, '{layer_symbol}' is not "
-                f"one of {set(Symbols.LAYER_CONFIG_MAP)}"
-            )
-
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and (Symbols.DS_ATTENTION in segment or Symbols.MLA in segment):
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
@@ -307,7 +292,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Tra
     Raises:
         ValueError: If segment contains invalid layer symbols.
     """
-    _validate_segment_layer_symbols(segment)
+    _validate_pattern(segment)
 
     layer_configs: list[TransformerConfig] = []
     for layer_symbol in segment:
@@ -389,7 +374,7 @@ def select_pipeline_segment(
             "Example: 'M*M*M*M*' with pp_size=2 should become 'M*M*|M*M*'.",
         )
         full_pattern = segments[0]
-        _validate_segment_layer_symbols(full_pattern)
+        _validate_pattern(full_pattern)
         num_layers = len(full_pattern)
 
         if first_stage_layers is not None or last_stage_layers is not None:
