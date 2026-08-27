@@ -182,6 +182,7 @@ def get_mock_mla_config(
     apply_rope_fusion: bool = False,
     rope_type: str = "yarn",
     rotary_percent: float = 1.0,
+    qk_layernorm: bool = True,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -197,7 +198,9 @@ def get_mock_mla_config(
         bf16=True,
         params_dtype=torch.bfloat16,
         layernorm_epsilon=1e-5,
+        attention_latent_norm_epsilon=1e-6,
         normalization="RMSNorm",
+        qk_layernorm=qk_layernorm,
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
         tensor_model_parallel_size=tensor_model_parallel_size,
@@ -359,6 +362,11 @@ def _run_functionality(
         cp_comm_type="all_gather" if cp_size > 1 else None,
         pg_collection=None,
     ).cuda()
+
+    assert absorbed_mla.q_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
+    assert absorbed_mla.kv_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
+    assert standard_mla.q_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
+    assert standard_mla.kv_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
 
     state_dict = standard_mla.state_dict()
     absorbed_mla.load_state_dict(state_dict)

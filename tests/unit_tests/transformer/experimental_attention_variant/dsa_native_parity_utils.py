@@ -87,7 +87,9 @@ def _make_config(
         add_bias_linear=False,
         bf16=True,
         params_dtype=torch.bfloat16,
-        layernorm_epsilon=1e-6,
+        layernorm_epsilon=1e-5,
+        attention_latent_norm_epsilon=1e-6,
+        dsa_indexer_k_norm_epsilon=1e-6,
         normalization="RMSNorm",
         qk_layernorm=True,
         layernorm_zero_centered_gamma=False,
@@ -198,7 +200,7 @@ class NativeIndexer(nn.Module):
         qk_pos_emb_head_dim: int,
         index_topk: int,
         use_sparse_loss: bool,
-        layernorm_epsilon: float,
+        dsa_indexer_k_norm_epsilon: float,
         weights_proj_output_dtype: str,
     ):
         super().__init__()
@@ -216,7 +218,7 @@ class NativeIndexer(nn.Module):
             self.q_lora_rank, self.index_n_heads * self.index_head_dim, bias=False
         )
         self.linear_wk = nn.Linear(self.hidden_size, self.index_head_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.index_head_dim, eps=layernorm_epsilon)
+        self.k_norm = nn.LayerNorm(self.index_head_dim, eps=dsa_indexer_k_norm_epsilon)
         self.linear_weights_proj = nn.Linear(self.hidden_size, self.index_n_heads, bias=False)
 
     def forward(
@@ -278,7 +280,8 @@ class NativeDSA(nn.Module):
         dsa_indexer_head_dim: int,
         dsa_indexer_topk: int,
         dsa_indexer_use_sparse_loss: bool,
-        layernorm_epsilon: float,
+        attention_latent_norm_epsilon: float,
+        dsa_indexer_k_norm_epsilon: float,
         rotary_base: float,
         rotary_scaling_factor: float,
         original_max_position_embeddings: int,
@@ -312,14 +315,14 @@ class NativeDSA(nn.Module):
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
 
         self.linear_q_down_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-        self.q_layernorm = nn.RMSNorm(self.q_lora_rank, eps=layernorm_epsilon)
+        self.q_layernorm = nn.RMSNorm(self.q_lora_rank, eps=attention_latent_norm_epsilon)
         self.linear_q_up_proj = nn.Linear(
             self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
         )
         self.linear_kv_down_proj = nn.Linear(
             self.hidden_size, self.kv_lora_rank + self.qk_pos_emb_head_dim, bias=False
         )
-        self.kv_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=layernorm_epsilon)
+        self.kv_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=attention_latent_norm_epsilon)
         self.linear_kv_up_proj = nn.Linear(
             self.kv_lora_rank, self.num_heads * (self.qk_head_dim + self.v_head_dim), bias=False
         )
@@ -332,7 +335,7 @@ class NativeDSA(nn.Module):
             qk_pos_emb_head_dim=self.qk_pos_emb_head_dim,
             index_topk=dsa_indexer_topk,
             use_sparse_loss=dsa_indexer_use_sparse_loss,
-            layernorm_epsilon=layernorm_epsilon,
+            dsa_indexer_k_norm_epsilon=dsa_indexer_k_norm_epsilon,
             weights_proj_output_dtype=dsa_indexer_weights_proj_output_dtype,
         )
 
@@ -473,6 +476,8 @@ def run_absorbed_mla_dsa_parity(
         real_layer = build_module(
             spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=None
         ).cuda()
+        assert config.attention_latent_norm_epsilon is not None
+        assert config.dsa_indexer_k_norm_epsilon is not None
         baseline = (
             NativeDSA(
                 hidden_size=config.hidden_size,
@@ -486,7 +491,8 @@ def run_absorbed_mla_dsa_parity(
                 dsa_indexer_head_dim=config.dsa_indexer_head_dim,
                 dsa_indexer_topk=config.dsa_indexer_topk,
                 dsa_indexer_use_sparse_loss=config.dsa_indexer_use_sparse_loss,
-                layernorm_epsilon=config.layernorm_epsilon,
+                attention_latent_norm_epsilon=config.attention_latent_norm_epsilon,
+                dsa_indexer_k_norm_epsilon=config.dsa_indexer_k_norm_epsilon,
                 rotary_base=config.rotary_base,
                 rotary_scaling_factor=config.rotary_scaling_factor,
                 original_max_position_embeddings=config.original_max_position_embeddings,

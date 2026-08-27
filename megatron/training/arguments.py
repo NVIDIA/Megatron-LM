@@ -4897,6 +4897,13 @@ def _add_mla_args(parser):
         help="Rank of Key and Value tensors' low rank representation.",
     )
     group.add_argument(
+        '--attention-latent-norm-epsilon',
+        type=float,
+        default=None,
+        help="Epsilon for the primary query and key-value latent norms in attention. "
+        "Defaults to --norm-epsilon when unset.",
+    )
+    group.add_argument(
         '--qk-head-dim',
         type=int,
         default=128,
