@@ -21,11 +21,30 @@ from tools.run_dynamic_text_generation_server import add_text_generation_server_
     ],
 )
 @pytest.mark.parametrize(
-    ("temperature_args", "expected_temperature"),
-    [([], 1.0), (["--default-temperature", "0.4"], 0.4)],
+    ("serve_args", "expected_defaults"),
+    [
+        ([], (1.0, 1.0, 0, False)),
+        (
+            [
+                "--default-temperature",
+                "0.4",
+                "--default-top-p",
+                "0.8",
+                "--default-top-k",
+                "5",
+                "--eval-mode",
+            ],
+            (0.4, 0.8, 5, True),
+        ),
+    ],
 )
-def test_default_temperature_flag(add_args, required_args, temperature_args, expected_temperature):
+def test_sampling_default_flags(add_args, required_args, serve_args, expected_defaults):
     parser = add_args(ArgumentParser())
-    args = parser.parse_args([*required_args, *temperature_args])
+    args = parser.parse_args([*required_args, *serve_args])
 
-    assert args.default_temperature == expected_temperature
+    assert (
+        args.default_temperature,
+        args.default_top_p,
+        args.default_top_k,
+        args.eval_mode,
+    ) == expected_defaults

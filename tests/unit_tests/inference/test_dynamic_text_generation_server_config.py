@@ -51,6 +51,7 @@ class _CapturingClient:
     [
         (False, {}, 0.7, 0.95, 20, True),
         (True, {}, 0.7, 0.95, 20, False),
+        (False, {"temperature": 0.0}, 0.0, 0.0, 1, True),
         (
             True,
             {"temperature": 0.4, "top_p": 0.8, "top_k": 5, "prevent_retokenization": True},
@@ -94,6 +95,87 @@ async def test_chat_request_uses_server_defaults(
     assert sampling_params.top_p == expected_top_p
     assert sampling_params.top_k == expected_top_k
     assert sampling_params.return_prompt_tokens is expected_prompt_tokens
+
+
+def test_sampling_config_reaches_frontend_process(monkeypatch):
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        text_generation_server as server,
+    )
+
+    captured = {}
+
+    async def fake_run_text_gen_server(*args):
+        captured["run_args"] = args
+
+    class FakeProcess:
+        pid = 123
+
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            self.started = False
+
+        def start(self):
+            self.started = True
+            self.target(*self.args)
+
+    class FakeSocket:
+        def getsockname(self):
+            return ("127.0.0.1", 4321)
+
+        def setblocking(self, blocking):
+            captured["blocking"] = blocking
+
+        def set_inheritable(self, inheritable):
+            captured["inheritable"] = inheritable
+
+        def fileno(self):
+            return 17
+
+    monkeypatch.setattr(server, "_SERVER_PROCESSES", [])
+    monkeypatch.setattr(server, "_SHARED_SOCKET", None)
+    monkeypatch.setattr(server.mp, "Process", FakeProcess)
+    monkeypatch.setattr(server, "_run_text_gen_server", fake_run_text_gen_server)
+    monkeypatch.setattr(server.asyncio, "set_event_loop", lambda loop: None)
+
+    tokenizer = object()
+    server.start_text_gen_server(
+        coordinator_addr="tcp://coord:5555",
+        tokenizer=tokenizer,
+        rank=3,
+        server_port=5000,
+        parsers=["json"],
+        verbose=True,
+        num_replicas=1,
+        hostname="127.0.0.1",
+        sock=FakeSocket(),
+        chat_template="template",
+        default_temperature=0.4,
+        default_top_p=0.8,
+        default_top_k=5,
+        eval_mode=True,
+    )
+
+    assert captured["run_args"] == (
+        "tcp://coord:5555",
+        tokenizer,
+        3,
+        4321,
+        ["json"],
+        True,
+        17,
+        "127.0.0.1",
+        "template",
+        0.4,
+        0.8,
+        5,
+        True,
+    )
+    assert captured["blocking"] is False
+    assert captured["inheritable"] is True
+    assert server._SERVER_PROCESSES[0].daemon is True
+    assert server._SERVER_PROCESSES[0].started is True
 
 
 @pytest.mark.asyncio
