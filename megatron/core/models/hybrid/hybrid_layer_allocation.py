@@ -147,7 +147,7 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Returns:
         Dictionary mapping layer symbol to count. Keys are all valid layer symbols
-            (``Symbols.VALID_LAYERS``).
+            (the keys of ``Symbols.LAYER_CONFIG_MAP``).
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
@@ -262,9 +262,12 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
     Raises:
         ValueError: If pattern contains invalid symbols
     """
-    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
     for char in pattern:
-        if char not in valid_chars:
+        is_pipe = allow_pipe and char == Symbols.PIPE
+        if not Symbols.is_valid_layer(char) and not is_pipe:
+            valid_chars = set(Symbols.LAYER_CONFIG_MAP)
+            if allow_pipe:
+                valid_chars.add(Symbols.PIPE)
             raise ValueError(
                 f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
                 f"Valid symbols are: {valid_chars}"
@@ -278,10 +281,10 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
 def _validate_segment_layer_symbols(segment: str) -> None:
     """Validate the layer symbols in a single pipeline segment."""
     for layer_symbol in segment:
-        if layer_symbol not in Symbols.VALID_LAYERS:
+        if not Symbols.is_valid_layer(layer_symbol):
             raise ValueError(
                 f"In hybrid layer pattern segment, '{layer_symbol}' is not "
-                f"one of {Symbols.VALID_LAYERS}"
+                f"one of {set(Symbols.LAYER_CONFIG_MAP)}"
             )
 
     # Disallow Attention + MLA/DSA hybridity.
@@ -490,7 +493,7 @@ def select_pipeline_segment(
 def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str, dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each valid layer type (those in Symbols.VALID_LAYERS) given a layer type list.
+    for each valid layer type (the keys of Symbols.LAYER_CONFIG_MAP) given a layer type list.
     """
     layer_types = [symbol for symbol in Symbols.name_sorted_valid_layer_symbols()]
     layer_maps = {layer_type: {} for layer_type in layer_types}

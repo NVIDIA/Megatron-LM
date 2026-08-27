@@ -649,7 +649,7 @@ class TestHybridBlock:
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_pattern_char = 'X'
-        assert invalid_pattern_char not in Symbols.VALID_LAYERS  # sanity check.
+        assert not Symbols.is_valid_layer(invalid_pattern_char)  # sanity check.
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_pattern_char
         # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):

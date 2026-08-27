@@ -32,6 +32,18 @@ def _make_transformer_config(tp_comm_overlap: bool = False) -> TransformerConfig
 @pytest.mark.internal
 class TestSymbols:
 
+    @pytest.mark.parametrize(
+        "layer_symbol", [layer_symbol for layer_symbol, _ in _EXPECTED_LAYER_CONFIG_TYPES]
+    )
+    def test_is_valid_layer(self, layer_symbol):
+        assert layer_utils.Symbols.is_valid_layer(layer_symbol)
+
+    @pytest.mark.parametrize(
+        "layer_symbol", [layer_utils.Symbols.PIPE, layer_utils.Symbols.MTP_SEPARATOR, "X"]
+    )
+    def test_is_not_valid_layer(self, layer_symbol):
+        assert not layer_utils.Symbols.is_valid_layer(layer_symbol)
+
     def test_name_sorted_valid_layer_symbols(self):
         assert layer_utils.Symbols.name_sorted_valid_layer_symbols() == [
             layer_utils.Symbols.ATTENTION,
