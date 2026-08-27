@@ -335,8 +335,6 @@ def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
         gtp_leader=source_parameters[0],
         source_tensors=source_tensors,
         gtp_native_grad=native_grad,
-        packed_runtime_grad=None,
-        packed_runtime_weight=None,
         weight_format="bf16",
         parameters=source_parameters,
         member_numel=member_shape[0] * member_shape[1],
@@ -372,6 +370,134 @@ def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
     assert projection.source_main_grad_ptrs == stable_ptrs
     assert tuple(projection.main_grad_bases.cpu().tolist()) == stable_ptrs
     torch.testing.assert_close(capture_probe, torch.ones_like(capture_probe), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) > 1,
+    reason="Process-local CUDA graph probe must run outside distributed parity tests",
+)
+def test_replica_gtp_bf16_weights_bind_directional_stable_buffers():
+    """Bind separate stable GTP forward/backward buffers without packing or copies."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_local_experts = 2
+    member_shape = (4, 4)
+    forward_weights = tuple(
+        torch.empty(member_shape, dtype=torch.bfloat16, device=device)
+        for _ in range(num_local_experts)
+    )
+    backward_weights = tuple(
+        torch.empty(member_shape, dtype=torch.bfloat16, device=device)
+        for _ in range(num_local_experts)
+    )
+    runtime_parameters = tuple(
+        torch.nn.Parameter(torch.empty_like(weight)) for weight in forward_weights
+    )
+    forward_bases = torch.empty(num_local_experts, dtype=torch.int64, device=device)
+    backward_bases = torch.empty_like(forward_bases)
+    projection = SimpleNamespace(
+        member_shape=member_shape,
+        source_tensors=(),
+        source_pointer_staging=tuple(
+            torch.empty(num_local_experts, dtype=torch.int64, pin_memory=True) for _ in range(2)
+        ),
+        gtp_forward_source_tensors=None,
+        gtp_backward_source_tensors=None,
+        gtp_forward_source_bases=forward_bases,
+        gtp_backward_source_bases=backward_bases,
+        gtp_forward_source_ptrs=None,
+        gtp_backward_source_ptrs=None,
+        runtime_parameters=runtime_parameters,
+    )
+    bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
+    bridge.device = device
+    bridge.num_local_experts = num_local_experts
+
+    runtime_ids = tuple(id(parameter) for parameter in runtime_parameters)
+    capture_probe = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.cuda.synchronize(device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        bridge._bind_materialized_gtp_bf16_weights(
+            projection, forward_weights, retain_for_grad=False
+        )
+        capture_probe.add_(1)
+    graph.replay()
+    torch.cuda.synchronize(device)
+
+    forward_ptrs = tuple(weight.data_ptr() for weight in forward_weights)
+    assert projection.gtp_forward_source_ptrs == forward_ptrs
+    assert tuple(forward_bases.cpu().tolist()) == forward_ptrs
+    assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == forward_ptrs
+
+    bridge._bind_materialized_gtp_bf16_weights(projection, backward_weights, retain_for_grad=True)
+    backward_ptrs = tuple(weight.data_ptr() for weight in backward_weights)
+    assert projection.gtp_backward_source_ptrs == backward_ptrs
+    assert tuple(backward_bases.cpu().tolist()) == backward_ptrs
+    assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == backward_ptrs
+    assert tuple(id(parameter) for parameter in runtime_parameters) == runtime_ids
+
+    bridge._bind_materialized_gtp_bf16_weights(projection, forward_weights, retain_for_grad=False)
+    assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == forward_ptrs
+    replacement = list(forward_weights)
+    replacement[0] = torch.empty_like(replacement[0])
+    with pytest.raises(RuntimeError, match="forward all-gather storage changed"):
+        bridge._bind_materialized_gtp_bf16_weights(
+            projection, tuple(replacement), retain_for_grad=False
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Replica weights require CUDA")
+def test_replica_bf16_runtime_over_64_experts_remains_discrete():
+    """Build more than 64 runtime experts without an internal GroupedTensor."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_local_experts = 33
+    member_shape = (4, 4)
+    parameters = tuple(
+        torch.nn.Parameter(torch.empty(member_shape, dtype=torch.bfloat16, device=device))
+        for _ in range(num_local_experts)
+    )
+    for parameter in parameters:
+        _set_main_grad(parameter)
+    virtual_weight = tuple(
+        torch.empty(member_shape, dtype=torch.bfloat16, device=device)
+        for _ in range(num_local_experts)
+    )
+    virtual_grad = torch.empty(
+        (num_local_experts, *member_shape), dtype=torch.float32, device=device
+    )
+    projection = SimpleNamespace(
+        gtp_leader=None,
+        source_tensors=tuple(parameter.data for parameter in parameters),
+        gtp_native_grad=None,
+        weight_format="bf16",
+        parameters=parameters,
+        member_numel=member_shape[0] * member_shape[1],
+        source_storage_ptrs=None,
+        source_main_grad_ptrs=None,
+        source_bases=torch.empty(num_local_experts, dtype=torch.int64, device=device),
+        main_grad_bases=torch.empty(num_local_experts, dtype=torch.int64, device=device),
+        virtual_weight=virtual_weight,
+        virtual_grad=virtual_grad,
+        runtime_parameters=None,
+    )
+    bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
+    bridge.device = device
+    bridge.num_local_experts = num_local_experts
+    bridge.num_runtime_experts = 2 * num_local_experts
+    bridge.projections = [projection]
+    bridge.workspace = SimpleNamespace(grad_dtype=torch.float32)
+
+    bridge.prepare_runtime_parameters()
+
+    assert len(projection.runtime_parameters) == 66
+    assert all(
+        isinstance(parameter, torch.nn.Parameter) for parameter in projection.runtime_parameters
+    )
+    assert tuple(parameter.data_ptr() for parameter in projection.runtime_parameters) == tuple(
+        weight.data_ptr()
+        for weight in tuple(parameter.data for parameter in parameters) + virtual_weight
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
@@ -727,9 +853,7 @@ def _run_replica_hybridep_full_layer_parity(
             ):
                 assert len(runtime_weights) == bridge.num_runtime_experts
                 native_weights = projection.source_tensors
-                if projection.packed_runtime_grad is not None:
-                    native_grads = tuple(projection.packed_runtime_grad[: bridge.num_local_experts])
-                elif projection.gtp_leader is not None:
+                if projection.gtp_leader is not None:
                     assert projection.gtp_native_grad is not None
                     native_grads = tuple(projection.gtp_native_grad)
                 else:
