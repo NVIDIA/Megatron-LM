@@ -36,9 +36,7 @@ def test_communicate_shapes_waits_without_device_synchronize(mocker):
         return requests
 
     batch_p2p = mocker.patch.object(
-        p2p_communication.torch.distributed,
-        "batch_isend_irecv",
-        side_effect=batch_isend_irecv,
+        p2p_communication.torch.distributed, "batch_isend_irecv", side_effect=batch_isend_irecv
     )
 
     recv_prev_shape, recv_next_shape = communicator._communicate_shapes(
