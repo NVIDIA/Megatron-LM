@@ -156,6 +156,49 @@ class _ParamAndGradBucket:
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
 
+    @torch.no_grad()
+    def _stage_layerwise_mxfp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
+        """Stage owner-rank LayerWise MXFP8 masters into the BF16 all-gather input.
+
+        LayerWise layouts keep each parameter wholly inside one data-parallel shard.
+        Unlike regular BF16 parameters, MXFP8 parameters retain TE-owned storage, so
+        updating ``param.data`` does not update this bucket's parameter buffer.
+        """
+        if not self.params_list or not getattr(
+            self.params_list[0], 'is_managed_by_layer_wise_optimizer', False
+        ):
+            return
+
+        local_shard_start = local_rank * local_data_view.numel()
+        local_shard_end = local_shard_start + local_data_view.numel()
+        for param in self.params_list:
+            if not (is_mxfp8tensor(param) or is_grouped_mxfp8tensor(param)):
+                continue
+
+            param_start, param_end = self.param_to_index[param]
+            if param_end <= local_shard_start or local_shard_end <= param_start:
+                continue
+            if not (local_shard_start <= param_start and param_end <= local_shard_end):
+                raise RuntimeError(
+                    "LayerWise MXFP8 parameter must be entirely inside its owner's DDP shard."
+                )
+
+            main_param = getattr(param, 'main_param', None)
+            if main_param is None:
+                raise RuntimeError(
+                    "The owner of a LayerWise MXFP8 parameter must have its FP32 main parameter."
+                )
+
+            param_slot = local_data_view[
+                param_start - local_shard_start : param_end - local_shard_start
+            ]
+            if param_slot.numel() != main_param.numel():
+                raise RuntimeError(
+                    "LayerWise MXFP8 master and DDP parameter slot must have equal size: "
+                    f"master={main_param.numel()}, slot={param_slot.numel()}."
+                )
+            param_slot.copy_(main_param.detach().reshape(-1))
+
     def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
         """Set per-rank parameter lists for layer-wise async all-gather.
 
@@ -242,9 +285,10 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
-        # overlap_param_gather covers the layer-wise optimizer case, which sets
-        # overlap_param_gather=True without use_distributed_optimizer.
-        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
+        # LayerWise parameter sync can use this collective group without the distributed
+        # optimizer: asynchronously when overlap is enabled, or synchronously when MXFP8 reuses
+        # grad_data as its BF16 all-gather transport.
+        if self.ddp_config.param_sync_via_bucket_group:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
@@ -463,9 +507,7 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        # overlap_param_gather covers the layer-wise optimizer case, which sets
-        # overlap_param_gather=True without use_distributed_optimizer.
-        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
+        assert self.ddp_config.param_sync_via_bucket_group
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -597,6 +639,10 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
+                    if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                        bucket._stage_layerwise_mxfp8_params(
+                            local_data_view, self.intra_distributed_optimizer_instance_rank
+                        )
                     dist_all_gather_func(
                         bucket.param_data,
                         local_data_view,
@@ -1831,7 +1877,11 @@ def partition_buckets(
     CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back communications will prevent the
     overlap of communication kernels with computation kernels.
 
-    The grouping strategy is:
+    Before applying a grouping strategy that could merge buckets, buffers are partitioned by
+    optimizer ownership so a bucket group never mixes LayerWise-managed and
+    DistributedOptimizer-managed parameters.
+
+    The grouping strategy within each optimizer ownership partition is:
     1. If force_single_bucket_group is True, put all buckets across all buffers into a single
        bucket group.
     2. If force_single_bucket_group is False, when there is no fp8 buffer in the input buffers,
@@ -1854,18 +1904,56 @@ def partition_buckets(
 
     Args:
         buffers (list): list of input buffers.
-        single_bucket_group_per_buffer (bool, optional): force group all buckets in each buffer
-            into a single bucket group.
+        force_single_bucket_group (bool, optional): force all buckets with the same optimizer
+            ownership into a single bucket group.
+        reduce_scatter_with_fp32_accumulation (bool, optional): keep buckets separate when the
+            FP32-accumulating reduce-scatter implementation requires singleton groups.
     """
 
     if len(buffers) == 0:
         return []
 
+    # LayerWiseDistributedOptimizer and DistributedOptimizer classify a whole bucket group from
+    # its first bucket when synchronizing their subsets. Partition only when the policy below may
+    # merge owners (or when multiple owners each have an FP8 buffer); singleton paths retain their
+    # existing global bucket order for overlap linkage.
+    buffers_by_optimizer_owner = {}
+    num_fp8_buffers = 0
+    for buffer in buffers:
+        assert buffer.params
+        is_layerwise_owned = getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+        assert all(
+            getattr(param, 'is_managed_by_layer_wise_optimizer', False) == is_layerwise_owned
+            for param in buffer.params
+        )
+        buffers_by_optimizer_owner.setdefault(is_layerwise_owned, []).append(buffer)
+        num_fp8_buffers += int(buffer.param_dtype == torch.uint8)
+
+    should_partition_by_owner = len(buffers_by_optimizer_owner) > 1 and (
+        force_single_bucket_group
+        or num_fp8_buffers > 1
+        or (num_fp8_buffers == 1 and not reduce_scatter_with_fp32_accumulation)
+    )
+    if should_partition_by_owner:
+        owner_buffer_partitions = list(buffers_by_optimizer_owner.values())
+        owner_buffer_partitions.sort(
+            key=lambda owner_buffers: not any(
+                buffer.param_dtype == torch.uint8 for buffer in owner_buffers
+            )
+        )
+        return [
+            bucket_group
+            for owner_buffers in owner_buffer_partitions
+            for bucket_group in partition_buckets(
+                owner_buffers,
+                force_single_bucket_group=force_single_bucket_group,
+                reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+            )
+        ]
+
     # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
     # whether one is present. Non-uint8 dtypes can legitimately appear in
-    # multiple buffers (e.g. LayerWise-managed bf16 weights + Adam-managed bf16
-    # biases share the bf16 ``param_dtype`` but live in separate buffers), so
-    # the uniqueness check is restricted to uint8.
+    # multiple buffers, so the uniqueness check is restricted to uint8.
     fp8_buffer = None
     for buffer in buffers:
         if buffer.param_dtype == torch.uint8:

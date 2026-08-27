@@ -2071,6 +2071,13 @@ def validate_args(args, defaults={}):
                 "not pass --use-layer-wise-param-layout) for fp8 parameter gather, or "
                 "fp8_param_gather=False."
             )
+    assert not (
+        args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
+    ), (
+        "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
+        "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
+        "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
+    )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
