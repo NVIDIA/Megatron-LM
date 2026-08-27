@@ -155,41 +155,13 @@ class MoKMegakernel(MegakernelBackend):
     def autograd_routed_parameters(self) -> tuple[nn.Parameter, ...]:
         return self.routed_fc1_parameters + self.routed_fc2_parameters
 
-    def shared_weight_views(
-        self, fc1: torch.Tensor | None = None, fc2: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split native combined FC1 into zero-copy gate/up views for MOK."""
-        fc1 = self.shared_fc1_weight if fc1 is None else fc1
-        fc2 = self.shared_fc2_weight if fc2 is None else fc2
-        i, h = self.intermediate_size, self.hidden_size
-        if tuple(fc1.shape) != (2 * i, h) or tuple(fc2.shape) != (h, i):
-            raise RuntimeError(
-                "MOK shared weight shape mismatch: expected "
-                f"{(2 * i, h)} and {(h, i)}, got "
-                f"{tuple(fc1.shape)} and {tuple(fc2.shape)}"
-            )
-        if not fc1.is_contiguous() or not fc2.is_contiguous():
-            raise RuntimeError("MOK shared weights must use contiguous native storage")
-        return fc1.narrow(0, 0, i), fc1.narrow(0, i, i), fc2
-
     def main_grad_arguments(self):
         """Return MOK logical main grads and optional per-expert descriptors."""
         shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
-        shared_gate_grad, shared_up_grad, shared_down_grad = self.shared_weight_views(
-            shared_fc1_grad, _main_grad_buffer(self.shared_fc2_weight)
-        )
+        shared_fc2_grad = _main_grad_buffer(self.shared_fc2_weight)
         fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
         fc2_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc2_parameters)
-        # MCore combines routed gate/up in one FC1 main-grad; MOK receives the same
-        # representative twice and distinguishes them by row offset and expert descriptor.
-        main_grads = (
-            shared_gate_grad,
-            fc1_main_grads[0],
-            shared_up_grad,
-            fc1_main_grads[0],
-            shared_down_grad,
-            fc2_main_grads[0],
-        )
+        main_grads = (shared_fc1_grad, fc1_main_grads[0], shared_fc2_grad, fc2_main_grads[0])
         if self.native_single_grouped_weights:
             return main_grads, None
 
@@ -205,10 +177,7 @@ class MoKMegakernel(MegakernelBackend):
         ):
             fc1_table = ops.make_routed_d_weight_storage_table(list(fc1_main_grads))
             fc2_table = ops.make_routed_d_weight_storage_table(list(fc2_main_grads))
-            self._split_main_grad_descriptor_cache = (
-                fingerprint,
-                (fc1_table, fc1_table, fc2_table),
-            )
+            self._split_main_grad_descriptor_cache = (fingerprint, (fc1_table, fc2_table))
         return main_grads, self._split_main_grad_descriptor_cache[1]
 
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
@@ -265,11 +234,11 @@ class MoKMegakernel(MegakernelBackend):
                     columns=self.intermediate_size,
                     use_mxfp8=self.use_mxfp8_weights,
                 )
-                self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc1, prepared_fc2)
+                self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc2)
             elif self.use_mxfp8_weights and self.is_first_microbatch:
                 # Non-single MXFP8: TE updates scales each optimizer iteration;
                 # refresh scale layouts while keeping data/descriptor addresses stable.
-                prepared_fc1, _, prepared_fc2 = self._prepared_routed_weight_cache
+                prepared_fc1, prepared_fc2 = self._prepared_routed_weight_cache
                 _refresh_native_split_weight_scales(
                     prepared_fc1,
                     self.routed_fc1_parameters,
@@ -302,7 +271,7 @@ class MoKMegakernel(MegakernelBackend):
         if self._prepared_routed_weight_cache is None or self.is_first_microbatch:
             # Single-weight MXFP8: reuse TE's gathered FP8 payload and prepare the
             # rowwise/columnwise scale layouts required by MOK forward/backward.
-            native_gate, _, native_down = _native_single_grouped_weight_views(
+            native_fc1, native_fc2 = _native_single_grouped_weight_views(
                 self.routed_fc1_weight,
                 self.routed_fc2_weight,
                 num_experts=self.num_local_experts,
@@ -310,15 +279,15 @@ class MoKMegakernel(MegakernelBackend):
                 hidden_size=self.hidden_size,
                 use_mxfp8=True,
             )
-            prepared_gate = _mok_mxfp8_backward_weight_views(
-                native_gate, rows=2 * self.intermediate_size, columns=self.hidden_size
+            prepared_fc1 = _mok_mxfp8_backward_weight_views(
+                native_fc1, rows=2 * self.intermediate_size, columns=self.hidden_size
             )
-            prepared_down = _mok_mxfp8_backward_weight_views(
-                native_down, rows=self.hidden_size, columns=self.intermediate_size
+            prepared_fc2 = _mok_mxfp8_backward_weight_views(
+                native_fc2, rows=self.hidden_size, columns=self.intermediate_size
             )
             # Only the compact scale layouts allocate storage. FP8 row/column
             # payloads remain zero-copy views of the current TE gather buffer.
-            self._prepared_routed_weight_cache = (prepared_gate, prepared_gate, prepared_down)
+            self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc2)
 
         self.is_first_microbatch = False
         return self._prepared_routed_weight_cache
