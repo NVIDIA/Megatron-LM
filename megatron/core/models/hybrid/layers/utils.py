@@ -44,9 +44,14 @@ class Symbols:
         return [value for (_, value) in valid_layer_attrs]
 
 
-def is_valid_layer(layer_symbol: str) -> bool:
-    """Return whether ``layer_symbol`` identifies a supported hybrid layer."""
-    return layer_symbol in Symbols.LAYER_CONFIG_MAP
+def is_valid_layer(layer_symbol: str, allow_pipe: bool = False) -> bool:
+    """Return whether ``layer_symbol`` identifies a supported layer or allowed pipe.
+
+    Args:
+        layer_symbol: Symbol to validate.
+        allow_pipe: Whether to also accept the pipeline separator symbol.
+    """
+    return layer_symbol in Symbols.LAYER_CONFIG_MAP or (allow_pipe and layer_symbol == Symbols.PIPE)
 
 
 def create_layer_config(config: TransformerConfig, layer_symbol: str) -> TransformerConfig:

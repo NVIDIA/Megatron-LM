@@ -44,6 +44,9 @@ class TestSymbols:
     def test_is_not_valid_layer(self, layer_symbol):
         assert not layer_utils.is_valid_layer(layer_symbol)
 
+    def test_is_valid_layer_allows_pipe(self):
+        assert layer_utils.is_valid_layer(layer_utils.Symbols.PIPE, allow_pipe=True)
+
     def test_name_sorted_valid_layer_symbols(self):
         assert layer_utils.Symbols.name_sorted_valid_layer_symbols() == [
             layer_utils.Symbols.ATTENTION,
