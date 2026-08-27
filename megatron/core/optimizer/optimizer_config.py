@@ -284,13 +284,57 @@ class OptimizerConfig:
     each shard independently, which makes the update rule depend on the parallelism config;
     "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
     change as TP changes. "auto" select between duplicated and distributed mode per-weight for
-    dense weights. Defaults to "duplicated"."""
+    dense weights. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
+    each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain — i.e. the
+    GTP domain — all_to_all stages over the gtp_remat and tp groups assemble the complete
+    (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
+    mode runs there with zero communication and zero redundancy, and reverse all_to_all
+    stages scatter the result back to the original shards. layer_sharded requires the
+    layer-wise distributed optimizer path and muon_split_qkv=False (its default is True:
+    split-QKV Newton-Schulz is not implemented on the layer-sharded path, so
+    LayerShardedMuon rejects it at construction; the training path surfaces it earlier
+    via validate_args). Defaults to "duplicated"."""
 
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    muon_ns_batch_size: int = 1
+    """Max number of same-shape matrices fused into one batched Newton-Schulz under
+    layer-sharded muon. MoE assigns hundreds of identically shaped expert weights to a
+    single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
+    transient stack of this many matrices for far fewer launches. Batches of more than
+    one use baddbmm instead of addmm, so results differ from the per-matrix path by
+    kernel-level floating point rounding and bitwise parity with duplicated mode is
+    lost. Only used when muon_tp_mode='layer_sharded'. The value is an upper
+    bound per same-shape bucket: a home owning fewer matrices of a shape simply
+    forms a smaller (or single-matrix, bit-exact) batch, so oversizing it is
+    harmless. Defaults to 1 (bit-exact per-matrix path); raise (e.g. to 32) to
+    trade bitwise parity for fewer kernel launches on MoE expert homes. Values
+    > 1 require emerging-optimizers >= 0.3.0 (batched 3-D Newton-Schulz); the
+    default runs on any version with the newton_schulz API."""
+
+    muon_expert_tp_mode: Optional[str] = None
+    """Tensor-parallel NS mode for expert-parallel weights. None (default): expert
+    weights follow muon_tp_mode. Set to any muon_tp_mode value to give the expert
+    domain its own mode — e.g. muon_tp_mode='auto' with
+    muon_expert_tp_mode='layer_sharded' runs the per-weight duplicated/distributed
+    cost model on dense weights while layer-sharding the MoE expert weights, where
+    the layer-sharded win concentrates (many identically shaped matrices per NS
+    home). When the effective expert mode differs from muon_tp_mode, the optimizer
+    builder keeps the dense/expert buckets separate and constructs one base
+    optimizer per bucket; both feed LayerWiseDistributedOptimizer. Requires
+    num_experts when set explicitly (a model without expert weights has no expert
+    bucket to route)."""
+
+    muon_concurrent_groups: bool = True
+    """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
+    on its own CUDA stream so one group's compute fills another group's all_to_all stall.
+    Bitwise-neutral (op order within a group is unchanged), but the transient buffers of
+    all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
+    tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
 
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.

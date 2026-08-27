@@ -104,9 +104,12 @@ class EmergingOptimizerEntry:
     """Everything needed to create and configure an emerging optimizer.
 
     Attributes:
-        optimizer_cls: The torch optimizer class.
+        optimizer_cls: The torch optimizer class (default when config_to_cls is None).
         init_state_fn: Lazily initialises optimizer state (needed for checkpoint formats).
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
+        config_to_cls: Optional ``(config) -> type`` callable. When provided, overrides
+            ``optimizer_cls`` so the instantiated class can vary based on config (e.g.
+            selecting ``LayerShardedMuon`` when ``muon_tp_mode == 'layer_sharded'``).
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
     """
@@ -114,6 +117,7 @@ class EmergingOptimizerEntry:
     optimizer_cls: type
     init_state_fn: Callable = _eopt_init_state_fn
     config_to_kwargs: Callable | None = None
+    config_to_cls: Callable | None = None
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
         default_factory=_default_param_overrides_factory
     )
@@ -122,13 +126,66 @@ class EmergingOptimizerEntry:
 def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
     """Instantiate an emerging optimizer and return it with its init_state_fn."""
     entry = _EMERGING_OPTIMIZERS[eopt_name]
+
+    # Hybrid modes: when muon_expert_tp_mode differs from muon_tp_mode, the caller
+    # keeps the dense/expert bucket split (see get_megatron_optimizer's grouping)
+    # and calls this once per bucket, constructing one base optimizer per bucket
+    # under its own mode — e.g. dense on TensorParallelMuon tp_mode='auto' while
+    # expert weights run LayerShardedMuon (where the layer-sharded win
+    # concentrates: many identically shaped matrices per NS home). Both land in
+    # layer_wise_base_results — LayerWiseDistributedOptimizer takes a list of
+    # base optimizers, and its NS-home wiring only touches LayerShardedMuon
+    # instances.
+    if eopt_name == 'muon' and _muon_modes_are_hybrid(config):
+        is_expert_bucket = bool(param_groups) and bool(
+            param_groups[0].get('is_expert_parallel', False)
+        )
+        mode = _muon_expert_tp_mode(config) if is_expert_bucket else getattr(
+            config, 'muon_tp_mode', 'duplicated'
+        )
+        if mode == 'layer_sharded':
+            from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+            eopt_kwargs = _layer_sharded_muon_config_to_kwargs(
+                config, model_chunks, pg_collection
+            )
+            if is_expert_bucket:
+                # Under hybrid modes split-QKV may legitimately be enabled for
+                # the dense (TensorParallelMuon) bucket — QKV weights are dense —
+                # but LayerShardedMuon rejects split_qkv at construction. The
+                # expert bucket never owns QKV weights, so forcing it off here is
+                # semantics-free. (A dense LayerShardedMuon bucket keeps the loud
+                # constructor reject: validate_args already forbids split-QKV
+                # when the dense mode is layer_sharded.)
+                eopt_kwargs['split_qkv'] = False
+                # This instance only ever owns expert groups, so its
+                # constructor-default domain should be the expert one. Per-group
+                # wiring (_wire_layer_sharding_ns_homes) still assigns domains
+                # group by group; this keeps the fallback consistent if wiring
+                # is ever skipped.
+                eopt_kwargs['gtp_remat_group'] = (
+                    getattr(pg_collection, 'expt_gtp_remat', None) if pg_collection else None
+                )
+                eopt_kwargs['tp_group'] = (
+                    getattr(pg_collection, 'expt_tp', None) if pg_collection else None
+                )
+            return LayerShardedMuon(param_groups, **eopt_kwargs), entry.init_state_fn
+        eopt_kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+        # The reflective builder read muon_tp_mode; this bucket's mode may be the
+        # expert override instead.
+        eopt_kwargs['tp_mode'] = mode
+        return TensorParallelMuon(param_groups, **eopt_kwargs), entry.init_state_fn
+
     if entry.config_to_kwargs is not None:
         eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
     else:
         eopt_kwargs = _default_adam_based_eopt_config_to_kwargs(
             eopt_name, config, model_chunks, pg_collection
         )
-    optimizer = entry.optimizer_cls(param_groups, **eopt_kwargs)
+    optimizer_cls = (
+        entry.config_to_cls(config) if entry.config_to_cls is not None else entry.optimizer_cls
+    )
+    optimizer = optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
 
 
@@ -679,13 +736,96 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
     return kwargs
 
 
+def _is_layer_sharded(config) -> bool:
+    """Whether the config selects layer sharding: ``muon_tp_mode='layer_sharded'``
+    is a registry-level class selector, not a TensorParallelMuon runtime mode."""
+    return getattr(config, 'muon_tp_mode', 'duplicated') == 'layer_sharded'
+
+
+def _muon_expert_tp_mode(config) -> str:
+    """Effective NS mode for expert-parallel weights: ``muon_expert_tp_mode``
+    when set, otherwise following ``muon_tp_mode``."""
+    return getattr(config, 'muon_expert_tp_mode', None) or getattr(
+        config, 'muon_tp_mode', 'duplicated'
+    )
+
+
+def _muon_modes_are_hybrid(config) -> bool:
+    """Whether dense and expert weights run DIFFERENT NS modes, requiring one
+    base optimizer per (dense, expert) bucket."""
+    return _muon_expert_tp_mode(config) != getattr(config, 'muon_tp_mode', 'duplicated') 
+
+
+def _muon_config_to_cls(config) -> type:
+    """Return the Muon optimizer class based on config.
+
+    Returns ``LayerShardedMuon`` when ``muon_tp_mode == 'layer_sharded'``;
+    ``TensorParallelMuon`` otherwise.
+    """
+    if _is_layer_sharded(config):
+        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+        return LayerShardedMuon
+    return TensorParallelMuon
+
+
+def _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to LayerShardedMuon constructor kwargs.
+
+    Layered on top of :func:`_muon_config_to_kwargs` the same way
+    :func:`_adaptive_muon_config_to_kwargs` is: the parent-class kwargs
+    (including ``is_qkv_fn``, ``qkv_split_shapes`` and ``pg_collection`` — the
+    latter is what makes the empty-``param_ns_homes`` fallback TP-correct) come
+    from the shared TensorParallelMuon builder, then LayerShardedMuon's own
+    muon-prefixed attrs and the (GTP_remat, TP) process groups are added. NS home
+    assignments are wired after construction by
+    ``LayerWiseDistributedOptimizer._wire_layer_sharding_ns_homes``.
+    """
+    from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+    kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    kwargs.update(_kwargs_from_config(LayerShardedMuon, "muon", config))
+    # 'layer_sharded' is the registry-level selector that routed construction to
+    # this builder; it is NOT a TensorParallelMuon mode, so the tp_mode the
+    # constructor (and its fallback/degenerate paths) receives is the bitwise
+    # reference mode instead.
+    kwargs['tp_mode'] = 'duplicated'
+    # Explicit injections: reflective matching cannot cover these (no config attr).
+    kwargs['gtp_remat_group'] = (
+        getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
+    )
+    kwargs['tp_group'] = getattr(pg_collection, 'tp', None) if pg_collection else None
+    return kwargs
+
+
 def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Convert OptimizerConfig to TensorParallelMuon constructor kwargs."""
+    """Convert OptimizerConfig to TensorParallelMuon constructor kwargs.
+
+    Deliberately does NOT dispatch on ``muon_tp_mode='layer_sharded'``: this helper is
+    shared by optimizers that do not support layer sharding (``adaptive_muon``
+    layers :func:`_adaptive_muon_config_to_kwargs` on top of it), so it must stay
+    a pure :class:`TensorParallelMuon` kwargs builder. Layer-sharding dispatch
+    lives in :func:`_muon_registry_config_to_kwargs`, wired only to the ``muon``
+    registry entry alongside its ``config_to_cls``.
+    """
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
     kwargs["pg_collection"] = pg_collection
     return kwargs
+
+
+def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """``config_to_kwargs`` for the ``muon`` registry entry only.
+
+    Dispatches to :func:`_layer_sharded_muon_config_to_kwargs` when
+    ``muon_tp_mode == 'layer_sharded'`` (paired with :func:`_muon_config_to_cls`
+    selecting ``LayerShardedMuon``); plain :class:`TensorParallelMuon` kwargs
+    otherwise.
+    """
+    if _is_layer_sharded(config):
+        return _layer_sharded_muon_config_to_kwargs(config, model_chunks, pg_collection)
+    return _muon_config_to_kwargs(config, model_chunks, pg_collection)
 
 
 def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
@@ -712,7 +852,8 @@ _EMERGING_OPTIMIZERS.update(
         'muon': EmergingOptimizerEntry(
             optimizer_cls=TensorParallelMuon,
             init_state_fn=_eopt_init_state_fn,
-            config_to_kwargs=_muon_config_to_kwargs,
+            config_to_kwargs=_muon_registry_config_to_kwargs,
+            config_to_cls=_muon_config_to_cls,
             default_param_overrides={
                 ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
                     'optimizer': 'adam'

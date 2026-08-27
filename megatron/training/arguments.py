@@ -1745,6 +1745,19 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
+    # Effective per-domain modes: expert weights follow --muon-tp-mode unless
+    # --muon-expert-tp-mode overrides them.
+    muon_dense_mode = getattr(args, 'muon_tp_mode', 'duplicated')
+    muon_expert_mode = getattr(args, 'muon_expert_tp_mode', None) or muon_dense_mode
+    # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
+    # sgd/adam that block is skipped entirely, which would silently ignore the
+    # mode — the one case where the loud failure matters most.
+    if 'layer_sharded' in (muon_dense_mode, muon_expert_mode):
+        assert args.optimizer == 'muon', (
+            f"--muon-tp-mode/--muon-expert-tp-mode layer_sharded is only supported "
+            f"with --optimizer muon (got --optimizer {args.optimizer}). Other "
+            "optimizers, including adaptive_muon, do not implement layer sharding."
+        )
     if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
@@ -1761,6 +1774,30 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+        if getattr(args, 'muon_expert_tp_mode', None) is not None:
+            # An explicit expert mode routes expert-parallel weights separately;
+            # a model without experts has no expert bucket to route.
+            assert args.num_experts is not None and args.num_experts > 0, (
+                "--muon-expert-tp-mode routes expert-parallel weights, but this "
+                "model has no experts (--num-experts). Drop the flag for "
+                "dense-only models (expert weights follow --muon-tp-mode)."
+            )
+        if 'layer_sharded' in (muon_dense_mode, muon_expert_mode):
+            # optimizer == 'muon' is already guaranteed by the hoisted assert above.
+            assert args.use_layer_wise_distributed_optimizer, (
+                "layer_sharded requires the layer-wise distributed optimizer "
+                "path (--optimizer muon with --use-distributed-optimizer)."
+            )
+        if muon_dense_mode == 'layer_sharded':
+            # split-QKV lives on TensorParallelMuon's path; only the DENSE side
+            # carries QKV weights, so the restriction is keyed to it — with
+            # e.g. --muon-tp-mode auto --muon-expert-tp-mode layer_sharded,
+            # dense QKV splitting stays available.
+            assert not args.muon_split_qkv, (
+                "--muon-tp-mode layer_sharded does not implement split-QKV "
+                "Newton-Schulz yet; pass --muon-no-split-qkv."
+            )
 
 
     # Make sure all functionality that requires Gloo process groups is disabled.
@@ -2677,16 +2714,49 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
-                       choices=['blockwise', 'duplicated', 'distributed', 'auto'],
+                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
+                                'layer_sharded'],
                        help='How to perform NS calculation for tensor model parallel weights. '
                        'blockwise orthogonalizes each shard on its own, so the update rule '
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results; auto '
                        'select between duplicated and distributed mode per-weight for '
-                       'dense weights.')
+                       'dense weights; layer_sharded assigns each 2D weight one NS home '
+                       'rank in the (gtp_remat x tp) domain — all_to_all exchanges '
+                       'assemble the full matrix there, Newton-Schulz runs locally with '
+                       'zero communication and zero redundancy, and the result is '
+                       'scattered back. Mathematically identical to duplicated-mode NS; '
+                       'requires the layer-wise distributed optimizer path (emerging '
+                       'optimizer + --use-distributed-optimizer).')
+    group.add_argument('--muon-expert-tp-mode', type=str, default=None,
+                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
+                                'layer_sharded'],
+                       help='NS mode for expert-parallel weights. Default (unset): '
+                       'expert weights follow --muon-tp-mode. Set to give the expert '
+                       'domain its own mode — e.g. --muon-tp-mode auto '
+                       '--muon-expert-tp-mode layer_sharded runs the per-weight '
+                       'cost model on dense weights while layer-sharding the MoE '
+                       'expert weights. When the modes differ, the optimizer builder '
+                       'keeps dense/expert buckets separate and constructs one base '
+                       'optimizer per bucket. Requires --num-experts when set.')
+    group.add_argument('--muon-ns-batch-size', type=int, default=1,
+                       help='Max number of same-shape matrices fused into one batched '
+                       'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
+                       'The default of 1 keeps the bit-exact per-matrix path; raise '
+                       '(e.g. to 32) to cut kernel launches on MoE expert homes at '
+                       'the cost of bitwise parity (baddbmm vs addmm rounding).')
     group.add_argument('--muon-use-syrk', action='store_true',
-                       help='Use the Triton SYRK kernel for the Gram matrix '
-                       'in Newton-Schulz iteration.')
+                       help='Use the Triton SYRK kernel for the symmetric-output '
+                       'Newton-Schulz GEMMs in Muon (~1/3 off '
+                       'NS FLOPs for near-square matrices). Requires '
+                       '--muon-fp32-matmul-prec medium; auto-disabled when Triton/SM '
+                       'requirements are unmet.')
+    group.add_argument('--muon-no-concurrent-groups', action='store_false',
+                       dest='muon_concurrent_groups',
+                       help='Serialize param groups on one CUDA stream under '
+                       '--muon-tp-mode layer_sharded instead of overlapping one group\'s '
+                       'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
+                       'when the concurrent transient buffers push peak memory too high.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
