@@ -42,10 +42,16 @@ class GroupRolloutParams(NamedTuple):
     One instance is created per group call and reused for all rollouts in that group.
     Every rollout is an episode: run_episode generates it (one or more turns), while
     build_rollout turns the completed episode into a Rollout.
+
+    Args:
+        run_episode: A callable that returns an EpisodeResult.
+        build_rollout: A callable that returns a Rollout.
+        problem_state: A dictionary of problem state used to restore the group.
     """
 
     run_episode: Callable[[], Awaitable[EpisodeResult]]
     build_rollout: Callable[[EpisodeResult], Awaitable[Rollout]]
+    problem_state: dict | None = None
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -144,8 +150,19 @@ class GroupedRolloutGenerator(Agent, ABC):
     """Agent contract consumed by RolloutPipeline to generate grouped rollouts (e.g. GRPO)."""
 
     @abstractmethod
-    async def prepare_group_rollout(self, request: GroupedRolloutRequest) -> GroupRolloutParams:
-        """Return the params for one group's rollouts."""
+    async def prepare_group_rollout(
+        self, request: GroupedRolloutRequest, *, problem_state: dict | None = None
+    ) -> GroupRolloutParams:
+        """Return the params for one group's rollouts.
+
+        Args:
+            request: The grouped rollout request being served.
+            problem_state: When None, draw a fresh problem as usual. When given, it
+                is a state this agent previously returned on ``GroupRolloutParams``;
+                prepare for that same problem instead of drawing a new one, so a
+                restored group's missing members are regenerated against the prompt
+                its existing members already answered.
+        """
         ...
 
     def rollout_allocations(self, num_groups: int) -> list[EnvAllocation]:

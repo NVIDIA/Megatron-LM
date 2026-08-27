@@ -4,9 +4,11 @@
 
 import asyncio
 import logging
+import queue as thread_queue
+import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, AsyncIterator, NamedTuple
+from typing import TYPE_CHECKING, AsyncIterator, Iterable, NamedTuple
 
 import numpy as np
 
@@ -14,14 +16,29 @@ from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..inference import ReturnsRaw
+from ..rollout_bank import _PendingProblem, _PendingRollout
 from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
 from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
+
+logger = logging.getLogger(__name__)
+
+BANK_WRITE_MAX_RECORDS = 64
+
+
+class _PendingConsumedMarkers(NamedTuple):
+    """A consumption-marker batch riding the bank queue behind its records.
+
+    FIFO order through the single writer thread is what guarantees the marker
+    reaches disk only after every record enqueued before it — the invariant a
+    blocking ``drain_bank`` used to provide at the inference-to-training switch.
+    """
+
+    uids: tuple[str, ...]
+    iteration: int
 
 if TYPE_CHECKING:
     from ..rollout_bank import RolloutBank
     from .api import GroupedRolloutGenerator, Rollout, TokenRollout
-
-logger = logging.getLogger(__name__)
 
 
 class _GranularityConfig(NamedTuple):
@@ -171,6 +188,11 @@ class _InferWorkItem(NamedTuple):
     Timestamps are wall-clock monotonic seconds: `prepared_at` is stamped at
     construction and `infer_dequeued_at` is filled in via `_replace` when an
     infer worker dequeues the item. Zero means "not yet reached".
+
+    `bank_uid` is the owning group's durable bank identity, reserved before any
+    member exists and None whenever the durable rollout bank is disabled. It is
+    distinct from `group_id`, which is the pipeline-local assemble-bucket key and
+    is always present.
     """
 
     group_id: int
@@ -179,6 +201,7 @@ class _InferWorkItem(NamedTuple):
     index_in_batch: int
     params: GroupRolloutParams
     env_index: int = 0
+    bank_uid: str | None = None
     prepared_at: float = 0.0
     infer_dequeued_at: float = 0.0
 
@@ -242,6 +265,17 @@ class RolloutPipeline:
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
         self.output_queue = asyncio_Queue()
+        # The bank queue is a plain thread queue, not an asyncio queue: its
+        # consumer must keep writing while the trainer holds the loop thread
+        # inside a training step and nothing pumps the event loop.
+        self.bank_queue: thread_queue.Queue = thread_queue.Queue()
+        self._bank_error: Exception | None = None
+        self._bank_writer: threading.Thread | None = None
+        if bank is not None:
+            self._bank_writer = threading.Thread(
+                target=self._bank_writer_loop, name="rollout-bank-writer", daemon=True
+            )
+            self._bank_writer.start()
 
         # Track regenerated groups and tasks for proper shutdown.
         self._next_regen_group_id = -1
@@ -250,7 +284,7 @@ class RolloutPipeline:
         self._regen_tasks: set[asyncio.Task] = set()
 
         # Buffers of partial results.
-        self._assemble_pending: dict[int, list[_InferredItem]] = {}
+        self._assemble_pending: dict[int, dict[int, RolloutGroup]] = {}
         self._consume_pending: dict[int, list[RolloutGroup]] = {}
         self._output_enqueued_at: dict[tuple[int, int], float] = {}
 
@@ -267,6 +301,7 @@ class RolloutPipeline:
         self.filtered_count = 0
         self.refilled_placeholder_groups = 0
         self.restored_count = 0
+        self.restored_rollout_count = 0
         self.yielded_count = 0
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.assembled_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
@@ -280,11 +315,11 @@ class RolloutPipeline:
         Yields:
             RolloutGroup: Groups in consumption-granularity order.
         """
-        tasks = (
+        tasks = [
             asyncio.create_task(self.stage_prepare()),
             asyncio.create_task(self.stage_infer()),
             asyncio.create_task(self.stage_assemble()),
-        )
+        ]
         try:
             async for group in self.stage_consume():
                 yield group
@@ -311,15 +346,44 @@ class RolloutPipeline:
             await asyncio.gather(*tasks, *regen_tasks, return_exceptions=True)
 
     async def _submit_group_to_infer_queue(
-        self, *, group_id: int, batch_id: int, index_in_batch: int
+        self,
+        *,
+        group_id: int,
+        batch_id: int,
+        index_in_batch: int,
+        restored: RolloutGroup | None = None,
     ) -> None:
-        """Enqueue one group's inference items, acquiring per-rollout gate slots."""
+        """Enqueue one group's inference items, acquiring per-rollout gate slots.
+
+        Args:
+            group_id: Pipeline-local key for this group's assemble bucket.
+            batch_id: Trainer batch this group belongs to.
+            index_in_batch: Slot within that batch.
+            restored: An incomplete group recovered from the bank. Its members seed
+                the assemble bucket and only its missing slots are generated, using
+                the persisted problem state so they answer the same prompt.
+        """
         env_index = self.gran_policy.env_of_index(index_in_batch)
         agent = self.allocations[env_index].agent
-        params: GroupRolloutParams = await agent.prepare_group_rollout(self.request)
+        params: GroupRolloutParams = await agent.prepare_group_rollout(
+            self.request, problem_state=restored.problem_state if restored else None
+        )
         self.prepared_groups_per_env[env_index] += 1
 
-        for rollout_idx in range(self.request.rollouts_per_group):
+        if restored is not None:
+            bank_uid = restored.uid
+            indices = restored.missing_indices(self.request.rollouts_per_group)
+            self._assemble_pending[group_id] = dict(
+                zip(restored.member_indices, restored.rollouts, strict=True)
+            )
+            self.restored_rollout_count += len(restored.rollouts)
+        else:
+            bank_uid = self.bank.reserve_group_uid() if self.bank is not None else None
+            indices = list(range(self.request.rollouts_per_group))
+            if self.bank is not None and params.problem_state is not None:
+                self.bank_queue.put_nowait(_PendingProblem(bank_uid, params.problem_state))
+
+        for rollout_idx in indices:
             await self.gate.acquire_for("R")
             item = _InferWorkItem(
                 group_id=group_id,
@@ -328,6 +392,7 @@ class RolloutPipeline:
                 index_in_batch=index_in_batch,
                 params=params,
                 env_index=env_index,
+                bank_uid=bank_uid,
                 prepared_at=time.monotonic(),
             )
             await self.infer_queue.put(item)
@@ -339,7 +404,12 @@ class RolloutPipeline:
             self.infer_queue.shutdown()
 
     def assert_no_inflight_rollouts(self) -> None:
-        """Verify no rollouts are buffered or in-flight at an iteration boundary for lag=0."""
+        """Verify no rollouts are buffered or in-flight at an iteration boundary for lag=0.
+
+        Counts rollouts rather than groups: dropped groups consume prepared
+        rollouts without ever being yielded, and a partially restored group is
+        yielded having consumed only some of its members from the gate.
+        """
         buffered = {
             "infer_queue": self.infer_queue.qsize(),
             "assemble_queue": self.assemble_queue.qsize(),
@@ -352,16 +422,16 @@ class RolloutPipeline:
             f"The rollout pipeline has buffered rollouts at iteration boundary: {buffered}. "
             "The generator has run ahead under a stale policy."
         )
-        # Dropped groups consume prepared rollouts without ever being yielded;
-        # restored groups are yielded without being freshly prepared.
-        fresh_yielded_count = self.yielded_count - self.restored_count
+        yielded_rollouts = (
+            self.yielded_count * self.request.rollouts_per_group - self.restored_rollout_count
+        )
         in_flight = self.prepared_count - (
-            (fresh_yielded_count + self.dropped_count) * self.request.rollouts_per_group
+            yielded_rollouts + self.dropped_count * self.request.rollouts_per_group
         )
         assert in_flight == 0, (
             f"The rollout pipeline prepared {self.prepared_count} rollout(s) but yielded "
-            f"{self.yielded_count} ({self.restored_count} restored) and dropped "
-            f"{self.dropped_count} group(s) of {self.request.rollouts_per_group} "
+            f"{self.yielded_count} group(s) ({self.restored_rollout_count} restored member(s)) "
+            f"and dropped {self.dropped_count} group(s) of {self.request.rollouts_per_group} "
             f"({self.filtered_count} same-reward-filtered, "
             f"{self.refilled_placeholder_groups} placeholder-refilled); "
             f"{in_flight} rollout(s) in flight at iteration boundary."
@@ -380,19 +450,29 @@ class RolloutPipeline:
                     self._groups_in_flight += 1
                     env_index = self.gran_policy.env_of_index(index_in_batch)
                     allocation = self.allocations[env_index]
-                    restored = self.agent.take_restored_group(allocation.env_id)
+                    restored: RolloutGroup | None = self.agent.take_restored_group(allocation.env_id)
                     if restored is not None:
                         assert all(rollout.env_id == allocation.env_id for rollout in restored), (
                             f"Restored rollout group routed to env {allocation.env_id!r} contains "
                             f"members for {[rollout.env_id for rollout in restored]}"
                         )
-                        restored.batch_id = batch_id
-                        restored.index_in_batch = index_in_batch
-                        self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
-                        await self.output_queue.put(restored)
-                        self.restored_count += 1
-                        self._groups_in_flight -= 1
-                        self._maybe_close_intake()
+                        if restored.is_complete(self.request.rollouts_per_group):
+                            restored.batch_id = batch_id
+                            restored.index_in_batch = index_in_batch
+                            self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
+                            await self.output_queue.put(restored)
+                            self.restored_count += 1
+                            self.restored_rollout_count += len(restored.rollouts)
+                            self._groups_in_flight -= 1
+                            self._maybe_close_intake()
+                            group_id += 1
+                            continue
+                        await self._submit_group_to_infer_queue(
+                            group_id=group_id,
+                            batch_id=batch_id,
+                            index_in_batch=index_in_batch,
+                            restored=restored,
+                        )
                         group_id += 1
                         continue
                     await self._submit_group_to_infer_queue(
@@ -406,6 +486,134 @@ class RolloutPipeline:
         finally:
             self._prepare_done = True
             self._maybe_close_intake()
+
+    def _bank_writer_loop(self) -> None:
+        """Consume the bank queue on a dedicated thread, for the pipeline's lifetime.
+
+        The trainer only runs the asyncio loop while collecting rollouts, so a
+        loop-driven consumer would freeze for the whole training step and force
+        the inference-to-training switch to drain the backlog with the GPUs
+        idle. This thread keeps writing regardless of what the loop is doing.
+
+        A single consumer means only one write is ever in flight, which is what
+        lets the bank keep its running sidecar offsets without a lock. All
+        failures are latched, never raised, so the thread cannot die and a
+        ``bank_queue.join()`` cannot deadlock.
+        """
+        while True:
+            items = [self.bank_queue.get()]
+            while len(items) < BANK_WRITE_MAX_RECORDS:
+                try:
+                    items.append(self.bank_queue.get_nowait())
+                except thread_queue.Empty:
+                    break
+            try:
+                self._process_bank_items(items)
+            finally:
+                for _ in items:
+                    self.bank_queue.task_done()
+
+    def _process_bank_items(self, items: list) -> None:
+        """Apply queued items in FIFO order: coalesced record writes, markers in place.
+
+        A marker batch flushes the records queued before it first, so a marker
+        can never reach disk ahead of a record it names.
+        """
+        records: list = []
+        for item in items:
+            if isinstance(item, _PendingConsumedMarkers):
+                self._write_records_latching(records)
+                records = []
+                self._mark_consumed_latching(item)
+            else:
+                records.append(item)
+        self._write_records_latching(records)
+
+    def _write_records_latching(self, records: list) -> None:
+        """Write one set of records, recording any failure instead of raising.
+
+        Latching keeps the writer thread alive through a bad write; the failure
+        surfaces at the next durability barrier or marker enqueue instead.
+        """
+        if not records:
+            return
+        try:
+            self.bank.write_records(records)
+        except Exception as exc:
+            self._bank_error = exc
+            logger.exception("Rollout bank write failed; %d record(s) lost", len(records))
+
+    def _mark_consumed_latching(self, markers: _PendingConsumedMarkers) -> None:
+        """Apply one consumption-marker batch, recording any failure instead of raising."""
+        try:
+            self.bank.mark_consumed_many(markers.uids, markers.iteration)
+        except Exception as exc:
+            self._bank_error = exc
+            logger.exception(
+                "Rollout bank consumption-marker write failed; %d marker(s) lost",
+                len(markers.uids),
+            )
+
+    def _raise_latched_bank_error(self) -> None:
+        """Raise the last latched bank failure once, then clear it."""
+        if self._bank_error is not None:
+            error, self._bank_error = self._bank_error, None
+            raise error
+
+    def enqueue_consumed_markers(self, uids: Iterable[str | None], iteration: int) -> None:
+        """Queue consumption markers behind the records they name, without blocking.
+
+        The single FIFO writer guarantees the markers reach disk only after
+        every record enqueued before them — the same records-before-marker
+        invariant a blocking drain used to enforce at the inference-to-training
+        switch, minus the idle GPUs. A crash mid-queue loses the tail records
+        and their marker together, which recovery already treats as "never
+        generated": the groups regenerate.
+
+        Raises any bank failure latched since the last barrier, so a broken
+        disk surfaces within one training iteration.
+        """
+        if self.bank is None:
+            return
+        self._raise_latched_bank_error()
+        markers = _PendingConsumedMarkers(
+            uids=tuple(uid for uid in uids if uid), iteration=iteration
+        )
+        if not markers.uids:
+            return
+        self.bank_queue.put(markers)
+        if self._bank_writer is None or not self._bank_writer.is_alive():
+            self.drain_bank()
+
+    def drain_bank(self) -> None:
+        """Block until every queued bank record and marker is durable.
+
+        The barrier before segment switches and compaction, both of which
+        rewrite state that queued items would be written against. Needs no
+        event loop: the writer runs on its own thread, and has had the whole
+        training step to work through the backlog, so this is normally instant.
+
+        If the writer thread is unavailable (it never started, or the
+        interpreter is tearing it down), the remaining items are applied inline
+        instead of dropped.
+        """
+        if self.bank is None:
+            return
+        if self._bank_writer is not None and self._bank_writer.is_alive():
+            self.bank_queue.join()
+        else:
+            pending = []
+            while True:
+                try:
+                    pending.append(self.bank_queue.get_nowait())
+                except thread_queue.Empty:
+                    break
+            try:
+                self._process_bank_items(pending)
+            finally:
+                for _ in pending:
+                    self.bank_queue.task_done()
+        self._raise_latched_bank_error()
 
     async def stage_infer(self) -> None:
         """Run a persistent pool of inference workers, spawned once per pipeline."""
@@ -448,7 +656,18 @@ class RolloutPipeline:
         )
 
     async def stage_assemble(self) -> None:
-        """Build complete rollout groups, and regenerate dropped groups."""
+        """Grade each rollout as it arrives, emit groups once they fill, and
+        regenerate dropped ones.
+
+        Grading moved here from group completion so a member can be persisted the
+        moment it is durable-worthy. It does not run more often: every rollout is
+        graded either way, because the drop decision needs the rewards.
+
+        Placeholders are not persisted. A failed episode has an empty trajectory
+        and no decode work to save, and banking one would let a restored group
+        carry a placeholder past the refill path in ``_decide_drop``; leaving the
+        slot empty means restore regenerates it instead.
+        """
         pending = self._assemble_pending
         try:
             while True:
@@ -459,22 +678,33 @@ class RolloutPipeline:
                 dequeued_at = time.monotonic()
                 if inferred.inferred_at:
                     self.assemble_queue_dwell.append(dequeued_at - inferred.inferred_at)
-                bucket = pending.setdefault(inferred.item.group_id, [])
-                bucket.append(inferred)
+
+                item = inferred.item
+                rollout = await item.params.build_rollout(inferred.episode)
+                if (
+                    self.bank is not None
+                    and item.bank_uid is not None
+                    and not rollout.is_placeholder
+                ):
+                    self.bank_queue.put_nowait(
+                        _PendingRollout(item.bank_uid, item.rollout_idx, rollout)
+                    )
+
+                bucket = pending.setdefault(item.group_id, {})
+                bucket[item.rollout_idx] = rollout
                 if len(bucket) < self.request.rollouts_per_group:
                     continue
-                completed = pending.pop(inferred.item.group_id)
-                completed.sort(key=lambda item: item.item.rollout_idx)
-                rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.episode) for item in completed]
-                )
-                first = completed[0]
+
+                pending.pop(item.group_id)
+                indices = sorted(bucket)
                 self.assembled_count += 1
-                self.assembled_groups_per_env[first.item.env_index] += 1
+                self.assembled_groups_per_env[item.env_index] += 1
                 group = RolloutGroup(
-                    rollouts=rollouts,
-                    batch_id=first.item.batch_id,
-                    index_in_batch=first.item.index_in_batch,
+                    rollouts=[bucket[index] for index in indices],
+                    batch_id=item.batch_id,
+                    index_in_batch=item.index_in_batch,
+                    uid=item.bank_uid,
+                    member_indices=indices,
                 )
                 if self._decide_drop(group):
                     self.dropped_count += 1
@@ -484,8 +714,6 @@ class RolloutPipeline:
                     self._regen_tasks.add(task)
                     task.add_done_callback(self._regen_tasks.discard)
                     continue
-                if self.bank is not None:
-                    group.uid = self.bank.append(group)
                 self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
                     time.monotonic()
                 )

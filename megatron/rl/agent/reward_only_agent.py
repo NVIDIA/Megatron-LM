@@ -233,16 +233,24 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         )
 
     async def prepare_group_rollout(
-        self,
-        request: GroupedRolloutRequest,
+        self, request: GroupedRolloutRequest, *, problem_state: dict | None = None
     ) -> GroupRolloutParams:
+        """Prepare one group, either from a fresh draw or from a restored problem.
 
-        prompt, golden = await self.get_prompt(validation=request.validation)
+        Implemented once here so every env deriving from ``RewardOnlyAgent`` becomes
+        completable after a crash without per-env work. Envs whose ``golden`` is not
+        JSON-serializable should override this and return ``problem_state=None``.
+        """
+        if problem_state is None:
+            prompt, golden = await self.get_prompt(validation=request.validation)
+        else:
+            prompt, golden = problem_state["prompt"], problem_state["golden"]
 
         # Every rollout runs as a (possibly multi-turn) episode over the group's shared prompt.
         return GroupRolloutParams(
             run_episode=functools.partial(self._run_episode, request, prompt=prompt, golden=golden),
             build_rollout=functools.partial(self._rollout_from_episode, request, golden=golden),
+            problem_state={"prompt": prompt, "golden": golden},
         )
 
     async def _evaluation(
