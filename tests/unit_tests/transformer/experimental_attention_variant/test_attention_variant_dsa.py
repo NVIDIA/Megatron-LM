@@ -18,7 +18,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -3996,6 +3996,66 @@ class TestDSAModuleSpecDispatch:
             self._make_dsa_config(
                 experimental_attention_variant="dsa", context_parallel_size=2, cp_comm_type="p2p"
             )
+
+    def _make_packed_cudnn_dsa_graph_config(self, monkeypatch, **overrides):
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config."
+            "_validate_dsa_kernel_backend_dependencies",
+            lambda _backend: None,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config.is_te_min_version", lambda _version: True
+        )
+        kwargs = {
+            "experimental_attention_variant": "dsa",
+            "dsa_kernel_backend": "cudnn",
+            "sequence_packing_scheduler": "dp_balanced",
+            "max_seqlen_per_dp_cp_rank": 128,
+            "pad_packed_seq_alignment": "max",
+            "thd_max_packed_sequences": 4,
+            "context_parallel_size": 2,
+            "cp_comm_type": "allgather",
+            "cuda_graph_impl": "local",
+            "cuda_graph_modules": [CudaGraphModule.attn],
+        }
+        kwargs.update(overrides)
+        return self._make_dsa_config(**kwargs)
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules",
+        [[], [CudaGraphModule.attn], [CudaGraphModule.mlp]],
+        ids=["whole_layer", "attention", "mlp_only"],
+    )
+    def test_packed_cudnn_dsa_cp_rejects_every_local_cuda_graph_scope(
+        self, monkeypatch, cuda_graph_modules
+    ):
+        """CP layout construction fails during local warmup even for MLP-only capture."""
+        with pytest.raises(ValueError, match="packed cuDNN DSA with context parallelism"):
+            self._make_packed_cudnn_dsa_graph_config(
+                monkeypatch, cuda_graph_modules=cuda_graph_modules
+            )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"context_parallel_size": 1, "cp_comm_type": None},
+            {"experimental_attention_variant": None},
+            {"dsa_kernel_backend": "none"},
+            {
+                "sequence_packing_scheduler": None,
+                "max_seqlen_per_dp_cp_rank": None,
+                "pad_packed_seq_alignment": None,
+                "thd_max_packed_sequences": None,
+            },
+            {"cuda_graph_impl": "none"},
+            {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": [CudaGraphModule.mlp]},
+        ],
+        ids=["cp1", "non_dsa", "unfused_backend", "nonpacked", "cuda_graph_disabled", "te_mlp"],
+    )
+    def test_packed_cudnn_dsa_cp_local_cuda_graph_guard_is_narrow(self, monkeypatch, overrides):
+        """Changing any measured guard dimension leaves the neighboring config available."""
+        config = self._make_packed_cudnn_dsa_graph_config(monkeypatch, **overrides)
+        assert isinstance(config, MLATransformerConfig)
 
     def test_get_dsa_module_spec_for_backend(self):
         """get_dsa_module_spec_for_backend returns the correct full spec structure."""
