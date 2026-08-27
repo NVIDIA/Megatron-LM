@@ -125,6 +125,8 @@ def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
 
 def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
     """Copy optimizer-relevant metadata when creating param views/copies."""
+    if hasattr(source, 'allreduce'):
+        destination.allreduce = source.allreduce
     if hasattr(source, 'shared'):
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
@@ -315,6 +317,7 @@ class MegatronOptimizer(ABC):
           - parameter should not be shared (i.e., grads shouldn't be double counted while
             computing norms).
           - should not be a replica due to tensor model parallelism.
+          - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
         for param in params:
@@ -341,9 +344,12 @@ class MegatronOptimizer(ABC):
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
+                param,
+                tp_group=getattr(self, 'tp_group', None),
+                expert_tp_group=getattr(self, 'expert_tp_group', None),
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
         return grads_for_norm
 
@@ -508,6 +514,7 @@ class MegatronOptimizer(ABC):
                 and getattr(params[0], "__fsdp_param__", False)
             ),
             tp_group=getattr(self, 'tp_group', None),
+            expert_tp_group=getattr(self, 'expert_tp_group', None),
         )
 
     @abstractmethod
@@ -926,6 +933,120 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         return success, grad_norm, num_zeros_in_grad
 
 
+def _strip_module_prefix(name: str) -> str:
+    """Strip wrapper ``module.`` prefixes (DDP/Float16Module) off a dotted param name."""
+    while name.startswith('module.'):
+        name = name[len('module.') :]
+    return name
+
+
+def _backfill_gtp_sharded_param_map(
+    id_to_sharded_param_map: dict, float16_groups, model_sharded_state_dict=None
+) -> None:
+    """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
+
+    WHAT: ``get_param_id_to_sharded_param_map`` matches an optimizer param to its model
+    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). Two GTP_remat
+    cases break that match:
+      1. Native-FP8 GTP weights: the model entry's data is a *dequantized BF16 copy* of the param
+         (make_tp_sharded_tensor_for_checkpoint). The copy carries a ``_gtp_dequant_src`` backlink
+         to the live FP8 param, so the model's OWN entry is reused here (identity first, tagged
+         ``_debug_name`` second) -- preserving its full offsets (expert axes included) and
+         replica_id.
+      2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
+         tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
+         ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
+         aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
+         loudly instead of writing colliding shards across EP groups.
+
+    WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
+    matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
+    Distributed Adam uses its own ``DistributedOptimizer.sharded_state_dict`` (flat-buffer path)
+    and is unaffected.
+
+    No-op when GTP is unavailable or when every param already matched.
+    """
+    try:
+        from megatron.core.tensor_parallel.gtp_api import (
+            is_gtp_param,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        )
+    except ImportError:
+        return  # GTP not built in -- nothing to backfill.
+
+    # is_gtp_param matches both the legacy BF16 slice params and native-FP8 GTP params.
+    unmatched = [
+        (param_id, p)
+        for param_id, p in enumerate(chain.from_iterable(float16_groups))
+        if param_id not in id_to_sharded_param_map and is_gtp_param(p)
+    ]
+    if not unmatched:
+        return
+
+    from ..dist_checkpointing.dict_utils import nested_values
+    from ..dist_checkpointing.mapping import ShardedTensor
+
+    # Index the model's own entries by (a) the dequantized-copy backlink and (b) checkpoint key.
+    src_id_to_entry = {}
+    key_to_entry = {}
+    if model_sharded_state_dict is not None:
+        for entry in nested_values(model_sharded_state_dict):
+            src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+            if src is not None:
+                src_id_to_entry[id(src)] = entry
+            key = getattr(entry, 'key', None)
+            if key is not None:
+                # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.
+                key_to_entry[key] = None if key in key_to_entry else entry
+
+    # Groups sourced lazily (below) only when a rebuild is needed, so GTP models on
+    # explicit grids (e.g. MiMo) don't require the global MPU groups unless they hit it.
+    tp_group = None
+    dp_cp_gtp_remat_group = None
+    for param_id, p in unmatched:
+        # Case 1: reuse the model's own entry (native-FP8 dequantized copy broke the id match).
+        entry = src_id_to_entry.get(id(p))
+        if entry is None:
+            name = _strip_module_prefix(getattr(p, '_debug_name', '') or '')
+            candidate = key_to_entry.get(name)
+            # Reuse only a plain ShardedTensor with this shard's local shape; a factory
+            # (gathered data, e.g. Mamba in_proj) must take the per-shard rebuild below.
+            if (
+                candidate is not None
+                and isinstance(candidate, ShardedTensor)
+                and tuple(candidate.data.shape) == tuple(p.shape)
+            ):
+                entry = candidate
+        if entry is not None:
+            id_to_sharded_param_map[param_id] = entry
+            continue
+        # Case 2: rebuild. Not EP-aware -- an expert param rebuilt here would collide across
+        # expert-parallel groups (duplicate writers), so it must have matched above.
+        if not getattr(p, 'allreduce', True):
+            raise ValueError(
+                f"GTP expert-parallel param '{getattr(p, '_debug_name', '')}' (id {param_id}) "
+                "has no matching model ShardedTensor; refusing the EP-unaware rebuild (it would "
+                "write duplicate shards across expert-parallel groups)."
+            )
+        if tp_group is None:
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
+            dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            )
+        # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
+        # keeps the function usable in tests where the name was not tagged.
+        key = p._debug_name or f'_gtp_optim_param_{param_id}'
+        rebuilt = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {key: p},
+            prefix='',
+            tensor_parallel_layers_axis_map={key: 0},
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_gtp_remat_group,
+        )
+        id_to_sharded_param_map[param_id] = rebuilt[key]
+
+
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     """Float16 optimizer for fp16 and bf16 data types.
 
@@ -973,22 +1094,29 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Seed the fp32 master from the high-precision pre-quantization init
-                            # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
-                            # fp8_param_gather ON/OFF hold an identical master at iter 0.
-                            if hasattr(param, 'get_high_precision_init_val'):
-                                main_param = (
-                                    param.get_high_precision_init_val()
-                                    .detach()
-                                    .clone()
-                                    .to(param.device)
-                                    .float()
+                            # Native quantized parameters may retain their pre-quantization
+                            # BF16/FP16 initializer on CPU. Build the FP32 master from that value
+                            # so primary-weight and non-primary-weight runs start identically.
+                            # Falling back to the model parameter is correct for ordinary
+                            # BF16/FP16 parameters and older quantized-tensor implementations.
+                            get_high_precision_init_val = getattr(
+                                param, 'get_high_precision_init_val', None
+                            )
+                            high_precision_init_val = (
+                                get_high_precision_init_val()
+                                if get_high_precision_init_val is not None
+                                else None
+                            )
+                            if high_precision_init_val is not None:
+                                main_param = high_precision_init_val.to(
+                                    device=param.device, dtype=torch.float32, copy=True
                                 )
                                 param.clear_high_precision_init_val()
                             else:
                                 main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            tensor_parallel.copy_gtp_attributes(main_param, param)
                             copy_optimizer_param_metadata(main_param, param)
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
@@ -1187,6 +1315,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, model_params_in_optimizer_order()
+        )
+
+        _backfill_gtp_sharded_param_map(
+            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
         )
 
         # Convert fp32_from_fp16_params
@@ -1950,6 +2082,8 @@ class ChainedOptimizer(MegatronOptimizer):
                     self.config.use_precision_aware_optimizer
                     and getattr(params[0], "__fsdp_param__", False)
                 ),
+                tp_group=getattr(self.chained_optimizers[0], 'tp_group', None),
+                expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
             )
         else:
             num_zeros_in_grad = 0

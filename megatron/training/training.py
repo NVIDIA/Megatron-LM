@@ -150,7 +150,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import is_hybrid_model
+from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -687,6 +687,38 @@ def num_floating_point_operations(
             + (2 * total_tokens * d_in * hidden_size)  # out_proj
         )
 
+    def gated_delta_product_layer_flops(
+        total_tokens,
+        hidden_size,
+        num_householder,
+        state_dim=128,
+        head_dim=64,
+        num_groups=8,
+        num_heads=None,
+        conv_kernel_dim=4,
+    ):
+        """Calculate FLOPs for a Gated Delta Product (GDP) layer."""
+        if num_heads is None:
+            d_inner = 2 * hidden_size
+            num_heads = d_inner // head_dim
+        else:
+            d_inner = num_heads * head_dim
+        in_proj_dim = (
+            d_inner * (1 + num_householder)
+            + num_groups * state_dim * (1 + num_householder)
+            + num_heads * (1 + num_householder)
+        )
+        conv_dim = d_inner * num_householder + num_groups * state_dim * (1 + num_householder)
+        non_core_flops = (
+            2
+            * total_tokens
+            * (hidden_size * in_proj_dim + conv_kernel_dim * conv_dim + d_inner * hidden_size)
+        )
+        # Best-case recurrent GDP core estimate. The FLA chunk kernel may do additional
+        # score/solve/WY work, but this keeps the implementation-agnostic lower bound explicit.
+        core_flops = (4 * num_householder + 3) * total_tokens * d_inner * state_dim
+        return non_core_flops + core_flops
+
     def gdn_layer_flops(
         total_tokens,
         hidden_size,
@@ -754,6 +786,7 @@ def num_floating_point_operations(
         num_mamba_layers,
         num_mlp_layers,
         num_moe_layers,
+        gdp_num_householder,
         num_gdn_layers=0,
         mamba_state_dim=128,
         mamba_head_dim=64,
@@ -769,6 +802,7 @@ def num_floating_point_operations(
         moe_ffn_hidden_size=2048,
         shared_expert_ffn_hidden_size=2048,
         num_experts_routed_to=1,
+        use_gated_delta_product=False,
         gdn_qk_head_dim=128,
         gdn_v_head_dim=128,
         gdn_num_qk_heads=16,
@@ -801,6 +835,26 @@ def num_floating_point_operations(
         dsa_indexer_topk=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
+        mamba_flops = (
+            gated_delta_product_layer_flops(
+                total_tokens,
+                hidden_size,
+                gdp_num_householder,
+                mamba_state_dim,
+                mamba_head_dim,
+                mamba_num_groups,
+                mamba_num_heads,
+            )
+            if use_gated_delta_product
+            else mamba_layer_flops(
+                total_tokens,
+                hidden_size,
+                mamba_state_dim,
+                mamba_head_dim,
+                mamba_num_groups,
+                mamba_num_heads,
+            )
+        )
         # Self-attention (already summed over all attention layers, fwd-equivalent
         # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
         if experimental_attention_variant == "dsv4_hybrid":
@@ -871,15 +925,7 @@ def num_floating_point_operations(
             attn_flops_total
             + kda_flops_total
             + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
-            + num_mamba_layers
-            * mamba_layer_flops(
-                total_tokens,
-                hidden_size,
-                mamba_state_dim,
-                mamba_head_dim,
-                mamba_num_groups,
-                mamba_num_heads,
-            )
+            + num_mamba_layers * mamba_flops
             + num_moe_layers
             * moe_layer_flops(
                 total_tokens,
@@ -1277,6 +1323,24 @@ def num_floating_point_operations(
         )
         return total_floating_point_operations
 
+    def _uses_gated_delta_product_spec(args):
+        """Return True when the selected hybrid stack spec swaps Mamba layers to GDP."""
+        def _split_spec_part(part):
+            return str(part).replace('[', ' ').replace(']', ' ').replace(',', ' ').split()
+
+        spec = getattr(args, 'spec', None)
+        if spec is None:
+            return False
+        if isinstance(spec, str):
+            spec_parts = _split_spec_part(spec)
+        else:
+            spec_parts = []
+            for part in spec:
+                spec_parts.extend(_split_spec_part(part))
+        if not spec_parts:
+            return False
+        return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
+
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -1332,12 +1396,14 @@ def num_floating_point_operations(
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
             mamba_num_heads=args.mamba_num_heads,
+            gdp_num_householder=args.gdp_num_householder,
             num_attn_heads=args.num_attention_heads,
             gqa=args.group_query_attention,
             gqa_groups=args.num_query_groups,
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
             swiglu=args.swiglu,
+            use_gated_delta_product=_uses_gated_delta_product_spec(args),
             moe_latent_size=args.moe_latent_size,
             moe_ffn_hidden_size=(
                 args.moe_ffn_hidden_size
@@ -2041,6 +2107,13 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
+    if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+        # Deregister the GTP symmetric-memory pools: windows left registered when the
+        # process groups are destroyed make NCCL abort.
+        deregister_and_clear_gtp_symm_pools()
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -2177,8 +2250,22 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
-            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
+            # The distributed optimizer shards each bucket over the intra-instance group, which
+            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
+            # same group, otherwise the layout reports more shards than the reduce-scatter uses
+            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
+            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
+            # when there are several instances.
+            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
+            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
+            data_parallel_world_size = get_pg_size(
+                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
+            )
+            expert_data_parallel_world_size = get_pg_size(
+                intra_expt_dp_group
+                if intra_expt_dp_group is not None
+                else getattr(layout_pgs, "expt_dp", None)
+            )
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -2323,9 +2410,12 @@ def get_model(
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, pipeline) '
-            'model parallel rank ({}, {}): {}'.format(
-                get_pg_rank(pg_collection.tp), get_pg_rank(pg_collection.pp), num_parameters
+            ' > number of parameters on (tensor, gtp_weight_remat, pipeline) '
+            'model parallel rank ({}, {}, {}): {}'.format(
+                get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.gtp_remat),
+                get_pg_rank(pg_collection.pp),
+                num_parameters,
             ),
             flush=True,
         )
@@ -2587,8 +2677,46 @@ def setup_model_and_optimizer(
                 pg_collection=pg_collection,
             )
 
+    # Configure GTP weight-remat padding/loss reduction before model construction (pad
+    # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
+    # also covers the config-container builder path, which does not call get_model.
+    if is_gtp_remat_active(args):
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+        from megatron.core.tensor_parallel.gtp_api import (
+            configure_gtp_remat_from_recipe,
+            register_gtp_symm_pool,
+        )
+
+        configure_gtp_remat_from_recipe(
+            fp4=getattr(args, 'fp4', None) is not None,
+            fp8_recipe=getattr(args, 'fp8_recipe', None),
+            fp8=getattr(args, 'fp8', None) is not None,
+            calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+            reduce_scatter_with_fp32_accumulation=getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ),
+        )
+
+        if getattr(args, 'gtp_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+        if getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
+
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+
+    # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
+    # first forward. Placed here (not in get_model) so it also covers the config-container
+    # builder path.
+    if is_gtp_remat_active(args):
+        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+
+        classify_gtp_remat_chains(
+            model,
+            cuda_graph_modules=getattr(args, 'cuda_graph_modules', None),
+            moe_shared_expert_overlap=getattr(args, 'moe_shared_expert_overlap', False),
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
+        )
 
     if args.logits_save_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
@@ -2711,7 +2839,9 @@ def setup_model_and_optimizer(
             and args.ckpt_format == "torch_dist",
             tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
             pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-            dp_cp_group=ckpt_pgc.dp_cp if ckpt_pgc is not None else None,
+            # Replica_id must match the save path (see save_checkpoint_and_time): use the
+            # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
+            dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
             dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
             expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
@@ -3139,7 +3269,9 @@ def train_step(
             getattr(pg_collection, _required, None) is not None
         ), f"model pg_collection used by train_step must define {_required}"
     mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
+    # gtp_remat-inclusive: the reported global per-token loss must cover gtp_remat peers' distinct
+    # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
+    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -3159,7 +3291,15 @@ def train_step(
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+        # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so multiply it
+        # back in for the sample count.
+        increment = (
+            get_num_microbatches()
+            * args.micro_batch_size
+            * args.data_parallel_size
+            * args.gtp_weight_remat_size
+        )
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
@@ -3314,8 +3454,15 @@ def training_log(
     if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
-    # Calculate batch size.
-    batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
+    # total_model_size at arguments.py:446); each gtp-remat peer consumes a distinct microbatch,
+    # so multiply it back in for the global sample count.
+    batch_size = (
+        args.micro_batch_size
+        * args.data_parallel_size
+        * args.gtp_weight_remat_size
+        * get_num_microbatches()
+    )
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -3739,7 +3886,8 @@ def save_checkpoint_and_time(
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
+    # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
+    dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
     rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
@@ -4101,12 +4249,15 @@ def train(
     )
 
     def _dp_world_size():
+        # Full DP x gtp_remat degree (num_microbatches spans the full data-distribution axis).
+        gtp_remat = args.gtp_weight_remat_size
         if lang_pgc is not None:
-            return lang_pgc.dp.size()
+            return lang_pgc.dp.size() * gtp_remat
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        # args.data_parallel_size equals the language (llm) dp on all ranks (entry validate_args).
-        return args.data_parallel_size
+        # args.data_parallel_size is the language (llm) dp on all ranks (set in validate_args) and
+        # excludes gtp_remat, so scale by gtp_remat to span the full data-distribution axis.
+        return args.data_parallel_size * gtp_remat
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
@@ -4824,6 +4975,13 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+            # Deregister the GTP symmetric-memory pools: windows left registered when the
+            # process groups are destroyed make NCCL abort.
+            deregister_and_clear_gtp_symm_pools()
+
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
@@ -4875,12 +5033,22 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
-    eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
+    # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+    # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so include it in the
+    # global sample breadth we divide out to recover the microbatch count.
+    eval_num_microbatches = eval_batch_size // (
+        eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+    )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
+    # gtp_remat-inclusive, mirroring train_step: gtp_remat peers hold distinct micro-batches, so
+    # the reduction must cover every distinct-data rank. Reducing over the replicate dp_cp would
+    # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
+    # dp=6/gtp_remat=64) while consumed_valid_samples still books the full eval_batch_size.
+    eval_dp_cp_group = getattr(eval_pgc, 'dp_cp_gtp_remat', None) or eval_pgc.dp_cp
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -4922,7 +5090,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -4968,13 +5136,13 @@ def evaluate(
                             val = torch.vstack(val)
                             val = val[:, 0] / val[:, 1].clamp(min=1)
                             val = val.mean()
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
-                            val /= torch.distributed.get_world_size(group=eval_pgc.dp_cp)
+                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
+                            val /= torch.distributed.get_world_size(group=eval_dp_cp_group)
                             total_loss_dict[key][0] += val
                             total_loss_dict[key][1] += 1
                         else:
                             val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
+                            torch.distributed.all_reduce(val, group=eval_dp_cp_group)
                             total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
@@ -5220,7 +5388,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

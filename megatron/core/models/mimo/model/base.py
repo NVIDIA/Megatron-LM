@@ -128,7 +128,7 @@ class MimoModel(MegatronModule):
                         hasattr(pg, 'dp_cp') and pg.dp_cp is not None
                     ), f"pg_collection on '{name}' is missing dp_cp group"
                     mod_metadata = dict(metadata) if metadata else {}
-                    mod_metadata['dp_cp_group'] = pg.dp_cp
+                    mod_metadata['dp_cp_group'] = getattr(pg, 'dp_cp_gtp_remat', None) or pg.dp_cp
                 # Unwrap wrappers so the sharded keys match the raw load_state_dict keys.
                 inner = module
                 child_prefix = f'{prefix}{name}.'
@@ -503,6 +503,8 @@ class MimoModel(MegatronModule):
             language_grid = grid_map[MIMO_LANGUAGE_MODULE_KEY]
             encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
             language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
+            if "gtp_remat" in language_grid.dim_names:
+                language_dp *= language_grid.shape[language_grid.dim_names.index("gtp_remat")]
             assert encoder_dp <= language_dp, (
                 f"Bridge fan-out split metadata with non-uniform per-sample sizes "
                 f"requires encoder DP <= LM DP (got encoder='{encoder_name}' "

@@ -13,7 +13,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -278,6 +278,17 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
+            linear_gtp_kwargs = {}
+            if linear_cls is TELinear:
+                linear_gtp_kwargs = {
+                    "gtp_remat_group": gtp_remat_group,
+                    "gtp_replica_group": pg_collection.dp_cp,
+                }
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -289,6 +300,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                **linear_gtp_kwargs,
             )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
@@ -301,7 +313,13 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
+                **linear_gtp_kwargs,
             )
+            if linear_cls is TELinear:
+                # The duplicated operation has no TP execution group. TELinear uses
+                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
+                self.fc1_latent_proj._tp_group = pg_collection.tp
+                self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":

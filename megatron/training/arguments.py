@@ -455,10 +455,22 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
+    # GTP_remat counts toward total_model_size (an independent weight-shard axis), so the
+    # args.data_parallel_size below is the replicate degree (matches
+    # parallel_state). gtp_weight_remat_size is derived from --tensor-parallel-num-weight-shards.
+    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
     total_model_size = (
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
+        * args.gtp_weight_remat_size
     )
 
     # Total model size.
@@ -478,6 +490,7 @@ def validate_args(args, defaults={}):
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
+        * args.gtp_weight_remat_size
     )
     args.data_parallel_size = args.world_size // total_model_size
 
@@ -740,11 +753,17 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
+    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
+    # divides eval_global_batch_size by the same product to get its microbatch count, and without
+    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
     assert (
-        args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0
+        args.eval_global_batch_size
+        % (args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size)
+        == 0
     ), (
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
+        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
     )
 
     if args.perform_rl_step:
@@ -1331,6 +1350,23 @@ def validate_args(args, defaults={}):
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
+
+    if args.accumulate_allreduce_grads_in_fp32:
+        # The FP32-accumulation reduce-scatters only exist to recover FP32 accumulation from a
+        # lower-precision wire dtype. With FP32 main_grads the plain ring reduce-scatter already
+        # sums in FP32 on both axes, so they buy no precision and cost one extra
+        # unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.
+        for arg_name in (
+            'ddp_reduce_scatter_with_fp32_accumulation',
+            'gtp_remat_reduce_scatter_with_fp32_accumulation',
+        ):
+            if getattr(args, arg_name, False):
+                setattr(args, arg_name, False)
+                warn_rank_0(
+                    f"Setting args.{arg_name} to False since "
+                    "--accumulate-allreduce-grads-in-fp32 already reduces in fp32"
+                )
+
     if args.cuda_graph_impl == "full_iteration":
         assert (
             not args.check_for_nan_in_loss_and_grad
@@ -1660,6 +1696,120 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
+
+    # Derive the internal gtp_weight_remat_size from the user-facing
+    # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
+    # from argument generation), so it is set here as a fresh attribute on args before it is
+    # consumed below (and in initialize/training, which read args.gtp_weight_remat_size directly).
+    # Mirrors ModelParallelConfig.__post_init__.
+    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+    (args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size) = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+    # Same for the expert layers: derive the internal expert_gtp_weight_remat_size from the
+    # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
+    # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
+    (args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size) = (
+        resolve_tensor_parallel_weight_shards(
+            args.expert_tensor_parallel_size,
+            args.expert_tensor_parallel_num_weight_shards,
+            getattr(args, "expert_gtp_weight_remat_size", 1),
+        )
+    )
+
+    if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+        if args.fp4 and not args.fp4_param_gather:
+            raise ValueError(
+                "GTP (--tensor-parallel-num-weight-shards / "
+                "--expert-tensor-parallel-num-weight-shards > 1) with --fp4-format requires "
+                "--fp4-param-gather so NVFP4 weights are all-gathered as native NVFP4."
+            )
+        gtp_weight_remat_size = args.gtp_weight_remat_size
+        egtp_weight_remat_size = args.expert_gtp_weight_remat_size
+        if get_device_arch_version() >= 10:
+            # Setting GTP communication groups for high priority streams for Blackwell and later
+            # architectures. Assigning high priority to communication streams ensures that
+            # communication kernels are scheduled with higher priority, minimizing the exposed
+            # communication when it is overlapped with other computation kernels.
+            if 'gtp_remat' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('gtp_remat')
+                warn_rank_0("Setting 'gtp_remat' group for high priority streams.")
+            if (
+                egtp_weight_remat_size > 1
+                and 'expt_gtp_remat' not in args.high_priority_stream_groups
+            ):
+                args.high_priority_stream_groups.append('expt_gtp_remat')
+                warn_rank_0("Setting 'expt_gtp_remat' group for high priority streams.")
+
+            # Sanity check for 'CUDA_GRAPHS_USE_NODE_PRIORITY'.
+            if args.cuda_graph_impl != "none":
+                assert os.environ.get('CUDA_GRAPHS_USE_NODE_PRIORITY') == "1", \
+                    'GTP requires CUDA_GRAPHS_USE_NODE_PRIORITY=1 to make sure fine-grained GTP ' \
+                    'comms can be well overlapped with GEMMs when CudaGraph is enabled for ' \
+                    'Blackwell and later architecture.'
+
+        # Sanity check for 'NCCL_PROTO'.
+        if os.environ.get('NCCL_PROTO', '').lower() == "simple":
+            warn_rank_0(
+                "Generally GTP prefers 'NCCL_PROTO=LL128 or LL' while get 'NCCL_PROTO=simple', "
+                "force setting NCCL_PROTO=Simple might introduce bad perf."
+            )
+
+        assert not args.ddp_average_in_collective, (
+            "GTP requires --ddp-average-in-collective off (the default); averaged collectives "
+            "would need per-buffer 1/gtp_remat scaling."
+        )
+
+        assert args.ckpt_format in ('torch', 'torch_dist'), (
+            f"GTP supports only --ckpt-format 'torch' (legacy) or 'torch_dist', got "
+            f"'{args.ckpt_format}'."
+        )
+        assert not (
+            getattr(args, 'dist_ckpt_optim_fully_reshardable', False)
+            and getattr(args, 'distrib_optim_fully_reshardable_mem_efficient', False)
+        ), (
+            "GTP does not support the distributed-optimizer fully-reshardable + "
+            "mem-efficient checkpoint mode. Disable "
+            "--distrib-optim-fully-reshardable-mem-efficient (or "
+            "--dist-ckpt-optim-fully-reshardable)."
+        )
+
+        # GTP with the mxfp8 recipe requires --fp8-param-gather: GTP keeps no bf16 weight and
+        # relies on the optimizer maintaining the fp8 shard (the forward all-gathers fp8 and does
+        # not re-quantize). Without fp8-param-gather the fp8 forward weight would never be updated.
+        if getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            assert getattr(args, 'fp8_param_gather', False), (
+                "GTP + mxfp8 requires --fp8-param-gather (the optimizer maintains the fp8 shard; "
+                "GTP does not keep or re-quantize a bf16 weight)."
+            )
+            # MXFP8 params cannot be mapped into the contiguous param buffer (TE's
+            # replace_raw_data does not support the MXFP8 tile-scaling layout), so the param
+            # all-gather must reuse the grad buffer instead.
+            assert getattr(args, 'reuse_grad_buf_for_mxfp8_param_ag', False), (
+                "GTP + mxfp8 + --fp8-param-gather requires --reuse-grad-buf-for-mxfp8-param-ag "
+                "(MXFP8 params keep their own quantized storage; mapping them into the param "
+                "buffer via replace_raw_data is unsupported)."
+            )
+
+        # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
+        # windows), which contradicts --disable-symmetric-registration.
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+            assert not getattr(args, 'disable_symmetric_registration', False), (
+                "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
+                "cannot be combined with --disable-symmetric-registration."
+            )
+            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+                print_rank_0(
+                    "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
+                    "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
+                    "symmetric reduce-scatters accumulate in fp32 in-switch "
+                    "(NCCL multimem.ld_reduce .acc::f32)."
+                )
+
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False
@@ -1921,6 +2071,13 @@ def validate_args(args, defaults={}):
                 "not pass --use-layer-wise-param-layout) for fp8 parameter gather, or "
                 "fp8_param_gather=False."
             )
+    assert not (
+        args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
+    ), (
+        "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
+        "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
+        "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
+    )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2830,6 +2987,10 @@ def _add_network_size_args(parser):
         "apply_dsa_kernel_fusion",
         "dsa_kernel_backend",
         "mamba_training_ssm_states_dtype",
+        # internal/derived: controlled only via --tensor-parallel-num-weight-shards
+        "gtp_weight_remat_size",
+        # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
+        "expert_gtp_weight_remat_size",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3328,9 +3489,14 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--muon-tp-mode',
         type=str,
-        default='blockwise',
-        choices=['blockwise', 'duplicated', 'distributed'],
-        help='How to perform NS calculation for tensor model parallel weights',
+        default='duplicated',
+        choices=['blockwise', 'duplicated', 'distributed', 'auto'],
+        help='How to perform NS calculation for tensor model parallel weights. '
+        'blockwise orthogonalizes each shard on its own, so the update rule '
+        'depends on the parallelism config; duplicated and distributed both '
+        'orthogonalize the whole matrix and give TP-invariant results; auto '
+        'select between duplicated and distributed mode per-weight for '
+        'dense weights.',
     )
     group.add_argument(
         '--muon-extra-scale-factor',
@@ -4163,6 +4329,16 @@ def _add_distributed_args(parser):
         'with the standard ring implementation) but performs accumulation locally in FP32.',
     )
     group.add_argument(
+        '--gtp-remat-reduce-scatter-with-fp32-accumulation',
+        action='store_true',
+        default=False,
+        help='Same trade as --ddp-reduce-scatter-with-fp32-accumulation, but for '
+        'the wgrad reduce-scatter GTP weight-remat performs over the gtp_remat axis: send '
+        'low-precision values over the wire via an all-to-all and accumulate locally in FP32. '
+        'Independent of the DDP flag (different collective, different process group). Costs one '
+        'extra unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.',
+    )
+    group.add_argument(
         '--ddp-param-name-patterns-for-fp32-local-accumulation',
         nargs='+',
         default=[],
@@ -4226,7 +4402,24 @@ def _add_distributed_args(parser):
         dest='disable_symmetric_registration',
         default=False,
         help='Disable symmetric (window) registration for NCCL userbuffer registration.'
-        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
+        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set. '
+        'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require '
+        'symmetric windows.',
+    )
+    group.add_argument(
+        '--gtp-remat-nccl-ub',
+        action='store_true',
+        dest='gtp_remat_nccl_ub',
+        default=False,
+        help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
+        'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).',
+    )
+    group.add_argument(
+        '--gtp-expert-remat-nccl-ub',
+        action='store_true',
+        dest='gtp_expert_remat_nccl_ub',
+        default=False,
+        help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.',
     )
     group.add_argument(
         '--fsdp-manual-registration',

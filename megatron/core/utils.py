@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy
 import torch
@@ -935,7 +935,10 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        ],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -1029,6 +1032,53 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
+    # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
+    # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
+    # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp_api import (
+            dequantize_gtp_native_fp8,
+            gtp_replica_rank,
+            is_gtp_param,
+        )
+
+        if is_gtp_param(tensor):
+            gtp_rank = get_pg_rank(tensor.group)
+            gtp_remat_size = get_pg_size(tensor.group)
+            if tp_axis == 0:
+                # same axis as TP → one composite axis-0 offset
+                new_offsets[0] = (
+                    prepend_axis_num,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    tp_size * gtp_remat_size,
+                )
+            else:
+                # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas): the
+            # group stamped on the param by the caller's pg_collection, else the MPU globals.
+            dp_replica_id = gtp_replica_rank(tensor)
+            # Saved global is the padded shape when GTP padded out_features for alignment.
+            if getattr(tensor, "pad_length", 0):
+                kwargs.setdefault("allow_shape_mismatch", True)
+            # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
+            # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
+            # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
+            # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
+            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
+            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            if is_float8tensor(tensor):
+                fp8_param = tensor
+                tensor = dequantize_gtp_native_fp8(tensor)
+                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
+                # to model entries by id(entry.data), which this dequantized copy would break
+                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                tensor._gtp_dequant_src = fp8_param
+
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
@@ -1058,6 +1108,18 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
             - dp_cp_group: Data parallel + context parallel group
               (default: None, falls back to parallel_state)
     """
+    # Sanity guard.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+        assert not is_gtp_param(tensor), (
+            f"GTP weight-remat param '{key}' reached make_sharded_tensor_for_checkpoint (the "
+            "replicated path); route GTP-sharded weights through "
+            "make_tp_sharded_tensor_for_checkpoint or make_sharded_tensors_for_checkpoint instead."
+        )
+
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
@@ -3100,3 +3162,28 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+#: Attribute a parameter-sharding backend sets on each parameter it publishes asynchronously.
+#: See :func:`ensure_params_ready`.
+PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready_callback"
+
+
+def ensure_params_ready(params: Iterable[Any]) -> None:
+    """Make ``params`` readable now, finishing any outstanding backend publication.
+
+    A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
+    asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
+    consumer reading it earlier -- ahead of that module, or from another stream -- calls this
+    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    no-op, so neither side needs to know about the other.
+
+    Callbacks are shared per communication bucket, so each fires once, not once per parameter.
+    """
+    fired = set()
+    for param in params:
+        callback = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+        if callback is None or id(callback) in fired:
+            continue
+        fired.add(id(callback))
+        callback()

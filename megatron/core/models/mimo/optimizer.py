@@ -16,6 +16,7 @@ from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.utils import unwrap_model
 
 if TYPE_CHECKING:
     from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -312,7 +313,7 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    Returns (tp_gtp_rank, pp_rank, dp_cp_rank) so only (0, 0, 0) within each
     module's parallelism group is the main replica; all other ranks
     in the same module are non-main replicas of the same object.
     """
@@ -324,32 +325,13 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
-        hasattr(pg_collection, 'dp') and pg_collection.dp is not None
-    ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
-
-
-_EXPERT_VIEW = "expert"
-
-
-def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
-    """Derive the optimizer's ProcessGroupCollection from a populated HyperCommGrid.
-
-    Dense groups come from the base view; expert-parallel groups (tp_ep_pp, expt_dp) come from
-    the grid's dedicated expert view -- expert parallelism is always factored into a separate
-    view (expt_tp/ep/expt_dp), never the base view. All groups must be pre-created on the grid.
-    """
-    pg = ProcessGroupCollection()
-    pg.dp = grid.get_pg("dp")
-    pg.dp_cp = grid.get_pg(["dp", "cp"])
-    pg.tp = grid.get_pg("tp")
-    pg.pp = grid.get_pg("pp")
-    pg.mp = grid.get_pg(["tp", "pp"])
-    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
-    pg.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
-    # Distributed-optimizer grad-stats group spans the dense shards (mirrors the topology PGC).
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
-    return pg
+        hasattr(pg_collection, 'dp_cp') and pg_collection.dp_cp is not None
+    ), "pg_collection.dp_cp must be set for checkpoint deduplication"
+    gtp_group = getattr(pg_collection, 'gtp_remat', None)
+    gtp_rank = gtp_group.rank() if gtp_group is not None else 0
+    gtp_size = gtp_group.size() if gtp_group is not None else 1
+    tp_gtp_rank = pg_collection.tp.rank() * gtp_size + gtp_rank
+    return (tp_gtp_rank, pg_collection.pp.rank(), pg_collection.dp_cp.rank())
 
 
 def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
@@ -376,7 +358,10 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 module = mimo_model.modality_submodules[module_name]
 
             if module is not None:
-                pg_collection = _get_pg_collection_for_optimizer(grid)
+                pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
+                assert (
+                    pg_collection is not None
+                ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
                 assert (
                     not hasattr(module, 'ddp_config')
                     or module.ddp_config is None
