@@ -11,6 +11,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    FinishedRequestRecord,
     InferenceRequest,
     compute_block_hashes_batched,
     deserialize_ndarray,
@@ -122,6 +123,8 @@ def test_inference_request_serialize_round_trip_through_msgpack():
     dyn_out = DynamicInferenceRequest.deserialize(dyn_data)
     assert isinstance(dyn_out.routing_indices, np.ndarray)
     assert dyn_out.routing_indices.tolist() == [[1, 2], [3, 4]]
+    # The engine-minted uid (the OpenAI response id / ledger key) survives the wire.
+    assert dyn_out.uid == dyn.uid
 
 
 def test_dynamic_inference_request_post_init_prefix_caching():
@@ -246,6 +249,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     b.generated_text = "bar"
     a.routing_indices = np.array([[1, 2]])
     b.routing_indices = np.array([[3, 4]])
+    b.policy_epoch = [(0, 3)]
+    a.add_event_evict()
     rec = DynamicInferenceRequestRecord(requests=[a, b])
     rec.latency = 4.2
     merged = rec.merge()
@@ -253,6 +258,14 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert merged.generated_text == "foobar"
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
+    # Every request mints a distinct chatcmpl- uid; merge() keeps the FIRST
+    # segment's — the id the response and the finished-request ledger key on.
+    assert a.uid.startswith("chatcmpl-") and a.uid != b.uid
+    assert merged.uid == a.uid
+    # FinishedRequestRecord mirrors the merged stamps and counts EVICT events.
+    finished = FinishedRequestRecord.from_request(merged)
+    assert finished.policy_epoch == [(0, 3)] and finished.kv_cache_epoch is None
+    assert finished.num_evictions == 1
 
     # merge() with both generated_text=None propagates None (rather than "None"+"None").
     c = DynamicInferenceRequest(
@@ -267,7 +280,11 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
         sampling_params=sp,
         generated_tokens=[12],
     )
-    assert DynamicInferenceRequestRecord(requests=[c, d]).merge().generated_text is None
+    merged_cd = DynamicInferenceRequestRecord(requests=[c, d]).merge()
+    assert merged_cd.generated_text is None
+    # Never-stamped requests record None epochs (non-RL serving).
+    finished_cd = FinishedRequestRecord.from_request(merged_cd)
+    assert finished_cd.policy_epoch is None and finished_cd.num_evictions == 0
 
 
 def test_dynamic_inference_request_serialize_strips_event_add_engine():

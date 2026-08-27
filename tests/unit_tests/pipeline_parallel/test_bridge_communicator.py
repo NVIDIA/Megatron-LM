@@ -123,8 +123,8 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, gtp_remat=1):
         os.environ["WORLD_SIZE"] = "8"
 
     grid = HyperCommGrid(
-        shape=[tp, gtp_remat, cp, pp, dp],
-        dim_names=["tp", "gtp_remat", "cp", "pp", "dp"],
+        shape=[tp, cp, gtp_remat, pp, dp],
+        dim_names=["tp", "cp", "gtp_remat", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )
@@ -269,6 +269,73 @@ class TestBridgeCommunicatorSplitMetadata:
 
         with pytest.raises(ValueError, match="expected 3 tensors for shape communication, got 2"):
             BridgeCommunicator._as_per_peer_tensors(tensors, expected_count=3)
+
+    @pytest.mark.parametrize(
+        "op, expected_callable",
+        [("send", torch.distributed.isend), ("recv", torch.distributed.irecv)],
+    )
+    def test_batched_payload_launches_all_peers_before_waiting(
+        self, monkeypatch, op, expected_callable
+    ):
+        bridge = self._bridge()
+        bridge.bridge_pg = object()
+        peers = [17, 5, 29]
+        tensors = [torch.empty((3, 2)), torch.empty((0, 2)), torch.empty((7, 2))]
+        created_ops = []
+        calls = []
+
+        class FakeOp:
+            def __init__(self, p2p_op, tensor, peer, group):
+                self.op = p2p_op
+                self.tensor = tensor
+                self.peer = peer
+                self.group = group
+                created_ops.append(self)
+                calls.append(("construct", peer))
+
+        class FakeWork:
+            def __init__(self, index):
+                self.index = index
+
+            def wait(self):
+                assert len(created_ops) == len(peers)
+                calls.append(("wait", self.index))
+
+        def fake_batch(ops):
+            assert list(ops) == created_ops
+            calls.append(("launch", tuple(item.peer for item in ops)))
+            return [FakeWork(index) for index in range(len(ops))]
+
+        monkeypatch.setattr(torch.distributed, "P2POp", FakeOp)
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", fake_batch)
+
+        bridge._run_batched_payload_p2p(tensors, peers, op=op)
+
+        assert calls == [
+            ("construct", 17),
+            ("construct", 5),
+            ("construct", 29),
+            ("launch", (17, 5, 29)),
+            ("wait", 0),
+            ("wait", 1),
+            ("wait", 2),
+        ]
+        assert [item.op for item in created_ops] == [expected_callable] * len(peers)
+        assert all(item.tensor is tensor for item, tensor in zip(created_ops, tensors))
+        assert [item.peer for item in created_ops] == peers
+        assert all(item.group is bridge.bridge_pg for item in created_ops)
+
+    def test_batched_payload_rejects_invalid_mapping_before_launch(self, monkeypatch):
+        bridge = self._bridge()
+        bridge.bridge_pg = object()
+        monkeypatch.setattr(
+            torch.distributed,
+            "batch_isend_irecv",
+            lambda _ops: (_ for _ in ()).throw(AssertionError("invalid batch was launched")),
+        )
+
+        with pytest.raises(ValueError, match="one payload tensor per peer"):
+            bridge._run_batched_payload_p2p([torch.empty(1)], [4, 5], op="send")
 
 
 class TestBridgeCommunicator:

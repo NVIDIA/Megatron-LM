@@ -25,6 +25,31 @@ mxfp8_available = HAVE_MXFP8_TENSOR and get_device_arch_version() >= 10
 reason_for_no_mxfp8 = "MXFP8 requires Transformer Engine and device arch >= 10"
 
 
+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    ("is_init", "config_values", "te_helper"),
+    [
+        (
+            False,
+            {"fp8": "hybrid", "fp4": None, "fp8_param": False, "fp4_param": False},
+            "fp8_autocast",
+        ),
+        (True, {"fp8": None, "fp4": None, "fp8_param": True, "fp4_param": False}, "fp8_model_init"),
+    ],
+)
+def test_get_fp8_disabled_context_uses_disabled_te_context(is_init, config_values, te_helper):
+    config = Mock(**config_values)
+    disabled_context = Mock()
+
+    with patch.object(
+        fp8_utils.transformer_engine.pytorch, te_helper, return_value=disabled_context
+    ) as te_context:
+        result = fp8_utils.get_fp8_disabled_context(config, is_init=is_init)
+
+    assert result is disabled_context
+    te_context.assert_called_once_with(enabled=False)
+
+
 def _dummy_quantizer_factory(*args, **kwargs):
     return None
 

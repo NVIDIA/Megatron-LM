@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       release-ref:
-        description: Ref (SHA or branch name) to release
+        description: Commit SHA to release (must be a full 40-char SHA)
         required: true
         type: string
       dry-run:
@@ -71,19 +71,31 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release-ref is a commit SHA
+        env:
+          RELEASE_REF: ${{ inputs.release-ref || github.sha }}
+        run: |
+          if ! echo "$RELEASE_REF" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::release-ref must be a full 40-character commit SHA, not a branch name."
+            exit 1
+          fi
+
   pre-flight:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
     if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
 
   bump:
-    needs: [pre-flight]
+    needs: [pre-flight, validate-inputs]
     if: |
       !cancelled() && !failure()
       && github.repository == 'NVIDIA/Megatron-LM'
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_merge_group == 'true'
            || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@6dfd1b435cca9e3c2640f7b31c4f37e42c6bf796 # v1.4.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
     with:
       release-branch-pattern: "core_[rv][0-9]*.[0-9]*.[0-9]*"
       release-ref: ${{ inputs.release-ref || github.sha }}
@@ -123,7 +135,7 @@ jobs:
       github.repository == 'NVIDIA/Megatron-LM'
       && (success() || !failure())
       && !cancelled()
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@6a2f81195fd910ae91d3c001d2e32ceb6d82e975 # v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@cf5acebace78c7c339bc1f804357a991336f1c4d # v1.8.10
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
