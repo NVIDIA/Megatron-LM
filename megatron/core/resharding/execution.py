@@ -18,13 +18,23 @@ from .utils import ReshardPlan, get_refit_tensor_dict
 logger = logging.getLogger(__name__)
 
 
-def _refresh_module_caches(dst_module: Optional[torch.nn.Module]) -> None:
-    """Refresh parameter-derived caches in the destination module."""
+def refresh_module_caches(
+    dst_module: torch.nn.Module | list[torch.nn.Module] | tuple[torch.nn.Module, ...] | None,
+) -> None:
+    """Refresh parameter-derived caches in the destination module(s).
+
+    Lists and tuples let external refit callers, including Megatron Bridge,
+    pass virtual-pipeline model chunks directly. ``None`` is a no-op for
+    send-only ranks. The ``dst_module`` parameter name remains stable for
+    callers that use keyword arguments.
+    """
     if dst_module is None:
         return
-    for module in dst_module.modules():
-        if isinstance(module, MegatronModule):
-            module.refresh_cache()
+    roots = dst_module if isinstance(dst_module, (list, tuple)) else (dst_module,)
+    for root in roots:
+        for module in root.modules():
+            if isinstance(module, MegatronModule):
+                module.refresh_cache()
 
 
 @dataclass
@@ -89,12 +99,24 @@ def execute_reshard_plan(
     transform's prepare_send / prepare_recv / finalize_recv methods instead
     of the default slice-and-copy logic.
     """
+    service.set_plan(plan, transform=transform)
+
     # Extract parameters and persistent buffers from models if present.
     # Persistent buffers carry training state (e.g. MoE router expert_bias)
     # and must be refit alongside parameters.  Cached on each module so the
     # named_modules() walk happens once per model, not per refit.
     src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
     dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
+
+    if service.execute_plan(plan, src_params, dst_params, transform=transform):
+        logger.info("Executing native reshard plan")
+        torch.cuda.synchronize()
+        if service.requires_process_group_barrier:
+            dist.barrier(group=group)
+        refresh_module_caches(dst_module)
+        torch.cuda.synchronize()
+        logger.info("Reshard complete")
+        return
 
     # Cache dequantized BF16 views of MXFP8 source params so that multiple
     # send ops for the same param reuse one dequant instead of repeating it.
@@ -241,7 +263,7 @@ def execute_reshard_plan(
             dst_param.quantize_(full_bf16)
     pending_quantized.clear()
 
-    _refresh_module_caches(dst_module)
+    refresh_module_caches(dst_module)
 
     # Ensure all writeback and cache-refresh copies are visible to subsequent CUDA
     # ops (e.g. CUDA graph warmup).  The synchronize() above fires *before* the
