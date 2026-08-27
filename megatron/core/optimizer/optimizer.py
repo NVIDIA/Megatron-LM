@@ -1094,16 +1094,22 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Seed the fp32 master from the high-precision pre-quantization init
-                            # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
-                            # fp8_param_gather ON/OFF hold an identical master at iter 0.
-                            if hasattr(param, 'get_high_precision_init_val'):
-                                main_param = (
-                                    param.get_high_precision_init_val()
-                                    .detach()
-                                    .clone()
-                                    .to(param.device)
-                                    .float()
+                            # Native quantized parameters may retain their pre-quantization
+                            # BF16/FP16 initializer on CPU. Build the FP32 master from that value
+                            # so primary-weight and non-primary-weight runs start identically.
+                            # Falling back to the model parameter is correct for ordinary
+                            # BF16/FP16 parameters and older quantized-tensor implementations.
+                            get_high_precision_init_val = getattr(
+                                param, 'get_high_precision_init_val', None
+                            )
+                            high_precision_init_val = (
+                                get_high_precision_init_val()
+                                if get_high_precision_init_val is not None
+                                else None
+                            )
+                            if high_precision_init_val is not None:
+                                main_param = high_precision_init_val.to(
+                                    device=param.device, dtype=torch.float32, copy=True
                                 )
                                 param.clear_high_precision_init_val()
                             else:
