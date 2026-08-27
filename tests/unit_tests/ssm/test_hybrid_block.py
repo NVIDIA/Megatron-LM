@@ -49,7 +49,19 @@ class TestHybridBlock:
         model_parallel_cuda_manual_seed(123)
 
     def get_pg_collection(self):
-        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        return ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=[
+                'tp',
+                'pp',
+                'cp',
+                'ep',
+                'expt_tp',
+                'expt_dp',
+                'tp_ep',
+                'tp_cp',
+                'tp_dp_cp',
+            ]
+        )
 
     @staticmethod
     def _non_fused_norm_submodules():
