@@ -653,6 +653,10 @@ jobs:
 
   cicd-container-build:
     needs: [is-not-external-contributor, pre-flight, configure, cicd-wait-in-queue]
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'

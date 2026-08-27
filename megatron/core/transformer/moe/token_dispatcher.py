@@ -10,6 +10,7 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
+from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
@@ -1587,6 +1588,9 @@ class _NCCLEPManager(_DispatchManager):
                         "ragged per-expert counts on device)."
                     )
 
+        self.dispatch_fwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_dispatch_fwd_dtype)
+        self.combine_bwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_combine_bwd_dtype)
+
         # Fresh EpBuffer per dispatch, held until the matching combine consumes it. dispatch
         # and combine share one buffer: handle_mem is the routing table that dispatch writes
         # and combine reads. Safe because dispatch i / combine i strictly alternate.
@@ -1612,6 +1616,8 @@ class _NCCLEPManager(_DispatchManager):
             hidden_dim=self.hidden_dim,
             num_local_experts=self.num_local_experts,
             alignment=self.alignment,
+            dispatch_fwd_quant_recipe=self.dispatch_fwd_quant_recipe,
+            combine_bwd_quant_recipe=self.combine_bwd_quant_recipe,
         )
         return self._buffer
 

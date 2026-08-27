@@ -553,6 +553,13 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
+        # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
+        # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
+        # grouped view at the op boundary.
+        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
+        # TODO: remove after TE support the grouped tensor path
+        if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
+            op.ep_mxfp8_carrier_input = True
         op_list.append(op)
         fc1_op = op
 
@@ -656,6 +663,13 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
+        # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
+        # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
+        # view at the op boundary.
+        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
+        # TODO: remove after TE support the grouped tensor path
+        if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
+            op.ep_mxfp8_carrier_grad = True
         op_list.append(op)
         fc2_op = op
 
@@ -1285,6 +1299,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
+            source_dtype: torch.dtype | None = None
             for i in range(self.num_local_experts):
                 w = getattr(linear, f'weight{i}')
                 if isinstance(w, MXFP8Tensor):
@@ -1299,6 +1314,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 validate_mxfp8_tensor(
                     mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
                 )
+                if mxfp8.dtype is not None:
+                    source_dtype = source_dtype or mxfp8.dtype
+                    if mxfp8.dtype != source_dtype:
+                        raise RuntimeError(
+                            f"Conflicting source dtypes for {linear_name} expert weights: "
+                            f"{source_dtype} and {mxfp8.dtype}."
+                        )
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
@@ -1306,7 +1328,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
             setattr(
-                self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend)
+                self,
+                buf_name,
+                MXFP8Tensor(
+                    data=stacked_data, scale=stacked_scale, dtype=source_dtype, backend=backend
+                ),
             )
 
             # Redirect per-expert weight .data to views into the stacked buffer,

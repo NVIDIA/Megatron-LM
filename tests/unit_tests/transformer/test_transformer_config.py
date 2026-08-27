@@ -4,6 +4,7 @@ import pytest
 import torch.nn.functional as F
 
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 
 
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
@@ -31,6 +32,19 @@ def test_ep_a2a_overlap_accepts_supported_mtp_layer_counts(mtp_num_layers: int |
 def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int):
     with pytest.raises(AssertionError, match="MTP supports at most one layer"):
         _make_overlap_config(mtp_num_layers)
+
+
+def test_batch_invariant_backend_rejects_unknown_value_at_construction():
+    # Programmatic construction bypasses argparse's Literal choices, so
+    # __post_init__ must catch typos before model init.
+    with pytest.raises(AssertionError, match="Unknown batch_invariant_backend"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te-native",
+        )
 
 
 def test_gdp_num_householder_defaults_to_three():
@@ -79,6 +93,25 @@ def _fused_moe_config(**overrides) -> TransformerConfig:
     return TransformerConfig(**kwargs)
 
 
+def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        expert_model_parallel_size=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="ncclep",
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        moe_dispatch_fwd_dtype='mxfp8',
+        moe_combine_bwd_dtype='mxfp8',
+        bf16=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
 def test_fused_moe_config_enables_grouped_tensor():
     config = _fused_moe_config()
 
@@ -100,3 +133,88 @@ def test_fused_moe_config_enables_grouped_tensor():
 def test_fused_moe_config_rejects_incompatible_modes(override, error):
     with pytest.raises(ValueError, match=error):
         _fused_moe_config(**override)
+
+
+def test_mxfp8_wire_dtypes_accept_valid_ncclep_config():
+    config = _make_mxfp8_wire_config()
+
+    assert config.moe_dispatch_fwd_dtype == 'mxfp8'
+    assert config.moe_combine_bwd_dtype == 'mxfp8'
+
+
+def test_mxfp8_wire_dtypes_accept_a2a_overlap():
+    # The 1F1B a2a overlap schedule only moves/stages the dispatch output as an opaque block,
+    # which the plain-tensor MXFP8 carrier survives; the combination is deliberately allowed.
+    config = _make_mxfp8_wire_config(overlap_moe_expert_parallel_comm=True)
+
+    assert config.overlap_moe_expert_parallel_comm
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(moe_flex_dispatcher_backend="hybridep"),
+        dict(moe_token_dispatcher_type="alltoall", moe_flex_dispatcher_backend=None),
+    ],
+)
+def test_mxfp8_wire_dtypes_reject_non_ncclep_dispatcher(overrides):
+    with pytest.raises(ValueError, match="require the 'ncclep' flex"):
+        _make_mxfp8_wire_config(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides", [dict(use_transformer_engine_op_fuser=False), dict(moe_grouped_gemm=False)]
+)
+def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
+    with pytest.raises(ValueError, match="require BOTH"):
+        _make_mxfp8_wire_config(**overrides)
+
+
+requires_te_2_9 = pytest.mark.skipif(
+    not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
+)
+
+
+def _make_packing_config(**kwargs) -> TransformerConfig:
+    defaults = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=4096,
+    )
+    defaults.update(kwargs)
+    return TransformerConfig(**defaults)
+
+
+@requires_te_2_9
+def test_sequence_packing_dense_config_passes():
+    # Dense models have no MoE dispatcher; the (unused) allgather default
+    # must not fail sequence-packing validation.
+    config = _make_packing_config()
+    assert config.variable_seq_lengths is True
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_requires_alltoall_dispatcher():
+    # The general allgather-vs-variable_seq_lengths check fires first, since
+    # sequence packing derives variable_seq_lengths=True.
+    with pytest.raises(ValueError, match="alltoall"):
+        _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="allgather")
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_alltoall_dispatcher_passes():
+    config = _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="alltoall")
+    assert config.variable_seq_lengths is True
+
+
+def test_sequence_packing_rejects_unknown_scheduler():
+    # Raised by ModelParallelConfig.__post_init__ before any TE check runs.
+    with pytest.raises(ValueError, match="Unsupported scheduler"):
+        _make_packing_config(sequence_packing_scheduler="bogus")
+
+
+def test_sequence_packing_requires_max_seqlen_per_dp_cp_rank():
+    with pytest.raises(ValueError, match="max_seqlen_per_dp_cp_rank"):
+        _make_packing_config(max_seqlen_per_dp_cp_rank=None)
