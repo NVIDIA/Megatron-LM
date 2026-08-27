@@ -656,11 +656,17 @@ def test_evict_lru_asserts_on_cyclic_parent_graph():
     a cycle exposes no leaf, so the peel cannot collect enough blocks; this is a
     bug and must fail loudly rather than silently under-evict."""
     a = _lru_allocator()
-    # 2-cycle: block 0's parent hash is 20 (block 1) and block 1's parent hash is
-    # 10 (block 0). register_kv_block_hashes never produces this — we seed it
-    # directly to model the pathological collision case.
-    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[20, 10], timestamps=[1, 2])
+    # Register a normal chain first, then close a 2-cycle in the parent graph by
+    # hand: block 0's parent becomes block 1, which already has block 0 as its
+    # parent. register_kv_block_hashes never produces this, and it now rejects a
+    # batch whose head parent is unregistered, so the pathological collision has
+    # to be written straight into the parent bookkeeping the peel reads.
+    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
     assert int(a.get_evictable_block_count()) == 2
+    a.block_parent_id[0] = 1
+    # With each block a parent of the other, neither is a leaf, so the peel finds
+    # no starting point and cannot collect the block it was asked for.
+    a.block_child_count[1] = 1
 
     with pytest.raises(AssertionError):
         a.evict_lru_blocks(1)
