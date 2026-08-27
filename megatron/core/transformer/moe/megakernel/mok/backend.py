@@ -323,6 +323,11 @@ class MoKMegakernel(MegakernelBackend):
         self.is_first_microbatch = False
         return self._prepared_routed_weight_cache
 
+    # Checkpoint contract: native MCore expert modules own the canonical parameters,
+    # optimizer state, and checkpoint shards. This supports regular/distributed
+    # save-resume when the backend, weight layout, and model/parallel configuration
+    # are unchanged. Baseline<->MOK, single<->non-single, interleaved-layout, and
+    # legacy-checkpoint conversion are deliberately outside this integration.
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Emit no aliases; native expert modules own all checkpoint shards."""
         del prefix, sharded_offsets, metadata
