@@ -297,16 +297,13 @@ class RotaryEmbedding(nn.Module):
                     # With attention residuals, non-first pipeline stages receive
                     # the depth-source payload: [num_slices * s, b, h]. Divide the
                     # slice count back out to recover the true sequence length.
+                    from megatron.core import parallel_state
                     from megatron.core.transformer.attention_residual import (
-                        attn_res_num_payload_slices,
-                    )
-                    from megatron.core.transformer.transformer_layer import (
-                        get_transformer_layer_offset,
+                        attn_res_payload_slices_for_pp_rank,
                     )
 
-                    num_slices = attn_res_num_payload_slices(
-                        get_transformer_layer_offset(transformer_config, vp_stage=None),
-                        transformer_config.attn_res_block_layers,
+                    num_slices = attn_res_payload_slices_for_pp_rank(
+                        transformer_config, parallel_state.get_pipeline_model_parallel_rank()
                     )
                     assert rotary_seq_len % num_slices == 0, (
                         f"attention residual payload length {rotary_seq_len} is not "
