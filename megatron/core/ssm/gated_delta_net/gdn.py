@@ -26,7 +26,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
-from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
