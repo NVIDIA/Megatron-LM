@@ -348,6 +348,16 @@ def _get_topk_alignment() -> int:
     raise RuntimeError(f"cudnn fused DSA requires SM90+ (Hopper or later), got SM{sm[0]}{sm[1]}.")
 
 
+def _get_score_recompute_topk_alignment() -> int:
+    """Minimum top-K alignment required by cuDNN sparse score recompute."""
+    sm = _current_sm()
+    if sm[0] >= 10:
+        return 64
+    if sm[0] >= 9:
+        return 128
+    raise RuntimeError(f"cudnn fused DSA requires SM90+ (Hopper or later), got SM{sm[0]}{sm[1]}.")
+
+
 def _flash_mla_head_padding(num_heads: int) -> Optional[int]:
     """Padded query-head count FlashMLA supports for ``num_heads``, or None if unsupported.
 
@@ -771,13 +781,30 @@ def _packed_thd_kernel_applicable(
         or packed_cu_seqlens_q.numel() < 2
     ):
         return False
+    same_view = packed_cu_seqlens_q.device == packed_cu_seqlens_k.device and (
+        packed_cu_seqlens_q is packed_cu_seqlens_k
+        or (
+            packed_cu_seqlens_q.data_ptr() == packed_cu_seqlens_k.data_ptr()
+            and packed_cu_seqlens_q.storage_offset() == packed_cu_seqlens_k.storage_offset()
+            and packed_cu_seqlens_q.stride() == packed_cu_seqlens_k.stride()
+        )
+    )
+    same_boundaries = same_view or (
+        not packed_cu_seqlens_q.is_cuda
+        and not packed_cu_seqlens_k.is_cuda
+        and torch.equal(packed_cu_seqlens_q, packed_cu_seqlens_k)
+    )
+    # The packed scorer restores sequence-local top-k indices with the Q-derived
+    # row bounds. Differing K boundaries would silently map selected columns into
+    # another packed sequence, so decline unless equality is provable without a
+    # CUDA synchronization. Canonical self-attention schedulers preserve aliases.
+    if not same_boundaries:
+        return False
     if cp_size > 1:
         return sk % (2 * cp_size) == 0
 
-    # The CP1 path forwards cu-seqlens directly to cuDNN, so prove both kernel
-    # readiness and equality without synchronizing a CUDA tensor. Q boundaries are
-    # also used to restore sequence-local top-k indices; differing K boundaries would
-    # therefore produce incorrect global indices.
+    # The CP1 path forwards cu-seqlens directly to cuDNN, so prove its stricter
+    # device, dtype, maximum-length, and contiguity requirements as well.
     if (
         packed_cu_seqlens_q.device != device
         or packed_cu_seqlens_k.device != device
@@ -789,14 +816,7 @@ def _packed_thd_kernel_applicable(
         or not packed_cu_seqlens_k.is_contiguous()
     ):
         return False
-    same_view = packed_cu_seqlens_q is packed_cu_seqlens_k or (
-        packed_cu_seqlens_q.data_ptr() == packed_cu_seqlens_k.data_ptr()
-        and packed_cu_seqlens_q.storage_offset() == packed_cu_seqlens_k.storage_offset()
-        and packed_cu_seqlens_q.stride() == packed_cu_seqlens_k.stride()
-    )
-    if same_view:
-        return True
-    return not packed_cu_seqlens_q.is_cuda and torch.equal(packed_cu_seqlens_q, packed_cu_seqlens_k)
+    return True
 
 
 def _indexer_topk_packed_thd(
@@ -1862,6 +1882,14 @@ def _compute_attn_target(
     """
     _ensure_dsa_namespace()
     q_attn_bshd, lse, qhead_per_kv_head = _pad_attn_target_heads(q_attn_bshd, lse)
+    logical_topk = topk_indices.size(-1)
+    if topk_indices.is_cuda:
+        topk_alignment = _get_score_recompute_topk_alignment()
+        padded_topk = round_up_to_nearest_multiple(logical_topk, topk_alignment)
+        if padded_topk != logical_topk:
+            topk_indices = torch.nn.functional.pad(
+                topk_indices, (0, padded_topk - logical_topk), value=-1
+            )
     kwargs = {"qhead_per_kv_head": qhead_per_kv_head, "topk_indices_global": False}
     if topk_length is not None:
         kwargs["topk_length"] = topk_length.to(dtype=torch.int32, device=topk_indices.device)
@@ -1873,7 +1901,7 @@ def _compute_attn_target(
         softmax_scale,
         **kwargs,
     )
-    return result["target"].contiguous()
+    return result["target"][..., :logical_topk].contiguous()
 
 
 def _dense_attn_lse_chunk_rows(b: int, qhead_per_kv_head: int, sk: int, sq: int) -> int:
