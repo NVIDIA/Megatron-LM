@@ -26,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+    should_use_fused_mla_rope,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -41,13 +42,9 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
-    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-        fused_apply_mla_rope_for_kv,
-        fused_apply_mla_rope_for_q,
-    )
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_concat
 except ImportError:
-    fused_apply_mla_rope_for_kv = None
-    fused_apply_mla_rope_for_q = None
+    fused_mla_rope_concat = None
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -462,23 +459,20 @@ class AbsorbedMLASelfAttention(Attention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
+        use_fused_rope = should_use_fused_mla_rope(self.config)
+        if use_fused_rope:
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
+            )
+            rotary_pos_emb = None
+            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+            assert (
+                fused_mla_rope_concat is not None
+            ), "Fused MLA RoPE apply is not imported successfully"
+        elif self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
-            if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
-                )
-                rotary_pos_emb = None
-                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_apply_mla_rope_for_q is not None
-                    and fused_apply_mla_rope_for_kv is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
-            else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq=thd_packed_seq
-                )
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
 
         if thd_packed_seq:
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -598,7 +592,7 @@ class AbsorbedMLASelfAttention(Attention):
 
             k_up_weight, _ = self._get_kv_up_weights()
 
-            if self.config.apply_rope_fusion:
+            if use_fused_rope:
                 # q_no_pe: [num_tokens, n, qk_head_dim]
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_no_pe, q_pos_emb = torch.split(
@@ -608,34 +602,26 @@ class AbsorbedMLASelfAttention(Attention):
                 # Absorb k_up_weight into q_no_pe
                 # q_absorbed: [num_tokens, n, kv_lora_rank]
                 q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
                 assert q_absorbed.ndim == q.ndim
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
 
-                # q_absorbed: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
-                q_absorbed = torch.cat([q_absorbed, q_pos_emb], dim=-1)
-                # kv_compressed: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
-                kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
-
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
-                q_absorbed = fused_apply_mla_rope_for_q(
+                q_absorbed = fused_mla_rope_concat(
                     q_absorbed,
+                    q_pos_emb,
                     rotary_pos_cos,
                     rotary_pos_sin,
-                    self.config.kv_lora_rank,
-                    self.config.qk_pos_emb_head_dim,
                     cu_seqlens_q,
                     cp_rank,
                     cp_size,
                 )
-                kv_compressed = fused_apply_mla_rope_for_q(
+                kv_compressed = fused_mla_rope_concat(
                     kv_compressed,
+                    k_pos_emb,
                     rotary_pos_cos,
                     rotary_pos_sin,
-                    self.config.kv_lora_rank,
-                    self.config.qk_pos_emb_head_dim,
                     cu_seqlens_kv,
                     cp_rank,
                     cp_size,

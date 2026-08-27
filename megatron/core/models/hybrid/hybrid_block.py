@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -122,17 +123,26 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             and config.recompute_granularity == "selective"
             and "mhc" in (config.recompute_modules or [])
         ):
-            raise ValueError(
+            # Warn rather than reject: this combination was constructible before the
+            # attention-only split existed and nothing here is known to be wrong, it
+            # is just unlikely to pay. Under per-layer Transformer Engine capture the
+            # hybrid wrapper captures the mHC producer inside the graph, so that
+            # checkpoint's per-microbatch registration is swallowed and its activation
+            # is not recovered -- the rest of the mHC recompute group sits outside the
+            # graph and still works. The attention-only split, which keeps the producer
+            # eager, exists only on the GPT HyperConnectionTransformerLayer path.
+            # No manual dedup: the default warning filter already reports once per
+            # (message, category, module, lineno), and a module-level latch would
+            # leak across tests.
+            warnings.warn(
                 "mHC selective recompute with CUDA Graphs (cuda_graph_impl="
-                f"{config.cuda_graph_impl!r}) is not supported for HybridStack mHC "
-                "layers. For per-layer Transformer Engine capture, the hybrid wrapper "
-                "captures the mHC producer inside the graph, so per-microbatch "
-                "checkpoint registration cannot run; the guarded attention-only split "
-                "exists only on the GPT HyperConnectionTransformerLayer path. "
-                "Full-iteration capture is rejected here because it has only been "
-                "validated on that same GPT path -- the config-level gate that admits "
-                "it is not model-family aware. Disable CUDA graphs or remove 'mhc' "
-                "from recompute_modules."
+                f"{config.cuda_graph_impl!r}) is not validated for HybridStack mHC "
+                "layers: per-layer capture takes the mHC producer with it, and "
+                "full-iteration capture records the recompute itself, so this "
+                "wrapper's aggregate checkpoint is not the saving it is on the GPT "
+                "path. The rest of the recompute group is unaffected.",
+                UserWarning,
+                stacklevel=2,
             )
         self.inner_layer = layer
         self.layer_number = layer.layer_number

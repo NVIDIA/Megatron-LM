@@ -374,6 +374,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_mhc_overlap_attn_cudagraph_nosplit]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn_no_nvrx_sync]
     products:
       - environment: [dev]
