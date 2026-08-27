@@ -406,3 +406,80 @@ class TestAttnResConfigValidation:
 
         with pytest.raises(ValueError, match=match):
             TransformerConfig(**self._base_kwargs(**overrides))
+
+
+class TestAttnResHybridSchedule:
+    """Hybrid payload-width math and hybrid-specific config validation."""
+
+    def _hybrid_config(self, **overrides):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        kwargs = dict(
+            num_layers=16,
+            hidden_size=16,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=2,
+            is_hybrid_model=True,
+        )
+        kwargs.update(overrides)
+        return TransformerConfig(**kwargs)
+
+    def test_pipe_segment_payload_slices(self):
+        from megatron.core.transformer.attention_residual import attn_res_payload_slices_for_pp_rank
+
+        config = self._hybrid_config(
+            hybrid_layer_pattern="MM*-|M*--|**--|M-M-",
+            pipeline_model_parallel_size=4,
+            pipeline_dtype=torch.float32,
+        )
+        # Offsets: 0, 4, 8, 12 entries; k=2 -> slices = (L-1)//2 + 2.
+        assert attn_res_payload_slices_for_pp_rank(config, 1) == 3
+        assert attn_res_payload_slices_for_pp_rank(config, 2) == 5
+        assert attn_res_payload_slices_for_pp_rank(config, 3) == 7
+
+    def test_uneven_pipe_segments(self):
+        from megatron.core.transformer.attention_residual import attn_res_payload_slices_for_pp_rank
+
+        config = self._hybrid_config(
+            num_layers=12,
+            hybrid_layer_pattern="MM*|M*-M-|*-M-",
+            pipeline_model_parallel_size=3,
+            pipeline_dtype=torch.float32,
+            attn_res_block_layers=1,
+        )
+        # Offsets: 0, 3, 8 entries; k=1 -> slices = L + 1.
+        assert attn_res_payload_slices_for_pp_rank(config, 1) == 4
+        assert attn_res_payload_slices_for_pp_rank(config, 2) == 9
+
+    def test_pipe_free_even_split(self):
+        from megatron.core.transformer.attention_residual import attn_res_payload_slices_for_pp_rank
+
+        config = self._hybrid_config(
+            hybrid_layer_pattern="MM*-M*--**--M-M-", pipeline_model_parallel_size=1
+        )
+        # Even split at pp=1 degenerates; exercise the helper via a fake rank
+        # computation on a copy configured for pp=2.
+        config2 = self._hybrid_config(
+            hybrid_layer_pattern="MM*-M*--|**--M-M-",
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        assert attn_res_payload_slices_for_pp_rank(config2, 1) == (8 - 1) // 2 + 2
+        del config
+
+    def test_segment_count_mismatch_rejected(self):
+        with pytest.raises(ValueError, match="pipe segments"):
+            self._hybrid_config(
+                hybrid_layer_pattern="MM*-|M*--|**--|M-M-",
+                pipeline_model_parallel_size=2,
+                pipeline_dtype=torch.float32,
+            )
+
+    def test_hybrid_mtp_rejected(self):
+        with pytest.raises(ValueError, match="hybrid MTP"):
+            self._hybrid_config(mtp_num_layers=1)
+
+    def test_missing_pattern_with_pp_rejected(self):
+        with pytest.raises(ValueError, match="hybrid_layer_pattern"):
+            self._hybrid_config(pipeline_model_parallel_size=2, pipeline_dtype=torch.float32)

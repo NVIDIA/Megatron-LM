@@ -1149,12 +1149,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             raise RuntimeError(
                 "Use the mHC TransformerLayer/Hybrid wrapper when hyper connections are enabled."
             )
-        if self.config.enable_attention_residuals:
+        called_from_hybrid_attn_res_wrapper = kwargs.pop(
+            "_called_from_hybrid_attn_res_wrapper", False
+        )
+        if self.config.enable_attention_residuals and not called_from_hybrid_attn_res_wrapper:
             raise RuntimeError(
                 "TransformerLayer.forward() must not be called directly when "
-                "enable_attention_residuals=True. Use AttnResTransformerLayer, which "
-                "the GPT layer specs select automatically; execution paths that build "
-                "plain TransformerLayers cannot run attention residuals."
+                "enable_attention_residuals=True. Use AttnResTransformerLayer (selected "
+                "automatically by the GPT layer specs); AttnResHybridLayer drives the "
+                "wrapped layer through this path automatically for hybrid stacks."
             )
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}

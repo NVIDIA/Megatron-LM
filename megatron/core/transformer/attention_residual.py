@@ -36,6 +36,7 @@ This module contains:
   along the sequence dimension: ``[num_slices * s, b, h]``.
 """
 
+import functools
 import logging
 from typing import List, Optional, Sequence, Tuple
 
@@ -48,12 +49,17 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def is_attn_res_block_start(global_layer_number: int, block_layers: int) -> bool:
-    """Whether the attention sublayer of this layer opens a new depth block.
+    """Whether this layer opens a new depth block.
 
-    Block boundaries fall on transformer-layer starts only (``S`` is always an
-    even number of sublayers). Layer numbers are 1-based global indices.
-    The very first layer is always a block start: it appends the token
-    embedding (the initial partial sum) as depth source ``b_0``.
+    Layer numbers are 1-based global indices. The very first layer is always a
+    block start: it appends the token embedding (the initial partial sum) as
+    depth source ``b_0``.
+
+    Unit semantics of ``block_layers`` (= ``config.attn_res_block_layers``):
+    in GPT stacks a layer is one TransformerLayer (two sublayers, so the
+    paper's block size S = 2 * block_layers and boundaries fall on layer
+    starts only); in hybrid stacks a layer is one pattern entry (one sublayer,
+    S = block_layers, which may be odd).
     """
     return (global_layer_number - 1) % block_layers == 0
 
@@ -96,16 +102,46 @@ def attn_res_num_payload_slices(num_layers_before: int, block_layers: int) -> in
     return attn_res_num_sources(num_layers_before, block_layers) + 1
 
 
+@functools.lru_cache(maxsize=32)
+def _hybrid_layers_before_pp_rank(main_pattern: str, num_layers: int, pp_size: int, pp_rank: int):
+    """Layer entries owned by pipeline stages before ``pp_rank`` for a hybrid pattern.
+
+    Pipe-based patterns use cumulative '|' segment lengths (possibly uneven);
+    pipe-free patterns fall back to the legacy even split, matching
+    ``select_pipeline_segment`` in hybrid_layer_allocation.py.
+    """
+    if '|' in main_pattern:
+        segments = main_pattern.split('|')
+        assert len(segments) == pp_size, (
+            f"hybrid pattern has {len(segments)} pipe segments but "
+            f"pipeline_model_parallel_size={pp_size} (interleaved VPP is not supported "
+            "with attention residuals)"
+        )
+        return sum(len(segment) for segment in segments[:pp_rank])
+    return (num_layers // pp_size) * pp_rank
+
+
 def attn_res_payload_slices_for_pp_rank(
     config: TransformerConfig, boundary_recv_pp_rank: int
 ) -> int:
     """Payload slice count for the boundary received by ``boundary_recv_pp_rank``.
 
     The number of layers before that boundary equals the receiving stage's
-    global layer offset. Uneven splits expressed through
-    ``account_for_embedding_in_pipeline_split`` / ``account_for_loss_in_pipeline_split``
-    are handled by :func:`get_transformer_layer_offset`.
+    global layer offset. For GPT stacks that comes from
+    :func:`get_transformer_layer_offset` (which also handles
+    ``account_for_embedding/loss_in_pipeline_split``); for hybrid stacks it
+    comes from the pattern's pipe segmentation.
     """
+    if getattr(config, 'is_hybrid_model', False):
+        main_pattern = (config.hybrid_layer_pattern or '').split('/')[0]
+        layers_before = _hybrid_layers_before_pp_rank(
+            main_pattern,
+            config.num_layers,
+            config.pipeline_model_parallel_size,
+            boundary_recv_pp_rank,
+        )
+        return attn_res_num_payload_slices(layers_before, config.attn_res_block_layers)
+
     # Imported lazily to avoid a circular import with transformer_layer.py.
     from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
