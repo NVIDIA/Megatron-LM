@@ -264,7 +264,7 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
     """
     for char in pattern:
         is_pipe = allow_pipe and char == Symbols.PIPE
-        if not Symbols.is_valid_layer(char) and not is_pipe:
+        if not layer_utils.is_valid_layer(char) and not is_pipe:
             valid_chars = set(Symbols.LAYER_CONFIG_MAP)
             if allow_pipe:
                 valid_chars.add(Symbols.PIPE)
@@ -281,7 +281,7 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
 def _validate_segment_layer_symbols(segment: str) -> None:
     """Validate the layer symbols in a single pipeline segment."""
     for layer_symbol in segment:
-        if not Symbols.is_valid_layer(layer_symbol):
+        if not layer_utils.is_valid_layer(layer_symbol):
             raise ValueError(
                 f"In hybrid layer pattern segment, '{layer_symbol}' is not "
                 f"one of {set(Symbols.LAYER_CONFIG_MAP)}"

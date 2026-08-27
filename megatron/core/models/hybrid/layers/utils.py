@@ -34,19 +34,19 @@ class Symbols:
     ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA}
 
     @classmethod
-    def is_valid_layer(cls, layer_symbol: str) -> bool:
-        """Return whether ``layer_symbol`` identifies a supported hybrid layer."""
-        return layer_symbol in cls.LAYER_CONFIG_MAP
-
-    @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
         """Return valid layer symbols sorted by their public attribute names."""
         valid_layer_attrs = []
         for name, value in vars(cls).items():
-            if not name.startswith('_') and isinstance(value, str) and cls.is_valid_layer(value):
+            if not name.startswith('_') and isinstance(value, str) and is_valid_layer(value):
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
+
+
+def is_valid_layer(layer_symbol: str) -> bool:
+    """Return whether ``layer_symbol`` identifies a supported hybrid layer."""
+    return layer_symbol in Symbols.LAYER_CONFIG_MAP
 
 
 def create_layer_config(config: TransformerConfig, layer_symbol: str) -> TransformerConfig:
@@ -62,7 +62,7 @@ def create_layer_config(config: TransformerConfig, layer_symbol: str) -> Transfo
     Raises:
         ValueError: If ``layer_symbol`` does not identify a supported hybrid layer.
     """
-    if not Symbols.is_valid_layer(layer_symbol):
+    if not is_valid_layer(layer_symbol):
         raise ValueError(f"Unexpected hybrid layer symbol: {layer_symbol}")
     return Symbols.LAYER_CONFIG_MAP[layer_symbol].from_config(config)
 

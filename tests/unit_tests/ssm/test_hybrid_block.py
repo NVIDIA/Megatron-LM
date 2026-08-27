@@ -14,6 +14,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -649,7 +650,7 @@ class TestHybridBlock:
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_pattern_char = 'X'
-        assert not Symbols.is_valid_layer(invalid_pattern_char)  # sanity check.
+        assert not layer_utils.is_valid_layer(invalid_pattern_char)  # sanity check.
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_pattern_char
         # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
