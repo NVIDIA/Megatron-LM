@@ -9,7 +9,7 @@ High-level refit/reshard orchestration:
 """
 
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, Literal, NamedTuple, Optional, Union
 
 import torch
 
@@ -26,13 +26,26 @@ from . import build_local_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
+from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
-RefitBackendName = Literal["nccl", "gloo", "nvshmem", "nixl"]
+RefitBackendName = Literal["nccl", "nccl_m2n", "gloo", "nvshmem", "nixl"]
+
+
+class _ParallelConfig(NamedTuple):
+    """Parallel group sizes that determine a refit plan."""
+
+    tp_size: int
+    pp_size: int
+    ep_size: int
+    dp_size: int
+    expert_tp_size: int
+    gtp_remat_size: int
+    expert_gtp_remat_size: int
 
 
 @dataclass(frozen=True)
@@ -42,9 +55,8 @@ class _PlanCacheKey:
     """
 
     rank: int
-    # Parallelism configuration: (TP, PP, EP, DP, expt_tp) or None for non-collocated ranks
-    src_config: Optional[Tuple[int, int, int, int, int]]
-    dst_config: Optional[Tuple[int, int, int, int, int]]
+    src_config: Optional[_ParallelConfig]
+    dst_config: Optional[_ParallelConfig]
     num_experts: Optional[int]
     # Adding inference nodes leaves the configs and offsets unchanged, so without
     # world_size the stale pre-growth plan would be reused.
@@ -59,8 +71,8 @@ class _PlanCacheKey:
     pool_index: int = 0
 
 
-def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
-    """Extract (TP, PP, EP, DP, expt_tp) sizes from a model core, memoized on the core.
+def _get_parallel_config(core) -> Optional[_ParallelConfig]:
+    """Extract TP/PP/EP/DP/expert-TP/GTP-remat sizes, memoized on the core.
 
     Process-group sizes don't change after init, so the result is cached on the
     core object itself to avoid repeated ``get_process_group_ranks`` calls on
@@ -68,19 +80,23 @@ def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
     """
     if core is None:
         return None
-    cached = getattr(core, '_refit_config_tuple', None)
+    cached = getattr(core, '_refit_parallel_config', None)
     if cached is not None:
         return cached
     pg = core.pg_collection
     expt_tp = getattr(pg, 'expt_tp', None)
-    result = (
-        pg.tp.size() if pg.tp else 1,
-        pg.pp.size() if pg.pp else 1,
-        pg.ep.size() if pg.ep else 1,
-        pg.dp.size() if pg.dp else 1,
-        expt_tp.size() if expt_tp else 1,
+    gtp_remat = getattr(pg, 'gtp_remat', None)
+    expt_gtp_remat = getattr(pg, 'expt_gtp_remat', None)
+    result = _ParallelConfig(
+        tp_size=pg.tp.size() if pg.tp else 1,
+        pp_size=pg.pp.size() if pg.pp else 1,
+        ep_size=pg.ep.size() if pg.ep else 1,
+        dp_size=pg.dp.size() if pg.dp else 1,
+        expert_tp_size=expt_tp.size() if expt_tp else 1,
+        gtp_remat_size=gtp_remat.size() if gtp_remat else 1,
+        expert_gtp_remat_size=expt_gtp_remat.size() if expt_gtp_remat else 1,
     )
-    core._refit_config_tuple = result
+    core._refit_parallel_config = result
     return result
 
 
@@ -100,8 +116,8 @@ def _build_plan_cache_key(
     world_size = group.size() if group is not None else torch.distributed.get_world_size()
     return _PlanCacheKey(
         rank=rank,
-        src_config=_get_config_tuple(src_core),
-        dst_config=_get_config_tuple(tgt_core),
+        src_config=_get_parallel_config(src_core),
+        dst_config=_get_parallel_config(tgt_core),
         num_experts=num_experts,
         world_size=world_size,
         src_rank_offset=src_rank_offset,
@@ -110,8 +126,11 @@ def _build_plan_cache_key(
     )
 
 
-# Module-level cache for refit services to avoid repeated allocations
-_service_cache: dict[str, CopyService] = {}
+# Module-level cache for refit services to avoid repeated allocations. Services
+# own process-group-specific communicators, so the group identity is part of the
+# key. ``id(group)`` is safe because the cached service retains the group object,
+# preventing its address from being reused while the cache entry exists.
+_service_cache: dict[tuple[str, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
 
 
@@ -122,14 +141,17 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     when swap_model_weights is called multiple times with the same backend.
 
     Args:
-        backend: Backend name ("nccl", "gloo", "nvshmem", or "nixl").
-        group: Optional process group for NCCL backend.
+        backend: Backend name ("nccl", "nccl_m2n", "gloo", "nvshmem", or "nixl").
+        group: Optional process group for the backend.
     """
-    if backend in _service_cache:
-        return _service_cache[backend]
+    cache_key = (backend, id(group) if group is not None else None)
+    if cache_key in _service_cache:
+        return _service_cache[cache_key]
 
     if backend == "nccl":
         service = NCCLCopyService(group=group)
+    elif backend == "nccl_m2n":
+        service = NCCLM2NCopyService(group=group)
     elif backend == "gloo":
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
@@ -139,7 +161,7 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     else:
         raise ValueError(f"Unknown backend '{backend}'")
 
-    _service_cache[backend] = service
+    _service_cache[cache_key] = service
     return service
 
 
@@ -193,7 +215,7 @@ def _unwrap_model_cores(src_model, target_model):
             raise RuntimeError("Source model missing pg_collection required for reshard")
         # Fill missing DP group on the source using Megatron's parallel state if not provided
         if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
+            src_core.pg_collection.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
@@ -382,6 +404,12 @@ def swap_model_weights(
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
 
+    if num_dst_pools > 1 and not service.supports_idle_ranks:
+        raise ValueError(
+            f"{type(service).__name__} does not support num_dst_pools > 1 because each pool "
+            "pass leaves the other destination ranks idle"
+        )
+
     for pool in range(num_dst_pools):
         target = target_model if pool == dst_pool_index else None
 
@@ -490,6 +518,7 @@ def reshard_model_weights(
         src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index
     )
     _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
+    service.set_model_roles(is_source=src_core is not None, is_destination=tgt_core is not None)
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )

@@ -1745,12 +1745,20 @@ def _disable_te_native_workspace_starvation():
     _TE_NATIVE_ENV_ORIG.clear()
 
 
+_BATCH_INVARIANT_COLLECTIVE = "ordered"
+
+
+def get_batch_invariant_collective() -> str:
+    """Return the active batch-invariant cross-rank combine collective."""
+    return _BATCH_INVARIANT_COLLECTIVE
+
+
 def get_batch_invariant_backend() -> str:
     """Return the active batch-invariant GEMM backend name."""
     return _BATCH_INVARIANT_BACKEND
 
 
-def enable_batch_invariant_mode(backend: str = "te_native"):
+def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "ordered"):
     """Enable global batch-invariant mode and patch Aten/TE kernels.
 
     Args:
@@ -1765,8 +1773,11 @@ def enable_batch_invariant_mode(backend: str = "te_native"):
             DeepGEMM for "deepgemm"/"triton"; "te_native" leaves it native.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
+    global _BATCH_INVARIANT_COLLECTIVE
     if _batch_invariant_MODE:
         return
+    assert collective in ("ordered", "multimem"), f"Unknown collective {collective!r}"
+    _BATCH_INVARIANT_COLLECTIVE = collective
     if backend not in _BATCH_INVARIANT_BACKENDS:
         raise ValueError(
             f"Unknown batch-invariant backend {backend!r}; "
