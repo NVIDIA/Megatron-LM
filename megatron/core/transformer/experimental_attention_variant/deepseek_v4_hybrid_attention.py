@@ -312,6 +312,46 @@ class DSv4HybridAttention(Attention):
             raise RuntimeError(
                 'DSV4_TP_LOCAL_INDEXER_Q currently requires dsa_indexer_loss_coeff == 0.'
             )
+        tp_local_indexer_topk = (
+            os.environ.get('DSV4_TP_LOCAL_INDEXER_TOPK', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and not tp_local_indexer_q
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+        )
+        if tp_local_indexer_topk and (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0:
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_INDEXER_TOPK currently requires dsa_indexer_loss_coeff == 0.'
+            )
+        if tp_local_indexer_topk and os.environ.get('DSV4_TP_LOCAL_INDEXER_TOPK_UNSAFE', '0') != '1':
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_INDEXER_TOPK is disabled: local RoPE/top-k changed routes '
+                'beyond the legacy fused-kernel nondeterminism envelope. '
+                'Set DSV4_TP_LOCAL_INDEXER_TOPK_UNSAFE=1 only to reproduce the negative experiment.'
+            )
+        tp_local_attention_compressor = (
+            os.environ.get('DSV4_TP_LOCAL_ATTENTION_COMPRESSOR', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+            and self._dsv4_compress_ratio > 1
+        )
+        if (
+            tp_local_attention_compressor
+            and os.environ.get('DSV4_TP_LOCAL_ATTENTION_COMPRESSOR_UNSAFE', '0') != '1'
+        ):
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_ATTENTION_COMPRESSOR is disabled: rank-distinct backward '
+                'gradient correctness failed. Set ..._UNSAFE=1 only to reproduce the negative experiment.'
+            )
         cp_group = self.pg_collection.tp if tp_local_csa else _orig_cp_group
         if not tp_local_csa and packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
@@ -342,6 +382,14 @@ class DSv4HybridAttention(Attention):
                 self._dsv4_compress_ratio,
                 self.config.csa_window_size,
                 self.pg_collection.cp,
+            )
+        attention_compressor_boundary_hidden = None
+        if tp_local_attention_compressor:
+            attention_compressor_boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                hidden_states,
+                self._dsv4_compress_ratio,
+                self.config.csa_window_size,
+                self.pg_collection.tp,
             )
 
         # =====================
@@ -388,6 +436,24 @@ class DSv4HybridAttention(Attention):
             value = _take_tp_local_rows(value)
             q_compressed = _take_tp_local_rows(q_compressed)
 
+        local_indexer_qr = q_compressed
+        if (tp_local_indexer_q or tp_local_indexer_topk) and q_compressed is not None:
+            # The duplicated q-down projection may return a sequence-gathered
+            # tensor under TE sequence-parallel mode.  Indexer Q is token-wise
+            # and only needs this rank's compressed-query rows.
+            global_rows = sequence_parallel_local_length * self.tp_size
+            if q_compressed.size(0) == global_rows:
+                tp_rank = torch.distributed.get_rank(group=self.pg_collection.tp)
+                local_indexer_qr = q_compressed.narrow(
+                    0, tp_rank * sequence_parallel_local_length, sequence_parallel_local_length
+                ).contiguous()
+            elif q_compressed.size(0) != sequence_parallel_local_length:
+                raise RuntimeError(
+                    "DSv4 TP-local Indexer received an unexpected compressed-query length: "
+                    f"shape={tuple(q_compressed.shape)}, local={sequence_parallel_local_length}, "
+                    f"tp={self.tp_size}"
+                )
+
         core_q_compressed = q_compressed
         if self.tp_size > 1 and self.config.sequence_parallel and not tp_local_csa:
             # q-down is duplicated and remains TP-local, while CSA's learned
@@ -421,9 +487,19 @@ class DSv4HybridAttention(Attention):
                 qr=core_q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
-                indexer_x_local=hidden_states if tp_local_indexer_q else None,
-                indexer_qr_local=q_compressed if tp_local_indexer_q else None,
+                indexer_x_local=(
+                    hidden_states if (tp_local_indexer_q or tp_local_indexer_topk) else None
+                ),
+                indexer_qr_local=(
+                    local_indexer_qr if (tp_local_indexer_q or tp_local_indexer_topk) else None
+                ),
                 tp_local_indexer_q=tp_local_indexer_q,
+                tp_local_indexer_topk=tp_local_indexer_topk,
+                attention_compressor_x_local=(
+                    hidden_states if tp_local_attention_compressor else None
+                ),
+                attention_compressor_boundary_hidden=attention_compressor_boundary_hidden,
+                tp_local_attention_compressor=tp_local_attention_compressor,
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
