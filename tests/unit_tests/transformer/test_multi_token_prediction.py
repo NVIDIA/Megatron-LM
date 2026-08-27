@@ -120,12 +120,25 @@ class TestMultiTokenPredictionLayer:
         )
         return config, mtp_block_spec
 
-    def test_mtp_placement_uses_explicit_pipeline_rank(self, monkeypatch):
-        """Explicit PP metadata must avoid global MPU reads during model construction."""
+    def test_mtp_placement_uses_explicit_pipeline_group(self, monkeypatch):
+        """An explicit PP group must avoid global MPU reads during model construction."""
+
+        pp_group = object()
+        pp_rank = 1
+
+        def explicit_pg_rank(group):
+            assert group is pp_group
+            return pp_rank
+
+        def explicit_pg_size(group):
+            assert group is pp_group
+            return 2
 
         def unexpected_global_read(*args, **kwargs):
             raise AssertionError("global pipeline state must not be read")
 
+        monkeypatch.setattr(mtp_module, "get_pg_rank", explicit_pg_rank)
+        monkeypatch.setattr(mtp_module, "get_pg_size", explicit_pg_size)
         monkeypatch.setattr(
             mtp_module.parallel_state, "get_pipeline_model_parallel_rank", unexpected_global_read
         )
@@ -141,10 +154,19 @@ class TestMultiTokenPredictionLayer:
         )
 
         assert mtp_on_this_rank(
-            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_rank=1, pp_size=2, vp_size=1
+            mtp_num_layers=1,
+            ignore_virtual=False,
+            vp_stage=0,
+            pp_group=pp_group,
+            vp_size=1,
         )
+        pp_rank = 0
         assert not mtp_on_this_rank(
-            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_rank=0, pp_size=2, vp_size=1
+            mtp_num_layers=1,
+            ignore_virtual=False,
+            vp_stage=0,
+            pp_group=pp_group,
+            vp_size=1,
         )
 
         config = TransformerConfig(

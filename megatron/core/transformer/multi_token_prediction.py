@@ -790,8 +790,7 @@ def mtp_on_this_rank(
     mtp_num_layers: Optional[int] = None,
     ignore_virtual: Optional[bool] = True,
     vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
-    pp_size: Optional[int] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
     vp_size: Optional[int] = None,
 ) -> bool:
     """
@@ -807,9 +806,13 @@ def mtp_on_this_rank(
           pipeline stage. The function returns True only on the last pipeline stage.
     """
     mtp_on_this_rank = False
-    if pp_rank is None:
-        # Compatibility fallback for callers that have not migrated to explicit PP metadata.
+    if pp_group is not None:
+        pp_rank = get_pg_rank(pp_group)
+        pp_size = get_pg_size(pp_group)
+    else:
+        # Compatibility fallback for callers that have not migrated to an explicit PP group.
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = None
     if vp_size is None and layout is not None:
         vp_size = layout.virtual_pipeline_model_parallel_size
     elif vp_size is None and not ignore_virtual:

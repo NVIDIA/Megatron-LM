@@ -229,8 +229,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_layers=self.config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=self.vp_stage,
-                pp_rank=self.pg_collection.pp.rank(),
-                pp_size=self.pg_collection.pp.size(),
+                pp_group=self.pg_collection.pp,
                 vp_size=self.config.virtual_pipeline_model_parallel_size,
             )
         )
