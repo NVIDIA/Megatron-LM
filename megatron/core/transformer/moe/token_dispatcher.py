@@ -1714,11 +1714,11 @@ class _NCCLEPManager(_DispatchManager):
                 "TransformerEngine NCCL EP is unavailable. The 'ncclep' backend requires a "
                 "TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
             )
-        if self.rank_capacity_factor is None:
+        if self.static_shape and self.rank_capacity_factor is None:
             raise ValueError(
-                "The 'ncclep' backend requires moe_expert_rank_capacity_factor to be set: it "
-                "sizes the per-rank receive buffer. Exceeding the budget hard-traps, so set it "
-                "generously."
+                "The 'ncclep' backend with moe_ncclep_static_shape=True requires "
+                "moe_expert_rank_capacity_factor to be set: it sizes the per-rank receive buffer. "
+                "Exceeding the budget hard-traps, so set it generously."
             )
 
         # Fresh EpBuffer per dispatch, held until the matching combine consumes it. dispatch
@@ -1745,7 +1745,7 @@ class _NCCLEPManager(_DispatchManager):
         self.num_local_tokens = num_tokens
 
     def _ensure_bootstrap(self):
-        """Bootstrap NCCL EP and size the receive buffer on first use (static shapes)."""
+        """Bootstrap NCCL EP and size the receive buffer on first use."""
         if self._bootstrapped:
             return
         # NCCL EP's HT backend requires max_dispatch_tokens_per_rank to be a multiple of the HT
@@ -1757,10 +1757,16 @@ class _NCCLEPManager(_DispatchManager):
             // _HT_TOKENS_PER_CHUNK
             * _HT_TOKENS_PER_CHUNK
         )
-        budget = int(self._max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
-        if self.alignment != 0:
-            budget += -budget % self.alignment
-        self._recv_capacity = budget
+        if self.static_shape:
+            budget = int(self._max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
+            if self.alignment != 0:
+                budget += -budget % self.alignment
+            self._recv_capacity = budget
+        else:
+            # Dynamic-shape NCCL EP must use TE eager mode. Passing a fixed capacity here makes
+            # dispatch return a [capacity, H] tensor, and narrowing it before combine violates
+            # combine_bwd's reverse-dispatch shape contract.
+            self._recv_capacity = None
 
         ensure_nccl_ep_bootstrapped(
             self.group,
@@ -1768,6 +1774,7 @@ class _NCCLEPManager(_DispatchManager):
             max_tokens_per_rank=self._max_tokens_per_rank,
             recv_capacity_per_rank=self._recv_capacity,
             hidden_dim=self.hidden_dim,
+            num_topk=self.router_topk,
             num_sms=(
                 self.config.moe_flex_dispatcher_num_sms
                 if self.config.moe_flex_dispatcher_num_sms is not None
@@ -1825,16 +1832,8 @@ class _NCCLEPManager(_DispatchManager):
         return self.tokens_per_expert
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # TE ep_combine reads from the static [recv_capacity, H] buffer. static_shape=False path the
-        # experts ran on the narrowed [Σ, H] slice, so re-expand back to recv_capacity; in
-        # static_shape mode the output is already recv_capacity rows (no-op). Rows beyond the valid
-        # region map to no token and combine ignores them.
-        num_valid = hidden_states.shape[0]
-        pad_rows = self._recv_capacity - num_valid
-        if pad_rows > 0:
-            hidden_states = torch.cat(
-                [hidden_states, hidden_states.new_zeros(pad_rows, hidden_states.shape[-1])], dim=0
-            )
+        # TE ep_combine accepts the actual expert-major row count. Keeping the dynamic-shape
+        # [Σ, H] tensor avoids materializing a large zero-padded [recv_capacity, H] temporary.
         return hidden_states
 
     def combine(
