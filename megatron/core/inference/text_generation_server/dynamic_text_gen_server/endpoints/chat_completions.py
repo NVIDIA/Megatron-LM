@@ -302,9 +302,7 @@ def _fetch_remote_image(parsed: urllib.parse.ParseResult) -> bytes:
         raise ValueError(f"Invalid image_url: {parsed.geturl()[:40]!r}") from exc
 
     addresses = _resolve_public_addresses(parsed.hostname, port)
-    connection_type = (
-        _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
-    )
+    connection_type = _PinnedHTTPSConnection if parsed.scheme == "https" else _PinnedHTTPConnection
     target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
     host_header = parsed.hostname
     if ":" in host_header:
@@ -314,14 +312,10 @@ def _fetch_remote_image(parsed: urllib.parse.ParseResult) -> bytes:
 
     last_error = None
     for sockaddr in addresses:
-        connection = connection_type(
-            parsed.hostname, port, sockaddr, _IMAGE_FETCH_TIMEOUT_S
-        )
+        connection = connection_type(parsed.hostname, port, sockaddr, _IMAGE_FETCH_TIMEOUT_S)
         try:
             connection.request(
-                "GET",
-                target,
-                headers={"Host": host_header, "User-Agent": _IMAGE_FETCH_USER_AGENT},
+                "GET", target, headers={"Host": host_header, "User-Agent": _IMAGE_FETCH_USER_AGENT}
             )
             response = connection.getresponse()
             if not 200 <= response.status < 300:

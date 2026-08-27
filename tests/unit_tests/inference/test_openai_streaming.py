@@ -511,7 +511,9 @@ def test_remote_image_fetch_uses_validated_numeric_address(monkeypatch):
         def close():
             pass
 
-    monkeypatch.setattr(chat_completions, "_resolve_public_addresses", lambda *_: [("93.184.216.34", 80)])
+    monkeypatch.setattr(
+        chat_completions, "_resolve_public_addresses", lambda *_: [("93.184.216.34", 80)]
+    )
     monkeypatch.setattr(chat_completions, "_PinnedHTTPConnection", FakeConnection)
 
     assert (
@@ -521,6 +523,8 @@ def test_remote_image_fetch_uses_validated_numeric_address(monkeypatch):
     assert observed["hostname"] == "example.com"
     assert observed["sockaddr"] == ("93.184.216.34", 80)
     assert observed["headers"]["Host"] == "example.com"
+
+
 @pytest.mark.parametrize(
     "raw_kwargs,expected",
     [
