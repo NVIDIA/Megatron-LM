@@ -755,7 +755,7 @@ def test_cudnn_indexer_topk_multi_packed_cp1_real_kernel_matches_pytorch_gradien
     indexer_dim = 128
     attention_heads = 64
     attention_dim = 576
-    # SM100 sparse score recompute requires top-k to be a multiple of 64.
+    # Exercise the SM90 internal 128-slot padding while SM100 consumes 64 directly.
     topk = 64
     softmax_scale = attention_dim**-0.5
     loss_coeff = 0.01
@@ -964,6 +964,27 @@ def test_cudnn_general_thd_rejects_impossible_qk_geometry():
     assert not dsa_cudnn_kernels._packed_thd_kernel_applicable(sk=5, **common)
     mismatched_max = {**common, "packed_max_seqlen_k": 1}
     assert not dsa_cudnn_kernels._packed_thd_kernel_applicable(sk=3, **mismatched_max)
+
+
+def test_cudnn_general_thd_cp2_rejects_different_qk_boundaries():
+    """Q-relative index restoration is unsafe when packed K starts differ."""
+    cu_q = torch.tensor([0, 8, 24], dtype=torch.int32)
+    cu_k = torch.tensor([0, 16, 24], dtype=torch.int32)
+
+    assert not dsa_cudnn_kernels._packed_thd_kernel_applicable(
+        b=1,
+        sq=12,
+        sk=24,
+        device=cu_q.device,
+        packed_cu_seqlens_q=cu_q,
+        packed_cu_seqlens_k=cu_k,
+        packed_max_seqlen_q=16,
+        packed_max_seqlen_k=16,
+        cp_size=2,
+        cp_rank=0,
+        local_packed_cp_query_start=0,
+        local_packed_cp_query_len=None,
+    )
 
 
 @pytest.mark.parametrize("max_segment_k", [5, 6], ids=["odd-k", "even-k"])
@@ -1804,6 +1825,13 @@ def test_flash_mla_topk_alignment_uses_sm100_block(monkeypatch):
         assert dsa_cudnn_kernels._get_topk_alignment() == 512
     finally:
         dsa_cudnn_kernels._device_sm.cache_clear()
+
+
+@pytest.mark.parametrize("sm, expected", [((9, 0), 128), ((10, 0), 64)])
+def test_sparse_score_recompute_topk_alignment(monkeypatch, sm, expected):
+    monkeypatch.setattr(dsa_cudnn_kernels, "_current_sm", lambda: sm)
+
+    assert dsa_cudnn_kernels._get_score_recompute_topk_alignment() == expected
 
 
 def test_dsa_fwd_flash_mla_pads_topk_to_flashmla_block(monkeypatch):
