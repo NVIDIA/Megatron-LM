@@ -46,6 +46,44 @@ def test_batch_invariant_backend_rejects_unknown_value_at_construction():
         )
 
 
+def test_mhc_fused_backend_defaults_to_auto():
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    assert config.mhc_fused_backend == "auto"
+
+
+@pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
+def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        use_fused_mhc=True,
+        mhc_fused_backend=backend,
+    )
+
+    assert config.mhc_fused_backend == backend
+
+
+def test_mhc_fused_backend_rejects_unknown_value_at_construction():
+    with pytest.raises(ValueError, match="Unknown mhc_fused_backend"):
+        TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, mhc_fused_backend="cuda"
+        )
+
+
+def test_explicit_mhc_fused_backend_requires_fused_mhc():
+    with pytest.raises(ValueError, match="requires use_fused_mhc"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            mhc_fused_backend="native",
+        )
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
