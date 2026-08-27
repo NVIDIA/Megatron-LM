@@ -25,7 +25,7 @@ from tests.unit_tests.test_utilities import Utils
 
 def _nccl_with_version(*release: int):
     version = SimpleNamespace(release=release)
-    version_info = SimpleNamespace(libnccl=SimpleNamespace(version=version))
+    version_info = SimpleNamespace(nccl=SimpleNamespace(version=version))
     return SimpleNamespace(get_version=lambda: version_info)
 
 
