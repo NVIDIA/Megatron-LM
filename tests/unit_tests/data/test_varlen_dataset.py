@@ -769,13 +769,7 @@ def test_packing_scheduler_dataloader_yields_microbatches():
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
         set_args(
-            _loader_args(
-                use_varlen=True,
-                sbhd=False,
-                scheduler="dp_balanced",
-                mbs=mbs,
-                gbs=gbs,
-            )
+            _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
         )
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
