@@ -15,6 +15,8 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.fused_mtp_prefix import mtp_e2e_prefix_objective
+from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -929,9 +931,125 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _process_mtp_e2e_tv_loss(
+    hidden_states_list: tuple[Tensor, ...],
+    loss_mask: Tensor,
+    output_layer: Callable,
+    output_weight: Tensor,
+    runtime_gather_output: Optional[bool],
+    is_training: bool,
+    config: TransformerConfig,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams],
+    scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
+    original_num_tokens: Tensor,
+) -> Tensor:
+    """Apply the end-to-end TV objective to MTP draft hidden states.
+
+    The frozen backbone is projected once. For depth ``i``, its target logits are
+    shifted by ``i + 1`` positions to align with the MTP draft distribution for
+    the same future token. Only start positions with a complete chain across all
+    configured MTP depths contribute to the objective.
+    """
+    hidden_states = hidden_states_list[0]
+    logits_are_vocab_sharded = _mtp_logits_are_vocab_sharded(output_layer, runtime_gather_output)
+
+    # Project the frozen backbone once, then align each target distribution by
+    # rolling logits. Re-projecting one shifted hidden tensor per MTP depth would
+    # add a full vocabulary GEMM for every draft step.
+    with torch.no_grad():
+        target_logits, _ = output_layer(
+            hidden_states.detach(),
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            target_logits = scale_logits_fn(target_logits)
+    # roll_tensor handles packed boundaries and CP communication along its last
+    # dimension. Keep vocabulary before sequence while preparing target alignment.
+    target_logits = target_logits.permute(1, 2, 0)
+    current_loss_mask = loss_mask
+    chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
+    tv_distances = []
+
+    for mtp_layer_number in range(config.mtp_num_layers):
+        target_logits, _ = roll_tensor(
+            target_logits,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=False,
+        )
+        current_loss_mask, _ = roll_tensor(
+            current_loss_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=False,
+        )
+        chain_valid &= current_loss_mask.bool()
+
+        draft_logits, _ = output_layer(
+            hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            draft_logits = scale_logits_fn(draft_logits)
+        aligned_target_logits = target_logits.permute(2, 0, 1)
+        tv_distances.append(
+            vocab_parallel_tv_distance(
+                draft_logits,
+                aligned_target_logits,
+                tp_group=tp_group,
+                logits_are_vocab_sharded=logits_are_vocab_sharded,
+            )
+        )
+
+    tv_distances_tensor = torch.stack(tv_distances, dim=0)
+    per_step_acceptance = 1.0 - tv_distances_tensor
+    e2e_tv_loss, prefix_losses = mtp_e2e_prefix_objective(per_step_acceptance)
+
+    chain_mask = chain_valid.transpose(0, 1).to(e2e_tv_loss.dtype)
+    num_tokens = chain_mask.sum()
+    masked_e2e_tv_loss = e2e_tv_loss * chain_mask
+
+    if is_training:
+        avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        for mtp_layer_number in range(config.mtp_num_layers):
+            loss_for_log = torch.sum(
+                prefix_losses[mtp_layer_number] * chain_mask
+            ) / num_tokens.clamp(min=1)
+            correct = torch.sum(per_step_acceptance[mtp_layer_number] * chain_mask)
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                loss_for_log,
+                correct,
+                num_tokens,
+                mtp_layer_number,
+                config.mtp_num_layers,
+                avg_group=avg_group,
+            )
+
+    assert config.mtp_loss_scaling_factor is not None
+    if config.calculate_per_token_loss:
+        normalized_loss = (
+            config.mtp_loss_scaling_factor
+            * masked_e2e_tv_loss
+            * (original_num_tokens / num_tokens.clamp(min=1))
+        )
+    else:
+        normalized_loss = (
+            config.mtp_loss_scaling_factor * masked_e2e_tv_loss / num_tokens.clamp(min=1)
+        )
+    return MTPLossAutoScaler.apply(hidden_states, normalized_loss)
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
-    labels: Tensor,
+    labels: Optional[Tensor],
     loss_mask: Optional[Tensor],
     output_layer: Callable,
     output_weight: Optional[Tensor],
@@ -1008,6 +1126,23 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+
+    if config.mtp_loss_type == "e2e_tv":
+        assert output_weight is not None
+        return _process_mtp_e2e_tv_loss(
+            hidden_states_list=hidden_states_list,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=is_training,
+            config=config,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            packed_seq_params=packed_seq_params,
+            scale_logits_fn=scale_logits_fn,
+            original_num_tokens=original_num_tokens,
+        )
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
