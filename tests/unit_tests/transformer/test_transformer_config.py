@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
+import torch.nn.functional as F
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -71,6 +72,27 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
         )
 
 
+def _fused_moe_config(**overrides) -> TransformerConfig:
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="ncclep",
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        moe_single_grouped_weight=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        add_bias_linear=False,
+        bf16=True,
+        moe_use_transformer_engine_fused_moe=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
 def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
     kwargs = dict(
         num_layers=1,
@@ -88,6 +110,29 @@ def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
+
+
+def test_fused_moe_config_enables_grouped_tensor():
+    config = _fused_moe_config()
+
+    assert config.moe_use_grouped_tensor
+
+
+@pytest.mark.parametrize(
+    "override,error",
+    [
+        ({"moe_token_dispatcher_type": "alltoall"}, "moe_token_dispatcher_type='flex'"),
+        ({"moe_flex_dispatcher_backend": "deepep"}, "moe_flex_dispatcher_backend='ncclep'"),
+        ({"moe_single_grouped_weight": False}, "moe_single_grouped_weight=True"),
+        ({"moe_shared_expert_overlap": True}, "moe_shared_expert_overlap"),
+        ({"cuda_graph_impl": "local"}, "CUDA graphs"),
+        ({"moe_paged_stash": True}, "moe_paged_stash"),
+        ({"fp4": "nvfp4"}, "does not support FP4"),
+    ],
+)
+def test_fused_moe_config_rejects_incompatible_modes(override, error):
+    with pytest.raises(ValueError, match=error):
+        _fused_moe_config(**override)
 
 
 def test_mxfp8_wire_dtypes_accept_valid_ncclep_config():

@@ -290,6 +290,7 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+        self._last_fused_moe_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -389,6 +390,11 @@ class TEGroupedMLP(MegatronModule):
             from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
         except ImportError:
             return False  # Transformer Engine version is too old
+        if self.config.moe_use_transformer_engine_fused_moe:
+            try:
+                from transformer_engine.pytorch.ops import Combine, Dispatch  # noqa: F401
+            except ImportError:
+                return False  # Transformer Engine does not provide fusible NCCL-EP ops
 
         if not is_te_min_version("2.14.0"):
             return False
@@ -455,8 +461,17 @@ class TEGroupedMLP(MegatronModule):
             return False
         return True
 
-    def _make_fused_ops(self) -> torch.nn.Module:
-        """Construct fused module for FC1, activation, and FC2."""
+    def _make_fused_ops(
+        self,
+        ep_buffer=None,
+    ) -> torch.nn.Module:
+        """Construct the TE operation-fuser module.
+
+        When ``ep_buffer`` is provided, dispatch and combine are included around
+        the grouped MLP. The routing metadata is connected through internal
+        channels so Transformer Engine can replace the five-op sequence with
+        MegaMOE when its runtime gates pass.
+        """
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
 
@@ -488,8 +503,13 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
-        # Container for fusible ops
-        ops = te.pytorch.ops.Sequential()
+        # Build standalone operations first. Channel routing must be bound
+        # before Sequential constructs an OperationFuser and locks it.
+        op_list = []
+        dispatch_op = None
+        if ep_buffer is not None:
+            dispatch_op = te.pytorch.ops.Dispatch(ep_buffer)
+            op_list.append(dispatch_op)
 
         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
         fc1_single_grouped_weight = self.linear_fc1.single_grouped_weight
@@ -540,7 +560,8 @@ class TEGroupedMLP(MegatronModule):
         # TODO: remove after TE support the grouped tensor path
         if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
             op.ep_mxfp8_carrier_input = True
-        ops.append(op)
+        op_list.append(op)
+        fc1_op = op
 
         # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
         glu_interleave = self.config.moe_mlp_glu_interleave_size
@@ -617,7 +638,8 @@ class TEGroupedMLP(MegatronModule):
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
-        ops.append(op)
+        op_list.append(op)
+        activation_op = op
 
         # FC2
         fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
@@ -648,12 +670,61 @@ class TEGroupedMLP(MegatronModule):
         # TODO: remove after TE support the grouped tensor path
         if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
             op.ep_mxfp8_carrier_grad = True
-        ops.append(op)
+        op_list.append(op)
+        fc2_op = op
+
+        if ep_buffer is not None:
+            combine_op = te.pytorch.ops.Combine()
+            op_list.append(combine_op)
+            dispatch_op.set_extra_output_channel(
+                0, "tokens_per_expert", output_to_caller=False
+            )
+            dispatch_op.set_extra_output_channel(
+                1, "routing_weights", output_to_caller=False
+            )
+            dispatch_op.set_extra_output_channel(2, "ep_handle", output_to_caller=False)
+            dispatch_op.set_extra_output_channel(
+                3, "routing_indices", output_to_caller=False
+            )
+            fc1_op.set_extra_input_channel(0, "tokens_per_expert")
+            activation_op.set_extra_input_channel(0, "routing_weights")
+            fc2_op.set_extra_input_channel(0, "tokens_per_expert")
+            combine_op.set_extra_input_channel(0, "ep_handle")
+            combine_op.set_extra_input_channel(1, "tokens_per_expert")
+            combine_op.set_extra_input_channel(2, "routing_indices")
+
+        ops = te.pytorch.ops.Sequential(*op_list)
 
         # Emulate submodule pre-forward hooks
         ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())
 
         return ops
+
+    def fused_moe_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        ep_buffer,
+    ) -> torch.Tensor:
+        """Run dispatch, routed experts, and combine in one TE Sequential."""
+        if not self.config.moe_use_transformer_engine_fused_moe:
+            raise RuntimeError(
+                "fused_moe_forward requires moe_use_transformer_engine_fused_moe=True."
+            )
+        if hidden_states.dtype is not torch.bfloat16:
+            raise TypeError(
+                "Transformer Engine Dispatch requires BF16 hidden states, "
+                f"got {hidden_states.dtype}."
+            )
+
+        ops = self._make_fused_ops(
+            ep_buffer=ep_buffer,
+        )
+        # Keep the most recent sequence available for diagnostics without
+        # registering duplicate parameter aliases as child modules.
+        self._last_fused_moe_ops = (ops,)
+        return ops(hidden_states, topk_idx, topk_weights.float())
 
     def _make_fused_impl_pre_forward_hook(self) -> Callable:
         """Make function that calls submodule pre-forward callback hooks.
@@ -1103,12 +1174,26 @@ class TEGroupedMLP(MegatronModule):
         # wgrad pass through the fused children instead of falling through to no-op
         # backward_dw() on linear_fc{1,2} (whose forward never ran in the fused path).
         if self._with_fused_impl and self.linear_fc1.delay_wgrad_compute:
-            if self._fused_ops is not None:
-                (seq,) = self._fused_ops
+            ops = (
+                self._last_fused_moe_ops
+                if self.config.moe_use_transformer_engine_fused_moe
+                else self._fused_ops
+            )
+            if ops is not None:
+                (seq,) = ops
                 fused_children = list(seq.children())
-                assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
-                fused_children[2].backward_dw()
-                fused_children[0].backward_dw()
+                if self.config.moe_use_transformer_engine_fused_moe:
+                    assert len(fused_children) == 5, (
+                        "expected Dispatch, FC1, activation, FC2, Combine in fused TE ops"
+                    )
+                    fc1_idx, fc2_idx = 1, 3
+                else:
+                    assert len(fused_children) == 3, (
+                        "expected FC1, activation, FC2 in fused TE ops"
+                    )
+                    fc1_idx, fc2_idx = 0, 2
+                fused_children[fc2_idx].backward_dw()
+                fused_children[fc1_idx].backward_dw()
                 # DDP registers wgrad hooks on the original linear_fc1/fc2 module objects
                 # (those are in the nn.Module tree), but backward_dw() is called on the
                 # NEW GroupedLinear instances created by _make_fused_ops().  We must

@@ -1002,6 +1002,13 @@ class TransformerConfig(ModelParallelConfig):
     symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
     fused op (use_transformer_engine_op_fuser). Defaults to False."""
 
+    moe_use_transformer_engine_fused_moe: bool = False
+    """Build routed experts as one Transformer Engine
+    ``Sequential(Dispatch, FC1, SwiGLU, FC2, Combine)``. Transformer Engine uses the cuDNN
+    MegaMOE kernel when its runtime capability checks pass and otherwise executes the same
+    sequence with the unfused NCCL-EP operations. This experimental path currently supports only
+    the standard (non-overlapped, non-CUDA-graph) NCCL-EP execution."""
+
     moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
     """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
@@ -1836,6 +1843,50 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_use_grouped_tensor=True without use_transformer_engine_op_fuser is "
                     "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
                     "or select the alltoall, DeepEP, or HybridEP dispatcher."
+                )
+
+        if self.moe_use_transformer_engine_fused_moe:
+            requirements = {
+                "moe_token_dispatcher_type='flex'": self.moe_token_dispatcher_type == "flex",
+                "moe_flex_dispatcher_backend='ncclep'": (
+                    self.moe_flex_dispatcher_backend == "ncclep"
+                ),
+                "moe_grouped_gemm=True": self.moe_grouped_gemm,
+                "use_transformer_engine_op_fuser=True": self.use_transformer_engine_op_fuser,
+                "moe_single_grouped_weight=True": self.moe_single_grouped_weight,
+                "moe_use_grouped_tensor=True": self.moe_use_grouped_tensor,
+                "gated_linear_unit=True": self.gated_linear_unit,
+                "activation_func=F.silu": self.activation_func is F.silu,
+                "add_bias_linear=False": not self.add_bias_linear,
+            }
+            missing = [name for name, enabled in requirements.items() if not enabled]
+            if missing:
+                raise ValueError(
+                    "moe_use_transformer_engine_fused_moe requires " + ", ".join(missing) + "."
+                )
+            if self.fp4:
+                raise ValueError("moe_use_transformer_engine_fused_moe does not support FP4.")
+            if self.fp8 and self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_use_transformer_engine_fused_moe supports only the MXFP8 FP8 recipe."
+                )
+            incompatible = {
+                "overlap_moe_expert_parallel_comm": self.overlap_moe_expert_parallel_comm,
+                "moe_shared_expert_overlap": self.moe_shared_expert_overlap,
+                "CUDA graphs": self.cuda_graph_impl != "none",
+                "moe_paged_stash": self.moe_paged_stash,
+                "moe_latent_size": self.moe_latent_size is not None,
+                "overlap_dispatch_backward_with_experts_wgrad": (
+                    self.overlap_dispatch_backward_with_experts_wgrad
+                ),
+                "fine_grained_activation_offloading": self.fine_grained_activation_offloading,
+            }
+            active = [name for name, enabled in incompatible.items() if enabled]
+            if active:
+                raise ValueError(
+                    "moe_use_transformer_engine_fused_moe does not yet support "
+                    + ", ".join(active)
+                    + "."
                 )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':

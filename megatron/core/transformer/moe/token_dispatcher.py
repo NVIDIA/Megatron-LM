@@ -1607,6 +1607,20 @@ class _NCCLEPManager(_DispatchManager):
         self.tokens_per_expert: Optional[torch.Tensor] = None
         self.num_local_tokens: Optional[int] = None
 
+    def _new_buffer(self):
+        """Create the per-forward EP buffer shared by dispatch and combine."""
+        self._buffer = new_nccl_ep_buffer(
+            top_k=self.router_topk,
+            max_tokens_per_rank=self._max_tokens_per_rank,
+            recv_capacity_per_rank=self._recv_capacity,
+            hidden_dim=self.hidden_dim,
+            num_local_experts=self.num_local_experts,
+            alignment=self.alignment,
+            dispatch_fwd_quant_recipe=self.dispatch_fwd_quant_recipe,
+            combine_bwd_quant_recipe=self.combine_bwd_quant_recipe,
+        )
+        return self._buffer
+
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
         probs = probs.reshape(num_tokens, self.num_experts)
@@ -1702,16 +1716,7 @@ class _NCCLEPManager(_DispatchManager):
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_bootstrap()
         # Fresh buffer per dispatch; held until the matching combine consumes it.
-        self._buffer = new_nccl_ep_buffer(
-            top_k=self.router_topk,
-            max_tokens_per_rank=self._max_tokens_per_rank,
-            recv_capacity_per_rank=self._recv_capacity,
-            hidden_dim=self.hidden_dim,
-            num_local_experts=self.num_local_experts,
-            alignment=self.alignment,
-            dispatch_fwd_quant_recipe=self.dispatch_fwd_quant_recipe,
-            combine_bwd_quant_recipe=self.combine_bwd_quant_recipe,
-        )
+        self._new_buffer()
         # TE requires int64 indices and float32 weights.
         # token_indices/token_probs: [num_local_tokens, router_topk]
         topk_idx = self.token_indices
@@ -1741,6 +1746,26 @@ class _NCCLEPManager(_DispatchManager):
         # bf16 gets a fresh per-call pool buffer (not shared), so no copy is needed.
         self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
         return recv_tokens
+
+    def prepare_fused_moe_sequential(self):
+        """Prepare one buffer and routing inputs for the end-to-end TE Sequential."""
+        self._ensure_bootstrap()
+        if self.token_indices is None or self.token_probs is None or self.num_local_tokens is None:
+            raise RuntimeError(
+                "NCCL-EP routing metadata must be initialized before the fused MoE Sequential."
+            )
+        buffer = self._new_buffer()
+        return buffer, self.token_indices, self.token_probs.float()
+
+    def finish_fused_moe_sequential(self, *, completed: bool) -> None:
+        """Finalize accounting after the end-to-end TE Sequential returns."""
+        if completed and not self.eager:
+            total_recv_tokens = self._buffer.total_recv_tokens
+            self.over_budget |= total_recv_tokens > self._recv_capacity
+            torch.maximum(self.required_recv, total_recv_tokens, out=self.required_recv)
+        self._buffer = None
+        self.dispatched_probs = None
+        self.tokens_per_expert = None
 
     def grow_recv_capacity(self, new_capacity: int) -> None:
         """Raise the static receive budget to ``new_capacity``, the peak a dropped step needed.
@@ -1889,6 +1914,18 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             None if self.config.overlap_moe_expert_parallel_comm else _detached("_zc_bwd_token_buf")
         )
         return _detached("_zc_fwd_token_buf"), dispatch_grad_input
+
+    def prepare_fused_moe_sequential(self):
+        """Return the NCCL-EP buffer and top-k tensors for a full TE MoE sequence."""
+        if not isinstance(self._comm_manager, _NCCLEPManager):
+            raise RuntimeError("The full TE MoE Sequential requires the NCCL-EP flex backend.")
+        return self._comm_manager.prepare_fused_moe_sequential()
+
+    def finish_fused_moe_sequential(self, *, completed: bool) -> None:
+        """Release full-sequence forward metadata and update capacity accounting."""
+        if not isinstance(self._comm_manager, _NCCLEPManager):
+            raise RuntimeError("The full TE MoE Sequential requires the NCCL-EP flex backend.")
+        self._comm_manager.finish_fused_moe_sequential(completed=completed)
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
