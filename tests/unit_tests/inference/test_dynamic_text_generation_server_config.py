@@ -51,7 +51,9 @@ class _CapturingClient:
     [
         (False, {}, 0.7, 0.95, 20, True),
         (True, {}, 0.7, 0.95, 20, False),
+        (False, {"prevent_retokenization": False}, 0.7, 0.95, 20, False),
         (False, {"temperature": 0.0}, 0.0, 0.0, 1, True),
+        (True, {"temperature": None, "top_p": None, "top_k": None}, 0.7, 0.95, 20, False),
         (
             True,
             {"temperature": 0.4, "top_p": 0.8, "top_k": 5, "prevent_retokenization": True},
@@ -140,6 +142,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
     monkeypatch.setattr(server.asyncio, "set_event_loop", lambda loop: None)
 
     tokenizer = object()
+    multimodal_prompt_config = object()
     server.start_text_gen_server(
         coordinator_addr="tcp://coord:5555",
         tokenizer=tokenizer,
@@ -151,6 +154,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         hostname="127.0.0.1",
         sock=FakeSocket(),
         chat_template="template",
+        multimodal_prompt_config=multimodal_prompt_config,
         default_temperature=0.4,
         default_top_p=0.8,
         default_top_k=5,
@@ -167,6 +171,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         17,
         "127.0.0.1",
         "template",
+        multimodal_prompt_config,
         0.4,
         0.8,
         5,
@@ -176,6 +181,66 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
     assert captured["inheritable"] is True
     assert server._SERVER_PROCESSES[0].daemon is True
     assert server._SERVER_PROCESSES[0].started is True
+
+
+@pytest.mark.asyncio
+async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeypatch):
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        text_generation_server as server,
+    )
+
+    captured = {}
+
+    class FakeInferenceClient:
+        def __init__(self, coordinator_addr, deserialize):
+            captured["client_init"] = (coordinator_addr, deserialize)
+
+        def start(self):
+            captured["client_started"] = True
+
+        def stop(self):
+            captured["client_stopped"] = True
+
+    async def fake_serve(app, config):
+        captured["app"] = app
+        captured["hypercorn_config"] = config
+
+    monkeypatch.setattr(server, "InferenceClient", FakeInferenceClient)
+    monkeypatch.setattr(server, "serve", fake_serve)
+    monkeypatch.setattr(server.endpoints, "__all__", [])
+
+    tokenizer = object()
+    multimodal_prompt_config = object()
+    await server._run_text_gen_server(
+        coordinator_addr="tcp://coord:5555",
+        tokenizer=tokenizer,
+        rank=3,
+        server_port=4321,
+        parsers=["json"],
+        verbose=True,
+        hostname="127.0.0.1",
+        chat_template="template",
+        multimodal_prompt_config=multimodal_prompt_config,
+        default_temperature=0.4,
+        default_top_p=0.8,
+        default_top_k=5,
+        eval_mode=True,
+    )
+
+    app_config = captured["app"].config
+    assert captured["client_init"] == ("tcp://coord:5555", False)
+    assert captured["client_started"] is True
+    assert captured["client_stopped"] is True
+    assert app_config["tokenizer"] is tokenizer
+    assert app_config["parsers"] == ["json"]
+    assert app_config["verbose"] is True
+    assert app_config["chat_template"] == "template"
+    assert app_config["multimodal_prompt_config"] is multimodal_prompt_config
+    assert app_config["default_temperature"] == 0.4
+    assert app_config["default_top_p"] == 0.8
+    assert app_config["default_top_k"] == 5
+    assert app_config["eval_mode"] is True
+    assert captured["hypercorn_config"].bind == ["127.0.0.1:4321"]
 
 
 @pytest.mark.asyncio
