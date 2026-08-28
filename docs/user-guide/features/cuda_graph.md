@@ -134,6 +134,25 @@ This implementation does not create inference CUDA graphs. For inference, use
 --no-check-for-nan-in-loss-and-grad
 ```
 
+### THD Sequence Packing (fixed schedule)
+
+Full-iteration capture is supported with the THD sequence packing scheduler
+(`--sequence-packing-scheduler dp_balanced`) under a fixed-schedule, static-shape contract:
+
+- `num_microbatches` must stay constant across warmup, capture and replay. The packing scheduler
+  and dataset must produce the same number of packed microbatches every step; a change after
+  capture raises a signature-mismatch error instead of silently replaying the stale graph.
+- `--pad-packed-seq-alignment max` (or a value equal to `--max-seqlen-per-dp-cp-rank`),
+  `--max-seqlen-per-dp-cp-rank` and `--thd-max-packed-sequences` are required. Every packed
+  microbatch is canonicalized outside the graph to the per-rank token capacity and a fixed
+  `thd_max_packed_sequences + 1` cu_seqlens width; the real sequence count, `cu_seqlens` content
+  and padding distribution may still change per step.
+- Dynamic context parallel (`--dynamic-context-parallel`) is not supported; the CP topology must
+  be static.
+- Pipeline parallel send/recv use the static CP-local token capacity instead of the per-step
+  variable-shape handshake.
+- Validation/eval runs eager: a dedicated fixed-shape validation graph is not implemented yet.
+
 ---
 
 ## Common Configuration Examples

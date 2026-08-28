@@ -42,7 +42,10 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import wrap_data_iterator
+from megatron.core.datasets.data_schedule import (
+    prepare_thd_static_batch_for_full_iteration_cuda_graph,
+    wrap_data_iterator,
+)
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -2040,6 +2043,13 @@ def pretrain(
 
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
+
+    if args.cuda_graph_impl == "full_iteration":
+        # Captured graphs (including graph-captured NCCL P2P for PP) must be
+        # destroyed before communicator/process teardown, otherwise interpreter
+        # shutdown can hang until the NCCL watchdog aborts the process.
+        torch.cuda.synchronize()
+        FullCudaGraphWrapper.reset_cuda_graph()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -4270,10 +4280,22 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     if args.cuda_graph_impl == "full_iteration":
+        thd_batch_preparation_fn = None
+        if args.sequence_packing_scheduler is not None:
+            # THD full-iteration graphs require every packed microbatch to be
+            # canonicalized to graph-static shapes outside the captured region
+            # (this path issues TP broadcasts), and a fixed num_microbatches
+            # per step (enforced via the wrapper's capture signature).
+            thd_batch_preparation_fn = functools.partial(
+                prepare_thd_static_batch_for_full_iteration_cuda_graph,
+                config=config,
+                vpp_size=config.virtual_pipeline_model_parallel_size,
+            )
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            batch_preparation_fn=thd_batch_preparation_fn,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -4883,7 +4905,11 @@ def evaluate(
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
-    if args.cuda_graph_impl == "full_iteration":
+    if args.cuda_graph_impl == "full_iteration" and args.sequence_packing_scheduler is None:
+        # THD sequence packing keeps validation eager: a dedicated fixed-shape
+        # validation graph is not implemented yet, and the packed validation
+        # schedule may use a different num_microbatches than the captured
+        # training graph.
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
