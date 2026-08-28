@@ -1309,9 +1309,12 @@ class TransformerConfig(ModelParallelConfig):
 
     This buys the aggregate checkpoint's activation back -- one ``[s, b, C]`` per layer in the
     recompute group -- at the cost of a smaller captured region. The rest of the mHC recompute
-    group is outside the attention graph either way and is unaffected. The split additionally
-    constrains the configuration (see ``__post_init__``), which is why it is opt-in rather than
-    implied by ``recompute_modules=[mhc]``.
+    group is outside the attention graph either way and is unaffected. Static packed THD inputs,
+    including fixed context-parallel groups, are supported. Dynamic CP is not: its per-batch local
+    token count and process group cannot be represented by a graph with fixed tensor shapes and
+    collective topology. The split additionally constrains the configuration (see
+    ``__post_init__``), which is why it is opt-in rather than implied by
+    ``recompute_modules=[mhc]``.
     """
 
     ####################
@@ -3266,9 +3269,7 @@ class TransformerConfig(ModelParallelConfig):
                 "checkpoint is not recovered and the static graph input is "
                 "[s, b, n*C]. Set mhc_recompute_attn_cuda_graph_split=True for the "
                 "attention-only split, which keeps the producer eager and shrinks "
-                "the captured input to [s, b, C]. (The split's replay does not yet "
-                "forward THD captured kwargs; on packed sequences keep the switch "
-                "off.)",
+                "the captured input to [s, b, C].",
                 UserWarning,
                 stacklevel=2,
             )
@@ -3316,14 +3317,15 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_attn_cuda_graph_split to capture the whole attention "
                     "range instead."
                 )
-            if self.sequence_packing_scheduler is not None:
+            if (
+                self.dynamic_context_parallel
+                or self.sequence_packing_scheduler == "default_dynamic_cp"
+            ):
                 raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split does not support packed "
-                    "(THD) sequences: THD capture takes cu_seqlens_*/padding_mask "
-                    "as captured kwargs and the split's replay does not forward "
-                    "them, so the first replay fails at the Transformer Engine "
-                    "boundary. Keep the switch off on packed-sequence runs to "
-                    "capture the whole attention range instead."
+                    "mhc_recompute_attn_cuda_graph_split does not support Dynamic CP: "
+                    "local_cp_size and cp_group can vary between batches, while a "
+                    "Transformer Engine CUDA Graph captures fixed tensor shapes and "
+                    "collective topology. Static packed THD with fixed CP is supported."
                 )
             if self.fine_grained_activation_offloading:
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces

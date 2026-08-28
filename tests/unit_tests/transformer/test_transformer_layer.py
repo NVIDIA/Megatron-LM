@@ -14,6 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     MHCCheckpointManager,
@@ -900,29 +901,57 @@ class TestMHCWithCudaGraph:
         assert layer.self_attention in graph_submodules
         assert layer.self_attention_hyper_connection not in graph_submodules
 
-    def test_mhc_split_config_rejects_packed_sequence(self):
-        """The split validator rejects packed (THD) sequences at config time.
+    @pytest.mark.parametrize("context_parallel_size", [1, 2, 8, 16])
+    def test_mhc_split_config_accepts_static_packed_sequence(self, context_parallel_size):
+        """Static dp-balanced THD has no split-specific CP-size ceiling."""
+        config = _make_mhc_config(
+            bf16=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
+            context_parallel_size=context_parallel_size,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=32,
+            thd_max_packed_sequences=2,
+            pad_packed_seq_alignment="max",
+        )
 
-        The split replay's kwargs assembly does not forward the THD captured
-        kwargs (cu_seqlens_*, padding_mask) to the graphed callable, and
-        Transformer Engine raises TypeError for a kwarg present at capture but
-        missing at replay -- so without this gate a THD split run is accepted
-        and then dies on the first replay. The gate keys on
-        sequence_packing_scheduler, the same signal _is_thd_cuda_graph() uses
-        to shape the THD static inputs.
-        """
-        with pytest.raises(ValueError, match="does not support packed"):
-            self._create_mhc_layer(
+        assert config.context_parallel_size == context_parallel_size
+        assert config.sequence_packing_scheduler == "dp_balanced"
+
+    @pytest.mark.parametrize(
+        "dynamic_config",
+        [
+            pytest.param(
+                {
+                    "dynamic_context_parallel": True,
+                    "context_parallel_size": 8,
+                    "min_dynamic_context_parallel_size": 1,
+                    "sequence_packing_scheduler": "default_dynamic_cp",
+                },
+                id="dynamic-context-parallel",
+            ),
+            pytest.param(
+                {"sequence_packing_scheduler": "default_dynamic_cp"}, id="dynamic-scheduler"
+            ),
+        ],
+    )
+    def test_mhc_split_config_rejects_dynamic_packed_sequence(self, dynamic_config):
+        """Dynamic CP needs per-batch graph topology and remains unsupported."""
+        with pytest.raises(ValueError, match="Dynamic CP"):
+            _make_mhc_config(
                 bf16=True,
                 cuda_graph_impl="transformer_engine",
                 cuda_graph_modules=[CudaGraphModule.attn],
                 recompute_granularity="selective",
                 recompute_modules=["mhc"],
                 mhc_recompute_attn_cuda_graph_split=True,
-                sequence_packing_scheduler="dp_balanced",
                 max_seqlen_per_dp_cp_rank=32,
                 thd_max_packed_sequences=2,
                 pad_packed_seq_alignment="max",
+                **dynamic_config,
             )
 
     @pytest.mark.parametrize(
@@ -1077,7 +1106,16 @@ class TestMHCWithCudaGraph:
                 (hidden,), {"hidden_states": hidden}, None
             )
 
-    def _run_split_replay(self, layer, config, fake_graph_output, monkeypatch, manager=None):
+    def _run_split_replay(
+        self,
+        layer,
+        config,
+        fake_graph_output,
+        monkeypatch,
+        manager=None,
+        replay_kwargs=None,
+        public_entry=False,
+    ):
         """Drive the split replay with a stubbed captured graph and eager tails."""
         from megatron.core.transformer.module import GraphableMegatronModule
 
@@ -1085,6 +1123,7 @@ class TestMHCWithCudaGraph:
 
         def fake_replay(layer_self, *args, **kwargs):
             recorded["graph_input"] = args[0]
+            recorded["graph_kwargs"] = kwargs.copy()
             out = fake_graph_output(args[0])
             return out
 
@@ -1095,6 +1134,7 @@ class TestMHCWithCudaGraph:
 
         def fake_mlp(hidden_states, **kwargs):
             recorded["mlp_manager"] = kwargs.get("mhc_recompute_manager")
+            recorded["mlp_kwargs"] = kwargs.copy()
             return hidden_states
 
         monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", fake_replay)
@@ -1103,10 +1143,112 @@ class TestMHCWithCudaGraph:
         layer._mhc_recompute_manager = manager
 
         hidden = torch.randn(8, 2, config.num_residual_streams * config.hidden_size, device="cuda")
-        output, context = layer._te_cuda_graph_replay_mhc_attention_split(
-            (hidden,), {"attention_mask": None}, None
-        )
+        replay_kwargs = {"attention_mask": None} if replay_kwargs is None else replay_kwargs
+        if public_entry:
+            output, context = layer._te_cuda_graph_replay(hidden, **replay_kwargs)
+        else:
+            output, context = layer._te_cuda_graph_replay_mhc_attention_split(
+                (hidden,), replay_kwargs, None
+            )
         return output, recorded
+
+    def test_split_public_replay_projects_all_thd_tensor_kwargs(self, monkeypatch):
+        """Public replay expands PackedSeqParams before the split selects graph kwargs."""
+        layer, config = self._create_split_layer()
+        cu_seqlens_q = torch.tensor([0, 3, 8], dtype=torch.int32, device="cuda")
+        cu_seqlens_kv = cu_seqlens_q.clone()
+        cu_seqlens_q_padded = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        cu_seqlens_kv_padded = cu_seqlens_q_padded.clone()
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            max_seqlen_q=4,
+            max_seqlen_kv=4,
+        )
+        padding_mask = torch.zeros((1, 8), dtype=torch.bool, device="cuda")
+        input_ids = torch.arange(8, device="cuda").unsqueeze(0)
+
+        _, recorded = self._run_split_replay(
+            layer,
+            config,
+            lambda aggregated: aggregated,
+            monkeypatch,
+            replay_kwargs={
+                "attention_mask": None,
+                "packed_seq_params": packed_seq_params,
+                "padding_mask": padding_mask,
+                "input_ids": input_ids,
+            },
+            public_entry=True,
+        )
+
+        graph_kwargs = recorded["graph_kwargs"]
+        expected_cu_tensors = {
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_kv": cu_seqlens_kv,
+            "cu_seqlens_q_padded": cu_seqlens_q_padded,
+            "cu_seqlens_kv_padded": cu_seqlens_kv_padded,
+        }
+        assert "packed_seq_params" not in graph_kwargs
+        for name, tensor in expected_cu_tensors.items():
+            assert graph_kwargs[name] is tensor
+        assert graph_kwargs["padding_mask"] is padding_mask
+        assert graph_kwargs["input_ids"] is input_ids
+        assert recorded["mlp_kwargs"]["padding_mask"] is padding_mask
+        assert recorded["mlp_kwargs"]["input_ids"] is input_ids
+
+    def test_split_capture_reconstructs_static_cp_packed_sequence(self, monkeypatch):
+        """Capture rebuilds graph-static PackedSeqParams from flat THD tensors."""
+        layer, config = self._create_mhc_layer(
+            bf16=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=32,
+            thd_max_packed_sequences=2,
+            pad_packed_seq_alignment="max",
+        )
+        # Isolate the reconstruction contract from distributed CP initialization.
+        config.context_parallel_size = 8
+        config.cp_partition_mode = "contiguous"
+        cu_tensors = {
+            "cu_seqlens_q": torch.tensor([0, 64, 256], dtype=torch.int32, device="cuda"),
+            "cu_seqlens_kv": torch.tensor([0, 64, 256], dtype=torch.int32, device="cuda"),
+            "cu_seqlens_q_padded": torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda"),
+            "cu_seqlens_kv_padded": torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda"),
+        }
+        padding_mask = torch.zeros((1, 32), dtype=torch.bool, device="cuda")
+        captured = {}
+
+        def fake_consumer(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs.copy()
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            return (hidden_states,)
+
+        monkeypatch.setattr(layer, "_forward_mhc_attention_cuda_graph_consumer", fake_consumer)
+        hidden_states = torch.randn(32, 1, config.hidden_size, device="cuda")
+        layer._te_cuda_graph_capture(
+            hidden_states=hidden_states, padding_mask=padding_mask, **cu_tensors
+        )
+
+        capture_kwargs = captured["kwargs"]
+        reconstructed = capture_kwargs["packed_seq_params"]
+        assert reconstructed.qkv_format == "thd"
+        assert reconstructed.cp_partition_mode == "contiguous"
+        assert reconstructed.max_seqlen_q == 256
+        assert reconstructed.max_seqlen_kv == 256
+        assert reconstructed.pad_between_seqs is True
+        for name, tensor in cu_tensors.items():
+            assert getattr(reconstructed, name) is tensor
+            assert name not in capture_kwargs
+        assert capture_kwargs["padding_mask"] is padding_mask
 
     def test_split_replay_maps_output_arity_and_bias(self, monkeypatch):
         """Captured output arity: 1 tensor -> (out, None); 2 -> (out, bias); else error."""
