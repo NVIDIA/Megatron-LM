@@ -47,9 +47,7 @@ DOT_PRECISION_AUTOTUNE_LIST = (
     configs=autotune_configs(
         [
             triton.Config(
-                {'DOT_PRECISION': DOT_PRECISION},
-                num_warps=num_warps,
-                num_stages=num_stages,
+                {'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages
             )
             for num_warps in [2, 4, 8]
             for num_stages in [2, 3, 4, 5]
