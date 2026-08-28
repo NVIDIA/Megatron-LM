@@ -2,6 +2,7 @@
 
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -937,7 +938,7 @@ class TestMHCWithCudaGraph:
 
     def test_te_graph_static_hidden_input_tracks_runtime_microbatch_slot(self):
         """Static-input handles use the same modulo slot selection as TE graphs."""
-        layer, _ = self._create_mhc_layer()
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.cuda_graphs = [object(), object()]
         slot_inputs = (
             torch.empty((4, 1, 64), device="cuda"),
@@ -953,7 +954,7 @@ class TestMHCWithCudaGraph:
 
     def test_te_graph_static_hidden_input_rejects_address_drift(self):
         """A retained static-input handle whose storage moved must refuse to serve."""
-        layer, _ = self._create_mhc_layer()
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.cuda_graphs = [object()]
         slot = torch.empty((4, 1, 64), device="cuda")
         layer.set_te_cuda_graph_static_hidden_inputs((slot,))
@@ -962,12 +963,76 @@ class TestMHCWithCudaGraph:
             layer.get_te_cuda_graph_static_hidden_input()
 
     def test_set_te_cuda_graph_static_hidden_inputs_validates_inputs(self):
-        layer, _ = self._create_mhc_layer()
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.cuda_graphs = [object(), object()]
         with pytest.raises(ValueError, match="match graph count"):
             layer.set_te_cuda_graph_static_hidden_inputs((torch.empty(2, device="cuda"),))
         with pytest.raises(TypeError, match="CUDA tensors"):
             layer.set_te_cuda_graph_static_hidden_inputs((torch.empty(2), torch.empty(2)))
+        with pytest.raises(ValueError, match="unknown dynamic CP size"):
+            layer.set_te_cuda_graph_static_hidden_inputs(
+                (torch.empty(2, device="cuda"),), dynamic_cp_size=2
+            )
+
+    def test_te_graph_static_hidden_inputs_follow_dynamic_cp_graph_bank(self, monkeypatch):
+        """DCP replay must switch the graph and mHC direct-write input as one bank."""
+        layer, _ = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
+        graph_banks = {1: [object(), object()], 2: [object(), object()]}
+        input_banks = {
+            1: (torch.empty((8, 1, 64), device="cuda"), torch.empty((8, 1, 64), device="cuda")),
+            2: (torch.empty((4, 1, 64), device="cuda"), torch.empty((4, 1, 64), device="cuda")),
+        }
+        cp_groups = {1: object(), 2: object()}
+        layer.cuda_graphs_by_dynamic_cp_size = graph_banks
+        for cp_size in (1, 2):
+            layer.cuda_graphs = graph_banks[cp_size]
+            layer.set_te_cuda_graph_static_hidden_inputs(
+                input_banks[cp_size], dynamic_cp_size=cp_size
+            )
+
+        monkeypatch.setattr(
+            parallel_state,
+            "get_dynamic_data_context_parallel_groups",
+            lambda group_size: cp_groups[group_size],
+        )
+        layer.current_microbatch = 1
+        for cp_size in (1, 2, 1):
+            layer._activate_dynamic_cp_cuda_graph(
+                SimpleNamespace(local_cp_size=cp_size, cp_group=cp_groups[cp_size])
+            )
+            assert layer.cuda_graphs is graph_banks[cp_size]
+            assert layer.get_te_cuda_graph_static_hidden_input() is input_banks[cp_size][1]
+
+        layer.clear_te_cuda_graph_static_hidden_inputs()
+        assert not layer._te_cuda_graph_static_hidden_inputs_by_dynamic_cp_size
+        assert not layer._te_cuda_graph_static_hidden_input_ptrs_by_dynamic_cp_size
+
+    def test_dynamic_cp_graph_bank_rejects_invalid_runtime_metadata(self, monkeypatch):
+        """Runtime graph selection must keep its guards under optimized Python."""
+        expected_group = object()
+        layer = SimpleNamespace(
+            cuda_graphs_by_dynamic_cp_size={2: [object()]},
+            activate_te_cuda_graph_static_hidden_inputs=lambda _cp_size: None,
+        )
+        monkeypatch.setattr(
+            parallel_state,
+            "get_dynamic_data_context_parallel_groups",
+            lambda group_size: expected_group,
+        )
+
+        for params in (None, SimpleNamespace(local_cp_size=None, cp_group=expected_group)):
+            with pytest.raises(RuntimeError, match="requires packed sequence metadata"):
+                TransformerLayer._activate_dynamic_cp_cuda_graph(layer, params)
+
+        with pytest.raises(RuntimeError, match="No layer CUDA graph bank entry"):
+            TransformerLayer._activate_dynamic_cp_cuda_graph(
+                layer, SimpleNamespace(local_cp_size=4, cp_group=expected_group)
+            )
+
+        with pytest.raises(RuntimeError, match="process group that does not match"):
+            TransformerLayer._activate_dynamic_cp_cuda_graph(
+                layer, SimpleNamespace(local_cp_size=2, cp_group=object())
+            )
 
     def _create_split_layer(self):
         layer, config = self._create_mhc_layer(
