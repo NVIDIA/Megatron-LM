@@ -58,15 +58,6 @@ def _make_valid_mhc_overlap_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-@pytest.mark.parametrize(
-    "cuda_graph_kwargs",
-    ({"cuda_graph_impl": "local"}, {"enable_cuda_graph": True}, {"external_cuda_graph": True}),
-)
-def test_mhc_overlap_recompute_rejects_cuda_graphs(cuda_graph_kwargs):
-    with pytest.raises(ValueError, match="explicit schedule-owned recompute barrier"):
-        _make_valid_mhc_overlap_config(**cuda_graph_kwargs)
-
-
 def test_mhc_overlap_recompute_accepts_full_iteration_cuda_graph():
     config = _make_valid_mhc_overlap_config(
         cuda_graph_impl="full_iteration",
@@ -107,6 +98,9 @@ class _RecordingLayer:
         self.mhc_post = _RecordingNode(calls, f"{prefix}.mhc_post")
         self.mhc_recompute = None
         self.mtp_post_process = _RecordingNode(calls, f"{prefix}.mtp_post_process")
+        # This layer exercises mHC selective recompute, not full recompute, so it
+        # belongs to no RecomputeSegment and the segment hooks are skipped.
+        self.recompute_segment = None
 
     def get_fp8_context(self):
         return nullcontext()
@@ -122,6 +116,8 @@ class _RecordingChunk:
         self.pre_process = _RecordingNode(calls, "chunk.pre_process")
         self.post_process = None
         self.vp_stage = 0
+        # Read by run() only on the post_process path, which this chunk does not take.
+        self.recompute_full = False
 
     def record_current_stream(self):
         self.calls.append("chunk.record_current_stream")
@@ -138,13 +134,9 @@ class _RecordingChunk:
     def release_state(self):
         self.calls.append("chunk.release_state")
 
-    def snapshot_rng_for_recompute(self):
-        # This chunk exercises mHC selective recompute, not VPP-stage full recompute,
-        # so the real method short-circuits to a no-op (recompute_vpp_stage is off).
-        pass
-
-    def recompute_model_chunk_schedule_plan(self):
-        # No-op for the same reason as snapshot_rng_for_recompute above.
+    def release_layer_activations(self):
+        # This chunk exercises mHC selective recompute, not full recompute, so it has
+        # no RecomputeSegments and the real method iterates an empty list.
         pass
 
 
@@ -306,8 +298,11 @@ def test_checkpoint_manager_explicit_recompute_is_idempotent_and_restores_gradie
     torch.testing.assert_close(input_tensor.grad, reference_input.grad)
 
 
-def _run_schedule_and_capture(model, data):
+def _run_schedule_and_capture(model, data, on_plan_built=None):
     schedule_plan = model.build_schedule_plan(**data)
+    if on_plan_built is not None:
+        # The plan is released during the backward below, so assert on it here.
+        on_plan_built(schedule_plan)
     output = TransformerModelChunkSchedulePlan.run(schedule_plan, None)
     output_value = output.detach().clone()
     TransformerModelChunkSchedulePlan.run(None, schedule_plan, b_grad=torch.ones_like(output))
@@ -386,6 +381,25 @@ def _make_mhc_numerical_config(overlap=True, recompute=True, extra_config=None):
     if extra_config:
         extra_kwargs.update(extra_config)
     return get_test_config(num_layers=2, extra_kwargs=extra_kwargs)
+
+
+def _make_mhc_full_recompute_config(overlap=True, method="uniform", num_layers=1):
+    """mHC + MTP + full recompute: the only config that exercises the mHC bridge across
+    a segment replay. Without MTP or hyper-connections mhc_multistream stays None and
+    RecomputeSegment's grad-carrier code never runs.
+    """
+    return _make_mhc_numerical_config(
+        overlap=overlap,
+        # Not selective mHC recompute; the extra_config below switches on full recompute.
+        recompute=False,
+        extra_config={
+            "recompute_granularity": "full",
+            "recompute_method": method,
+            "recompute_num_layers": num_layers,
+            "mtp_num_layers": 1,
+            "mtp_loss_scaling_factor": 1.1,
+        },
+    )
 
 
 def _assert_close_grads(overlap_gradients, reference_gradients, rtol=5e-3, atol=5e-3):
@@ -523,14 +537,19 @@ class TestMhcA2AOverlapNumerics:
         _assert_close_grads(overlap_gradients, reference_gradients)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    def test_cuda_graph_replay_receives_padding_mask(self):
-        # The attention-only CUDA-graph split runs the MoE routing tail itself, so
-        # it has to receive the same padding_mask the eager callable reads off
-        # node.chunk_state. The schedule reaches it through _te_cuda_graph_replay
-        # rather than TransformerLayer.__call__, so nothing else puts the mask in
-        # kwargs. Losing it is silent -- the router would take the unpadded branch
-        # for the z-loss mean, dropless gating, and the aux-loss-free load counters
-        # -- so pin the argument at the boundary instead of the numerics.
+    @pytest.mark.parametrize("split_switch", [True, False], ids=["split", "whole-attn"])
+    def test_cuda_graph_replay_receives_padding_mask(self, split_switch):
+        # Every replay path that runs the MoE routing tail itself -- the split and
+        # the non-split overlap branch alike -- has to receive the same
+        # padding_mask the eager callable reads off node.chunk_state. The schedule
+        # reaches it through _te_cuda_graph_replay rather than
+        # TransformerLayer.__call__, so nothing else puts the mask in kwargs.
+        # Losing it is silent -- the router would take the unpadded branch for the
+        # z-loss mean, dropless gating, and the aux-loss-free load counters -- so
+        # pin the argument at the boundary for both switch settings. The manager
+        # attribute is pinned alongside it: the non-split overlap tail registers
+        # its MLP-side checkpoints through layer._mhc_recompute_manager, and the
+        # schedule installs it just before the replay entry point.
         from megatron.core.transformer.enums import CudaGraphModule
 
         config = _make_mhc_numerical_config()
@@ -547,14 +566,14 @@ class TestMhcA2AOverlapNumerics:
             for layer in model.decoder.layers:
                 # Make submodule_attn_forward take the CUDA-graph replay branch
                 # without capturing anything: the branch is gated on a truthy
-                # cuda_graphs attribute, and the padding_mask threading below it
-                # on _uses_mhc_recompute_attn_cuda_graph_split(), which needs the
-                # TE impl and attn scope as well as the mHC recompute modules the
-                # config already carries. Setting only the modules would describe
-                # a configuration that is not the attention-only split.
+                # cuda_graphs attribute. padding_mask threading now applies to
+                # every hyper-connection layer under replay; the split predicate
+                # additionally needs the switch, the TE impl and the attn scope
+                # set here so the replay dispatch routes into the split.
                 layer.cuda_graphs = [object()]
                 layer.config.cuda_graph_impl = "transformer_engine"
                 layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+                layer.config.mhc_recompute_attn_cuda_graph_split = split_switch
                 layer.set_te_cuda_graph_backward_dw_wrapper = lambda: None
 
                 def _record(*args, **kwargs):
@@ -580,6 +599,14 @@ class TestMhcA2AOverlapNumerics:
         # sequence parallelism before it lands on the chunk state.
         assert forwarded is not None
         assert int((~forwarded).sum()) == 4
+        assert any(
+            getattr(layer, "_mhc_recompute_manager", None) is not None
+            for layer in model.decoder.layers
+        ), (
+            "the schedule must install the recompute manager on the layer before "
+            "the replay entry point; the non-split overlap tail registers its "
+            "MLP-side mHC checkpoints through it"
+        )
 
     def test_mtp_builder_tracks_callable_tuple_width(self):
         # The MTP builder wraps build_transformer_layer_callables and re-unpacks its
@@ -773,6 +800,46 @@ class TestMhcA2AOverlapNumerics:
             }
             del graph
             gc.collect()
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize(
+        "method,num_layers", [("uniform", 1), ("block", 2)], ids=["uniform", "block"]
+    )
+    def test_full_recompute_carries_the_mhc_bridge_gradient(self, method, num_layers):
+        """mHC + MTP under full recompute matches the eager reference.
+
+        The MTP segment is replayed and backwarded before the producer segment installs a
+        new bridge leaf, so the gradient has to be carried across. Dropping it yields a
+        wrong decoder-side grad rather than an error, hence a numerical parity test.
+        """
+        reference_config = _make_mhc_full_recompute_config(
+            overlap=False, method=method, num_layers=num_layers
+        )
+        overlap_config = _make_mhc_full_recompute_config(method=method, num_layers=num_layers)
+        assert overlap_config.enable_hyper_connections, "the mHC bridge must be enabled"
+        assert overlap_config.mtp_num_layers == 1, "the mHC bridge needs an MTP consumer"
+
+        def assert_every_layer_is_its_own_segment(schedule_plan):
+            # 2 decoder + 1 MTP layer, one segment each under both methods. That is what
+            # puts the MTP consumer and the decoder producer in different segments; a
+            # coarser segmentation would silently stop testing the hand-off.
+            assert [len(s.layers) for s in schedule_plan._recompute_segments] == [1, 1, 1]
+
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(
+                overlap_model, data, on_plan_built=assert_every_layer_is_its_own_segment
+            )
 
         torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
         _assert_close_grads(overlap_gradients, reference_gradients)

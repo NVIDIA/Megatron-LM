@@ -173,6 +173,9 @@ class MegatronFSDP(torch.nn.Module):
             children). Checked with :func:`isinstance`. Defaults to empty (none).
         report_nan_in_param_grad (bool): Whether to enable precise NaN-checking for parameter wgrad.
             Can significantly degrade performance. Defaults to False.
+        fsdp_buffer_count (int): Number of persistent buffers allocated for each FSDP
+            communication pool. Defaults to two. Appended to preserve positional-call
+            compatibility.
 
     Examples:
         >>> model = GPTModel(config)
@@ -213,6 +216,7 @@ class MegatronFSDP(torch.nn.Module):
         enable_fine_grained_param_gather_backward_hook: bool = False,
         fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
         report_nan_in_param_grad: bool = False,
+        fsdp_buffer_count: int = 2,
     ):
         super().__init__()
         # If device is not specified, use the current device.
@@ -253,6 +257,7 @@ class MegatronFSDP(torch.nn.Module):
                 keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
                 nccl_ub=nccl_ub,
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+                fsdp_buffer_count=fsdp_buffer_count,
                 fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
                 disable_symmetric_registration=disable_symmetric_registration,
                 check_for_nan_in_grad=False,

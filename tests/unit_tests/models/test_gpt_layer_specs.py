@@ -2,6 +2,7 @@
 
 import pytest
 
+from megatron.core.models.bagel.flex_attention import FlexAttention
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -65,3 +66,12 @@ class TestGptLayerSpecsHyperConnection:
         assert spec.module is expected_module
         assert spec.submodules.self_attention_hyper_connection is expected_hc
         assert spec.submodules.mlp_hyper_connection is expected_hc
+
+
+class TestGptLayerSpecsFlexAttention:
+    """Test that the TE GPT layer spec selects FlexAttention when requested."""
+
+    def test_flex_attention_spec(self):
+        spec = _TE(flex_attention=True)
+
+        assert spec.submodules.self_attention.submodules.core_attention is FlexAttention

@@ -12,11 +12,14 @@ own pair.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import torch
+
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.parallel.thd import (
+    ThdPackMeta,
     pack_nested_thd,
     parallel_state_from_model,
     prepare_packed_thd_kwargs_for_context_parallel,
@@ -31,6 +34,19 @@ from megatron.lite.runtime.contracts.loss import get_loss_context
 
 def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
+
+
+def _model_attribute(model, name: str):
+    """Read an attribute through optional distributed model wrappers."""
+
+    current = model
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if hasattr(current, name):
+            return getattr(current, name)
+        current = getattr(current, "module", None)
+    return None
 
 
 def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
@@ -87,6 +103,98 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     }
     prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
     return kwargs
+
+
+_MAGI_RUNTIME_KEY = "_mlite_magi_runtime_key"
+
+
+def pack_magi_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
+    """Pad a THD batch, then apply MagiAttention's load-balanced CP dispatch.
+
+    Dispatch happens on token IDs and all aligned targets before embeddings and
+    QKV projection. The exact runtime key is carried by ``PackedSeqParams`` so
+    recomputation reuses the same token permutation.
+    """
+
+    from megatron.lite.primitive.modules.attention.magi import (
+        build_magi_attention_runtime_key,
+        dispatch_magi_attention_tensor,
+    )
+
+    ps = _parallel_state(model)
+    if ps.cp_size <= 1 or ps.cp_group is None:
+        raise ValueError("MagiAttention batch dispatch requires CP>1 and an explicit cp_group.")
+    model_cfg = _model_attribute(model, "config")
+    if model_cfg is None:
+        raise ValueError("The model is missing its architecture config.")
+    if model_cfg.num_attention_heads % ps.tp_size != 0:
+        raise ValueError("MagiAttention query heads must be divisible by tensor parallel size.")
+    if model_cfg.num_key_value_heads % ps.tp_size != 0:
+        raise ValueError("MagiAttention KV heads must be divisible by tensor parallel size.")
+
+    seq_lens = batch.seq_lens
+    packed = pack_nested_thd(
+        nested_from_packed(batch.input_ids, seq_lens),
+        tp_size=ps.tp_size,
+        cp_size=ps.cp_size,
+        cp_rank=ps.cp_rank,
+        cp_group=ps.cp_group,
+        split_cp=False,
+        labels=nested_from_packed(batch.labels, seq_lens),
+        roll_labels=batch.labels is not None,
+        loss_mask=nested_from_packed(batch.loss_mask, seq_lens),
+        roll_loss_mask=batch.loss_mask is not None,
+    )
+    # No per-model tuning is threaded through: the primitive's automatic
+    # behaviour (and its resolve_magi_attention_config calibration seam)
+    # fully owns chunk sizing and overlap staging.
+    runtime_key = build_magi_attention_runtime_key(
+        packed.cu_seqlens_padded,
+        num_heads_q=model_cfg.num_attention_heads // ps.tp_size,
+        num_heads_kv=model_cfg.num_key_value_heads // ps.tp_size,
+        head_dim=model_cfg.head_dim,
+        cp_group=ps.cp_group,
+    )
+
+    def dispatch_row(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        if tensor.dim() != 2 or tensor.size(0) != 1:
+            raise ValueError(
+                f"MagiAttention expects packed token rows shaped [1, tokens], got {tensor.shape}."
+            )
+        return dispatch_magi_attention_tensor(tensor[0], runtime_key).unsqueeze(0)
+
+    input_ids = dispatch_row(packed.input_ids)
+    if input_ids is None:
+        raise ValueError("MagiAttention requires input_ids.")
+    if input_ids.size(1) % ps.tp_size != 0:
+        raise ValueError(
+            f"MagiAttention dispatched {input_ids.size(1)} local tokens, which is not "
+            f"divisible by TP={ps.tp_size}. Align the packed batch to the TP/CP "
+            "grid, or encode a chunk policy in resolve_magi_attention_config."
+        )
+
+    max_seqlen = int(packed.padded_lengths.max().item()) if packed.padded_lengths.numel() else 0
+    packed_seq_params = PackedSeqParams(
+        qkv_format="magi",
+        cu_seqlens_q=packed.cu_seqlens_padded,
+        cu_seqlens_kv=packed.cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        local_cp_size=ps.cp_size,
+        cp_group=ps.cp_group,
+        cp_rank=ps.cp_rank,
+        magi_runtime_key=runtime_key,
+    )
+    batch.extras[_MAGI_RUNTIME_KEY] = runtime_key
+    return {
+        "input_ids": input_ids,
+        "labels": dispatch_row(packed.labels),
+        "loss_mask": dispatch_row(packed.loss_mask),
+        "position_ids": dispatch_row(packed.position_ids),
+        "packed_seq_params": packed_seq_params,
+    }
 
 
 def unpack_thd_forward_output(model, batch: PackedBatch, output: torch.Tensor) -> torch.Tensor:
@@ -194,6 +302,32 @@ def pack_r3_replay_mask(
     ].bool()
 
 
+def unpack_magi_forward_output(model, batch: PackedBatch, output: torch.Tensor) -> torch.Tensor:
+    """Undispatch a MagiAttention output, then remove THD sequence padding."""
+
+    from megatron.lite.primitive.modules.attention.magi import undispatch_magi_attention_tensor
+
+    runtime_key = batch.extras.get(_MAGI_RUNTIME_KEY)
+    if runtime_key is None:
+        raise ValueError("MagiAttention output cannot be unpacked without its runtime key.")
+    if output.dim() >= 2 and output.size(0) == 1:
+        local_output = output[0]
+    elif output.dim() >= 2 and output.size(1) == 1:
+        local_output = output[:, 0]
+    else:
+        local_output = output
+    full_output = undispatch_magi_attention_tensor(local_output, runtime_key)
+
+    ps = _parallel_state(model)
+    meta: ThdPackMeta = thd_pack_meta(
+        batch.seq_lens, tp_size=ps.tp_size, cp_size=ps.cp_size, cp_group=ps.cp_group
+    )
+    # MagiAttention undispatch already reconstructed the full CP sequence.
+    return unpack_thd_to_nested(
+        full_output, replace(meta, cp_size=1, cp_group=None), contiguous=False
+    )
+
+
 def add_loss_context_kwargs(kwargs: dict[str, Any], *, include_return_log_probs: bool = False) -> None:
     loss_context = get_loss_context()
     if loss_context is None:
@@ -217,9 +351,11 @@ __all__ = [
     "add_cross_entropy_fusion",
     "add_loss_context_kwargs",
     "nested_from_packed",
+    "pack_magi_forward_kwargs",
     "pack_r3_replay_mask",
     "pack_routed_experts",
     "pack_thd_forward_kwargs",
     "set_cross_entropy_fusion",
+    "unpack_magi_forward_output",
     "unpack_thd_forward_output",
 ]
