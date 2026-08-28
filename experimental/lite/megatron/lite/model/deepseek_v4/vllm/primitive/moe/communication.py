@@ -31,6 +31,26 @@ def _moe_nvtx_range(name: str):
 
 
 @triton.jit
+def _route_hash_kernel(
+    fingerprint_words,
+    indices,
+    weight_bits,
+    hashes,
+    FINGERPRINT_WORDS: tl.constexpr,
+):
+    row = tl.program_id(0) + tl.arange(0, 1)
+    value = tl.full((1,), 1469598103934665603, tl.int64)
+    for column in range(FINGERPRINT_WORDS):
+        word = tl.load(
+            fingerprint_words + row * FINGERPRINT_WORDS + column
+        ).to(tl.int64)
+        value = (value ^ (word & 0xFFFF)) * 1099511628211
+    value = (value ^ tl.load(indices + row).to(tl.int64)) * 1099511628211
+    bits = tl.load(weight_bits + row).to(tl.int64) & 0xFFFFFFFF
+    tl.store(hashes + row, (value ^ bits) * 1099511628211)
+
+
+@triton.jit
 def _scatter_routes_forward_kernel(
     hidden_states,
     output_index,
@@ -659,6 +679,43 @@ def _deepep_route_handle_received_rows(handle: tuple) -> int:
     return received_metadata.shape[0]
 
 
+def _route_hashes(
+    fingerprints: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    words = fingerprints.contiguous().view(torch.int16).flatten(1)
+    indices = indices.contiguous()
+    weight_bits = weights.contiguous().view(torch.int32)
+    if words.shape[0] == 0:
+        return torch.empty((0,), dtype=torch.int64, device=words.device)
+    if words.is_cuda:
+        hashes = torch.empty(
+            (words.shape[0],), dtype=torch.int64, device=words.device
+        )
+        _route_hash_kernel[(words.shape[0],)](
+            words,
+            indices,
+            weight_bits,
+            hashes,
+            FINGERPRINT_WORDS=words.shape[1],
+            num_warps=1,
+        )
+        return hashes
+    hashes = torch.full(
+        (words.shape[0],),
+        1469598103934665603,
+        dtype=torch.int64,
+        device=words.device,
+    )
+    for column in range(words.shape[1]):
+        hashes = (
+            hashes ^ (words[:, column].to(torch.int64) & 0xFFFF)
+        ) * 1099511628211
+    hashes = (hashes ^ indices.to(torch.int64)) * 1099511628211
+    return (hashes ^ (weight_bits.to(torch.int64) & 0xFFFFFFFF)) * 1099511628211
+
+
 def _validate_and_order_route_preserving_outputs(
     expert_outputs: torch.Tensor,
     received_tokens: torch.Tensor,
@@ -706,26 +763,6 @@ def _validate_and_order_route_preserving_outputs(
     # At full-model scale they may preserve the same routes while choosing a
     # different arrival order within an expert. Match the two streams by a
     # bitwise route fingerprint before validating and building combine rows.
-    def _route_hashes(
-        fingerprints: torch.Tensor,
-        indices: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        # Preserve the statically known fingerprint width when an EP rank
-        # receives no routes; reshape(0, -1) is ambiguous in PyTorch.
-        words = fingerprints.contiguous().view(torch.int16).flatten(1)
-        hashes = torch.full(
-            (words.shape[0],),
-            1469598103934665603,
-            dtype=torch.int64,
-            device=words.device,
-        )
-        for column in range(words.shape[1]):
-            hashes = (hashes ^ (words[:, column].to(torch.int64) & 0xFFFF)) * 1099511628211
-        hashes = (hashes ^ indices.to(torch.int64)) * 1099511628211
-        weight_bits = weights.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-        return (hashes ^ weight_bits) * 1099511628211
-
     expected_hashes = _route_hashes(
         expected_fingerprints, expected_indices, expected_weights
     )
