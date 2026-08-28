@@ -118,13 +118,11 @@ class TestParallelTransformerLayer:
         output, context = parallel_transformer_layer(
             hidden_states=hidden_states, attention_mask=attention_mask
         )
+        assert not parallel_transformer_layer.supports_split_output_projection()
         assert context is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
-
-    def test_combined_attention_mlp_layer_does_not_support_split_output_projection(self):
-        assert not self.parallel_transformer_layer.supports_split_output_projection()
 
     def test_chunked_mlp(self):
         with torch.no_grad():
