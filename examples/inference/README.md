@@ -111,7 +111,7 @@ Inference can collect traces two ways.
 
 | Path | Enable with | Captures | CUDA graphs |
 |------|-------------|----------|------------|
-| **Sink** | `--moe-enable-routing-replay` | top-K indices only | on |
+| **Sink** | `--moe-enable-routing-replay` + legacy scheduling | top-K indices only | on |
 | **Hook** | no replay + `--cuda-graph-impl none` | indices **+ hidden states + router weights** | must be off |
 
 Only the hook path captures the hidden states and router weights that
@@ -134,10 +134,14 @@ Forward hooks do not fire during CUDA graph replay. MoE cudagraphs must be disab
 
 **Inference — sink** (routing indices only, graphs on):
 
+Routing replay requires legacy scheduling. Because async scheduling is enabled by
+default, explicitly select legacy mode when enabling the routing replay sink.
+
 ```bash
 --moe-routing-trace-path /path/to/trace_dir
 --moe-routing-trace-max-inference-steps 200
 --moe-enable-routing-replay
+--inference-dynamic-batching-async-sched-mode legacy
 ```
 
 **Inference — hook** (adds hidden states + weights for predictability):
