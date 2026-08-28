@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from functools import partial
 from unittest.mock import patch
 
 import pytest
@@ -624,23 +625,21 @@ def _make_compressor_submodules():
 
 def _make_csa_indexer_submodules():
     """Create CSAIndexer submodules spec."""
-    from megatron.core.extensions.transformer_engine import TELinear, TENorm
+    from megatron.core.extensions.transformer_engine import TELinear
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     return CSAIndexerSubmodules(
         linear_wq_b=ModuleSpec(module=TELinear),
         linear_weights_proj=ModuleSpec(module=TELinear),
-        compressor=ModuleSpec(module=Compressor, submodules=_make_compressor_submodules()),
+        compressor=partial(Compressor, submodules=_make_compressor_submodules()),
     )
 
 
 def _make_csa_submodules():
     """Create CompressedSparseAttention submodules spec."""
-    from megatron.core.transformer.spec_utils import ModuleSpec
-
     return CompressedSparseAttentionSubmodules(
-        compressor=ModuleSpec(module=Compressor, submodules=_make_compressor_submodules()),
-        indexer=ModuleSpec(module=CSAIndexer, submodules=_make_csa_indexer_submodules()),
+        compressor=partial(Compressor, submodules=_make_compressor_submodules()),
+        indexer=partial(CSAIndexer, submodules=_make_csa_indexer_submodules()),
     )
 
 
