@@ -30,7 +30,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, SplitOutputProjection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -315,7 +315,7 @@ class BaseTransformerLayer(ABC):
         pass
 
 
-class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutputProjection):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -672,7 +672,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return attention_output_with_bias, self.attn_norm_manager, residual
 
-    def _forward_attention(
+    def supports_split_output_projection(self) -> bool:
+        """Return whether the configured self-attention supports split execution."""
+        return (
+            isinstance(self.self_attention, SplitOutputProjection)
+            and self.self_attention.supports_split_output_projection()
+        )
+
+    def forward_pre_output_proj(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
@@ -691,8 +698,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_params: Optional[Any] = None,
     ):
         """
-        Perform a forward pass through the attention layer and the layernorms before and after
-        the attention operations.
+        Run input normalization, QKV projection, and core attention.
 
         Args:
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
@@ -728,9 +734,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # operation in attention's out_proj (linear_proj)
             self._set_proj_residual(residual)
 
+        split_attention = self.supports_split_output_projection()
+        attention_fn = (
+            self.self_attention.forward_pre_output_proj if split_attention else self.self_attention
+        )
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
-            attention_output_with_bias = self.self_attention(
+            attention_intermediate = attention_fn(
                 input_layernorm_output,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
@@ -743,6 +753,31 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 sequence_len_offset=sequence_len_offset,
             )
         nvtx_range_pop(suffix="self_attention")
+
+        return attention_intermediate, residual, context, attn_state
+
+    def _attention_output_proj(
+        self,
+        attention_intermediate: Tensor,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        attn_state=(),
+    ):
+        """Apply attention output projection and the original post-attention operations."""
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
+        )
+
+        if self.supports_split_output_projection():
+            attention_output_with_bias = self.self_attention.forward_output_proj(
+                attention_intermediate
+            )
+        else:
+            # Identity attention and implementations with a specialized forward retain their
+            # original atomic path.
+            attention_output_with_bias = attention_intermediate
 
         if self._input_layernorm_checkpoint_active:
             # discard the output of the input layernorm and register the recompute
@@ -857,6 +892,81 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         return hidden_states, context
+
+    def forward_output_proj(
+        self,
+        attention_intermediate: Tensor,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        attn_state=(),
+        context_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        padding_mask: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Finish a split attention layer, including its unchanged MLP tail."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        hidden_states, context = self._attention_output_proj(
+            attention_intermediate,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            inference_context=inference_context,
+            attn_state=attn_state,
+        )
+        output = self._forward_mlp(
+            hidden_states,
+            inference_context,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+        )
+        return output, context
+
+    def _forward_attention(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Run the two attention phases while preserving the original API."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        attention_intermediate, residual, context, attn_state = self.forward_pre_output_proj(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            context=context,
+            context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            padding_mask=padding_mask,
+        )
+        return self._attention_output_proj(
+            attention_intermediate,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            inference_context=inference_context,
+            attn_state=attn_state,
+        )
 
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):

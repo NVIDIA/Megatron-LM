@@ -24,6 +24,10 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.shortcut_block import (
+    ShortcutMoEBlock,
+    group_layers_into_shortcut_blocks,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -274,6 +278,13 @@ class HybridStack(MegatronModule):
                 setattr(self.hc_head_base, 'sequence_parallel', True)
                 setattr(self.hc_head_scale, 'sequence_parallel', True)
 
+        if self.config.moe_shortcut_connection:
+            self.layers = group_layers_into_shortcut_blocks(
+                self.layers,
+                self.layer_type_list,
+                self.config,
+            )
+
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
         # being modified underneath them.
@@ -496,29 +507,42 @@ class HybridStack(MegatronModule):
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
 
-                    with inner_quant_context:
-                        if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
-                            layer_kwargs = dict(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=layer_packed_seq_params,
-                                padding_mask=padding_mask,
-                            )
-                            if mhc_manager is not None and isinstance(
-                                layer, HyperConnectionHybridLayer
-                            ):
-                                layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                            hidden_states, _ = layer(**layer_kwargs)
-                        else:  # MambaLayer, Expert, or MLP
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                packed_seq_params=layer_packed_seq_params,
-                            )
+                    if isinstance(layer, ShortcutMoEBlock):
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                            packed_seq_params=layer_packed_seq_params,
+                            padding_mask=padding_mask,
+                            quant_context_factory=get_inner_quant_context,
+                            quant_config=self.config,
+                        )
+                    else:
+                        with inner_quant_context:
+                            if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                                layer_kwargs = dict(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    sequence_len_offset=sequence_len_offset,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    padding_mask=padding_mask,
+                                )
+                                if mhc_manager is not None and isinstance(
+                                    layer, HyperConnectionHybridLayer
+                                ):
+                                    layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                                hidden_states, _ = layer(**layer_kwargs)
+                            else:  # MambaLayer, Expert, or MLP
+                                hidden_states = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    packed_seq_params=layer_packed_seq_params,
+                                )
 
                     # The attention layer (currently a simplified transformer layer)
                     # outputs a tuple of (hidden_states, context). Context is intended

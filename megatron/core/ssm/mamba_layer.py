@@ -24,7 +24,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, SplitOutputProjection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -56,7 +56,7 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayer(GraphableMegatronModule):
+class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
     """
     A single Mamba layer.
 
@@ -118,6 +118,71 @@ class MambaLayer(GraphableMegatronModule):
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
+
+    def supports_split_output_projection(self) -> bool:
+        """Return whether the configured sequence mixer supports split execution."""
+        return (
+            isinstance(self.mixer, SplitOutputProjection)
+            and self.mixer.supports_split_output_projection()
+        )
+
+    def forward_pre_output_proj(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        sequence_len_offset: Optional[int] = None,  # Not used in MambaLayer
+        padding_mask: Optional[Tensor] = None,  # Not used in MambaLayer
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Run normalization, input projection, and the selective SSM/SSD.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
+                b is batch size, and h is hidden size.
+            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
+            inference_context (BaseInferenceContext, optional): Parameters for inference-time
+                optimizations.
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+
+        Returns:
+            Tuple containing the pre-output-projection SSM result and residual.
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
+
+        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+        hidden_states = apply_module(self.norm)(hidden_states)
+
+        ssm_output = self.mixer.forward_pre_output_proj(
+            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
+        )
+        return ssm_output, residual
+
+    def forward_output_proj(
+        self,
+        ssm_output: Tensor,
+        residual: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        padding_mask: Optional[Tensor] = None,
+    ):
+        """Apply Mamba's output projection and the original residual/BDA operation."""
+        del inference_context, padding_mask
+        mixer_out_with_bias = self.mixer.forward_output_proj(ssm_output)
+
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mamba_bda(
+                training=self.training, fused=self.config.bias_dropout_fusion
+            )(mixer_out_with_bias, residual, self.hidden_dropout)
+
+        return hidden_states
 
     def forward(
         self,

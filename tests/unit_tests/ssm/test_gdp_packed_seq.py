@@ -246,6 +246,24 @@ class TestGDPPackedSequence:
         torch.testing.assert_close(cp2_out_full, ref_out, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.parametrize("seq_lens", PACK_SHAPES)
+    def test_split_compute_interface_matches_forward(self, seq_lens):
+        """GDP's shortcut-MoE split interface preserves its regular forward output."""
+        _, mixer, config, _, _ = _build_cp_pair()
+        assert mixer.supports_split_output_projection()
+        mixer.eval()
+        hidden_full, psp = _make_hidden_packed(seq_lens, config.hidden_size)
+
+        with torch.no_grad():
+            forward_output = mixer(hidden_full, packed_seq_params=psp)
+            split_output = mixer.forward_output_proj(
+                mixer.forward_pre_output_proj(hidden_full, packed_seq_params=psp)
+            )
+
+        forward_output = forward_output[0] if isinstance(forward_output, tuple) else forward_output
+        split_output = split_output[0] if isinstance(split_output, tuple) else split_output
+        torch.testing.assert_close(split_output, forward_output, atol=5e-2, rtol=5e-2)
+
+    @pytest.mark.parametrize("seq_lens", PACK_SHAPES)
     def test_backward_equivalence(self, seq_lens):
         """CP=2 parameter gradients (after all-reduce across CP) match CP=1
         reference gradients on the same packed input.

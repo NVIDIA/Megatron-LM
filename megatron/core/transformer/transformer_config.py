@@ -751,6 +751,22 @@ class TransformerConfig(ModelParallelConfig):
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
     """
+    moe_shortcut_connection: bool = False
+    """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
+    process the preceding layer's output (via a shortcut connection) instead of the current layer's
+    post-attention representation. The shared expert still processes the current layer's representation.
+    This decouples routing from current-layer computation. Supported only by HybridStack and requires
+    num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap.
+    Without moe_shortcut_parallel, dispatch and combine communication are serialized with the
+    paired compute. CUDA graphs are not supported. For the first MoE layer (no preceding layer),
+    falls back to standard routing."""
+
+    moe_shortcut_parallel: bool = False
+    """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
+    Dispatch and combine collectives run on a side CUDA stream; routing, experts, and paired
+    compute remain on the main stream. Requires moe_shortcut_connection = True and
+    num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap and unsupported with
+    full activation recomputation."""
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -1913,6 +1929,28 @@ class TransformerConfig(ModelParallelConfig):
                         "single moe_flex_dispatcher_num_sms instead."
                     )
                 self.moe_flex_dispatcher_num_sms = next(iter(_deprecated_num_sms.values()))
+        if self.moe_shortcut_connection:
+            assert self.num_moe_experts is not None and self.num_moe_experts > 0, (
+                "moe_shortcut_connection requires MoE to be enabled (num_moe_experts > 0)"
+            )
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "moe_shortcut_connection is not supported with full activation "
+                    "recomputation"
+                )
+            if self.moe_shared_expert_overlap:
+                raise ValueError(
+                    "moe_shortcut_connection is mutually exclusive with "
+                    "moe_shared_expert_overlap. ScMoE computes shared experts inline."
+                )
+
+        if self.moe_shortcut_parallel:
+            assert self.moe_shortcut_connection, (
+                "moe_shortcut_parallel requires moe_shortcut_connection = True"
+            )
+            assert self.num_moe_experts is not None and self.num_moe_experts > 0, (
+                "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
+            )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
@@ -2903,6 +2941,10 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        assert not (
+            self.moe_shortcut_connection and self.cuda_graph_impl != "none"
+        ), "CUDA graphs are not supported with moe_shortcut_connection."
 
         if self.cuda_graph_impl != "none":
 

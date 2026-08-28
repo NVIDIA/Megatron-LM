@@ -46,6 +46,12 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         attention_mask = None
 
         output, bias = gdn(hidden_states, attention_mask)
+        assert gdn.supports_split_output_projection()
+
+        norm_out = gdn.forward_pre_output_proj(hidden_states, attention_mask)
+        split_output, split_bias = gdn.forward_output_proj(norm_out)
+        torch.testing.assert_close(split_output, output)
+        assert split_bias is bias is None
 
         assert output.dim() == 3, f"Output too many dimensions ({output.shape=})"
         assert output.shape[0] == seq_length // self.sp_size // self.cp_size, (
@@ -61,6 +67,85 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         assert (
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+
+    def test_selective_recompute_norm_out(self):
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        def build_gdn(config):
+            gdn_spec = get_experimental_attention_variant_module_spec(config=config)
+            gdn = gdn_spec.module(
+                config,
+                submodules=gdn_spec.submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            return gdn.cuda().bfloat16()
+
+        def run(gdn, hidden_states):
+            output, _ = gdn(hidden_states, None)
+            output.float().sum().backward()
+            grads = {
+                name: param.grad.detach()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            input_grad = hidden_states.grad.detach().clone()
+            return output.detach(), grads, input_grad
+
+        micro_batch_size = 2
+        seq_length = 64
+        base_config = copy.deepcopy(self.transformer_config)
+        rec_config = copy.deepcopy(self.transformer_config)
+        rec_config.recompute_granularity = "selective"
+        rec_config.recompute_modules = ["gdn_norm_out"]
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (
+                seq_length // self.sp_size // self.cp_size,
+                micro_batch_size,
+                self.gdn.config.hidden_size,
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_norm_out is False
+        assert base_gdn.supports_split_output_projection()
+        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
+        hidden_states.grad = None
+        assert base_gdn.norm_out_checkpoint is None
+        del base_gdn
+        torch.cuda.empty_cache()
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        rec_gdn = build_gdn(rec_config)
+        assert rec_gdn.recompute_norm_out is True
+        assert not rec_gdn.supports_split_output_projection()
+        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
+        assert rec_gdn.norm_out_checkpoint is not None
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
+        assert torch.equal(rec_input_grad, base_input_grad), f"Input grad not identical ({rank=})"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            assert torch.equal(
+                rec_grads[name], base_grads[name]
+            ), f"Grad not identical for {name} ({rank=})"
 
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
