@@ -47,7 +47,7 @@ from megatron.core.transformer.moe.moe_utils import (
     unpermute,
 )
 from megatron.core.transformer.moe.replica_planner import (
-    HybridEPReplicaWeightBridge,
+    ReplicaCuTeDSLWeightBridge,
     ReplicaPlan,
     ReplicaPlannerWorkspace,
     map_replica_plan_to_hybridep,
@@ -1322,7 +1322,7 @@ class _ReplicaPlannedManagerMixin:
         self.semantic_token_probs: Optional[torch.Tensor] = None
         self.semantic_token_indices: Optional[torch.Tensor] = None
         self.semantic_tokens_per_expert: Optional[torch.Tensor] = None
-        self._bridge: Optional[HybridEPReplicaWeightBridge] = None
+        self._bridge: Optional[ReplicaCuTeDSLWeightBridge] = None
         self._planner_num_tokens: Optional[int] = None
         self._replica_plan_slots: list[_ReplicaPlanSlot] = []
         self._active_replica_plan_slot: Optional[_ReplicaPlanSlot] = None
@@ -1330,7 +1330,7 @@ class _ReplicaPlannedManagerMixin:
 
     def bind_experts(self, experts) -> None:
         """Bind the dispatcher-independent runtime weights to the expert MLP."""
-        self._bridge = HybridEPReplicaWeightBridge(
+        self._bridge = ReplicaCuTeDSLWeightBridge(
             experts=experts,
             group=self.group,
             num_experts=self.semantic_num_experts,
@@ -1339,9 +1339,6 @@ class _ReplicaPlannedManagerMixin:
                 torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32
             ),
             num_sms=self.config.moe_flex_dispatcher_num_sms,
-            num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
-            num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
-            num_sms_preprocessing=self.config.moe_hybridep_num_sms_preprocessing,
         )
         experts.set_replica_weight_bridge(self._bridge)
 
