@@ -60,19 +60,18 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import (
-    gated_delta_product_stack_spec,
-    hybrid_stack_spec,
-)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    hybrid_mixer_kwargs,
+    hybrid_stack_spec_for,
+    skip_if_sequence_packing_not_available,
+)
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 try:
@@ -81,15 +80,6 @@ try:
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
-
-try:
-    import einops  # noqa: F401
-    import fla  # noqa: F401
-    import mamba_ssm  # noqa: F401
-
-    HAVE_GDP_DEPS = True
-except ImportError:
-    HAVE_GDP_DEPS = False
 
 
 class _ImageOnlyCapabilityWrapper:
@@ -306,18 +296,7 @@ def skip_if_mamba_sequence_packing_not_available(model_provider: str, ssm_mixer:
         # GDN packing rides on FLA, which every GDN test already gates on
         # separately via HAVE_FLA.
         return
-    if ssm_mixer == "gdp":
-        if not HAVE_GDP_DEPS:
-            pytest.skip("GDP requires fla + mamba_ssm + einops")
-        sequence_packing_available, reason_for_no_sequence_packing = (
-            check_fla_sequence_packing_support()
-        )
-    else:
-        sequence_packing_available, reason_for_no_sequence_packing = (
-            _check_mamba_sequence_packing_support()
-        )
-    if not sequence_packing_available:
-        pytest.skip(reason_for_no_sequence_packing)
+    skip_if_sequence_packing_not_available(ssm_mixer)
 
 
 def set_rounder(value):
@@ -676,7 +655,6 @@ class DynamicInferenceEngineTestBase:
                 position_embedding_type=test_config.position_embedding_type,
             ).cuda()
         elif test_config.model_provider == "hybrid":
-            is_gdp = test_config.ssm_mixer == "gdp"
             is_gdn = test_config.ssm_mixer == "gdn"
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
@@ -687,19 +665,7 @@ class DynamicInferenceEngineTestBase:
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 mtp_num_layers=test_config.num_speculative_tokens,
                 hidden_size=256,  # The Mamba layer places several constraints on this
-                # GDP needs its head/group/state dims spelled out, plus the
-                # Householder count that sizes its chunk descriptors.
-                **(
-                    dict(
-                        gdp_num_householder=2,
-                        mamba_num_heads=8,
-                        mamba_head_dim=32,
-                        mamba_num_groups=8,
-                        mamba_state_dim=64,
-                    )
-                    if is_gdp
-                    else dict(mamba_num_heads=16)
-                ),
+                **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
                 linear_conv_kernel_dim=4,
                 linear_key_head_dim=32,
@@ -756,7 +722,7 @@ class DynamicInferenceEngineTestBase:
                 mamba_pattern = recurrent_symbol + "*-|" + recurrent_symbol + "*-" + mtp_suffix
             model = HybridModel(
                 config=transformer_config,
-                hybrid_stack_spec=(gated_delta_product_stack_spec if is_gdp else hybrid_stack_spec),
+                hybrid_stack_spec=hybrid_stack_spec_for(test_config.ssm_mixer),
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,

@@ -439,11 +439,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
-                # Gated Delta Product does not implement batch-invariant mode yet.
-                assert self.gdp_num_householder == 0, (
-                    "batch_invariant_mode does not support Gated Delta Product layers; "
-                    "set batch_invariant_mode=False."
-                )
                 assert not self.enable_prefix_caching, (
                     "batch_invariant_mode does not support Mamba prefix caching; "
                     "set enable_prefix_caching=False."
