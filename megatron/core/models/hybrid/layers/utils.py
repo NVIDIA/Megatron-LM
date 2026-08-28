@@ -31,7 +31,7 @@ class Symbols:
         MLP: MLPLayerConfig,
         MOE: MoELayerConfig,
     }
-    ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA}
+    ATTENTION_LAYER_CONFIGS = {AttentionLayerConfig, DSALayerConfig, MLALayerConfig}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:

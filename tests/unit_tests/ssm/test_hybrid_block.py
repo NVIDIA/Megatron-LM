@@ -198,7 +198,7 @@ def test_hybrid_stack_rejects_layer_config_subclasses(monkeypatch):
 
 
 def test_layer_type_list_rejects_unsupported_tp_overlap():
-    """The positional layer-type API rejects unsupported TP overlap before conversion."""
+    """The positional layer-type API rejects unsupported TP overlap."""
     config = MLATransformerConfig(
         num_layers=3, hidden_size=64, num_attention_heads=4, tp_comm_overlap=True
     )
