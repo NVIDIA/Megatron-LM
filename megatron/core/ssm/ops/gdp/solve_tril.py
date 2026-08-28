@@ -20,6 +20,8 @@ import os
 
 import torch
 
+from megatron.core.ssm.ops.common.determinism import autotune_configs
+
 from .common import (
     HAVE_TRITON,
     IS_TMA_SUPPORTED,
@@ -42,12 +44,18 @@ DOT_PRECISION_AUTOTUNE_LIST = (
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({'DOT_PRECISION': DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-        for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config(
+                {'DOT_PRECISION': DOT_PRECISION},
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4, 5]
+            for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
+        ]
+    ),
     key=['H', 'BT', 'IS_VARLEN'],
 )
 @triton.jit(do_not_specialize=['T'])
