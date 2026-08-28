@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import math
 import time
 from collections.abc import Callable
@@ -31,6 +32,7 @@ class PretrainSessionConfig:
     forward_only: bool = False
     empty_cache_between_steps: bool = False
     max_steady_peak_growth: float = 0.02
+    trace_fingerprints: bool = False
 
 
 def _is_cuda_device(device: str) -> bool:
@@ -101,6 +103,47 @@ def _global_grad_norm_without_step(handle: ModelHandle) -> float:
         for chunk in chunks
     ]
     return float(torch.stack(squared_norms).sum().sqrt().item())
+
+
+def _sampled_parameter_fingerprint(
+    handle: ModelHandle, *, gradients: bool
+) -> dict[str, Any]:
+    """Hash bounded endpoint samples from every local parameter in one D2H."""
+    digest = hashlib.sha256()
+    samples = []
+    tensor_count = 0
+    chunks = handle._extras.get("model_chunks", [handle._model])
+    for chunk_idx, chunk in enumerate(chunks):
+        for name, parameter in sorted(chunk.named_parameters(), key=lambda item: item[0]):
+            tensor = parameter
+            if gradients:
+                tensor = parameter.grad
+                if tensor is None:
+                    tensor = getattr(parameter, "main_grad", None)
+                if tensor is None:
+                    continue
+            if hasattr(tensor, "to_local"):
+                tensor = tensor.to_local()
+            flat = tensor.detach().reshape(-1)
+            if flat.numel() == 0:
+                continue
+            take = min(8, flat.numel())
+            sample = torch.cat((flat[:take], flat[-take:])).float()
+            samples.append(sample)
+            digest.update(f"{chunk_idx}:{name}:{tuple(tensor.shape)}\0".encode())
+            tensor_count += 1
+    if samples:
+        payload = torch.cat(samples).contiguous().cpu()
+        digest.update(payload.view(torch.uint8).numpy().tobytes())
+        sample_count = payload.numel()
+    else:
+        sample_count = 0
+    return {
+        "sha256": digest.hexdigest(),
+        "tensor_count": tensor_count,
+        "sample_count": sample_count,
+        "rule": "first8_last8_as_float32_per_local_parameter",
+    }
 
 
 def _resolve_vocab_size(handle: ModelHandle) -> int:
@@ -265,6 +308,17 @@ def run_pretrain_session(
                 raise RuntimeError(
                     f"training benchmark produced invalid grad_norm={grad_norm}"
                 )
+            trace_fingerprints = cfg.trace_fingerprints and step >= cfg.warmup
+            grad_fingerprint = (
+                _sampled_parameter_fingerprint(handle, gradients=True)
+                if trace_fingerprints and not cfg.forward_only
+                else None
+            )
+            weight_fingerprint = (
+                _sampled_parameter_fingerprint(handle, gradients=False)
+                if trace_fingerprints
+                else None
+            )
             tflops_per_gpu = _calc_tflops_per_gpu(
                 num_floating_point_operations=step_flops,
                 activated_params=activated_params,
@@ -285,6 +339,8 @@ def run_pretrain_session(
                 peak_mem_gb=memory["peak_allocated_bytes"] / 1e9,
                 **memory,
                 tflops_per_gpu=tflops_per_gpu,
+                grad_fingerprint=grad_fingerprint,
+                weight_fingerprint=weight_fingerprint,
             )
             if step_reporter is not None:
                 step_reporter(trace)
@@ -351,6 +407,7 @@ def run_pretrain_session(
             "device": cfg.device,
             "use_thd": cfg.use_thd,
             "memory_gate": memory_gate,
+            "trace_fingerprints": cfg.trace_fingerprints,
         },
     )
 

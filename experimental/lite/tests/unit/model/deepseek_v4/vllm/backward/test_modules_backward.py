@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
+    _dispatch_rms_norm_vjp,
     _pre_graph,
     block_fp8_linear,
     fused_block_fp8_linear,
@@ -200,6 +201,41 @@ def test_rms_norm_vjp_matches_pytorch(fused: bool) -> None:
         visible(*refs, eps).backward(grad)
     for actual, reference in zip(candidates, refs, strict=True):
         torch.testing.assert_close(actual.grad, reference.grad, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_compiled_rms_norm_vjp_accepts_dynamic_shapes() -> None:
+    eps = 1e-6
+    for rows in range(1, 6):
+        for hidden in (64, 128):
+            value = torch.randn(
+                rows, hidden, device="cuda", dtype=torch.bfloat16
+            )
+            weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+            grad_output = torch.randn_like(value)
+            grad_value, grad_weight = _dispatch_rms_norm_vjp(
+                grad_output, value, weight, eps
+            )
+
+            value_ref = value.detach().float().requires_grad_(True)
+            weight_ref = weight.detach().float().requires_grad_(True)
+            output_ref = F.rms_norm(
+                value_ref,
+                (hidden,),
+                weight_ref,
+                eps,
+            )
+            expected_value, expected_weight = torch.autograd.grad(
+                output_ref,
+                (value_ref, weight_ref),
+                grad_output.float(),
+            )
+            torch.testing.assert_close(
+                grad_value.float(), expected_value, rtol=1e-2, atol=1e-2
+            )
+            torch.testing.assert_close(
+                grad_weight.float(), expected_weight, rtol=1e-2, atol=1e-2
+            )
 
 
 def test_mhc_visible_values_use_functional_vjps() -> None:

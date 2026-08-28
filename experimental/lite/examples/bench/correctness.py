@@ -17,17 +17,22 @@ import torch
 
 _EXPERIMENTAL_LITE_ROOT = Path(__file__).resolve().parents[2]
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
-    sys.path.insert(0, str(_EXPERIMENTAL_LITE_ROOT))
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(1, str(_REPO_ROOT))
+for root in (str(_REPO_ROOT), str(_EXPERIMENTAL_LITE_ROOT)):
+    if root in sys.path:
+        sys.path.remove(root)
+    sys.path.insert(0, root)
 
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime import create_runtime
 
-from examples.bench.bench import BenchCliConfig, build_runtime_config, build_session_config
+from examples.bench.bench import (
+    BenchCliConfig,
+    _install_deepep_topk_layout_normalizer,
+    build_runtime_config,
+    build_session_config,
+)
 from examples.bench.results import compare_correctness_artifacts, load_result_artifact
-from examples.bench.session import _make_data_iter
+from examples.bench.session import _global_grad_norm_without_step, _make_data_iter
 
 
 def _distributed_rank() -> int:
@@ -40,6 +45,18 @@ def _distributed_rank() -> int:
         except ValueError:
             continue
     return 0
+
+
+def _distributed_world_size() -> int:
+    for name in ("WORLD_SIZE", "SLURM_NTASKS"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return 1
 
 
 def _sync(device: str) -> None:
@@ -314,9 +331,46 @@ def _forward_logits(rt, handle, batch: Any) -> torch.Tensor | None:
         loss_fn=None,
         num_microbatches=1,
         forward_only=True,
+        router_replay={"action": "replay"}
+        if getattr(batch, "routed_experts", None) is not None
+        else None,
     )
     output = result.model_output
     return output.vocab_parallel_logits if output.vocab_parallel_logits is not None else (-output.log_probs if output.log_probs is not None else None)
+
+
+def _fixed_route_batches(data_iter, handle):
+    model_cfg = handle._extras.get("model_cfg")
+    num_layers = int(getattr(model_cfg, "num_hidden_layers"))
+    topk = int(getattr(model_cfg, "num_experts_per_tok"))
+    num_experts = int(getattr(model_cfg, "n_routed_experts"))
+    for batch in data_iter:
+        rows = []
+        for length_tensor in batch.seq_lens:
+            length = int(length_tensor.item())
+            tokens = torch.arange(length, device=batch.input_ids.device)
+            layers = torch.arange(num_layers, device=batch.input_ids.device)
+            slots = torch.arange(topk, device=batch.input_ids.device)
+            routes = (
+                tokens[:, None, None]
+                + layers[None, :, None] * topk
+                + slots[None, None, :]
+            ).remainder(num_experts)
+            rows.append(routes)
+        batch.routed_experts = torch.nested.as_nested_tensor(
+            rows, layout=torch.jagged
+        )
+        batch.r3_replay_mask = torch.ones(
+            batch.input_ids.numel(), dtype=torch.bool, device=batch.input_ids.device
+        )
+        yield batch
+
+
+def _batch_fingerprint(batch: Any) -> dict[str, Any]:
+    return {
+        name: _hash_tensor(getattr(batch, name, None))
+        for name in ("input_ids", "labels", "seq_lens", "loss_mask", "position_ids")
+    }
 
 
 def run_backend(
@@ -324,23 +378,32 @@ def run_backend(
     *,
     hash_weights: bool = True,
     activation_probe_names: list[str] | None = None,
+    fixed_router_replay: bool = False,
 ) -> dict[str, Any]:
     os.environ["MEGATRON_LITE_DETERMINISTIC"] = "1"
     set_deterministic(cfg.seed)
 
+    if cfg.normalize_deepep_topk_layout:
+        _install_deepep_topk_layout_normalizer()
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
     session_cfg = build_session_config(cfg)
 
     eval_iter = _make_data_iter(handle, session_cfg)
+    if fixed_router_replay:
+        eval_iter = _fixed_route_batches(eval_iter, handle)
     eval_batch = next(eval_iter)
+    initial_weights = _weight_fingerprint(rt, handle) if hash_weights else None
+    input_fingerprint = _batch_fingerprint(eval_batch)
     activation_probe_names = list(activation_probe_names or [])
     with _activation_probe_context(handle, activation_probe_names) as activation_probes:
         with rt.eval_mode(handle):
             eval_logits = _hash_tensor(_forward_logits(rt, handle, eval_batch))
 
     data_iter = _make_data_iter(handle, session_cfg)
+    if fixed_router_replay:
+        data_iter = _fixed_route_batches(data_iter, handle)
     steps: list[dict[str, Any]] = []
     with rt.train_mode(handle):
         for step in range(session_cfg.steps):
@@ -350,7 +413,11 @@ def run_backend(
                 rt.zero_grad(handle)
                 _sync(session_cfg.device)
                 result = rt.forward_backward(
-                    handle, data_iter, loss_fn=None, num_microbatches=session_cfg.num_microbatches
+                    handle,
+                    data_iter,
+                    loss_fn=None,
+                    num_microbatches=session_cfg.num_microbatches,
+                    router_replay={"action": "replay"} if fixed_router_replay else None,
                 )
                 _sync(session_cfg.device)
                 output = result.model_output
@@ -358,7 +425,9 @@ def run_backend(
                 grads = _grad_fingerprint(handle)
 
                 if session_cfg.no_optimizer:
-                    update_successful, grad_norm, num_zeros = True, 0.0, 0
+                    update_successful = True
+                    grad_norm = _global_grad_norm_without_step(handle)
+                    num_zeros = 0
                 else:
                     update_successful, grad_norm, num_zeros = rt.optimizer_step(handle)
                     rt.lr_scheduler_step(handle)
@@ -385,20 +454,43 @@ def run_backend(
         "kind": "mlite_bench_correctness",
         "backend": cfg.backend,
         "model_name": cfg.model_name,
+        "impl": cfg.impl,
         "seed": cfg.seed,
         "seq_len": cfg.seq_len,
         "num_microbatches": cfg.num_microbatches,
         "steps": steps,
         "eval_logits": eval_logits,
+        "initial_weights": initial_weights,
+        "input_fingerprint": input_fingerprint,
         "activation_probes": activation_probes,
         "metadata": {
             "deterministic": True,
+            "rank": _distributed_rank(),
+            "world_size": _distributed_world_size(),
             "hash_weights": hash_weights,
             "same_data_across_dp": cfg.same_data_across_dp,
             "use_thd": cfg.use_thd,
+            "parallel": {
+                "tp": cfg.tp,
+                "etp": cfg.etp,
+                "ep": cfg.ep,
+                "pp": cfg.pp,
+                "vpp": cfg.vpp,
+                "cp": cfg.cp,
+            },
+            "optimizer": {
+                "disabled": cfg.no_optimizer,
+                "lr": cfg.optimizer_lr,
+                "weight_decay": cfg.optimizer_weight_decay,
+                "clip_grad": cfg.optimizer_clip_grad,
+            },
+            "impl_cfg": json.loads(cfg.impl_cfg_json),
+            "fixed_router_replay": fixed_router_replay,
         },
     }
-    rt.close(handle)
+    close = getattr(rt, "close", None)
+    if close is not None:
+        close(handle)
     return artifact
 
 
@@ -434,9 +526,19 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--override-transformer-json", default="{}")
     parser.add_argument("--override-optimizer-json", default="{}")
     parser.add_argument("--impl-cfg-json", default="{}")
+    parser.add_argument(
+        "--normalize-deepep-topk-layout",
+        action="store_true",
+        help="Benchmark-only compatibility shim for DeepEP builds requiring contiguous top-k indices.",
+    )
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--skip-weight-hash", action="store_true")
     parser.add_argument("--activation-probes-json", default="{}")
+    parser.add_argument(
+        "--fixed-router-replay",
+        action="store_true",
+        help="Replay deterministic per-token expert IDs while retaining live router scores.",
+    )
 
 
 def _activation_probe_names(raw: str, backend: str) -> list[str]:
@@ -499,11 +601,20 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         cfg,
         hash_weights=not ns.skip_weight_hash,
         activation_probe_names=_activation_probe_names(ns.activation_probes_json, cfg.backend),
+        fixed_router_replay=ns.fixed_router_replay,
     )
-    if _distributed_rank() == 0:
-        text = json.dumps(artifact, indent=2, sort_keys=True)
+    text = json.dumps(artifact, indent=2, sort_keys=True)
+    output_path = Path(ns.output_json)
+    rank = _distributed_rank()
+    world_size = _distributed_world_size()
+    if world_size > 1:
+        rank_output_path = output_path.with_name(
+            f"{output_path.stem}.rank{rank}{output_path.suffix}"
+        )
+        rank_output_path.parent.mkdir(parents=True, exist_ok=True)
+        rank_output_path.write_text(text + "\n", encoding="utf-8")
+    if rank == 0:
         print(text, flush=True)
-        output_path = Path(ns.output_json)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text + "\n", encoding="utf-8")
     return artifact

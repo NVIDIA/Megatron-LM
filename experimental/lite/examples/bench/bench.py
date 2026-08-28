@@ -68,6 +68,8 @@ class BenchCliConfig:
     override_transformer_json: str = "{}"
     override_optimizer_json: str = "{}"
     impl_cfg_json: str = "{}"
+    normalize_deepep_topk_layout: bool = False
+    trace_fingerprints: bool = False
     dry_run: bool = False
     output_json: str | None = None
 
@@ -80,6 +82,34 @@ def _json_mapping(raw: str, *, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a JSON object.")
     return value
+
+
+def _install_deepep_topk_layout_normalizer() -> None:
+    """Enforce the contiguous top-k layout required by the installed DeepEP ABI."""
+    from deep_ep.buffer import Buffer
+
+    original_layout = Buffer.get_dispatch_layout
+    if getattr(original_layout, "_mlite_contiguous_topk", False):
+        return
+
+    def contiguous_get_dispatch_layout(self, topk_idx, *args, **kwargs):
+        return original_layout(self, topk_idx.contiguous(), *args, **kwargs)
+
+    contiguous_get_dispatch_layout._mlite_contiguous_topk = True
+    Buffer.get_dispatch_layout = contiguous_get_dispatch_layout
+
+    original_dispatch = Buffer.dispatch
+
+    def contiguous_dispatch(self, *args, **kwargs):
+        topk_idx = kwargs.get("topk_idx")
+        if topk_idx is not None:
+            kwargs["topk_idx"] = topk_idx.contiguous()
+        topk_weights = kwargs.get("topk_weights")
+        if topk_weights is not None:
+            kwargs["topk_weights"] = topk_weights.contiguous()
+        return original_dispatch(self, *args, **kwargs)
+
+    Buffer.dispatch = contiguous_dispatch
 
 
 def _parallel_config(cfg: BenchCliConfig) -> ParallelConfig:
@@ -270,6 +300,8 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             setattr(optimizer, key, value)
         impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
         impl_cfg.setdefault("use_thd", cfg.use_thd)
+        if cfg.no_optimizer:
+            impl_cfg.setdefault("optimizer", None)
         if cfg.model_name == "qwen3_5":
             from megatron.lite.primitive.deterministic import deterministic_requested
 
@@ -323,6 +355,7 @@ def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
         forward_only=cfg.forward_only,
         empty_cache_between_steps=cfg.empty_cache_between_steps,
         max_steady_peak_growth=cfg.max_steady_peak_growth,
+        trace_fingerprints=cfg.trace_fingerprints,
     )
 
 
@@ -382,6 +415,8 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
     if cfg.dry_run:
         return build_dry_run_plan(cfg)
 
+    if cfg.normalize_deepep_topk_layout:
+        _install_deepep_topk_layout_normalizer()
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
@@ -447,6 +482,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--override-transformer-json", default="{}")
     parser.add_argument("--override-optimizer-json", default="{}")
     parser.add_argument("--impl-cfg-json", default="{}")
+    parser.add_argument(
+        "--normalize-deepep-topk-layout",
+        action="store_true",
+        help="Benchmark-only compatibility shim for DeepEP builds requiring contiguous top-k indices.",
+    )
+    parser.add_argument(
+        "--trace-fingerprints",
+        action="store_true",
+        help="Record bounded per-step gradient and post-update parameter fingerprints.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-json", default=None)
     return parser

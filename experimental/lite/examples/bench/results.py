@@ -23,6 +23,8 @@ class StepTrace:
     post_reserved_bytes: int | None = None
     active_bytes: int | None = None
     tflops_per_gpu: float | None = None
+    grad_fingerprint: dict[str, Any] | None = None
+    weight_fingerprint: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -45,6 +47,10 @@ class StepTrace:
                 result[name] = value
         if self.tflops_per_gpu is not None:
             result["tflops_per_gpu"] = self.tflops_per_gpu
+        if self.grad_fingerprint is not None:
+            result["grad_fingerprint"] = dict(self.grad_fingerprint)
+        if self.weight_fingerprint is not None:
+            result["weight_fingerprint"] = dict(self.weight_fingerprint)
         return result
 
 
@@ -179,6 +185,106 @@ def compare_step_traces(
     }
 
 
+def compare_step_trends(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    min_level_correlation: float = 0.75,
+    min_delta_correlation: float = 0.9,
+    min_delta_sign_fraction: float = 0.85,
+    min_change_ratio: float = 0.5,
+    max_change_ratio: float = 2.0,
+) -> dict[str, Any]:
+    """Compare curve direction and shape when forward oracles have an offset."""
+
+    def correlation(left: list[float], right: list[float]) -> float:
+        left_mean = sum(left) / len(left)
+        right_mean = sum(right) / len(right)
+        left_centered = [value - left_mean for value in left]
+        right_centered = [value - right_mean for value in right]
+        denominator = math.sqrt(
+            sum(value * value for value in left_centered)
+            * sum(value * value for value in right_centered)
+        )
+        if denominator == 0:
+            return 1.0 if left == right else 0.0
+        return sum(
+            left_value * right_value
+            for left_value, right_value in zip(
+                left_centered, right_centered, strict=True
+            )
+        ) / denominator
+
+    def field_result(
+        base_steps: list[dict[str, Any]],
+        cand_steps: list[dict[str, Any]],
+        field: str,
+    ) -> dict[str, Any]:
+        base = [float(step[field]) for step in base_steps]
+        cand = [float(step[field]) for step in cand_steps]
+        finite = all(math.isfinite(value) for value in (*base, *cand))
+        base_delta = [
+            base[index] - base[index - 1] for index in range(1, len(base))
+        ]
+        cand_delta = [
+            cand[index] - cand[index - 1] for index in range(1, len(cand))
+        ]
+        same_sign = sum(
+            (left == 0 and right == 0) or left * right > 0
+            for left, right in zip(base_delta, cand_delta, strict=True)
+        ) / len(base_delta)
+        base_change = base[-1] - base[0]
+        cand_change = cand[-1] - cand[0]
+        same_direction = base_change * cand_change > 0
+        change_ratio = abs(cand_change / base_change) if base_change else math.inf
+        level_correlation = correlation(base, cand)
+        delta_correlation = correlation(base_delta, cand_delta)
+        passed = (
+            finite
+            and level_correlation >= min_level_correlation
+            and delta_correlation >= min_delta_correlation
+            and same_sign >= min_delta_sign_fraction
+            and same_direction
+            and min_change_ratio <= change_ratio <= max_change_ratio
+        )
+        return {
+            "passed": passed,
+            "finite": finite,
+            "level_correlation": level_correlation,
+            "delta_correlation": delta_correlation,
+            "delta_sign_fraction": same_sign,
+            "baseline_change": base_change,
+            "candidate_change": cand_change,
+            "change_ratio": change_ratio,
+        }
+
+    base_steps = baseline.get("result", {}).get("step_traces", [])
+    cand_steps = candidate.get("result", {}).get("step_traces", [])
+    lengths_match = len(base_steps) == len(cand_steps) and len(base_steps) >= 3
+    if not lengths_match:
+        return {
+            "passed": False,
+            "samples": min(len(base_steps), len(cand_steps)),
+            "lengths_match": False,
+        }
+    loss = field_result(base_steps, cand_steps, "loss")
+    grad_norm = field_result(base_steps, cand_steps, "grad_norm")
+    return {
+        "passed": loss["passed"] and grad_norm["passed"],
+        "samples": len(base_steps),
+        "lengths_match": True,
+        "thresholds": {
+            "min_level_correlation": min_level_correlation,
+            "min_delta_correlation": min_delta_correlation,
+            "min_delta_sign_fraction": min_delta_sign_fraction,
+            "min_change_ratio": min_change_ratio,
+            "max_change_ratio": max_change_ratio,
+        },
+        "loss": loss,
+        "grad_norm": grad_norm,
+    }
+
+
 def compare_correctness_artifacts(
     baseline: dict[str, Any],
     candidate: dict[str, Any],
@@ -230,11 +336,70 @@ def compare_correctness_artifacts(
         reference_max = max((abs(float(value)) for value in base_values), default=0.0)
         return local_max <= tensor_atol + tensor_rtol * reference_max
 
+    def _collection_fingerprint_matches(base: Any, cand: Any) -> bool:
+        if base == cand:
+            return True
+        if not isinstance(base, dict) or not isinstance(cand, dict):
+            return False
+        if base.get("tensor_count") != cand.get("tensor_count"):
+            return False
+        base_details = base.get("details")
+        cand_details = cand.get("details")
+        if not isinstance(base_details, list) or not isinstance(cand_details, list):
+            return False
+        base_by_name = {item.get("name"): item for item in base_details}
+        cand_by_name = {item.get("name"): item for item in cand_details}
+        if base_by_name.keys() != cand_by_name.keys():
+            return False
+        return all(
+            _tensor_fingerprint_matches(base_by_name[name], cand_by_name[name])
+            for name in base_by_name
+        )
+
+    def _collection_mismatch_names(base: Any, cand: Any, *, limit: int = 8) -> list[str]:
+        if not isinstance(base, dict) or not isinstance(cand, dict):
+            return []
+        base_details = base.get("details")
+        cand_details = cand.get("details")
+        if not isinstance(base_details, list) or not isinstance(cand_details, list):
+            return []
+        base_by_name = {item.get("name"): item for item in base_details}
+        cand_by_name = {item.get("name"): item for item in cand_details}
+        names = sorted(set(base_by_name) | set(cand_by_name), key=str)
+        return [
+            str(name)
+            for name in names
+            if name not in base_by_name
+            or name not in cand_by_name
+            or not _tensor_fingerprint_matches(base_by_name[name], cand_by_name[name])
+        ][:limit]
+
     base_eval = baseline.get("eval_logits")
     cand_eval = candidate.get("eval_logits")
     if base_eval is not None or cand_eval is not None:
         if not _tensor_fingerprint_matches(base_eval, cand_eval):
             mismatches.append({"field": "eval_logits"})
+    if not _collection_fingerprint_matches(
+        baseline.get("initial_weights"), candidate.get("initial_weights")
+    ):
+        mismatches.append(
+            {
+                "field": "initial_weights",
+                "first_names": _collection_mismatch_names(
+                    baseline.get("initial_weights"), candidate.get("initial_weights")
+                ),
+            }
+        )
+    base_input = baseline.get("input_fingerprint")
+    cand_input = candidate.get("input_fingerprint")
+    if base_input != cand_input:
+        if not isinstance(base_input, dict) or not isinstance(cand_input, dict):
+            mismatches.append({"field": "input_fingerprint"})
+        elif base_input.keys() != cand_input.keys() or any(
+            not _tensor_fingerprint_matches(base_input[name], cand_input[name])
+            for name in base_input
+        ):
+            mismatches.append({"field": "input_fingerprint"})
 
     for idx in range(sample_count):
         base = base_steps[idx]
@@ -256,6 +421,18 @@ def compare_correctness_artifacts(
             mismatches.append({"step": idx, "field": "loss"})
         if not grad_matches:
             mismatches.append({"step": idx, "field": "grad_norm"})
+        if not _collection_fingerprint_matches(
+            base.get("grad_fingerprint"), cand.get("grad_fingerprint")
+        ):
+            mismatches.append(
+                {
+                    "step": idx,
+                    "field": "grad_fingerprint",
+                    "first_names": _collection_mismatch_names(
+                        base.get("grad_fingerprint"), cand.get("grad_fingerprint")
+                    ),
+                }
+            )
         for field in ("post_step_weights", "update_successful", "num_zeros"):
             if base.get(field) != cand.get(field):
                 mismatches.append({"step": idx, "field": field})
@@ -295,6 +472,7 @@ __all__ = [
     "StepTrace",
     "compare_correctness_artifacts",
     "compare_step_traces",
+    "compare_step_trends",
     "load_result_artifact",
     "result_summary",
 ]

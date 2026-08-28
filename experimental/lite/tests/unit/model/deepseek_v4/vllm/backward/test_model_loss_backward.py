@@ -184,6 +184,8 @@ def test_aligned_chunked_logprob_uses_rollout_value_and_same_head_vjp(
     reference.sum().backward()
 
     assert calls[:3] == [2, 2, 1]
+    assert torch.count_nonzero(value.grad)
+    assert torch.count_nonzero(head.weight.grad)
     torch.testing.assert_close(value.grad, reference_value.grad, rtol=0, atol=0)
     torch.testing.assert_close(head.weight.grad, reference_weight.grad, rtol=0, atol=0)
 

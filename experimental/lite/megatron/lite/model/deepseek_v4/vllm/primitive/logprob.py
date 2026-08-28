@@ -3,7 +3,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 
 def _rollout_selected_log_probs(
@@ -49,8 +48,8 @@ def aligned_selected_log_probs(
 
     vLLM's selected-logprob Triton kernel intentionally has no autograd.  The
     visible value is evaluated by that exact kernel.  The differentiable path
-    is derived from the very same BF16 logits.  Non-reentrant checkpointing
-    drops each full-vocabulary chunk and recomputes it during backward.
+    is derived from the very same BF16 logits and retains each bounded chunk
+    for backward, avoiding a hidden second LM-head forward.
     """
     if chunk_size <= 0:
         raise ValueError("logprob_chunk_size must be positive")
@@ -58,9 +57,8 @@ def aligned_selected_log_probs(
     selected_chunks = []
     entropy_chunks = []
     grad_enabled = torch.is_grad_enabled()
-    # Keep both forward and backward full-vocabulary storage bounded.  Training
-    # recomputes one chunk at a time, so the only difference from a one-shot
-    # head is floating-point accumulation order for the shared weight gradient.
+    # Chunking bounds each individual full-vocabulary allocation while preserving
+    # the shared weight-gradient accumulation order.
     for start in range(0, hidden_states.shape[0], chunk_size):
         stop = min(start + chunk_size, hidden_states.shape[0])
         chunk_labels = labels[start:stop]
@@ -87,9 +85,7 @@ def aligned_selected_log_probs(
 
         chunk_hidden = hidden_states[start:stop]
         if grad_enabled:
-            chunk_result = checkpoint(
-                chunk_forward, chunk_hidden, use_reentrant=False
-            )
+            chunk_result = chunk_forward(chunk_hidden)
         else:
             with torch.no_grad():
                 logits = lm_head(chunk_hidden)

@@ -314,6 +314,43 @@ def test_result_trace_compare_reports_metric_level_failures():
     assert comparison["grad_norm_passed"] is False
 
 
+def test_result_trend_compare_allows_offsets_but_rejects_opposite_direction():
+    from examples.bench.results import compare_step_trends
+
+    def artifact(losses, grad_norms):
+        return {
+            "result": {
+                "step_traces": [
+                    {
+                        "step": step,
+                        "loss": loss,
+                        "grad_norm": grad_norm,
+                        "step_ms": 1.0,
+                    }
+                    for step, (loss, grad_norm) in enumerate(
+                        zip(losses, grad_norms, strict=True)
+                    )
+                ]
+            }
+        }
+
+    baseline = artifact(
+        [20.0, 19.8, 19.7, 19.4, 19.2],
+        [10.0, 10.2, 10.1, 10.5, 10.8],
+    )
+    aligned = artifact(
+        [21.0, 20.7, 20.55, 20.1, 19.8],
+        [8.0, 8.3, 8.15, 8.75, 9.2],
+    )
+    opposite = artifact(
+        [21.0, 21.2, 21.3, 21.6, 21.8],
+        [8.0, 7.8, 7.9, 7.5, 7.2],
+    )
+
+    assert compare_step_trends(baseline, aligned)["passed"] is True
+    assert compare_step_trends(baseline, opposite)["passed"] is False
+
+
 def test_correctness_compare_requires_bitwise_fields():
     from examples.bench.results import compare_correctness_artifacts
 
@@ -340,6 +377,16 @@ def test_correctness_compare_requires_bitwise_fields():
 
     assert comparison["passed"] is False
     assert comparison["max_grad_norm_abs"] == 0.5
+
+    candidate = json.loads(json.dumps(baseline))
+    candidate["steps"][0]["grad_fingerprint"]["sha256"] = "different"
+    comparison = compare_correctness_artifacts(baseline, candidate)
+
+    assert comparison["passed"] is False
+    assert any(
+        mismatch["step"] == 0 and mismatch["field"] == "grad_fingerprint"
+        for mismatch in comparison["mismatches"]
+    )
 
 
 def test_correctness_compare_supports_explicit_numeric_tolerances():
@@ -384,3 +431,33 @@ def test_correctness_compare_supports_explicit_numeric_tolerances():
 
     assert comparison["passed"] is True
     assert abs(comparison["max_tensor_abs"] - 2e-3) < 1e-12
+
+
+def test_correctness_fixed_routes_are_deterministic_and_unique():
+    from types import SimpleNamespace
+
+    from examples.bench.correctness import _fixed_route_batches
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    batch = PackedBatch(
+        input_ids=torch.arange(8),
+        labels=torch.arange(8),
+        seq_lens=torch.tensor([3, 5]),
+    )
+    handle = SimpleNamespace(
+        _extras={
+            "model_cfg": SimpleNamespace(
+                num_hidden_layers=4,
+                num_experts_per_tok=6,
+                n_routed_experts=256,
+            )
+        }
+    )
+
+    routed_batch = next(_fixed_route_batches(iter([batch]), handle))
+    rows = list(routed_batch.routed_experts.unbind())
+
+    assert [tuple(row.shape) for row in rows] == [(3, 4, 6), (5, 4, 6)]
+    assert all(torch.equal(row, row.remainder(256)) for row in rows)
+    assert all(torch.all(row[..., 1:] != row[..., :-1]) for row in rows)
+    assert routed_batch.r3_replay_mask.tolist() == [True] * 8

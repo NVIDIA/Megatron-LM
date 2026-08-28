@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 
 import torch
 
@@ -12,6 +13,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
 )
 
 _M_ALIGNMENT = 128
+_PACK_DEBUG_SYNC = os.getenv("MLITE_VLLM_PACK_DEBUG_SYNC") == "1"
 
 
 @contextmanager
@@ -132,13 +134,19 @@ def _vllm_grouped_forward(
     weight_cache: DeploymentGroupedBlockFP8Adapter,
     w13: tuple[torch.Tensor, ...],
     w2: tuple[torch.Tensor, ...],
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.utils.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
 
     if hidden_states.shape[0] == 0:
-        return hidden_states.new_empty((0, hidden_states.shape[1]))
+        return (
+            hidden_states.new_empty((0, hidden_states.shape[1])),
+            hidden_states.new_empty((0, w13[0].shape[0])),
+        )
     compact_output = hidden_states.new_empty(
         (hidden_states.shape[0], w2[0].shape[0])
+    )
+    compact_gate_up = hidden_states.new_empty(
+        (hidden_states.shape[0], w13[0].shape[0])
     )
     token_offset = 0
     experts_per_group = len(counts)
@@ -168,6 +176,22 @@ def _vllm_grouped_forward(
             gate_up,
             m_indices,
         )
+        if _PACK_DEBUG_SYNC:
+            try:
+                torch.cuda.synchronize(hidden_states.device)
+            except torch.AcceleratorError as error:
+                raise RuntimeError(
+                    "grouped FC1 failed before FC2 packing: "
+                    f"counts={group_counts}, padded_counts={padded_counts}"
+                ) from error
+        visible_gate_up = (
+            gate_up
+            if valid_rows is None
+            else gate_up.index_select(0, valid_rows)
+        )
+        compact_gate_up.narrow(0, token_offset, group_tokens).copy_(
+            visible_gate_up
+        )
         activated_q = torch.empty(
             (padded.shape[0], w2[0].shape[1]),
             device=hidden_states.device,
@@ -178,6 +202,14 @@ def _vllm_grouped_forward(
             output=activated_q,
             swiglu_limit=swiglu_limit,
         )
+        if _PACK_DEBUG_SYNC:
+            try:
+                torch.cuda.synchronize(hidden_states.device)
+            except torch.AcceleratorError as error:
+                raise RuntimeError(
+                    "grouped SwiGLU quant failed before FC2 packing: "
+                    f"counts={group_counts}, padded_counts={padded_counts}"
+                ) from error
         packed_w2 = weight_cache.pack_weight(
             ("w2", expert_start),
             w2[expert_start:expert_end],
@@ -200,7 +232,7 @@ def _vllm_grouped_forward(
             "grouped MoE expert counts do not cover all expert-major rows: "
             f"{token_offset} != {hidden_states.shape[0]}"
         )
-    return compact_output
+    return compact_output, compact_gate_up
 
 
 def _te_grouped_gemm(
@@ -235,6 +267,7 @@ def _te_grouped_gemm(
 
 def _te_grouped_bf16_backward(
     hidden_states: torch.Tensor,
+    gate_up: torch.Tensor,
     grad_output: torch.Tensor,
     counts: tuple[int, ...],
     swiglu_limit: float,
@@ -249,23 +282,10 @@ def _te_grouped_bf16_backward(
     tuple[torch.Tensor | None, ...],
     tuple[torch.Tensor | None, ...],
 ]:
-    """Recompute activation and run FC dgrad/wgrad with TE grouped GEMMs."""
+    """Run the common BF16 FC dgrad/wgrad path from saved visible intermediates."""
     activation_dtype = hidden_states.dtype
     hidden_mats = tuple(torch.split(hidden_states, counts))
     grad_output_mats = tuple(torch.split(grad_output.contiguous(), counts))
-
-    gate_up = hidden_states.new_empty(
-        (hidden_states.shape[0], w13[0].shape[0])
-    )
-    with _nvtx_range("moe_bwd/recompute_fc1"):
-        _te_grouped_gemm(
-            w13,
-            hidden_mats,
-            gate_up,
-            activation_dtype=activation_dtype,
-            m_splits=counts,
-            single_output=True,
-        )
 
     with torch.enable_grad():
         gate_up_graph = gate_up.detach().requires_grad_(True)
@@ -383,7 +403,7 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
             raise ValueError("tokens_per_expert does not match expert-major rows")
         w13 = tuple(weights[:num_experts])
         w2 = tuple(weights[num_experts:])
-        output = _vllm_grouped_forward(
+        output, gate_up = _vllm_grouped_forward(
             hidden_states,
             counts,
             float(swiglu_limit),
@@ -393,17 +413,18 @@ class VLLMGroupedMoEWithBF16Backward(torch.autograd.Function):
         )
         ctx.counts = counts
         ctx.swiglu_limit = float(swiglu_limit)
-        ctx.save_for_backward(hidden_states, *weights)
+        ctx.save_for_backward(hidden_states, gate_up, *weights)
         return output
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        hidden_states, *weights = ctx.saved_tensors
+        hidden_states, gate_up, *weights = ctx.saved_tensors
         num_experts = len(ctx.counts)
         w13 = tuple(weights[:num_experts])
         w2 = tuple(weights[num_experts:])
         grad_hidden, grad_w13, grad_w2 = _te_grouped_bf16_backward(
             hidden_states,
+            gate_up,
             grad_output,
             ctx.counts,
             ctx.swiglu_limit,

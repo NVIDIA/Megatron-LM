@@ -44,6 +44,29 @@ def _top_k_per_row_prefill(
 ) -> None:
     """Use deterministic score-order Top-K whenever BI is enabled."""
     if envs.VLLM_BATCH_INVARIANT:
+        # The standalone BI extension has a fixed 4096-column radix-sort
+        # capacity.  A 32K C4 request has 8192 compressed columns.  vLLM's
+        # official prefill kernel uses its deterministic insertion-sort branch
+        # for at most 12288 rows and has the same score/source-index ordering.
+        # Keep the authoritative extension for every shape it supports and use
+        # that existing vLLM path only for the larger full-model geometry.
+        if logits.shape[1] > 4096:
+            if num_rows > 12288:
+                raise RuntimeError(
+                    "DS4 BI Top-K fallback would leave vLLM's deterministic "
+                    "insertion-sort range"
+                )
+            torch.ops._C.top_k_per_row_prefill(
+                logits,
+                row_starts,
+                row_ends,
+                output,
+                num_rows,
+                stride0,
+                stride1,
+                topk,
+            )
+            return
         if not hasattr(torch.ops.ds4_bi, "top_k_per_row_prefill"):
             library = os.environ.get("DS4_BI_TOPK_LIB")
             if library:

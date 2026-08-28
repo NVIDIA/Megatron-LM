@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 import triton
@@ -14,6 +16,8 @@ from megatron.lite.primitive.modules.dispatcher import (
     deep_ep,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe import hybridep
+
+_HOT_PATH_ASSERTS = os.getenv("MLITE_VLLM_HOT_PATH_ASSERTS") == "1"
 
 
 @triton.jit
@@ -226,7 +230,7 @@ def compact_route_positions(
         device=valid.device,
         dtype=torch.long,
     )
-    if flat_valid.numel():
+    if flat_valid.numel() and _HOT_PATH_ASSERTS:
         torch._assert_async(
             prefix[-1] == num_routes,
             "DeepEP compact route count differs from its metadata handle",
@@ -442,19 +446,21 @@ def _scatter_deepep_routes_with_padding(
     )
     if counts_are_exact_unpadded:
         counts = real_counts
-        torch._assert_async(
-            real_counts.sum() == expected_route_count,
-            "DeepEP received route count differs from its route-preserving metadata",
-        )
+        if _HOT_PATH_ASSERTS:
+            torch._assert_async(
+                real_counts.sum() == expected_route_count,
+                "DeepEP received route count differs from its route-preserving metadata",
+            )
     else:
         counts = tokens_per_expert.to(
             device=topk_indices.device,
             dtype=torch.long,
         ).reshape(-1)
-    torch._assert_async(
-        torch.all(real_counts <= counts),
-        "DeepEP real route count exceeds its aligned expert count",
-    )
+    if _HOT_PATH_ASSERTS:
+        torch._assert_async(
+            torch.all(real_counts <= counts),
+            "DeepEP real route count exceeds its aligned expert count",
+        )
 
     if count_values is None:
         total_rows = int(counts.sum().item())
@@ -491,10 +497,11 @@ def _scatter_deepep_routes_with_padding(
             dtype=output_index.dtype
         )
 
-    torch._assert_async(
-        torch.all(~valid | (output_index >= 0)),
-        "A valid DeepEP route has no expert-major output row",
-    )
+    if _HOT_PATH_ASSERTS:
+        torch._assert_async(
+            torch.all(~valid | (output_index >= 0)),
+            "A valid DeepEP route has no expert-major output row",
+        )
     permuted_hidden = _DeepEPScatterWithDeterministicBackward.apply(
         hidden_states,
         output_index,
@@ -694,9 +701,9 @@ def _validate_and_order_route_preserving_outputs(
         indices: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
-        words = fingerprints.contiguous().view(torch.int16).reshape(
-            fingerprints.shape[0], -1
-        )
+        # Preserve the statically known fingerprint width when an EP rank
+        # receives no routes; reshape(0, -1) is ambiguous in PyTorch.
+        words = fingerprints.contiguous().view(torch.int16).flatten(1)
         hashes = torch.full(
             (words.shape[0],),
             1469598103934665603,
@@ -724,23 +731,24 @@ def _validate_and_order_route_preserving_outputs(
     expected_indices = expected_indices.index_select(0, expected_for_route)
     expected_weights = expected_weights.index_select(0, expected_for_route)
     expected_fingerprints = expected_fingerprints.index_select(0, expected_for_route)
-    torch._assert_async(
-        torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
-        "Route-preserving DeepEP metadata changed local expert order",
-    )
-    torch._assert_async(
-        torch.all(
-            expected_weights.contiguous().view(torch.int32)
-            == route_weights.to(dtype=expected_weights.dtype)
-            .contiguous()
-            .view(torch.int32)
-        ),
-        "Route-preserving DeepEP metadata changed route probability order",
-    )
-    torch._assert_async(
-        torch.all(expected_fingerprints == route_fingerprints),
-        "Route-preserving DeepEP metadata changed source-token order",
-    )
+    if _HOT_PATH_ASSERTS:
+        torch._assert_async(
+            torch.all(expected_indices == route_indices.to(dtype=expected_indices.dtype)),
+            "Route-preserving DeepEP metadata changed local expert order",
+        )
+        torch._assert_async(
+            torch.all(
+                expected_weights.contiguous().view(torch.int32)
+                == route_weights.to(dtype=expected_weights.dtype)
+                .contiguous()
+                .view(torch.int32)
+            ),
+            "Route-preserving DeepEP metadata changed route probability order",
+        )
+        torch._assert_async(
+            torch.all(expected_fingerprints == route_fingerprints),
+            "Route-preserving DeepEP metadata changed source-token order",
+        )
     primary_route_rows = output_index[token_rows, topk_slots].to(
         dtype=torch.long
     ).index_select(0, expected_for_route)

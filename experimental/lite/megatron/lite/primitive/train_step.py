@@ -166,9 +166,12 @@ def _bucketed_grad_sq_sum(
         bucket_bytes = 0
 
     for name, param in model.named_parameters():
-        if param.grad is None or not include_param(name):
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is None or not include_param(name):
             continue
-        grad = param.grad.view(-1)
+        grad = grad.view(-1)
         grad_bytes = grad.numel() * grad.element_size()
         if bucket and bucket_bytes + grad_bytes > max_bucket_bytes:
             flush_bucket()

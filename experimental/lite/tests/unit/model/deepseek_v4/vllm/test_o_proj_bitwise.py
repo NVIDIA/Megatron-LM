@@ -153,13 +153,20 @@ def test_o_projection_explicit_grouped_gemm_vjp_matches_functional_gradients() -
         z = torch.einsum("tgd,grd->tgr", grouped, wa)
         return z.flatten(1) @ wb_.T
 
+    def visible_with_intermediate(o_, wa_, wb_):
+        inverse = _inverse_rope(o_, positions, cos_sin, nope_dim, rope_dim)
+        grouped = inverse.reshape(tokens, n_groups, -1)
+        wa = wa_.reshape(n_groups, o_lora_rank, -1)
+        z = torch.einsum("tgd,grd->tgr", grouped, wa).flatten(1)
+        return z @ wb_.T, z
+
     reference_o = o.detach().clone().requires_grad_(True)
     reference_a = wo_a.detach().clone().requires_grad_(True)
     reference_b = wo_b.detach().clone().requires_grad_(True)
     reference = functional(reference_o, reference_a, reference_b)
 
     candidate = _o_projection(
-        functional,
+        visible_with_intermediate,
         o,
         wo_a,
         wo_b,

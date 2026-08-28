@@ -59,8 +59,18 @@ def test_real_flashmla_sparse_backward_matches_reference_direction() -> None:
     dq, dkv = _default_sparse_backward(
         q, kv, out, grad_out, lse, sink, indices, scale, lengths
     )
+    dq_repeat, dkv_repeat = _default_sparse_backward(
+        q, kv, out, grad_out, lse, sink, indices, scale, lengths
+    )
     assert torch.isfinite(dq).all()
     assert torch.isfinite(dkv).all()
+    # cuDNN DSA computes DQ deterministically, while DKV uses BF16 atomic
+    # accumulation when multiple queries select the same KV row. Keep the
+    # vendor path, but explicitly bound that known non-deterministic surface.
+    torch.testing.assert_close(dq, dq_repeat, rtol=0, atol=0)
+    dkv_delta = (dkv.float() - dkv_repeat.float()).norm()
+    assert dkv_delta / dkv.float().norm() < 1e-4
+    assert (dkv.float() - dkv_repeat.float()).abs().max() <= 0.03125
 
     with torch.enable_grad():
         q_ref = q.detach().float().requires_grad_(True)

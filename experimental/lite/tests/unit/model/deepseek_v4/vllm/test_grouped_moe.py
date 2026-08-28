@@ -33,6 +33,17 @@ def _visible_reference(hidden, counts, limit, _weight_cache, w13, w2):
     return _reference(hidden, counts, limit, w13, w2)
 
 
+def _visible_reference_with_gate_up(
+    hidden, counts, limit, _weight_cache, w13, w2
+):
+    gate_up = []
+    offset = 0
+    for count, fc1 in zip(counts, w13, strict=True):
+        gate_up.append(F.linear(hidden[offset : offset + count], fc1))
+        offset += count
+    return _reference(hidden, counts, limit, w13, w2), torch.cat(gate_up)
+
+
 @pytest.mark.parametrize(
     ("scale_format_name", "expected_quantizer", "expected_use_ue8m0"),
     [
@@ -188,12 +199,13 @@ def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
     monkeypatch.setattr(
         vllm_grouped_moe,
         "_vllm_grouped_forward",
-        _visible_reference,
+        _visible_reference_with_gate_up,
     )
     weight_cache = Mock()
 
     def reference_backward(
         hidden_states,
+        _gate_up,
         grad_output,
         expert_counts,
         swiglu_limit,
@@ -282,7 +294,7 @@ def test_te_grouped_bf16_backward_matches_reference_bitwise(monkeypatch) -> None
     monkeypatch.setattr(
         vllm_grouped_moe,
         "_vllm_grouped_forward",
-        _visible_reference,
+        _visible_reference_with_gate_up,
     )
     weight_cache = Mock()
     output = vllm_grouped_moe.VLLMGroupedMoEWithBF16Backward.apply(

@@ -105,30 +105,20 @@ def o_projection_visible(
     nope_dim: int,
     rope_dim: int,
     o_lora_rank: int,
-) -> Tensor:
-    with torch.no_grad():
-        canonical_wa = quantize_block_fp8_weight(wo_a)
-        wa_q, wa_s = deepgemm_post_process_fp8_weight_block(
-            wq=canonical_wa.qweight,
-            ws=canonical_wa.scales,
-            quant_block_shape=(128, 128),
-            use_e8m0=True,
-            is_bmm=True,
-            bmm_batch_size=n_groups,
-        )
-        packed_wa = type("_PackedGroupedWeight", (), {})()
-        packed_wa.weight = wa_q
-        packed_wa.weight_scale = wa_s
+    return_intermediate: bool = False,
+    packed_weights: tuple[Any, torch.Tensor, torch.Tensor] | None = None,
+) -> Tensor | tuple[Tensor, Tensor]:
+    if packed_weights is None:
+        with torch.no_grad():
+            packed_weights = _pack_o_projection_weights(wo_a, wo_b, n_groups)
+    packed_wa, wb_q, wb_s = packed_weights
 
-        canonical_wb = quantize_block_fp8_weight(wo_b)
-        wb_q, wb_s = deepgemm_post_process_fp8_weight_block(
-            wq=canonical_wb.qweight,
-            ws=canonical_wb.scales,
-            quant_block_shape=(128, 128),
-            use_e8m0=True,
-        )
+    intermediate = None
 
     def packed_wb(value: Tensor) -> Tensor:
+        nonlocal intermediate
+        if return_intermediate:
+            intermediate = value
         aligned = bool(envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES)
         aq, a_s = per_token_group_quant_fp8(
             value,
@@ -150,7 +140,7 @@ def o_projection_visible(
 
     with torch.no_grad():
         recipe, aligned = compute_fp8_einsum_recipe()
-        return deep_gemm_fp8_o_proj(
+        output = deep_gemm_fp8_o_proj(
             o,
             positions,
             cos_sin_cache,
@@ -164,6 +154,40 @@ def o_projection_visible(
             einsum_recipe=recipe,
             tma_aligned_scales=aligned,
         )
+    if not return_intermediate:
+        return output
+    if intermediate is None:
+        raise RuntimeError("vLLM o-projection did not expose its BF16 intermediate")
+    return output, intermediate
+
+
+def _pack_o_projection_weights(
+    wo_a: Tensor,
+    wo_b: Tensor,
+    n_groups: int,
+) -> tuple[Any, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        canonical_wa = quantize_block_fp8_weight(wo_a)
+        wa_q, wa_s = deepgemm_post_process_fp8_weight_block(
+            wq=canonical_wa.qweight,
+            ws=canonical_wa.scales,
+            quant_block_shape=(128, 128),
+            use_e8m0=True,
+            is_bmm=True,
+            bmm_batch_size=n_groups,
+        )
+        packed_wa = type("_PackedGroupedWeight", (), {})()
+        packed_wa.weight = wa_q
+        packed_wa.weight_scale = wa_s
+
+        canonical_wb = quantize_block_fp8_weight(wo_b)
+        wb_q, wb_s = deepgemm_post_process_fp8_weight_block(
+            wq=canonical_wb.qweight,
+            ws=canonical_wb.scales,
+            quant_block_shape=(128, 128),
+            use_e8m0=True,
+        )
+    return packed_wa, wb_q, wb_s
 
 
 def _inverse_rope(o, positions, cache, nope_dim, rope_dim):
@@ -254,8 +278,13 @@ class _OProjectionVJP(torch.autograd.Function):
         rope_dim: int,
         o_lora_rank: int,
     ) -> torch.Tensor:
-        output = visible_op(o, wo_a, wo_b)
-        ctx.save_for_backward(o, wo_a, wo_b, positions, cos_sin_cache)
+        visible_result = visible_op(o, wo_a, wo_b)
+        if not isinstance(visible_result, tuple) or len(visible_result) != 2:
+            raise RuntimeError(
+                "training o-projection must return (visible_output, bf16_intermediate)"
+            )
+        output, z = visible_result
+        ctx.save_for_backward(o, z, wo_a, wo_b, positions, cos_sin_cache)
         ctx.versions = parameter_versions((wo_a, wo_b))
         ctx.n_groups = n_groups
         ctx.nope_dim = nope_dim
@@ -270,7 +299,7 @@ class _OProjectionVJP(torch.autograd.Function):
 
     @staticmethod
     def _backward_impl(ctx: Any, grad_output: torch.Tensor):
-        o, wo_a, wo_b, positions, cos_sin_cache = ctx.saved_tensors
+        o, z, wo_a, wo_b, positions, cos_sin_cache = ctx.saved_tensors
         check_parameter_versions((wo_a, wo_b), ctx.versions)
         n_groups = ctx.n_groups
         rank = ctx.o_lora_rank
@@ -287,17 +316,6 @@ class _OProjectionVJP(torch.autograd.Function):
         wa_mats = tuple(wa_packed.unbind(0))
         splits = (tokens,) * n_groups
 
-        with _nvtx_range("o_projection_backward/recompute"):
-            z_packed = o.new_empty((n_groups, tokens, rank))
-            _te_grouped_gemm(
-                wa_mats,
-                grouped_mats,
-                z_packed.view(n_groups * tokens, rank),
-                activation_dtype=activation_dtype,
-                m_splits=splits,
-                single_output=True,
-            )
-            z = z_packed.transpose(0, 1).contiguous().reshape(tokens, -1)
         with _nvtx_range("o_projection_backward/wo_b_vjp"):
             grad_z, grad_wo_b = native_linear_vjp(
                 grad_output.reshape(tokens, -1),
@@ -429,6 +447,11 @@ class VLLMAttention(CompressedSparseAttention):
         self.indexer_q_linear = DeploymentBlockFP8Adapter(
             cache_weight=cache_deployment_weights
         )
+        self._cache_deployment_weights = cache_deployment_weights
+        self._o_projection_weight_cache: (
+            tuple[tuple[tuple[int, int], tuple[int, int]], tuple[Any, Tensor, Tensor]]
+            | None
+        ) = None
         self._projection_streams: list[torch.cuda.Stream] | None = None
         self._projection_events: list[torch.cuda.Event] | None = None
 
@@ -436,6 +459,28 @@ class VLLMAttention(CompressedSparseAttention):
         self.fused_linear.clear_cache()
         self.q_linear.clear_cache()
         self.indexer_q_linear.clear_cache()
+        self._o_projection_weight_cache = None
+
+    def _packed_o_projection_weights(
+        self,
+        wo_a: Tensor,
+        wo_b: Tensor,
+    ) -> tuple[Any, Tensor, Tensor] | None:
+        if not self._cache_deployment_weights:
+            return None
+        key = (
+            (id(wo_a), wo_a._version),
+            (id(wo_b), wo_b._version),
+        )
+        if (
+            self._o_projection_weight_cache is None
+            or self._o_projection_weight_cache[0] != key
+        ):
+            self._o_projection_weight_cache = (
+                key,
+                _pack_o_projection_weights(wo_a, wo_b, self.config.o_groups),
+            )
+        return self._o_projection_weight_cache[1]
 
     def _output_projection(
         self,
@@ -447,6 +492,11 @@ class VLLMAttention(CompressedSparseAttention):
         nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
         bind_source_scale_to_visible_weight(self.wo_a, "weight", self.wo_a.weight)
         bind_source_scale_to_visible_weight(self.wo_b, "weight", self.wo_b.weight)
+        needs_intermediate = torch.is_grad_enabled()
+        packed_weights = self._packed_o_projection_weights(
+            self.wo_a.weight,
+            self.wo_b.weight,
+        )
         return _o_projection(
             lambda value, wa, wb: o_projection_visible(
                 value,
@@ -459,6 +509,8 @@ class VLLMAttention(CompressedSparseAttention):
                 nope_dim=nope_dim,
                 rope_dim=self.config.qk_rope_head_dim,
                 o_lora_rank=self.config.o_lora_rank,
+                return_intermediate=needs_intermediate,
+                packed_weights=packed_weights,
             ),
             result,
             self.wo_a.weight,
@@ -689,11 +741,36 @@ class VLLMAttention(CompressedSparseAttention):
             hidden_compact = compression_geometry.hidden_compact
             group_ids = compression_geometry.compressed_group_ids
             seq_to_rank_row = compression_geometry.seq_to_rank_row
+            if cp_size == 1:
+                # Preserve the authoritative non-CP request geometry exactly.
+                # CP-local capacities include padding and must not replace the
+                # request-local compressed boundaries in this path.
+                local_compressed_boundaries = compressed_boundaries
+            else:
+                local_boundaries = [0]
+                local_end = global_start + l_local
+                d_comp = 8 if ratio == 4 else ratio
+                for seq_start, seq_end in zip(
+                    sequence_boundaries, sequence_boundaries[1:]
+                ):
+                    owned_start = max(global_start, seq_start)
+                    owned_end = min(local_end, seq_end)
+                    first_group = max(
+                        0,
+                        (owned_start - seq_start - d_comp + ratio - 1) // ratio,
+                    )
+                    last_group = max(0, (owned_end - seq_start) // ratio)
+                    local_boundaries.append(
+                        local_boundaries[-1] + max(0, last_group - first_group)
+                    )
+                local_compressed_boundaries = tuple(local_boundaries)
             if cu_seqlens_compressed.numel() != len(compressed_boundaries):
                 raise RuntimeError(
                     "DS4 host compressed boundaries do not match GPU metadata shape"
                 )
-            if compressed_boundaries[-1] > group_ids.numel():
+            # Host boundaries describe the global sequence, while CP geometry
+            # contains only this rank's compact rows.
+            if cp_size == 1 and compressed_boundaries[-1] > group_ids.numel():
                 raise RuntimeError(
                     "DS4 host compressed terminal exceeds compact GPU rows"
                 )
@@ -730,8 +807,23 @@ class VLLMAttention(CompressedSparseAttention):
                     runtime_metadata=metadata.compressor_metadata,
                     ratio=ratio,
                     head_dim=self.config.head_dim,
-                    compressed_boundaries=compressed_boundaries,
+                    compressed_boundaries=local_compressed_boundaries,
                 )
+                if compressed_graph.shape[0] > group_ids.shape[0]:
+                    raise RuntimeError(
+                        "DS4 official compressor exceeded CP rank capacity"
+                    )
+                if cp_size > 1 and compressed_graph.shape[0] < group_ids.shape[0]:
+                    compressed_graph = torch.cat(
+                        (
+                            compressed_graph,
+                            compressed_graph.new_zeros(
+                                (group_ids.shape[0] - compressed_graph.shape[0],)
+                                + compressed_graph.shape[1:]
+                            ),
+                        ),
+                        dim=0,
+                    )
                 compressed_local = compressed_graph
             else:
                 compressed_local = quantized_main_k_visible(compressed_graph)
@@ -783,8 +875,23 @@ class VLLMAttention(CompressedSparseAttention):
                     runtime_metadata=metadata.indexer_compressor_metadata,
                     ratio=ratio,
                     head_dim=self.config.index_head_dim,
-                    compressed_boundaries=compressed_boundaries,
+                    compressed_boundaries=local_compressed_boundaries,
                 )
+                if index_k_local.shape[0] > group_ids.shape[0]:
+                    raise RuntimeError(
+                        "DS4 official indexer compressor exceeded CP rank capacity"
+                    )
+                if cp_size > 1 and index_k_local.shape[0] < group_ids.shape[0]:
+                    index_k_local = torch.cat(
+                        (
+                            index_k_local,
+                            index_k_local.new_zeros(
+                                (group_ids.shape[0] - index_k_local.shape[0],)
+                                + index_k_local.shape[1:]
+                            ),
+                        ),
+                        dim=0,
+                    )
                 if cp_size > 1:
                     index_k_rank_major, index_k_seq_major = gather_cp_compressed_rows(
                         index_k_local,

@@ -31,6 +31,15 @@ _MHC_ENTRIES = {
 }
 
 
+def _compiled_vjp_or_eager(compiled, eager, *args):
+    if not any(isinstance(arg, torch.Tensor) and arg.is_cuda for arg in args):
+        return eager(*args)
+    try:
+        return compiled(*args)
+    except torch._dynamo.exc.FailOnRecompileLimitHit:
+        return eager(*args)
+
+
 def mhc_kernel(name: str, *args, **kwargs):
     return _MHC_ENTRIES[name](*args, **kwargs)
 
@@ -55,10 +64,36 @@ def native_linear_vjp(
     value: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    x2d = value.reshape(-1, value.shape[-1])
-    dy2d = grad_output.reshape(-1, grad_output.shape[-1]).to(value.dtype)
+    x2d = value.reshape(-1, value.shape[-1]).contiguous()
+    dy2d = (
+        grad_output.reshape(-1, grad_output.shape[-1])
+        .to(value.dtype)
+        .contiguous()
+    )
     if grad_output.shape[:-1] != value.shape[:-1]:
         raise RuntimeError("linear bridge received incompatible grad_output shape")
+    if value.is_cuda:
+        from megatron.lite.primitive.utils.moe import _te_general_gemm
+
+        grad_value = _te_general_gemm(
+            weight.to(dy2d.dtype),
+            dy2d,
+            value.dtype,
+            layout="NN",
+            grad=True,
+        )
+        grad_weight = _te_general_gemm(
+            x2d,
+            dy2d,
+            weight.dtype,
+            layout="NT",
+            grad=True,
+        )
+        if grad_value is not None and grad_weight is not None:
+            return (
+                grad_value[0].reshape(value.shape),
+                grad_weight[0],
+            )
     return (
         torch.mm(dy2d, weight.to(dy2d.dtype)).to(value.dtype).reshape(value.shape),
         torch.mm(dy2d.T, x2d).to(weight.dtype),
@@ -149,11 +184,68 @@ def visible_clamped_swiglu(value: torch.Tensor, limit: float) -> torch.Tensor:
         silu_and_mul_with_clamp(output, value_, float(limit))
         return output
 
-    return visible_functional_vjp(
-        visible_op,
-        lambda value_: swiglu_with_probs(value_, None, float(limit)),
-        (value,),
+    if not torch.is_grad_enabled():
+        return visible_op(value)
+    return _ClampedSwiGLUVJP.apply(visible_op, value, float(limit))
+
+
+def _clamped_swiglu_vjp(
+    grad_output: torch.Tensor,
+    value: torch.Tensor,
+    limit: float,
+) -> torch.Tensor:
+    gate_source, up_source = value.chunk(2, dim=-1)
+    gate = gate_source.float()
+    up = up_source.float()
+    if limit > 0:
+        gate = torch.clamp(gate, max=limit)
+        up = torch.clamp(up, min=-limit, max=limit)
+        gate_mask = gate_source.float() <= limit
+        up_mask = (up_source.float() >= -limit) & (
+            up_source.float() <= limit
+        )
+    else:
+        gate_mask = up_mask = 1.0
+    sigmoid = torch.sigmoid(gate)
+    silu = gate * sigmoid
+    grad = grad_output.float()
+    grad_gate = (
+        grad
+        * up
+        * sigmoid
+        * (1.0 + gate * (1.0 - sigmoid))
+        * gate_mask
     )
+    grad_up = grad * silu * up_mask
+    return torch.cat((grad_gate, grad_up), dim=-1).to(value.dtype)
+
+
+_compiled_clamped_swiglu_vjp = torch.compile(
+    _clamped_swiglu_vjp,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+class _ClampedSwiGLUVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible_op: Callable, value: torch.Tensor, limit: float):
+        output = visible_op(value)
+        ctx.save_for_backward(value)
+        ctx.limit = float(limit)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (value,) = ctx.saved_tensors
+        grad_value = _compiled_vjp_or_eager(
+            _compiled_clamped_swiglu_vjp,
+            _clamped_swiglu_vjp,
+            grad_output,
+            value,
+            ctx.limit,
+        )
+        return None, grad_value, None
 
 
 class _VisibleLinear(torch.autograd.Function):
@@ -230,21 +322,103 @@ def _norm(value: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
     )
 
 
-def rms_norm(visible_op: Callable, value, weight, eps):
-    return visible_functional_vjp(
-        lambda value_, weight_: visible_op(value_, weight_, eps),
-        lambda value_, weight_: _norm(value_, weight_, eps),
-        (value, weight),
-        version_indices=(1,),
+def _rms_norm_vjp(
+    grad_output: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = value.float()
+    w = weight.float()
+    grad = grad_output.float()
+    rstd = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    scaled_grad = grad * w
+    correction = (scaled_grad * x).mean(dim=-1, keepdim=True)
+    grad_value = (scaled_grad * rstd - x * rstd.pow(3) * correction).to(
+        value.dtype
+    )
+    reduce_dims = tuple(range(grad.ndim - 1))
+    grad_weight = (grad * x * rstd).sum(dim=reduce_dims).to(weight.dtype)
+    return grad_value, grad_weight
+
+
+_compiled_rms_norm_vjp = torch.compile(
+    _rms_norm_vjp,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+def _dispatch_rms_norm_vjp(grad_output, value, weight, eps):
+    return _compiled_vjp_or_eager(
+        _compiled_rms_norm_vjp,
+        _rms_norm_vjp,
+        grad_output,
+        value,
+        weight,
+        eps,
     )
 
 
+class _RMSNormVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible_op: Callable, value, weight, eps):
+        output = visible_op(value, weight, eps)
+        ctx.save_for_backward(value, weight)
+        ctx.eps = float(eps)
+        ctx.versions = parameter_versions((weight,))
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, weight = ctx.saved_tensors
+        check_parameter_versions((weight,), ctx.versions)
+        grad_value, grad_weight = _dispatch_rms_norm_vjp(
+            grad_output, value, weight, ctx.eps
+        )
+        return None, grad_value, grad_weight, None
+
+
+def rms_norm(visible_op: Callable, value, weight, eps):
+    if not torch.is_grad_enabled():
+        return visible_op(value, weight, eps)
+    return _RMSNormVJP.apply(visible_op, value, weight, eps)
+
+
+class _FusedQKVRMSNormVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible_op: Callable, q, kv, q_weight, kv_weight, eps):
+        q_out, kv_out = visible_op(q, kv, q_weight, kv_weight, eps)
+        ctx.save_for_backward(q, kv, q_weight, kv_weight)
+        ctx.eps = float(eps)
+        ctx.versions = parameter_versions((q_weight, kv_weight))
+        return q_out, kv_out
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_kv):
+        q, kv, q_weight, kv_weight = ctx.saved_tensors
+        check_parameter_versions((q_weight, kv_weight), ctx.versions)
+        grad_q_value, grad_q_weight = _dispatch_rms_norm_vjp(
+            grad_q, q, q_weight, ctx.eps
+        )
+        grad_kv_value, grad_kv_weight = _dispatch_rms_norm_vjp(
+            grad_kv, kv, kv_weight, ctx.eps
+        )
+        return (
+            None,
+            grad_q_value,
+            grad_kv_value,
+            grad_q_weight,
+            grad_kv_weight,
+            None,
+        )
+
+
 def fused_qkv_rms_norm(visible_op: Callable, q, kv, q_weight, kv_weight, eps):
-    return visible_functional_vjp(
-        lambda q_, kv_, qw_, kvw_: visible_op(q_, kv_, qw_, kvw_, eps),
-        lambda q_, kv_, qw_, kvw_: (_norm(q_, qw_, eps), _norm(kv_, kvw_, eps)),
-        (q, kv, q_weight, kv_weight),
-        version_indices=(2, 3),
+    if not torch.is_grad_enabled():
+        return visible_op(q, kv, q_weight, kv_weight, eps)
+    return _FusedQKVRMSNormVJP.apply(
+        visible_op, q, kv, q_weight, kv_weight, eps
     )
 
 
@@ -264,6 +438,231 @@ def _pre_graph(x, fn, scale, base, *, mult, iters, eps):
 
 def _post_graph(x, residual, post, comb):
     return HyperConnection.post(x, residual, post.squeeze(-1), comb)
+
+
+def _normalization_vjp(
+    grad_output: torch.Tensor,
+    value: torch.Tensor,
+    dim: int,
+    eps: float,
+) -> torch.Tensor:
+    total = value.sum(dim=dim, keepdim=True)
+    denominator = total.clamp(min=eps)
+    grad_value = grad_output / denominator
+    active = total >= eps
+    correction = (grad_output * value).sum(dim=dim, keepdim=True)
+    return grad_value - torch.where(
+        active,
+        correction / denominator.square(),
+        torch.zeros_like(correction),
+    )
+
+
+def _sinkhorn_vjp(
+    grad_output: torch.Tensor,
+    logits: torch.Tensor,
+    iters: int,
+    eps: float,
+) -> torch.Tensor:
+    maximum, maximum_indices = logits.max(dim=-1, keepdim=True)
+    values = [torch.exp(logits - maximum)]
+    comb = values[0]
+    for _ in range(iters):
+        comb = comb / comb.sum(dim=-1, keepdim=True).clamp(min=eps)
+        values.append(comb)
+        comb = comb / comb.sum(dim=-2, keepdim=True).clamp(min=eps)
+        values.append(comb)
+
+    grad = grad_output
+    for iteration in reversed(range(iters)):
+        after_row = values[2 * iteration + 1]
+        before_row = values[2 * iteration]
+        grad = _normalization_vjp(grad, after_row, -2, eps)
+        grad = _normalization_vjp(grad, before_row, -1, eps)
+
+    grad_logits = grad * values[0]
+    grad_maximum = -grad_logits.sum(dim=-1, keepdim=True)
+    return grad_logits.scatter_add(-1, maximum_indices, grad_maximum)
+
+
+_compiled_sinkhorn_vjp = torch.compile(
+    _sinkhorn_vjp,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+def _mhc_pre_vjp(
+    grad_residual,
+    grad_post,
+    grad_comb,
+    grad_hidden,
+    x,
+    fn,
+    scale,
+    base,
+    norm_weight,
+    mult,
+    iters,
+    eps,
+    norm_eps,
+):
+    residual = x
+    broadcast = residual.ndim == 2
+    if broadcast:
+        residual = residual.unsqueeze(-2).expand(
+            *residual.shape[:-1], mult, residual.shape[-1]
+        )
+    flat = residual.flatten(-2)
+    flat_norm = flat.norm(dim=-1, keepdim=True)
+    rms_inv = 1.0 / (flat_norm / math.sqrt(flat.shape[-1]) + eps)
+    fn_value = fn.to(flat.dtype)
+    linear = F.linear(flat, fn_value)
+    mixes = linear * rms_inv
+    split_sizes = [mult, mult, mult * mult]
+    pre_mix, post_mix, comb_mix = mixes.split(split_sizes, dim=-1)
+    base_pre, base_post, base_comb = base.to(mixes.dtype).split(
+        split_sizes, dim=-1
+    )
+    scale_value = scale.to(mixes.dtype)
+    pre = torch.sigmoid(pre_mix * scale_value[0] + base_pre)
+    post = 2 * torch.sigmoid(post_mix * scale_value[1] + base_post)
+    comb_logits = (
+        comb_mix * scale_value[2] + base_comb
+    ).view(*comb_mix.shape[:-1], mult, mult)
+
+    hidden = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)
+    grad_hidden_input, grad_norm_weight = _rms_norm_vjp(
+        grad_hidden, hidden, norm_weight, norm_eps
+    )
+    grad_pre = (grad_hidden_input.unsqueeze(-2) * residual).sum(dim=-1)
+    grad_residual_value = grad_hidden_input.unsqueeze(-2) * pre.unsqueeze(-1)
+    if grad_residual is not None:
+        grad_residual_value = grad_residual_value + grad_residual.to(
+            grad_residual_value.dtype
+        )
+
+    grad_pre_logits = grad_pre * pre * (1.0 - pre)
+    grad_post_value = grad_post.squeeze(-1).to(post.dtype)
+    grad_post_logits = grad_post_value * post * (1.0 - post * 0.5)
+    grad_comb_logits = _sinkhorn_vjp(
+        grad_comb.to(comb_logits.dtype), comb_logits, iters, eps
+    )
+    grad_comb_flat = grad_comb_logits.flatten(-2)
+    grad_mixes = torch.cat(
+        (
+            grad_pre_logits * scale_value[0],
+            grad_post_logits * scale_value[1],
+            grad_comb_flat * scale_value[2],
+        ),
+        dim=-1,
+    )
+    grad_base = torch.cat(
+        (grad_pre_logits, grad_post_logits, grad_comb_flat), dim=-1
+    ).flatten(0, -2).sum(dim=0).to(base.dtype)
+    grad_scale = torch.stack(
+        (
+            (grad_pre_logits * pre_mix).sum(),
+            (grad_post_logits * post_mix).sum(),
+            (grad_comb_flat * comb_mix).sum(),
+        )
+    ).to(scale.dtype)
+
+    grad_linear = grad_mixes * rms_inv
+    flat_2d = flat.flatten(0, -2)
+    grad_linear_2d = grad_linear.flatten(0, -2)
+    grad_fn = torch.matmul(
+        grad_linear_2d.transpose(0, 1), flat_2d
+    ).to(fn.dtype)
+    grad_flat = torch.matmul(grad_linear, fn_value)
+    grad_rms_inv = (grad_mixes * linear).sum(dim=-1, keepdim=True)
+    norm_scale = math.sqrt(flat.shape[-1])
+    grad_norm = -grad_rms_inv * rms_inv.square() / norm_scale
+    grad_flat = grad_flat + torch.where(
+        flat_norm > 0,
+        grad_norm * flat / flat_norm.clamp_min(torch.finfo(flat.dtype).tiny),
+        torch.zeros_like(flat),
+    )
+    grad_residual_value = grad_residual_value + grad_flat.view_as(residual)
+    grad_x = (
+        grad_residual_value.sum(dim=-2)
+        if broadcast
+        else grad_residual_value
+    ).to(x.dtype)
+    return grad_x, grad_fn, grad_scale, grad_base, grad_norm_weight
+
+
+_compiled_mhc_pre_vjp = torch.compile(
+    _mhc_pre_vjp,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+class _MHCPreVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        visible_op: Callable,
+        x,
+        fn,
+        scale,
+        base,
+        norm_weight,
+        mult,
+        iters,
+        eps,
+        norm_eps,
+    ):
+        outputs = visible_op(x, fn, scale, base, norm_weight)
+        ctx.save_for_backward(x, fn, scale, base, norm_weight)
+        ctx.mult = int(mult)
+        ctx.iters = int(iters)
+        ctx.eps = float(eps)
+        ctx.norm_eps = float(norm_eps)
+        ctx.versions = parameter_versions((fn, scale, base, norm_weight))
+        return outputs
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_residual,
+        grad_post,
+        grad_comb,
+        grad_hidden,
+    ):
+        x, fn, scale, base, norm_weight = ctx.saved_tensors
+        check_parameter_versions((fn, scale, base, norm_weight), ctx.versions)
+        results = _compiled_vjp_or_eager(
+            _compiled_mhc_pre_vjp,
+            _mhc_pre_vjp,
+            grad_residual,
+            grad_post,
+            grad_comb,
+            grad_hidden,
+            x,
+            fn,
+            scale,
+            base,
+            norm_weight,
+            ctx.mult,
+            ctx.iters,
+            ctx.eps,
+            ctx.norm_eps,
+        )
+        grad_x, grad_fn, grad_scale, grad_base, grad_norm_weight = results
+        return (
+            None,
+            grad_x,
+            grad_fn,
+            grad_scale,
+            grad_base,
+            grad_norm_weight,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class _MHCPostVJP(torch.autograd.Function):
@@ -286,9 +685,18 @@ class _MHCPostVJP(torch.autograd.Function):
         grad_post = (grad * x.to(dtype).unsqueeze(-2)).sum(dim=-1)
         if post.ndim == grad_post.ndim + 1:
             grad_post = grad_post.unsqueeze(-1)
-        grad_residual = torch.matmul(
-            comb_value.transpose(-2, -1), grad
-        ).to(residual.dtype)
+        if grad.is_cuda:
+            grad_residual = mhc_kernel(
+                "post",
+                torch.zeros_like(x),
+                grad,
+                torch.zeros_like(post, dtype=torch.float32),
+                comb_value.float().contiguous(),
+            ).to(residual.dtype)
+        else:
+            grad_residual = torch.matmul(
+                comb_value.transpose(-2, -1), grad
+            ).to(residual.dtype)
         grad_comb = torch.matmul(
             grad, residual_value.transpose(-2, -1)
         ).to(comb.dtype)
@@ -308,18 +716,19 @@ def mhc_pre_broadcast(
     eps: float,
     norm_eps: float,
 ):
-    def functional(x_, fn_, scale_, base_, norm_weight_):
-        residual, post, comb, hidden = _pre_graph(
-            x_, fn_, scale_, base_, mult=mult, iters=iters, eps=eps
-        )
-        hidden = F.rms_norm(hidden, (hidden.shape[-1],), norm_weight_, norm_eps)
-        return residual, post, comb, hidden
-
-    return visible_functional_vjp(
+    if not torch.is_grad_enabled():
+        return visible_op(x, fn, scale, base, norm_weight)
+    return _MHCPreVJP.apply(
         visible_op,
-        functional,
-        (x, fn, scale, base, norm_weight),
-        version_indices=(1, 2, 3, 4),
+        x,
+        fn,
+        scale,
+        base,
+        norm_weight,
+        mult,
+        iters,
+        eps,
+        norm_eps,
     )
 
 
@@ -330,13 +739,90 @@ def mhc_post(visible_op: Callable, x, residual, post, comb):
 
 
 def mhc_head(visible_op: Callable, x, fn, scale, base, *, eps: float):
-    def functional(x_, fn_, scale_, base_):
-        flat = x_.flatten(-2).float()
-        rstd = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
-        mixes = F.linear(flat, fn_.float()) * rstd
-        pre = torch.sigmoid(mixes * scale_.float() + base_.float()) + eps
-        return torch.sum(pre.unsqueeze(-1) * x_.float(), dim=-2).to(x_.dtype)
-
-    return visible_functional_vjp(
-        visible_op, functional, (x, fn, scale, base), version_indices=(1, 2, 3)
+    if not torch.is_grad_enabled():
+        return visible_op(x, fn, scale, base)
+    return _MHCHeadVJP.apply(
+        visible_op, x, fn, scale, base, float(eps)
     )
+
+
+def _mhc_head_vjp(grad_output, x, fn, scale, base, eps):
+    flat = x.flatten(-2).float()
+    fn_value = fn.float()
+    scale_value = scale.float()
+    base_value = base.float()
+    rstd = torch.rsqrt(
+        flat.square().mean(dim=-1, keepdim=True) + eps
+    )
+    raw_mixes = F.linear(flat, fn_value)
+    mixes = raw_mixes * rstd
+    sigmoid = torch.sigmoid(mixes * scale_value + base_value)
+
+    grad = grad_output.float()
+    grad_pre = (grad.unsqueeze(-2) * x.float()).sum(dim=-1)
+    grad_logits = grad_pre * sigmoid * (1.0 - sigmoid)
+    reduce_dims = tuple(range(grad_logits.ndim - 1))
+    grad_scale = (grad_logits * mixes).sum(dim=reduce_dims)
+    grad_base = grad_logits.sum(dim=reduce_dims)
+
+    grad_mixes = grad_logits * scale_value
+    grad_raw = grad_mixes * rstd
+    grad_rstd = (grad_mixes * raw_mixes).sum(dim=-1, keepdim=True)
+    grad_flat = torch.matmul(grad_raw, fn_value)
+    grad_flat = grad_flat - (
+        grad_rstd * flat * rstd.pow(3) / flat.shape[-1]
+    )
+    grad_fn = torch.matmul(
+        grad_raw.reshape(-1, grad_raw.shape[-1]).transpose(0, 1),
+        flat.reshape(-1, flat.shape[-1]),
+    )
+
+    direct_grad_x = grad.unsqueeze(-2) * (sigmoid + eps).unsqueeze(-1)
+    grad_x = direct_grad_x + grad_flat.reshape_as(x)
+    return (
+        grad_x.to(x.dtype),
+        grad_fn.to(fn.dtype),
+        grad_scale.to(scale.dtype),
+        grad_base.to(base.dtype),
+    )
+
+
+_compiled_mhc_head_vjp = torch.compile(
+    _mhc_head_vjp,
+    fullgraph=True,
+    dynamic=False,
+)
+
+
+class _MHCHeadVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible_op: Callable, x, fn, scale, base, eps):
+        output = visible_op(x, fn, scale, base)
+        ctx.save_for_backward(x, fn, scale, base)
+        ctx.eps = float(eps)
+        ctx.versions = parameter_versions((fn, scale, base))
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, fn, scale, base = ctx.saved_tensors
+        check_parameter_versions((fn, scale, base), ctx.versions)
+        results = _compiled_vjp_or_eager(
+            _compiled_mhc_head_vjp,
+            _mhc_head_vjp,
+            grad_output,
+            x,
+            fn,
+            scale,
+            base,
+            ctx.eps,
+        )
+        grad_x, grad_fn, grad_scale, grad_base = results
+        return (
+            None,
+            grad_x,
+            grad_fn,
+            grad_scale,
+            grad_base,
+            None,
+        )

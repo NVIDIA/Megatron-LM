@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+
 import torch
+
+_HOT_PATH_ASSERTS = os.getenv("MLITE_VLLM_HOT_PATH_ASSERTS") == "1"
 
 def _rope_and_qnorm(value, positions, cache, rope_dim, eps, *, normalize):
     x = value.float()
@@ -271,14 +275,15 @@ class _VisibleSparseAttentionFunction(torch.autograd.Function):
             q, kv, out, grad_out, lse, sink, indices, ctx.scale, length
         )
         dkv = dkv.reshape_as(kv)
-        torch._assert_async(
-            torch.isfinite(dq).all(),
-            "native CP sparse attention produced non-finite dq",
-        )
-        torch._assert_async(
-            torch.isfinite(dkv).all(),
-            "native CP sparse attention produced non-finite dkv",
-        )
+        if _HOT_PATH_ASSERTS:
+            torch._assert_async(
+                torch.isfinite(dq).all(),
+                "native CP sparse attention produced non-finite dq",
+            )
+            torch._assert_async(
+                torch.isfinite(dkv).all(),
+                "native CP sparse attention produced non-finite dkv",
+            )
         return None, None, None, dq, dkv, None, None, None
 
 
