@@ -19,9 +19,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.csa import (
-    CompressedSparseAttentionBuilder,
-)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -60,7 +57,7 @@ class DSv4HybridSelfAttentionSubmodules:
     linear_q_down_proj: Union[ModuleSpec, type] = None
     linear_q_up_proj: Union[ModuleSpec, type] = None
     linear_kv_proj: Union[ModuleSpec, type] = None
-    core_attention: CompressedSparseAttentionBuilder | None = None
+    core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -162,9 +159,8 @@ class DSv4HybridAttention(Attention):
                 cp_group=self.pg_collection.cp,
             )
 
-        if submodules.core_attention is None:
-            raise ValueError("DSv4 hybrid attention requires a core-attention builder")
-        self.core_attention = submodules.core_attention(
+        self.core_attention = build_module(
+            submodules.core_attention,
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -188,13 +184,17 @@ class DSv4HybridAttention(Attention):
         group_proj_in_size = self.query_projection_size // self.config.o_groups
         group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
 
+        group_proj_device = (
+            'cpu' if self.config.use_cpu_initialization else torch.cuda.current_device()
+        )
         _linear_o_group_proj = torch.empty(
             group_proj_out_size,
             group_proj_in_size,
-            device=torch.cuda.current_device(),
+            device=group_proj_device,
             dtype=self.config.params_dtype,
         )
-        self.config.init_method(_linear_o_group_proj)
+        if self.config.perform_initialization:
+            self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank

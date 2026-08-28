@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from functools import partial
 from unittest.mock import patch
 
 import pytest
@@ -109,11 +108,11 @@ def _make_config(
 def _make_attention_spec(config):
     """Build the full DSv4HybridSelfAttention ModuleSpec using the canonical spec builder."""
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention_module_specs import (
-        get_dsv4_hybrid_module_spec_for_backend,
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_experimental_attention_variant_module_spec,
     )
 
-    return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
+    return get_experimental_attention_variant_module_spec(config=config, backend=TESpecProvider())
 
 
 def test_attention_latent_norm_epsilon_defaults_to_layernorm_epsilon():
@@ -131,7 +130,10 @@ def test_attention_latent_norm_epsilon_accepts_override():
 
 
 def test_module_spec_is_built_from_explicit_backend():
-    """The neutral spec builder should use only its explicitly supplied backend."""
+    """The production selector should build DSv4 from its explicitly supplied backend."""
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_experimental_attention_variant_module_spec,
+    )
     from megatron.core.transformer.experimental_attention_variant.csa import (
         CompressedSparseAttention,
         Compressor,
@@ -140,9 +142,7 @@ def test_module_spec_is_built_from_explicit_backend():
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
         DSv4HybridSelfAttention,
     )
-    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention_module_specs import (
-        get_dsv4_hybrid_module_spec_for_backend,
-    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
 
     class Linear:
         pass
@@ -169,26 +169,75 @@ def test_module_spec_is_built_from_explicit_backend():
         def layer_norm(self, rms_norm=False, for_qk=False, has_residual=False):
             return Norm
 
-    spec = get_dsv4_hybrid_module_spec_for_backend(_make_config(), Backend())
+    spec = get_experimental_attention_variant_module_spec(_make_config(), Backend())
 
     assert spec.module is DSv4HybridSelfAttention
     assert spec.submodules.linear_q_down_proj is Linear
     assert spec.submodules.linear_q_up_proj is ColumnParallelLinear
     assert spec.submodules.linear_kv_proj is ColumnParallelLinear
     assert spec.submodules.linear_proj is RowParallelLinear
-    core_attention_builder = spec.submodules.core_attention
-    assert isinstance(core_attention_builder, partial)
-    assert core_attention_builder.func is CompressedSparseAttention
+    core_attention_spec = spec.submodules.core_attention
+    assert isinstance(core_attention_spec, ModuleSpec)
+    assert core_attention_spec.module is CompressedSparseAttention
 
-    core_attention_submodules = core_attention_builder.keywords["submodules"]
-    compressor_builder = core_attention_submodules.compressor
-    assert isinstance(compressor_builder, partial)
-    assert compressor_builder.func is Compressor
+    core_attention_submodules = core_attention_spec.submodules
+    compressor_spec = core_attention_submodules.compressor
+    assert isinstance(compressor_spec, ModuleSpec)
+    assert compressor_spec.module is Compressor
 
-    indexer_builder = core_attention_submodules.indexer
-    assert isinstance(indexer_builder, partial)
-    assert indexer_builder.func is CSAIndexer
-    assert indexer_builder.keywords["submodules"].compressor is compressor_builder
+    indexer_spec = core_attention_submodules.indexer
+    assert isinstance(indexer_spec, ModuleSpec)
+    assert indexer_spec.module is CSAIndexer
+    assert indexer_spec.submodules.compressor is compressor_spec
+
+
+def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
+    """The custom grouped projection follows the standard CPU/no-init constructor contract."""
+    from megatron.core.transformer import identity_op
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    class SizeOneGroup:
+        def size(self) -> int:
+            return 1
+
+    def unexpected_cuda_device() -> None:
+        raise AssertionError("CPU initialization must not query the current CUDA device")
+
+    def unexpected_parameter_init(_tensor: torch.Tensor) -> None:
+        raise AssertionError("perform_initialization=False must skip parameter initialization")
+
+    monkeypatch.setattr(torch.cuda, "current_device", unexpected_cuda_device)
+    monkeypatch.setattr(dsv4_attention, "RotaryEmbedding", identity_op.IdentityOp)
+    monkeypatch.setattr(dsv4_attention, "TELinear", identity_op.IdentityOp)
+
+    config = _make_config(perform_initialization=False, csa_compress_ratios=[0, 0, 0, 0])
+    config.init_method = unexpected_parameter_init
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = SizeOneGroup()
+    pg_collection.cp = SizeOneGroup()
+    submodules = dsv4_attention.DSv4HybridSelfAttentionSubmodules(
+        q_layernorm=identity_op.IdentityOp,
+        kv_layernorm=identity_op.IdentityOp,
+        linear_q_down_proj=identity_op.IdentityOp,
+        linear_q_up_proj=identity_op.IdentityOp,
+        linear_kv_proj=identity_op.IdentityOp,
+        core_attention=ModuleSpec(module=identity_op.IdentityOp),
+        linear_proj=identity_op.IdentityOp,
+    )
+
+    attention = dsv4_attention.DSv4HybridSelfAttention(
+        config=config,
+        submodules=submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=pg_collection,
+        compress_ratio=0,
+    )
+
+    assert attention.linear_o_group_proj.device.type == "cpu"
 
 
 def test_config_includes_mtp_ratio_and_derives_dimensions():
