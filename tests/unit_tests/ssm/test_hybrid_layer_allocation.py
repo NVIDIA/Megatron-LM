@@ -79,6 +79,7 @@ class TestValidateSegmentLayers:
             ("GEGEGE*E", ['G', 'E', 'G', 'E', 'G', 'E', '*', 'E']),
             ("MDMD", ['M', 'D', 'M', 'D']),
             ("M+M+", ['M', '+', 'M', '+']),
+            ("WECEH+", ['W', 'E', 'C', 'E', 'H', '+']),
         ]
         for pattern, expected in test_cases:
             result = validate_segment_layers(pattern)
@@ -107,6 +108,13 @@ class TestValidateSegmentLayers:
             # as DSA: * uses the model-level rotary_pos_emb while + uses MLA's
             # own decoupled RoPE).
             validate_segment_layers("M+M*-")
+
+    def test_dsv4_attention_symbols(self):
+        assert {Symbols.WINDOW, Symbols.CSA, Symbols.HCA, Symbols.MLA} <= Symbols.MLA_ATTENTION
+        assert {Symbols.WINDOW, Symbols.CSA, Symbols.HCA} <= Symbols.ATTENTION_LAYERS
+        assert validate_segment_layers("WDCH+") == ["W", "D", "C", "H", "+"]
+        with pytest.raises(ValueError):
+            validate_segment_layers("W*C")
 
 
 @pytest.mark.internal
@@ -317,75 +325,96 @@ class TestGetHybridLayerCounts:
     def test_simple_pattern(self):
         assert get_hybrid_layer_counts("M*M*") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_all_layer_types(self):
         # Not allowed to have both standard Attention and MLA/DSA, so we do separate asserts.
         assert get_hybrid_layer_counts("MG*-E") == {
             '*': 1,
+            'C': 0,
             'D': 0,
             'G': 1,
+            'H': 0,
             'M': 1,
             '+': 0,
             '-': 1,
             'E': 1,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("MGD-E") == {
             '*': 0,
+            'C': 0,
             'D': 1,
             'G': 1,
+            'H': 0,
             'M': 1,
             '+': 0,
             '-': 1,
             'E': 1,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("MG+-E") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 1,
+            'H': 0,
             'M': 1,
             '+': 1,
             '-': 1,
             'E': 1,
+            'W': 0,
         }
 
     def test_with_pipes(self):
         # Pipes should be skipped in counting
         assert get_hybrid_layer_counts("M*|M*") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
             '*': 1,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 4,
             '+': 0,
             '-': 4,
             'E': 0,
+            'W': 0,
         }
 
     def test_with_mtp(self):
         # MTP pattern "MM" repeated 2 depths -> 4 extra mamba layers
         assert get_hybrid_layer_counts("M*M*/MM/MM") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 6,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_with_pipes_and_mtp(self):
@@ -393,91 +422,115 @@ class TestGetHybridLayerCounts:
         # MTP: MM x 2 depths -> +4 mamba
         assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {
             '*': 1,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 8,
             '+': 0,
             '-': 4,
             'E': 0,
+            'W': 0,
         }
 
     def test_moe_pattern(self):
         assert get_hybrid_layer_counts("MEME") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 2,
+            'W': 0,
         }
 
     def test_mtp_with_attention(self):
         # MTP pattern "*M" repeated 3 depths -> 3 attn + 3 mamba from MTP
         assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {
             '*': 3,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 7,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_gdn_pattern(self):
         assert get_hybrid_layer_counts("GMGM") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 2,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_gdn_hybrid_pattern(self):
         # GDN + Mamba + Attention
         assert get_hybrid_layer_counts("G*GM*") == {
             '*': 2,
+            'C': 0,
             'D': 0,
             'G': 2,
+            'H': 0,
             'M': 1,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_dsa_pattern(self):
         assert get_hybrid_layer_counts("DMDM") == {
             '*': 0,
+            'C': 0,
             'D': 2,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_mla_pattern(self):
         assert get_hybrid_layer_counts("+M+M") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 2,
             '+': 2,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
     def test_empty_pattern(self):
         assert get_hybrid_layer_counts("") == {
             '*': 0,
+            'C': 0,
             'D': 0,
             'G': 0,
+            'H': 0,
             'M': 0,
             '+': 0,
             '-': 0,
             'E': 0,
+            'W': 0,
         }
 
 
@@ -761,7 +814,7 @@ class TestGetLayerMapsFromLayerTypeList:
         """Standard symbols each produce a single-entry map at local index 0."""
         maps = get_layer_maps_from_layer_type_list(["*", "M", "-", "E"])
         # We always get all symbols returned, not only those contained in the pattern.
-        assert len(maps) == 7
+        assert len(maps) == len(Symbols.VALID_LAYERS)
         attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
             Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
         )(maps)
@@ -822,6 +875,13 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mamba_map == {1: 0, 3: 1}
         assert mlp_map == {}
         assert moe_map == {}
+
+    def test_dsv4_attention_variants(self):
+        """C/H/W layers get independent maps and retain their local ordering."""
+        maps = get_layer_maps_from_layer_type_list(["C", "H", "W", "C"])
+        assert maps[Symbols.CSA] == {0: 0, 3: 1}
+        assert maps[Symbols.HCA] == {1: 0}
+        assert maps[Symbols.WINDOW] == {2: 0}
 
     def test_mixed_dsa_and_mla(self):
         """D and + can coexist (both are MLA-based and use decoupled RoPE)."""

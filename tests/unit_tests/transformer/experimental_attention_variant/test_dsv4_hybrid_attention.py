@@ -268,6 +268,36 @@ def test_config_accepts_hybrid_model_ratio_tail():
     assert config.csa_compress_ratios == [0, 4, 128, 4]
 
 
+def test_hybrid_stack_spec_assigns_fixed_ratios_without_mutating_base_spec():
+    """Each config-aware build gets private C/H/W specs with the DSv4 fixed ratios."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_dsv4_stack_spec,
+        hybrid_stack_spec,
+    )
+
+    first = hybrid_dsv4_stack_spec(_make_config())
+    second = hybrid_dsv4_stack_spec(_make_config())
+    baseline = hybrid_stack_spec.submodules
+
+    assert first.submodules is not baseline
+    assert second.submodules is not first.submodules
+    assert first.submodules.dsa_layer is baseline.dsa_layer
+    assert first.submodules.mla_layer is baseline.mla_layer
+
+    first_attentions = [
+        first.submodules.csa_layer.submodules.self_attention,
+        first.submodules.hca_layer.submodules.self_attention,
+        first.submodules.window_layer.submodules.self_attention,
+    ]
+    second_attentions = [
+        second.submodules.csa_layer.submodules.self_attention,
+        second.submodules.hca_layer.submodules.self_attention,
+        second.submodules.window_layer.submodules.self_attention,
+    ]
+    assert [spec.params["compress_ratio"] for spec in first_attentions] == [4, 128, 0]
+    assert all(left is not right for left, right in zip(first_attentions, second_attentions))
+
+
 def test_constructor_requires_explicit_process_groups():
     """Production DSv4 construction must not read process groups from global MPU state."""
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (

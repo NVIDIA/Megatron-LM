@@ -927,10 +927,9 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and (
-            Symbols.MLA in args.hybrid_layer_pattern
-            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    # All MLA-based hybrid attention symbols use MLA projections.
+    if args.hybrid_layer_pattern and any(
+        symbol in args.hybrid_layer_pattern for symbol in Symbols.MLA_ATTENTION
     ):
         args.multi_latent_attention = True
 
