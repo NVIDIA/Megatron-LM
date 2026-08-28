@@ -413,7 +413,7 @@ def _step_reporter(trace: StepTrace) -> None:
 
 def _benchmark_config_snapshot(cfg: BenchCliConfig) -> dict[str, Any]:
     impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
-    optimizer_backend = None if cfg.no_optimizer else impl_cfg.get("optimizer")
+    optimizer_backend = impl_cfg.get("optimizer")
     return {
         "schema_version": 1,
         "backend": cfg.backend,

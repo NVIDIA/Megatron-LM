@@ -107,6 +107,11 @@ def _global_grad_norm_without_step(handle: ModelHandle) -> float:
     """Report the runtime-aligned global norm without mutating weights or grads."""
     from megatron.lite.primitive.train_step import compute_global_grad_norm
 
+    optimizer = handle._optimizer
+    compute_grad_norm = getattr(optimizer, "compute_grad_norm", None)
+    if callable(compute_grad_norm):
+        return float(compute_grad_norm().float().item())
+
     ps = handle._parallel_state
     chunks = handle._extras.get("model_chunks", [handle._model])
     protocol = handle._extras.get("protocol")

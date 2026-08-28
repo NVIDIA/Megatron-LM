@@ -7,6 +7,7 @@ import json
 import sys
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -207,6 +208,15 @@ def test_no_optimizer_grad_norm_reports_real_gradients_without_mutation():
     torch.testing.assert_close(model.weight.grad, original, rtol=0, atol=0)
 
 
+def test_no_optimizer_grad_norm_uses_sharded_optimizer_path():
+    from examples.bench.session import _global_grad_norm_without_step
+
+    optimizer = SimpleNamespace(compute_grad_norm=lambda: torch.tensor(7.0))
+    handle = ModelHandle(model=torch.nn.Linear(1, 1), optimizer=optimizer)
+
+    assert _global_grad_norm_without_step(handle) == 7.0
+
+
 def test_bench_main_writes_dry_run_output_json(tmp_path):
     from examples.bench.bench import main
 
@@ -272,6 +282,7 @@ def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeyp
             steps=10,
             warmup=5,
             seq_len=16384,
+            no_optimizer=True,
             skip_load_hf_weights=True,
             trace_fingerprints=True,
             impl_cfg_json=(
@@ -283,6 +294,7 @@ def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeyp
 
     assert snapshot["load_hf_weights"] is False
     assert snapshot["optimizer_backend"] == "fsdp2"
+    assert snapshot["schedule"]["no_optimizer"] is True
     assert snapshot["parallel"]["ep"] == 8
     assert snapshot["schedule"]["warmup"] == 5
     assert snapshot["recompute"] == ["full"]

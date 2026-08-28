@@ -163,7 +163,7 @@ class FSDP2Optimizer:
             if grad is not None:
                 grad.mul_(self.expert_sharded_grad_scale)
 
-    def clip_grad_norm(self) -> float:
+    def compute_grad_norm(self) -> torch.Tensor:
         excluded_sharded_param_ids = (
             self._replicated_grad_param_ids
             | self._tp_replicated_grad_param_ids
@@ -253,7 +253,10 @@ class FSDP2Optimizer:
         ):
             all_reduce_scalar_(total_sq, op=dist.ReduceOp.SUM, group=self.ps.pp_group)
 
-        grad_norm = total_sq.sqrt()
+        return total_sq.sqrt()
+
+    def clip_grad_norm(self) -> float:
+        grad_norm = self.compute_grad_norm()
         if torch.isfinite(grad_norm):
             clip_grads_with_sharded_norm_(self.params, self.clip_grad, grad_norm)
         return float(grad_norm.float().item())

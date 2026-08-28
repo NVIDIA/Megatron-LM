@@ -526,7 +526,7 @@ def test_fsdp2_optimizer_uses_scalar_all_reduce_for_all_norm_groups(monkeypatch)
             tp_group=groups.tp,
             pp_group=groups.pp,
         ),
-        clip_grad=100.0,
+        clip_grad=1.0,
         replicated_grad_params=[replicated],
         replicated_grad_norm_group=groups.replicated,
         expert_sharded_grad_params=[expert],
@@ -534,8 +534,15 @@ def test_fsdp2_optimizer_uses_scalar_all_reduce_for_all_norm_groups(monkeypatch)
         tp_replicated_grad_params=[tp_replicated],
     )
 
+    expected_norm = (2.0**2 + 3.0**2 + 4.0**2 + 5.0**2) ** 0.5
+    original_grads = [param.grad.clone() for param in optimizer.params]
+    assert optimizer.compute_grad_norm().item() == pytest.approx(expected_norm)
+    for param, original in zip(optimizer.params, original_grads, strict=True):
+        torch.testing.assert_close(param.grad, original)
+    reduced_groups.clear()
+
     assert optimizer.clip_grad_norm() == pytest.approx(
-        (2.0**2 + 3.0**2 + 4.0**2 + 5.0**2) ** 0.5
+        expected_norm
     )
     assert reduced_groups == [
         groups.dp_cp,
