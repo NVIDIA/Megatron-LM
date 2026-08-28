@@ -140,6 +140,10 @@ class SizeOneGroup:
     def size():
         return 1
 
+    @staticmethod
+    def rank():
+        return 0
+
 
 class PassthroughHyperConnection(torch.nn.Module):
     """Minimal mHC transform that lets the canonical wrapper execute on CPU."""
@@ -556,7 +560,7 @@ def test_mtp_layer_passes_its_depth_to_nested_hybrid_stack(monkeypatch):
 
     monkeypatch.setattr(hybrid_block_module, "HybridStack", _RecordingHybridStack)
     monkeypatch.setattr(
-        allocation_module, "validate_segment_layers", lambda _pattern: [LayerSymbols.MOE]
+        allocation_module, "validate_segment_layers", lambda _pattern, _config: [LayerSymbols.MOE]
     )
     monkeypatch.setattr(mtp_module, "build_module", lambda *_args, **_kwargs: torch.nn.Identity())
 
@@ -582,7 +586,7 @@ def test_mtp_layer_passes_its_depth_to_nested_hybrid_stack(monkeypatch):
         config=config,
         submodules=submodules,
         layer_number=2,
-        pg_collection=SimpleNamespace(cp=None, tp=None),
+        pg_collection=SimpleNamespace(cp=None, tp=None, pp=SizeOneGroup()),
         mtp_layer_pattern="E",
         hybrid_submodules=HybridStackSubmodules(),
         hash_moe_layer_threshold=6,

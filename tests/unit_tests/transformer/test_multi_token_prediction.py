@@ -3379,6 +3379,7 @@ class TestMultiTokenPredictionHybrid:
                 mtp_num_layers=1,
                 use_mup=False,
                 inference_cuda_graph_scope=None,
+                sequence_parallel=False,
             ),
             pre_process=False,
             post_process=True,
