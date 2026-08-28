@@ -34,8 +34,8 @@ class TestInferenceConfig:
         [
             ("torch", "triton"),
             (InferenceGroupedGemmBackend.TORCH, "triton"),
-            ("flashinfer", "flashinfer"),
-            (InferenceGroupedGemmBackend.FLASHINFER, "flashinfer"),
+            ("flashinfer", "triton"),
+            (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
         ],
     )
     def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
