@@ -94,6 +94,19 @@ class TestRotaryEmbedding:
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cpu_get_cos_sin(self):
+        """The fused-RoPE cache path lazily moves CPU-initialized frequencies to CUDA."""
+        assert self.rope_cpu_init.inv_freq.device.type == 'cpu'
+
+        cos, sin = self.rope_cpu_init.get_cos_sin(64)
+        expected_cos, expected_sin = self.rope_gpu_init.get_cos_sin(64)
+
+        assert self.rope_cpu_init.inv_freq.device.type == 'cuda'
+        assert cos.device.type == sin.device.type == 'cuda'
+        assert torch.allclose(cos, expected_cos)
+        assert torch.allclose(sin, expected_sin)
+
 
 class TestQKVRotaryEmbedding:
     def setup_method(self):
@@ -133,7 +146,7 @@ class TestQKVRotaryEmbedding:
         qkv_split_arg_list = [self.kv_channels * 4, self.kv_channels, self.kv_channels]
         # Create input tensors
         qkv = torch.randn(self.seq_len, 1, self.num_heads, self.kv_channels * 6, device="cuda")
-        (query_in, key_in, value_in) = torch.split(qkv, qkv_split_arg_list, dim=3)
+        query_in, key_in, value_in = torch.split(qkv, qkv_split_arg_list, dim=3)
 
         query_in = query_in.reshape(query_in.shape[0], query_in.shape[1], -1, self.kv_channels)
         q_out_ref = apply_rotary_pos_emb(query_in, pos_embed, self.transformer_config)

@@ -451,6 +451,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._reset_pending_kv_imports()
         self.clear_vision_embedding_cache()
         self.context.reset()
+        self.controller._async_sched_logits.clear()
 
         # Request state.
         self.request_counter = Counter()
@@ -1128,6 +1129,7 @@ class DynamicInferenceEngine(AbstractEngine):
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.controller._async_sched_logits.clear()
             recompute_active_ids = active_request_ids
 
             # Reset any partially prefilled requests so they recompute from the start
@@ -2092,7 +2094,8 @@ class DynamicInferenceEngine(AbstractEngine):
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
             if (
-                request_log_probs is not None
+                request.sampling_params.return_log_probs
+                and request_log_probs is not None
                 and request_id not in self.stop_word_being_finished_ids
             ):
                 # Initialize lists if they don't exist
