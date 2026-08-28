@@ -199,7 +199,7 @@ def model_overrides(args: argparse.Namespace) -> dict:
 
 def load_model(args: argparse.Namespace):
     """Load/convert and return the canonical Bridge NemotronOmniModel."""
-    bridge = AutoBridge.from_hf_pretrained(args.hf_model, trust_remote_code=True)
+    bridge = AutoBridge.from_hf_pretrained(args.hf_model, trust_remote_code=False)
     provider = bridge.to_megatron_provider(load_weights=args.megatron_checkpoint is None)
     configure_provider(provider, args)
     provider.initialize_model_parallel(
@@ -235,7 +235,7 @@ def build_tokenizer(model_path: str) -> MegatronTokenizerText:
     return MegatronTokenizerText(
         model_path,
         {"library": "huggingface"},
-        trust_remote_code=True,
+        trust_remote_code=False,
         use_fast=True,
         include_special_tokens=True,
     )

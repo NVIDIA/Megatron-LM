@@ -151,7 +151,7 @@ def configure_provider(provider: Any, args: argparse.Namespace) -> None:
 
 def load_llava_model(args: argparse.Namespace) -> LLaVAModel:
     """Load HF weights explicitly through the historical LLaVA bridge."""
-    auto_bridge = AutoBridge.from_hf_pretrained(args.hf_model, trust_remote_code=True)
+    auto_bridge = AutoBridge.from_hf_pretrained(args.hf_model, trust_remote_code=False)
     llava_bridge = NemotronOmniLlavaBridge()
     provider = llava_bridge.provider_bridge(auto_bridge.hf_pretrained)
     configure_provider(provider, args)
@@ -187,7 +187,7 @@ def build_tokenizer(model_path: str) -> MegatronTokenizerText:
     return MegatronTokenizerText(
         model_path,
         {"library": "huggingface"},
-        trust_remote_code=True,
+        trust_remote_code=False,
         use_fast=True,
         include_special_tokens=True,
     )
