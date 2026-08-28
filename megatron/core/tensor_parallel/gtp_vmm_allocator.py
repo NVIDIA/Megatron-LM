@@ -117,10 +117,11 @@ def _build_vmm_allocator():
             CUmemGenericAllocationHandle handle = {};
             CUresult create_result = cuMemCreate(&handle, mapped_size, &prop, 0);
         #if CUDA_VERSION >= 12030
-            // ncclMemAlloc's fallback: only the auto-added FABRIC bit may drop.
-            if (create_result != CUDA_SUCCESS && fabric_added &&
-                (create_result == CUDA_ERROR_NOT_PERMITTED ||
-                 create_result == CUDA_ERROR_NOT_SUPPORTED)) {
+            // FABRIC is best-effort: the device attribute can report support on nodes
+            // where IMEX is not actually provisioned, and that surfaces under several
+            // error codes -- retry on any failure. Safe because fabric_added means we
+            // added the bit ourselves; a genuine error still fails the retry below.
+            if (create_result != CUDA_SUCCESS && fabric_added) {
                 handle_types &= ~CU_MEM_HANDLE_TYPE_FABRIC;
                 prop.requestedHandleTypes = (CUmemAllocationHandleType)handle_types;
                 create_result = cuMemCreate(&handle, mapped_size, &prop, 0);
@@ -152,11 +153,13 @@ def _build_vmm_allocator():
             CUdeviceptr address = (CUdeviceptr)ptr;
 
             // Recover handle and extent before unmapping invalidates the pointer.
+            // Requirement: the driver must support cuMemRetainAllocationHandle and
+            // cuMemGetAddressRange on cuMemMap'd VMM ranges (the docs only mention
+            // cuMemAlloc, but ncclMemFree relies on this same sequence).
             CUmemGenericAllocationHandle handle = {};
             CU_CHECK(cuMemRetainAllocationHandle(&handle, ptr));
-            CUdeviceptr base = 0;
             size_t mapped_size = 0;
-            CU_CHECK(cuMemGetAddressRange(&base, &mapped_size, address));
+            CU_CHECK(cuMemGetAddressRange(NULL, &mapped_size, address));
             CU_CHECK(cuMemUnmap(address, mapped_size));
             CU_CHECK(cuMemRelease(handle));
             CU_CHECK(cuMemAddressFree(address, mapped_size));
@@ -185,8 +188,10 @@ def _build_vmm_allocator():
     """
     # Same shared build dir as the nccl allocator extension; torch's file lock
     # serializes concurrent builds across local ranks.
+    # Own subdirectory: load_inline writes a fixed main.cpp per build dir, so sharing
+    # nccl_allocator's dir would clobber sources. Torch's file lock serializes ranks.
     module_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    build_dir = os.path.join(module_dir, "build")
+    build_dir = os.path.join(module_dir, "build", "gtp_vmm_allocator")
     os.makedirs(build_dir, exist_ok=True)
     try:
         vmm_allocator = torch.utils.cpp_extension.load_inline(
