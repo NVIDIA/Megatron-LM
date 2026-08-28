@@ -3374,6 +3374,7 @@ class TestMultiTokenPredictionHybrid:
                 fine_grained_activation_offloading=False,
                 freeze_base_model_for_mtp=False,
                 moe_paged_stash=False,
+                moe_n_hash_layers=0,
                 multi_latent_attention=False,
                 mtp_num_layers=1,
                 use_mup=False,

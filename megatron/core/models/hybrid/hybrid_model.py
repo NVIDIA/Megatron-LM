@@ -56,6 +56,50 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
     return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
 
 
+def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) -> int:
+    """Convert a leading hash-MoE count to a global hybrid layer-number threshold."""
+    if n_hash_layers <= 0:
+        return 0
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    global_layer_pattern = (main_pattern or '').replace(Symbols.PIPE, '')
+    moe_layer_numbers = [
+        layer_number
+        for layer_number, layer_type in enumerate(global_layer_pattern, start=1)
+        if layer_type == Symbols.MOE
+    ]
+    if n_hash_layers > len(moe_layer_numbers):
+        raise ValueError(
+            f"moe_n_hash_layers={n_hash_layers} exceeds the {len(moe_layer_numbers)} "
+            "MoE layers in the main hybrid layer pattern."
+        )
+    return moe_layer_numbers[n_hash_layers - 1]
+
+
+def _validate_hash_moe_pipeline_placement(
+    layer_type_list: list[str], layer_offset: int, hash_moe_layer_threshold: int, pre_process: bool
+) -> None:
+    """Reject local hash-MoE layers on a stage that does not own the token IDs."""
+    if hash_moe_layer_threshold <= 0 or pre_process:
+        return
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    local_hash_layer_numbers = [
+        layer_offset + local_layer_number
+        for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
+        if layer_type == Symbols.MOE
+        and layer_offset + local_layer_number <= hash_moe_layer_threshold
+    ]
+    if local_hash_layer_numbers:
+        raise ValueError(
+            "Currently, all hash MoE layers must be in the same pipeline/virtual-pipeline "
+            "stage as the embedding because only that stage owns input_ids. This "
+            f"non-embedding stage contains hash MoE layer(s) {local_hash_layer_numbers}."
+        )
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -199,6 +243,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Parse unified pattern to extract main and MTP components.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            get_layer_type_list_from_layer_config_list,
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
@@ -206,6 +251,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
+            parsed.main_pattern, self.config.moe_n_hash_layers
+        )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -239,6 +287,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
             **logging_pg_kwargs,
+        )
+        _validate_hash_moe_pipeline_placement(
+            get_layer_type_list_from_layer_config_list(layer_config_list),
+            layer_offset,
+            hash_moe_layer_threshold,
+            self.pre_process,
         )
 
         # megatron core pipelining currently depends on model type
@@ -296,6 +350,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
+            hash_moe_layer_threshold=hash_moe_layer_threshold or None,
             name="decoder",
         )
 
@@ -316,6 +371,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
+                hash_moe_layer_threshold=hash_moe_layer_threshold or None,
                 name="mtp",
             )
             self._setup_mtp_cuda_graphs()
@@ -504,6 +560,39 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
+        # Hash routing consumes batch-major token IDs. Under sequence parallelism,
+        # shard them with decoder activations so each TP rank hashes its local tokens.
+        hash_input_ids = None
+        if self.config.moe_n_hash_layers > 0:
+            hash_input_ids = input_ids
+        if (
+            self.config.sequence_parallel
+            and decoder_input is not None
+            and hash_input_ids is not None
+            and hash_input_ids.shape[1] != decoder_input.shape[0]
+        ):
+            hash_input_ids = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    hash_input_ids.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
+        if (
+            padding_mask is not None
+            and self.config.sequence_parallel
+            and decoder_input is not None
+            and padding_mask.shape[1] != decoder_input.shape[0]
+        ):
+            padding_mask = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -560,6 +649,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask=padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                input_ids=hash_input_ids,
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
