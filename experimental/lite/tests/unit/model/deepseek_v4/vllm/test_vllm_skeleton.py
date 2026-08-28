@@ -77,9 +77,10 @@ def test_gate_logits_use_one_batch_invariant_gemm(tokens: int) -> None:
     ("optimizer", "override", "expected"),
     [
         ("dist_opt", None, True),
-        ("fsdp2", None, False),
+        ("fsdp2", None, True),
         ("fsdp2", True, True),
         ("dist_opt", False, False),
+        (None, None, False),
     ],
 )
 def test_deployment_weight_cache_policy_tracks_optimizer(

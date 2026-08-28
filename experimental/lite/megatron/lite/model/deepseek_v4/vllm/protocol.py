@@ -74,7 +74,7 @@ class ImplConfig:
 def _deployment_weight_cache_enabled(impl_cfg: ImplConfig) -> bool:
     if impl_cfg.cache_deployment_weights is not None:
         return impl_cfg.cache_deployment_weights
-    return _optimizer_backend_name(impl_cfg.optimizer) == "dist_opt"
+    return _optimizer_backend_name(impl_cfg.optimizer) in {"fsdp2", "dist_opt"}
 
 
 def _local_num_tokens(batch: Any) -> int:

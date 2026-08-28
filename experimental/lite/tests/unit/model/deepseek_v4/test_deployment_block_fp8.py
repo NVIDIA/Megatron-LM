@@ -16,6 +16,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     BLOCK_SHAPE,
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
+    DeploymentGroupedBlockFP8Adapter,
     bind_source_scale_to_visible_weight,
     fp8_gemm_nt,
     pack_block_fp8_activation,
@@ -335,6 +336,25 @@ def test_opt_in_cache_uses_parameter_version_and_invalidates(fake_vllm) -> None:
 
     adapter.clear_cache()
     assert adapter._cached_weight is None
+
+
+def test_grouped_cache_packs_only_first_microbatch_until_step_invalidation(
+    fake_vllm,
+) -> None:
+    masters = [_weight(), _weight()]
+    adapter = DeploymentGroupedBlockFP8Adapter(cache_weight=True)
+
+    first = adapter.pack_weight("experts", masters)
+    for _microbatch in range(1, 4):
+        assert adapter.pack_weight("experts", masters) is first
+    assert [call[0] for call in fake_vllm].count("weight_quant") == len(masters)
+
+    adapter.clear_cache()
+    next_step = adapter.pack_weight("experts", masters)
+    assert next_step is not first
+    assert [call[0] for call in fake_vllm].count("weight_quant") == 2 * len(
+        masters
+    )
 
 
 @pytest.mark.parametrize(
