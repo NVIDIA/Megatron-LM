@@ -687,6 +687,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.padding_mask = padding_mask
+        # Keep the pre-transformer mask for MTP sequence-roll preparation. GPT
+        # preprocessing may sequence-parallel scatter ``padding_mask`` in place.
+        self._model_chunk_state.mtp_padding_mask = padding_mask
+        self._model_chunk_state.mtp_sequence_roll_context = None
+        self._model_chunk_state.mtp_materialized_roll_rows = None
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.output_processor = output_processor
@@ -728,8 +733,28 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         from megatron.core.tensor_parallel.random import MHCCheckpointManager
 
-        num_layers = len(module.layers)
         config = module.config
+        is_repeated_mtp = bool(
+            module_tag == "mtp" and getattr(module, "mtp_use_repeated_layer", False)
+        )
+        if is_repeated_mtp:
+            assert (
+                len(module.layers) == 1
+            ), "Repeated MTP fine-grained scheduling requires exactly one physical layer."
+            num_layers = int(getattr(module, "mtp_num_depths", 0) or config.mtp_num_layers or 0)
+            assert num_layers > 0, "Repeated MTP requires at least one logical prediction depth."
+            physical_layer = module.layers[0]
+            first_absolute_depth = physical_layer.layer_number
+            scheduled_layers = tuple(
+                (physical_layer, first_absolute_depth + logical_index)
+                for logical_index in range(num_layers)
+            )
+        else:
+            num_layers = len(module.layers)
+            scheduled_layers = tuple(
+                (layer, layer.layer_number if module_tag == "mtp" else None)
+                for layer in module.layers
+            )
         use_mhc_recompute = (
             module.training
             and torch.is_grad_enabled()
@@ -743,7 +768,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         )
         group_index = 0
 
-        for layer_idx in range(num_layers):
+        for layer_idx, (layer, mtp_absolute_depth) in enumerate(scheduled_layers):
             is_group_end = bool(
                 mhc_recompute_manager is not None
                 and (layer_idx == num_layers - 1 or (layer_idx + 1) % group_size == 0)
@@ -755,14 +780,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 "is_last_layer_in_mhc_recompute_group": is_group_end,
                 "mhc_recompute_group_index": group_index,
                 "mhc_recompute_module_tag": module_tag,
+                "mtp_absolute_depth": mtp_absolute_depth,
             }
             layer_plan = TransformerLayerSchedulePlan(
-                module.layers[layer_idx],
-                self.event,
-                self.state,
-                comp_stream,
-                comm_stream,
-                extra_args,
+                layer, self.event, self.state, comp_stream, comm_stream, extra_args
             )
             self._transformer_layers.append(layer_plan)
 
@@ -855,6 +876,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
         self._recompute_segments = []
+        self._model_chunk_state.mtp_sequence_roll_context = None
+        self._model_chunk_state.mtp_materialized_roll_rows = None
         self._model_chunk_state.model = None
         self.pre_process.model_chunk_state = None
         self.pre_process = None

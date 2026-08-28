@@ -13,7 +13,6 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
-from megatron.core.dynamic_cp_group import get_logical_cp_transport_group, get_process_group_ranks
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
@@ -33,6 +32,12 @@ from megatron.core.tensor_parallel.inference_layers import (
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollContext,
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_fields,
+    roll_tensor,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -59,404 +64,6 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
-
-
-_MTP_SEQUENCE_FIELD_FILL_VALUES = {
-    "input_ids": 0,
-    "position_ids": 0,
-    "labels": 0,
-    "loss_mask": 0,
-    "padding_mask": True,
-}
-
-
-class MTPSequenceRollHalos:
-    """Base type for layout-specific successor rows prepared before MTP.
-
-    Halo storage is owned by the corresponding roll context and never travels through
-    the model's public forward signature. Concrete layouts can choose how to acquire
-    and represent their successor rows without changing GPT, Hybrid, or MTP layers.
-    """
-
-
-@dataclass(frozen=True)
-class ContiguousPackedCPRollHalos(MTPSequenceRollHalos):
-    """Compact successor rows prefetched across contiguous CP ranks.
-
-    Each tensor stores only a small right halo, never a view of the full packed
-    microbatch. Offset zero is the immediate successor of this CP rank's local
-    final row; offset d is used by the d-th repeated left roll. Values that cross
-    a physical packed-sequence boundary are replaced with the field's normal
-    boundary fill value once, before MTP starts.
-
-    The explicit optional fields keep this dataclass friendly to CUDA-graph input
-    traversal and make the supported payload contract visible. A pipeline stage
-    may omit fields it does not own.
-
-    Attributes:
-        input_ids: Successor token IDs (the data batch calls this field 'tokens').
-        position_ids: Successor learned-absolute position IDs.
-        labels: Successor SFT labels.
-        loss_mask: Successor loss-mask values.
-        padding_mask: Successor padding flags, with True marking padding.
-    """
-
-    input_ids: Optional[Tensor] = None
-    position_ids: Optional[Tensor] = None
-    labels: Optional[Tensor] = None
-    loss_mask: Optional[Tensor] = None
-    padding_mask: Optional[Tensor] = None
-
-    def __post_init__(self):
-        present_halos = [
-            halo
-            for halo in (
-                self.input_ids,
-                self.position_ids,
-                self.labels,
-                self.loss_mask,
-                self.padding_mask,
-            )
-            if halo is not None
-        ]
-        if not present_halos:
-            raise ValueError("A contiguous packed-CP halo payload must contain at least one field.")
-        widths = {halo.size(-1) for halo in present_halos}
-        if len(widths) != 1:
-            raise ValueError("All contiguous packed-CP halo fields must have the same width.")
-
-    @property
-    def width(self) -> int:
-        """Return the number of prefetched successor rows."""
-        for halo in (
-            self.input_ids,
-            self.position_ids,
-            self.labels,
-            self.loss_mask,
-            self.padding_mask,
-        ):
-            if halo is not None:
-                return halo.size(-1)
-        raise AssertionError("ContiguousPackedCPRollHalos requires at least one field.")
-
-    def get(self, sequence_field: str) -> Optional[Tensor]:
-        """Return the halo for a canonical MTP sequence field."""
-        if sequence_field not in {
-            "input_ids",
-            "position_ids",
-            "labels",
-            "loss_mask",
-            "padding_mask",
-        }:
-            raise ValueError(f"Unsupported MTP sequence halo field: {sequence_field}.")
-        return getattr(self, sequence_field)
-
-
-class MTPSequenceRollContext:
-    """Base type for layout-specific state shared by MTP sequence rolls.
-
-    The public MTP call chain passes this marker without knowing the physical
-    sequence layout. A roll dispatcher inspects the concrete subtype and extracts
-    the plan and optional prefetched payload needed by that layout. Future layouts
-    can add a subtype without adding another layout-specific argument to GPT,
-    Hybrid, or MTP layers.
-    """
-
-    def prefetch_halos(
-        self,
-        width: int,
-        *,
-        input_ids: Tensor | None = None,
-        position_ids: Tensor | None = None,
-        labels: Tensor | None = None,
-        loss_mask: Tensor | None = None,
-        padding_mask: Tensor | None = None,
-    ) -> MTPSequenceRollContext:
-        """Return a context with successor rows prepared for repeated MTP rolls.
-
-        Layout-specific contexts implement the communication and boundary rules.
-        Keeping this operation on the context lets model entry points remain layout
-        neutral while a future zigzag implementation can use a different strategy.
-        Optional fields that are not consumed on this pipeline stage can be omitted.
-
-        Args:
-            width: Number of successor rows required by repeated MTP rolls.
-            input_ids: Local token IDs used by MTP embedding or RL label derivation.
-            position_ids: Local learned-absolute position IDs, when rolled by MTP.
-            labels: Local SFT labels consumed by MTP loss.
-            loss_mask: Local MTP loss mask.
-            padding_mask: Local padding flags rolled by MTP embedding.
-
-        Returns:
-            A context containing the prepared layout-specific halo payload.
-        """
-        raise NotImplementedError(f"{type(self).__name__} does not support halo prefetch.")
-
-
-@dataclass(frozen=True)
-class ContiguousPackedSeqRollPlan:
-    """Per-microbatch metadata for one-token contiguous-CP packed-sequence rolls.
-
-    A one-token left roll is local except at the end of a CP shard, where the
-    replacement value may be the first element owned by the next CP rank. Packed
-    sequences add another constraint: positions at a physical packed-sequence
-    boundary must receive a field-specific fill value instead of a value from the
-    following sequence.
-
-    The CP neighbors and boundary mask depend only on the physical packed layout,
-    not on tensor dtype or payload. One context can therefore reuse this plan for
-    input IDs, learned-absolute position IDs, padding masks, labels, and loss masks
-    throughout a microbatch. When prefetched halos are present, the neighbor ranks
-    remain recorded for validation and fallback but no rolling P2P is issued.
-
-    Reuse is valid only for tensors on the recorded device, with the recorded local
-    sequence length, using the recorded CP group. Do not cache a plan across
-    microbatches unless those layout invariants are guaranteed to remain unchanged.
-
-    Attributes:
-        invalid_next: One-dimensional boolean mask over the local sequence axis.
-            True means that the corresponding global position has no immediate
-            physical successor in the same packed sequence. Repeated local rolls
-            propagate fills at internal boundaries; prefetched tail halos are
-            separately sanitized for every prediction depth.
-        sequence_length: Length of the local contiguous CP shard.
-        device: Device on which the boundary mask and compatible payload tensors
-            reside.
-        cp_group: Effective CP process group for this microbatch. This may be the
-            dynamic group injected into PackedSeqParams rather than the model's
-            statically configured CP group.
-        recv_rank: Global rank of the next contiguous CP shard, used by the P2P
-            fallback when no prefetched halo is supplied. None on the last CP rank.
-        send_rank: Global rank of the previous contiguous CP shard, used by the P2P
-            fallback. None on the first CP rank.
-        has_sequences: Whether de-duplicated cumulative sequence lengths describe at
-            least one physical packed sequence.
-        right_halo_valid_count: Number of successor rows after the local final row
-            that remain in the same physical packed sequence. This device scalar
-            sanitizes an arbitrary small halo width without rebuilding packed
-            metadata.
-    """
-
-    invalid_next: Tensor
-    sequence_length: int
-    device: torch.device
-    cp_group: torch.distributed.ProcessGroup
-    recv_rank: Optional[int]
-    send_rank: Optional[int]
-    has_sequences: bool
-    right_halo_valid_count: Tensor
-
-
-@dataclass(frozen=True)
-class ContiguousPackedCPRollContext(MTPSequenceRollContext):
-    """State reused by all contiguous packed-CP rolls in one microbatch.
-
-    Attributes:
-        plan: Boundary and CP-neighbor metadata shared by every field and depth.
-        halos: Optional compact successor rows prefetched immediately before MTP.
-            None retains grouped P2P as a correctness fallback for direct callers.
-    """
-
-    plan: ContiguousPackedSeqRollPlan
-    halos: Optional[ContiguousPackedCPRollHalos] = None
-
-    def prefetch_halos(
-        self,
-        width: int,
-        *,
-        input_ids: Tensor | None = None,
-        position_ids: Tensor | None = None,
-        labels: Tensor | None = None,
-        loss_mask: Tensor | None = None,
-        padding_mask: Tensor | None = None,
-    ) -> MTPSequenceRollContext:
-        """Prefetch contiguous-CP successor rows in one grouped P2P operation.
-
-        The returned context is immutable and shares this context's roll plan. The
-        payload contains only width rows per present field, so it does not retain or
-        copy a full packed microbatch. Missing optional fields keep their later
-        grouped roll calls on the communication fallback.
-
-        Args:
-            width: Number of successor rows required by repeated MTP rolls.
-            input_ids: Local token IDs used by MTP embedding or RL label derivation.
-            position_ids: Local learned-absolute position IDs, when rolled by MTP.
-            labels: Local SFT labels consumed by MTP loss.
-            loss_mask: Local MTP loss mask.
-            padding_mask: Local padding flags rolled by MTP embedding.
-
-        Returns:
-            A new context with compact halos, or this context when prefetch is not
-            applicable to the local shard or no fields are present.
-        """
-        if self.halos is not None:
-            raise ValueError("Contiguous packed-CP halos have already been prefetched.")
-        if width <= 0:
-            raise ValueError("Contiguous packed-CP halo width must be positive.")
-        if width > self.plan.sequence_length:
-            # One neighbor exchange cannot supply rows spanning multiple CP shards.
-            # Keep the established per-roll grouped P2P path for these tiny shards.
-            return self
-
-        tensors_by_field = {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "labels": labels,
-            "loss_mask": loss_mask,
-            "padding_mask": padding_mask,
-        }
-        sequence_fields = []
-        present_tensors: List[Tensor] = []
-        for field, tensor in tensors_by_field.items():
-            if tensor is not None:
-                sequence_fields.append(field)
-                present_tensors.append(tensor)
-        if not sequence_fields:
-            return self
-
-        return ContiguousPackedCPRollContext(
-            plan=self.plan,
-            halos=_prefetch_contiguous_packed_cp_roll_halos(
-                tensors=present_tensors,
-                sequence_fields=sequence_fields,
-                fill_values=[_MTP_SEQUENCE_FIELD_FILL_VALUES[field] for field in sequence_fields],
-                width=width,
-                plan=self.plan,
-            ),
-        )
-
-
-def _get_packed_roll_cu_seqlens(packed_seq_params: PackedSeqParams) -> Tensor:
-    """Return the physical packed-sequence boundaries used by MTP rolling."""
-    cu_seqlens = (
-        packed_seq_params.cu_seqlens_q_padded
-        if getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is not None
-        else packed_seq_params.cu_seqlens_q
-    )
-    assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
-    return cu_seqlens
-
-
-def _get_packed_seq_end_indices(
-    cu_seqlens: Tensor, device: torch.device, sequence_length: int
-) -> Tensor:
-    """Return the ends of explicit packed sequences and any implicit tail.
-
-    PackedSeqParams permits the physical tensor to be longer than the final
-    cumulative sequence length. In that case, the remaining buffer is an
-    implicit tail sequence whose final element must also be filled after the
-    full-buffer roll. Duplicate end indices are safe because index_fill_ is
-    idempotent.
-    """
-    sequence_end_indices = cu_seqlens[1:].to(device=device, dtype=torch.long) - 1
-    if sequence_length == 0:
-        return sequence_end_indices.new_empty((0,))
-    implicit_tail_end = sequence_end_indices.new_full((1,), sequence_length - 1)
-    return torch.cat((sequence_end_indices, implicit_tail_end))
-
-
-def _build_contiguous_packed_seq_roll_plan(
-    tensor: Tensor, dims: int, cu_seqlens: Tensor, cp_group: torch.distributed.ProcessGroup
-) -> ContiguousPackedSeqRollPlan:
-    """Build reusable boundary and neighbor metadata for a contiguous-CP shard."""
-    assert (
-        dims == -1 or dims == tensor.dim() - 1
-    ), "Packed sequence roll only supports the last dimension."
-
-    local_seq_len = tensor.size(dims)
-    cp_size = cp_group.size()
-    local_rank = cp_group.rank()
-    global_ranks = get_process_group_ranks(cp_group)
-
-    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
-    if cu.numel() > 1:
-        # Static packed metadata can repeat its final boundary to pad the number
-        # of cu_seqlens entries. Remove duplicates before assigning positions to
-        # packed intervals so every retained interval has a nonzero length.
-        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
-        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
-        cu = cu[nonduplicate_boundaries]
-
-    has_sequences = cu.numel() > 1
-    if local_seq_len == 0 or not has_sequences:
-        invalid_next = torch.ones(local_seq_len, device=tensor.device, dtype=torch.bool)
-        right_halo_valid_count = torch.zeros((), device=tensor.device, dtype=cu.dtype)
-    else:
-        global_start = local_rank * local_seq_len
-        global_positions = global_start + torch.arange(
-            local_seq_len, device=tensor.device, dtype=cu.dtype
-        )
-        seq_idx = torch.bucketize(global_positions, cu[1:], right=True).clamp(max=cu.numel() - 2)
-        seq_ends = cu[1:][seq_idx]
-        # This deliberately stays true at the local shard's final position when
-        # the same packed sequence continues on the next CP rank. A prefetched
-        # halo or grouped P2P supplies that successor; only physical ends are masked.
-        valid_next = (global_positions < cu[-1]) & (global_positions + 1 < seq_ends)
-        invalid_next = ~valid_next
-
-        # Successor rows are valid only until the physical sequence containing
-        # this shard's final row ends. Keeping the count as a device scalar avoids
-        # a host synchronization and lets halo preparation build any small width.
-        local_tail = global_positions[-1]
-        right_halo_valid_count = torch.where(
-            local_tail < cu[-1],
-            (seq_ends[-1] - local_tail - 1).clamp_min(0),
-            torch.zeros((), device=tensor.device, dtype=cu.dtype),
-        )
-
-    # A left roll receives from the next contiguous shard and sends the first
-    # local element to the previous shard. Store global ranks because PyTorch's
-    # P2P API interprets peer ranks globally even when a process group is passed.
-    return ContiguousPackedSeqRollPlan(
-        invalid_next=invalid_next,
-        sequence_length=local_seq_len,
-        device=tensor.device,
-        cp_group=cp_group,
-        recv_rank=global_ranks[local_rank + 1] if local_rank < cp_size - 1 else None,
-        send_rank=global_ranks[local_rank - 1] if local_rank > 0 else None,
-        has_sequences=has_sequences,
-        right_halo_valid_count=right_halo_valid_count,
-    )
-
-
-def prepare_mtp_sequence_roll_context(
-    tensor: Tensor | None,
-    cp_group: torch.distributed.ProcessGroup | None,
-    packed_seq_params: PackedSeqParams | None,
-    dims: int = -1,
-) -> MTPSequenceRollContext | None:
-    """Prepare layout-specific state shared by MTP rolls in one microbatch.
-
-    The public boundary is layout neutral. Contiguous packed CP is currently the
-    only backend with prepared state; CP1, zigzag CP, unpacked layouts, and missing
-    tensors return None and retain their established roll paths. The returned
-    context can prefetch layout-specific halos immediately before MTP without
-    modifying PackedSeqParams or the model's public forward inputs.
-
-    Args:
-        tensor: Reference payload that establishes local sequence length and device.
-        cp_group: Effective context-parallel process group for the microbatch.
-        packed_seq_params: Physical packed-sequence layout metadata.
-        dims: Sequence dimension; packed rolling supports only the final dimension.
-
-    Returns:
-        A layout-specific roll context, or None when no prepared state is needed.
-    """
-    needs_no_context = (
-        tensor is None or packed_seq_params is None or cp_group is None or cp_group.size() <= 1
-    )
-    if needs_no_context:
-        return None
-
-    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
-    if cp_partition_mode != 'contiguous':
-        return None
-
-    return ContiguousPackedCPRollContext(
-        plan=_build_contiguous_packed_seq_roll_plan(
-            tensor, dims, _get_packed_roll_cu_seqlens(packed_seq_params), cp_group
-        )
-    )
 
 
 if HAVE_TE:
@@ -583,598 +190,6 @@ def tie_output_layer_state_dict(
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
     )
-
-
-def roll_tensor(
-    tensors: List[Tensor],
-    shifts: int = -1,
-    dims: int = -1,
-    cp_group: torch.distributed.ProcessGroup | None = None,
-    packed_seq_params: PackedSeqParams | None = None,
-    fill_values: List[Union[bool, int, float]] | None = None,
-    roll_context: MTPSequenceRollContext | None = None,
-    sequence_fields: List[str] | None = None,
-    roll_depth: int = 0,
-) -> List[Tensor]:
-    """Roll one or more MTP tensor fields along the sequence dimension.
-
-    All tensors in one call share the same physical sequence layout. Grouping them
-    allows contiguous packed CP to share metadata and use one P2P batch. When a
-    contiguous context owns prefetched halos, the same dispatcher replaces each
-    local tail from the requested field/depth and issues no rolling P2P.
-
-    Args:
-        tensors: Tensor fields to roll together.
-        shifts: Shift along the sequence dimension.
-        dims: Sequence dimension.
-        cp_group: Effective context-parallel process group.
-        packed_seq_params: Packed-sequence layout metadata, when applicable.
-        fill_values: Per-field values written at physical sequence boundaries.
-        roll_context: Layout-specific state prepared for this microbatch. None
-            retains the regular dispatcher and communication fallback.
-        sequence_fields: Canonical source fields corresponding to tensors. These
-            identify prefetched halo payloads and are required only when the
-            context contains halos.
-        roll_depth: Zero-based repeated-roll depth. Depth zero consumes the
-            immediate successor; depth d consumes halo offset d.
-
-    Returns:
-        Rolled tensors in the same order as tensors.
-
-    Raises:
-        ValueError: If field counts, depth, or roll-context arguments are inconsistent.
-    """
-    if not tensors:
-        return []
-    if roll_depth < 0:
-        raise ValueError("roll_depth must be non-negative.")
-    if fill_values is None:
-        fill_values = [0] * len(tensors)
-    if len(tensors) != len(fill_values):
-        raise ValueError("Each tensor must have a corresponding roll fill value.")
-    if sequence_fields is not None and len(tensors) != len(sequence_fields):
-        raise ValueError("Each tensor must have a corresponding canonical sequence field.")
-
-    if packed_seq_params is None:
-        if roll_context is not None:
-            raise ValueError("A prepared sequence-roll context requires packed parameters.")
-        return _roll_tensors_unpacked(tensors, shifts, dims, cp_group, fill_values)
-
-    return _roll_tensors_packed_seq(
-        tensors,
-        shifts,
-        dims,
-        packed_seq_params,
-        cp_group,
-        fill_values,
-        roll_context,
-        sequence_fields,
-        roll_depth,
-    )
-
-
-def _roll_tensors_unpacked(
-    tensors: List[Tensor],
-    shifts: int,
-    dims: int,
-    cp_group: Optional[torch.distributed.ProcessGroup],
-    fill_values: List[Union[bool, int, float]],
-) -> List[Tensor]:
-    """Roll unpacked tensors for CP1 or the standard zigzag CP layout."""
-    if cp_group is None or cp_group.size() == 1:
-        rolled_tensors = [torch.roll(tensor, shifts=shifts, dims=dims) for tensor in tensors]
-        for rolled_tensor, fill_value in zip(rolled_tensors, fill_values):
-            rolled_tensor.select(dims, shifts).fill_(fill_value)
-        return rolled_tensors
-
-    return [
-        _roll_tensor_unpacked_zigzag_cp(tensor, shifts, dims, cp_group, fill_value=fill_value)
-        for tensor, fill_value in zip(tensors, fill_values)
-    ]
-
-
-def _roll_tensor_unpacked_zigzag_cp(tensor, shifts, dims, cp_group, fill_value=0):
-    """Roll one unpacked tensor in the standard two-chunk zigzag CP layout."""
-    # This matches the batch splitting logic in get_batch_on_this_cp_rank().
-    tensor_list = tensor.chunk(2, dim=dims)
-    rolled_tensor_list = []
-    for i in range(len(tensor_list)):
-        rolled_tensor_list.append(torch.roll(tensor_list[i], shifts=shifts, dims=dims))
-
-    # Prepare tensors for communication between CP ranks
-    # Each CP rank needs to send boundary elements to adjacent ranks
-    tensor_send_list = []
-    tensor_recv_list = []
-    for i in range(len(rolled_tensor_list)):
-        tensor_send_list.append(rolled_tensor_list[i].select(dims, shifts).contiguous())
-        empty_tensor = torch.empty(
-            tensor_send_list[i].shape,
-            dtype=tensor_send_list[i].dtype,
-            device=torch.cuda.current_device(),
-        )
-        tensor_recv_list.append(empty_tensor)
-
-    # Get the global rank of next and prev process in the cp group
-    global_ranks = get_process_group_ranks(cp_group)
-    local_rank = cp_group.rank()
-    next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
-    prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
-    transport_group = get_logical_cp_transport_group(cp_group)
-
-    # Start send and recv ops
-    ops = []
-    if local_rank != 0:
-        req_send_first_part = torch.distributed.isend(
-            tensor=tensor_send_list[0], dst=prev_rank, group=transport_group
-        )
-        ops.append(req_send_first_part)
-        req_recv_second_part = torch.distributed.irecv(
-            tensor=tensor_recv_list[1], src=prev_rank, group=transport_group
-        )
-        ops.append(req_recv_second_part)
-    else:
-        tensor_recv_list[1] = fill_value
-    if local_rank != len(global_ranks) - 1:
-        req_recv_first_part = torch.distributed.irecv(
-            tensor=tensor_recv_list[0], src=next_rank, group=transport_group
-        )
-        ops.append(req_recv_first_part)
-        req_send_second_part = torch.distributed.isend(
-            tensor=tensor_send_list[1], dst=next_rank, group=transport_group
-        )
-        ops.append(req_send_second_part)
-    else:
-        # For the last CP rank, the removed elements of second part go into the first part
-        tensor_recv_list[0] = tensor_send_list[1]
-
-    # Wait for all communication operations to complete
-    for op in ops:
-        op.wait()
-
-    # Splicing: Replace boundary elements with received elements from adjacent ranks
-    # This ensures proper sequence continuity across CP boundaries
-    index = [slice(None)] * rolled_tensor_list[0].dim()
-    index[dims] = shifts
-    for i in range(len(rolled_tensor_list)):
-        rolled_tensor_list[i][tuple(index)] = tensor_recv_list[i]
-
-    # Concatenate the processed chunks back into a single tensor
-    rolled_tensor = torch.cat(rolled_tensor_list, dim=dims)
-
-    return rolled_tensor
-
-
-def _roll_tensors_packed_seq(
-    tensors: List[Tensor],
-    shifts: int,
-    dims: int,
-    packed_seq_params: PackedSeqParams,
-    cp_group: Optional[torch.distributed.ProcessGroup],
-    fill_values: List[Union[bool, int, float]],
-    roll_context: Optional[MTPSequenceRollContext],
-    sequence_fields: Optional[List[str]],
-    roll_depth: int,
-) -> List[Tensor]:
-    """Dispatch packed tensors to CP1, zigzag CP, or contiguous CP rolling."""
-    for tensor in tensors:
-        assert (
-            dims == -1 or dims == tensor.dim() - 1
-        ), "Packed sequence roll only supports the last dimension."
-    assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
-
-    # Prefer padded cumulative seqlens because CP's local THD layout uses the
-    # padded physical boundaries. Unpadded boundaries index the wrong local
-    # chunks when sequence lengths are not already divisible by 2 * cp_size.
-    cu_seqlens = _get_packed_roll_cu_seqlens(packed_seq_params)
-
-    cp_size = cp_group.size() if cp_group is not None else 1
-    if cp_size == 1:
-        if roll_context is not None:
-            raise ValueError("A prepared sequence-roll context cannot be used for packed CP1.")
-        reference_tensor = tensors[0]
-        sequence_end_indices = _get_packed_seq_end_indices(
-            cu_seqlens, reference_tensor.device, reference_tensor.size(dims)
-        )
-        for tensor in tensors:
-            if tensor.device != reference_tensor.device:
-                raise ValueError("All packed CP1 tensors must be on the same device.")
-            if tensor.size(dims) != reference_tensor.size(dims):
-                raise ValueError("All packed CP1 tensors must have the same sequence length.")
-        return [
-            _roll_tensor_packed_seq_cp1(
-                tensor, shifts, dims, sequence_end_indices, fill_value=fill_value
-            )
-            for tensor, fill_value in zip(tensors, fill_values)
-        ]
-
-    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
-    if cp_partition_mode == 'zigzag':
-        if roll_context is not None:
-            raise ValueError(
-                "A prepared sequence-roll context is not supported for packed zigzag CP."
-            )
-        return [
-            _roll_tensor_packed_seq_zigzag_cp(
-                tensor, shifts, dims, cu_seqlens, cp_group, fill_value=fill_value
-            )
-            for tensor, fill_value in zip(tensors, fill_values)
-        ]
-    if cp_partition_mode == 'contiguous':
-        contiguous_roll_halos = None
-        if roll_context is None:
-            contiguous_roll_plan = _build_contiguous_packed_seq_roll_plan(
-                tensors[0], dims, cu_seqlens, cp_group
-            )
-        elif isinstance(roll_context, ContiguousPackedCPRollContext):
-            contiguous_roll_plan = roll_context.plan
-            contiguous_roll_halos = roll_context.halos
-        else:
-            raise ValueError(
-                "The prepared sequence-roll context does not support contiguous packed CP."
-            )
-        return _roll_tensors_packed_seq_contiguous_cp(
-            tensors,
-            dims,
-            fill_values,
-            contiguous_roll_plan,
-            contiguous_roll_halos,
-            sequence_fields,
-            roll_depth,
-        )
-    raise ValueError(f"Unsupported packed sequence CP partition mode: {cp_partition_mode}")
-
-
-def _roll_tensor_packed_seq_cp1(tensor, shifts, dims, sequence_end_indices, fill_value=0):
-    """Roll one CP1 packed tensor and fill every physical sequence end."""
-    # A full-buffer left roll is equivalent to rolling each packed sequence
-    # independently once the values that crossed sequence boundaries are filled.
-    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-    rolled_tensor.index_fill_(dims, sequence_end_indices, fill_value)
-    return rolled_tensor
-
-
-def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0):
-    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries."""
-    cp_size = cp_group.size()
-    rolled_tensor = tensor.clone()
-
-    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
-    local_rank = cp_group.rank()
-    global_ranks = get_process_group_ranks(cp_group)
-    next_rank = global_ranks[(local_rank + 1) % cp_size]
-    prev_rank = global_ranks[(local_rank - 1) % cp_size]
-    transport_group = get_logical_cp_transport_group(cp_group)
-
-    # Iterate over each sequence individually
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i]
-        end_idx = cu_seqlens[i + 1]
-
-        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
-        local_start_idx = start_idx // cp_size
-        local_end_idx = end_idx // cp_size
-
-        # Skip empty sequences - this can happen when a sequence is very short and
-        # after dividing by cp_size, the local slice has zero length
-        local_seq_len = local_end_idx - local_start_idx
-        if local_seq_len == 0:
-            continue
-
-        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
-
-        # The following code is very similar as the code in roll_tensor function
-        local_chunks = tensor_slice.chunk(2, dim=dims)
-        rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
-
-        tensor_send_list = []
-        tensor_recv_list = []
-        for chunk in rolled_chunks:
-            # Skip empty chunks that can occur when the sequence slice is very small
-            if chunk.size(dims) == 0:
-                tensor_send_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                tensor_recv_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                continue
-            boundary = chunk.select(dims, shifts).contiguous().clone()
-            tensor_send_list.append(boundary)
-            tensor_recv_list.append(torch.empty_like(boundary))
-
-        ops = []
-        if local_rank != 0:
-            ops.append(
-                torch.distributed.isend(
-                    tensor=tensor_send_list[0], dst=prev_rank, group=transport_group
-                )
-            )
-            ops.append(
-                torch.distributed.irecv(
-                    tensor=tensor_recv_list[1], src=prev_rank, group=transport_group
-                )
-            )
-        else:
-            tensor_recv_list[1].fill_(fill_value)
-
-        if local_rank != cp_size - 1:
-            ops.append(
-                torch.distributed.irecv(
-                    tensor=tensor_recv_list[0], src=next_rank, group=transport_group
-                )
-            )
-            ops.append(
-                torch.distributed.isend(
-                    tensor=tensor_send_list[1], dst=next_rank, group=transport_group
-                )
-            )
-        else:
-            tensor_recv_list[0].copy_(tensor_send_list[1])
-
-        for op in ops:
-            op.wait()
-
-        index = [slice(None)] * rolled_chunks[0].dim()
-        index[dims] = shifts
-        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
-            # Skip empty chunks
-            if chunk.size(dims) == 0:
-                continue
-            chunk[tuple(index)] = recv
-
-        seq_result = torch.cat(rolled_chunks, dim=dims)
-
-        # update the rolled tensor
-        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
-
-    return rolled_tensor
-
-
-def _prefetch_contiguous_packed_cp_roll_halos(
-    tensors: List[Tensor],
-    sequence_fields: List[str],
-    fill_values: List[Union[bool, int, float]],
-    width: int,
-    plan: ContiguousPackedSeqRollPlan,
-) -> ContiguousPackedCPRollHalos:
-    """Fetch compact right halos for contiguous packed CP in one grouped P2P.
-
-    Each rank sends the first width rows of every requested field to its
-    predecessor and receives the corresponding rows from its successor. Received
-    rows are sanitized once using the physical packed boundary that contains this
-    rank's local final row. Repeated MTP rolls can then consume halo offsets without
-    further communication.
-
-    Args:
-        tensors: Local MTP fields sharing the plan's sequence axis.
-        sequence_fields: Canonical names corresponding to tensors.
-        fill_values: Per-field physical-boundary fill values.
-        width: Number of successor rows required by all MTP prediction depths.
-        plan: Reusable contiguous packed-CP layout and neighbor metadata.
-
-    Returns:
-        Compact, independently allocated successor rows keyed by MTP field.
-
-    Raises:
-        ValueError: If the field metadata is inconsistent with the roll plan.
-    """
-    if width <= 0:
-        raise ValueError("Contiguous packed-CP halo width must be positive.")
-    if len(tensors) != len(sequence_fields) or len(tensors) != len(fill_values):
-        raise ValueError("Each halo tensor must have a canonical field and fill value.")
-    if len(set(sequence_fields)) != len(sequence_fields):
-        raise ValueError("Each contiguous packed-CP halo field may be prefetched only once.")
-    if width > plan.sequence_length:
-        raise ValueError(
-            f"Contiguous packed-CP halo width {width} exceeds local sequence length "
-            f"{plan.sequence_length}."
-        )
-
-    halos: List[Tensor] = []
-    for tensor, sequence_field, fill_value in zip(tensors, sequence_fields, fill_values):
-        if sequence_field not in _MTP_SEQUENCE_FIELD_FILL_VALUES:
-            raise ValueError(f"Unsupported MTP sequence halo field: {sequence_field}.")
-        expected_fill_value = _MTP_SEQUENCE_FIELD_FILL_VALUES[sequence_field]
-        if fill_value != expected_fill_value:
-            raise ValueError(
-                f"Halo field {sequence_field} requires boundary fill value "
-                f"{expected_fill_value!r}, got {fill_value!r}."
-            )
-        if tensor.device != plan.device:
-            raise ValueError("All halo tensors sharing a roll plan must be on the same device.")
-        if tensor.size(-1) != plan.sequence_length:
-            raise ValueError(
-                "All halo tensors sharing a roll plan must have the same sequence length."
-            )
-
-        halo_shape = list(tensor.shape)
-        halo_shape[-1] = width
-        halos.append(tensor.new_full(halo_shape, fill_value))
-
-    # Retain contiguous send slices until every grouped work handle completes.
-    send_buffers: List[Tensor] = []
-    p2p_ops = []
-    transport_group = get_logical_cp_transport_group(plan.cp_group)
-    if plan.has_sequences and plan.recv_rank is not None:
-        for halo in halos:
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, halo, plan.recv_rank, group=transport_group
-                )
-            )
-    if plan.has_sequences and plan.send_rank is not None:
-        for tensor in tensors:
-            send_buffer = tensor.narrow(-1, 0, width).contiguous()
-            send_buffers.append(send_buffer)
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, send_buffer, plan.send_rank, group=transport_group
-                )
-            )
-
-    works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
-    for work in works:
-        work.wait()
-
-    # Offset d is valid only when the local tail and its (d + 1)-th successor
-    # belong to the same physical packed sequence. Broadcasting this small mask
-    # sanitizes every field without retaining the full packed metadata.
-    invalid_halo = (
-        torch.arange(width, device=plan.device, dtype=plan.right_halo_valid_count.dtype)
-        >= plan.right_halo_valid_count
-    )
-    for halo, fill_value in zip(halos, fill_values):
-        halo.masked_fill_(invalid_halo, fill_value)
-
-    halo_by_field = dict(zip(sequence_fields, halos))
-    return ContiguousPackedCPRollHalos(
-        input_ids=halo_by_field.get("input_ids"),
-        position_ids=halo_by_field.get("position_ids"),
-        labels=halo_by_field.get("labels"),
-        loss_mask=halo_by_field.get("loss_mask"),
-        padding_mask=halo_by_field.get("padding_mask"),
-    )
-
-
-def _roll_tensors_packed_seq_contiguous_cp(
-    tensors: List[Tensor],
-    dims: int,
-    fill_values: List[Union[bool, int, float]],
-    contiguous_roll_plan: ContiguousPackedSeqRollPlan,
-    contiguous_roll_halos: Optional[ContiguousPackedCPRollHalos] = None,
-    sequence_fields: Optional[List[str]] = None,
-    roll_depth: int = 0,
-) -> List[Tensor]:
-    """Roll contiguous packed-CP tensors from halos or one grouped P2P exchange.
-
-    A prefetched halo is used only when every field in this grouped call is present.
-    Otherwise the entire call takes the grouped P2P fallback, keeping all CP ranks
-    on the same communication branch while supporting optional model inputs.
-    """
-    assert len(tensors) == len(fill_values)
-    if not tensors:
-        return []
-
-    for tensor in tensors:
-        assert (
-            dims == -1 or dims == tensor.dim() - 1
-        ), "Packed sequence roll only supports the last dimension."
-        if tensor.size(dims) != contiguous_roll_plan.sequence_length:
-            raise ValueError(
-                "All tensors sharing a packed-sequence roll plan must have the same "
-                "sequence length."
-            )
-        if tensor.device != contiguous_roll_plan.device:
-            raise ValueError(
-                "All tensors sharing a packed-sequence roll plan must be on the same device."
-            )
-
-    if contiguous_roll_plan.sequence_length == 0:
-        return [torch.roll(tensor, shifts=-1, dims=dims) for tensor in tensors]
-
-    if not contiguous_roll_plan.has_sequences:
-        rolled_tensors = [torch.roll(tensor, shifts=-1, dims=dims) for tensor in tensors]
-        for rolled_tensor, fill_value in zip(rolled_tensors, fill_values):
-            rolled_tensor.fill_(fill_value)
-        return rolled_tensors
-
-    halo_tail_values = None
-    if contiguous_roll_halos is not None and sequence_fields is not None:
-        if len(sequence_fields) != len(tensors):
-            raise ValueError("Each rolled tensor must have a canonical sequence field.")
-
-        requested_halos = [contiguous_roll_halos.get(field) for field in sequence_fields]
-        if all(halo is not None for halo in requested_halos):
-            if roll_depth >= contiguous_roll_halos.width:
-                raise ValueError(
-                    f"roll_depth={roll_depth} exceeds the prefetched halo width "
-                    f"{contiguous_roll_halos.width}."
-                )
-
-            halo_tail_values = []
-            for tensor, sequence_field, fill_value, halo in zip(
-                tensors, sequence_fields, fill_values, requested_halos
-            ):
-                assert halo is not None
-                expected_fill_value = _MTP_SEQUENCE_FIELD_FILL_VALUES[sequence_field]
-                if fill_value != expected_fill_value:
-                    raise ValueError(
-                        f"Halo field {sequence_field} requires boundary fill value "
-                        f"{expected_fill_value!r}, got {fill_value!r}."
-                    )
-                if halo.device != tensor.device:
-                    raise ValueError(
-                        f"Halo field {sequence_field} and its tensor must be on the same device."
-                    )
-                if halo.dtype != tensor.dtype:
-                    raise ValueError(
-                        f"Halo field {sequence_field} and its tensor must have the same dtype."
-                    )
-                if halo.dim() != tensor.dim() or halo.shape[:-1] != tensor.shape[:-1]:
-                    raise ValueError(
-                        f"Halo field {sequence_field} must match its tensor's leading dimensions."
-                    )
-                halo_tail_values.append(halo.select(dims, roll_depth))
-
-    if halo_tail_values is not None:
-        rolled_tensors = [torch.roll(tensor, shifts=-1, dims=dims) for tensor in tensors]
-        for rolled_tensor, halo_tail, fill_value in zip(
-            rolled_tensors, halo_tail_values, fill_values
-        ):
-            rolled_tensor.select(dims, -1).copy_(halo_tail)
-            # Internal physical sequence ends are handled by the shared immediate
-            # boundary mask. Tail values for deeper rolls were sanitized before
-            # slicing because their validity depends on the requested depth.
-            rolled_tensor[..., contiguous_roll_plan.invalid_next] = fill_value
-        return rolled_tensors
-
-    recv_buffers: List[Optional[Tensor]] = [None] * len(tensors)
-    # Keep contiguous send buffers alive until every grouped work handle completes.
-    send_buffers: List[Tensor] = []
-    p2p_ops = []
-    transport_group = get_logical_cp_transport_group(contiguous_roll_plan.cp_group)
-
-    if contiguous_roll_plan.recv_rank is not None:
-        # After a left roll, each local tail consumes the first element from the
-        # next contiguous CP shard.
-        for index, tensor in enumerate(tensors):
-            recv_buffer = torch.empty_like(tensor.select(dims, 0))
-            recv_buffers[index] = recv_buffer
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    recv_buffer,
-                    contiguous_roll_plan.recv_rank,
-                    group=transport_group,
-                )
-            )
-    if contiguous_roll_plan.send_rank is not None:
-        # This rank's first element becomes the previous shard's local tail.
-        for tensor in tensors:
-            send_buffer = tensor.select(dims, 0).contiguous()
-            send_buffers.append(send_buffer)
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend,
-                    send_buffer,
-                    contiguous_roll_plan.send_rank,
-                    group=transport_group,
-                )
-            )
-
-    works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
-    rolled_tensors = [torch.roll(tensor, shifts=-1, dims=dims) for tensor in tensors]
-    for work in works:
-        work.wait()
-
-    for rolled_tensor, recv_buffer, fill_value in zip(rolled_tensors, recv_buffers, fill_values):
-        if recv_buffer is not None:
-            rolled_tensor.select(dims, -1).copy_(recv_buffer)
-        # Apply the shared boundary mask after installing the adjacent value so a
-        # physical packed-sequence end always wins over a cross-rank successor.
-        rolled_tensor[..., contiguous_roll_plan.invalid_next] = fill_value
-
-    return rolled_tensors
 
 
 class MTPLossLoggingHelper:
@@ -1786,7 +801,6 @@ def _process_mtp_e2e_tv_loss(
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
     sequence_roll_context: Optional[MTPSequenceRollContext],
     derived_labels_from_input_ids: bool,
-    original_num_tokens: Optional[Tensor],
 ) -> Tensor:
     """Apply the end-to-end TV objective to MTP draft hidden states.
 
@@ -1809,32 +823,72 @@ def _process_mtp_e2e_tv_loss(
         )
         if scale_logits_fn is not None:
             target_logits = scale_logits_fn(target_logits)
-    # roll_tensor handles packed boundaries and CP communication along its last
-    # dimension. Keep vocabulary before sequence while preparing target alignment.
-    target_logits = target_logits.permute(1, 2, 0)
-    current_loss_mask = loss_mask
+    num_depths = config.mtp_num_layers
+    max_offset = num_depths + int(derived_labels_from_input_ids)
+    tv_roll_context = prepare_mtp_sequence_roll_fields(
+        sequence_roll_context,
+        (
+            MTPSequenceRollField("target_logits", target_logits, 0, 1, 0),
+            MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0),
+        ),
+        max_offset=max_offset,
+    )
+    use_prepared_roll_rows = tv_roll_context is not None
+
+    # The legacy path keeps vocabulary before sequence because roll_tensor
+    # operates on the final dimension. The addressed path leaves target logits
+    # in their native [sequence, batch, vocab] layout and reads them directly.
+    if use_prepared_roll_rows:
+        assert tv_roll_context is not None
+        aligned_loss_masks = tv_roll_context.materialize_all("loss_mask")
+        current_loss_mask = loss_mask
+        original_loss_mask = aligned_loss_masks[0] if derived_labels_from_input_ids else loss_mask
+    else:
+        target_logits = target_logits.permute(1, 2, 0)
+        current_loss_mask = loss_mask
+        if derived_labels_from_input_ids:
+            current_loss_mask = roll_tensor(
+                [current_loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=["loss_mask"],
+                roll_depth=0,
+            )[0]
+        original_loss_mask = current_loss_mask
+
+    original_num_tokens = original_loss_mask.sum() if config.calculate_per_token_loss else None
     chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
     tv_distances = []
 
-    for mtp_layer_number in range(config.mtp_num_layers):
-        target_logits = roll_tensor(
-            [target_logits],
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            fill_values=[0],
-        )[0]
-        current_loss_mask = roll_tensor(
-            [current_loss_mask],
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            roll_context=sequence_roll_context,
-            sequence_fields=["loss_mask"],
-            roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
-        )[0]
+    for mtp_layer_number in range(num_depths):
+        if use_prepared_roll_rows:
+            assert tv_roll_context is not None
+            target_address = tv_roll_context.address("target_logits", mtp_layer_number + 1)
+            current_loss_mask = aligned_loss_masks[
+                mtp_layer_number + int(derived_labels_from_input_ids)
+            ]
+        else:
+            target_logits = roll_tensor(
+                [target_logits],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                fill_values=[0],
+            )[0]
+            current_loss_mask = roll_tensor(
+                [current_loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=["loss_mask"],
+                roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
+            )[0]
         chain_valid &= current_loss_mask.bool()
 
         draft_logits, _ = output_layer(
@@ -1844,15 +898,28 @@ def _process_mtp_e2e_tv_loss(
         )
         if scale_logits_fn is not None:
             draft_logits = scale_logits_fn(draft_logits)
-        aligned_target_logits = target_logits.permute(2, 0, 1)
-        tv_distances.append(
-            vocab_parallel_tv_distance(
-                draft_logits,
-                aligned_target_logits,
-                tp_group=tp_group,
-                logits_are_vocab_sharded=logits_are_vocab_sharded,
+        if use_prepared_roll_rows:
+            tv_distances.append(
+                vocab_parallel_tv_distance(
+                    draft_logits,
+                    target_address.source,
+                    tp_group=tp_group,
+                    logits_are_vocab_sharded=logits_are_vocab_sharded,
+                    target_row_indices=target_address.row_indices,
+                    target_valid_rows=target_address.valid_rows,
+                    target_halo_logits=target_address.halo,
+                )
             )
-        )
+        else:
+            aligned_target_logits = target_logits.permute(2, 0, 1)
+            tv_distances.append(
+                vocab_parallel_tv_distance(
+                    draft_logits,
+                    aligned_target_logits,
+                    tp_group=tp_group,
+                    logits_are_vocab_sharded=logits_are_vocab_sharded,
+                )
+            )
 
     tv_distances_tensor = torch.stack(tv_distances, dim=0)
     per_step_acceptance = 1.0 - tv_distances_tensor
@@ -1947,28 +1014,15 @@ def process_mtp_loss(
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
-    # When labels are not provided (e.g. RL training), derive them from input_ids by
-    # rolling left so that label[i] = input_id[i + 1], matching the SFT label format.
     derived_labels_from_input_ids = labels is None
     if derived_labels_from_input_ids:
         if input_ids is None:
             return hidden_states
         if loss_mask is None:
             loss_mask = torch.ones_like(input_ids)
-        labels, loss_mask = roll_tensor(
-            [input_ids, loss_mask],
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            roll_context=sequence_roll_context,
-            sequence_fields=["input_ids", "loss_mask"],
-            roll_depth=0,
-        )
     elif loss_mask is None:
         loss_mask = torch.ones_like(labels)
 
-    assert labels is not None
     assert loss_mask is not None
 
     if config.mtp_detach_heads:
@@ -1976,13 +1030,6 @@ def process_mtp_loss(
             output_weight = output_weight.detach()
         else:
             output_weight = output_layer.weight.detach()
-
-    mtp_labels = labels
-
-    # Store the original number of tokens before rolling for proper normalization
-    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
-    # correctly scaled relative to the main loss gradients in finalize_model_grads.
-    original_num_tokens = loss_mask.sum() if config.calculate_per_token_loss else None
 
     if config.mtp_loss_type == "e2e_tv":
         assert output_weight is not None
@@ -2000,26 +1047,65 @@ def process_mtp_loss(
             scale_logits_fn=scale_logits_fn,
             sequence_roll_context=sequence_roll_context,
             derived_labels_from_input_ids=derived_labels_from_input_ids,
-            original_num_tokens=original_num_tokens,
         )
+
+    label_source = input_ids if derived_labels_from_input_ids else labels
+    assert label_source is not None
+    label_key = "input_ids" if derived_labels_from_input_ids else "labels"
+    max_offset = config.mtp_num_layers + int(derived_labels_from_input_ids)
+    loss_roll_context = prepare_mtp_sequence_roll_fields(
+        sequence_roll_context,
+        (
+            MTPSequenceRollField(label_key, label_source, -1, 0, 0),
+            MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0),
+        ),
+        max_offset=max_offset,
+    )
+    use_prepared_roll_rows = loss_roll_context is not None
+    if use_prepared_roll_rows:
+        assert loss_roll_context is not None
+        aligned_labels = loss_roll_context.materialize_all(label_key)
+        aligned_loss_masks = loss_roll_context.materialize_all("loss_mask")
+        original_loss_mask = aligned_loss_masks[0] if derived_labels_from_input_ids else loss_mask
+        mtp_labels = label_source
+    else:
+        # Preserve the original cumulative-roll path exactly. RL first derives
+        # SFT-format labels/mask at offset one; every MTP depth then rolls once.
+        mtp_labels = label_source
+        if derived_labels_from_input_ids:
+            mtp_labels, loss_mask = roll_tensor(
+                [mtp_labels, loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=["input_ids", "loss_mask"],
+                roll_depth=0,
+            )
+        original_loss_mask = loss_mask
+
+    original_num_tokens = original_loss_mask.sum() if config.calculate_per_token_loss else None
 
     fuse_linear_cross_entropy = (
         config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
     )
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_labels, loss_mask = roll_tensor(
-            [mtp_labels, loss_mask],
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            roll_context=sequence_roll_context,
-            sequence_fields=[
-                "input_ids" if derived_labels_from_input_ids else "labels",
-                "loss_mask",
-            ],
-            roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
-        )
+        if use_prepared_roll_rows:
+            offset_index = mtp_layer_number + int(derived_labels_from_input_ids)
+            mtp_labels = aligned_labels[offset_index]
+            loss_mask = aligned_loss_masks[offset_index]
+        else:
+            mtp_labels, loss_mask = roll_tensor(
+                [mtp_labels, loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=[label_key, "loss_mask"],
+                roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
+            )
         num_tokens = loss_mask.sum()
         if fuse_linear_cross_entropy:
             mtp_loss = output_layer(
@@ -2310,6 +1396,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         padding_mask: Optional[torch.Tensor] = None,
         sequence_roll_context: Optional[MTPSequenceRollContext] = None,
         roll_depth: int = 0,
+        _inputs_pre_aligned: bool = False,
     ):
         """Roll MTP inputs once and compute the next-depth token embeddings.
 
@@ -2324,40 +1411,44 @@ class MultiTokenPredictionLayer(MegatronModule):
                 in this microbatch.
             roll_depth: Zero-based prediction depth selecting the prefetched
                 successor row for this repeated roll.
+            _inputs_pre_aligned: Internal block-to-layer contract indicating that
+                input, learned position, and padding fields already represent the
+                absolute shifted row for this depth.
         """
-        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        if not _inputs_pre_aligned:
+            cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
 
-        tensors_to_roll = [input_ids]
-        fill_values = [0]
-        sequence_fields = ["input_ids"]
-        roll_position_ids = getattr(embedding, 'add_position_embedding', True)
-        if roll_position_ids:
-            tensors_to_roll.append(position_ids)
-            fill_values.append(0)
-            sequence_fields.append("position_ids")
-        if padding_mask is not None:
-            tensors_to_roll.append(padding_mask)
-            fill_values.append(True)
-            sequence_fields.append("padding_mask")
+            tensors_to_roll = [input_ids]
+            fill_values = [0]
+            sequence_fields = ["input_ids"]
+            roll_position_ids = getattr(embedding, 'add_position_embedding', True)
+            if roll_position_ids:
+                tensors_to_roll.append(position_ids)
+                fill_values.append(0)
+                sequence_fields.append("position_ids")
+            if padding_mask is not None:
+                tensors_to_roll.append(padding_mask)
+                fill_values.append(True)
+                sequence_fields.append("padding_mask")
 
-        rolled_tensors = roll_tensor(
-            tensors_to_roll,
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            fill_values=fill_values,
-            roll_context=sequence_roll_context,
-            sequence_fields=sequence_fields,
-            roll_depth=roll_depth,
-        )
-        input_ids = rolled_tensors[0]
-        next_rolled_tensor = 1
-        if roll_position_ids:
-            position_ids = rolled_tensors[next_rolled_tensor]
-            next_rolled_tensor += 1
-        if padding_mask is not None:
-            padding_mask = rolled_tensors[next_rolled_tensor]
+            rolled_tensors = roll_tensor(
+                tensors_to_roll,
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                fill_values=fill_values,
+                roll_context=sequence_roll_context,
+                sequence_fields=sequence_fields,
+                roll_depth=roll_depth,
+            )
+            input_ids = rolled_tensors[0]
+            next_rolled_tensor = 1
+            if roll_position_ids:
+                position_ids = rolled_tensors[next_rolled_tensor]
+                next_rolled_tensor += 1
+            if padding_mask is not None:
+                padding_mask = rolled_tensors[next_rolled_tensor]
 
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
@@ -2825,6 +1916,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_roll_context: Optional[MTPSequenceRollContext] = None,
         roll_depth: int = 0,
+        _inputs_pre_aligned: bool = False,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
         mtp_dsa_context: Optional[MTPDSAIterationContext] = None,
@@ -2848,6 +1940,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 in this microbatch.
             roll_depth: Zero-based prediction depth selecting the prefetched
                 successor row for this repeated roll.
+            _inputs_pre_aligned: Internal block-to-layer contract indicating that
+                sequence fields are already aligned to this absolute depth.
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
             mtp_dsa_context (MTPDSAIterationContext, optional): Per-iteration carrier for the
@@ -2871,6 +1965,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
             sequence_roll_context=sequence_roll_context,
             roll_depth=roll_depth,
+            _inputs_pre_aligned=_inputs_pre_aligned,
         )
 
         mtp_dsa_kwargs = {}
@@ -2962,6 +2057,23 @@ class MultiTokenPredictionBlockSubmodules:
     """
 
     layer_specs: Optional[List[ModuleSpec]] = None
+
+
+def _scatter_mtp_padding_mask(
+    padding_mask: Optional[Tensor], *, sequence_parallel: bool, tp_group
+) -> Optional[Tensor]:
+    """Convert one globally aligned MTP routing mask to its TP-local layout."""
+    if padding_mask is None or not sequence_parallel:
+        return padding_mask
+    if tp_group is None:
+        raise ValueError("MTP sequence-parallel padding-mask scatter requires a TP group.")
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(), group=tp_group
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
 
 
 def _get_mtp_block_submodules(
@@ -3185,6 +2297,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_roll_context: Optional[MTPSequenceRollContext] = None,
+        sequence_roll_padding_mask: Optional[Tensor] = None,
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
@@ -3202,8 +2315,11 @@ class MultiTokenPredictionBlock(MegatronModule):
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
             padding_mask (Tensor, optional): Padding mask for MoE routing (True = padded).
-                Each MTP layer rolls this mask in sync with input_ids/position_ids using
-                a True field fill value so boundary positions are marked as padded.
+                This is already TP-local under sequence parallelism and remains the
+                source for the cumulative-roll fallback.
+            sequence_roll_padding_mask (Tensor, optional): Unsharded padding-mask source
+                used to prepare and materialize absolute roll rows. Each row is scattered
+                to the MTP layer's TP-local layout after materialization.
             sequence_roll_context: Layout-specific metadata shared across all MTP
                 depths.
 
@@ -3223,6 +2339,38 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
+        if sequence_roll_padding_mask is not None and padding_mask is None:
+            raise ValueError(
+                "MTP sequence_roll_padding_mask requires the corresponding TP-local padding_mask."
+            )
+
+        roll_position_ids = getattr(embedding, "add_position_embedding", True)
+        roll_fields = [MTPSequenceRollField("input_ids", input_ids, -1, 0, 0)]
+        if roll_position_ids:
+            roll_fields.append(MTPSequenceRollField("position_ids", position_ids, -1, 0, 0))
+        if sequence_roll_padding_mask is not None:
+            roll_fields.append(
+                MTPSequenceRollField("padding_mask", sequence_roll_padding_mask, -1, 0, True)
+            )
+        # A local padding mask without its unsharded source cannot participate in
+        # absolute addressing. Fall back the complete consumer group so input IDs,
+        # positions, and padding retain the established cumulative-roll semantics.
+        prepared_roll_context = None
+        if padding_mask is None or sequence_roll_padding_mask is not None:
+            prepared_roll_context = prepare_mtp_sequence_roll_fields(
+                sequence_roll_context, roll_fields, max_offset=self.config.mtp_num_layers
+            )
+        use_prepared_roll_rows = prepared_roll_context is not None
+        aligned_rows = None
+        if use_prepared_roll_rows:
+            assert prepared_roll_context is not None
+            # Materialize the complete group before invoking any MTP layer. A
+            # depth therefore either consumes only absolute rows or stays wholly
+            # on the established cumulative-roll path.
+            aligned_rows = {
+                field.key: prepared_roll_context.materialize_all(field.key) for field in roll_fields
+            }
+
         shared_dsa_tensors = None
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
@@ -3233,6 +2381,17 @@ class MultiTokenPredictionBlock(MegatronModule):
                     iteration=iteration, shared_tensors=shared_dsa_tensors
                 )
                 mtp_dsa_kwargs["mtp_dsa_context"] = mtp_dsa_context
+            if aligned_rows is not None:
+                input_ids = aligned_rows["input_ids"][iteration]
+                if roll_position_ids:
+                    position_ids = aligned_rows["position_ids"][iteration]
+                if sequence_roll_padding_mask is not None:
+                    padding_mask = aligned_rows["padding_mask"][iteration]
+                    padding_mask = _scatter_mtp_padding_mask(
+                        padding_mask,
+                        sequence_parallel=getattr(self.config, "sequence_parallel", False),
+                        tp_group=getattr(self.layers[layer_idx], "tp_group", None),
+                    )
             layer_outputs = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -3246,6 +2405,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_roll_context=sequence_roll_context,
                 roll_depth=iteration,
+                _inputs_pre_aligned=aligned_rows is not None,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
                 **mtp_dsa_kwargs,
