@@ -11,7 +11,11 @@ import torch
 from torch import Tensor
 
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_masking
+from megatron.core.transformer.experimental_attention_variant import (
+    dsa_indexer_loss,
+    dsa_layout,
+    dsa_masking,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan import (
     IndexerScoringDecision,
     IndexerScoringPlan,
@@ -181,6 +185,28 @@ def _get_packed_thd_metadata(
     )
 
 
+def _resolve_packed_layout_flags(
+    *,
+    use_local_indexer_varlen: bool,
+    single_packed_thd_sequence: bool,
+    packed_thd_causal_identity_layout: Optional[bool],
+    packed_thd_single_sequence: Optional[bool],
+) -> Tuple[bool, bool]:
+    """Prefer the new CP-independent facts while accepting direct legacy calls."""
+    return (
+        (
+            use_local_indexer_varlen
+            if packed_thd_causal_identity_layout is None
+            else packed_thd_causal_identity_layout
+        ),
+        (
+            single_packed_thd_sequence
+            if packed_thd_single_sequence is None
+            else packed_thd_single_sequence
+        ),
+    )
+
+
 def run_fused_dsa_attention(
     *,
     config: TransformerConfig,
@@ -208,6 +234,8 @@ def run_fused_dsa_attention(
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
     single_packed_thd_sequence: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
     local_packed_cp_rank: int = 0,
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
@@ -219,6 +247,12 @@ def run_fused_dsa_attention(
     ``use_fused_dsa_kernels`` before calling, so this hook assumes it was selected (matching
     the TileLang backend) and only validates that the requested shapes/layout are supported.
     """
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
     _assert_supported_indexer_scoring(use_relu)
     if (
         not absorbed_mla
@@ -1608,8 +1642,16 @@ def run_fused_qk_topk(
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
     _assert_supported_indexer_scoring(use_relu)
     del block_size
     if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
@@ -1678,8 +1720,16 @@ def run_fused_qk_topk_with_loss(
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
     del block_size
     tp_group = getattr(pg_collection, "tp", None)
     _assert_supported_indexer_scoring(use_relu)

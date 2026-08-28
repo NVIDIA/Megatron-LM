@@ -26,7 +26,7 @@ _BACKEND_MODULE_NAME_BY_BACKEND = {
 _BACKEND: Optional[ModuleType] = None
 _BACKEND_SELECTION: Optional[str] = None
 _LOGGER = logging.getLogger(__name__)
-_HOOK_KWARG_SIGNATURE_CACHE: dict[int, tuple[object, Optional[frozenset[str]]]] = {}
+_HOOK_KWARG_SIGNATURE_CACHE: dict[int, tuple[object, Optional[frozenset[str]], bool]] = {}
 
 
 def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
@@ -76,24 +76,30 @@ def _log_declined_hook(config: TransformerConfig, hook_name: str, reason: str) -
     )
 
 
-def _hook_kwargs_accepting(fn, **candidate_kwargs):
+def _hook_kwargs_accepting(fn, *, opaque_fallback_names: Tuple[str, ...] = (), **candidate_kwargs):
     """Keep only the kwargs ``fn`` can accept.
 
     Backend hooks are resolved dynamically and may live out of tree; passing a
     keyword an older backend does not know would fail with a TypeError at the
-    first fused call rather than a clean decline.
+    first fused call rather than a clean decline. Opaque C/pybind hooks receive
+    no newly introduced kwargs by default, but callers can name kwargs that
+    predate this filtering so an unavailable signature does not break an
+    existing hook contract.
     """
     cache_key = id(fn)
     cached = _HOOK_KWARG_SIGNATURE_CACHE.get(cache_key)
     if cached is not None and cached[0] is fn:
         accepted_names = cached[1]
+        signature_is_opaque = cached[2]
     else:
         try:
             sig = inspect.signature(fn)
         except (TypeError, ValueError):
             # Opaque C/pybind hooks cannot safely receive a newly introduced keyword.
             accepted_names = frozenset()
+            signature_is_opaque = True
         else:
+            signature_is_opaque = False
             if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                 accepted_names = None
             else:
@@ -104,11 +110,38 @@ def _hook_kwargs_accepting(fn, **candidate_kwargs):
                     in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
                 )
         # Retain the callable so Python object-id reuse cannot apply a stale signature.
-        _HOOK_KWARG_SIGNATURE_CACHE[cache_key] = (fn, accepted_names)
+        _HOOK_KWARG_SIGNATURE_CACHE[cache_key] = (fn, accepted_names, signature_is_opaque)
 
     if accepted_names is None:
         return candidate_kwargs
+    if signature_is_opaque:
+        accepted_names = frozenset(opaque_fallback_names)
     return {k: v for k, v in candidate_kwargs.items() if k in accepted_names}
+
+
+def _packed_layout_hook_kwargs(
+    fn,
+    *,
+    varlen_is_plain_causal: bool,
+    packed_thd_causal_identity_layout: bool,
+    packed_thd_single_sequence: bool,
+    opaque_fallback_names: Tuple[str, ...] = (),
+):
+    """Offer CP-independent layout facts only to hooks that declare support."""
+    return _hook_kwargs_accepting(
+        fn,
+        opaque_fallback_names=opaque_fallback_names,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
+
+
+def _legacy_packed_cp_flags(
+    *, cp_size: int, use_local_indexer_varlen: bool, single_packed_thd_sequence: bool
+) -> Tuple[bool, bool]:
+    """Preserve the historical CP-only meaning of existing backend hook flags."""
+    return (use_local_indexer_varlen and cp_size > 1, single_packed_thd_sequence and cp_size > 1)
 
 
 def _resolve_fused_hook(config: TransformerConfig, hook_name: str):
@@ -155,16 +188,19 @@ def run_fused_qk_topk(
 ) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations.
 
-    Contract note (changed in this release): ``single_packed_thd_sequence`` and
-    ``use_local_indexer_varlen`` describe the layout only -- a single-sequence pack
-    and a packed causal layout with identity key positions -- and no longer imply
-    ``cp_size > 1``. Backends deciding kernel applicability from them must consult
-    ``cp_size`` (and their own shape preconditions) rather than assume a zigzag
-    split with an even local length.
+    The existing ``single_packed_thd_sequence`` and ``use_local_indexer_varlen``
+    backend kwargs retain their historical CP-only meaning. CP-independent layout
+    facts are offered as optional, signature-filtered kwargs so older out-of-tree
+    hooks cannot silently enter a CP path for a CP=1 pack.
     """
     fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
         return None
+    legacy_local_varlen, legacy_single_sequence = _legacy_packed_cp_flags(
+        cp_size=cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+    )
     result = fn(
         q=q,
         k=k,
@@ -174,14 +210,19 @@ def run_fused_qk_topk(
         ends=ends,
         block_size=block_size,
         use_relu=use_relu,
-        use_local_indexer_varlen=use_local_indexer_varlen,
-        single_packed_thd_sequence=single_packed_thd_sequence,
+        use_local_indexer_varlen=legacy_local_varlen,
+        single_packed_thd_sequence=legacy_single_sequence,
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **_hook_kwargs_accepting(fn, varlen_is_plain_causal=varlen_is_plain_causal),
+        **_packed_layout_hook_kwargs(
+            fn,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd_causal_identity_layout=use_local_indexer_varlen,
+            packed_thd_single_sequence=single_packed_thd_sequence,
+        ),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
@@ -216,16 +257,17 @@ def run_fused_qk_topk_with_loss(
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations.
 
-    Contract note (changed in this release): ``single_packed_thd_sequence`` and
-    ``use_local_indexer_varlen`` describe the layout only -- a single-sequence pack
-    and a packed causal layout with identity key positions -- and no longer imply
-    ``cp_size > 1``. Backends deciding kernel applicability from them must consult
-    ``cp_size`` (and their own shape preconditions) rather than assume a zigzag
-    split with an even local length.
+    The existing packed-layout kwargs retain their historical CP-only meaning;
+    CP-independent facts use optional, signature-filtered kwargs.
     """
     fn = _resolve_fused_hook(config, "run_fused_qk_topk_with_loss")
     if fn is None:
         return None
+    legacy_local_varlen, legacy_single_sequence = _legacy_packed_cp_flags(
+        cp_size=cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+    )
     result = fn(
         config=config,
         q=q,
@@ -243,14 +285,19 @@ def run_fused_qk_topk_with_loss(
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
         use_relu=use_relu,
-        use_local_indexer_varlen=use_local_indexer_varlen,
-        single_packed_thd_sequence=single_packed_thd_sequence,
+        use_local_indexer_varlen=legacy_local_varlen,
+        single_packed_thd_sequence=legacy_single_sequence,
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **_hook_kwargs_accepting(fn, varlen_is_plain_causal=varlen_is_plain_causal),
+        **_packed_layout_hook_kwargs(
+            fn,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd_causal_identity_layout=use_local_indexer_varlen,
+            packed_thd_single_sequence=single_packed_thd_sequence,
+        ),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk_with_loss", "backend returned None")
@@ -310,16 +357,17 @@ def run_fused_dsa_attention(
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together.
 
-    Contract note (changed in this release): ``single_packed_thd_sequence`` and
-    ``use_local_indexer_varlen`` describe the layout only -- a single-sequence pack
-    and a packed causal layout with identity key positions -- and no longer imply
-    ``cp_size > 1``. Backends deciding kernel applicability from them must consult
-    ``cp_size`` (and their own shape preconditions) rather than assume a zigzag
-    split with an even local length.
+    The existing packed-layout kwargs retain their historical CP-only meaning;
+    CP-independent facts use optional, signature-filtered kwargs.
     """
     fn = _resolve_fused_hook(config, "run_fused_dsa_attention")
     if fn is None:
         return None
+    legacy_local_varlen, legacy_single_sequence = _legacy_packed_cp_flags(
+        cp_size=cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+    )
     result = fn(
         config=config,
         query=query,
@@ -342,10 +390,18 @@ def run_fused_dsa_attention(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
-        **_hook_kwargs_accepting(fn, varlen_is_plain_causal=varlen_is_plain_causal),
+        **_packed_layout_hook_kwargs(
+            fn,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd_causal_identity_layout=use_local_indexer_varlen,
+            packed_thd_single_sequence=single_packed_thd_sequence,
+            # ``varlen_is_plain_causal`` was already part of the full-hook
+            # contract before optional kwarg filtering was introduced.
+            opaque_fallback_names=("varlen_is_plain_causal",),
+        ),
         use_relu=use_relu,
-        use_local_indexer_varlen=use_local_indexer_varlen,
-        single_packed_thd_sequence=single_packed_thd_sequence,
+        use_local_indexer_varlen=legacy_local_varlen,
+        single_packed_thd_sequence=legacy_single_sequence,
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
