@@ -14,14 +14,23 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     MHCCheckpointManager,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    TECudaGraphHelper,
+    _CudagraphGlobalRecord,
+)
 from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -1088,7 +1097,7 @@ class TestMHCWithCudaGraph:
         monkeypatch.setattr(
             HyperConnectionTransformerLayer,
             "_te_cuda_graph_replay_mhc_attention_split",
-            lambda self, args, kwargs, context: sentinel,
+            lambda self, args, kwargs, context, packed_seq_params=None: sentinel,
         )
         hidden = torch.randn(8, 2, config.num_residual_streams * config.hidden_size, device="cuda")
         assert layer._te_cuda_graph_replay_impl((hidden,), {}, None) is sentinel
@@ -1167,6 +1176,7 @@ class TestMHCWithCudaGraph:
             cu_seqlens_kv_padded=cu_seqlens_kv_padded,
             max_seqlen_q=4,
             max_seqlen_kv=4,
+            tokens_per_sample=8,
         )
         padding_mask = torch.zeros((1, 8), dtype=torch.bool, device="cuda")
         input_ids = torch.arange(8, device="cuda").unsqueeze(0)
@@ -1199,6 +1209,7 @@ class TestMHCWithCudaGraph:
         assert graph_kwargs["input_ids"] is input_ids
         assert recorded["mlp_kwargs"]["padding_mask"] is padding_mask
         assert recorded["mlp_kwargs"]["input_ids"] is input_ids
+        assert recorded["mlp_kwargs"]["packed_seq_params"] is packed_seq_params
 
     def test_split_capture_reconstructs_static_cp_packed_sequence(self, monkeypatch):
         """Capture rebuilds graph-static PackedSeqParams from flat THD tensors."""
@@ -1249,6 +1260,206 @@ class TestMHCWithCudaGraph:
             assert getattr(reconstructed, name) is tensor
             assert name not in capture_kwargs
         assert capture_kwargs["padding_mask"] is padding_mask
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine >= 2.10",
+    )
+    @pytest.mark.parametrize("context_parallel_size", [2, 8])
+    def test_real_te_thd_attention_split_with_static_cp(self, context_parallel_size, monkeypatch):
+        """Real TE capture/replay keeps static CP and runtime THD metadata intact.
+
+        CP2 is the mandatory distributed regression; CP8 runs when the launcher has
+        enough ranks.  The production ``TECudaGraphHelper`` drives
+        ``make_graphed_callables`` without replacing either side of the graph boundary.
+        Two public replays then use different, same-shape cu-seqlens tensors and run
+        backward through the captured attention plus the eager mHC/MLP tails.
+        """
+        if Utils.world_size < context_parallel_size:
+            pytest.skip(f"CP{context_parallel_size} requires at least that many ranks")
+        if Utils.world_size % context_parallel_size != 0:
+            pytest.skip(
+                f"world size {Utils.world_size} is not divisible by CP{context_parallel_size}"
+            )
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, context_parallel_size=context_parallel_size
+        )
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+
+        local_tokens = 16
+        global_tokens = local_tokens * context_parallel_size
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=2,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            use_te_rng_tracker=True,
+            tensor_model_parallel_size=1,
+            context_parallel_size=context_parallel_size,
+            cp_comm_type="p2p",
+            cp_partition_mode="zigzag",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_warmup_steps=3,
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=local_tokens,
+            thd_max_packed_sequences=2,
+            pad_packed_seq_alignment="max",
+            create_attention_mask_in_dataloader=False,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer = HyperConnectionTransformerLayer(
+            config, layer_spec.submodules, pg_collection=pg_collection
+        ).cuda()
+        layer.train()
+
+        fixed_cp_group = pg_collection.cp
+        assert fixed_cp_group is not None
+        assert fixed_cp_group.size() == context_parallel_size
+        assert layer.pg_collection is pg_collection
+        assert layer.self_attention.pg_collection.cp is fixed_cp_group
+
+        class _SingleLayerModel(torch.nn.Module):
+            """Smallest model surface discoverable by ``TECudaGraphHelper``."""
+
+            def __init__(self, graph_layer, graph_config):
+                super().__init__()
+                self.config = graph_config
+                self.position_embedding_type = "none"
+                self.decoder = torch.nn.Module()
+                self.decoder.layers = torch.nn.ModuleList([graph_layer])
+
+            def zero_grad_buffer(self):
+                self.zero_grad(set_to_none=True)
+
+        model = _SingleLayerModel(layer, config)
+        helper = None
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=torch.distributed.get_rank(),
+            rampup_batch_size=None,
+            global_batch_size=pg_collection.dp.size(),
+            micro_batch_size=1,
+            data_parallel_size=pg_collection.dp.size(),
+            decrease_batch_size_if_needed=False,
+        )
+
+        def make_packed_seq_params(first_boundary):
+            cu_seqlens = torch.tensor(
+                [0, first_boundary, global_tokens], dtype=torch.int32, device="cuda"
+            )
+            return PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens.clone(),
+                cu_seqlens_q_padded=cu_seqlens.clone(),
+                cu_seqlens_kv_padded=cu_seqlens.clone(),
+                max_seqlen_q=global_tokens,
+                max_seqlen_kv=global_tokens,
+                tokens_per_sample=global_tokens,
+                cp_partition_mode=config.cp_partition_mode,
+            )
+
+        packed_inputs = (
+            make_packed_seq_params(global_tokens // 2),
+            make_packed_seq_params(global_tokens // 4),
+        )
+        assert packed_inputs[0].cu_seqlens_q.shape == packed_inputs[1].cu_seqlens_q.shape
+        assert not torch.equal(packed_inputs[0].cu_seqlens_q, packed_inputs[1].cu_seqlens_q)
+        assert all(packed.cp_group is None for packed in packed_inputs)
+
+        observed_mlp_packed_inputs = []
+        eager_mlp_tail = layer._forward_mlp
+
+        def recording_mlp_tail(hidden_states, *args, **kwargs):
+            observed_mlp_packed_inputs.append(kwargs.get("packed_seq_params"))
+            return eager_mlp_tail(hidden_states, *args, **kwargs)
+
+        try:
+            helper = TECudaGraphHelper(
+                model=[model],
+                config=config,
+                seq_length=global_tokens,
+                micro_batch_size=1,
+                optimizers=[],
+                pg_collection=pg_collection,
+                thd_sequence_length_upper_bound=global_tokens,
+            )
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert len(layer.cuda_graphs) == 1
+
+            # The spy is intentionally installed only on the eager continuation;
+            # capture and replay still cross the production TE graph unchanged.
+            monkeypatch.setattr(layer, "_forward_mlp", recording_mlp_tail)
+            padding_mask = torch.zeros((1, local_tokens), dtype=torch.bool, device="cuda")
+            base_hidden_states = torch.randn(
+                local_tokens,
+                1,
+                config.num_residual_streams * config.hidden_size,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            replay_outputs = []
+            for packed_seq_params in packed_inputs:
+                layer.zero_grad(set_to_none=True)
+                hidden_states = base_hidden_states.clone().requires_grad_(True)
+                output, context = layer(
+                    hidden_states, packed_seq_params=packed_seq_params, padding_mask=padding_mask
+                )
+                loss = output.float().square().mean()
+                loss.backward()
+
+                assert context is None
+                assert torch.isfinite(output).all()
+                assert hidden_states.grad is not None
+                assert torch.isfinite(hidden_states.grad).all()
+                parameter_grads = [
+                    parameter.grad for parameter in layer.parameters() if parameter.grad is not None
+                ]
+                assert parameter_grads
+                assert all(torch.isfinite(grad).all() for grad in parameter_grads)
+                for attention_parameter in (
+                    layer.self_attention.linear_qkv.weight,
+                    layer.self_attention.linear_proj.weight,
+                ):
+                    assert attention_parameter.grad is not None
+                    assert torch.isfinite(attention_parameter.grad).all()
+                replay_outputs.append(output.detach().clone())
+
+            assert len(observed_mlp_packed_inputs) == len(packed_inputs)
+            assert all(
+                observed is expected
+                for observed, expected in zip(observed_mlp_packed_inputs, packed_inputs)
+            )
+            assert not torch.allclose(replay_outputs[0], replay_outputs[1])
+            assert layer.self_attention.pg_collection.cp is fixed_cp_group
+        finally:
+            try:
+                if helper is not None and helper.graphs_created():
+                    helper.delete_cuda_graphs()
+                elif layer.cuda_graphs:
+                    # Capture can fail after graphs are attached but before the
+                    # helper marks the lifecycle complete.  Do not leave those
+                    # graph pools live for the next distributed test.
+                    for graph in layer.cuda_graphs:
+                        graph.reset()
+                    layer.cuda_graphs = []
+                    layer.cuda_graph_manual_hooks = []
+                    layer.clear_te_cuda_graph_static_hidden_inputs()
+            finally:
+                destroy_num_microbatches_calculator()
+                torch.cuda.synchronize()
+                Utils.destroy_model_parallel()
+                initialize_rng_tracker(use_cudagraphable_rng=True, force_reset=True)
 
     def test_split_replay_maps_output_arity_and_bias(self, monkeypatch):
         """Captured output arity: 1 tensor -> (out, None); 2 -> (out, bias); else error."""

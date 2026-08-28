@@ -1505,6 +1505,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         For THD format, PackedSeqParams is decomposed into individual tensor kwargs.
         """
         context = None
+        # Keep the Python metadata object for any eager continuation after a
+        # partial graph. The graph boundary still receives only its decomposed
+        # tensor fields; in particular, tokens_per_sample is needed to restore
+        # the batch dimension before an eager MoE tail.
+        packed_seq_params = kwargs.get("packed_seq_params")
         padding_mask = kwargs.get("padding_mask", None)
         if (
             self.config.cuda_graph_modules
@@ -1533,7 +1538,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.off_interface.enter_replay()
 
         try:
-            return self._te_cuda_graph_replay_impl(args, kwargs, context)
+            return self._te_cuda_graph_replay_impl(
+                args, kwargs, context, packed_seq_params=packed_seq_params
+            )
         finally:
             if self.config.delay_offload_until_cuda_graph:
                 self.off_interface.exit_replay()
@@ -1590,7 +1597,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias
 
-    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+    def _te_cuda_graph_replay_impl(
+        self, args, kwargs, context, packed_seq_params: Optional[PackedSeqParams] = None
+    ):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
 
@@ -1704,7 +1713,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states,
                 padding_mask=kwargs.get("padding_mask", None),
                 input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params", None),
+                packed_seq_params=packed_seq_params,
             )
         return output, context
 
@@ -2627,17 +2636,23 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return hidden_states, context, mhc_recompute_manager, kwargs
 
-    def _te_cuda_graph_replay_mhc_attention_split(self, args, kwargs, context):
+    def _te_cuda_graph_replay_mhc_attention_split(
+        self, args, kwargs, context, packed_seq_params: Optional[PackedSeqParams] = None
+    ):
         """Replay captured attention between eager mHC pre/post operations."""
         hidden_states, context, mhc_recompute_manager, kwargs = self._replay_mhc_attention_consumer(
             args, kwargs, context
         )
+        if packed_seq_params is None:
+            # Preserve compatibility with tests or integrations that call the
+            # split implementation directly instead of the public replay entry.
+            packed_seq_params = kwargs.get("packed_seq_params")
         output = self._forward_mlp(
             hidden_states,
             inference_context=kwargs.get("inference_context"),
             padding_mask=kwargs.get("padding_mask"),
             input_ids=kwargs.get("input_ids"),
-            packed_seq_params=kwargs.get("packed_seq_params"),
+            packed_seq_params=packed_seq_params,
             mhc_recompute_manager=mhc_recompute_manager,
         )
         return output, context
@@ -2706,7 +2721,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 
-    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+    def _te_cuda_graph_replay_impl(
+        self, args, kwargs, context, packed_seq_params: Optional[PackedSeqParams] = None
+    ):
         """Implementation of _te_cuda_graph_replay with hyper connection support.
 
         Overrides the parent's _te_cuda_graph_replay_impl so that the
@@ -2720,7 +2737,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             if self.config.overlap_moe_expert_parallel_comm:
                 return self._te_cuda_graph_replay_mhc_attention_split_overlap(args, kwargs, context)
-            return self._te_cuda_graph_replay_mhc_attention_split(args, kwargs, context)
+            return self._te_cuda_graph_replay_mhc_attention_split(
+                args, kwargs, context, packed_seq_params=packed_seq_params
+            )
 
         # Read, do not pop: on THD, padding_mask IS a capture-time kwarg
         # (get_layer_static_inputs adds it whenever _is_thd_cuda_graph()), and
@@ -2882,7 +2901,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 *cuda_graph_output,
                 padding_mask=padding_mask,
                 input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params", None),
+                packed_seq_params=packed_seq_params,
                 mhc_recompute_manager=getattr(self, '_mhc_recompute_manager', None),
             )
         return output, context
