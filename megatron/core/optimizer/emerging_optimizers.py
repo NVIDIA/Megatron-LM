@@ -11,12 +11,9 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as package_version
 from typing import Any, Callable, Dict, Literal, Optional, get_args
 
 import torch
-from packaging.version import Version
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -57,19 +54,6 @@ logger = logging.getLogger(__name__)
 # ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
 # elsewhere in the tree are written.
 _SYRK_MIN_EO_VERSION = "0.4.0.dev0"
-
-try:
-    EMERGING_OPTIMIZERS_VERSION = Version(package_version("emerging-optimizers"))
-except PackageNotFoundError:
-    EMERGING_OPTIMIZERS_VERSION = Version("0")
-
-_BATCHED_NEWTON_SCHULZ_MIN_VERSION = Version("0.3.0")
-
-
-def _supports_batched_newton_schulz() -> bool:
-    """Return whether Emerging-Optimizers supports batched Newton-Schulz."""
-    return EMERGING_OPTIMIZERS_VERSION >= _BATCHED_NEWTON_SCHULZ_MIN_VERSION
-
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
     """Return the coefficient types supported by the installed emerging_optimizers.
@@ -521,7 +505,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     f"Muon per-head QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
                     f"split_shapes={split_shapes}"
                 )
-            if len(set(split_shapes)) == 1 and _supports_batched_newton_schulz():
+            if len(set(split_shapes)) == 1:
                 # A 3D input selects Emerging-Optimizers' batched Newton-Schulz path.
                 head_rows = split_shapes[0]
                 return orthogonalize_fn(grad.view(len(split_shapes), head_rows, -1)).view_as(grad)
