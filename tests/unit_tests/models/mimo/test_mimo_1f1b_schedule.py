@@ -457,7 +457,7 @@ def get_mimo_model(
     if use_layer_wise_distributed_optimizer:
         wrap_active_modules_with_ddp(
             SimpleNamespace(
-                encoder_ddp_overlap=False,
+                mimo_encoder_ddp_overlap=False,
                 freeze_lm=False,
                 freeze_vit=False,
                 freeze_projection=False,
