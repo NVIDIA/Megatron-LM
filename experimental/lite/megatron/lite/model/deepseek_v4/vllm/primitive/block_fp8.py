@@ -98,62 +98,6 @@ if triton is not None:
         tl.store(qweight + offsets, dequantized * (1.0 / scale))
         tl.store(ue8m0_scales + block, exponent + 127.0)
 
-    @triton.jit
-    def _dynamic_grouped4_block_fp8_quantize_ue8m0(
-        weight0,
-        weight1,
-        weight2,
-        weight3,
-        qweight,
-        ue8m0_scales,
-        columns: tl.constexpr,
-        scale_columns: tl.constexpr,
-        blocks_per_weight: tl.constexpr,
-        weight_elements: tl.constexpr,
-        num_weights: tl.constexpr,
-        BLOCK_ELEMENTS: tl.constexpr,
-    ):
-        grouped_block = tl.program_id(0)
-        expert = grouped_block // blocks_per_weight
-        block = grouped_block - expert * blocks_per_weight
-        block_row = block // scale_columns
-        block_col = block - block_row * scale_columns
-        local = tl.arange(0, BLOCK_ELEMENTS)
-        row = block_row * 128 + local // 128
-        column = block_col * 128 + local % 128
-        offsets = row * columns + column
-        values = tl.load(weight0 + offsets, mask=expert == 0, other=0.0).to(
-            tl.float32
-        )
-        if num_weights > 1:
-            candidate = tl.load(
-                weight1 + offsets, mask=expert == 1, other=0.0
-            ).to(tl.float32)
-            values = tl.where(expert == 1, candidate, values)
-        if num_weights > 2:
-            candidate = tl.load(
-                weight2 + offsets, mask=expert == 2, other=0.0
-            ).to(tl.float32)
-            values = tl.where(expert == 2, candidate, values)
-        if num_weights > 3:
-            candidate = tl.load(
-                weight3 + offsets, mask=expert == 3, other=0.0
-            ).to(tl.float32)
-            values = tl.where(expert == 3, candidate, values)
-        first_amax = tl.maximum(tl.max(tl.abs(values), axis=0), 1.0e-4)
-        first_scale = first_amax / 448.0
-        first_quantized = (values * (1.0 / first_scale)).to(tl.float8e4nv)
-        dequantized = first_quantized.to(tl.float32) * first_scale
-        amax = tl.maximum(tl.max(tl.abs(dequantized), axis=0), 1.0e-4)
-        exponent = tl.ceil(tl.log2(amax / 448.0))
-        scale = tl.exp2(exponent)
-        output_offsets = expert * weight_elements + offsets
-        tl.store(qweight + output_offsets, dequantized * (1.0 / scale))
-        tl.store(
-            ue8m0_scales + expert * blocks_per_weight + block,
-            exponent + 127.0,
-        )
-
 
 @contextmanager
 def _weight_nvtx_range(name: str):
@@ -228,32 +172,6 @@ def _quantize_block_fp8_weight_fused_ue8m0_out(
         ue8m0_scales,
         columns=weight.shape[1],
         scale_columns=ue8m0_scales.shape[1],
-        BLOCK_ELEMENTS=BLOCK_SHAPE[0] * BLOCK_SHAPE[1],
-        num_warps=8,
-    )
-
-
-def _quantize_grouped4_block_fp8_weight_fused_ue8m0_out(
-    weights: tuple[torch.Tensor, ...],
-    qweight: torch.Tensor,
-    ue8m0_scales: torch.Tensor,
-) -> None:
-    if not 1 <= len(weights) <= 4:
-        raise ValueError("grouped FP8 quantization requires one to four weights")
-    blocks_per_weight = ue8m0_scales[0].numel()
-    unused = weights[0]
-    padded_weights = (*weights, *((unused,) * (4 - len(weights))))
-    _dynamic_grouped4_block_fp8_quantize_ue8m0[
-        (len(weights) * blocks_per_weight,)
-    ](
-        *padded_weights,
-        qweight,
-        ue8m0_scales,
-        columns=weights[0].shape[1],
-        scale_columns=ue8m0_scales.shape[2],
-        blocks_per_weight=blocks_per_weight,
-        weight_elements=weights[0].numel(),
-        num_weights=len(weights),
         BLOCK_ELEMENTS=BLOCK_SHAPE[0] * BLOCK_SHAPE[1],
         num_warps=8,
     )
@@ -395,15 +313,9 @@ def _quantize_grouped_block_fp8_weights_direct(
         device=weights[0].device,
     )
     with torch.no_grad():
-        batched = (
-            os.environ.get("MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "1") != "0"
-        )
-        for start in range(0, len(weights), 4 if batched else 1):
-            chunk = weights[start : start + (4 if batched else 1)]
-            _quantize_grouped4_block_fp8_weight_fused_ue8m0_out(
-                tuple(weight.detach() for weight in chunk),
-                qweight[start : start + len(chunk)],
-                scales[start : start + len(chunk)],
+        for index, weight in enumerate(weights):
+            _quantize_block_fp8_weight_fused_ue8m0_out(
+                weight.detach(), qweight[index], scales[index]
             )
     return qweight, scales
 

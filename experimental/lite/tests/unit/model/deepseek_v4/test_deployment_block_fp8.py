@@ -217,28 +217,6 @@ def test_direct_grouped_weight_pack_matches_stacked_vllm_bitwise(
 
 
 @pytest.mark.gpus(1)
-def test_batched_grouped_weight_quant_matches_single_launches_bitwise(
-    monkeypatch,
-) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires one CUDA GPU")
-    weights = tuple(
-        nn.Parameter(torch.randn(256, 384, device="cuda", dtype=torch.bfloat16))
-        for _ in range(7)
-    )
-    monkeypatch.setenv("MLITE_VLLM_FUSED_WEIGHT_QUANT", "1")
-    monkeypatch.setenv("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1")
-
-    monkeypatch.setenv("MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "0")
-    reference = pack_grouped_block_fp8_weight(weights)
-    monkeypatch.setenv("MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "1")
-    actual = pack_grouped_block_fp8_weight(weights)
-
-    assert torch.equal(actual.qweight, reference.qweight)
-    assert torch.equal(actual.scales, reference.scales)
-
-
-@pytest.mark.gpus(1)
 def test_direct_fused_weight_pack_matches_concatenated_vllm_bitwise(
     monkeypatch,
 ) -> None:
