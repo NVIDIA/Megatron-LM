@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from typing import Any
 
 import torch
@@ -9,7 +9,7 @@ import torch
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.cuda_graph_config import is_te_layer_whole_moe_cuda_graph
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     paged_stash_copy_kernel,
@@ -923,6 +923,46 @@ class PagedStashManager:
             self.current_vp_stage,
         ) = runtime_state
 
+    def abort_cuda_graph_capture(self, runtime_state=None):
+        """Discard paged-stash work left by an aborted TE or full-iteration capture.
+
+        Capture can fail after stash kernels have populated the pending queues and advanced page
+        free lists.  Drain the auxiliary stream before returning those pages to the free list so
+        a retry in the same process starts from a clean transaction.
+        """
+
+        streams = [getattr(self, "_pack_stream", None)]
+        unpack_stream = getattr(self, "_unpack_stream", None)
+        if unpack_stream is not streams[0]:
+            streams.append(unpack_stream)
+        for stream in streams:
+            if stream is not None:
+                with suppress(BaseException):
+                    stream.synchronize()
+
+        self._pack_stream_status = "idle"
+        self._unpack_stream_status = "idle"
+        self.paged_tensors_to_stash.clear()
+        self.paged_tensors_stash_in_progress.clear()
+        self.paged_tensors_to_reload.clear()
+
+        if self.stash_buffers is not None:
+            for dtype_buffers in self.stash_buffers.values():
+                for stash_buffer in dtype_buffers.values():
+                    with suppress(BaseException):
+                        stash_buffer.reset()
+        if self.overflow is not None:
+            with suppress(BaseException):
+                self.overflow.zero_()
+        if self.host_spill is not None:
+            with suppress(BaseException):
+                self.host_spill.zero_()
+
+        if runtime_state is not None:
+            self.finish_te_graph_capture(runtime_state)
+        else:
+            self._te_graph_capture = False
+
     def finish_te_graph_capture_group_io(self):
         """Join auxiliary stash streams before a TE per-layer graph capture ends."""
         if not self._te_graph_capture:
@@ -1203,7 +1243,11 @@ def paged_stash_te_graph_capture(enabled, order=None, config=None):
     runtime_state = stash_manager.start_te_graph_capture(order, config=config)
     try:
         yield
-    finally:
+    except BaseException:
+        with suppress(BaseException):
+            stash_manager.abort_cuda_graph_capture(runtime_state)
+        raise
+    else:
         stash_manager.finish_te_graph_capture(runtime_state)
 
 
@@ -1474,8 +1518,7 @@ class PagedStashRunner:
         """Fail fast when a captured TE whole-MoE graph exceeds its static buffers."""
         te_whole_moe_graph_replay = (
             training
-            and self.config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and is_te_layer_whole_moe_cuda_graph(self.config)
             and self._te_graph_capture_finished
         )
         if not te_whole_moe_graph_replay or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
@@ -1494,8 +1537,7 @@ class PagedStashRunner:
         """Require the runtime microbatch count to remain fixed after TE graph capture."""
         te_whole_moe_paged_stash_replay = (
             training
-            and self.config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and is_te_layer_whole_moe_cuda_graph(self.config)
             and self.config.moe_paged_stash
             and self._te_graph_capture_finished
         )
@@ -1508,6 +1550,15 @@ class PagedStashRunner:
                 "runtime microbatch count after capture: expected "
                 f"{self._te_graph_runtime_num_microbatches}, got {num_microbatches}."
             )
+
+    def _restore_full_iteration_paged_stash_replay_state(self, training: bool) -> None:
+        """Restore stash enablement omitted when a full-iteration graph only replays."""
+
+        if not isinstance(self.forward_backward_func, FullCudaGraphWrapper):
+            return
+        stage = "training" if training else "validation"
+        if FullCudaGraphWrapper.cuda_graph[stage] is not None:
+            self.stash_manager.enabled = training and self.config.moe_paged_stash
 
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun"""
@@ -1613,6 +1664,7 @@ class PagedStashRunner:
 
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
+        self._restore_full_iteration_paged_stash_replay_state(training)
         self._validate_te_whole_moe_graph_runtime(training, num_microbatches)
         saved_moe_paged_stash = self.config.moe_paged_stash
         saved_cuda_graph_impls = [
@@ -1631,7 +1683,18 @@ class PagedStashRunner:
             )
 
             kwargs['data_iterator'] = data_list
-            result = self.forward_backward_func(*args, **kwargs)
+            try:
+                result = self.forward_backward_func(*args, **kwargs)
+            except BaseException:
+                if isinstance(self.forward_backward_func, FullCudaGraphWrapper):
+                    with suppress(BaseException):
+                        FullCudaGraphWrapper.abort_cuda_graph(
+                            stage="training" if training else "validation"
+                        )
+                if self.config.moe_paged_stash:
+                    with suppress(BaseException):
+                        self.stash_manager.abort_cuda_graph_capture()
+                raise
 
             stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
             self._raise_if_te_whole_moe_graph_overflow(

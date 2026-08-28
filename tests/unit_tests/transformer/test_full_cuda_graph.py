@@ -33,6 +33,7 @@ def _reset_full_cuda_graph_state():
     FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
     FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
     FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+    FullCudaGraphWrapper.capture_signature = {'training': None, 'validation': None}
     StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
 
 
@@ -48,6 +49,30 @@ def reset_full_cuda_graph_state():
     MTPLossLoggingHelper.tracker = {}
     Utils.destroy_model_parallel()
     gc.collect()
+
+
+def test_abort_cuda_graph_clears_only_failed_stage_state():
+    FullCudaGraphWrapper.cuda_graph = {"training": object(), "validation": object()}
+    FullCudaGraphWrapper.result = {"training": object(), "validation": object()}
+    FullCudaGraphWrapper.curr_iteration = {"training": 2, "validation": 3}
+    FullCudaGraphWrapper.capture_signature = {
+        "training": {"num_microbatches": 2},
+        "validation": {"num_microbatches": 1},
+    }
+    StaticBufferLoader.static_buffers = {
+        "training": [{"tokens": object()}],
+        "validation": [{"tokens": object()}],
+    }
+
+    FullCudaGraphWrapper.abort_cuda_graph("training")
+
+    assert FullCudaGraphWrapper.cuda_graph["training"] is None
+    assert FullCudaGraphWrapper.result["training"] is None
+    assert FullCudaGraphWrapper.curr_iteration["training"] == 0
+    assert FullCudaGraphWrapper.capture_signature["training"] is None
+    assert StaticBufferLoader.static_buffers["training"] == []
+    assert FullCudaGraphWrapper.cuda_graph["validation"] is not None
+    assert StaticBufferLoader.static_buffers["validation"]
 
 
 @pytest.mark.skipif(

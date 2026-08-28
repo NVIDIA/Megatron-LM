@@ -31,6 +31,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.cuda_graph_config import te_cuda_graph_capture_contains_moe
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig, is_p2p_cp_comm_type
@@ -1642,10 +1643,13 @@ def _layer_is_graphable(layer, config):
     # Chunk capture uses the complete TransformerBlock as the TE callable. The
     # layer-wise module scopes below do not describe that outer callable.
     if getattr(config, 'cuda_graph_granularity', 'layer') == 'chunk':
-        return bool(getattr(layer, 'is_cuda_graph_chunk_callable', False))
+        return bool(getattr(layer, 'is_cuda_graph_chunk_callable', False)) and (
+            not getattr(config, 'dynamic_context_parallel', False)
+            or getattr(layer, '_supports_dynamic_cp_cuda_graph_replay', False)
+        )
 
-    if getattr(config, 'dynamic_context_parallel', False) and not hasattr(
-        layer, '_activate_dynamic_cp_cuda_graph'
+    if getattr(config, 'dynamic_context_parallel', False) and not getattr(
+        layer, '_supports_dynamic_cp_cuda_graph_replay', False
     ):
         return False
 
@@ -1725,6 +1729,7 @@ class _DynamicCPCaptureCallable(torch.nn.Module):
         self.training = module.training
 
     def forward(self, *args, **kwargs):
+        """Activate the capture context and invoke the wrapped module."""
         self._context_setter(self._capture_context)
         outputs = self.module(*args, **kwargs)
         mlp_norm_manager = getattr(self.module, 'mlp_norm_manager', None)
@@ -2041,9 +2046,9 @@ class TECudaGraphHelper:
         if getattr(self.config, 'moe_paged_stash', False):
             from megatron.core.transformer.moe.paged_stash import PagedStashManager
 
-            assert not PagedStashManager.get_instance().enabled, (
-                "Parallel chunk prewarm must run before the first Paged Stash schedule."
-            )
+            assert (
+                not PagedStashManager.get_instance().enabled
+            ), "Parallel chunk prewarm must run before the first Paged Stash schedule."
 
         torch.distributed.barrier()
         torch.cuda.synchronize()
@@ -2066,6 +2071,7 @@ class TECudaGraphHelper:
         input_tensor_backups = []
         saved_fp8_tensors = None
         offload_disabled = False
+        prewarm_dynamic_cp_context = None
 
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             DSAIndexerLossAutoScaler,
@@ -2084,10 +2090,16 @@ class TECudaGraphHelper:
         )
 
         try:
+            if self.config.dynamic_context_parallel:
+                # Prewarm runs before create_cudagraphs() publishes a capture context.
+                # Use the largest logical CP group so all parent-group ranks execute the
+                # same collectives while initializing the production local-token shape.
+                prewarm_dynamic_cp_context = max(
+                    self._get_dynamic_cp_capture_contexts(), key=lambda context: context[0]
+                )
+                self._set_dynamic_cp_capture_context(prewarm_dynamic_cp_context)
             sample_args, sample_kwargs = self._get_local_prewarm_arguments()
-            assert (
-                len(sample_args) == len(sample_kwargs) == len(self.flattened_callables)
-            ), (
+            assert len(sample_args) == len(sample_kwargs) == len(self.flattened_callables), (
                 "Parallel chunk prewarm requires exactly one forward sample for every local "
                 "chunk callable."
             )
@@ -2103,9 +2115,7 @@ class TECudaGraphHelper:
                     if module_id not in seen_modules:
                         seen_modules.add(module_id)
                         if hasattr(module, 'is_first_microbatch'):
-                            first_microbatch_backups.append(
-                                (module, module.is_first_microbatch)
-                            )
+                            first_microbatch_backups.append((module, module.is_first_microbatch))
                             module.is_first_microbatch = True
                     for buffer in module.buffers(recurse=False):
                         buffer_id = id(buffer)
@@ -2151,9 +2161,9 @@ class TECudaGraphHelper:
                         kwargs.setdefault('attention_mask', None)
                         outputs = callable_module.forward(*args, **kwargs)
                         differentiable_outputs = self._collect_differentiable_tensors(outputs)
-                        assert differentiable_outputs, (
-                            "A training chunk prewarm must produce a differentiable tensor."
-                        )
+                        assert (
+                            differentiable_outputs
+                        ), "A training chunk prewarm must produce a differentiable tensor."
                         torch.autograd.backward(
                             differentiable_outputs,
                             grad_tensors=[
@@ -2164,6 +2174,8 @@ class TECudaGraphHelper:
 
             torch.cuda.synchronize()
         finally:
+            if prewarm_dynamic_cp_context is not None:
+                self._set_dynamic_cp_capture_context(None)
             if saved_fp8_tensors is not None:
                 restore_fp8_tensors(self.flattened_callables, saved_fp8_tensors)
             with torch.no_grad():
@@ -3562,7 +3574,11 @@ class TECudaGraphHelper:
         )
         callables, sample_args, kwargs = self._get_dynamic_cp_variant_capture_data(capture_banks)
         sample_args = list(sample_args)
-        variant_graphs = tuple(self._capture_graph_bank(callables, sample_args, kwargs))
+        variant_graphs = tuple(
+            self._capture_graph_bank(
+                callables, sample_args, kwargs, paged_stash_order=capture_banks[0][3]['_order']
+            )
+        )
         start = 0
         for cp_size, _, bank_sample_args, _ in capture_banks:
             stop = start + len(bank_sample_args)
@@ -3609,6 +3625,9 @@ class TECudaGraphHelper:
         Reset the model and optimizer state after capturing CUDA Graphs.
         """
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
         from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
         for model_chunk in self.model:
@@ -3616,6 +3635,8 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        if DSAIndexerLossLoggingHelper.tracker:
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -3667,7 +3688,16 @@ class TECudaGraphHelper:
                     FineGrainedActivationOffloadingInterface as off_interface,
                 )
 
+                # TE does not guarantee its post-warmup hook runs when warmup raises.
+                # Restore the process-global offload state before resetting iteration state.
+                off_interface.enable_offload()
                 off_interface.reset()
+
+        with suppress(BaseException):
+            if self._should_share_dynamic_cp_pool():
+                # A failed warmup can retain dispatcher tensor views that belong to the
+                # aborted graph bank. They must not leak into a retry in the same process.
+                self._clear_moe_cudagraph_tensor_attrs()
 
         for cleanup in (self._reset_after_capture, gc.collect, torch.cuda.empty_cache):
             with suppress(BaseException):
@@ -3711,21 +3741,22 @@ class TECudaGraphHelper:
 
         self._graphs_created = True
 
-    def _capture_graph_bank(self, callables, sample_args, kwargs):
+    def _capture_graph_bank(self, callables, sample_args, kwargs, *, paged_stash_order=None):
         """Capture one CP bank with the standard TE graph schedule."""
         rng_context = (
             get_cuda_rng_tracker().fork() if self.config.sequence_parallel else nullcontext()
         )
         from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
 
-        te_whole_moe_paged_stash = (
-            getattr(self.config, 'moe_paged_stash', False)
-            and CudaGraphModule.moe in getattr(self.config, 'cuda_graph_modules', ())
-        )
+        te_whole_moe_paged_stash = getattr(
+            self.config, 'moe_paged_stash', False
+        ) and te_cuda_graph_capture_contains_moe(self.config)
+        if paged_stash_order is None:
+            paged_stash_order = kwargs['_order']
         with (
             rng_context,
             paged_stash_te_graph_capture(
-                te_whole_moe_paged_stash, order=kwargs['_order'], config=self.config
+                te_whole_moe_paged_stash, order=paged_stash_order, config=self.config
             ),
         ):
             return make_graphed_callables(tuple(callables), sample_args, **kwargs)

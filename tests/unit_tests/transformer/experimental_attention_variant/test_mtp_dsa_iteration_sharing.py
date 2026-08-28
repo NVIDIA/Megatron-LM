@@ -25,6 +25,10 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType, CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MTPDSAIterationContext,
     MultiTokenPredictionBlock,
@@ -124,6 +128,14 @@ def test_iteration_sharing_accepts_full_iteration_cuda_graph_scope():
     config = _make_config(cuda_graph_impl="full_iteration", cuda_graph_modules=[])
 
     assert config.cuda_graph_impl == "full_iteration"
+
+
+def test_iteration_sharing_accepts_chunk_cuda_graph_scope():
+    config = _make_config(
+        cuda_graph_impl="transformer_engine", cuda_graph_granularity="chunk", cuda_graph_modules=[]
+    )
+
+    assert config.cuda_graph_granularity == "chunk"
 
 
 def test_iteration_sharing_accepts_selective_mla_up_projection_recompute():
@@ -1033,7 +1045,19 @@ def test_recompute_path_threads_shared_kv_through_iteration_context(recompute_me
 
 def test_mtp_block_passes_one_source_state_through_all_repeated_iterations():
     observed = []
-    sequence_roll_context = object()
+    input_ids = torch.arange(4).view(1, 4)
+    position_ids = torch.arange(4).view(1, 4)
+    sequence_roll_context = prepare_mtp_sequence_roll_context(
+        tensor=input_ids, cp_group=None, packed_seq_params=None
+    )
+    assert sequence_roll_context is not None
+    sequence_roll_context = sequence_roll_context.prepare_fields(
+        (
+            MTPSequenceRollField("input_ids", input_ids, -1, 0, 0),
+            MTPSequenceRollField("position_ids", position_ids, -1, 0, 0),
+        ),
+        max_offset=7,
+    )
 
     class FakeRepeatedLayer:
         def __call__(
@@ -1075,8 +1099,8 @@ def test_mtp_block_passes_one_source_state_through_all_repeated_iterations():
     hidden_states = torch.randn(4, 1, 3)
     output = MultiTokenPredictionBlock.forward(
         block,
-        input_ids=torch.arange(4).view(1, 4),
-        position_ids=torch.arange(4).view(1, 4),
+        input_ids=input_ids,
+        position_ids=position_ids,
         hidden_states=hidden_states,
         attention_mask=None,
         sequence_roll_context=sequence_roll_context,

@@ -22,6 +22,33 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
+def is_te_layer_whole_moe_cuda_graph(config) -> bool:
+    """Return whether a layer-granularity TE graph captures the whole MoE body.
+
+    An empty ``cuda_graph_modules`` list means whole-layer capture, so it includes the MoE
+    body just like an explicit ``CudaGraphModule.moe`` entry.  Chunk granularity has a separate
+    runtime-key schedule and must not inherit the fixed-microbatch layer-graph contract.
+    """
+
+    modules = getattr(config, "cuda_graph_modules", ()) or ()
+    return (
+        getattr(config, "cuda_graph_impl", "none") == "transformer_engine"
+        and getattr(config, "cuda_graph_granularity", "layer") == "layer"
+        and (not modules or CudaGraphModule.moe in modules)
+    )
+
+
+def te_cuda_graph_capture_contains_moe(config) -> bool:
+    """Return whether the current TE callable boundary contains a complete MoE body."""
+
+    modules = getattr(config, "cuda_graph_modules", ()) or ()
+    return getattr(config, "cuda_graph_impl", "none") == "transformer_engine" and (
+        getattr(config, "cuda_graph_granularity", "layer") == "chunk"
+        or not modules
+        or CudaGraphModule.moe in modules
+    )
+
+
 PACKED_DSA_CP_CUDA_GRAPH_ERROR = (
     "CUDA graph capture is not supported for this packed DSA context-parallel "
     "configuration: the requested capture path cannot preserve or reconstruct the "

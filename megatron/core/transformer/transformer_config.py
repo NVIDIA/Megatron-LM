@@ -18,6 +18,7 @@ from megatron.core.transformer.cuda_graph_config import (
     PACKED_DSA_CP_CUDA_GRAPH_ERROR,
     get_deprecated_cuda_graph_modules_migration,
     is_packed_dsa_cp_cuda_graph_capture_unsupported,
+    is_te_layer_whole_moe_cuda_graph,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
@@ -3241,8 +3242,7 @@ class TransformerConfig(ModelParallelConfig):
         # earlier placement would compare unnormalized string module forms and let
         # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
         is_te_chunk_graph = (
-            self.cuda_graph_impl == "transformer_engine"
-            and self.cuda_graph_granularity == "chunk"
+            self.cuda_graph_impl == "transformer_engine" and self.cuda_graph_granularity == "chunk"
         )
 
         # Two things about mHC recompute depend on CUDA graphs regardless of the
@@ -3436,31 +3436,33 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
+        cuda_graph_preserves_mtp_share_lifetime = self.cuda_graph_impl == "full_iteration" or (
+            self.cuda_graph_impl == "transformer_engine" and self.cuda_graph_granularity == "chunk"
+        )
         if (
             self.dsa_mtp_index_kv_share
             and cuda_graph_captures_attention
-            and self.cuda_graph_impl != "full_iteration"
+            and not cuda_graph_preserves_mtp_share_lifetime
         ):
             raise ValueError(
                 "dsa_mtp_index_kv_share does not support per-layer CUDA graph scopes "
-                "that capture attention. Use a MoE-only scope or a graph scope that "
-                "contains the complete MTP producer-consumer chain."
+                "that capture attention. Use a MoE-only scope, a full-iteration graph, "
+                "or a whole-chunk graph that keeps MTP postprocessing eager."
             )
 
         if self.cuda_graph_parallel_prewarm:
             assert self.cuda_graph_impl == "transformer_engine", (
-                "cuda_graph_parallel_prewarm requires "
-                "cuda_graph_impl='transformer_engine'."
+                "cuda_graph_parallel_prewarm requires " "cuda_graph_impl='transformer_engine'."
             )
-            assert self.cuda_graph_granularity == "chunk", (
-                "cuda_graph_parallel_prewarm requires cuda_graph_granularity='chunk'."
-            )
-            assert self.sequence_packing_scheduler is not None, (
-                "cuda_graph_parallel_prewarm currently supports only THD sequence packing."
-            )
-            assert self.pipeline_model_parallel_size > 1, (
-                "cuda_graph_parallel_prewarm requires pipeline_model_parallel_size > 1."
-            )
+            assert (
+                self.cuda_graph_granularity == "chunk"
+            ), "cuda_graph_parallel_prewarm requires cuda_graph_granularity='chunk'."
+            assert (
+                self.sequence_packing_scheduler is not None
+            ), "cuda_graph_parallel_prewarm currently supports only THD sequence packing."
+            assert (
+                self.pipeline_model_parallel_size > 1
+            ), "cuda_graph_parallel_prewarm requires pipeline_model_parallel_size > 1."
 
         if self.cuda_graph_impl != "none":
 
@@ -3491,6 +3493,10 @@ class TransformerConfig(ModelParallelConfig):
                     assert self.cuda_graph_warmup_steps >= 2, (
                         "Paged Stash with chunk CUDA graphs requires at least two warmup steps "
                         "for schedule discovery and buffer allocation."
+                    )
+                    assert self.cuda_graph_dynamic_microbatches, (
+                        "Paged Stash with chunk CUDA graphs requires "
+                        "cuda_graph_dynamic_microbatches so capture uses runtime schedule keys."
                     )
                 if self.sequence_packing_scheduler is not None:
                     assert self.cuda_graph_dynamic_microbatches, (
@@ -3551,10 +3557,11 @@ class TransformerConfig(ModelParallelConfig):
                             and self.moe_paged_stash
                             and self.use_transformer_engine_op_fuser
                         )
-                        assert (
-                            CudaGraphModule.moe not in self.cuda_graph_modules
-                            or sync_free_hybridep_moe_graph
-                        ), (
+                        whole_moe_graph = CudaGraphModule.moe in self.cuda_graph_modules or (
+                            self.cuda_graph_impl == "transformer_engine"
+                            and not self.cuda_graph_modules
+                        )
+                        assert not whole_moe_graph or sync_free_hybridep_moe_graph, (
                             "moe cuda graph is only supported with drop-padding MoE or "
                             "transformer_engine sync-free HybridEP with rank capacity and "
                             "paged stash."
@@ -3569,9 +3576,7 @@ class TransformerConfig(ModelParallelConfig):
                             )
 
             te_whole_moe_paged_stash = (
-                self.cuda_graph_impl == "transformer_engine"
-                and CudaGraphModule.moe in self.cuda_graph_modules
-                and self.moe_paged_stash
+                is_te_layer_whole_moe_cuda_graph(self) and self.moe_paged_stash
             )
             if te_whole_moe_paged_stash:
                 assert not self.cuda_graph_dynamic_microbatches, (
@@ -3582,6 +3587,13 @@ class TransformerConfig(ModelParallelConfig):
                 assert self.cuda_graph_warmup_steps >= 2, (
                     "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
                     "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
+
+            if self.cuda_graph_impl == "full_iteration" and self.moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 1, (
+                    "Full-iteration CUDA graphs with paged stash require at least one eager "
+                    "warmup step to discover the stash schedule and buffer capacity before "
+                    "capture."
                 )
 
             if self.recompute_granularity:
@@ -4043,7 +4055,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.dynamic_context_parallel and self.cuda_graph_impl != "none":
             if self.cuda_graph_impl != "transformer_engine":
-                raise ValueError("Dynamic CP supports only layer-wise TE CUDA graphs.")
+                raise ValueError("Dynamic CP supports only Transformer Engine CUDA graphs.")
             if not self.cuda_graph_dynamic_microbatches:
                 raise ValueError("Dynamic CP CUDA graphs require dynamic microbatch slots.")
             if self.delay_wgrad_compute or self.overlap_moe_expert_parallel_comm:

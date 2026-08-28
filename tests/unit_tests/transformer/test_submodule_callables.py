@@ -63,6 +63,10 @@ def test_repeated_mtp_te_graph_owns_backward_dw_wrapper_per_logical_depth():
         def _te_cuda_graph_replay(hidden_states, **_kwargs):
             return hidden_states, None, None, None
 
+        @staticmethod
+        def _forward_mlp(hidden_states, **_kwargs):
+            return hidden_states
+
     layer = FakeGraphableLayer()
     logical_callables = []
     owned_wrappers = []
@@ -151,7 +155,9 @@ def test_fine_grained_repeated_mtp_reuses_prepared_rows_by_absolute_depth(monkey
 
     def fake_build_transformer_layer_callables(layer):
         del layer
-        return [fake_attn, unused_callable, unused_callable, unused_callable, None], {"attn": []}
+        return [fake_attn, unused_callable, unused_callable, unused_callable, None, None], {
+            "attn": []
+        }
 
     monkeypatch.setattr(fine_grained_callables, "MoELayer", FakeMoELayer)
     monkeypatch.setattr(

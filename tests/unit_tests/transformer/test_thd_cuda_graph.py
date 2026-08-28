@@ -1380,6 +1380,85 @@ class TestStaticInputs:
         assert reconstructed.max_seqlen_q == 128
         assert torch.equal(reconstructed.cu_seqlens_q, packed_seq_params.cu_seqlens_q)
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dynamic_cp_chunk_uses_capture_metadata_and_runtime_graph_bank(self, monkeypatch):
+        from megatron.core import parallel_state
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        block = _build_chunk(256, 4, 4, 1024, 128, 8)
+        groups = {2: object(), 4: object()}
+        block.config.context_parallel_size = 4
+        block.config.dynamic_context_parallel = True
+        block.config._cuda_graph_capture_dynamic_cp = (2, groups[2])
+
+        static_inputs = block.get_layer_static_inputs(seq_length=512, micro_batch_size=1)
+        assert static_inputs["cu_seqlens_q"][-1].item() == 256
+
+        packed_seq_params = _make_psp([128, 128])
+        kwargs = {'packed_seq_params': packed_seq_params}
+        block._decompose_packed_seq_params_to_kwargs(kwargs)
+        block._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        reconstructed = kwargs['packed_seq_params']
+        assert reconstructed.max_seqlen_q == 256
+        assert reconstructed.local_cp_size == 2
+        assert reconstructed.cp_group is groups[2]
+
+        graph_calls = []
+
+        def graph_for(cp_size):
+            def replay(*args, **kwargs):
+                graph_calls.append((cp_size, args, kwargs))
+                return cp_size
+
+            return replay
+
+        graph_banks = {cp_size: [graph_for(cp_size)] for cp_size in groups}
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.callables_per_chunk = [[block]]
+        helper.num_microbatches = 1
+        helper.config = SimpleNamespace(overlap_moe_expert_parallel_comm=False)
+        helper._graphs_created = False
+        helper._install_captured_graphs(
+            [(cp_size, groups[cp_size]) for cp_size in groups], graph_banks
+        )
+        assert block.cuda_graphs_by_dynamic_cp_size == graph_banks
+        assert helper._graphs_created is True
+        monkeypatch.setattr(
+            parallel_state,
+            'get_dynamic_data_context_parallel_groups',
+            lambda group_size: groups[group_size],
+        )
+
+        hidden_states = torch.ones(128, 1, 256, dtype=torch.bfloat16, device="cuda")
+        for cp_size, logical_microbatch in ((2, 2), (4, 16), (2, 33)):
+            runtime_psp = _make_psp([128])
+            runtime_psp.local_cp_size = cp_size
+            runtime_psp.cp_group = groups[cp_size]
+            block.current_microbatch = logical_microbatch
+            assert (
+                block._te_cuda_graph_replay(hidden_states, packed_seq_params=runtime_psp) == cp_size
+            )
+            assert block.cuda_graphs is block.cuda_graphs_by_dynamic_cp_size[cp_size]
+
+        assert [cp_size for cp_size, _, _ in graph_calls] == [2, 4, 2]
+
+        for missing_metadata in (None, SimpleNamespace(local_cp_size=None, cp_group=groups[2])):
+            with pytest.raises(RuntimeError, match="requires packed sequence metadata"):
+                block._activate_dynamic_cp_cuda_graph(missing_metadata)
+
+        wrong_group = _make_psp([128])
+        wrong_group.local_cp_size = 2
+        wrong_group.cp_group = groups[4]
+        with pytest.raises(RuntimeError, match="process group"):
+            block._te_cuda_graph_replay(hidden_states, packed_seq_params=wrong_group)
+
+        unknown_size = _make_psp([128])
+        unknown_size.local_cp_size = 8
+        unknown_size.cp_group = object()
+        with pytest.raises(RuntimeError, match="available sizes"):
+            block._te_cuda_graph_replay(hidden_states, packed_seq_params=unknown_size)
+
 
 class TestDynamicMicrobatchSlots:
 
@@ -1677,6 +1756,38 @@ class TestDynamicMicrobatchSlots:
         assert helper._reuse_parent_cp_transport is True
         assert helper._capture_finished is True
         assert helper.config._cuda_graph_thd_rotary_seq_lens == {2: 4096}
+
+    @pytest.mark.internal
+    def test_failed_capture_restores_offload_and_dynamic_cp_warmup_state(self, monkeypatch):
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+        from megatron.core.transformer import cuda_graphs
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        calls = []
+        monkeypatch.setattr(off_interface, 'enable_offload', lambda: calls.append('enable'))
+        monkeypatch.setattr(off_interface, 'reset', lambda: calls.append('reset'))
+        monkeypatch.setattr(cuda_graphs, '_set_capture_end', lambda: calls.append('capture_end'))
+        monkeypatch.setattr(cuda_graphs.gc, 'collect', lambda: calls.append('gc'))
+        monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: calls.append('empty_cache'))
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper._graphs_created = True
+        helper.config = SimpleNamespace(fine_grained_activation_offloading=True)
+        helper.callables_per_chunk = []
+        helper._should_share_dynamic_cp_pool = lambda: True
+        helper._clear_moe_cudagraph_tensor_attrs = lambda: calls.append('clear_moe')
+        helper._reset_after_capture = lambda: calls.append('reset_capture')
+        helper._clear_thd_rotary_seq_lens = lambda: calls.append('clear_rope')
+
+        helper._abort_capturing({})
+
+        assert calls.index('enable') < calls.index('reset')
+        assert 'clear_moe' in calls
+        assert 'reset_capture' in calls
+        assert 'clear_rope' in calls
+        assert helper._graphs_created is False
 
     @pytest.mark.internal
     def test_thd_capture_rope_and_dummy_boundaries_share_sample_limit(self):
@@ -2285,7 +2396,8 @@ class TestDynamicMicrobatchSlots:
         ]
         rebound_inputs = ((object(),), (object(),))
 
-        def capture_graph_bank(_callables, sample_args, _kwargs):
+        def capture_graph_bank(_callables, sample_args, _kwargs, *, paged_stash_order=None):
+            assert paged_stash_order == order
             assert isinstance(sample_args, list)
             sample_args[1] = rebound_inputs[0]
             sample_args[3] = rebound_inputs[1]

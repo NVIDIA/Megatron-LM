@@ -1373,7 +1373,10 @@ class TestMultiTokenPrediction:
                 return hidden_states, input_ids, position_ids, padding_mask
 
         config = types.SimpleNamespace(
-            pipeline_model_parallel_size=1, mtp_num_layers=2, mtp_detach_heads=False
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=2,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=False,
         )
         block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
         torch.nn.Module.__init__(block)
@@ -1460,7 +1463,10 @@ class TestMultiTokenPrediction:
                 return hidden_states, input_ids, position_ids, padding_mask
 
         config = types.SimpleNamespace(
-            pipeline_model_parallel_size=1, mtp_num_layers=1, mtp_detach_heads=False
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=1,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=False,
         )
         block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
         torch.nn.Module.__init__(block)

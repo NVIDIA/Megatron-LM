@@ -340,6 +340,9 @@ class DSAIndexerLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        dynamic_cp_parent_group: torch.distributed.ProcessGroup = None,
+        configured_cp_size: int = 1,
+        calculate_per_token_loss: bool = False,
     ):
         """Save the indexer loss for logging.
 
@@ -349,12 +352,32 @@ class DSAIndexerLossLoggingHelper:
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
+            dynamic_cp_parent_group: Physical DP x CP group used to aggregate dynamic-CP
+                metric shards without retaining a per-microbatch logical subgroup.
+            configured_cp_size: Configured/static CP width, i.e. the static CP-SUM factor.
+                Used to preserve the nominal global-batch average when dynamic CP repacks
+                samples into fewer microbatches.
+            calculate_per_token_loss: Whether ``loss`` is a raw local token sum.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        logging_loss = loss.detach()
+        needs_dp_avg = True
+        if dynamic_cp_parent_group is not None:
+            if configured_cp_size < 1:
+                raise ValueError("configured_cp_size must be positive for dynamic CP logging.")
+            # Dynamic CP repacks the nominal N * DP samples into a variable number of
+            # scheduled microbatches. Logging still divides by nominal N. Parent-averaging
+            # each rank's raw token sum times configured CP gives every logical sample weight
+            # 1 / DP regardless of its effective CP size, matching static CP-SUM then DP-AVG.
+            if calculate_per_token_loss:
+                logging_loss = logging_loss * configured_cp_size
+            reduce_group = None
+            avg_group = dynamic_cp_parent_group
+            needs_dp_avg = False
         # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
         # (whose layer_number can exceed config.num_layers + config.mtp_num_layers when
         # each MTP depth contains multiple hybrid layers) don't index out of bounds.
@@ -368,9 +391,14 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        tracker["values"][layer_number - 1] += loss.detach()
+        tracker["values"][layer_number - 1] += logging_loss
+        # Preserve the historical last-writer behavior for callers such as CSA that replace
+        # their logical CP group per microbatch. Ordinary DSA dynamic CP passes a stable parent
+        # DP x CP group here, so its parent reduction metadata remains stable without imposing a
+        # new global invariant on all users of this shared helper.
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+        tracker["needs_dp_avg"] = needs_dp_avg
 
     @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
@@ -378,10 +406,12 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         reduce_group = tracker.get("reduce_group") if preserve_groups else None
         avg_group = tracker.get("avg_group") if preserve_groups else None
+        needs_dp_avg = tracker.get("needs_dp_avg", True) if preserve_groups else True
         if "values" in tracker:
             tracker["values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+        tracker["needs_dp_avg"] = needs_dp_avg
 
     @staticmethod
     def reduce_loss_in_tracker(num_layers: Optional[int] = None):
@@ -440,11 +470,12 @@ class DSAIndexerLossLoggingHelper:
             torch.distributed.all_reduce(
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
-        )
+        if tracker.get("needs_dp_avg", True):
+            torch.distributed.all_reduce(
+                values,
+                group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+                op=torch.distributed.ReduceOp.AVG,
+            )
 
     @staticmethod
     def track_indexer_metrics(
@@ -2543,6 +2574,15 @@ class DSAttention(MegatronModule):
         indexer_avg_group = (
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
+        dynamic_cp_parent_group = None
+        if (
+            use_indexer_loss
+            and packed_seq_params is not None
+            and packed_seq_params.local_cp_size is not None
+        ):
+            dynamic_cp_parent_group = getattr(self.pg_collection, "dp_cp", None)
+            if dynamic_cp_parent_group is None:
+                raise RuntimeError("Dynamic CP indexer logging requires a dp_cp process group.")
 
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
@@ -2694,6 +2734,9 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_parent_group=dynamic_cp_parent_group,
+                    configured_cp_size=self.config.context_parallel_size,
+                    calculate_per_token_loss=self.config.calculate_per_token_loss,
                 )
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return _normalize_dsattention_output_rank(output, x.ndim)
@@ -2785,6 +2828,9 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_parent_group=dynamic_cp_parent_group,
+                    configured_cp_size=self.config.context_parallel_size,
+                    calculate_per_token_loss=self.config.calculate_per_token_loss,
                 )
         elif topk_indices is None:
             assert q is not None and k is not None and weights is not None

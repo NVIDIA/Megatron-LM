@@ -12,6 +12,7 @@ class ChunkCudaGraphBlockMixin:
     """Make a complete decoder block a Transformer Engine graph callable."""
 
     is_cuda_graph_chunk_callable = True
+    _supports_dynamic_cp_cuda_graph_replay = True
 
     def _initialize_chunk_cuda_graph_support(self):
         """Validate and initialize block-boundary offload integration."""
@@ -63,7 +64,8 @@ class ChunkCudaGraphBlockMixin:
             assert (
                 max_num_seqs is not None
             ), "thd_max_packed_sequences must be set for THD chunk CUDA graphs."
-            max_tokens = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+            capture_cp_size, _ = self._get_thd_cuda_graph_capture_cp()
+            max_tokens = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
             cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
             cu_seqlens[1:] = max_tokens
             static_inputs.update(
@@ -117,7 +119,8 @@ class ChunkCudaGraphBlockMixin:
         """Rebuild graph-static PackedSeqParams inside the captured block."""
         if 'cu_seqlens_q' not in kwargs:
             return
-        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        capture_cp_size, capture_cp_group = self._get_thd_cuda_graph_capture_cp()
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
         kwargs['packed_seq_params'] = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
@@ -127,6 +130,8 @@ class ChunkCudaGraphBlockMixin:
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            local_cp_size=(capture_cp_size if self.config.dynamic_context_parallel else None),
+            cp_group=(capture_cp_group if self.config.dynamic_context_parallel else None),
             pad_between_seqs=True,
         )
 
@@ -207,18 +212,15 @@ class ChunkCudaGraphBlockMixin:
             return super()._te_cuda_graph_replay(*args, **kwargs)
 
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
+        self._activate_dynamic_cp_cuda_graph(kwargs.get('packed_seq_params'))
         self._decompose_packed_seq_params_to_kwargs(kwargs)
         if self._is_thd_cuda_graph() and kwargs.get('attention_mask') is None:
             kwargs.pop('attention_mask', None)
 
         microbatch_id = getattr(self, 'current_microbatch', 0)
-        pp_single_graph_replay = (
-            self.config.pipeline_model_parallel_size == 1 and len(self.cuda_graphs) == 1
-        )
-        assert microbatch_id >= 0 and (
-            pp_single_graph_replay or microbatch_id < len(self.cuda_graphs)
-        ), (
-            f"Chunk CUDA graph replay requested microbatch {microbatch_id}, but capture only "
-            f"contains Nmax={len(self.cuda_graphs)} graphs."
-        )
+        assert microbatch_id >= 0, "Chunk CUDA graph replay requires a nonnegative microbatch ID."
+        assert self.cuda_graphs, "Chunk CUDA graph replay requires a captured graph bank."
+        # ``current_microbatch`` is the logical pipeline-schedule ID, while dynamic
+        # microbatch capture may keep only a bounded ring of physical graph slots.
+        # GraphableMegatronModule owns the logical-to-physical modulo mapping.
         return super()._te_cuda_graph_replay(*args, **kwargs)

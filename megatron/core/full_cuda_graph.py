@@ -372,3 +372,10 @@ class FullCudaGraphWrapper:
             cls.curr_iteration[reset_stage] = 0
             cls.capture_signature[reset_stage] = None
         gc.collect()
+
+    @classmethod
+    def abort_cuda_graph(cls, stage):
+        """Drop a failed stage graph and its partially prepared static inputs."""
+
+        cls.reset_cuda_graph(stage=stage)
+        StaticBufferLoader.static_buffers[stage] = []

@@ -1024,7 +1024,7 @@ class TestMHCWithCudaGraph:
             with pytest.raises(RuntimeError, match="requires packed sequence metadata"):
                 TransformerLayer._activate_dynamic_cp_cuda_graph(layer, params)
 
-        with pytest.raises(RuntimeError, match="No layer CUDA graph bank entry"):
+        with pytest.raises(RuntimeError, match="No CUDA graph bank entry"):
             TransformerLayer._activate_dynamic_cp_cuda_graph(
                 layer, SimpleNamespace(local_cp_size=4, cp_group=expected_group)
             )

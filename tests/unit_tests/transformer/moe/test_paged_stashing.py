@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import torch.nn.functional as F
 from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -81,8 +83,7 @@ def test_prepare_for_chunk_graph_capture_reallocates_released_buffers(monkeypatc
     manager.allocate_stash_buffers = allocate_stash_buffers
     monkeypatch.setattr(PagedStashManager, "get_instance", staticmethod(lambda: manager))
     config = SimpleNamespace(
-        moe_paged_stash_buffer_size_factor_cuda=1.25,
-        moe_paged_stash_buffer_size_factor_cpu=0.5,
+        moe_paged_stash_buffer_size_factor_cuda=1.25, moe_paged_stash_buffer_size_factor_cpu=0.5
     )
 
     paged_stash_prepare_for_cuda_graph_capture(config)
@@ -112,6 +113,7 @@ def _make_schedule_manager(recorded_schedule, vp_size=1):
     manager.host_spill = torch.zeros(1, dtype=torch.int64)
     manager.paged_tensors_to_stash = []
     manager.paged_tensors_stash_in_progress = []
+    manager.paged_tensors_to_reload = {}
     return manager
 
 
@@ -167,12 +169,56 @@ def test_te_graph_capture_after_eval_restores_disabled_state_on_failure(monkeypa
     manager.enabled = False
     runtime_current_layer = manager.current_layer
     runtime_current_microbatch = manager.current_microbatch
+    sync_calls = []
+
+    class FakeStream:
+        def wait_stream(self, stream):
+            pass
+
+        def synchronize(self):
+            sync_calls.append("sync")
+
+    class FakeStashBuffer:
+        def __init__(self):
+            self.reset_calls = 0
+            self.head = 0
+
+        def reset(self):
+            self.reset_calls += 1
+            self.head = 0
+
+    class FakePagedTensor:
+        dtype = torch.float32
+        hidden_size = 1
+
+        @staticmethod
+        def offload_to_stash(buffer):
+            buffer.head += 1
+
+    stream = FakeStream()
+    stash_buffer = FakeStashBuffer()
+    manager._pack_stream = stream
+    manager._unpack_stream = stream
+    manager.stash_buffers = {torch.float32: {1: stash_buffer}}
     monkeypatch.setattr(PagedStashManager, "STASH_MGR", manager)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
     with pytest.raises(RuntimeError, match="capture failed"):
         with paged_stash_te_graph_capture(True, order=[1, -1]):
             assert manager.enabled
             assert manager._te_graph_capture
+            manager.paged_tensors_to_stash.append(FakePagedTensor())
+            manager.stash_paged_tensors(1_001_000)
+            assert stash_buffer.head == 1
+            assert manager.paged_tensors_stash_in_progress
+            assert manager.paged_tensors_to_reload[1_001_000]
+
+            # Simulate a second saved tensor whose group commit was not reached before failure.
+            manager.paged_tensors_to_stash.append(object())
+            manager._unpack_stream_status = "reloading"
+            manager.overflow.fill_(1)
+            manager.host_spill.fill_(1)
             raise RuntimeError("capture failed")
 
     assert not manager.enabled
@@ -180,6 +226,22 @@ def test_te_graph_capture_after_eval_restores_disabled_state_on_failure(monkeypa
     assert manager._pp_schedule is runtime_schedule
     assert manager.current_layer is runtime_current_layer
     assert manager.current_microbatch is runtime_current_microbatch
+    assert manager._pack_stream_status == "idle"
+    assert manager._unpack_stream_status == "idle"
+    assert not manager.paged_tensors_to_stash
+    assert not manager.paged_tensors_stash_in_progress
+    assert not manager.paged_tensors_to_reload
+    assert manager.overflow.item() == 0
+    assert manager.host_spill.item() == 0
+    assert stash_buffer.head == 0
+    assert sync_calls == ["sync"]
+
+    with paged_stash_te_graph_capture(True, order=[1, -1]):
+        assert manager.enabled
+        assert manager._te_graph_capture
+    assert not manager.enabled
+    assert not manager._te_graph_capture
+    assert stash_buffer.reset_calls >= 3
 
 
 def test_te_graph_capture_reallocates_buffers_released_by_warmup_fallback(monkeypatch):
@@ -289,10 +351,13 @@ def test_te_graph_capture_joins_auxiliary_streams_per_layer(monkeypatch):
     assert manager._unpack_stream_status == 'reloading'
 
 
-def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback():
+@pytest.mark.parametrize("cuda_graph_modules", [[], [CudaGraphModule.moe]])
+def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback(cuda_graph_modules):
     runner = PagedStashRunner.__new__(PagedStashRunner)
     runner.config = SimpleNamespace(
-        cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.moe]
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_granularity="layer",
+        cuda_graph_modules=cuda_graph_modules,
     )
     runner._te_graph_capture_finished = False
 
@@ -322,11 +387,13 @@ def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback():
     )
 
 
-def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count():
+@pytest.mark.parametrize("cuda_graph_modules", [[], [CudaGraphModule.moe]])
+def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count(cuda_graph_modules):
     runner = PagedStashRunner.__new__(PagedStashRunner)
     runner.config = SimpleNamespace(
         cuda_graph_impl="transformer_engine",
-        cuda_graph_modules=[CudaGraphModule.moe],
+        cuda_graph_granularity="layer",
+        cuda_graph_modules=cuda_graph_modules,
         moe_paged_stash=True,
     )
     runner._te_graph_runtime_num_microbatches = None
@@ -342,6 +409,42 @@ def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count():
     with pytest.raises(RuntimeError, match="expected 2, got 3"):
         runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=3)
     runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=2)
+
+
+def test_chunk_graph_does_not_inherit_layer_fixed_microbatch_contract():
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_granularity="chunk",
+        cuda_graph_modules=[],
+        moe_paged_stash=True,
+    )
+    runner._te_graph_runtime_num_microbatches = 2
+    runner._te_graph_capture_finished = True
+
+    runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=4)
+    runner._raise_if_te_whole_moe_graph_overflow(
+        stash_overflow_ranks=1, overbudget_ranks=1, training=True
+    )
+
+
+def test_full_iteration_replay_restores_training_and_validation_stash_state(monkeypatch):
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.config = SimpleNamespace(moe_paged_stash=True)
+    runner.forward_backward_func = FullCudaGraphWrapper(lambda **kwargs: None)
+    runner.stash_manager = SimpleNamespace(enabled=False)
+    monkeypatch.setitem(FullCudaGraphWrapper.cuda_graph, "training", object())
+    monkeypatch.setitem(FullCudaGraphWrapper.cuda_graph, "validation", object())
+
+    runner._restore_full_iteration_paged_stash_replay_state(training=True)
+    assert runner.stash_manager.enabled
+
+    runner._restore_full_iteration_paged_stash_replay_state(training=False)
+    assert not runner.stash_manager.enabled
+
+    runner.config.moe_paged_stash = False
+    runner._restore_full_iteration_paged_stash_replay_state(training=True)
+    assert not runner.stash_manager.enabled
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:

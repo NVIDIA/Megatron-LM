@@ -319,6 +319,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     output of the same size.
     """
 
+    _supports_dynamic_cp_cuda_graph_replay = True
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1238,12 +1240,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         return self.self_attention.linear_qkv.layer_norm_weight.data
 
-    def _get_thd_cuda_graph_capture_cp(self):
-        """Return the CP size/group whose constants are being captured."""
-        if self.config.dynamic_context_parallel:
-            return self.config._cuda_graph_capture_dynamic_cp
-        return self.config.context_parallel_size, None
-
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the transformer layer. Besides the hidden_states that is
@@ -1410,34 +1406,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pad_between_seqs=True,
         )
         kwargs['packed_seq_params'] = packed_seq_params
-
-    def _activate_dynamic_cp_cuda_graph(self, packed_seq_params):
-        """Select the graph-bank entry for a runtime DCP microbatch."""
-        graph_bank = self.cuda_graphs_by_dynamic_cp_size
-        if not graph_bank:
-            return
-
-        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
-            raise RuntimeError(
-                "Dynamic-CP CUDA graph replay requires packed sequence metadata with "
-                "local_cp_size."
-            )
-        dynamic_cp_size = int(packed_seq_params.local_cp_size)
-        if dynamic_cp_size not in graph_bank:
-            raise RuntimeError(
-                f"No layer CUDA graph bank entry for local_cp_size={dynamic_cp_size}; "
-                f"available sizes are {sorted(graph_bank)}."
-            )
-        expected_group = parallel_state.get_dynamic_data_context_parallel_groups(
-            group_size=dynamic_cp_size
-        )
-        if packed_seq_params.cp_group is not expected_group:
-            raise RuntimeError(
-                "Dynamic-CP CUDA graph replay received a process group that does not match "
-                f"local_cp_size={dynamic_cp_size}."
-            )
-        self.cuda_graphs = graph_bank[dynamic_cp_size]
-        self.activate_te_cuda_graph_static_hidden_inputs(dynamic_cp_size)
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """

@@ -2375,12 +2375,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             mtp_dsa_context = None
-            mtp_dsa_kwargs = {}
+            mtp_layer_kwargs = {}
             if self.config.dsa_mtp_index_kv_share:
                 mtp_dsa_context = MTPDSAIterationContext(
                     iteration=iteration, shared_tensors=shared_dsa_tensors
                 )
-                mtp_dsa_kwargs["mtp_dsa_context"] = mtp_dsa_context
+                mtp_layer_kwargs["mtp_dsa_context"] = mtp_dsa_context
             if aligned_rows is not None:
                 input_ids = aligned_rows["input_ids"][iteration]
                 if roll_position_ids:
@@ -2392,6 +2392,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                         sequence_parallel=getattr(self.config, "sequence_parallel", False),
                         tp_group=getattr(self.layers[layer_idx], "tp_group", None),
                     )
+                mtp_layer_kwargs["_inputs_pre_aligned"] = True
             layer_outputs = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -2405,10 +2406,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_roll_context=sequence_roll_context,
                 roll_depth=iteration,
-                _inputs_pre_aligned=aligned_rows is not None,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
-                **mtp_dsa_kwargs,
+                **mtp_layer_kwargs,
                 **(extra_block_kwargs or {}),
             )
             hidden_states, input_ids, position_ids, padding_mask = layer_outputs
