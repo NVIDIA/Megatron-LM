@@ -27,16 +27,16 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import (
-    gated_delta_product_stack_spec,
-    hybrid_stack_spec,
-)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    hybrid_mixer_kwargs,
+    hybrid_stack_spec_for,
+)
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase,
     set_rounder,
@@ -322,24 +322,11 @@ class TestChunkedPrefillCudaGraphs:
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
         elif model_provider == "hybrid":
-            is_gdp = ssm_mixer == "gdp"
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=3,
                 hidden_size=256,
-                # GDP needs its head/group/state dims spelled out, plus the
-                # Householder count that sizes its chunk descriptors.
-                **(
-                    dict(
-                        gdp_num_householder=2,
-                        mamba_num_heads=8,
-                        mamba_head_dim=32,
-                        mamba_num_groups=8,
-                        mamba_state_dim=64,
-                    )
-                    if is_gdp
-                    else dict(mamba_num_heads=16)
-                ),
+                **hybrid_mixer_kwargs(ssm_mixer),
                 num_attention_heads=16,
                 use_cpu_initialization=True,
                 cuda_graph_impl=cuda_graph_impl,
@@ -352,7 +339,7 @@ class TestChunkedPrefillCudaGraphs:
             )
             model = HybridModel(
                 config=config,
-                hybrid_stack_spec=(gated_delta_product_stack_spec if is_gdp else hybrid_stack_spec),
+                hybrid_stack_spec=hybrid_stack_spec_for(ssm_mixer),
                 vocab_size=CHUNKED_CG_VOCAB_SIZE,
                 max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
                 parallel_output=True,
@@ -606,13 +593,14 @@ class TestChunkedPrefillCudaGraphs:
             ("baseline", baseline_snapshots, baseline_prefill_steps),
             ("chunked", chunked_snapshots, chunked_prefill_steps),
         ):
-            # The first generated token comes out of the final prefill step, so
-            # the rest cost one decode step each. Checked rather than assumed: a
-            # different prompt split would otherwise leave the comparison below
-            # on two decode-step snapshots, which match no matter what.
-            assert len(snapshots) == prefill_steps + num_tokens_to_generate - 1, (
+            # Async scheduling launches the first prefill as a primer-only step,
+            # then resolves each generated token in a subsequent step. Checked
+            # rather than assumed: a different prompt split would otherwise leave
+            # the comparison below on two decode-step snapshots, which match no
+            # matter what.
+            assert len(snapshots) == prefill_steps + num_tokens_to_generate, (
                 f"{name}: expected {prefill_steps} prefill steps and "
-                f"{num_tokens_to_generate - 1} decode steps, got {len(snapshots)} steps"
+                f"{num_tokens_to_generate} sampling steps, got {len(snapshots)} steps"
             )
 
         baseline_conv = baseline_snapshots[baseline_prefill_steps - 1]

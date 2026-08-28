@@ -1055,6 +1055,37 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
 
     @pytest.mark.internal
+    def test_mamba_prefill_skip_clamp_lands_on_cached_block(self):
+        # The clamp that keeps effective_prefill_chunk_length >= 2 rounds the skip
+        # down to a block boundary, which can land on a block that has no cached
+        # Mamba state. The skip must walk back to the nearest block that does,
+        # otherwise add_request() zeroes the SSM state and resumes mid-prompt.
+        # One token past 3 full blocks: skipping all 3 leaves a 1-token chunk, so
+        # the clamp always fires and moves the boundary from block 3 to block 2.
+        ctx = self._mctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3 + 1)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+
+        # Only the last block has Mamba state, so the clamped boundary has none
+        # and there is no earlier cached block to fall back to: skip nothing.
+        self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[2:])
+        req = self._req(ctx, prompt.clone(), request_id=2)
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req, len(prompt))
+        assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
+
+        # Same clamp, but the first block is also cached: back off to it rather
+        # than all the way to zero.
+        ctx2 = self._mctx()
+        p2 = self._prompt(bs * 3 + 1)
+        ctx2.add_request(self._req(ctx2, p2.clone()))
+        blocks2 = self._block_ids(ctx2, 0, 3)
+        self._mamba_allocate_and_register(ctx2, [blocks2[0], blocks2[2]])
+        req2 = self._req(ctx2, p2.clone(), request_id=2)
+        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2, len(p2))
+        assert len(m2) == 3 and ps2 == bs and ec2 == len(p2) - bs
+
+    @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
         ctx = self._mctx(
             block_size_tokens=32, batch_invariant_mode=True, enable_prefix_caching=False
@@ -1634,14 +1665,13 @@ def _make_cpu_mamba_slot_allocator(
         max_mamba_intermediate_states_per_step=1,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         kv_block_allocator=kv_allocator,
-        # A real context always sets these two together (see
-        # DynamicInferenceContext.__init__), and the allocator asserts their
-        # divisibility on construction. Mamba-only values: a model whose SSM
-        # layers all chunk at 128 aligns at 128.
+        # A real context always sets these together (see
+        # DynamicInferenceContext.__init__), and the allocator asserts the
+        # alignment against whichever chunk size the model's SSM layers use.
+        # Mamba-only values: a model whose SSM layers all chunk at 128 aligns at
+        # 128, and carries no Gated Delta Product layers.
         mamba_chunk_size=128,
         ssm_chunk_alignment=128,
-        # Gated Delta Product prefix caching is unsupported; the allocator
-        # asserts this is 0 on construction (see MambaSlotAllocator.__init__).
         gdp_num_householder=0,
     )
     return MambaSlotAllocator(
