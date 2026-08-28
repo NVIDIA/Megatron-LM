@@ -4,12 +4,13 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -36,6 +37,29 @@ class TestHybridBlock:
 
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
+    def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
+        """Reject overlap before constructing any HybridModel submodule."""
+        config = TransformerConfig(
+            hidden_size=256, num_layers=1, num_attention_heads=4, use_cpu_initialization=True
+        )
+        # Mutate after generic config validation to exercise the pattern-specific guard.
+        config.overlap_moe_expert_parallel_comm = True
+
+        def fail_build(*args, **kwargs):
+            pytest.fail("HybridModel submodule construction must not begin")
+
+        monkeypatch.setattr("megatron.core.models.hybrid.hybrid_model.build_module", fail_build)
+
+        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
+                pg_collection=self.get_pg_collection(),
+            )
 
     def get_hybrid_block(self, layer_pattern, **config_kwargs):
         layer_type_list = validate_segment_layers(layer_pattern)
@@ -245,6 +269,79 @@ class TestHybridBlock:
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
+
+    def test_dsv4_layers_forward_build_context_and_wrap_once(self, monkeypatch):
+        """C/H/W construction forwards explicit context and applies one mHC wrapper."""
+
+        class DummyLayer(torch.nn.Module):
+
+            def __init__(self, layer_number):
+                super().__init__()
+                self.layer_number = layer_number
+
+        specs = {symbol: object() for symbol in (Symbols.CSA, Symbols.HCA, Symbols.WINDOW)}
+        submodules = HybridStackSubmodules(
+            csa_layer=specs[Symbols.CSA],
+            hca_layer=specs[Symbols.HCA],
+            window_layer=specs[Symbols.WINDOW],
+        )
+        build_calls = []
+        built_layers = []
+        wrapped_layers = []
+
+        def fake_build(spec, **kwargs):
+            build_calls.append((spec, kwargs))
+            layer = DummyLayer(kwargs["layer_number"])
+            built_layers.append(layer)
+            return layer
+
+        def fake_wrap(*, config, layer):
+            assert config is transformer_config
+            wrapped_layers.append(layer)
+            return layer
+
+        monkeypatch.setattr("megatron.core.models.hybrid.hybrid_block.build_module", fake_build)
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_block.HyperConnectionHybridLayer", fake_wrap
+        )
+
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=3,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+        )
+        pg_collection = self.get_pg_collection()
+        block = HybridStack(
+            transformer_config,
+            submodules,
+            layer_type_list=[Symbols.CSA, Symbols.HCA, Symbols.WINDOW],
+            pp_layer_offset=7,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=pg_collection,
+            is_mtp_layer=True,
+            name="decoder",
+        )
+
+        assert [spec for spec, _ in build_calls] == [
+            specs[Symbols.CSA],
+            specs[Symbols.HCA],
+            specs[Symbols.WINDOW],
+        ]
+        for index, (_, kwargs) in enumerate(build_calls):
+            assert kwargs == {
+                "config": transformer_config,
+                "layer_number": 8 + index,
+                "pg_collection": pg_collection,
+                "is_mtp_layer": True,
+                "add_layer_offset": False,
+                "pp_layer_offset": 7,
+                "name": f"decoder.layers.{index}",
+            }
+        assert wrapped_layers == built_layers
+        assert list(block.layers) == built_layers
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = 'X'

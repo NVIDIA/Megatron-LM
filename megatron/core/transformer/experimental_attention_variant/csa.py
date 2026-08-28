@@ -34,6 +34,7 @@ CSA_OPERATION_DETERMINISM: dict[str, str] = {
     "compressor_pooling": "unknown",
 }
 
+
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
 # ---------------------------------------------------------------------------
