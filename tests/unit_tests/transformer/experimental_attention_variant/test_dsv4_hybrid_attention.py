@@ -116,6 +116,20 @@ def _make_attention_spec(config):
     return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
 
+def test_attention_latent_norm_epsilon_defaults_to_layernorm_epsilon():
+    """Existing DSv4 configs inherit the model-wide norm epsilon."""
+    config = _make_config(layernorm_epsilon=3e-6)
+
+    assert config.attention_latent_norm_epsilon == pytest.approx(3e-6)
+
+
+def test_attention_latent_norm_epsilon_accepts_override():
+    """DSv4 latent norms can use the model recipe's dedicated epsilon."""
+    config = _make_config(layernorm_epsilon=3e-6, attention_latent_norm_epsilon=1e-5)
+
+    assert config.attention_latent_norm_epsilon == pytest.approx(1e-5)
+
+
 def test_module_spec_is_built_from_explicit_backend():
     """The neutral spec builder should use only its explicitly supplied backend."""
     from megatron.core.transformer.experimental_attention_variant.csa import (
@@ -265,6 +279,16 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'core_attention')
         assert hasattr(attn, 'q_layernorm')
         assert hasattr(attn, 'kv_layernorm')
+
+    def test_latent_norm_epsilon_is_scoped_to_q_and_kv_latents(self):
+        """The dedicated epsilon must not change the compressor norm."""
+        config = _make_config(layernorm_epsilon=1e-5, attention_latent_norm_epsilon=1e-6)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        attn = _build_attention(config, layer_number=1, pg_collection=pg)
+
+        assert attn.q_layernorm.eps == pytest.approx(1e-6)
+        assert attn.kv_layernorm.eps == pytest.approx(1e-6)
+        assert attn.core_attention.compressor.norm.eps == pytest.approx(1e-5)
 
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""

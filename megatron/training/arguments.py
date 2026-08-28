@@ -3645,6 +3645,13 @@ def _add_mla_args(parser):
                        help="Rank of Query tensor's low rank representation.")
     group.add_argument('--kv-lora-rank', type=int, default=32,
                        help="Rank of Key and Value tensors' low rank representation.")
+    group.add_argument(
+        '--attention-latent-norm-epsilon',
+        type=float,
+        default=None,
+        help="Epsilon for the primary query and key-value latent norms in attention. "
+             "Defaults to --norm-epsilon when unset.",
+    )
     group.add_argument('--qk-head-dim', type=int, default=128,
                        help="Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim")
     group.add_argument('--qk-pos-emb-head-dim', type=int, default=64,
