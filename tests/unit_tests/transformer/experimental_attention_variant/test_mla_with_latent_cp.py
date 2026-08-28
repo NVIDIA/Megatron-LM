@@ -1915,6 +1915,47 @@ def test_cudnn_prepare_caches_phase_metadata_binding():
     assert binding.total_q == 6 and binding.total_kv == 3
 
 
+def test_cudnn_aligned_staging_and_workspace_reuse(monkeypatch):
+    aligned = torch.randn(64, 3, 8)
+    assert latent_cp_cudnn_backend._pad_token_rows(aligned, 64) is aligned
+
+    smaller = torch.randn(17, 3, 8)
+    padded = latent_cp_cudnn_backend._pad_token_rows(smaller, 64)
+    assert padded.shape == (64, 3, 8)
+    assert padded.is_contiguous()
+    torch.testing.assert_close(padded[:17], smaller)
+
+    class FakeGraph:
+        def __init__(self, size):
+            self.size = size
+
+        def get_workspace_size(self):
+            return self.size
+
+    plan = latent_cp_cudnn_backend._CudnnPlan(
+        forward_graph=FakeGraph(13),
+        backward_graph=FakeGraph(17),
+        key=mock.sentinel.plan_key,
+    )
+    adapter = object.__new__(latent_cp.CudnnFusedAttentionAdapter)
+    adapter.device_index = 0
+    adapter._execution_lock = latent_cp_cudnn_backend.threading.RLock()
+    adapter._workspaces = {}
+    stream = SimpleNamespace(cuda_stream=101)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: stream)
+    forward = adapter._workspace(plan, backward=False, device=torch.device("cpu"))
+    assert (
+        adapter._workspace(plan, backward=False, device=torch.device("cpu")) is forward
+    )
+    backward = adapter._workspace(plan, backward=True, device=torch.device("cpu"))
+    assert backward is not forward
+    assert forward.numel() == 13 and backward.numel() == 17
+
+    stream.cuda_stream = 202
+    other_stream = adapter._workspace(plan, backward=False, device=torch.device("cpu"))
+    assert other_stream is not forward
+
+
 def test_shared_cudnn_adapter_is_process_device_runtime_scoped(monkeypatch):
     created = []
 

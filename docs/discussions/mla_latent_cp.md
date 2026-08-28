@@ -570,10 +570,12 @@ process/device identity, exact
 frontend/runtime versions, dtype and capability, heads/dimensions, phase shape, causal flag, scale,
 maximum packed lengths, and metadata capacity. Each binding retains exact cumulative tensors,
 canonical rank-4 length/offset buffers, actual token totals, and its prepared plan. Handle mutation,
-plan construction, and
-execution are lock-protected. Workspace tensors and variant packs are invocation-local and are never
-adapter-owned or reused across concurrent calls. `generate_stats=True` supplies local FP32 LSE for
-the corrected backward.
+plan construction, and execution are lock-protected. Workspaces are persistent per
+`(plan, CUDA stream, direction)`, so same-stream reuse remains ordered while different streams never
+share scratch storage. Variant packs and retained O/LSE remain invocation-owned. When an exact
+64-token-aligned capacity is already contiguous, Q/K/V/O/dO/stats bind directly without a staging
+copy; non-aligned phases retain the padded fallback. `generate_stats=True` supplies local FP32 LSE
+for the corrected backward.
 
 The public Attention descriptor contract is used literally for all ragged metadata. `SEQ_Q` and
 `SEQ_KV` are contiguous INT32 graph tensors and bound buffers with dimensions `(B, 1, 1, 1)` and
@@ -977,7 +979,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    A qualified layer must hold its matching adapter/runtime immediately after construction. The
    explicit block function derives one layout and shares it across latent-CP layers. Fake cuDNN tests
    call `prepare` twice and prove the second call reuses the same plan and canonical metadata binding;
-   phase execution only performs a binding lookup.
+   phase execution only performs a binding lookup. CPU guards require exact-capacity staging to
+   preserve tensor identity and workspace reuse to remain isolated by direction and CUDA stream.
    Feature-initialization tests require non-mutating GPT/Hybrid spec rewrites that preserve ordinary
    block classes. Existing data-scheduler tests own dynamic `local_cp_size/cp_group` consistency;
    full dynamic parity owns per-microbatch effective-group behavior.

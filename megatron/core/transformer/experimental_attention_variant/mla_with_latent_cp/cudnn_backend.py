@@ -115,6 +115,8 @@ def _aligned_token_capacity(tokens: int) -> int:
 
 def _pad_token_rows(tensor: Tensor, capacity: int) -> Tensor:
     _require(tensor.size(0) <= capacity, "cuDNN token capacity is too small")
+    if tensor.size(0) == capacity and tensor.is_contiguous():
+        return tensor
     padded = torch.empty(
         (capacity, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
     )
@@ -319,6 +321,7 @@ class CudnnFusedAttentionAdapter:
             )
         self._plans: dict[_CudnnPlanKey, _CudnnPlan] = {}
         self._bindings: OrderedDict[_CudnnBindingKey, _CudnnBinding] = OrderedDict()
+        self._workspaces: dict[tuple[_CudnnPlanKey, int, bool], Tensor] = {}
         self._execution_lock = threading.RLock()
 
     def __del__(self) -> None:
@@ -676,6 +679,21 @@ class CudnnFusedAttentionAdapter:
             )
         return binding
 
+    def _workspace(
+        self, plan: _CudnnPlan, *, backward: bool, device: torch.device
+    ) -> Tensor:
+        stream_id = int(torch.cuda.current_stream(self.device_index).cuda_stream)
+        cache_key = (plan.key, stream_id, backward)
+        with self._execution_lock:
+            workspace = self._workspaces.get(cache_key)
+            if workspace is None:
+                graph = plan.backward_graph if backward else plan.forward_graph
+                workspace = torch.empty(
+                    graph.get_workspace_size(), dtype=torch.uint8, device=device
+                )
+                self._workspaces[cache_key] = workspace
+            return workspace
+
     def prepare(
         self,
         *,
@@ -823,9 +841,7 @@ class CudnnFusedAttentionAdapter:
             int(_CudnnUid.STATS): stats_buffer,
             **{int(uid): tensor for uid, tensor in metadata.items()},
         }
-        workspace = torch.empty(
-            plan.forward_graph.get_workspace_size(), dtype=torch.uint8, device=q.device
-        )
+        workspace = self._workspace(plan, backward=False, device=q.device)
         with self._execution_lock, torch.cuda.device(self.device_index):
             self.cudnn.set_stream(
                 handle=self._handle,
@@ -876,9 +892,7 @@ class CudnnFusedAttentionAdapter:
             int(_CudnnUid.DV): dv_buffer,
             **{int(uid): tensor for uid, tensor in metadata.items()},
         }
-        workspace = torch.empty(
-            plan.backward_graph.get_workspace_size(), dtype=torch.uint8, device=q.device
-        )
+        workspace = self._workspace(plan, backward=True, device=q.device)
         with self._execution_lock, torch.cuda.device(self.device_index):
             self.cudnn.set_stream(
                 handle=self._handle,
