@@ -257,8 +257,14 @@ class CUDAGraphBatchDimensionBuilder:
         """
         Calculate CUDA graph token counts for a given configuration.
 
+        This builds one graph family (prefill/mixed or decode-only) at a time, so it only accepts
+        a distribution that names a single spacing. HYBRID -- the config default
+        (`cuda_graph_sizing_distribution`) -- names one distribution per family and must be
+        resolved by the caller to EXPONENTIAL (prefill/mixed) or LINEAR (decode-only) before
+        calling this; passing HYBRID here asserts.
+
         Dispatches on `sizing_distribution`:
-          - EXPONENTIAL (default): halves from cuda_graph_max_tokens down to tp_size, log-spaced,
+          - EXPONENTIAL: halves from cuda_graph_max_tokens down to tp_size, log-spaced,
             creates log2(max_tokens) graphs.
           - LINEAR: small graphs [1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16);
             explicit-N path uses even 16-stride from 0 to max.
@@ -267,7 +273,8 @@ class CUDAGraphBatchDimensionBuilder:
             tp_size: Tensor parallel size (for alignment)
             num_cuda_graphs: Number of CUDA graphs to generate (must be >= 1, or -1 to auto-size)
             cuda_graph_max_tokens: Maximum token count for CUDA graphs (must be > 0)
-            sizing_distribution: Distribution of cudagraph sizes. Defaults to EXPONENTIAL.
+            sizing_distribution: Distribution of cudagraph sizes, already resolved to a single
+                family. Falls back to EXPONENTIAL when None.
 
         Returns:
             List of token counts in descending order
@@ -469,6 +476,9 @@ class CUDAGraphBatchDimensionBuilder:
             max_sequence_length: Maximum sequence length
             use_cuda_graphs_for_non_decode_steps: Whether to use CUDA graphs for non-decode steps
             num_speculative_tokens: Number of speculative tokens
+            sizing_distribution: How token counts are spaced. Defaults to HYBRID when None,
+                matching the config default. HYBRID is resolved here into EXPONENTIAL for the
+                prefill/mixed family and LINEAR for the decode-only family.
 
         Returns:
             Tuple containing:
@@ -506,8 +516,10 @@ class CUDAGraphBatchDimensionBuilder:
             # Lazy import to avoid a circular dependency with config.py.
             from megatron.core.inference.config import CudaGraphSizingDistribution
 
+            # Match the config default (`cuda_graph_sizing_distribution`) so direct callers that
+            # omit the argument get the same graph set as the inference engine does.
             if sizing_distribution is None:
-                sizing_distribution = CudaGraphSizingDistribution.EXPONENTIAL
+                sizing_distribution = CudaGraphSizingDistribution.HYBRID
 
             # Ensure valid num_cuda_graphs.
             if (
@@ -603,15 +615,18 @@ class CUDAGraphBatchDimensionBuilder:
         else:
             # Mixed prefill and decode mode.
             #
-            # Under EXPONENTIAL distribution (default): generate mixed CGs across a
+            # Mixed graphs belong to the prefill family, so key off `prefill_distribution`
+            # (EXPONENTIAL under the HYBRID default).
+            #
+            # Under EXPONENTIAL prefill distribution: generate mixed CGs across a
             # geometric P-grid {1, 2, 4, ..., max_requests}. This bounds the relative
             # overhead per real batch (~2x P slack worst case) and is the structural fix
             # that makes mixed CGs usable for real batches with P != fixed_P.
             #
-            # Under LINEAR distribution: use the legacy fixed P value
+            # Under LINEAR prefill distribution: use the legacy fixed P value
             # (cuda_graph_mixed_prefill_request_count) — same single-P behavior main has
             # today, for apples-to-apples benchmarking against vLLM-style configurations.
-            if sizing_distribution == CudaGraphSizingDistribution.LINEAR:
+            if prefill_distribution == CudaGraphSizingDistribution.LINEAR:
                 p_values = [min(cuda_graph_mixed_prefill_request_count, max_requests)]
                 # In legacy mode, the prefill-only floor uses the fixed P value to match
                 # main's behavior exactly.

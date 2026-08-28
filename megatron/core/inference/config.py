@@ -195,7 +195,7 @@ class KVCacheManagementMode(str, Enum):
 class CudaGraphSizingDistribution(str, Enum):
     """How CUDA graph token-count sizes are spaced when generating the captured graphs.
 
-    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    EXPONENTIAL — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
     giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
     `log2(max_tokens)` total graphs.
 
@@ -203,7 +203,8 @@ class CudaGraphSizingDistribution(str, Enum):
     sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
     Higher graph density at the top end.
 
-    HYBRID — EXPONENTIAL for prefill and mixed graphs, LINEAR for decode-only graphs. The two
+    HYBRID (default) — EXPONENTIAL for prefill and mixed graphs, LINEAR for decode-only graphs.
+    The two
     serve different ranges: prefill token counts span the whole `cuda_graph_max_tokens` (thousands),
     where log spacing keeps padding bounded at ~2x for a handful of graphs, while decode-only counts
     are capped at `max_requests * (num_speculative_tokens + 1)` (tens), where halving is far too
@@ -381,9 +382,7 @@ class InferenceConfig:
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
     """
 
-    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
-        CudaGraphSizingDistribution.HYBRID
-    )
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     """
     How CUDA graph token counts are spaced. HYBRID (default) applies EXPONENTIAL to prefill and
     mixed graphs and LINEAR to decode-only graphs, since the two cover ranges that differ by

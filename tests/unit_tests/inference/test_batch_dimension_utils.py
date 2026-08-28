@@ -13,6 +13,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
+from megatron.core.inference.config import CudaGraphSizingDistribution
 from tests.unit_tests.test_utilities import Utils
 
 BD = InferenceBatchDimensions
@@ -26,7 +27,12 @@ MIXED_PREFILL_COUNT = 16
 
 
 def _generate_graphs(num_cuda_graphs, use_non_decode=True):
-    """Generate cuda graph batch dimensions using the builder."""
+    """Generate cuda graph batch dimensions using the builder.
+
+    Pinned to EXPONENTIAL rather than the builder default (HYBRID): the token-count
+    alignment assertions below require the decode-only and mixed pools to share a
+    ladder, which only holds when both families use the same distribution.
+    """
     graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
         tp_size=TP_SIZE,
         num_cuda_graphs=num_cuda_graphs,
@@ -36,6 +42,7 @@ def _generate_graphs(num_cuda_graphs, use_non_decode=True):
         max_tokens=MAX_TOKENS,
         max_sequence_length=MAX_SEQ_LEN,
         use_cuda_graphs_for_non_decode_steps=use_non_decode,
+        sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL,
     )
     return graph_list
 
