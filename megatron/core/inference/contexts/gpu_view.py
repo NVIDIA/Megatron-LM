@@ -43,6 +43,9 @@ class ContextGPUView:
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
         req_4byte_bytes = max_requests * 4
+        # Scalar: real (unpadded) token count for the current step. Used by
+        # MoE routing to mask out CUDA-graph padding tokens.
+        real_token_count_bytes = 4
 
         # MHA section: 5 fields shared by both graphed and non-graphed MHAMetadata
         # (only one is active per step, so sharing storage is fine).
@@ -74,6 +77,7 @@ class ContextGPUView:
             3 * tok_int64_bytes
             + 3 * tok_int32_bytes
             + 7 * req_4byte_bytes
+            + real_token_count_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
             + mha_kv_seq_lengths_bytes
@@ -162,6 +166,12 @@ class ContextGPUView:
             torch.int32
         )
         off += req_4byte_bytes
+
+        # Real (unpadded) token count for the current step. Scalar int32 view.
+        # MoE routing reads this to skip routing CUDA-graph padding tokens to
+        # experts. Refreshed each step by transfer_bookkeeping_to_gpu().
+        self.real_token_count = self._buf[off : off + real_token_count_bytes].view(torch.int32)
+        off += real_token_count_bytes
 
         # MHA flash-attention metadata (shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata — only one is active per step).
