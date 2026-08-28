@@ -42,6 +42,7 @@ import os
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum, auto
 
 import torch
 import torch.distributed as dist
@@ -216,62 +217,104 @@ def _parameter_storage(parameter: torch.nn.Parameter) -> torch.Tensor:
     return rowwise_data if rowwise_data is not None else parameter.data
 
 
+def _bf16_storage_ptrs(
+    sources: tuple[torch.Tensor, ...],
+    *,
+    member_numel: int,
+    device: torch.device,
+    label: str,
+) -> tuple[tuple[int], ...]:
+    """Validate BF16 runtime storage and return its pointer signature."""
+    pointers = []
+    for index, source in enumerate(sources):
+        if (
+            source.dtype != torch.bfloat16
+            or source.device != device
+            or source.numel() != member_numel
+            or not source.is_contiguous()
+        ):
+            raise ValueError(
+                f"{label} expert {index} requires contiguous BF16 storage with "
+                f"{member_numel} elements on {device}; got dtype={source.dtype}, "
+                f"shape={tuple(source.shape)}, device={source.device}."
+            )
+        pointers.append((source.data_ptr(),))
+    return tuple(pointers)
+
+
+def _mxfp8_storage_ptrs(
+    sources: tuple[torch.Tensor, ...],
+    *,
+    member_shape: tuple[int, int],
+    rowwise_scale_shape: tuple[int, ...],
+    columnwise_scale_shape: tuple[int, ...],
+    device: torch.device,
+    label: str,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Validate complete MXFP8 runtime storage and return its pointer signature."""
+    pointers = []
+    for index, source in enumerate(sources):
+        storage = (
+            getattr(source, "_rowwise_data", None),
+            getattr(source, "_rowwise_scale_inv", None),
+            getattr(source, "_columnwise_data", None),
+            getattr(source, "_columnwise_scale_inv", None),
+        )
+        shapes = (
+            member_shape,
+            rowwise_scale_shape,
+            member_shape,
+            columnwise_scale_shape,
+        )
+        if (
+            tuple(source.shape) != member_shape
+            or source.device != device
+            or any(
+                tensor is None
+                or tensor.dtype != torch.uint8
+                or not tensor.is_contiguous()
+                or tuple(tensor.shape) != shape
+                for tensor, shape in zip(storage, shapes)
+            )
+        ):
+            actual = tuple(
+                None if tensor is None else (tensor.dtype, tuple(tensor.shape))
+                for tensor in storage
+            )
+            raise ValueError(
+                f"{label} expert {index} requires contiguous MXFP8 data/scales with "
+                f"shapes={shapes} on {device}; got shape={tuple(source.shape)}, "
+                f"device={source.device}, storage={actual}."
+            )
+        pointers.append(tuple(tensor.data_ptr() for tensor in storage))
+    return tuple(pointers)
+
+
 def _validate_mxfp8_members(
     members: tuple[torch.Tensor, ...], *, member_shape: tuple[int, int], backend_name: str
 ) -> tuple[tuple[int, ...], tuple[int, ...], torch.device]:
     """Validate native MXFP8 member storage and return its two scale shapes."""
-    rowwise_scale_shape = None
-    columnwise_scale_shape = None
-    device = None
-    for index, member in enumerate(members):
-        if not is_mxfp8tensor(member) or tuple(member.shape) != member_shape:
-            raise ValueError(
-                f"{backend_name} expected an MXFP8 expert with shape {member_shape}; "
-                f"expert {index} has type={type(member).__name__}, shape={tuple(member.shape)}."
-            )
-        storage_tensors = (
-            member._rowwise_data,
-            member._rowwise_scale_inv,
-            member._columnwise_data,
-            member._columnwise_scale_inv,
-        )
-        if any(tensor is None for tensor in storage_tensors):
-            raise ValueError(
-                f"{backend_name} MXFP8 expert {index} requires rowwise and columnwise "
-                "data plus scaling factors."
-            )
-        if any(
-            tensor.dtype != torch.uint8 or not tensor.is_contiguous() for tensor in storage_tensors
-        ):
-            raise ValueError(
-                f"{backend_name} MXFP8 expert {index} storage must be contiguous uint8."
-            )
-        if tuple(member._rowwise_data.shape) != member_shape:
-            raise ValueError(
-                f"{backend_name} MXFP8 rowwise data has shape "
-                f"{tuple(member._rowwise_data.shape)}, expected {member_shape}."
-            )
-        if tuple(member._columnwise_data.shape) != member_shape:
-            raise ValueError(
-                f"{backend_name} MXFP8 columnwise data has shape "
-                f"{tuple(member._columnwise_data.shape)}, expected {member_shape}."
-            )
-        current_rowwise_scale_shape = tuple(member._rowwise_scale_inv.shape)
-        current_columnwise_scale_shape = tuple(member._columnwise_scale_inv.shape)
-        if rowwise_scale_shape is None:
-            rowwise_scale_shape = current_rowwise_scale_shape
-            columnwise_scale_shape = current_columnwise_scale_shape
-            device = member.device
-        elif (
-            current_rowwise_scale_shape != rowwise_scale_shape
-            or current_columnwise_scale_shape != columnwise_scale_shape
-            or member.device != device
-        ):
-            raise ValueError(
-                f"{backend_name} MXFP8 experts must share scale shapes and one device."
-            )
-    if rowwise_scale_shape is None or columnwise_scale_shape is None or device is None:
+    if not members:
         raise ValueError(f"{backend_name} did not find any MXFP8 expert weights.")
+    for index, member in enumerate(members):
+        if not is_mxfp8tensor(member):
+            raise ValueError(
+                f"{backend_name} expected MXFP8 expert {index}, got {type(member).__name__}."
+            )
+    first = members[0]
+    if first._rowwise_scale_inv is None or first._columnwise_scale_inv is None:
+        raise ValueError(f"{backend_name} MXFP8 weights require rowwise and columnwise scales.")
+    rowwise_scale_shape = tuple(first._rowwise_scale_inv.shape)
+    columnwise_scale_shape = tuple(first._columnwise_scale_inv.shape)
+    device = first.device
+    _mxfp8_storage_ptrs(
+        members,
+        member_shape=member_shape,
+        rowwise_scale_shape=rowwise_scale_shape,
+        columnwise_scale_shape=columnwise_scale_shape,
+        device=device,
+        label=backend_name,
+    )
     return rowwise_scale_shape, columnwise_scale_shape, device
 
 
@@ -395,19 +438,42 @@ def _collect_replica_projection_specs(
     return projection_specs, device
 
 
+class _WeightDirection(Enum):
+    FORWARD = auto()
+    BACKWARD = auto()
+
+
+@dataclass(slots=True)
+class _DirectionalBinding:
+    data_bases: torch.Tensor
+    scale_bases: torch.Tensor | None = None
+    source_tensors: tuple[torch.Tensor, ...] | None = None
+    source_ptrs: tuple[tuple[int, ...], ...] | None = None
+    host_pointer_table: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchResources:
+    sources: tuple[torch.Tensor, ...]
+    scale_sources: tuple[torch.Tensor, ...] | None
+    arena: torch.Tensor
+    handle: object
+    grid_barrier: torch.Tensor
+    orientation: str
+
+
 @dataclass(slots=True)
 class _CuTeDSLReplicaProjection:
-    """One registered projection and its virtual symmetric-memory views."""
+    """One projection and its stable native/virtual runtime storage."""
 
+    name: str
+    device: torch.device
     weight_format: str
     parameters: tuple[torch.nn.Parameter, ...]
     gtp_leader: torch.nn.Parameter | None
     source_tensors: tuple[torch.Tensor, ...]
-    source_bases: torch.Tensor | None
-    rowwise_data_bases: torch.Tensor | None
-    rowwise_scale_bases: torch.Tensor | None
-    columnwise_data_bases: torch.Tensor | None
-    columnwise_scale_bases: torch.Tensor | None
+    forward: _DirectionalBinding
+    backward: _DirectionalBinding
     main_grad_bases: torch.Tensor
     member_shape: tuple[int, int]
     member_numel: int
@@ -416,18 +482,282 @@ class _CuTeDSLReplicaProjection:
     virtual_weight: tuple[torch.Tensor, ...]
     virtual_grad: torch.Tensor
     gtp_native_grad: torch.Tensor | None = None
-    source_pointer_staging: tuple[torch.Tensor, ...] = ()
-    gtp_forward_source_tensors: tuple[torch.Tensor, ...] | None = None
-    gtp_backward_source_tensors: tuple[torch.Tensor, ...] | None = None
-    gtp_forward_source_bases: torch.Tensor | None = None
-    gtp_backward_source_bases: torch.Tensor | None = None
-    gtp_forward_source_ptrs: tuple[int, ...] | None = None
-    gtp_backward_source_ptrs: tuple[int, ...] | None = None
-    gtp_rowwise_source_ptrs: tuple[tuple[int, int], ...] | None = None
-    gtp_columnwise_source_ptrs: tuple[tuple[int, int], ...] | None = None
     runtime_parameters: tuple[torch.nn.Parameter, ...] | None = None
     source_storage_ptrs: tuple[tuple[int, ...], ...] | None = None
     source_main_grad_ptrs: tuple[int, ...] | None = None
+    runtime_bound: bool = False
+
+    def binding(self, direction: _WeightDirection) -> _DirectionalBinding:
+        return self.backward if direction is _WeightDirection.BACKWARD else self.forward
+
+    def bind_materialized_weights(
+        self,
+        materialized_weights: tuple[torch.Tensor, ...],
+        direction: _WeightDirection,
+    ) -> None:
+        """Bind one stable directional GTP gather without copying its payload."""
+        if len(materialized_weights) != len(self.parameters):
+            raise RuntimeError(
+                f"GTP materialized {len(materialized_weights)} {self.name} weights, "
+                f"expected {len(self.parameters)}."
+            )
+        binding = self.binding(direction)
+        direction_name = direction.name.lower()
+        if self.weight_format == "bf16":
+            for index, source in enumerate(materialized_weights):
+                if (
+                    tuple(source.shape) != self.member_shape
+                    or source.dtype != torch.bfloat16
+                    or source.device != self.device
+                    or not source.is_contiguous()
+                ):
+                    raise RuntimeError(
+                        f"GTP BF16 {direction_name} gather returned invalid {self.name} "
+                        f"storage for replica expert {index}."
+                    )
+            source_ptrs = tuple((source.data_ptr(),) for source in materialized_weights)
+        else:
+            data_field, scale_field, scale_shape = (
+                ("_columnwise_data", "_columnwise_scale_inv", self.columnwise_scale_shape)
+                if direction is _WeightDirection.BACKWARD
+                else ("_rowwise_data", "_rowwise_scale_inv", self.rowwise_scale_shape)
+            )
+            source_ptrs = []
+            for index, source in enumerate(materialized_weights):
+                data = getattr(source, data_field, None)
+                scale = getattr(source, scale_field, None)
+                if (
+                    tuple(source.shape) != self.member_shape
+                    or source.device != self.device
+                    or data is None
+                    or scale is None
+                    or data.dtype != torch.uint8
+                    or scale.dtype != torch.uint8
+                    or not data.is_contiguous()
+                    or not scale.is_contiguous()
+                    or tuple(data.shape) != self.member_shape
+                    or tuple(scale.shape) != scale_shape
+                ):
+                    raise RuntimeError(
+                        f"GTP MXFP8 {direction_name} gather returned invalid {self.name} "
+                        f"storage for replica expert {index}."
+                    )
+                source_ptrs.append((data.data_ptr(), scale.data_ptr()))
+            source_ptrs = tuple(source_ptrs)
+
+        if binding.source_ptrs is not None:
+            if source_ptrs != binding.source_ptrs:
+                raise RuntimeError(
+                    f"Replica CuTeDSL GTP {direction_name} all-gather storage changed after "
+                    "direct binding; this would invalidate CUDA-graph source pointers."
+                )
+        else:
+            tables = (binding.data_bases, binding.scale_bases)
+            tables = tuple(table for table in tables if table is not None)
+            if binding.host_pointer_table is None or len(tables) != len(source_ptrs[0]):
+                raise RuntimeError("Replica CuTeDSL GTP direct binding lost pointer storage.")
+            binding.source_ptrs = source_ptrs
+            for component, table in enumerate(tables):
+                host_row = binding.host_pointer_table[component]
+                host_row.copy_(
+                    torch.tensor([ptrs[component] for ptrs in source_ptrs], dtype=torch.int64)
+                )
+                table.copy_(host_row, non_blocking=True)
+
+        binding.source_tensors = materialized_weights
+        if self.weight_format == "bf16":
+            self.source_tensors = materialized_weights
+            if self.runtime_parameters is not None:
+                for parameter, source in zip(self.runtime_parameters, materialized_weights):
+                    parameter.data = source
+            return
+
+        component_offset = 2 if direction is _WeightDirection.BACKWARD else 0
+        for destination, source in zip(self.source_tensors, materialized_weights):
+            setattr(destination, data_field, getattr(source, data_field))
+            setattr(destination, scale_field, getattr(source, scale_field))
+        if self.runtime_parameters is not None:
+            for destination, source in zip(
+                self.runtime_parameters, materialized_weights
+            ):
+                setattr(destination, data_field, getattr(source, data_field))
+                setattr(destination, scale_field, getattr(source, scale_field))
+        if self.source_storage_ptrs is not None:
+            updated = [list(ptrs) for ptrs in self.source_storage_ptrs]
+            for expert, ptrs in enumerate(source_ptrs):
+                updated[expert][component_offset : component_offset + 2] = ptrs
+            self.source_storage_ptrs = tuple(tuple(ptrs) for ptrs in updated)
+
+    def _main_grads(self) -> tuple[torch.Tensor, ...]:
+        if self.gtp_leader is not None:
+            if self.gtp_native_grad is None:
+                raise RuntimeError(f"Replica CuTeDSL {self.name} lost GTP gradient staging.")
+            return tuple(self.gtp_native_grad)
+        grads = tuple(getattr(parameter, "main_grad", None) for parameter in self.parameters)
+        if any(grad is None for grad in grads):
+            raise RuntimeError(
+                "Replica CuTeDSL weights require gradient-accumulation fusion and "
+                "initialized parameter.main_grad buffers."
+            )
+        return grads
+
+    def prepare_runtime_parameters(self, grad_dtype: torch.dtype) -> None:
+        """Bind final DDP/GTP storage once, then validate pointer stability."""
+        sources = (
+            tuple(_parameter_storage(parameter) for parameter in self.parameters)
+            if self.gtp_leader is None and self.weight_format == "bf16"
+            else self.source_tensors
+        )
+        if len(sources) != len(self.parameters):
+            raise RuntimeError(
+                f"Replica CuTeDSL {self.name} expected {len(self.parameters)} native weights, "
+                f"got {len(sources)}."
+            )
+        storage_ptrs = (
+            _bf16_storage_ptrs(
+                sources,
+                member_numel=self.member_numel,
+                device=self.device,
+                label=f"Replica CuTeDSL {self.name}",
+            )
+            if self.weight_format == "bf16"
+            else _mxfp8_storage_ptrs(
+                sources,
+                member_shape=self.member_shape,
+                rowwise_scale_shape=self.rowwise_scale_shape,
+                columnwise_scale_shape=self.columnwise_scale_shape,
+                device=self.device,
+                label=f"Replica CuTeDSL {self.name}",
+            )
+        )
+        directional_gtp_bf16 = self.gtp_leader is not None and self.weight_format == "bf16"
+        if not directional_gtp_bf16 and self.source_storage_ptrs is None:
+            self.source_storage_ptrs = storage_ptrs
+            if self.gtp_leader is None:
+                tables = (
+                    (self.forward.data_bases, 0),
+                    (self.forward.scale_bases, 1),
+                    (self.backward.data_bases, 2),
+                    (self.backward.scale_bases, 3),
+                )
+                for table, component in tables:
+                    if table is not None and component < len(storage_ptrs[0]):
+                        table.copy_(
+                            torch.tensor(
+                                [ptrs[component] for ptrs in storage_ptrs], dtype=torch.int64,
+                                device=self.device,
+                            )
+                        )
+        elif not directional_gtp_bf16 and storage_ptrs != self.source_storage_ptrs:
+            raise RuntimeError(
+                f"Replica CuTeDSL {self.name} parameter storage changed after binding; "
+                "this would invalidate CUDA-graph source pointers."
+            )
+
+        main_grads = self._main_grads()
+        main_grad_ptrs = []
+        for index, grad in enumerate(main_grads):
+            if (
+                grad.dtype != grad_dtype
+                or grad.device != self.device
+                or grad.numel() != self.member_numel
+                or not grad.is_contiguous()
+            ):
+                raise ValueError(
+                    f"Replica CuTeDSL {self.name} main_grad {index} must be contiguous "
+                    f"{grad_dtype} with {self.member_numel} elements on {self.device}; got "
+                    f"dtype={grad.dtype}, shape={tuple(grad.shape)}, device={grad.device}."
+                )
+            main_grad_ptrs.append(grad.data_ptr())
+        main_grad_ptrs = tuple(main_grad_ptrs)
+        if self.source_main_grad_ptrs is None:
+            self.source_main_grad_ptrs = main_grad_ptrs
+            self.main_grad_bases.copy_(
+                torch.tensor(main_grad_ptrs, dtype=torch.int64, device=self.device)
+            )
+        elif main_grad_ptrs != self.source_main_grad_ptrs:
+            raise RuntimeError(
+                f"Replica CuTeDSL {self.name} main-grad storage changed after binding; "
+                "this would invalidate CUDA-graph destination pointers."
+            )
+
+        self.source_tensors = sources
+        weights = sources + tuple(self.virtual_weight)
+        grads = main_grads + tuple(self.virtual_grad)
+        if not self.runtime_bound:
+            self.bind_runtime_parameters(weights, grads)
+        else:
+            self.validate_runtime_parameters(weights, grads)
+
+    def bind_runtime_parameters(self, weights, grads) -> None:
+        """Create the stable native-then-virtual TE parameter sequence once."""
+        runtime_parameters = []
+        for weight, grad in zip(weights, grads):
+            parameter = torch.nn.Parameter(weight, requires_grad=True)
+            parameter.main_grad = grad
+            parameter.grad_added_to_main_grad = True
+            parameter.overwrite_main_grad = self.gtp_leader is not None
+            parameter.register_post_accumulate_grad_hook(_discard_runtime_parameter_grad)
+            runtime_parameters.append(parameter)
+        self.runtime_parameters = tuple(runtime_parameters)
+        self.runtime_bound = True
+
+    def validate_runtime_parameters(self, weights, grads) -> None:
+        """Validate stable storage while refreshing directional GTP gradients."""
+        if self.runtime_parameters is None:
+            raise RuntimeError(f"Replica CuTeDSL {self.name} lost its runtime parameters.")
+        for parameter, weight, grad in zip(self.runtime_parameters, weights, grads):
+            storage_matches = (
+                parameter.data_ptr() == weight.data_ptr()
+                if self.weight_format == "bf16"
+                else all(
+                    getattr(parameter, field).data_ptr()
+                    == getattr(weight, field).data_ptr()
+                    for field in (
+                        "_rowwise_data",
+                        "_rowwise_scale_inv",
+                        "_columnwise_data",
+                        "_columnwise_scale_inv",
+                    )
+                )
+            )
+            if not storage_matches:
+                raise RuntimeError(
+                    f"Replica CuTeDSL {self.name} runtime weight storage changed after binding."
+                )
+            runtime_grad = getattr(parameter, "main_grad", None)
+            if runtime_grad is None or runtime_grad.data_ptr() != grad.data_ptr():
+                if self.gtp_leader is None:
+                    raise RuntimeError(
+                        f"Replica CuTeDSL {self.name} runtime main-grad storage changed after "
+                        "binding."
+                    )
+                parameter.main_grad = grad
+            parameter.grad_added_to_main_grad = True
+            parameter.overwrite_main_grad = self.gtp_leader is not None
+
+    def finalize_gtp_grads(self) -> None:
+        if self.gtp_leader is not None:
+            self.gtp_leader.finalize_group_grads(list(self._main_grads()))
+
+    def destroy(self) -> None:
+        if self.runtime_parameters is not None:
+            for parameter in self.runtime_parameters:
+                parameter.main_grad = None
+        self.runtime_parameters = None
+        self.runtime_bound = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplicaCuTeDSLWorkspaceConfig:
+    world_size: int
+    num_local_experts: int
+    member_shapes: tuple[tuple[int, int], tuple[int, int]]
+    weight_format: str
+    rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
+    columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
+    grad_dtype: torch.dtype
+    num_sms: int
 
 
 class _ReplicaCuTeDSLWorkspace:
@@ -438,14 +768,7 @@ class _ReplicaCuTeDSLWorkspace:
         *,
         group: dist.ProcessGroup,
         device: torch.device,
-        world_size: int,
-        num_local_experts: int,
-        member_shapes: tuple[tuple[int, int], tuple[int, int]],
-        weight_format: str,
-        rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
-        columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
-        grad_dtype: torch.dtype,
-        num_sms: int | None,
+        config: _ReplicaCuTeDSLWorkspaceConfig,
     ) -> None:
         try:
             import torch.distributed._symmetric_memory as symm_mem
@@ -456,34 +779,26 @@ class _ReplicaCuTeDSLWorkspace:
 
         self.group = group
         self.device = device
-        self.world_size = int(world_size)
-        self.num_local_experts = int(num_local_experts)
-        self.member_shapes = member_shapes
-        self.member_numels = tuple(math.prod(shape) for shape in member_shapes)
-        self.weight_format = weight_format
-        self.rowwise_scale_shapes = rowwise_scale_shapes
-        self.columnwise_scale_shapes = columnwise_scale_shapes
-        if grad_dtype not in (torch.float32, torch.bfloat16):
-            raise ValueError(
-                "Replica CuTeDSL gradients must use torch.float32 or torch.bfloat16, "
-                f"got {grad_dtype}."
-            )
-        self.grad_dtype = grad_dtype
+        self.config = config
+        self.world_size = config.world_size
+        self.num_local_experts = config.num_local_experts
+        self.member_shapes = config.member_shapes
+        self.member_numels = tuple(math.prod(shape) for shape in config.member_shapes)
+        self.weight_format = config.weight_format
+        self.rowwise_scale_shapes = config.rowwise_scale_shapes
+        self.columnwise_scale_shapes = config.columnwise_scale_shapes
+        self.grad_dtype = config.grad_dtype
         self.rowwise_scale_numels = (
-            tuple(math.prod(shape) for shape in rowwise_scale_shapes)
-            if rowwise_scale_shapes is not None
+            tuple(math.prod(shape) for shape in self.rowwise_scale_shapes)
+            if self.rowwise_scale_shapes is not None
             else None
         )
         self.columnwise_scale_numels = (
-            tuple(math.prod(shape) for shape in columnwise_scale_shapes)
-            if columnwise_scale_shapes is not None
+            tuple(math.prod(shape) for shape in self.columnwise_scale_shapes)
+            if self.columnwise_scale_shapes is not None
             else None
         )
-        device_sms = torch.cuda.get_device_properties(device).multi_processor_count
-        requested_sms = 32 if num_sms is None else int(num_sms)
-        self.num_sms = min(requested_sms, MAX_REPLICA_WEIGHT_SMS, max(1, device_sms - 8))
-        if self.num_sms <= 0:
-            raise ValueError(f"Replica CuTeDSL num_sms must be positive, got {num_sms}.")
+        self.num_sms = config.num_sms
 
         arena_numel = self.num_local_experts * sum(self.member_numels)
         try:
@@ -502,12 +817,8 @@ class _ReplicaCuTeDSLWorkspace:
             if symm_mem.get_backend(device) != "NCCL":
                 symm_mem.set_backend("NCCL")
             if self.weight_format == "bf16":
-                self.weight_arena = symm_mem.empty(arena_numel, dtype=torch.bfloat16, device=device)
-                self.weight_handle = symm_mem.rendezvous(self.weight_arena, group)
-                self.rowwise_arena = None
-                self.rowwise_handle = None
-                self.columnwise_arena = None
-                self.columnwise_handle = None
+                weight_arena_numel = arena_numel
+                weight_dtype = torch.bfloat16
             elif self.weight_format == "mxfp8":
                 if self.rowwise_scale_numels is None or self.columnwise_scale_numels is None:
                     raise ValueError("MXFP8 replica weights require rowwise and columnwise scales.")
@@ -515,22 +826,19 @@ class _ReplicaCuTeDSLWorkspace:
                 # columnwise storage only after an explicit orientation prefetch.
                 # Retaining both would double the constant weight buffer despite
                 # their disjoint lifetimes.
-                shared_arena_numel = self.num_local_experts * sum(
+                weight_arena_numel = self.num_local_experts * sum(
                     member + max(rowwise_scale, columnwise_scale)
                     for member, rowwise_scale, columnwise_scale in zip(
                         self.member_numels, self.rowwise_scale_numels, self.columnwise_scale_numels
                     )
                 )
-                self.rowwise_arena = symm_mem.empty(
-                    shared_arena_numel, dtype=torch.uint8, device=device
-                )
-                self.rowwise_handle = symm_mem.rendezvous(self.rowwise_arena, group)
-                self.columnwise_arena = self.rowwise_arena
-                self.columnwise_handle = self.rowwise_handle
-                self.weight_arena = None
-                self.weight_handle = None
+                weight_dtype = torch.uint8
             else:
                 raise ValueError(f"Unsupported replica weight format {self.weight_format!r}.")
+            self.weight_arena = symm_mem.empty(
+                weight_arena_numel, dtype=weight_dtype, device=device
+            )
+            self.weight_handle = symm_mem.rendezvous(self.weight_arena, group)
             self.grad_arena = symm_mem.empty(arena_numel, dtype=self.grad_dtype, device=device)
             self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
@@ -539,12 +847,7 @@ class _ReplicaCuTeDSLWorkspace:
                 "EP group. The initial implementation requires a single NVLink domain."
             ) from exc
 
-        if self.weight_arena is not None:
-            self.weight_arena.zero_()
-        if self.rowwise_arena is not None:
-            self.rowwise_arena.zero_()
-        if self.columnwise_arena is not None and self.columnwise_arena is not self.rowwise_arena:
-            self.columnwise_arena.zero_()
+        self.weight_arena.zero_()
         self.grad_arena.zero_()
         self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         self.columnwise_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
@@ -587,46 +890,12 @@ class _ReplicaCuTeDSLWorkspace:
             return self.weight_stream_fallback
         raise RuntimeError("Replica CuTeDSL weight streams alias the active CUDA stream.")
 
-    def validate(
-        self,
-        *,
-        world_size: int,
-        num_local_experts: int,
-        member_shapes: tuple[tuple[int, int], tuple[int, int]],
-        weight_format: str,
-        rowwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
-        columnwise_scale_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None,
-        grad_dtype: torch.dtype,
-        num_sms: int | None,
-    ) -> None:
+    def validate(self, config: _ReplicaCuTeDSLWorkspaceConfig) -> None:
         """Reject heterogeneous layers instead of creating a shape-keyed memory pool."""
-        requested_sms = 32 if num_sms is None else int(num_sms)
-        device_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-        effective_sms = min(requested_sms, MAX_REPLICA_WEIGHT_SMS, max(1, device_sms - 8))
-        actual = (
-            int(world_size),
-            int(num_local_experts),
-            member_shapes,
-            weight_format,
-            rowwise_scale_shapes,
-            columnwise_scale_shapes,
-            grad_dtype,
-            effective_sms,
-        )
-        expected = (
-            self.world_size,
-            self.num_local_experts,
-            self.member_shapes,
-            self.weight_format,
-            self.rowwise_scale_shapes,
-            self.columnwise_scale_shapes,
-            self.grad_dtype,
-            self.num_sms,
-        )
-        if actual != expected:
+        if config != self.config:
             raise ValueError(
                 "All replica-planned MoE layers on an EP group must share one CuTeDSL "
-                f"weight shape and launch configuration; expected {expected}, got {actual}."
+                f"weight shape and launch configuration; expected {self.config}, got {config}."
             )
 
     def projection_views(self, projection_index: int) -> tuple[tuple, torch.Tensor]:
@@ -636,13 +905,11 @@ class _ReplicaCuTeDSLWorkspace:
         grad_numel = self.num_local_experts * member_numel
         member_shape = self.member_shapes[projection_index]
         virtual_grad = self.grad_arena.narrow(0, grad_offset, grad_numel).view(
-            self.num_local_experts, *member_shape
-        )
+            self.num_local_experts, *member_shape)
         if self.weight_format == "bf16":
             weight_offset = grad_offset
             weights = self.weight_arena.narrow(0, weight_offset, grad_numel).view(
-                self.num_local_experts, *member_shape
-            )
+                self.num_local_experts, *member_shape)
             return tuple(weights), virtual_grad
 
         rowwise_scale_numel = self.rowwise_scale_numels[projection_index]
@@ -655,18 +922,18 @@ class _ReplicaCuTeDSLWorkspace:
                 self.columnwise_scale_numels[:projection_index],
             )
         )
-        rowwise_data = self.rowwise_arena.narrow(
+        rowwise_data = self.weight_arena.narrow(
             0, projection_offset, self.num_local_experts * member_numel
         ).view(self.num_local_experts, *member_shape)
-        rowwise_scale = self.rowwise_arena.narrow(
+        rowwise_scale = self.weight_arena.narrow(
             0,
             projection_offset + self.num_local_experts * member_numel,
             self.num_local_experts * rowwise_scale_numel,
         ).view(self.num_local_experts, *self.rowwise_scale_shapes[projection_index])
-        columnwise_data = self.columnwise_arena.narrow(
+        columnwise_data = self.weight_arena.narrow(
             0, projection_offset, self.num_local_experts * member_numel
         ).view(self.num_local_experts, *member_shape)
-        columnwise_scale = self.columnwise_arena.narrow(
+        columnwise_scale = self.weight_arena.narrow(
             0,
             projection_offset + self.num_local_experts * member_numel,
             self.num_local_experts * columnwise_scale_numel,
@@ -709,12 +976,8 @@ class _ReplicaCuTeDSLWorkspace:
         # Handles own NCCL window registrations. Drop them before their backing
         # tensors and, critically, before model-parallel process-group teardown.
         self.weight_handle = None
-        self.rowwise_handle = None
-        self.columnwise_handle = None
         self.grad_handle = None
         self.weight_arena = None
-        self.rowwise_arena = None
-        self.columnwise_arena = None
         self.grad_arena = None
         self._destroyed = True
 
@@ -737,33 +1000,33 @@ def _get_replica_cutedsl_workspace(
     num_sms: int | None,
 ) -> _ReplicaCuTeDSLWorkspace:
     """Return the one fixed-shape workspace owned by an EP group and device."""
+    if grad_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            "Replica CuTeDSL gradients must use torch.float32 or torch.bfloat16, "
+            f"got {grad_dtype}."
+        )
+    requested_sms = 32 if num_sms is None else int(num_sms)
+    device_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    effective_sms = min(requested_sms, MAX_REPLICA_WEIGHT_SMS, max(1, device_sms - 8))
+    if effective_sms <= 0:
+        raise ValueError(f"Replica CuTeDSL num_sms must be positive, got {num_sms}.")
+    config = _ReplicaCuTeDSLWorkspaceConfig(
+        int(world_size),
+        int(num_local_experts),
+        member_shapes,
+        weight_format,
+        rowwise_scale_shapes,
+        columnwise_scale_shapes,
+        grad_dtype,
+        effective_sms,
+    )
     key = (id(group), device.index)
     workspace = _replica_cutedsl_workspaces.get(key)
     if workspace is None:
-        workspace = _ReplicaCuTeDSLWorkspace(
-            group=group,
-            device=device,
-            world_size=world_size,
-            num_local_experts=num_local_experts,
-            member_shapes=member_shapes,
-            weight_format=weight_format,
-            rowwise_scale_shapes=rowwise_scale_shapes,
-            columnwise_scale_shapes=columnwise_scale_shapes,
-            grad_dtype=grad_dtype,
-            num_sms=num_sms,
-        )
+        workspace = _ReplicaCuTeDSLWorkspace(group=group, device=device, config=config)
         _replica_cutedsl_workspaces[key] = workspace
     else:
-        workspace.validate(
-            world_size=world_size,
-            num_local_experts=num_local_experts,
-            member_shapes=member_shapes,
-            weight_format=weight_format,
-            rowwise_scale_shapes=rowwise_scale_shapes,
-            columnwise_scale_shapes=columnwise_scale_shapes,
-            grad_dtype=grad_dtype,
-            num_sms=num_sms,
-        )
+        workspace.validate(config)
     return workspace
 
 
@@ -779,49 +1042,28 @@ class ReplicaCuTeDSLWeightBridge:
         num_local_experts: int,
         grad_dtype: torch.dtype = torch.float32,
         num_sms: int | None = None,
-        hidden_dim: int | None = None,
-        top_k: int | None = None,
-        alignment: int | None = None,
-        zero_copy: bool | None = None,
-        num_blocks_permute: int | None = None,
-        num_blocks_unpermute: int | None = None,
-        num_sms_preprocessing: int | None = None,
     ) -> None:
-        del (
-            hidden_dim,
-            top_k,
-            alignment,
-            zero_copy,
-            num_blocks_permute,
-            num_blocks_unpermute,
-            num_sms_preprocessing,
-        )
         self.group = group
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        self.num_experts = int(num_experts)
         self.num_local_experts = int(num_local_experts)
-        self.num_slots = self.num_local_experts
         self.num_runtime_experts = 2 * self.num_local_experts
-        self._weight_backend_name = "Replica-CuTeDSL"
         self.last_plan = None
-        self._prefetch_pending = False
         self._prefetch_plan = None
-        self._grad_reduce_pending = False
         self._grad_reduce_plan = None
         self._experts_ref = weakref.ref(experts)
         self._destroyed = False
 
-        if self.num_experts != self.world_size * self.num_local_experts:
+        if int(num_experts) != self.world_size * self.num_local_experts:
             raise ValueError(
                 "Replica CuTeDSL weights require an even expert distribution: "
-                f"num_experts={self.num_experts}, world_size={self.world_size}, "
+                f"num_experts={num_experts}, world_size={self.world_size}, "
                 f"num_local_experts={self.num_local_experts}."
             )
         projection_specs, self.device = _collect_replica_projection_specs(
             experts,
             num_local_experts=self.num_local_experts,
-            backend_name=self._weight_backend_name,
+            backend_name="Replica-CuTeDSL",
         )
         # Replica wgrads are produced directly into ``main_grad`` and therefore
         # must not flow through PyTorch's leaf ``AccumulateGrad``. DDP sees this
@@ -885,16 +1127,26 @@ class ReplicaCuTeDSLWeightBridge:
             def pointer_table() -> torch.Tensor:
                 return torch.empty(self.num_local_experts, dtype=torch.int64, device=self.device)
 
+            def binding(data_bases, scale_bases=None, components=0):
+                host_table = (
+                    torch.empty(
+                        (components, self.num_local_experts),
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    )
+                    if components
+                    else None
+                )
+                return _DirectionalBinding(data_bases, scale_bases, host_pointer_table=host_table)
+
             if spec.weight_format == "bf16":
                 virtual_weight = virtual_storage
                 native_weight = native_storage
-                source_bases = pointer_table() if spec.gtp_leader is None else None
-                gtp_forward_source_bases = pointer_table() if spec.gtp_leader is not None else None
-                gtp_backward_source_bases = pointer_table() if spec.gtp_leader is not None else None
-                rowwise_data_bases = None
-                rowwise_scale_bases = None
-                columnwise_data_bases = None
-                columnwise_scale_bases = None
+                if spec.gtp_leader is None:
+                    forward = backward = binding(pointer_table())
+                else:
+                    forward = binding(pointer_table(), components=1)
+                    backward = binding(pointer_table(), components=1)
             else:
                 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
@@ -923,24 +1175,14 @@ class ReplicaCuTeDSLWeightBridge:
                 native_weight = (
                     wrap_mxfp8_storage(native_storage) if native_storage is not None else None
                 )
-                source_bases = None
-                gtp_forward_source_bases = None
-                gtp_backward_source_bases = None
-                rowwise_data_bases = pointer_table()
-                rowwise_scale_bases = pointer_table()
-                columnwise_data_bases = pointer_table()
-                columnwise_scale_bases = pointer_table()
+                components = 2 if spec.gtp_leader is not None else 0
+                forward = binding(pointer_table(), pointer_table(), components)
+                backward = binding(pointer_table(), pointer_table(), components)
             main_grad_bases = pointer_table()
-            source_pointer_staging = (
-                tuple(
-                    torch.empty(self.num_local_experts, dtype=torch.int64, pin_memory=True)
-                    for _ in range(4 if spec.weight_format == "mxfp8" else 2)
-                )
-                if spec.gtp_leader is not None
-                else ()
-            )
             self.projections.append(
                 _CuTeDSLReplicaProjection(
+                    name=f"FC{projection_index + 1}",
+                    device=self.device,
                     weight_format=spec.weight_format,
                     parameters=spec.parameters,
                     gtp_leader=spec.gtp_leader,
@@ -949,11 +1191,8 @@ class ReplicaCuTeDSLWeightBridge:
                         if native_weight is not None
                         else (() if spec.gtp_leader is not None else spec.source_tensors)
                     ),
-                    source_bases=source_bases,
-                    rowwise_data_bases=rowwise_data_bases,
-                    rowwise_scale_bases=rowwise_scale_bases,
-                    columnwise_data_bases=columnwise_data_bases,
-                    columnwise_scale_bases=columnwise_scale_bases,
+                    forward=forward,
+                    backward=backward,
                     main_grad_bases=main_grad_bases,
                     member_shape=spec.member_shape,
                     member_numel=math.prod(spec.member_shape),
@@ -962,9 +1201,6 @@ class ReplicaCuTeDSLWeightBridge:
                     virtual_weight=virtual_weight,
                     virtual_grad=virtual_grad,
                     gtp_native_grad=gtp_native_grad,
-                    source_pointer_staging=source_pointer_staging,
-                    gtp_forward_source_bases=gtp_forward_source_bases,
-                    gtp_backward_source_bases=gtp_backward_source_bases,
                 )
             )
         _replica_cutedsl_bridges.add(self)
@@ -988,182 +1224,14 @@ class ReplicaCuTeDSLWeightBridge:
     @property
     def source_parameters(self) -> tuple[torch.nn.Parameter, ...]:
         """Return the optimizer-owned FC1 and FC2 parameters."""
-        return tuple(
-            parameter for projection in self.projections for parameter in projection.parameters
-        )
+        return tuple(parameter for p in self.projections for parameter in p.parameters)
 
-    def _bind_materialized_gtp_mxfp8_weights(
-        self,
-        projection: _CuTeDSLReplicaProjection,
-        materialized_weights: tuple[torch.Tensor, ...],
-        *,
-        retain_for_grad: bool,
-    ) -> None:
-        """Bind stable GTP MXFP8 gather outputs directly as native replica sources."""
-        data_field, scale_field = (
-            ("_columnwise_data", "_columnwise_scale_inv")
-            if retain_for_grad
-            else ("_rowwise_data", "_rowwise_scale_inv")
-        )
-        expected_scale_shape = (
-            projection.columnwise_scale_shape if retain_for_grad else projection.rowwise_scale_shape
-        )
-        source_ptrs = []
-        for index, source in enumerate(materialized_weights):
-            source_data = getattr(source, data_field, None)
-            source_scale = getattr(source, scale_field, None)
-            if (
-                tuple(source.shape) != projection.member_shape
-                or source.device != self.device
-                or source_data is None
-                or source_scale is None
-                or source_data.dtype != torch.uint8
-                or source_scale.dtype != torch.uint8
-                or not source_data.is_contiguous()
-                or not source_scale.is_contiguous()
-                or tuple(source_data.shape) != projection.member_shape
-                or tuple(source_scale.shape) != expected_scale_shape
-            ):
-                raise RuntimeError(
-                    f"GTP MXFP8 {'backward' if retain_for_grad else 'forward'} gather "
-                    f"returned invalid storage for replica expert {index}."
-                )
-            source_ptrs.append((source_data.data_ptr(), source_scale.data_ptr()))
-        source_ptrs = tuple(source_ptrs)
-        bound_ptrs_attr = (
-            "gtp_columnwise_source_ptrs" if retain_for_grad else "gtp_rowwise_source_ptrs"
-        )
-        bound_ptrs = getattr(projection, bound_ptrs_attr)
-        if bound_ptrs is not None:
-            if source_ptrs != bound_ptrs:
-                raise RuntimeError(
-                    f"Replica CuTeDSL GTP {'backward' if retain_for_grad else 'forward'} "
-                    "all-gather storage changed after direct binding; this would invalidate "
-                    "CUDA-graph source pointers."
-                )
-            return
-
-        if len(projection.source_pointer_staging) != 4:
-            raise RuntimeError(
-                "Replica CuTeDSL GTP MXFP8 direct binding lost its pinned pointer staging."
-            )
-        setattr(projection, bound_ptrs_attr, source_ptrs)
-        component_offset = 2 if retain_for_grad else 0
-        pointer_tables = (
-            projection.rowwise_data_bases,
-            projection.rowwise_scale_bases,
-            projection.columnwise_data_bases,
-            projection.columnwise_scale_bases,
-        )
-        for component_index in range(2):
-            pointer_index = component_offset + component_index
-            host_table = projection.source_pointer_staging[pointer_index]
-            host_table.copy_(
-                torch.tensor([ptrs[component_index] for ptrs in source_ptrs], dtype=torch.int64)
-            )
-            pointer_tables[pointer_index].copy_(host_table, non_blocking=True)
-
-        runtime_parameters = projection.runtime_parameters
-        for index, (destination, source) in enumerate(
-            zip(projection.source_tensors, materialized_weights)
-        ):
-            source_data = getattr(source, data_field)
-            source_scale = getattr(source, scale_field)
-            setattr(destination, data_field, source_data)
-            setattr(destination, scale_field, source_scale)
-            if runtime_parameters is not None:
-                setattr(runtime_parameters[index], data_field, source_data)
-                setattr(runtime_parameters[index], scale_field, source_scale)
-
-        if projection.source_storage_ptrs is not None:
-            updated_storage_ptrs = [list(ptrs) for ptrs in projection.source_storage_ptrs]
-            for expert_index, ptrs in enumerate(source_ptrs):
-                updated_storage_ptrs[expert_index][component_offset] = ptrs[0]
-                updated_storage_ptrs[expert_index][component_offset + 1] = ptrs[1]
-            projection.source_storage_ptrs = tuple(tuple(ptrs) for ptrs in updated_storage_ptrs)
-
-    @torch.no_grad()
-    def _bind_materialized_gtp_bf16_weights(
-        self,
-        projection: _CuTeDSLReplicaProjection,
-        materialized_weights: tuple[torch.Tensor, ...],
-        *,
-        retain_for_grad: bool,
-    ) -> None:
-        """Bind one stable GTP BF16 gather buffer directly to the runtime parameters."""
-        direction = "backward" if retain_for_grad else "forward"
-        for index, source in enumerate(materialized_weights):
-            if (
-                tuple(source.shape) != projection.member_shape
-                or source.dtype != torch.bfloat16
-                or source.device != self.device
-                or not source.is_contiguous()
-            ):
-                raise RuntimeError(
-                    f"GTP BF16 {direction} gather returned invalid storage for replica "
-                    f"expert {index}."
-                )
-
-        source_ptrs = tuple(source.data_ptr() for source in materialized_weights)
-        tensors_attr = (
-            "gtp_backward_source_tensors" if retain_for_grad else "gtp_forward_source_tensors"
-        )
-        ptrs_attr = "gtp_backward_source_ptrs" if retain_for_grad else "gtp_forward_source_ptrs"
-        source_bases = (
-            projection.gtp_backward_source_bases
-            if retain_for_grad
-            else projection.gtp_forward_source_bases
-        )
-        bound_ptrs = getattr(projection, ptrs_attr)
-        if bound_ptrs is not None and source_ptrs != bound_ptrs:
-            raise RuntimeError(
-                f"Replica CuTeDSL GTP BF16 {direction} all-gather storage changed after "
-                "direct binding; this would invalidate CUDA-graph weight pointers."
-            )
-        if bound_ptrs is None:
-            if source_bases is None or len(projection.source_pointer_staging) != 2:
-                raise RuntimeError(
-                    "Replica CuTeDSL GTP BF16 direct binding lost its pointer storage."
-                )
-            setattr(projection, ptrs_attr, source_ptrs)
-            host_table = projection.source_pointer_staging[int(retain_for_grad)]
-            host_table.copy_(torch.tensor(source_ptrs, dtype=torch.int64))
-            source_bases.copy_(host_table, non_blocking=True)
-
-        setattr(projection, tensors_attr, materialized_weights)
-        projection.source_tensors = materialized_weights
-        if projection.runtime_parameters is not None:
-            for runtime_parameter, source in zip(
-                projection.runtime_parameters[: self.num_local_experts], materialized_weights
-            ):
-                runtime_parameter.data = source
-
-    def _publish_materialized_gtp_weights(
-        self,
-        projection: _CuTeDSLReplicaProjection,
-        materialized_weights: tuple[torch.Tensor, ...],
-        *,
-        retain_for_grad: bool,
-    ) -> None:
-        """Publish one completed GTP gather to the replica runtime and owner-push."""
-        if len(materialized_weights) != self.num_local_experts:
-            raise RuntimeError(
-                "GTP materialized an unexpected number of replica source weights: "
-                f"expected {self.num_local_experts}, got {len(materialized_weights)}."
-            )
-        if projection.weight_format == "bf16":
-            self._bind_materialized_gtp_bf16_weights(
-                projection, materialized_weights, retain_for_grad=retain_for_grad
-            )
-            return
-        self._bind_materialized_gtp_mxfp8_weights(
-            projection, materialized_weights, retain_for_grad=retain_for_grad
-        )
-
-    def _materialize_gtp_source_weights(self, *, retain_for_grad: bool) -> None:
+    def _materialize_gtp_source_weights(self, direction: _WeightDirection) -> None:
         """Complete GTP gathers before the replica owner-push reads native weights."""
         ordered_projections = (
-            reversed(self.projections) if retain_for_grad else iter(self.projections)
+            reversed(self.projections)
+            if direction is _WeightDirection.BACKWARD
+            else iter(self.projections)
         )
         for projection in ordered_projections:
             leader = projection.gtp_leader
@@ -1171,239 +1239,18 @@ class ReplicaCuTeDSLWeightBridge:
                 continue
             materialized = (
                 leader.materialize_group_for_backward()
-                if retain_for_grad
+                if direction is _WeightDirection.BACKWARD
                 else leader.materialize_group_for_forward()
             )
             materialized = (
                 tuple(materialized) if isinstance(materialized, (list, tuple)) else (materialized,)
             )
-            self._publish_materialized_gtp_weights(
-                projection, materialized, retain_for_grad=retain_for_grad
-            )
-
-    def _stable_gtp_main_grads(
-        self, projection: _CuTeDSLReplicaProjection
-    ) -> tuple[torch.Tensor, ...]:
-        """Return bridge-owned GTP gradient staging with stable device addresses."""
-        if projection.gtp_leader is None:
-            raise RuntimeError("Replica CuTeDSL requested GTP staging for a non-GTP projection.")
-        if projection.gtp_native_grad is not None:
-            return tuple(projection.gtp_native_grad)
-        raise RuntimeError("Replica CuTeDSL GTP weights lost their native gradient staging.")
+            projection.bind_materialized_weights(materialized, direction)
 
     def prepare_runtime_parameters(self) -> None:
-        """Late-bind optimizer storage and validate its subsequent stability.
-
-        DistributedDataParallel constructs its persistent parameter and gradient
-        buffers after the expert module (and therefore this bridge) is created.
-        The first prepared forward binds those final addresses; only a later
-        remapping would invalidate captured runtime pointers.
-        """
+        """Late-bind final DDP/GTP storage and validate subsequent stability."""
         for projection in self.projections:
-            if projection.gtp_leader is not None:
-                source_tensors = projection.source_tensors
-                main_grad_tensors = self._stable_gtp_main_grads(projection)
-            else:
-                source_tensors = (
-                    tuple(_parameter_storage(parameter) for parameter in projection.parameters)
-                    if projection.weight_format == "bf16"
-                    else projection.source_tensors
-                )
-                main_grad_tensors = tuple(
-                    getattr(parameter, "main_grad", None) for parameter in projection.parameters
-                )
-                if any(main_grad is None for main_grad in main_grad_tensors):
-                    raise RuntimeError(
-                        "Replica CuTeDSL weights require gradient-accumulation fusion and "
-                        "initialized parameter.main_grad buffers."
-                    )
-            if len(source_tensors) != self.num_local_experts:
-                raise RuntimeError(
-                    "Replica CuTeDSL runtime binding expected "
-                    f"{self.num_local_experts} native weights, got {len(source_tensors)}."
-                )
-
-            source_storage_ptrs = []
-            for source in source_tensors:
-                if projection.weight_format == "bf16":
-                    if (
-                        source.dtype != torch.bfloat16
-                        or source.device != self.device
-                        or source.numel() != projection.member_numel
-                        or not source.is_contiguous()
-                    ):
-                        raise ValueError(
-                            "Replica CuTeDSL requires contiguous BF16 expert weight storage on "
-                            f"the weight device with {projection.member_numel} elements per expert."
-                        )
-                    source_storage_ptrs.append((source.data_ptr(),))
-                else:
-                    rowwise_data = source._rowwise_data
-                    rowwise_scale = source._rowwise_scale_inv
-                    columnwise_data = source._columnwise_data
-                    columnwise_scale = source._columnwise_scale_inv
-                    if (
-                        tuple(source.shape) != projection.member_shape
-                        or source.device != self.device
-                        or any(
-                            tensor is None
-                            or tensor.dtype != torch.uint8
-                            or not tensor.is_contiguous()
-                            for tensor in (
-                                rowwise_data,
-                                rowwise_scale,
-                                columnwise_data,
-                                columnwise_scale,
-                            )
-                        )
-                        or tuple(rowwise_scale.shape) != projection.rowwise_scale_shape
-                        or tuple(columnwise_scale.shape) != projection.columnwise_scale_shape
-                    ):
-                        raise ValueError(
-                            "Replica CuTeDSL requires stable contiguous MXFP8 data and scales "
-                            "for every expert."
-                        )
-                    source_storage_ptrs.append(
-                        (
-                            rowwise_data.data_ptr(),
-                            rowwise_scale.data_ptr(),
-                            columnwise_data.data_ptr(),
-                            columnwise_scale.data_ptr(),
-                        )
-                    )
-            source_storage_ptrs = tuple(source_storage_ptrs)
-            directional_gtp_bf16 = (
-                projection.gtp_leader is not None and projection.weight_format == "bf16"
-            )
-            if directional_gtp_bf16:
-                # Forward and backward GTP gathers intentionally have different stable
-                # addresses. Their direction-specific invariants and owner-push tables
-                # are maintained by _bind_materialized_gtp_bf16_weights.
-                pass
-            elif projection.source_storage_ptrs is None:
-                projection.source_storage_ptrs = source_storage_ptrs
-                if projection.weight_format == "bf16":
-                    projection.source_bases.copy_(
-                        torch.tensor(
-                            [ptrs[0] for ptrs in source_storage_ptrs],
-                            dtype=torch.int64,
-                            device=self.device,
-                        )
-                    )
-                else:
-                    pointer_tables = (
-                        projection.rowwise_data_bases,
-                        projection.rowwise_scale_bases,
-                        projection.columnwise_data_bases,
-                        projection.columnwise_scale_bases,
-                    )
-                    for pointer_index, pointer_table in enumerate(pointer_tables):
-                        pointer_table.copy_(
-                            torch.tensor(
-                                [ptrs[pointer_index] for ptrs in source_storage_ptrs],
-                                dtype=torch.int64,
-                                device=self.device,
-                            )
-                        )
-            elif source_storage_ptrs != projection.source_storage_ptrs:
-                raise RuntimeError(
-                    "Replica CuTeDSL parameter storage changed after runtime binding; this "
-                    "would invalidate CUDA-graph source pointers."
-                )
-
-            main_grad_ptrs = []
-            for main_grad in main_grad_tensors:
-                if (
-                    main_grad.dtype != self.workspace.grad_dtype
-                    or main_grad.device != self.device
-                    or main_grad.numel() != projection.member_numel
-                    or not main_grad.is_contiguous()
-                ):
-                    raise ValueError(
-                        "Replica CuTeDSL requires contiguous registered main-grad buffers "
-                        f"with dtype {self.workspace.grad_dtype} on the weight device with one "
-                        "expert's shape."
-                    )
-                main_grad_ptrs.append(main_grad.data_ptr())
-            main_grad_ptrs = tuple(main_grad_ptrs)
-            if projection.source_main_grad_ptrs is None:
-                projection.source_main_grad_ptrs = main_grad_ptrs
-                projection.main_grad_bases.copy_(
-                    torch.tensor(main_grad_ptrs, dtype=torch.int64, device=self.device)
-                )
-            elif (
-                main_grad_ptrs != projection.source_main_grad_ptrs and projection.gtp_leader is None
-            ):
-                raise RuntimeError(
-                    "Replica CuTeDSL main-grad storage changed after runtime binding; this "
-                    "would invalidate CUDA-graph destination pointers."
-                )
-            elif main_grad_ptrs != projection.source_main_grad_ptrs:
-                raise RuntimeError(
-                    "Replica CuTeDSL bridge-owned GTP gradient staging changed after runtime "
-                    "binding; this would invalidate CUDA-graph destination pointers."
-                )
-            projection.source_tensors = source_tensors
-            if projection.runtime_parameters is None:
-                runtime_parameters = []
-                for weight, grad in zip(source_tensors, main_grad_tensors):
-                    runtime_parameter = torch.nn.Parameter(weight, requires_grad=True)
-                    runtime_parameter.main_grad = grad
-                    runtime_parameter.grad_added_to_main_grad = True
-                    runtime_parameter.overwrite_main_grad = projection.gtp_leader is not None
-                    runtime_parameter.register_post_accumulate_grad_hook(
-                        _discard_runtime_parameter_grad
-                    )
-                    runtime_parameters.append(runtime_parameter)
-                for weight, grad in zip(projection.virtual_weight, projection.virtual_grad):
-                    runtime_parameter = torch.nn.Parameter(weight, requires_grad=True)
-                    runtime_parameter.main_grad = grad
-                    runtime_parameter.grad_added_to_main_grad = True
-                    runtime_parameter.overwrite_main_grad = projection.gtp_leader is not None
-                    runtime_parameter.register_post_accumulate_grad_hook(
-                        _discard_runtime_parameter_grad
-                    )
-                    runtime_parameters.append(runtime_parameter)
-                projection.runtime_parameters = tuple(runtime_parameters)
-            else:
-                expected_weights = source_tensors + tuple(projection.virtual_weight)
-                expected_grads = main_grad_tensors + tuple(projection.virtual_grad)
-                for runtime_parameter, expected_weight, expected_grad in zip(
-                    projection.runtime_parameters, expected_weights, expected_grads
-                ):
-                    if projection.weight_format == "bf16":
-                        weight_storage_matches = (
-                            runtime_parameter.data_ptr() == expected_weight.data_ptr()
-                        )
-                    else:
-                        weight_storage_matches = all(
-                            getattr(runtime_parameter, field).data_ptr()
-                            == getattr(expected_weight, field).data_ptr()
-                            for field in (
-                                "_rowwise_data",
-                                "_rowwise_scale_inv",
-                                "_columnwise_data",
-                                "_columnwise_scale_inv",
-                            )
-                        )
-                    if not weight_storage_matches:
-                        raise RuntimeError(
-                            "Replica CuTeDSL runtime weight storage changed after binding; "
-                            "this would invalidate CUDA-graph weight pointers."
-                        )
-                    runtime_main_grad = getattr(runtime_parameter, "main_grad", None)
-                    if (
-                        runtime_main_grad is None
-                        or runtime_main_grad.data_ptr() != expected_grad.data_ptr()
-                    ):
-                        if projection.gtp_leader is None:
-                            raise RuntimeError(
-                                "Replica CuTeDSL runtime main-grad storage changed after "
-                                "binding; this would invalidate CUDA-graph gradient pointers."
-                            )
-                        runtime_parameter.main_grad = expected_grad
-                    runtime_parameter.grad_added_to_main_grad = True
-                    runtime_parameter.overwrite_main_grad = projection.gtp_leader is not None
+            projection.prepare_runtime_parameters(self.workspace.grad_dtype)
 
     def _validate_plan(self, plan: ReplicaPlan) -> None:
         """Validate fixed device metadata without extracting any CUDA values."""
@@ -1420,13 +1267,15 @@ class ReplicaCuTeDSLWeightBridge:
                 f"{expected_shape} on {self.device}."
             )
 
-    def prepare_source_weights(self, *, retain_for_grad: bool = False) -> None:
+    def prepare_source_weights(
+        self, direction: _WeightDirection = _WeightDirection.FORWARD
+    ) -> None:
         """Materialize GTP weights and bind the replica runtime buffers."""
         experts = self._experts_ref()
         if experts is None:
             raise RuntimeError("Replica CuTeDSL experts were destroyed before prefetch.")
         experts.prepare_fused_impl_parameters()
-        self._materialize_gtp_source_weights(retain_for_grad=retain_for_grad)
+        self._materialize_gtp_source_weights(direction)
         self.prepare_runtime_parameters()
 
     def prepare_forward(self) -> None:
@@ -1434,17 +1283,49 @@ class ReplicaCuTeDSLWeightBridge:
         if self.last_plan is None:
             raise RuntimeError("Replica CuTeDSL weights require a plan before expert compute.")
 
+    def _prefetch_resources(self, direction: _WeightDirection) -> _PrefetchResources:
+        backward = direction is _WeightDirection.BACKWARD
+        orientation = (
+            ("columnwise" if backward else "rowwise")
+            if self.weight_format == "mxfp8"
+            else (
+                "full_backward"
+                if backward
+                and any(projection.gtp_leader is not None for projection in self.projections)
+                else "full_forward"
+            )
+        )
+        bindings = tuple(projection.binding(direction) for projection in self.projections)
+        return _PrefetchResources(
+            sources=tuple(binding.data_bases for binding in bindings),
+            scale_sources=(
+                tuple(binding.scale_bases for binding in bindings)
+                if self.weight_format == "mxfp8"
+                else None
+            ),
+            arena=self.workspace.weight_arena,
+            handle=self.workspace.weight_handle,
+            grid_barrier=(
+                self.workspace.columnwise_grid_barrier
+                if orientation == "columnwise"
+                else self.workspace.weight_grid_barrier
+            ),
+            orientation=orientation,
+        )
+
     @torch.no_grad()
     @nvtx_decorator(message="replica_cutedsl_weight_owner_push_start")
-    def start_prefetch(self, plan: ReplicaPlan, *, retain_for_grad: bool = False) -> None:
+    def start_prefetch(
+        self, plan: ReplicaPlan, direction: _WeightDirection = _WeightDirection.FORWARD
+    ) -> None:
         """Enqueue owner-push FC1/FC2 prefetch without blocking the caller."""
-        if self._prefetch_pending:
+        if self._prefetch_plan is not None:
             raise RuntimeError("Replica CuTeDSL prefetch is already outstanding.")
         self._validate_plan(plan)
         # A GTP parameter stores only its local shard. Materialization consumes
         # any one-weight-ahead gather (or performs the cold synchronous gather)
         # and stages the full native experts before CuTeDSL exchanges replicas.
-        self.prepare_source_weights(retain_for_grad=retain_for_grad)
+        self.prepare_source_weights(direction)
         # The CuTeDSL kernel has a device-side cross-rank rendezvous.  Keep an
         # opt-in host rendezvous available for debugging launch skew and stale
         # symmetric-memory signal state; it must remain opt-in because a host
@@ -1456,117 +1337,47 @@ class ReplicaCuTeDSLWeightBridge:
         self.prefetch_ready.record(current_stream)
         weight_stream.wait_event(self.prefetch_ready)
         with torch.cuda.stream(weight_stream):
-            orientation = (
-                "columnwise"
-                if self.weight_format == "mxfp8" and retain_for_grad
-                else (
-                    "rowwise"
-                    if self.weight_format == "mxfp8"
-                    else (
-                        "full_backward"
-                        if retain_for_grad
-                        and any(
-                            projection.gtp_leader is not None for projection in self.projections
-                        )
-                        else "full_forward"
-                    )
-                )
-            )
+            resources = self._prefetch_resources(direction)
             resident = (
-                retain_for_grad
+                direction is _WeightDirection.BACKWARD
                 and self.workspace.resident_bridge is self
                 and self.workspace.resident_plan is plan
-                and self.workspace.resident_orientation == orientation
+                and self.workspace.resident_orientation == resources.orientation
             )
             if not resident:
-                if self.weight_format == "bf16":
-                    sources = tuple(
-                        (
-                            (
-                                projection.gtp_backward_source_bases
-                                if retain_for_grad
-                                else projection.gtp_forward_source_bases
-                            )
-                            if projection.gtp_leader is not None
-                            else projection.source_bases
-                        )
-                        for projection in self.projections
-                    )
-                    if any(source is None for source in sources):
-                        raise RuntimeError(
-                            "Replica CuTeDSL GTP BF16 source pointers were not bound before "
-                            "owner-push."
-                        )
-                    scale_sources = None
-                    arena = self.workspace.weight_arena
-                    handle = self.workspace.weight_handle
-                    grid_barrier = self.workspace.weight_grid_barrier
-                else:
-                    rowwise = orientation == "rowwise"
-                    sources = tuple(
-                        (
-                            projection.rowwise_data_bases
-                            if rowwise
-                            else projection.columnwise_data_bases
-                        )
-                        for projection in self.projections
-                    )
-                    scale_sources = tuple(
-                        (
-                            projection.rowwise_scale_bases
-                            if rowwise
-                            else projection.columnwise_scale_bases
-                        )
-                        for projection in self.projections
-                    )
-                    arena = (
-                        self.workspace.rowwise_arena if rowwise else self.workspace.columnwise_arena
-                    )
-                    handle = (
-                        self.workspace.rowwise_handle
-                        if rowwise
-                        else self.workspace.columnwise_handle
-                    )
-                    grid_barrier = (
-                        self.workspace.weight_grid_barrier
-                        if rowwise
-                        else self.workspace.columnwise_grid_barrier
-                    )
+                has_scales = resources.scale_sources is not None
                 launch_replica_weight_prefetch(
-                    sources=sources,
-                    scale_sources=scale_sources,
-                    arena=arena,
-                    peer_bases=handle.buffer_ptrs_dev,
-                    signal_bases=handle.signal_pad_ptrs_dev,
+                    sources=resources.sources,
+                    scale_sources=resources.scale_sources,
+                    arena=resources.arena,
+                    peer_bases=resources.handle.buffer_ptrs_dev,
+                    signal_bases=resources.handle.signal_pad_ptrs_dev,
                     experts_to_copy=plan.experts_to_copy,
-                    grid_barrier=grid_barrier,
+                    grid_barrier=resources.grid_barrier,
                     rank=self.rank,
                     world_size=self.world_size,
                     num_local_experts=self.num_local_experts,
                     member_numels=self.workspace.member_numels,
                     rowwise_scale_numels=(
-                        self.workspace.rowwise_scale_numels if scale_sources is not None else None
+                        self.workspace.rowwise_scale_numels if has_scales else None
                     ),
                     columnwise_scale_numels=(
-                        self.workspace.columnwise_scale_numels
-                        if scale_sources is not None
-                        else None
+                        self.workspace.columnwise_scale_numels if has_scales else None
                     ),
-                    orientation=orientation if scale_sources is not None else None,
+                    orientation=resources.orientation if has_scales else None,
                     num_sms=self.workspace.num_sms,
                 )
                 self.workspace.resident_bridge = self
                 self.workspace.resident_plan = plan
-                self.workspace.resident_orientation = orientation
+                self.workspace.resident_orientation = resources.orientation
             self.prefetch_done.record(weight_stream)
-        self._prefetch_pending = True
         self._prefetch_plan = plan
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_cutedsl_weight_owner_push_wait")
     def wait_prefetch(self, plan: ReplicaPlan) -> None:
         """Insert the sole forward/restore consumer-stream dependency."""
-        if not self._prefetch_pending:
+        if self._prefetch_plan is None:
             # The TE fused expert path can expose the same consumer boundary
             # through both its op-level and module-level hooks. Once this exact
             # plan is resident, a repeated wait is a no-op; starting a new
@@ -1580,19 +1391,13 @@ class ReplicaCuTeDSLWeightBridge:
         elif self._prefetch_plan is not plan:
             raise RuntimeError("Replica CuTeDSL prefetch plan changed while outstanding.")
         torch.cuda.current_stream(self.device).wait_event(self.prefetch_done)
-        self._prefetch_pending = False
         self._prefetch_plan = None
-
-    def prefetch(self, plan: ReplicaPlan) -> None:
-        """Compatibility helper that preserves stream-asynchronous waiting."""
-        self.start_prefetch(plan)
-        self.wait_prefetch(plan)
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_cutedsl_grad_reduce_start")
     def start_grad_reduce(self, plan: ReplicaPlan) -> None:
         """Enqueue direct peer reduction after expert wgrad production."""
-        if self._grad_reduce_pending:
+        if self._grad_reduce_plan is not None:
             raise RuntimeError("Replica CuTeDSL gradient reduction is already outstanding.")
         self._validate_plan(plan)
         self.prepare_runtime_parameters()
@@ -1617,29 +1422,23 @@ class ReplicaCuTeDSLWeightBridge:
         for projection in self.projections:
             for parameter in projection.parameters:
                 parameter.grad_added_to_main_grad = True
-        self._grad_reduce_pending = True
         self._grad_reduce_plan = plan
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_cutedsl_grad_reduce_wait")
     def wait_grad_reduce(self, plan: ReplicaPlan) -> None:
         """Finish replica reduction and notify DDP without materializing leaf grads."""
-        if not self._grad_reduce_pending:
+        if self._grad_reduce_plan is None:
             self.start_grad_reduce(plan)
         elif self._grad_reduce_plan is not plan:
             raise RuntimeError("Replica CuTeDSL grad-reduction plan changed while outstanding.")
         torch.cuda.current_stream(self.device).wait_event(self.grad_reduce_done)
-        self._grad_reduce_pending = False
         self._grad_reduce_plan = None
 
         # Expert backward computes FC2 before FC1. Preserve that reverse order
         # when handing full wgrads to GTP so its linked RS cascade remains valid.
         for projection in reversed(self.projections):
-            if projection.gtp_leader is None:
-                continue
-            projection.gtp_leader.finalize_group_grads(
-                list(self._stable_gtp_main_grads(projection))
-            )
+            projection.finalize_gtp_grads()
 
         # GTP finalization invokes its retained DDP hooks itself. Ordinary
         # replica parameters need the equivalent notification here because
@@ -1656,11 +1455,6 @@ class ReplicaCuTeDSLWeightBridge:
                 if hook is not None:
                     hook()
 
-    def reduce_grads(self, plan: ReplicaPlan) -> None:
-        """Compatibility helper that preserves stream-asynchronous waiting."""
-        self.start_grad_reduce(plan)
-        self.wait_grad_reduce(plan)
-
     def destroy(self) -> None:
         """Detach layer-owned TE parameters from the shared symmetric arenas."""
         if self._destroyed:
@@ -1670,10 +1464,7 @@ class ReplicaCuTeDSLWeightBridge:
             experts._fused_ops = None
             experts._replica_weight_bridge = None
         for projection in self.projections:
-            if projection.runtime_parameters is not None:
-                for runtime_parameter in projection.runtime_parameters:
-                    runtime_parameter.main_grad = None
-                projection.runtime_parameters = None
+            projection.destroy()
         self.projections.clear()
         if self.workspace.resident_bridge is self:
             self.workspace.resident_bridge = None
@@ -1683,12 +1474,6 @@ class ReplicaCuTeDSLWeightBridge:
         self.workspace = None
         self._destroyed = True
         _replica_cutedsl_bridges.discard(self)
-
-
-# Keep existing dispatcher-facing names as compatibility aliases. Weight
-# movement is intentionally independent of the activation dispatcher.
-NCCLEPReplicaWeightBridge = ReplicaCuTeDSLWeightBridge
-HybridEPReplicaWeightBridge = ReplicaCuTeDSLWeightBridge
 
 
 def finalize_replica_weight_bridges() -> None:
@@ -1704,49 +1489,34 @@ def finalize_replica_weight_bridges() -> None:
     gc.collect()
 
 
-class _ReplicaStartWeightPrefetch(torch.autograd.Function):
-    """Launch backward weight prefetch before activation-combine backward."""
+class _ReplicaBackwardAction(Enum):
+    START_WEIGHT_PREFETCH = auto()
+    WAIT_WEIGHT_PREFETCH = auto()
+    START_GRAD_REDUCE = auto()
+
+    def run(self, bridge: ReplicaCuTeDSLWeightBridge, plan: ReplicaPlan) -> None:
+        if self is _ReplicaBackwardAction.START_WEIGHT_PREFETCH:
+            bridge.start_prefetch(plan, _WeightDirection.BACKWARD)
+        elif self is _ReplicaBackwardAction.WAIT_WEIGHT_PREFETCH:
+            bridge.wait_prefetch(plan)
+        else:
+            bridge.start_grad_reduce(plan)
+
+
+class _ReplicaBackwardIdentity(torch.autograd.Function):
+    """Run one communication boundary while passing its tensor gradient through."""
 
     @staticmethod
-    def forward(ctx, combined_hidden, bridge, plan):
+    def forward(ctx, tensor, bridge, plan, action):
         ctx.bridge = bridge
         ctx.plan = plan
-        return combined_hidden
+        ctx.action = action
+        return tensor
 
     @staticmethod
-    def backward(ctx, grad_combined_hidden):
-        ctx.bridge.start_prefetch(ctx.plan, retain_for_grad=True)
-        return grad_combined_hidden, None, None
-
-
-class _ReplicaWaitWeightPrefetch(torch.autograd.Function):
-    """Wait for backward weight prefetch immediately before expert backward."""
-
-    @staticmethod
-    def forward(ctx, expert_output, bridge, plan):
-        ctx.bridge = bridge
-        ctx.plan = plan
-        return expert_output
-
-    @staticmethod
-    def backward(ctx, grad_expert_output):
-        ctx.bridge.wait_prefetch(ctx.plan)
-        return grad_expert_output, None, None
-
-
-class _ReplicaStartGradReduce(torch.autograd.Function):
-    """Launch replica-gradient reduction immediately after expert backward."""
-
-    @staticmethod
-    def forward(ctx, dispatched_hidden, bridge, plan):
-        ctx.bridge = bridge
-        ctx.plan = plan
-        return dispatched_hidden
-
-    @staticmethod
-    def backward(ctx, grad_dispatched_hidden):
-        ctx.bridge.start_grad_reduce(ctx.plan)
-        return grad_dispatched_hidden, None, None
+    def backward(ctx, grad):
+        ctx.action.run(ctx.bridge, ctx.plan)
+        return grad, None, None, None
 
 
 class _ReplicaWaitGradReduce(torch.autograd.Function):
@@ -1767,36 +1537,36 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
 
 
 def start_replica_weight_prefetch_before_combine_backward(
-    combined_hidden: torch.Tensor,
-    bridge: NCCLEPReplicaWeightBridge | HybridEPReplicaWeightBridge,
-    plan: ReplicaPlan,
+    combined_hidden: torch.Tensor, bridge: ReplicaCuTeDSLWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
     """Start weight communication before transport-combine backward."""
-    return _ReplicaStartWeightPrefetch.apply(combined_hidden, bridge, plan)
+    return _ReplicaBackwardIdentity.apply(
+        combined_hidden, bridge, plan, _ReplicaBackwardAction.START_WEIGHT_PREFETCH
+    )
 
 
 def wait_replica_weight_prefetch_before_expert_backward(
-    expert_output: torch.Tensor,
-    bridge: NCCLEPReplicaWeightBridge | HybridEPReplicaWeightBridge,
-    plan: ReplicaPlan,
+    expert_output: torch.Tensor, bridge: ReplicaCuTeDSLWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
     """Wait for weight communication immediately before expert backward."""
-    return _ReplicaWaitWeightPrefetch.apply(expert_output, bridge, plan)
+    return _ReplicaBackwardIdentity.apply(
+        expert_output, bridge, plan, _ReplicaBackwardAction.WAIT_WEIGHT_PREFETCH
+    )
 
 
 def start_replica_grad_reduce_after_expert_backward(
     dispatched_hidden: torch.Tensor,
-    bridge: NCCLEPReplicaWeightBridge | HybridEPReplicaWeightBridge,
+    bridge: ReplicaCuTeDSLWeightBridge,
     plan: ReplicaPlan,
 ) -> torch.Tensor:
     """Start replica-gradient communication after expert backward."""
-    return _ReplicaStartGradReduce.apply(dispatched_hidden, bridge, plan)
+    return _ReplicaBackwardIdentity.apply(
+        dispatched_hidden, bridge, plan, _ReplicaBackwardAction.START_GRAD_REDUCE
+    )
 
 
 def wait_replica_grad_reduce_after_dispatch_backward(
-    hidden_states: torch.Tensor,
-    bridge: NCCLEPReplicaWeightBridge | HybridEPReplicaWeightBridge,
-    plan: ReplicaPlan,
+    hidden_states: torch.Tensor, bridge: ReplicaCuTeDSLWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
     """Wait for replica gradients before registered-parameter DDP hooks."""
     return _ReplicaWaitGradReduce.apply(hidden_states, *bridge.source_parameters, bridge, plan)
@@ -1818,18 +1588,6 @@ def _initialize_allocation_kernel(
     the destination will execute for that semantic expert. Initially the
     native owner executes all routes; later kernels migrate portions of
     overloaded experts elsewhere.
-
-    Args:
-        gathered_tokens_per_expert: Pointer to int32 ``[EP_SIZE, NUM_EXPERTS]``
-            route counts, indexed by source rank and semantic expert.
-        global_tokens_per_expert: Output pointer to int32 ``[NUM_EXPERTS]``
-            global route counts.
-        expert_rank_allocations: Output pointer to int32
-            ``[NUM_EXPERTS, EP_SIZE]`` route allocations.
-        EP_SIZE: Number of expert-parallel ranks.
-        NUM_EXPERTS: Number of semantic experts.
-        NUM_EXPERTS_PER_GPU: Native experts per rank, ``NUM_EXPERTS / EP_SIZE``.
-        BLOCK_EP_SIZE: Power-of-two Triton block width covering ``EP_SIZE``.
     """
     expert = tl.program_id(0)
     ranks = tl.arange(0, BLOCK_EP_SIZE)
@@ -1856,17 +1614,6 @@ def _compute_group_balance_kernel(
     A positive balance means an owner's native experts have more than the
     per-rank route capacity and must shed work. A negative balance is free
     capacity that can host replicas for an overloaded owner.
-
-    Args:
-        global_tokens_per_expert: Pointer to int32 ``[num_experts]`` global
-            route counts.
-        rank_load_balance: Output pointer to int32 ``[ep_size]`` signed
-            load-minus-capacity values for each rank's native expert group.
-        RANK_ROUTE_CAPACITY: Per-rank route capacity
-            ``num_tokens * router_topk``.
-        NUM_EXPERTS_PER_GPU: Number of native experts owned by each rank.
-        BLOCK_NUM_EXPERTS_PER_GPU: Power-of-two Triton block width covering
-            ``NUM_EXPERTS_PER_GPU``.
     """
     owner = tl.program_id(0)
     local_experts = tl.arange(0, BLOCK_NUM_EXPERTS_PER_GPU)
@@ -1888,15 +1635,6 @@ def _choose_receiver_quotas_kernel(
     lowest rank, making the quota matrix identical on every EP rank.
     ``quotas[owner, receiver]`` records how many routes the receiver should
     take from that owner's experts; it does not choose the experts yet.
-
-    Args:
-        rank_load_balance: Pointer to int32 ``[EP_SIZE]`` signed group
-            balances. Values are loaded into registers and not modified in
-            global memory.
-        receiver_quotas: Output pointer to int32 ``[EP_SIZE, EP_SIZE]``. The
-            kernel clears it before writing owner-to-destination quotas.
-        EP_SIZE: Number of EP ranks and maximum number of greedy pairings.
-        BLOCK_EP_SIZE: Power-of-two Triton block width covering ``EP_SIZE``.
     """
     ranks = tl.arange(0, BLOCK_EP_SIZE)
     valid = ranks < EP_SIZE
@@ -1941,23 +1679,8 @@ def _allocate_migrations_kernel(
 
     For one owner, repeatedly pair its largest outstanding receiver quota with
     its largest remaining expert segment. Expert ties choose the lowest local
-    expert id, matching the reference placement policy. A semantic expert may therefore be split
-    between its owner and one or more replica destinations.
-
-    Args:
-        global_tokens_per_expert: Pointer to int32 ``[num_experts]`` global
-            route counts, laid out as ``EP_SIZE`` contiguous native groups of
-            ``NUM_EXPERTS_PER_GPU`` experts.
-        receiver_quotas: Pointer to int32 ``[EP_SIZE, EP_SIZE]``
-            owner-to-destination quotas from ``_choose_receiver_quotas_kernel``.
-        expert_rank_allocations: In/out pointer to int32
-            ``[num_experts, EP_SIZE]`` allocations. Each move subtracts routes
-            from the owner and adds them to a remote destination.
-        EP_SIZE: Number of expert-parallel ranks.
-        NUM_EXPERTS_PER_GPU: Number of native experts owned by each rank.
-        BLOCK_EP_SIZE: Power-of-two block width covering ``EP_SIZE``.
-        BLOCK_NUM_EXPERTS_PER_GPU: Power-of-two block width covering the local
-            experts owned by one rank.
+    expert id, matching the reference placement policy. A semantic expert may
+    therefore be split between its owner and one or more replica destinations.
     """
     owner = tl.program_id(0)
     ranks = tl.arange(0, BLOCK_EP_SIZE)
@@ -2010,7 +1733,6 @@ def _select_replica_experts_kernel(
     NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_PER_GPU: tl.constexpr,
     BLOCK_NUM_EXPERTS: tl.constexpr,
-    WRITE_REPLICA_LOOKUP: tl.constexpr,
 ):
     """Select destination replica slots by count descending, expert id descending.
 
@@ -2018,22 +1740,6 @@ def _select_replica_experts_kernel(
     ordering is observable because it defines replica-slot ids, so the expert
     id tie-break deliberately runs in descending order for deterministic parity.
     Unused slots are filled with ``-1``.
-
-    Args:
-        expert_rank_allocations: Pointer to int32
-            ``[NUM_EXPERTS, EP_SIZE]`` final route allocations.
-        experts_to_copy: Output pointer to int32
-            ``[EP_SIZE, NUM_EXPERTS_PER_GPU]`` semantic expert ids, indexed by
-            destination rank and replica slot.
-        expert_replica_slots: Optional output pointer to int32
-            ``[NUM_EXPERTS, EP_SIZE]`` inverse slot assignments.
-        EP_SIZE: Number of expert-parallel ranks.
-        NUM_EXPERTS: Number of semantic experts.
-        NUM_EXPERTS_PER_GPU: Replica slots per rank, equal to its native expert
-            count.
-        BLOCK_NUM_EXPERTS: Power-of-two block width covering ``NUM_EXPERTS``.
-        WRITE_REPLICA_LOOKUP: Whether to write ``expert_replica_slots`` while
-            selecting destination slots.
     """
     destination = tl.program_id(0)
     experts = tl.arange(0, BLOCK_NUM_EXPERTS)
@@ -2048,10 +1754,11 @@ def _select_replica_experts_kernel(
         expert = tl.max(tl.where(valid & (counts == maximum), experts, -1), axis=0)
         selected = tl.where(maximum > 0, expert, -1).to(tl.int32)
         tl.store(experts_to_copy + destination * NUM_EXPERTS_PER_GPU + slot, selected)
-        if WRITE_REPLICA_LOOKUP:
-            tl.store(
-                expert_replica_slots + selected * EP_SIZE + destination, slot, mask=selected >= 0
-            )
+        tl.store(
+            expert_replica_slots + selected * EP_SIZE + destination,
+            slot,
+            mask=selected >= 0,
+        )
         counts = tl.where(experts == expert, -1, counts)
 
 
@@ -2258,7 +1965,6 @@ def _map_virtual_experts_kernel(
     local_tokens_per_expert_cumsum,
     gathered_tokens_per_expert,
     expert_rank_allocations,
-    experts_to_copy,
     expert_replica_slots,
     virtual_experts,
     SOURCE_EP_RANK: tl.constexpr,
@@ -2267,7 +1973,6 @@ def _map_virtual_experts_kernel(
     NUM_EXPERTS_PER_GPU: tl.constexpr,
     NUM_ROUTES: tl.constexpr,
     BLOCK_NUM_ROUTES: tl.constexpr,
-    USE_REPLICA_LOOKUP: tl.constexpr,
 ):
     """Map globally ordered expert routes to rank-major native or replica ids.
 
@@ -2277,34 +1982,6 @@ def _map_virtual_experts_kernel(
     stream into destination segments in rank order. This kernel computes each
     local route's global ordinal, finds its segment, and converts the
     destination to the transport's native-or-replica virtual id.
-
-    Args:
-        flat_topk_indices: Pointer to flattened int32/int64 ``[NUM_ROUTES]``
-            semantic expert ids in original local route order.
-        sorted_route_indices: Pointer to int64 ``[NUM_ROUTES]`` original route
-            positions sorted by ``(semantic expert, original position)``.
-        local_tokens_per_expert_cumsum: Pointer to int32 ``[NUM_EXPERTS]``
-            inclusive prefix sums of this source rank's expert histogram.
-        gathered_tokens_per_expert: Pointer to int32
-            ``[EP_SIZE, NUM_EXPERTS]`` per-source expert histograms.
-        expert_rank_allocations: Pointer to int32
-            ``[NUM_EXPERTS, EP_SIZE]`` final route allocations; each expert row
-            partitions its global ordinal stream by destination.
-        experts_to_copy: Pointer to int32
-            ``[EP_SIZE, NUM_EXPERTS_PER_GPU]`` replica-slot assignments.
-        expert_replica_slots: Pointer to int32 ``[NUM_EXPERTS, EP_SIZE]``
-            inverse replica-slot assignments emitted by fused placement.
-        virtual_experts: Output pointer to int64 ``[NUM_ROUTES]`` rank-major
-            runtime ids; the workspace exposes it as
-            ``[num_tokens, router_topk]``.
-        SOURCE_EP_RANK: Rank whose local routes this kernel is mapping.
-        EP_SIZE: Number of expert-parallel ranks.
-        NUM_EXPERTS: Number of semantic experts.
-        NUM_EXPERTS_PER_GPU: Native experts and replica slots per rank.
-        NUM_ROUTES: Number of local routes, ``num_tokens * router_topk``.
-        BLOCK_NUM_ROUTES: Sorted routes processed by one Triton program.
-        USE_REPLICA_LOOKUP: Use the fused inverse map instead of scanning every
-            replica slot for each route.
     """
     positions = tl.program_id(0) * BLOCK_NUM_ROUTES + tl.arange(0, BLOCK_NUM_ROUTES)
     valid = positions < NUM_ROUTES
@@ -2348,20 +2025,14 @@ def _map_virtual_experts_kernel(
     # slot holding that expert's copied weights on the selected destination.
     owner = experts // NUM_EXPERTS_PER_GPU
     owned_local = experts % NUM_EXPERTS_PER_GPU
-    if USE_REPLICA_LOOKUP:
-        replica_slot = tl.load(
-            expert_replica_slots + experts * EP_SIZE + destination,
-            mask=valid & (destination != owner),
-            other=-1,
-        ).to(tl.int64)
-    else:
-        replica_slot = tl.full((BLOCK_NUM_ROUTES,), -1, dtype=tl.int64)
-        for slot in tl.static_range(0, NUM_EXPERTS_PER_GPU):
-            copied = tl.load(
-                experts_to_copy + destination * NUM_EXPERTS_PER_GPU + slot, mask=valid, other=-1
-            ).to(tl.int64)
-            replica_slot = tl.where((replica_slot < 0) & (copied == experts), slot, replica_slot)
-    runtime_local = tl.where(destination == owner, owned_local, NUM_EXPERTS_PER_GPU + replica_slot)
+    replica_slot = tl.load(
+        expert_replica_slots + experts * EP_SIZE + destination,
+        mask=valid & (destination != owner),
+        other=-1,
+    ).to(tl.int64)
+    runtime_local = tl.where(
+        destination == owner, owned_local, NUM_EXPERTS_PER_GPU + replica_slot
+    )
     virtual = destination.to(tl.int64) * (2 * NUM_EXPERTS_PER_GPU) + runtime_local
     tl.store(virtual_experts + routes, virtual, mask=valid)
 
@@ -2440,22 +2111,13 @@ def _validate_inputs(
 
 def _launch_replica_placement(
     workspace: ReplicaPlannerWorkspace,
-    local_tokens_per_expert: torch.Tensor,
     *,
-    source_rank: int | None = None,
     rank_route_capacity: int,
     ep_size: int,
     num_experts: int,
     num_local_experts: int,
-    use_fused_placement: bool = True,
-    write_replica_lookup: bool = False,
-    write_local_cumsum: bool = True,
 ) -> None:
-    """Launch the uniform multi-program replica placement path.
-
-    ``source_rank`` and ``use_fused_placement`` remain accepted for compatibility
-    with the standalone benchmark; neither selects a placement kernel.
-    """
+    """Launch deterministic multi-program replica placement."""
     block_ep_size = triton.next_power_of_2(ep_size)
     block_num_experts_per_gpu = triton.next_power_of_2(num_local_experts)
 
@@ -2496,10 +2158,7 @@ def _launch_replica_placement(
         NUM_EXPERTS=num_experts,
         NUM_EXPERTS_PER_GPU=num_local_experts,
         BLOCK_NUM_EXPERTS=block_num_experts,
-        WRITE_REPLICA_LOOKUP=write_replica_lookup,
     )
-    if write_local_cumsum:
-        torch.cumsum(local_tokens_per_expert, dim=0, out=workspace.local_count_cumsum)
 
 
 def _launch_replica_route_mapping(
@@ -2511,22 +2170,15 @@ def _launch_replica_route_mapping(
     num_experts: int,
     num_local_experts: int,
     num_routes: int,
-    use_fused_replica_lookup: bool,
-    launch_sort: bool = True,
 ) -> None:
-    """Launch stable route ordering and native-or-replica id mapping."""
+    """Map the stable route order to native-or-replica ids."""
     block_num_routes = 256
-    if launch_sort:
-        _launch_stable_route_bucket_sort(
-            workspace, flat_topk_indices, num_experts=num_experts, num_routes=num_routes
-        )
     _map_virtual_experts_kernel[(triton.cdiv(num_routes, block_num_routes),)](
         flat_topk_indices,
         workspace.sorted_route_indices,
         workspace.local_count_cumsum,
         workspace.gathered_counts,
         workspace.allocation,
-        workspace.experts_to_copy,
         workspace.expert_replica_slots,
         workspace.virtual_experts,
         SOURCE_EP_RANK=source_rank,
@@ -2535,7 +2187,6 @@ def _launch_replica_route_mapping(
         NUM_EXPERTS_PER_GPU=num_local_experts,
         NUM_ROUTES=num_routes,
         BLOCK_NUM_ROUTES=block_num_routes,
-        USE_REPLICA_LOOKUP=use_fused_replica_lookup,
     )
 
 
@@ -2545,9 +2196,6 @@ def plan_replica_routes(
     ep_group: dist.ProcessGroup,
     workspace: ReplicaPlannerWorkspace,
     *,
-    use_fused_placement: bool = True,
-    use_fused_replica_lookup: bool | None = None,
-    overlap_route_sort: bool = True,
     on_placement_ready: Callable[[ReplicaPlan], None] | None = None,
 ) -> ReplicaPlan:
     """Plan deterministic replica placements for HybridEP or NCCL-EP.
@@ -2569,17 +2217,6 @@ def plan_replica_routes(
         workspace: Fixed-address workspace allocated for the same
             ``(num_tokens, router_topk, num_experts, ep_size)`` shape. Its
             output buffers are overwritten.
-        use_fused_placement: Compatibility switch for the optimized inverse
-            replica lookup. Set this to ``False`` to run the preserved
-            reference lookup path; placement always uses the scalable
-            multi-program phase sequence.
-        use_fused_replica_lookup: Have placement emit the inverse
-            ``(expert, destination) -> replica slot`` map consumed by Phase 5.
-            ``None`` follows ``use_fused_placement``.
-        overlap_route_sort: Run stable local route ordering concurrently with
-            placement on the workspace's fixed side stream. It is enabled only
-            for EP sizes greater than four, where it overlaps the scalable
-            placement phases without changing the EP=4 synchronization path.
         on_placement_ready: Optional callback invoked after
             ``experts_to_copy`` is ready. Phase 5 has already been enqueued as
             an independent sibling branch at this point; the replica runtime
@@ -2598,11 +2235,6 @@ def plan_replica_routes(
     num_local_experts = num_experts // ep_size
     num_routes = num_tokens * router_topk
     source_rank = dist.get_rank(group=ep_group)
-    overlap_route_sort = overlap_route_sort and ep_size > 4
-    if use_fused_replica_lookup is None:
-        use_fused_replica_lookup = use_fused_placement
-    if use_fused_replica_lookup and not use_fused_placement:
-        raise ValueError("Fused replica lookup requires fused placement.")
 
     # A mismatch in tokens/top-k/experts would give ranks different kernel
     # shapes and can hang the following collective. Validate it once outside
@@ -2628,26 +2260,25 @@ def plan_replica_routes(
     # prefix, while placement depends on the gathered histograms. Fork the
     # stable bucket sort onto its fixed workspace stream after producing that
     # small prefix, then join it before the route mapper consumes both results.
-    if overlap_route_sort:
-        torch.cumsum(tokens_per_expert, dim=0, out=workspace.local_count_cumsum)
-        current_stream = torch.cuda.current_stream(topk_indices.device)
-        workspace.sort_stream.wait_stream(current_stream)
-        with torch.cuda.stream(workspace.sort_stream):
-            _launch_stable_route_bucket_sort(
-                workspace, topk_indices.reshape(-1), num_experts=num_experts, num_routes=num_routes
-            )
+    torch.cumsum(tokens_per_expert, dim=0, out=workspace.local_count_cumsum)
+    current_stream = torch.cuda.current_stream(topk_indices.device)
+    workspace.sort_stream.wait_stream(current_stream)
+    with torch.cuda.stream(workspace.sort_stream):
+        _launch_stable_route_bucket_sort(
+            workspace,
+            topk_indices.reshape(-1),
+            num_experts=num_experts,
+            num_routes=num_routes,
+        )
 
     # Phases 2-4: construct allocation[expert, destination], then turn its
     # remote nonzero entries into a deterministic replica-weight list per rank.
     _launch_replica_placement(
         workspace,
-        tokens_per_expert,
         rank_route_capacity=num_routes,
         ep_size=ep_size,
         num_experts=num_experts,
         num_local_experts=num_local_experts,
-        write_replica_lookup=use_fused_replica_lookup,
-        write_local_cumsum=not overlap_route_sort,
     )
 
     plan = ReplicaPlan(
@@ -2661,26 +2292,8 @@ def plan_replica_routes(
     # as a sibling branch. Enqueuing Phase 5 after the prefetch callback makes
     # CUDA-graph capture incorrectly put weight completion on the mapping
     # critical path.
-    if overlap_route_sort:
-        workspace.sort_stream.wait_stream(current_stream)
-        with torch.cuda.stream(workspace.sort_stream):
-            _launch_replica_route_mapping(
-                workspace,
-                topk_indices.reshape(-1),
-                source_rank=source_rank,
-                ep_size=ep_size,
-                num_experts=num_experts,
-                num_local_experts=num_local_experts,
-                num_routes=num_routes,
-                use_fused_replica_lookup=use_fused_replica_lookup,
-                launch_sort=False,
-            )
-        if on_placement_ready is not None:
-            on_placement_ready(plan)
-        current_stream.wait_stream(workspace.sort_stream)
-    else:
-        if on_placement_ready is not None:
-            on_placement_ready(plan)
+    workspace.sort_stream.wait_stream(current_stream)
+    with torch.cuda.stream(workspace.sort_stream):
         _launch_replica_route_mapping(
             workspace,
             topk_indices.reshape(-1),
@@ -2689,9 +2302,10 @@ def plan_replica_routes(
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             num_routes=num_routes,
-            use_fused_replica_lookup=use_fused_replica_lookup,
-            launch_sort=True,
         )
+    if on_placement_ready is not None:
+        on_placement_ready(plan)
+    current_stream.wait_stream(workspace.sort_stream)
     return plan
 
 
