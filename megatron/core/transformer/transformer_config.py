@@ -2323,6 +2323,17 @@ class TransformerConfig(ModelParallelConfig):
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
 
+        if (
+            self.dsa_mtp_index_kv_share
+            and self.recompute_granularity == "selective"
+            and "core_attn" in self.recompute_modules
+        ):
+            raise ValueError(
+                "dsa_mtp_index_kv_share does not yet support selective recompute with "
+                "'core_attn' in recompute_modules. Use selective 'mla_up_proj' recompute, "
+                "full activation recompute, or disable MTP DSA sharing."
+            )
+
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
                 allowed_modules = {

@@ -23,7 +23,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.enums import AttnBackend, CudaGraphModule
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType, CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
 from megatron.core.transformer.multi_token_prediction import (
     MTPDSAIterationContext,
@@ -130,6 +130,59 @@ def test_iteration_sharing_accepts_selective_mla_up_projection_recompute():
     config = _make_config(recompute_granularity="selective", recompute_modules=["mla_up_proj"])
 
     assert config.recompute_modules == ["mla_up_proj"]
+
+
+@pytest.mark.parametrize(
+    ("is_mtp_layer", "fused_enabled", "expected_log_count"),
+    [(True, True, 1), (True, False, 0), (False, True, 0)],
+    ids=["sharing-fused", "sharing-unfused", "non-mtp-fused"],
+)
+def test_iteration_sharing_logs_when_combined_fused_dsa_is_disabled(
+    monkeypatch, is_mtp_layer, fused_enabled, expected_log_count
+):
+    logged_messages = []
+    monkeypatch.setattr(dsa_module, "_warned_mtp_sharing_fused_bypass", False)
+    monkeypatch.setattr(
+        dsa_module.dsa_kernels, "use_fused_dsa_kernels", lambda _config: fused_enabled
+    )
+    monkeypatch.setattr(
+        dsa_module,
+        "log_single_rank",
+        lambda _logger, _level, message: logged_messages.append(message),
+    )
+    monkeypatch.setattr(dsa_module, "build_module", lambda *_args, **_kwargs: nn.Identity())
+    config = _make_config()
+    submodules = dsa_module.DSAttentionSubmodules(indexer=None)
+    pg_collection = SimpleNamespace()
+
+    for _ in range(2):
+        dsa_module.DSAttention(
+            config=config,
+            submodules=submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+        )
+
+    fallback_messages = [
+        message
+        for message in logged_messages
+        if "combined fused DSA kernel does not expose" in message
+    ]
+    assert len(fallback_messages) == expected_log_count
+
+
+def test_iteration_sharing_rejects_default_selective_core_attention_recompute():
+    with pytest.raises(ValueError, match="does not yet support selective recompute"):
+        _make_config(recompute_granularity="selective")
+
+
+def test_nonsharing_accepts_default_selective_core_attention_recompute():
+    config = _make_config(dsa_mtp_index_kv_share=False, recompute_granularity="selective")
+
+    assert config.recompute_modules == ["core_attn"]
 
 
 def test_nonsharing_selective_mla_up_projection_keeps_joint_qk_checkpoint(monkeypatch):
@@ -393,8 +446,9 @@ def _assert_similarity(left: torch.Tensor, right: torch.Tensor, tolerance: float
 
 @pytest.mark.parametrize("segment_lengths", [None, [5, 4]])
 @pytest.mark.parametrize("recompute_up_proj", [False, True])
+@pytest.mark.parametrize("apply_rope_fusion", [False, True], ids=["unfused-rope", "fused-rope"])
 def test_repeated_mtp_dsa_index_and_kv_share_native_parity(
-    monkeypatch, segment_lengths, recompute_up_proj
+    monkeypatch, segment_lengths, recompute_up_proj, apply_rope_fusion
 ):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
@@ -408,7 +462,7 @@ def test_repeated_mtp_dsa_index_and_kv_share_native_parity(
                 "recompute_granularity": "selective",
                 "recompute_modules": ["mla_up_proj"],
             }
-        config = _make_config(**recompute_overrides)
+        config = _make_config(apply_rope_fusion=apply_rope_fusion, **recompute_overrides)
         attention_spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
         real_attention = (
             build_module(attention_spec, config=config, layer_number=1, is_mtp_layer=True)
@@ -537,14 +591,15 @@ def test_repeated_mtp_dsa_index_and_kv_share_native_parity(
         Utils.destroy_model_parallel()
 
 
-def test_indexer_loss_is_computed_only_by_the_source_iteration(monkeypatch):
+@pytest.mark.parametrize("share_mtp_index_kv", [True, False], ids=["sharing", "nonsharing"])
+def test_repeated_mtp_indexer_loss_charge_count(monkeypatch, share_mtp_index_kv):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(2345)
         torch.manual_seed(2345)
         torch.cuda.manual_seed(2345)
 
-        config = _make_config(dsa_indexer_loss_coeff=0.1)
+        config = _make_config(dsa_indexer_loss_coeff=0.1, dsa_mtp_index_kv_share=share_mtp_index_kv)
         attention_spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
         attention = (
             build_module(attention_spec, config=config, layer_number=1, is_mtp_layer=True)
@@ -566,7 +621,11 @@ def test_indexer_loss_is_computed_only_by_the_source_iteration(monkeypatch):
         shared = None
         outputs = []
         for iteration in range(config.mtp_num_layers):
-            context = MTPDSAIterationContext(iteration, shared_tensors=shared)
+            context = None
+            attention_kwargs = {}
+            if share_mtp_index_kv:
+                context = MTPDSAIterationContext(iteration, shared_tensors=shared)
+                attention_kwargs["mtp_dsa_context"] = context
             hidden_states = torch.randn(
                 total_tokens,
                 1,
@@ -575,17 +634,16 @@ def test_indexer_loss_is_computed_only_by_the_source_iteration(monkeypatch):
                 device="cuda",
                 requires_grad=True,
             )
-            output, _ = attention(
-                hidden_states, attention_mask=attention_mask, mtp_dsa_context=context
-            )
-            if context.is_source:
+            output, _ = attention(hidden_states, attention_mask=attention_mask, **attention_kwargs)
+            if context is not None and context.is_source:
                 shared = context.require_source_tensors()
             outputs.append(output)
 
         sum(output.float().sum() for output in outputs).backward()
 
-        assert len(tracked_losses) == 1
-        assert tracked_losses[0].requires_grad
+        expected_loss_count = 1 if share_mtp_index_kv else config.mtp_num_layers
+        assert len(tracked_losses) == expected_loss_count
+        assert all(loss.requires_grad for loss in tracked_losses)
         for name in ("linear_wq_b.weight", "linear_wk.weight", "linear_weights_proj.weight"):
             parameter = dict(attention.core_attention.indexer.named_parameters())[name]
             assert parameter.grad is not None
@@ -884,8 +942,12 @@ def test_tp2_sequence_parallel_reuses_global_source_kv_and_topk(monkeypatch):
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("use_mxfp8", [False, True])
-def test_full_recompute_threads_shared_kv_as_checkpoint_tensor_inputs(use_mxfp8):
+@pytest.mark.parametrize(
+    ("recompute_method", "use_mxfp8"),
+    [("uniform", False), ("uniform", True), ("block", False)],
+    ids=["uniform-native", "uniform-te-mxfp8", "block-fallback"],
+)
+def test_recompute_path_threads_shared_kv_through_iteration_context(recompute_method, use_mxfp8):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(4321)
@@ -896,7 +958,7 @@ def test_full_recompute_threads_shared_kv_as_checkpoint_tensor_inputs(use_mxfp8)
                 fp8_recipe=Fp8Recipe.mxfp8 if use_mxfp8 else None,
                 fp4=False,
                 distribute_saved_activations=False,
-                recompute_method="uniform",
+                recompute_method=recompute_method,
                 recompute_num_layers=1,
             ),
             scale=scale,
@@ -918,17 +980,34 @@ def test_full_recompute_threads_shared_kv_as_checkpoint_tensor_inputs(use_mxfp8)
         hidden = [torch.randn(4, 1, 3, device="cuda", requires_grad=True) for _ in range(3)]
         decoder = [torch.randn_like(value) for value in hidden]
         shared = None
+        source_context = None
         outputs = []
         for iteration in range(3):
             context = MTPDSAIterationContext(iteration, shared_tensors=shared)
-            output, shared = MultiTokenPredictionLayer._checkpointed_forward(
-                dummy_layer,
-                hidden_states=hidden[iteration],
-                decoder_input=decoder[iteration],
-                mtp_dsa_context=context,
-            )
+            if recompute_method == "block":
+                with pytest.warns(UserWarning, match="is not supported for MTP"):
+                    output = MultiTokenPredictionLayer._checkpointed_forward(
+                        dummy_layer,
+                        hidden_states=hidden[iteration],
+                        decoder_input=decoder[iteration],
+                        mtp_dsa_context=context,
+                    )
+            else:
+                output = MultiTokenPredictionLayer._checkpointed_forward(
+                    dummy_layer,
+                    hidden_states=hidden[iteration],
+                    decoder_input=decoder[iteration],
+                    mtp_dsa_context=context,
+                )
+            assert isinstance(output, torch.Tensor)
+            if context.is_source:
+                source_context = context
+                shared = context.require_source_tensors()
             outputs.append(output)
 
+        source_shared = shared
+        assert source_shared is not None
+        source_key_ptr = source_shared.key.data_ptr()
         sum(output.sum() for output in outputs).backward()
 
         reference_scale = nn.Parameter(scale.detach().clone())
@@ -941,7 +1020,10 @@ def test_full_recompute_threads_shared_kv_as_checkpoint_tensor_inputs(use_mxfp8)
         ]
         sum(output.sum() for output in reference_outputs).backward()
 
-        assert shared is not None and shared.key.grad_fn is not None
+        assert source_context is not None
+        assert source_context.require_source_tensors() is source_shared
+        assert source_shared.key.data_ptr() == source_key_ptr
+        assert source_shared.key.grad_fn is not None
         torch.testing.assert_close(scale.grad, reference_scale.grad)
         for actual, expected in zip(hidden, reference_hidden):
             torch.testing.assert_close(actual.grad, expected.grad)
@@ -977,10 +1059,7 @@ def test_mtp_block_passes_one_source_state_through_all_repeated_iterations():
             if mtp_dsa_context.is_source:
                 topk = torch.zeros((1, hidden_states.size(0), 1), dtype=torch.int64)
                 mtp_dsa_context.capture(hidden_states * 2, topk, None)
-                shared = mtp_dsa_context.require_source_tensors()
-            else:
-                shared = mtp_dsa_context.shared_tensors
-            return hidden_states + 1, input_ids, position_ids, padding_mask, shared
+            return hidden_states + 1, input_ids, position_ids, padding_mask
 
     block = SimpleNamespace(
         config=SimpleNamespace(
@@ -1011,6 +1090,55 @@ def test_mtp_block_passes_one_source_state_through_all_repeated_iterations():
     assert all(shared is source_state for _, shared, *_ in observed[1:])
     assert all(context is sequence_roll_context for *_, context, _ in observed)
     assert [roll_depth for *_, roll_depth in observed] == list(range(7))
+
+
+def test_mtp_block_preserves_legacy_layer_signature_when_sharing_is_disabled():
+    observed_depths = []
+
+    class LegacyRepeatedLayer:
+        def __call__(
+            self,
+            *,
+            input_ids,
+            position_ids,
+            hidden_states,
+            attention_mask,
+            padding_mask,
+            inference_params,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            packed_seq_params,
+            sequence_roll_context,
+            roll_depth,
+            sequence_len_offset,
+            embedding,
+        ):
+            observed_depths.append(roll_depth)
+            return hidden_states + 1, input_ids, position_ids, padding_mask
+
+    block = SimpleNamespace(
+        config=SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=2,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=False,
+        ),
+        vp_stage=None,
+        mtp_use_repeated_layer=True,
+        layers=[LegacyRepeatedLayer()],
+    )
+    hidden_states = torch.randn(4, 1, 3)
+    output = MultiTokenPredictionBlock.forward(
+        block,
+        input_ids=torch.arange(4).view(1, 4),
+        position_ids=torch.arange(4).view(1, 4),
+        hidden_states=hidden_states,
+        attention_mask=None,
+    )
+
+    assert output.shape == (12, 1, 3)
+    assert observed_depths == [0, 1]
 
 
 @pytest.mark.parametrize("full_recompute", [False, True])

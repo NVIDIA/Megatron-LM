@@ -37,6 +37,7 @@ from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+_warned_mtp_sharing_fused_bypass = False
 
 try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -1965,6 +1966,22 @@ class DSAttention(MegatronModule):
             self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
         self.mtp_index_share = self.config.dsa_mtp_index_kv_share and is_mtp_layer
+        global _warned_mtp_sharing_fused_bypass
+        if (
+            self.mtp_index_share
+            and dsa_kernels.use_fused_dsa_kernels(self.config)
+            and not _warned_mtp_sharing_fused_bypass
+        ):
+            _warned_mtp_sharing_fused_bypass = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "dsa_mtp_index_kv_share=True requires reusable top-k indices, which the "
+                "combined fused DSA kernel does not expose. The repeated MTP layer therefore "
+                "uses the separable top-k and sparse-attention path; configured fused kernels "
+                "for those operations remain eligible. Benchmark this tradeoff for the target "
+                "MTP depth.",
+            )
         if self.mtp_index_share and self.skip_topk:
             raise ValueError(
                 "dsa_mtp_index_kv_share requires the repeated MTP layer to compute "
@@ -2070,7 +2087,9 @@ class DSAttention(MegatronModule):
         """
         if self.mtp_index_share and mtp_dsa_context is None:
             raise RuntimeError(
-                "The repeated MTP DSA layer requires an explicit per-iteration sharing context."
+                "The repeated MTP DSA layer requires an explicit per-iteration sharing context. "
+                "Serial compute_mtp_single_step speculative inference does not provide this "
+                "context; disable dsa_mtp_index_kv_share or speculative decoding."
             )
         if not self.mtp_index_share and mtp_dsa_context is not None:
             raise RuntimeError(

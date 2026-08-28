@@ -730,6 +730,9 @@ class AbsorbedMLASelfAttention(Attention):
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             if mtp_dsa_context is not None:
+                # In sharing mode, the source K must outlive this attention call. Including
+                # it in CheckpointWithoutOutput would clear its storage after forward, so
+                # every sharing iteration checkpoints Q only and constructs/reuses K outside.
                 q_absorbed = self.qkv_up_checkpoint.checkpoint(
                     q_up_proj_and_rope_apply, q_compressed, rotary_pos_emb
                 )

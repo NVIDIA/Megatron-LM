@@ -518,6 +518,19 @@ def test_async_generate_output_tokens_dynamic_batch_assertions(mode, expected_me
         asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True))
 
 
+@pytest.mark.launch_on_gb200
+def test_dsa_mtp_sharing_rejects_speculative_decoding_before_distributed_setup():
+    model_config = SimpleNamespace(dsa_mtp_index_kv_share=True)
+    inference_config = SimpleNamespace(num_speculative_tokens=1)
+    inference_wrapped_model = SimpleNamespace(
+        model=SimpleNamespace(config=model_config),
+        inference_context=SimpleNamespace(config=inference_config),
+    )
+
+    with pytest.raises(ValueError, match="do not carry iteration-0 DSA KV/top-k tensors"):
+        TextGenerationController(inference_wrapped_model, tokenizer=None)
+
+
 class TestTextGenerationController(TextGenerationControllerTestBase):
 
     @classmethod
