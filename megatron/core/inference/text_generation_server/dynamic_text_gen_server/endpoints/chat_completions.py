@@ -1047,14 +1047,25 @@ try:
         # add_request_with_id, not add_request: a non-streaming response writes
         # nothing to the socket while generating, so a disconnect is never
         # discovered as a broken pipe. Aborting needs the request ids.
-        submissions = [
-            client.add_request_with_id(
-                prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
-            )
-            for _ in range(n)
-        ]
-        request_ids = [request_id for request_id, _ in submissions]
-        tasks = [future for _, future in submissions]
+        #
+        # Submitted one at a time rather than in a comprehension so a failure on
+        # admission k -- a zmq send error, or multimodal serialization on a
+        # malformed payload -- can abort the k-1 already in flight. Left to
+        # escape they would generate to their token limit holding batch slots,
+        # the same leak the abort below the gather closes.
+        request_ids = []
+        tasks = []
+        try:
+            for _ in range(n):
+                request_id, future = client.add_request_with_id(
+                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                )
+                request_ids.append(request_id)
+                tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return Response(f"Error submitting request: {e}", status=500)
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()

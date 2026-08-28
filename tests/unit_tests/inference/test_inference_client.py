@@ -205,3 +205,47 @@ async def test_abort_requests_helper_is_best_effort():
     client.reset_mock(side_effect=True)
     abort_requests(client, [], "client disconnected")
     client.abort_request.assert_not_called()
+
+
+async def test_abort_request_ignores_an_already_completed_request():
+    """A completed request must not be recorded in aborted_request_ids.
+
+    That set is pruned in exactly one place -- _recv_task, when an ENGINE_REPLY
+    arrives for the id. Once the reply has been consumed no further reply will
+    ever arrive, so recording the id there leaks an entry for the lifetime of
+    the process: the same unbounded growth this abort path exists to prevent,
+    moved from the engine's batch into the client. The new callers hit this
+    routinely -- gather propagates on the first failure while siblings that
+    already succeeded are aborted after completion.
+    """
+    client, _, fake_socket = _make_client()
+
+    request_id, future = client.add_request_with_id("hello", SamplingParams())
+    # Stand in for _recv_task delivering the reply: it pops the future from
+    # completion_futures immediately before resolving it.
+    client.completion_futures.pop(request_id)
+    future.set_result({"tokens": [1]})
+    fake_socket.send.reset_mock()
+
+    client.abort_request(request_id)
+
+    assert request_id not in client.aborted_request_ids
+    # The coordinator has already dropped its mapping for a finished request,
+    # so the ABORT_REQUEST send would be wasted too.
+    fake_socket.send.assert_not_called()
+
+
+async def test_abort_request_ignores_an_already_finished_stream():
+    """Same guard on the streaming path, whose AsyncStream aborts on close."""
+    client, _, fake_socket = _make_client()
+
+    stream = client.add_request_streaming("hello", SamplingParams())
+    request_id = stream.request_id
+    # _recv_task pops the stream before delivering the final frame.
+    client.streams.pop(request_id)
+    fake_socket.send.reset_mock()
+
+    client.abort_request(request_id)
+
+    assert request_id not in client.aborted_request_ids
+    fake_socket.send.assert_not_called()

@@ -18,7 +18,8 @@ def abort_requests(client, request_ids: Iterable[int], reason: str) -> None:
     Best-effort and never raises: it runs on paths that are already unwinding
     (a cancelled handler, or an error response), where letting a second failure
     escape would replace the real one. A request that has already finished is
-    not an error to abort -- abort_request drops an unknown id.
+    not an error to abort -- abort_request returns without recording an id it
+    no longer holds local state for.
 
     Args:
         client: The InferenceClient the requests were submitted through.
@@ -30,6 +31,8 @@ def abort_requests(client, request_ids: Iterable[int], reason: str) -> None:
             client.abort_request(request_id)
         except Exception:  # pylint: disable=broad-except
             logger.warning("Failed to abort request %s (%s)", request_id, reason, exc_info=True)
+        else:
+            logger.debug("Aborted request %s (%s)", request_id, reason)
 
 
 def send_do_generate():

@@ -4,7 +4,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import (
@@ -137,7 +137,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
-    ) -> Tuple[int, asyncio.Future]:
+    ) -> tuple[int, asyncio.Future]:
         """Submit a request and return its id alongside its completion future.
 
         Same submission as add_request, which delegates here. The id is what
@@ -154,7 +154,7 @@ class InferenceClient:
                 add_request.
 
         Returns:
-            Tuple[int, asyncio.Future]: The request id and its completion future.
+            tuple[int, asyncio.Future]: The request id and its completion future.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -252,11 +252,20 @@ class InferenceClient:
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
         request_id = int(request_id)
-        self.aborted_request_ids.add(request_id)
         stream = self.streams.pop(request_id, None)
+        future = self.completion_futures.pop(request_id, None)
+        if stream is None and future is None:
+            # Already completed (or never submitted): _submit_request and
+            # _submit_stream register synchronously and _recv_task pops only
+            # immediately before delivering, so absence from both means the
+            # reply has been consumed. No further ENGINE_REPLY will arrive to
+            # prune aborted_request_ids, and the coordinator has already
+            # dropped its mapping, so recording the id would leak an entry
+            # nothing ever removes and the ABORT_REQUEST send would be wasted.
+            return
+        self.aborted_request_ids.add(request_id)
         if stream is not None:
             stream.finish()
-        future = self.completion_futures.pop(request_id, None)
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
