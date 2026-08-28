@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 PHASES = ("prod", "experimental")
+TESTMON_DEPENDENCY_OVERRIDE = "testmon_ignore_dependencies=pytest-testmon megatron-core"
 
 
 class _SelectionOutput:
@@ -67,7 +68,9 @@ def _run(args: argparse.Namespace) -> int:
             database = _database(args.cache_dir, args.phase)
             _clear_database_files(database)
             os.environ["TESTMON_DATAFILE"] = str(database)
-            pytest_args.extend(("--testmon", "--testmon-noselect"))
+            pytest_args.extend(
+                ("-o", TESTMON_DEPENDENCY_OVERRIDE, "--testmon", "--testmon-noselect")
+            )
         else:
             os.environ.pop("TESTMON_DATAFILE", None)
             pytest_args.extend(("-p", "no:testmon", "-p", "no:pytest-testmon"))
@@ -77,7 +80,14 @@ def _run(args: argparse.Namespace) -> int:
         selection_file.unlink(missing_ok=True)
         selection_plugin = _SelectionOutput(selection_file)
         pytest_args.extend(
-            ("--collect-only", "--testmon", "--testmon-nocollect", "--testmon-forceselect")
+            (
+                "-o",
+                TESTMON_DEPENDENCY_OVERRIDE,
+                "--collect-only",
+                "--testmon",
+                "--testmon-nocollect",
+                "--testmon-forceselect",
+            )
         )
         os.environ["TESTMON_DATAFILE"] = str(database)
 
