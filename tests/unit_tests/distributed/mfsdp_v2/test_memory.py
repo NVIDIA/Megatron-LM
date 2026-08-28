@@ -202,7 +202,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     loss = model(x).sum()
     loss.backward()
     optimizer.step()
-    assert parameter_group.model_weight.placements == (Flat(),)
+    assert parameter_group.model_weight.placements == (Replicate(),)
 
     actual_optimizer_size = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
@@ -222,9 +222,9 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     sharded_bf16_weight_size = full_bf16_weight_size // world_size
     sharded_fp32_weight_size = shard_numel * fp32_size
     activation_size = num_tokens * dim * bf16_size
-    # Backward peak growth:
-    # - Unsharded model weight: dim * dim * bf16_size.
-    backward_model_weight_size = full_bf16_weight_size
+    # Backward peak growth. The persistent replicated model weight was allocated
+    # before the measurement, so it adds no step-local allocation here.
+    backward_model_weight_size = 0
     # - Full parameter gradient: dim * dim * bf16_size.
     backward_parameter_gradient_size = full_bf16_weight_size
     # - Unreduced partial-gradient buffer: dim * dim * bf16_size.
@@ -232,19 +232,13 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     # - Earlier-layer activations: (num_layers - 1) * num_tokens * dim * bf16_size.
     #   This one-layer model has no stacked activation at its backward peak.
     backward_stacked_activation_size = (num_layers - 1) * activation_size
-    # - Released baseline model-weight shard: -(dim * dim * bf16_size / world_size).
-    released_sharded_model_weight_size = sharded_bf16_weight_size
     theoretical_backward_growth = (
         backward_model_weight_size
         + backward_parameter_gradient_size
         + backward_partial_gradient_size
         + backward_stacked_activation_size
-        - released_sharded_model_weight_size
     )
 
-    # First-Adam-step peak growth:
-    # - Model weight grows from sharded to full BF16: full - sharded BF16 weight.
-    optimizer_model_weight_growth = full_bf16_weight_size - sharded_bf16_weight_size
     # - BF16 main gradient shrinks from full to sharded: -(full - sharded BF16 weight).
     optimizer_main_gradient_reduction = full_bf16_weight_size - sharded_bf16_weight_size
     # - Casted gradient: shard_numel * fp32_size.
@@ -255,8 +249,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     #   bias-corrected denominator: 2 * shard_numel * fp32_size.
     optimizer_temporary_size = 2 * sharded_fp32_weight_size
     theoretical_optimizer_growth = (
-        optimizer_model_weight_growth
-        - optimizer_main_gradient_reduction
+        -optimizer_main_gradient_reduction
         + optimizer_casted_gradient_size
         + optimizer_state_size
         + optimizer_temporary_size

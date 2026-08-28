@@ -28,7 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import changed_mesh_axis
+from .placement import Flat, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -82,6 +82,8 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer
+    post_optimizer_model_weight: DBuffer
+    _model_weight_is_stale: bool
     main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
@@ -96,7 +98,6 @@ class FsdpParameterGroup:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        allgather_stream: torch.cuda.Stream,
         reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
@@ -111,7 +112,6 @@ class FsdpParameterGroup:
             main_grad_placements: Main-gradient buffer placements.
             main_weight_placements: Main-weight buffer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
-            allgather_stream: Stream used to allocate model weights when a dtype cast is required.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
@@ -127,7 +127,6 @@ class FsdpParameterGroup:
         for fqn, parameter in parameters.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
 
-        self._model_weight_placements = model_weight_placements
         # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
         # is finalized to main_weight's placements after the last microbatch.
         self._main_grad_placements = main_grad_placements
@@ -166,22 +165,40 @@ class FsdpParameterGroup:
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
         else:
             self._symm_mem_pool = None
-        if main_weight_dtype == self.dtype:
+        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
         else:
-            # Record the all-gather stream as model_weight's allocation stream to allow
-            # its uses to be joined back to it before the buffer is deleted.
-            with torch.cuda.stream(allgather_stream):
+            # Keep the configured compute-weight layout alive for the lifetime of this
+            # parameter group. The optimizer-layout sync buffer below is only a view
+            # into its local storage, so the first ZeRO-1 unshard can all-gather
+            # directly into this allocation.
+            with self._symmetric_memory_context():
                 self.model_weight = DBuffer(
                     mesh=self.mesh,
-                    placements=main_weight_placements,
+                    placements=model_weight_placements,
                     tensor_shapes=tensor_shapes,
                     dtype=self.dtype,
                     device=self.main_weight.device,
                 )
-            # Cast into the preallocated model_weight on the current stream without
-            # replacing its storage or its all-gather allocation stream.
-            self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
+        sync_axis = changed_mesh_axis(model_weight_placements, main_weight_placements)
+        if sync_axis is None:
+            self.post_optimizer_model_weight = self.model_weight
+        elif isinstance(model_weight_placements[sync_axis], Replicate) and isinstance(
+            main_weight_placements[sync_axis], Flat
+        ):
+            self.post_optimizer_model_weight = self.model_weight.scatter(
+                sync_axis, main_weight_placements[sync_axis]
+            )
+        else:
+            raise ValueError(
+                "Optimizer/main-weight placements must match the parameter/model-weight "
+                "placements or be a Replicate-to-Flat slice."
+            )
+        # Cast into the preallocated optimizer-layout view on the current stream.
+        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        self._model_weight_is_stale = (
+            self.post_optimizer_model_weight.placements != self.model_weight.placements
+        )
 
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
@@ -268,26 +285,22 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
-        allgather_stream = self.model_weight.allocation_stream
-        assert allgather_stream is not None
-        current_stream = torch.cuda.current_stream(self.model_weight.device)
-        allgather_stream.wait_stream(current_stream)
-        with torch.cuda.stream(allgather_stream):
-            self.model_weight = self.main_weight.cast(self.model_weight.dtype)
-        # CUDA graph capture requires every forked stream to rejoin the capture
-        # stream before capture ends.
-        current_stream.wait_stream(allgather_stream)
+        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        self._model_weight_is_stale = (
+            self.post_optimizer_model_weight.placements != self.model_weight.placements
+        )
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
-        # In ZeRO-1, the post-step cast leaves model_weight sharded. Only the first
-        # microbatch sees placements different from the configured model placements
-        # and restores the replicated model weight.
-        if self.model_weight.placements != self._model_weight_placements:
-            with self._symmetric_memory_context():
-                # Allocate the restored destination in symmetric memory when enabled so the
-                # redistribution can use the faster symmetric-memory all-gather path.
-                self.model_weight = self.model_weight.redistribute(self._model_weight_placements)
+        if self._model_weight_is_stale:
+            # This persistent owner may also back parameter views saved by autograd.
+            # Preserve its version counter while the optimizer-layout alias all-gathers
+            # directly into it.
+            with torch.autograd._unsafe_preserve_version_counter(self.model_weight.local_buffer):
+                self.post_optimizer_model_weight.redistribute(
+                    self.model_weight.placements, out=self.model_weight
+                )
+            self._model_weight_is_stale = False
         if self.model_weight.placements == self._unsharded_model_weight.placements:
             unsharded_model_weight = self.model_weight
         else:
