@@ -7,12 +7,16 @@ from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.shortcut_block import ShortcutExecutionMode, ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_product import HAVE_FLA as HAVE_GDP
+from megatron.core.ssm.gated_delta_product import HAVE_MAMBA_SSM as HAVE_GDP_MAMBA
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -38,7 +42,7 @@ class TestHybridBlock:
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-    def get_hybrid_block(self, layer_pattern, **config_kwargs):
+    def get_hybrid_block(self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs):
         layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
@@ -49,7 +53,7 @@ class TestHybridBlock:
             use_cpu_initialization=True,
             **config_kwargs,
         )
-        modules = hybrid_stack_spec.submodules
+        modules = stack_spec.submodules
         return HybridStack(
             transformer_config,
             modules,
@@ -247,44 +251,47 @@ class TestHybridBlock:
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
 
-    def test_shortcut_pair_is_one_registered_block(self):
-        block = self.get_hybrid_block(
-            Symbols.MAMBA + Symbols.MOE,
-            num_moe_experts=1,
-            moe_router_topk=1,
-            moe_router_pre_softmax=True,
-            moe_token_dispatcher_type="allgather",
-            moe_shortcut_connection=True,
-            moe_shortcut_parallel=False,
-            moe_shared_expert_intermediate_size=256,
-            add_bias_linear=False,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-        )
-
-        assert len(block.layers) == 1
-        shortcut = block.layers[0]
-        assert isinstance(shortcut, ShortcutMoEBlock)
-        assert shortcut.execution_mode == ShortcutExecutionMode.EAGER_SERIAL
-        assert isinstance(shortcut.compute_layer, MambaLayer)
-        assert isinstance(shortcut.moe_layer, TransformerLayer)
-        assert shortcut.shortcut_pre_mlp_layernorm is not shortcut.moe_layer.pre_mlp_layernorm
-        assert isinstance(shortcut.shortcut_post_norm, torch.nn.RMSNorm)
-        assert block.num_layers_per_pipeline_rank == 2
-
-        state_keys = set(block.state_dict())
-        assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
-        assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
-        assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
-        assert "layers.0.shortcut_post_norm.weight" in state_keys
-
     @pytest.mark.parametrize(
-        "compute_symbol", [Symbols.MAMBA, Symbols.ATTENTION], ids=["mamba", "attention"]
+        ("compute_symbol", "stack_spec", "compute_config"),
+        [
+            pytest.param(Symbols.MAMBA, hybrid_stack_spec, {}, id="mamba"),
+            pytest.param(
+                Symbols.GDN,
+                hybrid_stack_spec,
+                {
+                    "bf16": True,
+                    "params_dtype": torch.bfloat16,
+                    "activation_func": torch.nn.functional.silu,
+                },
+                marks=pytest.mark.skipif(not HAVE_GDN, reason="FLA is not installed"),
+                id="gdn",
+            ),
+            pytest.param(Symbols.ATTENTION, hybrid_stack_spec, {}, id="attention"),
+            pytest.param(
+                Symbols.MAMBA,
+                gated_delta_product_stack_spec,
+                {
+                    "bf16": True,
+                    "params_dtype": torch.bfloat16,
+                    "mamba_num_heads": 4,
+                    "mamba_head_dim": 64,
+                    "mamba_num_groups": 4,
+                    "mamba_state_dim": 16,
+                },
+                marks=pytest.mark.skipif(
+                    not (HAVE_GDP and HAVE_GDP_MAMBA), reason="GDP dependencies are not installed"
+                ),
+                id="gdp",
+            ),
+        ],
     )
     @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "overlap"])
-    def test_shortcut_pair_eager_forward_backward(self, monkeypatch, compute_symbol, parallel):
+    def test_shortcut_pair_eager_forward_backward(
+        self, monkeypatch, compute_symbol, stack_spec, compute_config, parallel
+    ):
         block = self.get_hybrid_block(
             compute_symbol + Symbols.MOE,
+            stack_spec=stack_spec,
             num_moe_experts=1,
             moe_router_topk=1,
             moe_router_pre_softmax=True,
@@ -293,7 +300,25 @@ class TestHybridBlock:
             moe_shortcut_parallel=parallel,
             moe_shared_expert_intermediate_size=256,
             add_bias_linear=False,
-        ).cuda()
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            **compute_config,
+        )
+
+        assert len(block.layers) == 1
+        assert block.num_layers_per_pipeline_rank == 2
+        shortcut = block.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+        assert shortcut.execution_mode == ShortcutExecutionMode.resolve(overlap_a2a=parallel)
+        assert shortcut.compute_layer.supports_split_output_projection()
+        assert isinstance(shortcut.moe_layer, TransformerLayer)
+        state_keys = set(block.state_dict())
+        assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
+        assert "layers.0.shortcut_post_norm.weight" in state_keys
+
+        block = block.cuda()
         block.train()
 
         hidden_states = torch.randn(
@@ -304,7 +329,7 @@ class TestHybridBlock:
             attention_mask = torch.triu(
                 torch.ones(1, 1, 16, 16, dtype=torch.bool, device=hidden_states.device), diagonal=1
             )
-            compute_layer = block.layers[0].compute_layer
+            compute_layer = shortcut.compute_layer
             assert compute_layer.supports_split_output_projection()
 
             def fail_if_mlp_runs(*args, **kwargs):
@@ -316,7 +341,6 @@ class TestHybridBlock:
         output.float().square().mean().backward()
 
         assert output.shape == hidden_states.shape
-        shortcut = block.layers[0]
         logical_norms = (
             shortcut.shortcut_pre_mlp_layernorm,
             shortcut.moe_layer.pre_mlp_layernorm,

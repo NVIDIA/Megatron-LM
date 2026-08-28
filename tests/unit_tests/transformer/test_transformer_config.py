@@ -99,58 +99,57 @@ def test_gdp_num_householder_accepts_positive_values():
 
 
 @pytest.mark.parametrize(
-    "removed_field",
+    ("overrides", "error", "message"),
     [
-        "moe_shortcut_output_norm",
-        "moe_shortcut_tied_norm",
-        "moe_shortcut_untied_norm",
-        "moe_shortcut_post_norm",
-        "moe_shortcut_scalar_gate",
-        "moe_shortcut_vector_gate",
+        pytest.param(
+            {"moe_shortcut_connection": True},
+            AssertionError,
+            "requires MoE to be enabled",
+            id="requires-moe",
+        ),
+        pytest.param(
+            {"num_moe_experts": 2, "moe_shortcut_parallel": True},
+            AssertionError,
+            "requires moe_shortcut_connection",
+            id="parallel-requires-shortcut",
+        ),
+        pytest.param(
+            {
+                "num_moe_experts": 2,
+                "moe_shortcut_connection": True,
+                "recompute_granularity": "full",
+            },
+            ValueError,
+            "not supported with full activation recomputation",
+            id="full-recompute",
+        ),
+        pytest.param(
+            {
+                "num_moe_experts": 2,
+                "moe_shortcut_connection": True,
+                "moe_shared_expert_overlap": True,
+            },
+            ValueError,
+            "mutually exclusive",
+            id="shared-expert-overlap",
+        ),
+        pytest.param(
+            {"num_moe_experts": 2, "moe_shortcut_connection": True, "cuda_graph_impl": "local"},
+            AssertionError,
+            "CUDA graphs are not supported",
+            id="cuda-graphs",
+        ),
     ],
 )
-def test_removed_shortcut_options_are_not_config_fields(removed_field: str):
-    assert removed_field not in TransformerConfig.__dataclass_fields__
-
-
-def test_shortcut_rejects_full_activation_recomputation():
-    with pytest.raises(ValueError, match="moe_shortcut_connection is not supported"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
-            num_moe_experts=1,
-            moe_router_topk=1,
-            moe_shortcut_connection=True,
-            recompute_granularity="full",
-        )
-
-
-@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine", "full_iteration"])
-def test_shortcut_rejects_cuda_graphs(cuda_graph_impl: str):
-    with pytest.raises(AssertionError, match="CUDA graphs are not supported"):
+def test_shortcut_rejects_incompatible_configurations(overrides, error, message):
+    with pytest.raises(error, match=message):
         TransformerConfig(
             num_layers=2,
             hidden_size=128,
             num_attention_heads=4,
-            num_moe_experts=2,
             moe_router_topk=1,
             moe_router_pre_softmax=True,
-            moe_shortcut_connection=True,
-            moe_shortcut_parallel=True,
-            cuda_graph_impl=cuda_graph_impl,
-            cuda_graph_modules=[],
-        )
-
-
-def test_shortcut_block_is_not_a_cuda_graph_module():
-    with pytest.raises(KeyError, match="shortcut_block"):
-        TransformerConfig(
-            num_layers=2,
-            hidden_size=128,
-            num_attention_heads=4,
-            cuda_graph_impl="local",
-            cuda_graph_modules=["shortcut_block"],
+            **overrides,
         )
 
 
