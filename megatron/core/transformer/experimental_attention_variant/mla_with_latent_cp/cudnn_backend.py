@@ -10,7 +10,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Final
+from typing import Any, Callable, Final
 
 import torch
 from torch import Tensor
@@ -152,6 +152,86 @@ class _CudnnSDPAFunction(torch.autograd.Function):
             ctx.scale,
         )
         return dq, dk, dv, None, None, None, None, None, None, None
+
+
+class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
+    """Run cuDNN SDPA while recomputing only latent-KV expansion in backward.
+
+    Retaining cuDNN's local output and statistics avoids replaying the attention
+    forward while still discarding expanded K/V at the phase boundary.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        query: Tensor,
+        payload: Tensor,
+        projection_weight: Tensor,
+        phase: PhaseSpec,
+        scale: float,
+        adapter: "CudnnFusedAttentionAdapter",
+        expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
+    ) -> tuple[Tensor, Tensor]:
+        key, value = expand_phase_kv(payload, phase)
+        raw_output, stats = adapter._execute_forward(
+            query,
+            key,
+            value,
+            phase.cu_seqlens_q,
+            phase.cu_seqlens_kv,
+            phase.max_seqlen_q,
+            phase.max_seqlen_kv,
+            phase.causal,
+            scale,
+        )
+        ctx.save_for_backward(query, payload, projection_weight, raw_output, stats)
+        ctx.phase = phase
+        ctx.scale = scale
+        ctx.adapter = adapter
+        ctx.expand_phase_kv = expand_phase_kv
+        return raw_output.float(), stats.float()
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_output: Tensor | None, grad_lse: Tensor | None
+    ) -> tuple[Tensor, Tensor, Tensor | None, None, None, None, None]:
+        query, payload, projection_weight, raw_output, stats = ctx.saved_tensors
+        phase = ctx.phase
+        if grad_output is None:
+            grad_output = torch.zeros_like(raw_output, dtype=torch.float32)
+        if grad_lse is None:
+            grad_lse = torch.zeros(
+                raw_output.shape[:2], dtype=torch.float32, device=raw_output.device
+            )
+
+        with torch.enable_grad():
+            replay_payload = payload.detach().requires_grad_(True)
+            key, value = ctx.expand_phase_kv(replay_payload, phase)
+            corrected_output, local_grad_output = cudnn_backward_proxy(
+                raw_output, grad_output, grad_lse
+            )
+            dq, dk, dv = ctx.adapter._execute_backward(
+                query,
+                key,
+                value,
+                corrected_output.to(torch.bfloat16),
+                local_grad_output.to(torch.bfloat16),
+                stats,
+                phase.cu_seqlens_q,
+                phase.cu_seqlens_kv,
+                phase.max_seqlen_q,
+                phase.max_seqlen_kv,
+                phase.causal,
+                ctx.scale,
+            )
+            grad_payload, grad_weight = torch.autograd.grad(
+                (key, value),
+                (replay_payload, projection_weight),
+                grad_outputs=(dk, dv),
+                allow_unused=True,
+            )
+        _require(grad_payload is not None, "latent-KV replay lost its payload gradient")
+        return dq, grad_payload, grad_weight, None, None, None, None
 
 
 def _resolve_cudnn_frontend_version(cudnn: Any) -> str:
@@ -690,6 +770,27 @@ class CudnnFusedAttentionAdapter:
         """Execute one phase through the differentiable cuDNN Graph wrapper."""
         return _CudnnSDPAFunction.apply(
             q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale, self
+        )
+
+    def forward_recomputed_phase(
+        self,
+        query: Tensor,
+        payload: Tensor,
+        projection_weight: Tensor,
+        phase: PhaseSpec,
+        scale: float,
+        expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
+    ) -> tuple[Tensor, Tensor]:
+        """Execute SDPA while retaining only latent payload plus cuDNN O/LSE state."""
+
+        return _CudnnRecomputedPhaseFunction.apply(
+            query,
+            payload,
+            projection_weight,
+            phase,
+            scale,
+            self,
+            expand_phase_kv,
         )
 
 

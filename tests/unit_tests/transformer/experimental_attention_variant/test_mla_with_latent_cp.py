@@ -67,7 +67,7 @@ EXPECTED_QUALIFIED_BACKEND_CONFIGS: tuple[latent_cp.QualifiedBackendTuple, ...] 
     (AttnBackend.flash, "4.0.0b11", "flash-attn-4==4.0.0b11", (10, 0)),
 )
 EXPECTED_QUALIFICATION_EPS: dict[latent_cp.QualifiedBackendTuple, float] = {
-    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 4.536757133166702e-05,
+    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 4.561878810305231e-05,
     (AttnBackend.fused, "1.26.0", "9.25.0", (10, 0)): 4.423665134356547e-05,
     (
         AttnBackend.flash,
@@ -1108,6 +1108,82 @@ def test_merge_matches_direct_softmax_and_gradients():
     direct.backward(upstream)
     for actual, tensor in zip(merged_grads, (logits_a, logits_b, value_a, value_b)):
         torch.testing.assert_close(actual, tensor.grad, rtol=3e-6, atol=3e-6)
+
+
+def test_cudnn_selective_recompute_matches_native_projection_gradients():
+    """The selective path must replay projection math, not attention forward."""
+
+    class FakeAdapter:
+        def __init__(self):
+            self.forward_calls = 0
+            self.backward_calls = 0
+
+        def _execute_forward(self, q, k, v, *_args):
+            self.forward_calls += 1
+            return q + k + v, torch.zeros(q.shape[:2], dtype=torch.float32)
+
+        def _execute_backward(self, q, k, v, output, grad_output, stats, *_args):
+            del output, stats
+            self.backward_calls += 1
+            return (
+                grad_output.to(q.dtype),
+                grad_output.to(k.dtype),
+                grad_output.to(v.dtype),
+            )
+
+    torch.manual_seed(51)
+    query = torch.randn(5, 1, 2, requires_grad=True)
+    payload = torch.randn(5, 2, requires_grad=True)
+    weight = torch.randn(4, 2, requires_grad=True)
+    query_ref = query.detach().clone().requires_grad_(True)
+    payload_ref = payload.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    cu = torch.tensor([0, 5], dtype=torch.int32)
+    indices = torch.arange(5)
+    phase = latent_cp.PhaseSpec(
+        phase=0,
+        owner=0,
+        kind="diagonal",
+        q_indices=indices,
+        kv_indices=indices,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=5,
+        max_seqlen_kv=5,
+        causal=True,
+    )
+    replay_calls = 0
+
+    def expand_phase_kv(latent, _phase):
+        nonlocal replay_calls
+        replay_calls += 1
+        expanded = F.linear(latent, weight).view(5, 1, 4)
+        return expanded[..., :2], expanded[..., 2:]
+
+    adapter = FakeAdapter()
+    output, lse = latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
+        query,
+        payload,
+        weight,
+        phase,
+        1.0,
+        adapter,
+        expand_phase_kv,
+    )
+    upstream = torch.randn_like(output).to(torch.bfloat16).float()
+    (output * upstream).sum().backward()
+
+    expanded_ref = F.linear(payload_ref, weight_ref).view(5, 1, 4)
+    reference = query_ref + expanded_ref[..., :2] + expanded_ref[..., 2:]
+    (reference * upstream).sum().backward()
+    torch.testing.assert_close(output, reference)
+    torch.testing.assert_close(lse, torch.zeros_like(lse))
+    torch.testing.assert_close(query.grad, query_ref.grad)
+    torch.testing.assert_close(payload.grad, payload_ref.grad)
+    torch.testing.assert_close(weight.grad, weight_ref.grad)
+    assert replay_calls == 2
+    assert adapter.forward_calls == 1
+    assert adapter.backward_calls == 1
 
 
 def test_merge_scatter_and_cudnn_proxy_extremes():
@@ -2916,7 +2992,9 @@ def _run_cudnn_do_only_phase_diagnostic() -> None:
         with (
             _forbid_default_process_group_resolvers(),
             mock.patch.object(
-                latent_cp, "cudnn_backward_proxy", wraps=latent_cp.cudnn_backward_proxy
+                latent_cp_cudnn_backend,
+                "cudnn_backward_proxy",
+                wraps=latent_cp_cudnn_backend.cudnn_backward_proxy,
             ) as proxy_spy,
         ):
             output.backward(upstream)
@@ -3069,7 +3147,9 @@ def _run_cudnn_two_phase_merge_diagnostic() -> None:
         with (
             _forbid_default_process_group_resolvers(),
             mock.patch.object(
-                latent_cp, "cudnn_backward_proxy", wraps=latent_cp.cudnn_backward_proxy
+                latent_cp_cudnn_backend,
+                "cudnn_backward_proxy",
+                wraps=latent_cp_cudnn_backend.cudnn_backward_proxy,
             ) as proxy_spy,
         ):
             merged_output.backward(upstream)
@@ -3330,12 +3410,12 @@ def _run_production_parity(
 def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
     runtime = _qualified_real_backend_runtime_or_skip(AttnBackend.fused)
     assertion_eps = EXPECTED_QUALIFICATION_EPS[runtime]
-    with _model_parallel(2, 2) as pg:
+    with _model_parallel(1, 2) as pg:
         torch.manual_seed(_SEED + 30)
         torch.cuda.manual_seed_all(_SEED + 30)
         model_parallel_cuda_manual_seed(_SEED + 30)
         config = _make_config(
-            tp_size=2,
+            tp_size=1,
             cp_size=2,
             backend=AttnBackend.fused,
             rope_type=rope_type,

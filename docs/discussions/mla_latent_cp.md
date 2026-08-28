@@ -29,8 +29,8 @@ backend, merge, and transport logic.
 
 P2P context parallelism (CP) circulates normalized MLA latent KV and the positional key component,
 rather than expanded K and V. Each receiving CP rank reconstructs K/V immediately before its
-attention phase. The phase is checkpointed, so remote full K/V are temporary and are recomputed in
-backward.
+attention phase. Expanded K/V remain temporary: backward recomputes the latent-KV up projection,
+while the cuDNN path retains local O/LSE and calls its backward graph without replaying SDPA.
 
 ## Goals and initial scope
 
@@ -449,15 +449,20 @@ larger initialized subgroup on one immutable module.
 
 ### Phase checkpoint and saved-state scope
 
-Each phase callable takes a Q view, one latent payload view, and immutable metadata. It performs KV
+Each phase takes a Q view, one latent payload view, and immutable metadata. It performs KV
 up-projection, key construction, direct backend attention, and returns canonical FP32 `(O_i,E_i)`.
-It is wrapped with `torch.utils.checkpoint.checkpoint(..., use_reentrant=False,
-preserve_rng_state=False)`. Dropout is zero.
+Dropout is zero.
 
-Checkpoint keeps its Q/latent inputs and returned partial outputs, but discards tensors saved inside
-KV expansion and backend attention. Backward re-executes KV up-projection and, in v1, attention
-forward before backend backward. Full K/V exist only during that phase call and are never sent or
-stored in ring state.
+The cuDNN adapter uses a feature-owned custom autograd boundary. Forward saves Q, latent payload,
+the up-projection weight, raw BF16 local output, and FP32 LSE, but not expanded K/V. Backward
+re-executes only KV expansion, applies the public cuDNN backward graph to retained O/LSE state, then
+differentiates reconstructed K/V through the ordinary MCore up projection. This preserves
+gradient-accumulation-fusion side effects and parameter hooks while removing the second SDPA
+forward. The FA4 adapter retains the non-reentrant phase-checkpoint fallback until its qualified
+public API exposes an equally narrow split forward/backward ownership boundary.
+
+Full K/V exist only during the initial phase forward and the short projection replay; they are
+never sent or stored in ring state.
 
 The intentionally retained activation classes are:
 
@@ -465,16 +470,14 @@ The intentionally retained activation classes are:
 - every canonical partial `O_i` in FP32 and `E_i` in FP32, plus final merge state; and
 - local Q/projection inputs required by normal MCore autograd.
 
-No expanded remote K/V is physically retained outside the checkpointed phase. It is absent from
-checkpoint inputs/outputs and module state. An outer `saved_tensors_hooks` recorder enumerates the
+No expanded remote K/V is physically retained outside phase execution. It is absent from saved
+autograd inputs/outputs and module state. An outer `saved_tensors_hooks` recorder enumerates the
 shape, element count, dtype, Python tensor class, and semantic state class of every tensor physically
 packed into the surrounding autograd graph after forward. The pack hook returns a holder while the
 recorder keeps only its weak reference, so only holders still owned by live autograd state are
-enumerated. It permits the phase Q/latent checkpoint inputs and FP32 partial O/LSE/merge state, while
-rejecting expanded remote K/V shapes. A backend
-custom autograd function may call `ctx.save_for_backward` inside the phase as part of its ordinary
-implementation, but non-reentrant checkpointing replaces those inner saves with replay holders, so
-they do not survive as physical K/V storage in the outer graph.
+enumerated. It permits phase Q/latent inputs and FP32 partial O/LSE/merge state, while rejecting
+expanded remote K/V shapes. The cuDNN custom autograd function owns saved Q/latent/O/LSE tensors
+directly; FA4 checkpoint replay uses the same recorder contract.
 
 The lifetime test includes a sensitivity control: its test-only native backend passes K/V through a
 numerically identity custom autograd sentinel whose `save_for_backward` names the exact THD K/V
@@ -482,9 +485,9 @@ state, mirroring the public cuDNN adapter's custom-function contract. It tempora
 checkpoint with direct phase execution and requires the same recorder to detect expanded value and
 Q/K-shaped attention state. This avoids depending on private `einsum`/BMM saved-view layouts.
 Tensor-wrapper weak references remain a supplemental check only. This is saved-state evidence, not
-an allocator-wide memory snapshot claim. A future backend-specific
-backward may remove attention-forward recompute or reduce partial-output storage, but that is not a
-v1 claim.
+an allocator-wide memory snapshot claim. The cuDNN selective-recompute test also compares output,
+Q, payload, and projection-weight gradients against an independent native projection reference and
+asserts one SDPA forward plus one KV replay.
 
 To avoid ambiguous nested checkpoint/offload behavior, v1 requires
 `recompute_granularity is None` and `fine_grained_activation_offloading=False`. The inactive
@@ -618,7 +621,7 @@ The completed sanitized qualification matrix is:
 
 | Hardware | Backend | Frontend/package | Runtime/distribution identity | Evidence epsilon |
 | --- | --- | --- | --- | --- |
-| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `4.536757133166702e-05` |
+| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `4.561878810305231e-05` |
 | SM100 | `AttnBackend.fused` | `1.26.0` | cuDNN `9.25.0` | `4.423665134356547e-05` |
 | SM100 | `AttnBackend.flash` | `4.0.0b11` | `flash-attn-4==4.0.0b11` | `4.3095951884009054e-05` |
 
@@ -977,11 +980,12 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    `gE_i`, `O_corr`, zero/tiny norm rows, extreme phase weights/LSE, and BF16 boundary casts.
 8. **Dtype and functional merge.** Assert raw BF16 backend output, canonical/merged FP32 output+LSE,
    functional upper scatter, and exactly one final BF16 cast before `_explicit_output_projection`.
-9. **Recompute/lifetime evidence.** Count `P` KV up-projections in forward and `P` in checkpoint
-   replay. Outer saved-tensor hooks enumerate retained shape/numel/dtype/Python class and classify
-   checkpoint Q/latent plus FP32 partial O/LSE state; expanded K/V is forbidden. Weakrefs supplement
-   this evidence. A checkpoint-disabled sensitivity control must expose expanded value and
-   Q/K-shaped saved state, proving the recorder would catch the regression.
+9. **Recompute/lifetime evidence.** Count `P` KV up-projections in forward and `P` in backward replay,
+   while cuDNN executes exactly `P` SDPA forwards total. Outer saved-tensor hooks enumerate retained
+   shape/numel/dtype/Python class and classify Q/latent plus partial O/LSE state; expanded K/V is
+   forbidden. Independent native math checks Q, payload, and up-projection-weight gradients. The
+   FA4 checkpoint-disabled sensitivity control must still expose expanded value and Q/K-shaped
+   saved state, proving the recorder would catch a lifetime regression.
 10. **Negative validation.** Cover unsupported projection specs, SBHD, contiguous/A2A modes,
     padding, non-divisible CP>1 lengths, malformed/mismatched dynamic metadata,
     non-causal/explicit masks, FP16/FP8/FP4, dropout,
@@ -1023,8 +1027,9 @@ worklog. The upstream document and GitHub-bound commit contain no internal clust
   supported only after independent tensor-by-tensor evidence covers ordinary and extreme rows.
 - **FA4 packaging:** source/distribution identity, import precedence, LSE layout, and `dLSE` remain
   tuple-specific qualification inputs.
-- **Memory/compute:** v1 deliberately retains FP32 partial O/LSE and recomputes phase attention. It
-  claims removal of remote full K/V, not O(1) activation memory or free recomputation.
+- **Memory/compute:** the cuDNN path retains raw local O/LSE and recomputes KV expansion, not SDPA;
+  FA4 retains full phase replay. The feature claims removal of remote full K/V, not O(1) activation
+  memory or free recomputation.
 - **Collectives:** all ranks must construct an identical autograd graph; v1 sacrifices overlap to
   make ordering and lifetime explicit.
 - **Projection scope:** only the local MCore Column/RowParallel projection spec, trainable bias-free

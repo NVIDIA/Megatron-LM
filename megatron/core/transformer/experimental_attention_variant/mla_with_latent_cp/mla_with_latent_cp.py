@@ -529,13 +529,13 @@ class MLAWithLatentCP(MLASelfAttention):
         )
         return query, payload
 
-    def _phase_attention(
+    def _expand_phase_kv(
         self,
-        query: Tensor,
         payload: Tensor,
         phase: latent_cp_layout.PhaseSpec,
-        backend: DirectAttentionAdapter,
     ) -> tuple[Tensor, Tensor]:
+        """Reconstruct one phase's full K/V from the communicated latent payload."""
+
         latent, k_rope = torch.split(
             payload, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
@@ -565,10 +565,20 @@ class MLAWithLatentCP(MLASelfAttention):
             ),
             dim=-1,
         ).contiguous()
+        return key, value.contiguous()
+
+    def _phase_attention(
+        self,
+        query: Tensor,
+        payload: Tensor,
+        phase: latent_cp_layout.PhaseSpec,
+        backend: DirectAttentionAdapter,
+    ) -> tuple[Tensor, Tensor]:
+        key, value = self._expand_phase_kv(payload, phase)
         output, lse = backend.forward_phase(
             query.contiguous(),
             key,
-            value.contiguous(),
+            value,
             phase.cu_seqlens_q,
             phase.cu_seqlens_kv,
             phase.max_seqlen_q,
@@ -644,13 +654,24 @@ class MLAWithLatentCP(MLASelfAttention):
                     q_input, payload_input, phase_spec, phase_backend
                 )
 
-            partial_output, partial_lse = checkpoint(
-                run_phase,
-                q_phase,
-                payload_phase,
-                use_reentrant=False,
-                preserve_rng_state=False,
-            )
+            recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
+            if recomputed_forward is None:
+                partial_output, partial_lse = checkpoint(
+                    run_phase,
+                    q_phase,
+                    payload_phase,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                partial_output, partial_lse = recomputed_forward(
+                    q_phase,
+                    payload_phase,
+                    self.linear_kv_up_proj.weight,
+                    phase,
+                    self.softmax_scale,
+                    self._expand_phase_kv,
+                )
             if phase.scatter_indices is not None:
                 partial_output, partial_lse = scatter_upper_phase(
                     partial_output,
