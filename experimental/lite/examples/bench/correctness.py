@@ -470,6 +470,8 @@ def run_backend(
             "hash_weights": hash_weights,
             "same_data_across_dp": cfg.same_data_across_dp,
             "use_thd": cfg.use_thd,
+            "load_hf_weights": not cfg.skip_load_hf_weights,
+            "build_optimizer": not cfg.skip_optimizer_build,
             "parallel": {
                 "tp": cfg.tp,
                 "etp": cfg.etp,
@@ -485,6 +487,17 @@ def run_backend(
                 "clip_grad": cfg.optimizer_clip_grad,
             },
             "impl_cfg": json.loads(cfg.impl_cfg_json),
+            "fp8": {
+                "fused_weight_quant": os.environ.get(
+                    "MLITE_VLLM_FUSED_WEIGHT_QUANT", "1"
+                ),
+                "fused_ue8m0_weight_quant": os.environ.get(
+                    "MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1"
+                ),
+                "batched_grouped_weight_quant": os.environ.get(
+                    "MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "1"
+                ),
+            },
             "fixed_router_replay": fixed_router_replay,
         },
     }
