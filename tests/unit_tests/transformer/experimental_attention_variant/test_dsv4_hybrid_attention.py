@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from functools import partial
 from unittest.mock import patch
 
 import pytest
@@ -142,7 +143,6 @@ def test_module_spec_is_built_from_explicit_backend():
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
         DSv4HybridSelfAttention,
     )
-    from megatron.core.transformer.spec_utils import ModuleSpec
 
     class Linear:
         pass
@@ -176,19 +176,19 @@ def test_module_spec_is_built_from_explicit_backend():
     assert spec.submodules.linear_q_up_proj is ColumnParallelLinear
     assert spec.submodules.linear_kv_proj is ColumnParallelLinear
     assert spec.submodules.linear_proj is RowParallelLinear
-    core_attention_spec = spec.submodules.core_attention
-    assert isinstance(core_attention_spec, ModuleSpec)
-    assert core_attention_spec.module is CompressedSparseAttention
+    core_attention_builder = spec.submodules.core_attention
+    assert isinstance(core_attention_builder, partial)
+    assert core_attention_builder.func is CompressedSparseAttention
 
-    core_attention_submodules = core_attention_spec.submodules
-    compressor_spec = core_attention_submodules.compressor
-    assert isinstance(compressor_spec, ModuleSpec)
-    assert compressor_spec.module is Compressor
+    core_attention_submodules = core_attention_builder.keywords["submodules"]
+    compressor_builder = core_attention_submodules.compressor
+    assert isinstance(compressor_builder, partial)
+    assert compressor_builder.func is Compressor
 
-    indexer_spec = core_attention_submodules.indexer
-    assert isinstance(indexer_spec, ModuleSpec)
-    assert indexer_spec.module is CSAIndexer
-    assert indexer_spec.submodules.compressor is compressor_spec
+    indexer_builder = core_attention_submodules.indexer
+    assert isinstance(indexer_builder, partial)
+    assert indexer_builder.func is CSAIndexer
+    assert indexer_builder.keywords["submodules"].compressor is compressor_builder
 
 
 def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
