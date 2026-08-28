@@ -1,18 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from functools import partial
-
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttention,
-    CompressedSparseAttentionBuilder,
     CompressedSparseAttentionSubmodules,
     Compressor,
-    CompressorBuilder,
     CompressorSubmodules,
     CSAIndexer,
-    CSAIndexerBuilder,
     CSAIndexerSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
@@ -36,26 +31,26 @@ def get_dsv4_hybrid_module_spec_for_backend(
         backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
     )
 
-    compressor_builder: CompressorBuilder = partial(
-        Compressor,
+    compressor_spec = ModuleSpec(
+        module=Compressor,
         submodules=CompressorSubmodules(
             linear_wkv=backend.linear(),
             linear_wgate=backend.linear(),
             norm=backend.layer_norm(rms_norm=True, for_qk=False),
         ),
     )
-    indexer_builder: CSAIndexerBuilder = partial(
-        CSAIndexer,
+    indexer_spec = ModuleSpec(
+        module=CSAIndexer,
         submodules=CSAIndexerSubmodules(
             linear_wq_b=backend.linear(),
             linear_weights_proj=backend.linear(),
-            compressor=compressor_builder,
+            compressor=compressor_spec,
         ),
     )
-    core_attention_builder: CompressedSparseAttentionBuilder = partial(
-        CompressedSparseAttention,
+    core_attention = ModuleSpec(
+        module=CompressedSparseAttention,
         submodules=CompressedSparseAttentionSubmodules(
-            compressor=compressor_builder, indexer=indexer_builder
+            compressor=compressor_spec, indexer=indexer_spec
         ),
     )
 
@@ -66,7 +61,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
             linear_q_down_proj=backend.linear(),
             linear_q_up_proj=backend.column_parallel_linear(),
             linear_kv_proj=backend.column_parallel_linear(),
-            core_attention=core_attention_builder,
+            core_attention=core_attention,
             linear_proj=backend.row_parallel_linear(),
             q_layernorm=qk_norm,
             kv_layernorm=qk_norm,

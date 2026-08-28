@@ -3122,6 +3122,74 @@ class TestMultiTokenPredictionHybrid:
         assert calls == {"inner": 1, "outer": 0}
         torch.testing.assert_close(output, hidden_states + 1)
 
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    def test_full_recompute_with_multi_layer_chunks_mamba(self):
+        """Hybrid MTP chunks are recomputed once without an outer MTP checkpoint."""
+        args = self.create_test_args(
+            tp=1,
+            cp=1,
+            sequence_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            full_recompute=True,
+        )
+        # The main pattern has four symbols and each MTP pattern has two. A chunk
+        # size larger than both should checkpoint each nested HybridStack once.
+        args.recompute_num_layers = 8
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model, _, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
+        )
+
+        mtp_layers = [
+            module
+            for module in unwrap_model(model[0]).modules()
+            if isinstance(module, MultiTokenPredictionLayer)
+        ]
+        assert len(mtp_layers) == args.mtp_num_layers
+
+        inner_layer_forward_counts = {}
+
+        def count_inner_layer_forward(module, _inputs, _output):
+            inner_layer_forward_counts[module] += 1
+
+        hook_handles = []
+        for mtp_layer in mtp_layers:
+            for inner_layer in mtp_layer.mtp_model_layer.layers:
+                inner_layer_forward_counts[inner_layer] = 0
+                hook_handles.append(inner_layer.register_forward_hook(count_inner_layer_forward))
+
+        try:
+            output = model[0].forward(
+                input_ids=batch['tokens'],
+                position_ids=batch['position_ids'],
+                attention_mask=batch['attention_mask'],
+                labels=batch['labels'],
+                loss_mask=batch['loss_mask'],
+            )
+            output.mean().backward()
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        # Each nested layer runs once in the original forward and once when its HybridStack
+        # chunk is recomputed in backward. An outer MTP checkpoint would add a third execution.
+        assert inner_layer_forward_counts
+        assert all(count == 2 for count in inner_layer_forward_counts.values())
+
+        for name, param in model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
+
     def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.
 
