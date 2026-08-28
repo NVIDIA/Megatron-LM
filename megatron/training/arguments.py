@@ -448,6 +448,11 @@ def validate_args(args, defaults={}):
     )
     args.data_parallel_size = args.world_size // total_model_size
 
+    if args.refit_execution_batch_bytes is not None:
+        assert args.refit_execution_batch_bytes > 0, (
+            '--refit-execution-batch-bytes must be a positive integer'
+        )
+
     if args.perform_rl_step:
         assert args.refit_method != 'nccl_m2n', 'nccl_m2n is unsupported by the built-in RL loop'
 
@@ -1267,13 +1272,6 @@ def validate_args(args, defaults={}):
     if args.rl_use_sequence_packing:
         args.consumed_train_bins = 0
 
-    # Support for variable sequence lengths across batches/microbatches.
-    # set it if the dataloader supports generation of variable sequence lengths
-    # across batches/microbatches. Due to additional communication overhead
-    # during pipeline parallelism, it should not be set if sequence length
-    # is constant during training.
-    args.variable_seq_lengths = False
-
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
     if args.train_iters and not args.skip_train:
@@ -1451,6 +1449,23 @@ def validate_args(args, defaults={}):
         assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
         assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
 
+    # Support for variable sequence lengths across batches/microbatches.
+    # set it if the dataloader supports generation of variable sequence lengths
+    # across batches/microbatches. Due to additional communication overhead
+    # during pipeline parallelism, it should not be set if sequence length
+    # is constant during training.
+    args.variable_seq_lengths = False
+    if args.mock_data and args.sft and args.sft_mock_dataset_config_json is None:
+        args.sft_mock_dataset_config_json = json.dumps(
+            {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": args.seq_length // 2,
+                "max_seq_len": args.seq_length,
+                "mean_seq_len": args.seq_length // 4 * 3,
+                "lognormal_sigma": 1.1,
+            }
+        )
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
@@ -1678,6 +1693,26 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    # Scheduler-name and max-seqlen validation live in
+    # ModelParallelConfig.__post_init__; only the buffer-size check stays here
+    # because seq_length is not a core config field. The None case for
+    # max_seqlen_per_dp_cp_rank is rejected by the config check.
+    if args.sequence_packing_scheduler is not None:
+        args.variable_seq_lengths = True
+        # Packed microbatches carry different numbers of valid tokens, so the
+        # default per-microbatch loss averaging would weight tokens unevenly
+        # depending on how samples happened to be packed (same reasoning as
+        # the hybrid-context-parallel check above).
+        assert args.calculate_per_token_loss, (
+            'Sequence packing must be used with --calculate-per-token-loss'
+        )
+        if args.max_seqlen_per_dp_cp_rank is not None:
+            total_cp_ranks = args.context_parallel_size
+            assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+                f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+                f'must be >= single sequence max length ({args.seq_length})'
+            )
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
@@ -1743,6 +1778,13 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
+    assert not (
+        args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
+    ), (
+        "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
+        "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
+        "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
+    )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -1979,6 +2021,10 @@ def validate_args(args, defaults={}):
     if args.mla_down_proj_fusion:
         assert args.multi_latent_attention, "--mla-down-proj-fusion requires --multi-latent-attention"
 
+    assert (
+        not args.moe_use_norm_before_up_proj or args.moe_latent_size is not None
+    ), "--moe-use-norm-before-up-proj requires --moe-latent-size to be set."
+
     # MoE latent projections
     if args.moe_latent_size is not None:
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
@@ -2196,6 +2242,29 @@ def _add_inference_args(parser):
                        'score = alpha * match + (1 - alpha) * normalized_load. '
                        'Higher alpha favors prefix cache hits; lower alpha '
                        'favors load balance. Default: 0.5.')
+    group.add_argument('--inference-dynamic-batching-media-cache-coordinator-policy',
+                       type=str, default='affinity',
+                       choices=['affinity', 'load_balanced'],
+                       dest='inference_dynamic_batching_media_cache_coordinator_policy',
+                       help='Coordinator routing policy for media caching. '
+                       '"affinity" prefers a rank assigned the same media; '
+                       '"load_balanced" ignores standalone media affinity.')
+    group.add_argument('--inference-dynamic-batching-media-cache-routing-weight',
+                       type=float, default=1.0,
+                       dest='inference_dynamic_batching_media_cache_routing_weight',
+                       help='Media-cache hit weight in equivalent compact-prompt blocks. '
+                       'Default: 1.0.')
+    group.add_argument('--inference-dynamic-batching-vision-embedding-cache-max-bytes',
+                       type=int, default=0,
+                       dest='inference_dynamic_batching_vision_embedding_cache_max_bytes',
+                       help='Maximum GPU bytes retained per engine for reusable vision '
+                       'embeddings. Zero disables the cache. Default: 0.')
+    group.add_argument('--inference-dynamic-batching-allow-stale-multimodal-embeddings',
+                       action='store_true',
+                       dest='inference_dynamic_batching_allow_stale_multimodal_embeddings',
+                       help='Allow request-local and cached multimodal embeddings to survive '
+                       'suspend/resume and generation-epoch changes. Use only when model '
+                       'weights do not change across these boundaries.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
                        type=float, default=None,
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',
@@ -2368,10 +2437,16 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        "max_seqlen_per_dp_cp_rank",
+        "hybrid_context_parallel",
+        "sequence_packing_scheduler",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        "max_seqlen_per_dp_cp_rank",
+        "hybrid_context_parallel",
+        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2847,6 +2922,16 @@ def _add_rl_args(parser):
                              'gloo: use GlooCopyService over CPU; '
                              'nvshmem: use NVSHMEMCopyService; '
                              'nixl: use NixlCopyService.'))
+    group.add_argument(
+        '--refit-execution-batch-bytes',
+        type=int,
+        default=None,
+        help=(
+            'Optional soft per-rank byte limit for ReFIT execution staging. '
+            'The default None preserves one model-wide generic submission and '
+            "NCCL M2N's existing 256 MiB default."
+        ),
+    )
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
@@ -3232,6 +3317,14 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
+    group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
+                       help='Maximum sequence length per CP rank. This is used to calculate the '
+                       'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
+    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
+                       help='Enables hybrid context parallel. This is used to balance the workload '
+                       'of each CP rank when we use packed samples with variable sequence lengths. '
+                       'Requires --max-seqlen-per-dp-cp-rank to be set.')
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
@@ -3781,6 +3874,21 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument('--sft-mock-dataset-config-json', type=str, default=None,
+                       help='This config provides the necessary information for the mock '
+                       'dataset. Accepts either an inline JSON literal or a path to a JSON '
+                       'file containing the same schema. You can either specify a CSV file '
+                       'that contains sequence lengths, where each line stores the length of '
+                       'a sequence, for example: {"mode":"file","path":"/path/to/file"}. '
+                       'Alternatively, you can specify a distribution (currently only '
+                       'supporting lognormal distribution) along with the required '
+                       'parameters, for example, {"mode":"distribution","type":"lognormal",'
+                       '"min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,'
+                       '"lognormal_sigma":1.1}, where sigma controls the variability of the '
+                       'lognormal distribution. If not specified and --mock-data is set, '
+                       'defaults to a lognormal distribution with min_seq_len=seq_length//2, '
+                       'max_seq_len=seq_length, mean_seq_len=seq_length*3//4, '
+                       'lognormal_sigma=1.1.')
     return parser
 
 def _add_logits_distillation_args(parser):

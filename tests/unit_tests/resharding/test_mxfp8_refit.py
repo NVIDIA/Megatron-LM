@@ -3,6 +3,10 @@
 import pytest
 import torch
 
+from megatron.core.resharding.copy_services.base import CopyService
+from megatron.core.resharding.execution import execute_reshard_plan
+from megatron.core.resharding.utils import ReshardPlan, TransferOp
+
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
 
 try:
@@ -476,3 +480,103 @@ class TestMXFP8RefitIntegration:
         expected = MXFP8Tensor.from_bf16(full_weight)
         assert torch.equal(dst_buf.data, expected.data)
         assert torch.equal(dst_buf.scale, expected.scale)
+
+    def test_multi_batch_plan_quantizes_complete_parameters(self):
+        """Each batch assembles every slice before quantizing its MXFP8 parameter."""
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        class LoopbackCopyService(CopyService):
+            requires_process_group_barrier = False
+            supports_multiple_runs_per_plan = True
+
+            def __init__(self):
+                self.sends = []
+                self.recvs = []
+                self.runs = []
+
+            def submit_send(self, src_tensor, dest_rank, task_id=None):
+                self.sends.append((src_tensor.clone(), task_id))
+
+            def submit_recv(self, dest_tensor, src_rank, task_id=None):
+                self.recvs.append((dest_tensor, task_id))
+
+            def run(self):
+                sends_by_id = {task_id: tensor for tensor, task_id in self.sends}
+                self.runs.append([task_id for _, task_id in self.sends])
+                for dest_tensor, task_id in self.recvs:
+                    dest_tensor.copy_(sends_by_id[task_id])
+                self.sends.clear()
+                self.recvs.clear()
+
+        shape = (128, 256)
+        source_weights = {
+            "decoder.first": torch.randn(*shape, dtype=torch.bfloat16, device="cuda"),
+            "decoder.second": torch.randn(*shape, dtype=torch.bfloat16, device="cuda"),
+        }
+        src_module = torch.nn.Module()
+        src_module.add_module("decoder", torch.nn.Module())
+        for name, weight in source_weights.items():
+            src_module.decoder.register_parameter(
+                name.removeprefix("decoder."), torch.nn.Parameter(weight.clone())
+            )
+
+        persistent_buffers = {
+            name.removeprefix("decoder."): MXFP8Tensor.from_bf16(torch.zeros_like(weight))
+            for name, weight in source_weights.items()
+        }
+        transform = MXFP8ReshardTransform(
+            convertible_params=set(source_weights),
+            persistent_buffers=persistent_buffers,
+            buffer_key_prefix="decoder.",
+            convert_on_send=False,
+        )
+
+        send_ops = []
+        recv_ops = []
+        task_id = 0
+        for batch_id, param_name in enumerate(source_weights):
+            for row_slice in (
+                (slice(0, shape[0] // 2), slice(None)),
+                (slice(shape[0] // 2, shape[0]), slice(None)),
+            ):
+                send_ops.append(
+                    TransferOp(
+                        param_name,
+                        peer_rank=0,
+                        is_send=True,
+                        my_slice=row_slice,
+                        peer_slice=row_slice,
+                        task_id=task_id,
+                        batch_id=batch_id,
+                    )
+                )
+                recv_ops.append(
+                    TransferOp(
+                        param_name,
+                        peer_rank=0,
+                        is_send=False,
+                        my_slice=row_slice,
+                        peer_slice=row_slice,
+                        task_id=task_id,
+                        batch_id=batch_id,
+                    )
+                )
+                task_id += 1
+
+        service = LoopbackCopyService()
+        execute_reshard_plan(
+            ReshardPlan(send_ops, recv_ops, num_batches=2),
+            src_module,
+            torch.nn.Module(),
+            service,
+            transform=transform,
+        )
+
+        assert service.runs == [[0, 1], [2, 3]]
+        assert not transform._pending_1d
+        for name, source_weight in source_weights.items():
+            actual = persistent_buffers[name.removeprefix("decoder.")]
+            expected = MXFP8Tensor.from_bf16(source_weight)
+            assert torch.equal(actual.data, expected.data)
+            assert torch.equal(actual.scale, expected.scale)
