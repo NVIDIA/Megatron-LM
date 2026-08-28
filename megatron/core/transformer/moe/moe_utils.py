@@ -1474,11 +1474,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
                     grad_weight = None
             else:
                 grad_weight = te_general_gemm(
-                    inp.to(ctx.router_dtype),
-                    grad_output,
-                    ctx.router_dtype,
-                    layout="NT",
-                    grad=True,
+                    inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
                 )
                 grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
