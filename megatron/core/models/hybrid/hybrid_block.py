@@ -126,21 +126,19 @@ class HybridStack(MegatronModule):
             ):
                 raise ValueError("Each entry in layer_type_list must be a single layer symbol")
             segment = ''.join(layer_type_list)
-            layer_utils.validate_tp_comm_overlap(config, segment, has_mtp=is_mtp_layer)
             warnings.warn(
                 "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
                 DeprecationWarning,
                 stacklevel=2,
             )
             layer_config_list = validate_segment_layers(segment, config)
-        else:
-            assert layer_config_list is not None
-            for layer_config in layer_config_list:
-                layer_utils.validate_tp_comm_overlap(
-                    layer_config,
-                    layer_utils.get_layer_symbol_from_config(layer_config),
-                    has_mtp=is_mtp_layer,
-                )
+
+        for layer_config in layer_config_list:
+            layer_utils.validate_tp_comm_overlap(
+                layer_config,
+                layer_utils.get_layer_symbol_from_config(layer_config),
+                has_mtp=is_mtp_layer,
+            )
 
         super().__init__(config=config)
         self.pre_process = pre_process
@@ -161,19 +159,13 @@ class HybridStack(MegatronModule):
 
         self._mhc_block_end_plan: Optional[List[bool]] = None
 
-        assert layer_config_list is not None
         self.layer_config_list = layer_config_list
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
-            attention_config_types = (
-                layer_utils.AttentionLayerConfig,
-                layer_utils.DSALayerConfig,
-                layer_utils.MLALayerConfig,
-            )
             layer_layouts = tuple(
                 (
                     layer_config.attention_cp_layout
-                    if type(layer_config) in attention_config_types
+                    if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
                     else layer_config.linear_cp_layout
                 )
                 for layer_config in self.layer_config_list
