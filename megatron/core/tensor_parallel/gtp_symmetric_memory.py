@@ -4,8 +4,9 @@
 
 """GTP symmetric memory: NCCL window registration for GTP communication buffers.
 
-This module keeps one ``ncclMemAlloc``-backed ``torch.cuda.MemPool`` per GTP process
-group. Once ``register_gtp_symm_pool(group)`` registers a pool on its group, PyTorch's
+This module keeps one ``torch.cuda.MemPool`` per GTP process group, backed by the GTP
+VMM allocator (see gtp_vmm_allocator). Once
+``register_gtp_symm_pool(group)`` registers a pool on its group, PyTorch's
 ProcessGroupNCCL hook window-registers every allocation made inside
 ``gtp_symm_pool_ctx(group)``, which lets NCCL run its symmetric / NVLS kernels on
 those buffers.
@@ -28,7 +29,7 @@ from contextlib import AbstractContextManager
 import torch
 import torch.distributed as dist
 
-import megatron.core.nccl_allocator as nccl_allocator
+import megatron.core.tensor_parallel.gtp_vmm_allocator as gtp_vmm_allocator
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -50,12 +51,12 @@ _registered: typing.Dict[str, typing.Any] = {}
 
 
 def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
-    """Return the per-group ``ncclMemAlloc``-backed MemPool, creating it once."""
+    """Return the per-group VMM-backed symmetric MemPool, creating it once."""
     name = group.group_name
     pool = _pools.get(name)
     if pool is None:
-        nccl_allocator.init()
-        pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+        gtp_vmm_allocator.init()
+        pool = gtp_vmm_allocator.create_vmm_mem_pool()
         _pools[name] = pool
     return pool
 
@@ -72,8 +73,8 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
     if not is_torch_min_version("2.9.0a0"):
         raise RuntimeError(
             "[GTP] --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require PyTorch >= 2.9: older "
-            "versions cannot create a symmetric memory pool (create_nccl_mem_pool silently "
-            "falls back to a non-symmetric one, so the reduce-scatter would not be symmetric)."
+            "versions cannot create a symmetric memory pool, so the reduce-scatter would "
+            "not be symmetric."
         )
     pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
@@ -82,7 +83,7 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
     # so the registration below sees an initialized communicator.
     warmup = torch.zeros(1, device=torch.cuda.current_device())
     dist.all_reduce(warmup, group=group)
-    nccl_allocator.register_mem_pool(pool, group, symmetric=True)
+    gtp_vmm_allocator.register_mem_pool(pool, group)
     _registered[group.group_name] = group
     log_single_rank(
         logger,
@@ -221,7 +222,7 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # Deregister while the recycled send buffers are still alive. Their memory keeps
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
-        nccl_allocator.deregister_mem_pool(_pools[name], _registered[name])
+        gtp_vmm_allocator.deregister_mem_pool(_pools[name], _registered[name])
     # Only now drop the buffers and the pools; the windows are gone, so the memory
     # is safe to release.
     symmetric_wgrad_pool.clear()
