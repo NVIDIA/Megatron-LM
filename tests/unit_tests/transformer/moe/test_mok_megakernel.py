@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.transformer.moe.megakernel import parameter_bridge
 from megatron.core.transformer.moe.megakernel.mok import backend as mok_megakernel
+from megatron.core.transformer.moe.megakernel.mok import runtime as mok_runtime
 from megatron.core.transformer.moe.megakernel.mok import weights as mok_weights
 
 
@@ -13,6 +14,46 @@ def _parameter_with_main_grad(shape=(4, 8)):
     param.main_grad = torch.zeros(shape, dtype=torch.float32)
     param.grad_added_to_main_grad = False
     return param
+
+
+def test_gate_up_weight_arguments_split_only_shared_fc1():
+    shared_fc1 = torch.arange(64, dtype=torch.bfloat16).reshape(8, 8)
+    routed_fc1 = object()
+
+    shared_gate, shared_up, routed_gate, routed_up = mok_runtime._gate_up_weight_arguments(
+        shared_fc1, routed_fc1, intermediate_size=4
+    )
+
+    torch.testing.assert_close(shared_gate, shared_fc1[:4])
+    torch.testing.assert_close(shared_up, shared_fc1[4:])
+    assert shared_gate.untyped_storage().data_ptr() == shared_fc1.untyped_storage().data_ptr()
+    assert shared_up.untyped_storage().data_ptr() == shared_fc1.untyped_storage().data_ptr()
+    assert routed_gate is routed_fc1
+    assert routed_up is routed_fc1
+
+
+def test_gate_up_main_grad_arguments_preserve_fc1_aliases():
+    shared_fc1 = torch.zeros((8, 8), dtype=torch.float32)
+    routed_fc1 = torch.zeros((2, 8, 8), dtype=torch.float32)
+    shared_fc2 = torch.zeros((8, 4), dtype=torch.float32)
+    routed_fc2 = torch.zeros((2, 8, 4), dtype=torch.float32)
+    fc1_table = object()
+    fc2_table = object()
+
+    actual, tables = mok_runtime._gate_up_main_grad_arguments(
+        (shared_fc1, routed_fc1, shared_fc2, routed_fc2),
+        (fc1_table, fc2_table),
+        intermediate_size=4,
+    )
+
+    shared_gate, routed_gate, shared_up, routed_up, actual_shared_fc2, actual_routed_fc2 = actual
+    assert shared_gate.untyped_storage().data_ptr() == shared_fc1.untyped_storage().data_ptr()
+    assert shared_up.untyped_storage().data_ptr() == shared_fc1.untyped_storage().data_ptr()
+    assert routed_gate is routed_fc1
+    assert routed_up is routed_fc1
+    assert actual_shared_fc2 is shared_fc2
+    assert actual_routed_fc2 is routed_fc2
+    assert tables == (fc1_table, fc1_table, fc2_table)
 
 
 def test_dummy_weight_gradient_reuses_parameter_storage():
