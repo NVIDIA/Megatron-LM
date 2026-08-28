@@ -229,6 +229,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_layers=self.config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=self.vp_stage,
+                pp_group=self.pg_collection.pp,
+                vp_size=self.config.virtual_pipeline_model_parallel_size,
             )
         )
 
@@ -432,6 +434,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        mtp_input_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
@@ -570,6 +573,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 embedding=self.embedding,
+                mtp_input_mask=mtp_input_mask,
             )
 
         if not self.post_process:
@@ -609,6 +613,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    mtp_input_mask=mtp_input_mask,
+                    metric_avg_group=(
+                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                        or self.pg_collection.dp_cp
+                    ),
                 )
         sequence_parallel_override = False
         if (
