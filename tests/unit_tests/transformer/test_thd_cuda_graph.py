@@ -509,7 +509,7 @@ class TestPadSequenceForThdAliasPreservation:
             b=1,
             sq=8,
             sk=8,
-            device=torch.device("cuda"),
+            device=padded.cu_seqlens_q_padded.device,
             packed_cu_seqlens_q=padded.cu_seqlens_q_padded,
             packed_cu_seqlens_k=padded.cu_seqlens_kv_padded,
             packed_max_seqlen_q=padded.max_seqlen_q,
