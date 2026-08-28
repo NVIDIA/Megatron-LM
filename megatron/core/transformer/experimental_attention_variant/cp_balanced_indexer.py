@@ -31,10 +31,14 @@ removed.)
 
 Triage switch: ``MCORE_DSA_CP_BAL_DEBUG=1`` logs the eligibility decision once.
 
-CUDA-graph contract: graph support is scoped to static pack compositions at PP=1 and is
+CUDA-graph contract: the default mode is scoped to static pack compositions at PP=1 and is
 enforced through ``prebuild_balanced_layouts`` — under CUDA graphs it MUST be called every
 microbatch (as ``pretrain_gpt.get_batch`` does); frontends that skip it lose the
 composition-change detection and are protected only by the in-graph divisibility assert.
+The separate opt-in ``dsa_cp_balance_indexer_graph_dynamic_packs`` mode instead validates
+every padded pack and builds one fixed-capacity, two-hop equal-split A2A route in that hook.
+The same fixed-shape route plan is supplied as CUDA-graph tensor inputs to every DSA layer, so a
+replay can refresh metadata for a different pack without recapturing or repeating route sorts.
 """
 
 import logging
@@ -44,6 +48,9 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+    FUSED_INDEXER_MAX_SAFE_ROWS,
+)
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 logger = logging.getLogger(__name__)
@@ -99,6 +106,27 @@ _ZZ_PACK_OK: dict = {}
 # change must fail loudly there too.
 _SEEN_CU: dict = {}
 
+# A graph-dynamic route is built once per PackedSeqParams in the data-step hook,
+# then flattened into ordinary tensor kwargs for TE CUDA graphs.  Keeping the
+# representation private avoids making feature-specific fields part of the public
+# PackedSeqParams dataclass while still giving every layer a fixed-shape input.
+_GRAPH_DYNAMIC_PLAN_ATTR = "_dsa_cp_balance_graph_plan"
+_GRAPH_DYNAMIC_PLAN_KWARGS = {
+    "validated_cu": "dsa_cp_graph_validated_cu",
+    "pos_head": "dsa_cp_graph_pos_head",
+    "pos_tail": "dsa_cp_graph_pos_tail",
+    "score_cu_q": "dsa_cp_graph_score_cu_q",
+    "score_cu_kv": "dsa_cp_graph_score_cu_kv",
+    "head_offsets": "dsa_cp_graph_head_offsets",
+    "tail_offsets": "dsa_cp_graph_tail_offsets",
+    "output_cu_q": "dsa_cp_graph_output_cu_q",
+    "output_cu_kv": "dsa_cp_graph_output_cu_kv",
+    "output_offsets": "dsa_cp_graph_output_offsets",
+    "src_slot": "dsa_cp_graph_src_slot",
+    "relay_perm": "dsa_cp_graph_relay_perm",
+    "dst_slot": "dsa_cp_graph_dst_slot",
+}
+
 
 def _is_capturing() -> bool:
     """True only while a CUDA stream capture is in progress.
@@ -151,7 +179,16 @@ def _a2a_buf(tag, rows, width, dtype, dev, cp_group, persistent=True):
 
 
 def dispatch_chunks_async(
-    indexer_qr, weights_indexer_cp, cp_group, cp_size, l_local, layout_cache=None, cu_seqlens=None
+    indexer_qr,
+    weights_indexer_cp,
+    cp_group,
+    cp_size,
+    l_local,
+    layout_cache=None,
+    cu_seqlens=None,
+    cu_seqlens_compressed=None,
+    graph_dynamic_packs=False,
+    graph_dynamic_plan=None,
 ):
     """Issue the chunk dispatch as early as possible; returns an opaque handle.
 
@@ -170,6 +207,8 @@ def dispatch_chunks_async(
     - ``"zzr"``: zigzag + prebuilt-route ``all_to_all_single`` — each rank exchanges
       only ~``l_local`` rows; splits/rows come from ``prebuild_balanced_layouts``
       (host ints), so the exchange is CUDA-graph capturable.
+    - ``"gdr"`` / ``"gdr2"``: opt-in replay-dynamic two-hop equal-split A2A;
+      metadata and invocation-owned staging buffers are captured with the graph.
     - ``"ag"``: zigzag fallback — no usable routed plan (never prebuilt, capacity
       mismatch, or plan lacks route fields): one static-shape S-row AllGather of the
       merged payload; row selection is deferred to consume time.
@@ -179,6 +218,17 @@ def dispatch_chunks_async(
     """
     if cp_size <= 1:
         return None
+    if graph_dynamic_packs:
+        return _graph_dynamic_dispatch_chunks_async(
+            indexer_qr,
+            weights_indexer_cp,
+            cu_seqlens,
+            cu_seqlens_compressed,
+            cp_group,
+            cp_size,
+            l_local,
+            graph_dynamic_plan,
+        )
     q_lora = indexer_qr.shape[-1]
     n_heads = weights_indexer_cp.shape[-1]
     # Detached: the dispatch feeds only the integer top-k; no gradient flows back.
@@ -561,6 +611,357 @@ def _zigzag_plan(cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, la
     return plan
 
 
+def _segmented_rank(key: torch.Tensor, tie: torch.Tensor) -> torch.Tensor:
+    """Return each element's zero-based rank among equal ``key`` values.
+
+    This is deliberately a fixed-shape tensor program. In particular it avoids
+    ``nonzero``/masked selection and host reads, so data preparation can build a
+    same-shaped source plan for every pack and copy it into TE's replay inputs.
+    """
+    count = key.numel()
+    order = torch.argsort(key * (count + 1) + tie)
+    sorted_key = key.index_select(0, order)
+    positions = torch.arange(count, dtype=torch.long, device=key.device)
+    is_start = torch.cat(
+        (torch.ones((1,), dtype=torch.bool, device=key.device), sorted_key[1:] != sorted_key[:-1])
+    )
+    group_start = torch.cummax(
+        torch.where(is_start, positions, torch.zeros_like(positions)), dim=0
+    ).values
+    rank_sorted = positions - group_start
+    result = torch.empty_like(rank_sorted)
+    result.scatter_(0, order, rank_sorted)
+    return result
+
+
+def _graph_dynamic_zigzag_plan(cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev):
+    """Build zigzag scoring and fixed-capacity A2A metadata for one pack.
+
+    This ordinary CUDA tensor program runs once in the data-step prebuild, not once
+    per DSA layer.  Its fixed-shape outputs are passed to TE graphs as replay inputs.
+    The two-hop route uses an equal ``all_to_all_single`` at both hops: each peer
+    block has ``C = min(L, floor(L/N) + N - 1)`` rows and every rank sends
+    ``R = N*C`` rows per hop.  ``C`` is sufficient for every permutation with
+    source/destination row sums ``L``; unused slots are completed into a full relay
+    permutation, which makes the exact reverse route fixed-shape as well.
+    """
+    N = cp_size
+    L = l_local
+    half = L // 2
+    S = N * L
+    nch = 2 * N
+    cu = cu_seqlens.reshape(-1)
+    dt = cu.dtype
+
+    # Prebuild rejects these conditions before creating a replay source plan.
+    # Keep tensor-side assertions here as a fail-closed boundary for direct
+    # callers of this builder; replay separately checks the plan's validated_cu
+    # snapshot against the refreshed graph input.
+    seq_lens = cu[1:] - cu[:-1]
+    torch._assert_async(cu[0] == 0)
+    torch._assert_async((seq_lens >= 0).all())
+    torch._assert_async(cu[-1] == S)
+    torch._assert_async((seq_lens % nch == 0).all())
+
+    # Per-sequence zigzag ownership for ALL destination ranks, in the scorer's
+    # [all heads | all tails] row order.  Eligibility and the fixed physical
+    # capacity are checked by prebuild_balanced_layouts before every replay.
+    starts = torch.cat((cu[:-1], cu[-1:]))
+    ends = torch.cat((cu[1:], torch.full_like(cu[:1], S)))
+    chunks = torch.div(ends - starts, nch, rounding_mode="floor")
+    torch._assert_async(2 * chunks.sum() == L)
+    base = _excl_cumsum(chunks)
+    rows = torch.arange(half, dtype=dt, device=dev)
+    seg_id = torch.bucketize(rows, base[1:], right=True).clamp_max(starts.shape[0] - 1)
+    off = rows - base.index_select(0, seg_id)
+    starts_by_row = starts.index_select(0, seg_id)
+    chunks_by_row = chunks.index_select(0, seg_id)
+    ranks = torch.arange(N, dtype=dt, device=dev).view(N, 1)
+    ordered_all = torch.cat(
+        (
+            starts_by_row.view(1, half) + ranks * chunks_by_row.view(1, half) + off,
+            starts_by_row.view(1, half) + (nch - 1 - ranks) * chunks_by_row.view(1, half) + off,
+        ),
+        dim=1,
+    ).long()
+
+    # Build the two-hop route for the global permutation O[d, v].  ``src_slot``
+    # scatters this source rank's L rows into relay blocks; ``dst_slot`` gathers
+    # this destination rank's L rows after hop 2.  ``relay_perm`` is a full
+    # permutation of [0, R), including padding-to-padding completion.
+    E = N * L
+    edge = torch.arange(E, dtype=torch.long, device=dev)
+    dst = torch.div(edge, L, rounding_mode="floor")
+    global_row = ordered_all.reshape(E)
+    src = torch.div(global_row, L, rounding_mode="floor")
+    edge_rank = _segmented_rank(src * N + dst, edge)
+    relay = torch.remainder(edge_rank, N)
+    src_relay_rank = _segmented_rank(src * N + relay, edge)
+
+    C = min(L, L // N + N - 1)
+    R = N * C
+    relay_input = src * C + src_relay_rank
+    src_send_slot = relay * C + src_relay_rank
+    relay_dst_rank = _segmented_rank(relay * N + dst, relay_input)
+    relay_output = dst * C + relay_dst_rank
+    dst_recv_slot = relay * C + relay_dst_rank
+
+    src_slots_all = torch.empty((E,), dtype=torch.long, device=dev)
+    src_slots_all.scatter_(0, global_row, src_send_slot)
+    src_slot = src_slots_all.view(N, L)[r]
+    dst_slot = dst_recv_slot.view(N, L)[r]
+
+    relay_valid = torch.full((N * R,), -1, dtype=torch.long, device=dev)
+    relay_valid.scatter_(0, relay * R + relay_output, relay_input)
+    relay_valid = relay_valid.view(N, R)
+    valid_input = torch.zeros((N * R,), dtype=torch.bool, device=dev)
+    valid_input.scatter_(0, relay * R + relay_input, True)
+    valid_input = valid_input.view(N, R)
+    valid_output = relay_valid >= 0
+    positions = torch.arange(R, dtype=torch.long, device=dev).expand(N, R)
+    # Unused relay inputs sort first.  Their order is paired one-for-one with
+    # unused output positions to complete a genuine permutation.
+    padding_inputs = torch.argsort(valid_input.long() * R + positions, dim=1)
+    padding_output_rank = torch.cumsum(~valid_output, dim=1) - 1
+    padding_fill = torch.take_along_dim(padding_inputs, padding_output_rank.clamp_min(0), dim=1)
+    relay_perm = torch.where(valid_output, relay_valid, padding_fill)[r]
+
+    # Dynamic scoring metadata for this rank.  Score widths and K slices remain
+    # conservative/static in the consumer; only these fixed-shape tensor values
+    # change with the pack composition.
+    gather_idx = ordered_all[r]
+    pos_head = r * chunks_by_row + off
+    pos_tail = (nch - 1 - r) * chunks_by_row + off
+    real_end = cu[-1]
+    pos_head = torch.where(gather_idx[:half] < real_end, pos_head, torch.zeros_like(pos_head))
+    pos_tail = torch.where(gather_idx[half:] < real_end, pos_tail, torch.zeros_like(pos_tail))
+    cu_comp = cu_seqlens_compressed.reshape(-1)
+    comp_pad = torch.cat((cu_comp, cu_comp[-1:]))
+    cu_q = torch.cat((torch.zeros_like(chunks[:1]), torch.cumsum(chunks, 0))).to(dt)
+    head_offsets = (r * chunks).to(dt)
+    tail_offsets = ((nch - 1 - r) * chunks).to(dt)
+
+    # Contiguous output layout for this CP rank.  It is composition metadata too,
+    # so build it once with the route instead of recording its cumsum in every
+    # DSA layer graph.
+    global_start = r * L
+    global_end = global_start + L
+    local_starts = cu[:-1].clamp_min(global_start)
+    local_ends = cu[1:].clamp_max(global_end)
+    q_lens = (local_ends - local_starts).clamp_min(0)
+    q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
+    zero = torch.zeros((1,), dtype=dt, device=dev)
+    padding_q = (global_end - cu[-1].clamp_min(global_start)).clamp_min(0)
+    output_cu_q = torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1)))
+    output_offsets = torch.cat((torch.where(q_lens > 0, local_starts - cu[:-1], 0), zero))
+    plan = {
+        # A private snapshot, rather than an alias of the frontend's cu tensor.
+        # The consumer compares it with the replay cu input, catching a frontend
+        # that updates cu_seqlens but accidentally reuses stale route metadata.
+        "validated_cu": cu.clone(),
+        "gather_idx": gather_idx,
+        "pos_head": pos_head.int(),
+        "pos_tail": pos_tail.int(),
+        "score_cu_q": cu_q,
+        "score_cu_kv": comp_pad,
+        "head_offsets": head_offsets,
+        "tail_offsets": tail_offsets,
+        "output_cu_q": output_cu_q,
+        "output_cu_kv": comp_pad,
+        "output_offsets": output_offsets,
+        "head_layout": (cu_q, comp_pad, head_offsets),
+        "tail_layout": (cu_q, comp_pad, tail_offsets),
+        "output_layout": (output_cu_q, comp_pad, output_offsets),
+        "half": half,
+        "src_slot": src_slot,
+        "relay_perm": relay_perm,
+        "dst_slot": dst_slot,
+        "route_rows": R,
+    }
+    return plan
+
+
+def _validate_graph_dynamic_capacity(capacity, cp_size):
+    """Validate the fixed physical capacity shared by every graph replay."""
+    if cp_size <= 1:
+        raise ValueError(
+            "graph-dynamic balanced CP route requires cp_size greater than one "
+            f"(cp_size={cp_size})."
+        )
+    if capacity <= 0 or capacity % cp_size != 0:
+        raise ValueError(
+            "graph-dynamic balanced CP route capacity must be positive and divisible "
+            f"by cp_size (capacity={capacity}, cp_size={cp_size})."
+        )
+    l_local = capacity // cp_size
+    if l_local % 2 != 0:
+        raise ValueError(
+            "graph-dynamic balanced CP route requires an even per-rank capacity "
+            f"(capacity={capacity}, cp_size={cp_size}, l_local={l_local})."
+        )
+    if l_local // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
+        raise RuntimeError(
+            f"graph-dynamic balanced CP indexer: per-rank pack capacity {l_local} would "
+            f"issue fused calls of {l_local // 2} rows, above the verified-safe limit "
+            f"of {FUSED_INDEXER_MAX_SAFE_ROWS}. Increase CP or reduce padded capacity."
+        )
+    return l_local
+
+
+def build_graph_dynamic_plan(cu_seqlens, cp_group, capacity):
+    """Build and return one graph-input route plan for the current microbatch.
+
+    The data-step hook calls this exactly once per ``PackedSeqParams``. All DSA
+    layers then consume this source plan through their TE input surfaces, avoiding
+    composition-dependent Python caches as well as repeated in-graph sorting.
+    """
+    cu = cu_seqlens.reshape(-1)
+    cp_size = cp_group.size()
+    if cu.numel() < 2:
+        raise ValueError("graph-dynamic balanced CP route requires at least one sequence.")
+    l_local = _validate_graph_dynamic_capacity(capacity, cp_size)
+    compressed_lens = torch.div(cu[1:] - cu[:-1], 4, rounding_mode="floor")
+    cu_compressed = torch.cat(
+        (torch.zeros_like(cu[:1]), torch.cumsum(compressed_lens, dim=0, dtype=torch.int32))
+    )
+    with torch.no_grad():
+        return _graph_dynamic_zigzag_plan(
+            cu, cu_compressed, cp_size, l_local, cp_group.rank(), cu.device
+        )
+
+
+def attach_graph_dynamic_plan(packed_seq_params, plan):
+    """Attach an invocation-owned graph route without publishing process-global state."""
+    setattr(packed_seq_params, _GRAPH_DYNAMIC_PLAN_ATTR, plan)
+
+
+def get_graph_dynamic_plan(packed_seq_params):
+    """Return the per-pack graph route, or ``None`` when the frontend did not prebuild it."""
+    return getattr(packed_seq_params, _GRAPH_DYNAMIC_PLAN_ATTR, None)
+
+
+def copy_graph_dynamic_plan_(destination, source):
+    """Refresh an already-captured plan's tensor surfaces from another pack."""
+    destination_plan = get_graph_dynamic_plan(destination)
+    source_plan = get_graph_dynamic_plan(source)
+    if destination_plan is None or source_plan is None:
+        raise RuntimeError("both packs must have prebuilt graph-dynamic balanced CP routes")
+    with torch.no_grad():
+        for key in _GRAPH_DYNAMIC_PLAN_KWARGS:
+            destination_plan[key].copy_(source_plan[key])
+
+
+def add_graph_dynamic_plan_to_kwargs(packed_seq_params, kwargs, *, required=False):
+    """Flatten a route plan into tensor-only TE CUDA graph kwargs."""
+    plan = get_graph_dynamic_plan(packed_seq_params)
+    if plan is None:
+        if required:
+            raise RuntimeError(
+                "graph-dynamic balanced CP indexer is missing its per-pack route. "
+                "The frontend must call prebuild_balanced_layouts before model forward."
+            )
+        return
+    for plan_key, kwarg_key in _GRAPH_DYNAMIC_PLAN_KWARGS.items():
+        kwargs[kwarg_key] = plan[plan_key]
+
+
+def pop_graph_dynamic_plan_from_kwargs(kwargs, cp_size, l_local):
+    """Reconstruct a route plan from TE CUDA graph tensor kwargs."""
+    first_key = next(iter(_GRAPH_DYNAMIC_PLAN_KWARGS.values()))
+    if first_key not in kwargs:
+        return None
+    missing = [name for name in _GRAPH_DYNAMIC_PLAN_KWARGS.values() if name not in kwargs]
+    if missing:
+        raise RuntimeError(
+            "incomplete graph-dynamic balanced CP route kwargs: " + ", ".join(missing)
+        )
+    plan = {
+        plan_key: kwargs.pop(kwarg_key)
+        for plan_key, kwarg_key in _GRAPH_DYNAMIC_PLAN_KWARGS.items()
+    }
+    plan["half"] = l_local // 2
+    plan["route_rows"] = cp_size * min(l_local, l_local // cp_size + cp_size - 1)
+    plan["head_layout"] = (plan["score_cu_q"], plan["score_cu_kv"], plan["head_offsets"])
+    plan["tail_layout"] = (plan["score_cu_q"], plan["score_cu_kv"], plan["tail_offsets"])
+    plan["output_layout"] = (plan["output_cu_q"], plan["output_cu_kv"], plan["output_offsets"])
+    return plan
+
+
+def add_graph_dynamic_plan_static_inputs(static_inputs, cu_seqlens, cp_group, capacity):
+    """Add a valid full-capacity sample route to a layer's TE capture inputs."""
+    plan = build_graph_dynamic_plan(cu_seqlens, cp_group, capacity)
+    for plan_key, kwarg_key in _GRAPH_DYNAMIC_PLAN_KWARGS.items():
+        static_inputs[kwarg_key] = plan[plan_key]
+
+
+def _graph_dynamic_dispatch_chunks_async(
+    indexer_qr,
+    weights_indexer_cp,
+    cu_seqlens,
+    cu_seqlens_compressed,
+    cp_group,
+    cp_size,
+    l_local,
+    plan,
+):
+    """Dispatch through the replay-dynamic two-hop fixed-capacity route."""
+    if cu_seqlens is None or cu_seqlens_compressed is None or plan is None:
+        raise RuntimeError(
+            "graph-dynamic balanced CP indexer requires padded cu_seqlens, "
+            "cu_seqlens_compressed, and a prebuilt per-pack graph route."
+        )
+    q_lora = indexer_qr.shape[-1]
+    n_heads = weights_indexer_cp.shape[-1]
+    q2 = indexer_qr.detach().reshape(l_local, q_lora)
+    w2 = weights_indexer_cp.detach().reshape(l_local, n_heads)
+    replay_cu = cu_seqlens.reshape(-1)
+    torch._assert_async((plan["validated_cu"] == replay_cu).all())
+    torch._assert_async(replay_cu[-1] == cp_size * l_local)
+    R = plan["route_rows"]
+
+    def _launch(payload):
+        width = payload.shape[-1]
+        # These buffers intentionally have invocation/graph-slot ownership.  An
+        # allocation recorded during capture belongs to that graph's private pool;
+        # publishing it through the process-global _A2A_BUF would make graph slots
+        # alias and could leave dangling pointers after re-recording.
+        # Only ``src_slot`` rows carry real payload.  Every remaining row stays
+        # on the padding-only side of the completed relay permutation, so its
+        # value is never observed by a destination row.  Avoid zero-filling the
+        # potentially large fixed-capacity staging buffer on every replay.
+        send1 = torch.empty((R, width), dtype=payload.dtype, device=payload.device)
+        send1.index_copy_(0, plan["src_slot"], payload)
+        recv1 = torch.empty_like(send1)
+        work = dist.all_to_all_single(recv1, send1, group=cp_group, async_op=True)
+        return work, send1, recv1
+
+    if q2.dtype == w2.dtype:
+        payload = torch.empty((l_local, q_lora + n_heads), dtype=q2.dtype, device=q2.device)
+        payload[:, :q_lora].copy_(q2)
+        payload[:, q_lora:].copy_(w2)
+        work, send1, recv1 = _launch(payload)
+        return {
+            "kind": "gdr",
+            "works": [work],
+            "recv1": recv1,
+            "send1": send1,
+            "plan": plan,
+            "q_lora": q_lora,
+        }
+    work_q, send_q, recv_q = _launch(q2)
+    work_w, send_w, recv_w = _launch(w2)
+    return {
+        "kind": "gdr2",
+        "works": [work_q, work_w],
+        "recv_q": recv_q,
+        "recv_w": recv_w,
+        "send_q": send_q,
+        "send_w": send_w,
+        "plan": plan,
+        "q_lora": q_lora,
+    }
+
+
 def balanced_compute_cp_indexer_topk(
     indexer_qr,  # [l_local, 1, q_lora]  detached indexer qr (pre-projection)
     weights_indexer_cp,  # [l_local, n_heads]    already-scaled indexer weights
@@ -580,6 +981,7 @@ def balanced_compute_cp_indexer_topk(
     use_fused=True,
     dispatch_handle=None,
     layout_cache=None,
+    graph_dynamic_packs=False,
 ):
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
@@ -596,6 +998,12 @@ def balanced_compute_cp_indexer_topk(
     """
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
+    if graph_dynamic_packs:
+        # Defensive even for direct callers: the opt-in path has no host route/layout
+        # cache contract. All composition-dependent tensors come from the current
+        # invocation's prebuilt source plan and are supplied as graph inputs.
+        layout_cache = None
+
     q_lora = indexer_qr.shape[-1]
     n_heads, head_dim = indexer.index_n_heads, indexer.index_head_dim
     pos_dim = indexer.qk_pos_emb_head_dim
@@ -604,10 +1012,40 @@ def balanced_compute_cp_indexer_topk(
     comp = int(k_seq_major.shape[0])
     S = cp_size * l_local
     r = cp_group.rank()
+    graph_plan = None
+    if graph_dynamic_packs:
+        if dispatch_handle is None or dispatch_handle.get("kind") not in ("gdr", "gdr2"):
+            raise RuntimeError(
+                "graph-dynamic balanced CP indexer requires its prebuilt dynamic dispatch handle."
+            )
+        graph_plan = dispatch_handle["plan"]
 
     # Contiguous layout for the return value: downstream builds indices from it plus the (balanced,
     # re-contiguous) top-k, so it is identical to the reference path.
     def _layout_at(gs_, rows_):
+        if graph_dynamic_packs:
+            if gs_ == int(global_start) and rows_ == l_local:
+                return graph_plan["output_layout"]
+            # Do not call cp_utils._build_cp_indexer_layout here: that helper is
+            # torch.compile'd, while this opt-in path intentionally records only
+            # ordinary CUDA ops (the controlled GB200 toy exposed an Inductor
+            # miscompile for the replay-dynamic builder). Degenerate subrange calls
+            # still build their one-off layout here; the normal full-rank layout is
+            # part of the per-pack source plan above.
+            global_end = gs_ + rows_
+            cu_q = cu_seqlens.reshape(-1)
+            cu_comp = cu_seqlens_compressed.reshape(-1)
+            zero = torch.zeros((1,), dtype=cu_q.dtype, device=cu_q.device)
+            local_starts = cu_q[:-1].clamp_min(gs_)
+            local_ends = cu_q[1:].clamp_max(global_end)
+            q_lens = (local_ends - local_starts).clamp_min(0)
+            q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
+            padding_q = (global_end - cu_q[-1].clamp_min(gs_)).clamp_min(0)
+            return (
+                torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1))),
+                torch.cat((cu_comp, cu_comp[-1:])),
+                torch.cat((torch.where(q_lens > 0, local_starts - cu_q[:-1], 0), zero)),
+            )
         # cu_seqlens is fixed for a microbatch, so layouts depend only on (offset, rows);
         # layout_cache (scoped to the microbatch's PackedSeqParams) reuses them across layers.
         if layout_cache is not None:
@@ -742,7 +1180,10 @@ def balanced_compute_cp_indexer_topk(
     if dispatch_handle is None:
         _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
     # ---- Per-sequence zigzag: exact balance for any pack composition -------------
-    if dispatch_handle is not None and dispatch_handle.get("kind") == "zzr":
+    if graph_dynamic_packs:
+        # Per-pack tensor-input plan: never consult layout_cache/_LAST_PLAN here.
+        plan = graph_plan
+    elif dispatch_handle is not None and dispatch_handle.get("kind") == "zzr":
         plan = dispatch_handle["plan"]
     else:
         plan = (layout_cache or {}).get(("zigzag", r))
@@ -801,8 +1242,8 @@ def balanced_compute_cp_indexer_topk(
     # max_seqlen_q (frontends may leave it unset/tensor-valued), so it stays
     # conservative. Both exceed every row's causal need; only buffer size
     # differs.
-    mkv_h = int(plan.get("mkv_head", gkv))
-    mkv_t = int(plan.get("mkv_tail", gkv))
+    mkv_h = gkv if graph_dynamic_packs else int(plan.get("mkv_head", gkv))
+    mkv_t = gkv if graph_dynamic_packs else int(plan.get("mkv_tail", gkv))
     k_rows_total = k_seq_major.shape[0]
     # Host-int invariants (free): a plan's K-slice end can never exceed the
     # physical K buffer of the pack it was built for, and a prebuilt plan must
@@ -851,7 +1292,40 @@ def balanced_compute_cp_indexer_topk(
     if dispatch_handle is not None:
         for work in dispatch_handle["works"]:
             work.wait()
-        if dispatch_handle["kind"] == "zzr":
+        # The async collectives have consumed their send tensors.  Drop those
+        # references before allocating the second hop/scoring buffers so the
+        # CUDA graph pool can reuse their storage during capture and replay.
+        dispatch_handle["works"].clear()
+        if dispatch_handle["kind"] == "gdr":
+            qlw = dispatch_handle["q_lora"]
+            dispatch_handle.pop("send1", None)
+            recv1 = dispatch_handle.pop("recv1")
+            send2 = torch.index_select(recv1, 0, plan["relay_perm"])
+            recv2 = torch.empty_like(send2)
+            dist.all_to_all_single(recv2, send2, group=cp_group)
+            rows = torch.index_select(recv2, 0, plan["dst_slot"])
+            qr_h, w_h = rows[:half, :qlw].contiguous(), rows[:half, qlw:].contiguous()
+            qr_t, w_t = rows[half:, :qlw].contiguous(), rows[half:, qlw:].contiguous()
+            del recv1, send2, recv2, rows
+        elif dispatch_handle["kind"] == "gdr2":
+            dispatch_handle.pop("send_q", None)
+            dispatch_handle.pop("send_w", None)
+            first_q = dispatch_handle.pop("recv_q")
+            send_q = torch.index_select(first_q, 0, plan["relay_perm"])
+            recv_q = torch.empty_like(send_q)
+            dist.all_to_all_single(recv_q, send_q, group=cp_group)
+            qh = torch.index_select(recv_q, 0, plan["dst_slot"])
+            qr_h, qr_t = qh[:half].contiguous(), qh[half:].contiguous()
+            del first_q, send_q, recv_q, qh
+
+            first_w = dispatch_handle.pop("recv_w")
+            send_w = torch.index_select(first_w, 0, plan["relay_perm"])
+            recv_w = torch.empty_like(send_w)
+            dist.all_to_all_single(recv_w, send_w, group=cp_group)
+            wh = torch.index_select(recv_w, 0, plan["dst_slot"])
+            w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
+            del first_w, send_w, recv_w, wh
+        elif dispatch_handle["kind"] == "zzr":
             qlw = dispatch_handle["q_lora"]
             recv = dispatch_handle["recv"]
             rows = torch.empty_like(recv)
@@ -884,21 +1358,49 @@ def balanced_compute_cp_indexer_topk(
         w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
     nvtx_range_pop("Bal_Dispatch")
 
+    if graph_dynamic_packs:
+        head_layout = (plan["score_cu_q"], plan["score_cu_kv"], plan["head_offsets"])
+        tail_layout = (plan["score_cu_q"], plan["score_cu_kv"], plan["tail_offsets"])
+    else:
+        head_layout, tail_layout = plan["head_layout"], plan["tail_layout"]
+
     nvtx_range_push("BalancedIndexerScore")
     nvtx_range_push("Bal_Head")
-    tk_head = _packed_topk(qr_h, w_h, plan["head_layout"], plan["pos_head"], k_h, mkv_h)
+    tk_head = _packed_topk(qr_h, w_h, head_layout, plan["pos_head"], k_h, mkv_h)
+    del qr_h, w_h
     nvtx_range_pop("Bal_Head")
     nvtx_range_push("Bal_Tail")
-    tk_tail = _packed_topk(qr_t, w_t, plan["tail_layout"], plan["pos_tail"], k_t, mkv_t)
+    tk_tail = _packed_topk(qr_t, w_t, tail_layout, plan["pos_tail"], k_t, mkv_t)
+    del qr_t, w_t
     nvtx_range_pop("Bal_Tail")
     nvtx_range_pop("BalancedIndexerScore")
 
     nvtx_range_push("Bal_Combine")
     tkw = tk_head.shape[-1]
-    ht = _a2a_buf("zz_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
-    ht[:half].copy_(tk_head)
-    ht[half:].copy_(tk_tail)
-    if "cmb_send_rows" in plan:
+    if graph_dynamic_packs:
+        # Exact reverse of the two equal-split dispatch hops.
+        send1 = torch.empty((plan["route_rows"], tkw), dtype=tk_head.dtype, device=tk_head.device)
+        send1.index_copy_(0, plan["dst_slot"][:half], tk_head)
+        send1.index_copy_(0, plan["dst_slot"][half:], tk_tail)
+        del tk_head, tk_tail
+        recv1 = torch.empty_like(send1)
+        dist.all_to_all_single(recv1, send1, group=cp_group)
+        del send1
+        # relay_perm is a full permutation, including padding-to-padding
+        # completion, so index_copy_ initializes every row.
+        send2 = torch.empty_like(recv1)
+        send2.index_copy_(0, plan["relay_perm"], recv1)
+        del recv1
+        recv2 = torch.empty_like(send2)
+        dist.all_to_all_single(recv2, send2, group=cp_group)
+        del send2
+        compressed_topk = torch.index_select(recv2, 0, plan["src_slot"])
+        del recv2
+    else:
+        ht = _a2a_buf("zz_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
+        ht[:half].copy_(tk_head)
+        ht[half:].copy_(tk_tail)
+    if not graph_dynamic_packs and "cmb_send_rows" in plan:
         # Route-A2A combine: exact inverse exchange, ~l_local rows per rank.
         send = _a2a_buf("zzr_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
         send.copy_(torch.index_select(ht, 0, plan["cmb_send_rows"]))
@@ -912,7 +1414,7 @@ def balanced_compute_cp_indexer_topk(
         )
         compressed_topk = torch.empty((l_local, tkw), dtype=tk_head.dtype, device=dev)
         compressed_topk.index_copy_(0, plan["cmb_recv_rows"], recv)
-    else:
+    elif not graph_dynamic_packs:
         Z = _a2a_buf("zz_cmb_recv", S, tkw, tk_head.dtype, dev, cp_group, persistent=False)
         dist.all_gather_into_tensor(Z, ht, group=cp_group)
         compressed_topk = torch.index_select(Z, 0, plan["inv_idx"])
@@ -921,7 +1423,12 @@ def balanced_compute_cp_indexer_topk(
 
 
 def prebuild_balanced_layouts(
-    packed_seq_params, cp_group=None, pad_alignment=None, capacity=None, graphs_enabled=False
+    packed_seq_params,
+    cp_group=None,
+    pad_alignment=None,
+    capacity=None,
+    graphs_enabled=False,
+    graph_dynamic_packs=False,
 ):
     """Data-prep-time prebuild of the balanced-indexer zigzag plan and multi-seq gate.
 
@@ -952,8 +1459,21 @@ def prebuild_balanced_layouts(
         return
     N, r = cp_group.size(), cp_group.rank()
     cu = cu.reshape(-1)
-    total = int(cu[-1].item())
-    if capacity is not None and 0 < total < capacity:
+    if graph_dynamic_packs and cu.numel() < 2:
+        raise ValueError(
+            "graph-dynamic balanced CP indexer requires cu_seqlens for at least one sequence."
+        )
+    metadata_total = int(cu[-1].item())
+    if graph_dynamic_packs:
+        if capacity is None:
+            raise ValueError(
+                "graph-dynamic balanced CP indexer requires an explicit fixed physical "
+                "capacity from the graph configuration."
+            )
+        total = int(capacity)
+    else:
+        total = metadata_total
+    if not graph_dynamic_packs and capacity is not None and 0 < total < capacity:
         # Middle-PP-stage PackedSeqParams carry the raw (unpadded) cu while the
         # hidden states are padded: probe and build at the PHYSICAL pack size.
         # Under graphs the pack is padded to the full target capacity; in eager
@@ -970,7 +1490,44 @@ def prebuild_balanced_layouts(
             capacity = min(capacity, per_rank * N)
         if total < capacity:
             total = capacity
-    l_local = total // N if total > 0 else 0
+    if graph_dynamic_packs:
+        l_local = _validate_graph_dynamic_capacity(total, N)
+    else:
+        l_local = total // N if total > 0 else 0
+
+    if graph_dynamic_packs:
+        # The opt-in graph path validates and builds one invocation-owned tensor
+        # plan here. It deliberately publishes neither a host layout cache nor a
+        # module-level verdict; TE receives the source plan through fixed-shape
+        # per-callable input surfaces.
+        cu_list_dynamic = [int(v) for v in cu.tolist()]
+        if cu_list_dynamic[0] != 0:
+            raise ValueError(
+                "graph-dynamic balanced CP indexer requires cu_seqlens to start at zero."
+            )
+        if any(e < s for s, e in zip(cu_list_dynamic[:-1], cu_list_dynamic[1:])):
+            raise ValueError("graph-dynamic balanced CP indexer requires monotonic cu_seqlens.")
+        if metadata_total != total:
+            raise ValueError(
+                "graph-dynamic balanced CP indexer requires padded cu_seqlens to end at "
+                f"the fixed physical capacity ({total}), got {metadata_total}."
+            )
+        seq_lens_dynamic = [e - s for s, e in zip(cu_list_dynamic[:-1], cu_list_dynamic[1:])] + [
+            total - cu_list_dynamic[-1]
+        ]
+        nch = 2 * N
+        if any(sl % nch for sl in seq_lens_dynamic):
+            raise ValueError(
+                "graph-dynamic balanced CP indexer cannot fall back during replay: every "
+                "padded sequence length and the capacity tail must be divisible by "
+                f"2 * cp_size = {nch} (l_local={l_local}, total={total})."
+            )
+        # Build exactly once per microbatch.  The resulting fixed-shape tensors
+        # become replay inputs to every captured DSA layer; no route builder or
+        # composition-dependent host cache lives inside an attention graph.
+        attach_graph_dynamic_plan(packed_seq_params, build_graph_dynamic_plan(cu, cp_group, total))
+        return
+
     gkey = (_group_key(cp_group), l_local)
 
     def _stash_verdict(ok):
@@ -1052,14 +1609,10 @@ def prebuild_balanced_layouts(
     # ineligible pack above the limit routes to the reference path. That legacy
     # path preserves its fused behavior and emits the shared backend warning, so
     # this balanced-only prebuild must not reject it here.
-    from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
-        FUSED_INDEXER_MAX_SAFE_ROWS,
-    )
-
     if l_local // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
         # The balanced path scores two packed fused calls of l_local // 2 rows each;
         # above this bound the fused kernel package silently corrupts rows >= 32768
-        # (see FUSED_INDEXER_MAX_SAFE_ROWS in cp_utils.py). Fail at data-prep time
+        # (see FUSED_INDEXER_MAX_SAFE_ROWS in dsa_fused_safety.py). Fail at data-prep time
         # with the remedy rather than at the first forward.
         raise RuntimeError(
             f"balanced CP indexer: per-rank pack capacity {l_local} would issue fused "

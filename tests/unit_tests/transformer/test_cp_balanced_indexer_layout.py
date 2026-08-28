@@ -24,8 +24,14 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
     _ZZ_PACK_OK,
     _ensure_pack_zigzag_ok,
+    _graph_dynamic_zigzag_plan,
     _zigzag_plan,
+    add_graph_dynamic_plan_to_kwargs,
+    build_graph_dynamic_plan,
+    copy_graph_dynamic_plan_,
+    get_graph_dynamic_plan,
     pack_eligible_for_zigzag,
+    pop_graph_dynamic_plan_from_kwargs,
     prebuild_balanced_layouts,
 )
 
@@ -39,6 +45,16 @@ _CASES = [
     ("uneq-2seq-cp32", [0, 163840, 262144], 32, _S),
     ("small", [0, 1024, 3072, 4096], 4, 4096),
     ("odd-cp3", [0, 1536, 4608], 3, 4608),
+]
+
+_GRAPH_DYNAMIC_ROUTE_CASES = [
+    # Keep the O(N*L log(N*L)) fixed-shape builder unit cases intentionally
+    # small; production-scale CUDA coverage lives in the GB200 graph test.
+    ("single", [0, 96], 4, 96),
+    ("unequal", [0, 16, 48, 96], 4, 96),
+    ("padded-tail-segment", [0, 64, 96], 4, 96),
+    ("fixed-entry-padding", [0, 16, 48, 96, 96, 96], 4, 96),
+    ("odd-cp3", [0, 24, 72], 3, 72),
 ]
 
 
@@ -177,6 +193,232 @@ def _sim_all_to_all(sends, in_splits_all):
             offs.append(offs[-1] + s)
         chunks.append([sends[r][offs[d] : offs[d + 1]] for d in range(n)])
     return [torch.cat([chunks[s][r] for s in range(n)]) for r in range(n)]
+
+
+def _sim_equal_all_to_all(sends, peer_rows):
+    """CPU emulation of equal-split all_to_all_single."""
+    n = len(sends)
+    return [
+        torch.cat([send[d * peer_rows : (d + 1) * peer_rows] for send in sends]) for d in range(n)
+    ]
+
+
+def _graph_dynamic_host_oracle(cu_list, cp_size, rank, capacity):
+    """Independent Python expansion of zigzag rows and synthetic scorer metadata."""
+    starts = list(cu_list[:-1]) + [cu_list[-1]]
+    ends = list(cu_list[1:]) + [capacity]
+    chunks = [(end - start) // (2 * cp_size) for start, end in zip(starts, ends)]
+    heads, tails, pos_head, pos_tail = [], [], [], []
+    for start, chunk in zip(starts, chunks):
+        heads.extend(range(start + rank * chunk, start + (rank + 1) * chunk))
+        tail_chunk = 2 * cp_size - 1 - rank
+        tails.extend(range(start + tail_chunk * chunk, start + (tail_chunk + 1) * chunk))
+        pos_head.extend(range(rank * chunk, (rank + 1) * chunk))
+        pos_tail.extend(range(tail_chunk * chunk, (tail_chunk + 1) * chunk))
+
+    cu_q = [0]
+    for chunk in chunks:
+        cu_q.append(cu_q[-1] + chunk)
+    cu_comp = _comp_cu(torch.tensor(cu_list, dtype=torch.int32))
+    comp_pad = torch.cat((cu_comp, cu_comp[-1:]))
+    return {
+        "gather_idx": torch.tensor(heads + tails, dtype=torch.long),
+        "pos_head": torch.tensor(pos_head, dtype=torch.int32),
+        "pos_tail": torch.tensor(pos_tail, dtype=torch.int32),
+        "head_layout": (
+            torch.tensor(cu_q, dtype=torch.int32),
+            comp_pad,
+            torch.tensor([rank * chunk for chunk in chunks], dtype=torch.int32),
+        ),
+        "tail_layout": (
+            torch.tensor(cu_q, dtype=torch.int32),
+            comp_pad,
+            torch.tensor([(2 * cp_size - 1 - rank) * chunk for chunk in chunks], dtype=torch.int32),
+        ),
+    }
+
+
+@pytest.mark.parametrize("name,cu_list,cp_size,capacity", _GRAPH_DYNAMIC_ROUTE_CASES)
+def test_graph_dynamic_fixed_a2a_forward_and_reverse(name, cu_list, cp_size, capacity):
+    """The fixed-capacity two-hop route is the zigzag permutation and its exact inverse."""
+    l_local = capacity // cp_size
+    cu = torch.tensor(cu_list, dtype=torch.int32)
+    plans = [
+        _graph_dynamic_zigzag_plan(cu, _comp_cu(cu), cp_size, l_local, r, torch.device("cpu"))
+        for r in range(cp_size)
+    ]
+    peer_rows = min(l_local, l_local // cp_size + cp_size - 1)
+    route_rows = cp_size * peer_rows
+    assert all(plan["route_rows"] == route_rows for plan in plans)
+
+    # Every metadata tensor is fixed-size, in range, and the relay mapping is a
+    # full permutation (including padding slots), not merely a valid-row gather.
+    for r, plan in enumerate(plans):
+        assert plan["src_slot"].shape == (l_local,)
+        assert plan["dst_slot"].shape == (l_local,)
+        assert plan["relay_perm"].shape == (route_rows,)
+        assert int(plan["src_slot"].min()) >= 0
+        assert int(plan["src_slot"].max()) < route_rows
+        assert int(plan["dst_slot"].min()) >= 0
+        assert int(plan["dst_slot"].max()) < route_rows
+        assert plan["src_slot"].unique().numel() == l_local
+        assert plan["dst_slot"].unique().numel() == l_local
+        assert torch.equal(torch.sort(plan["relay_perm"]).values, torch.arange(route_rows)), (
+            name,
+            r,
+        )
+
+    payloads = [
+        torch.arange(r * l_local, (r + 1) * l_local, dtype=torch.int64) for r in range(cp_size)
+    ]
+    send1 = []
+    for payload, plan in zip(payloads, plans):
+        stage = torch.zeros(route_rows, dtype=payload.dtype)
+        stage.index_copy_(0, plan["src_slot"], payload)
+        send1.append(stage)
+    recv1 = _sim_equal_all_to_all(send1, peer_rows)
+    send2 = [recv1[r].index_select(0, plans[r]["relay_perm"]) for r in range(cp_size)]
+    recv2 = _sim_equal_all_to_all(send2, peer_rows)
+    balanced = [recv2[r].index_select(0, plans[r]["dst_slot"]) for r in range(cp_size)]
+    for r, rows in enumerate(balanced):
+        expected = _graph_dynamic_host_oracle(cu_list, cp_size, r, capacity)
+        assert torch.equal(plans[r]["gather_idx"], expected["gather_idx"]), (
+            name,
+            r,
+            "plan-vs-oracle",
+        )
+        assert torch.equal(rows, expected["gather_idx"]), (name, r, "route-vs-oracle")
+        for key in ("pos_head", "pos_tail"):
+            assert torch.equal(plans[r][key], expected[key]), (name, r, key)
+        for key in ("head_layout", "tail_layout"):
+            for actual_tensor, expected_tensor in zip(plans[r][key], expected[key]):
+                assert torch.equal(actual_tensor, expected_tensor), (name, r, key)
+
+    # Reverse uses scatter(dst), inverse relay scatter, then gather(src).
+    reverse_send1 = []
+    for rows, plan in zip(balanced, plans):
+        stage = torch.zeros(route_rows, dtype=rows.dtype)
+        stage.index_copy_(0, plan["dst_slot"], rows)
+        reverse_send1.append(stage)
+    reverse_recv1 = _sim_equal_all_to_all(reverse_send1, peer_rows)
+    reverse_send2 = []
+    for r, plan in enumerate(plans):
+        stage = torch.zeros(route_rows, dtype=reverse_recv1[r].dtype)
+        stage.index_copy_(0, plan["relay_perm"], reverse_recv1[r])
+        reverse_send2.append(stage)
+    reverse_recv2 = _sim_equal_all_to_all(reverse_send2, peer_rows)
+    restored = [reverse_recv2[r].index_select(0, plans[r]["src_slot"]) for r in range(cp_size)]
+    for r in range(cp_size):
+        assert torch.equal(restored[r], payloads[r]), (name, r)
+
+
+def test_graph_dynamic_prebuild_validates_without_publishing_host_state():
+    """Opt-in prebuild owns a per-pack tensor route, never process-global host state."""
+    import megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer as M
+
+    group = _StubGroup(4, 1)
+    psp = _packed_params([0, 1024, 3072, 4096], 4096)
+    key = group.group_name
+    prebuild_balanced_layouts(psp, cp_group=group, capacity=4096, graph_dynamic_packs=True)
+    assert not hasattr(psp, "_dsa_cp_balance_layout_cache")
+    assert M.get_graph_dynamic_plan(psp) is not None
+    assert (key, group.rank()) not in M._LAST_PLAN
+    assert (key, 1024) not in M._ZZ_PACK_OK
+    assert key not in M._SEEN_CU
+
+    # With the opt-in omitted, retain the existing host-plan publication path.
+    prebuild_balanced_layouts(psp, cp_group=group)
+    assert ("zigzag", group.rank()) in psp._dsa_cp_balance_layout_cache
+    assert (key, group.rank()) in M._LAST_PLAN
+
+
+def test_graph_dynamic_plan_tensor_kwargs_roundtrip_and_refresh():
+    """TE graph inputs preserve every route leaf and can be refreshed in-place."""
+    group = _StubGroup(4, 1)
+    pack_a = _packed_params([0, 16, 48, 96], 96)
+    pack_b = _packed_params([0, 32, 64, 96], 96)
+    for pack in (pack_a, pack_b):
+        prebuild_balanced_layouts(pack, cp_group=group, capacity=96, graph_dynamic_packs=True)
+
+    kwargs = {}
+    add_graph_dynamic_plan_to_kwargs(pack_a, kwargs, required=True)
+    reconstructed = pop_graph_dynamic_plan_from_kwargs(kwargs, cp_size=4, l_local=24)
+    assert kwargs == {}
+    original = get_graph_dynamic_plan(pack_a)
+    for key in (
+        "validated_cu",
+        "pos_head",
+        "pos_tail",
+        "score_cu_q",
+        "score_cu_kv",
+        "head_offsets",
+        "tail_offsets",
+        "output_cu_q",
+        "output_cu_kv",
+        "output_offsets",
+        "src_slot",
+        "relay_perm",
+        "dst_slot",
+    ):
+        assert reconstructed[key].data_ptr() == original[key].data_ptr()
+
+    copy_graph_dynamic_plan_(pack_a, pack_b)
+    refreshed = get_graph_dynamic_plan(pack_a)
+    source = get_graph_dynamic_plan(pack_b)
+    for key in (
+        "validated_cu",
+        "pos_head",
+        "pos_tail",
+        "score_cu_q",
+        "score_cu_kv",
+        "head_offsets",
+        "tail_offsets",
+        "output_cu_q",
+        "output_cu_kv",
+        "output_offsets",
+        "src_slot",
+        "relay_perm",
+        "dst_slot",
+    ):
+        assert torch.equal(refreshed[key], source[key])
+
+
+def test_graph_dynamic_prebuild_rejects_ineligible_pack_instead_of_falling_back():
+    group = _StubGroup(4, 0)
+    # 1012 is not divisible by 2*CP; the legacy/default path records False and
+    # falls back eagerly, but a captured graph cannot tensor-branch at replay.
+    psp = _packed_params([0, 1012, 4096], 4096)
+    with pytest.raises(ValueError, match="cannot fall back during replay"):
+        prebuild_balanced_layouts(psp, cp_group=group, capacity=4096, graph_dynamic_packs=True)
+
+
+def test_graph_dynamic_prebuild_requires_and_checks_explicit_capacity():
+    group = _StubGroup(4, 0)
+    psp = _packed_params([0, 64], 64)
+    with pytest.raises(ValueError, match="requires an explicit fixed physical capacity"):
+        prebuild_balanced_layouts(psp, cp_group=group, graph_dynamic_packs=True)
+    with pytest.raises(ValueError, match="padded cu_seqlens to end"):
+        prebuild_balanced_layouts(psp, cp_group=group, capacity=96, graph_dynamic_packs=True)
+
+
+def test_graph_dynamic_shared_builder_rejects_invalid_fixed_capacity():
+    """Direct callers get host errors before the device route builder can run."""
+    group = _StubGroup(4, 0)
+    cu = torch.tensor([0, 64], dtype=torch.int32)
+    with pytest.raises(ValueError, match="positive and divisible"):
+        build_graph_dynamic_plan(cu, group, 0)
+    with pytest.raises(ValueError, match="positive and divisible"):
+        build_graph_dynamic_plan(cu, group, 66)
+    with pytest.raises(ValueError, match="even per-rank capacity"):
+        build_graph_dynamic_plan(cu, group, 20)
+    with pytest.raises(RuntimeError, match="above the verified-safe limit"):
+        build_graph_dynamic_plan(cu, group, 4 * 2 * (32768 + 1))
+
+
+def test_graph_dynamic_shared_builder_rejects_empty_cu_seqlens():
+    group = _StubGroup(4, 0)
+    with pytest.raises(ValueError, match="at least one sequence"):
+        build_graph_dynamic_plan(torch.empty(0, dtype=torch.int32), group, 64)
 
 
 @pytest.mark.parametrize("name,cu_list,cp_size,capacity", _CASES)
