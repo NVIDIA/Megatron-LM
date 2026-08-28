@@ -359,6 +359,25 @@ class TransformerConfig(ModelParallelConfig):
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
+    # Compressed sparse attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    # TODO(#6402): consumed by DSv4 Hybrid attention orchestration, which selects the
+    # per-layer compression ratio and builds the compressed-KV rotary embedding.
+    # Neither field has a production reader in this primitive-only PR.
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
+
+    ####################
     # linear attention
     ####################
     linear_attention_freq: Optional[Union[int, List[int]]] = None
@@ -1164,6 +1183,23 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
+
+    use_fused_mhc: bool = False
+    """Use fused kernels for mHC operations when supported.
+
+    With the default ``auto`` backend policy, selection is operation-specific
+    and unavailable accelerated implementations fall back to native torch.
+    Set ``mhc_fused_backend`` to request an explicit backend policy.
+    """
+
+    mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
+    """Backend policy for fused mHC operations.
+
+    ``auto`` selects the fastest available implementation for each operation.
+    Explicit policies require the requested dependency and device support, and
+    never select a different accelerated backend. Operations without an
+    implementation in the selected backend retain their native implementation.
+    """
 
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
@@ -2127,12 +2163,17 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute to reduce activation memory."
             )
 
-        # Validation for hyper_connections with MTP
-        if self.enable_mhc_connections and self.mtp_num_layers is not None:
+        if self.use_fused_mhc and not self.enable_mhc_connections:
+            raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
+
+        valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
+        if self.mhc_fused_backend not in valid_mhc_fused_backends:
             raise ValueError(
-                "enable_mhc_connections is not compatible with Multi-Token Prediction (MTP). "
-                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+                f"Unknown mhc_fused_backend {self.mhc_fused_backend!r}; expected one of "
+                f"{valid_mhc_fused_backends}."
             )
+        if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
+            raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
 
         if self.enable_mhc_connections and self.recompute_granularity == "full":
             raise NotImplementedError(
@@ -2156,7 +2197,7 @@ class TransformerConfig(ModelParallelConfig):
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
             # the stage holding the final layernorm, so every intermediate pipeline stage
             # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.
-            # Pipeline support lands in the follow-up mHC split, which lifts this guard.
+            # Pipeline support must resize the p2p buffers before this guard can be lifted.
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
                     "enable_mhc_connections does not support pipeline_model_parallel_size > 1 "
