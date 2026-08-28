@@ -275,6 +275,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_qkv_per_head = split_qkv_per_head
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        self._warned_distributed_qkv_fallback = False
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -300,6 +301,18 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             if self.pg_collection
             else None
         )
+
+    def _warn_distributed_qkv_fallback(self):
+        """Warn once when a QKV layout cannot use distributed Newton-Schulz."""
+        if self.tp_mode != "distributed" or self._warned_distributed_qkv_fallback:
+            return
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "muon_tp_mode='distributed' is not supported for per-head, GTP-rematerialized, "
+            "or fragmented QKV splitting; falling back to non-TP Newton-Schulz.",
+        )
+        self._warned_distributed_qkv_fallback = True
 
     def _gather_qkv_grad(self, p, grad, tp_group, expected_rows, gather_gtp=True):
         """Reconstruct a fused QKV gradient and record how to restore its local shard."""
@@ -454,6 +467,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         QKV tensor. For a global layout, reconstruct GTP-remat and TP dimension 0 before
         splitting so heads crossing rank boundaries remain complete.
         """
+        self._warn_distributed_qkv_fallback()
         local_split_shapes = getattr(p, "qkv_split_shapes", None)
         heads_are_complete = getattr(p, "qkv_split_heads_are_complete", None)
         has_gtp_padding = int(getattr(p, "qkv_gtp_pad_length", 0)) > 0
@@ -493,11 +507,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         return self._restore_local_qkv_grad(gathered_grad, tp_slice, gtp_slice)
 
-    def _orthogonalize_fragmented_qkv(self, p, grad, tp_group, split_shapes):
-        """Orthogonalize projections after reconstructing fragmented query-group blocks."""
+    def _orthogonalize_global_qkv(self, p, grad, tp_group, split_shapes):
+        """Orthogonalize projections after reconstructing their global QKV layout."""
+        self._warn_distributed_qkv_fallback()
         global_split_shapes = getattr(p, "qkv_split_shapes_global", None)
         if global_split_shapes is None:
-            raise RuntimeError("Muon fragmented QKV split requires global split shapes")
+            raise RuntimeError("Muon global QKV split requires global split shapes")
         expected_rows = sum(global_split_shapes)
         if expected_rows % sum(split_shapes) != 0:
             raise RuntimeError(
@@ -550,10 +565,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             if qkv_split_shapes is None:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
             if (
-                getattr(p, "qkv_split_groups_are_complete", None) is False
+                getattr(p, 'is_gtp_weight_remat', False)
+                or getattr(p, "qkv_split_groups_are_complete", None) is False
                 or int(getattr(p, "qkv_gtp_pad_length", 0)) > 0
-            ) and getattr(p, "qkv_split_shapes_global", None) is not None:
-                return self._orthogonalize_fragmented_qkv(p, grad, tp_group, qkv_split_shapes)
+            ):
+                return self._orthogonalize_global_qkv(p, grad, tp_group, qkv_split_shapes)
             log_single_rank(
                 logger,
                 logging.DEBUG,

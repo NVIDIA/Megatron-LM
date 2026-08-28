@@ -2519,9 +2519,9 @@ def _add_regularization_args(parser):
                        help='Whether to split QKV parameters for Muon optimizer')
     group.add_argument('--muon-split-qkv-per-head', action='store_true',
                        help='Orthogonalize each Q, gate, K, and V head independently. '
-                       'Batched execution requires emerging-optimizers>=0.3.0; older versions '
-                       'process heads individually. By default, Q, gate, K, and V projections '
-                       'are orthogonalized separately')
+                       'Uniform head sizes use the batched Newton-Schulz implementation from '
+                       'the emerging-optimizers revision pinned in pyproject.toml. By default, '
+                       'Q, gate, K, and V projections are orthogonalized separately')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
@@ -2541,7 +2541,9 @@ def _add_regularization_args(parser):
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'duplicated', 'distributed'],
-                       help='How to perform NS calculation for tensor model parallel weights')
+                       help='How to perform NS calculation for tensor model parallel weights. '
+                       'For QKV weights, distributed mode applies only to projection splits with '
+                       'complete local query groups and no GTP; other layouts fall back to non-TP NS')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',

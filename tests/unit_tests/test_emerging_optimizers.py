@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import json
+import logging
 import os
 
 import pytest
@@ -892,6 +893,61 @@ class TestMuonOptimizerMultiRankTP:
         )
         expected = expected_global[tp_rank * local_rows : (tp_rank + 1) * local_rows]
         torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("layout", "expects_fallback"),
+    (("local_projection", False), ("per_head", True), ("fragmented", True), ("gtp", True)),
+)
+def test_muon_qkv_distributed_mode_routing_warns_once(monkeypatch, layout, expects_fallback):
+    """Only complete local projection splits without GTP retain distributed NS."""
+    grad = torch.arange(16, dtype=torch.float32, device='cuda').view(4, 4)
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.partition_dim = 0
+    param.is_qkv = True
+    param.qkv_split_shapes = [2, 1, 1]
+    param.qkv_split_shapes_global = [2, 1, 1]
+    param.qkv_split_groups_are_complete = layout != "fragmented"
+    param.qkv_split_heads_are_complete = True
+    if layout == "gtp":
+        param.is_gtp_weight_remat = True
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=layout == "per_head",
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2, 1, 1],
+        pg_collection=None,
+        tp_mode="distributed",
+    )
+    orthogonalize_args = []
+    log_records = []
+
+    def passthrough(x, tp_group=None, partition_dim=None):
+        orthogonalize_args.append((tp_group, partition_dim))
+        return x
+
+    def record_log(_logger, level, message):
+        log_records.append((level, message))
+
+    optimizer.scaled_orthogonalize_fn = passthrough
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.log_single_rank", record_log)
+
+    torch.testing.assert_close(optimizer.orthogonalize(param, grad), grad)
+    torch.testing.assert_close(optimizer.orthogonalize(param, grad), grad)
+
+    warning_messages = [message for level, message in log_records if level == logging.WARNING]
+    if expects_fallback:
+        assert len(warning_messages) == 1
+        assert "falling back to non-TP Newton-Schulz" in warning_messages[0]
+        assert all(
+            tp_group is None and partition_dim is None
+            for tp_group, partition_dim in orthogonalize_args
+        )
+    else:
+        assert warning_messages == []
+        assert all(partition_dim == 0 for _, partition_dim in orthogonalize_args)
 
 
 # All non-custom coefficient types supported by emerging_optimizers.
