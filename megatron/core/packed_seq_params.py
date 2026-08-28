@@ -158,6 +158,36 @@ def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Option
     return padded
 
 
+def _same_tensor_view(a: Optional[Tensor], b: Optional[Tensor]) -> bool:
+    """Return whether two real tensors describe the same logical view."""
+    if not isinstance(a, Tensor) or not isinstance(b, Tensor):
+        return False
+    if a is b:
+        return type(a) is Tensor and not a.is_meta and a.numel() > 0
+    # Distinct tensor subclasses and meta/empty tensors do not provide a
+    # reliable physical-storage identity. Fail closed instead of comparing
+    # sentinel pointers or invoking unsupported storage accessors.
+    if type(a) is not Tensor or type(b) is not Tensor or a.is_meta or b.is_meta:
+        return False
+    if a.numel() == 0 or b.numel() == 0:
+        return False
+    try:
+        if (
+            a.dtype != b.dtype
+            or a.device != b.device
+            or a.shape != b.shape
+            or a.stride() != b.stride()
+            or a.storage_offset() != b.storage_offset()
+        ):
+            return False
+        a_data_ptr = a.data_ptr()
+        b_data_ptr = b.data_ptr()
+    except (RuntimeError, NotImplementedError):
+        # Some nonstandard tensor backends do not expose storage/data pointers.
+        return False
+    return a_data_ptr != 0 and a_data_ptr == b_data_ptr
+
+
 def _append_dummy_seq(cu_seqlens: Optional[Tensor], dummy_end: int) -> Optional[Tensor]:
     """Append a dummy sequence boundary to a cu_seqlens tensor.
 
@@ -568,6 +598,8 @@ def pad_sequence_for_thd(
     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
     cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
     cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
+    qkv_valid_share_view = _same_tensor_view(cu_seqlens_q, cu_seqlens_kv)
+    qkv_padded_share_view = _same_tensor_view(cu_seqlens_q_padded, cu_seqlens_kv_padded)
 
     # Represent post-pack padding either as a dummy sequence or as physical
     # padding attached to the final real sequence.
@@ -632,11 +664,21 @@ def pad_sequence_for_thd(
             cu_seqlens_q_padded = cu_seqlens_q
         if cu_seqlens_kv_padded is None:
             cu_seqlens_kv_padded = cu_seqlens_kv
+        # Missing padded metadata inherits the valid-coordinate source. Re-evaluate
+        # the relationship after that inheritance so self-attention Q/K aliases are
+        # not split by the two allocating transforms below.
+        qkv_padded_share_view = qkv_padded_share_view or _same_tensor_view(
+            cu_seqlens_q_padded, cu_seqlens_kv_padded
+        )
         assert (
             cu_seqlens_q_padded is not None or cu_seqlens_kv_padded is not None
         ), "Non-dummy THD tail padding requires metadata for at least one real sequence."
         cu_seqlens_q_padded = _extend_last_padded_sequence(cu_seqlens_q_padded, global_target_len)
-        cu_seqlens_kv_padded = _extend_last_padded_sequence(cu_seqlens_kv_padded, global_target_len)
+        cu_seqlens_kv_padded = (
+            cu_seqlens_q_padded
+            if qkv_padded_share_view
+            else _extend_last_padded_sequence(cu_seqlens_kv_padded, global_target_len)
+        )
         last_padded_q_len = _last_padded_sequence_length(cu_seqlens_q_padded)
         last_padded_kv_len = _last_padded_sequence_length(cu_seqlens_kv_padded)
 
@@ -646,6 +688,14 @@ def pad_sequence_for_thd(
         cu_seqlens_kv = _pad_cu_seqlens(cu_seqlens_kv, target_cu_entries)
         cu_seqlens_q_padded = _pad_cu_seqlens(cu_seqlens_q_padded, target_cu_entries)
         cu_seqlens_kv_padded = _pad_cu_seqlens(cu_seqlens_kv_padded, target_cu_entries)
+
+    # The packing scheduler intentionally supplies Q/K metadata as matching
+    # views. Preserve that contract across transforms that allocate new tensors,
+    # while keeping independently supplied metadata independent.
+    if qkv_valid_share_view:
+        cu_seqlens_kv = cu_seqlens_q
+    if qkv_padded_share_view:
+        cu_seqlens_kv_padded = cu_seqlens_q_padded
 
     # Rebuild PackedSeqParams with the padded tensor and metadata shapes.
     padded_params = PackedSeqParams(

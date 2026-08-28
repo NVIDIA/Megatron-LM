@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Unit tests for THD format with CUDA Graph support.
@@ -38,6 +38,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     _resolve_thd_padding_lengths,
+    _same_tensor_view,
     extend_thd_padding_before_cp_slice,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
@@ -81,6 +82,47 @@ def _make_psp(seqlens):
         max_seqlen_q=max(seqlens),
         max_seqlen_kv=max(seqlens),
     )
+
+
+def _make_same_view_cu_pair(boundaries):
+    storage = torch.tensor([-1, *boundaries, -1], dtype=torch.int32)
+    q = storage[1:-1]
+    kv = storage[1:-1]
+    assert q is not kv
+    assert q.data_ptr() == kv.data_ptr()
+    return q, kv
+
+
+def _make_same_view_psp(valid_boundaries, padded_boundaries):
+    cu_q, cu_kv = _make_same_view_cu_pair(valid_boundaries)
+    cu_q_padded, cu_kv_padded = _make_same_view_cu_pair(padded_boundaries)
+    max_seqlen = max(
+        right - left
+        for boundaries in (valid_boundaries, padded_boundaries)
+        for left, right in zip(boundaries, boundaries[1:])
+    )
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        cu_seqlens_q_padded=cu_q_padded,
+        cu_seqlens_kv_padded=cu_kv_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        pad_between_seqs=valid_boundaries != padded_boundaries,
+    )
+
+
+def _assert_qkv_views_are_shared(packed_seq_params):
+    for q, kv in (
+        (packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv),
+        (packed_seq_params.cu_seqlens_q_padded, packed_seq_params.cu_seqlens_kv_padded),
+    ):
+        assert q is kv
+        assert q.data_ptr() == kv.data_ptr()
+        assert q.storage_offset() == kv.storage_offset()
+        assert q.shape == kv.shape
+        assert q.stride() == kv.stride()
 
 
 def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
@@ -361,6 +403,250 @@ class TestResolveThdPaddingLengths:
 
         assert metadata_lengths == tensor_lengths
         assert metadata_lengths == (local_actual, global_actual, alignment, alignment * cp_size)
+
+
+class TestPadSequenceForThdAliasPreservation:
+
+    @pytest.mark.internal
+    def test_same_tensor_view_edge_cases_fail_closed(self):
+        base = torch.arange(6)
+        same_view = base[:4]
+        same_view_alias = base[:4]
+        assert _same_tensor_view(same_view, same_view)
+        assert _same_tensor_view(same_view, same_view_alias)
+        assert not _same_tensor_view(None, None)
+        assert not _same_tensor_view(same_view, None)
+
+        empty = torch.empty(0)
+        assert not _same_tensor_view(empty, empty)
+        assert not _same_tensor_view(empty, empty.view_as(empty))
+
+        meta = torch.empty(4, device="meta")
+        assert not _same_tensor_view(meta, meta)
+        assert not _same_tensor_view(meta, meta.view_as(meta))
+
+        assert not _same_tensor_view(same_view, base[1:5])
+        assert not _same_tensor_view(same_view, base[:3])
+
+    @pytest.mark.internal
+    def test_same_tensor_view_fake_tensor_fails_closed(self):
+        try:
+            from torch._subclasses.fake_tensor import FakeTensorMode
+        except ImportError:
+            pytest.skip("FakeTensorMode is not available in this PyTorch version.")
+
+        with FakeTensorMode():
+            fake = torch.empty(4, device="cuda")
+            fake_alias = fake.view_as(fake)
+
+        assert not _same_tensor_view(fake, fake)
+        assert not _same_tensor_view(fake, fake_alias)
+
+    @pytest.mark.internal
+    def test_append_dummy_sequence_preserves_qkv_views(self):
+        psp = _make_same_view_psp([0, 3, 5], [0, 3, 5])
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5), None, None, None, psp, target_len=8, cp_size=1, cp_rank=0
+        )
+
+        expected = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
+        assert torch.equal(padded.cu_seqlens_q, expected)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected)
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_extend_last_sequence_preserves_qkv_views(self):
+        psp = _make_same_view_psp([0, 3, 5], [0, 4, 7])
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 7),
+            None,
+            None,
+            None,
+            psp,
+            target_len=10,
+            tail_padding_policy="extend_last",
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        assert torch.equal(padded.cu_seqlens_q, torch.tensor([0, 3, 5], dtype=torch.int32))
+        assert torch.equal(padded.cu_seqlens_q_padded, torch.tensor([0, 4, 10], dtype=torch.int32))
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_extend_last_missing_padded_metadata_inherits_valid_qkv_view(self):
+        cu_q, cu_kv = _make_same_view_cu_pair([0, 3, 5])
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+            pad_between_seqs=False,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            tail_padding_policy="extend_last",
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        assert torch.equal(padded.cu_seqlens_q, torch.tensor([0, 3, 5], dtype=torch.int32))
+        assert torch.equal(padded.cu_seqlens_q_padded, torch.tensor([0, 3, 8], dtype=torch.int32))
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_extend_last_missing_padded_metadata_keeps_distinct_valid_qkv_views(self):
+        cu_q = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_kv = cu_q.clone()
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+            pad_between_seqs=False,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            tail_padding_policy="extend_last",
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        expected = torch.tensor([0, 3, 8], dtype=torch.int32)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected)
+        assert torch.equal(padded.cu_seqlens_kv_padded, expected)
+        assert padded.cu_seqlens_q_padded is not padded.cu_seqlens_kv_padded
+        assert padded.cu_seqlens_q_padded.data_ptr() != padded.cu_seqlens_kv_padded.data_ptr()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_extend_last_missing_padded_metadata_keeps_cp1_thd_scorer_eligible(self):
+        from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+        storage = torch.tensor([-1, 0, 3, 5, -1], dtype=torch.int32, device="cuda")
+        cu_q = storage[1:-1]
+        cu_kv = storage[1:-1]
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+            pad_between_seqs=False,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            tail_padding_policy="extend_last",
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        assert dsa_cudnn_kernels._packed_thd_kernel_applicable(
+            b=1,
+            sq=8,
+            sk=8,
+            device=padded.cu_seqlens_q_padded.device,
+            packed_cu_seqlens_q=padded.cu_seqlens_q_padded,
+            packed_cu_seqlens_k=padded.cu_seqlens_kv_padded,
+            packed_max_seqlen_q=padded.max_seqlen_q,
+            packed_max_seqlen_k=padded.max_seqlen_kv,
+            cp_size=1,
+            cp_rank=0,
+            local_packed_cp_query_start=0,
+            local_packed_cp_query_len=None,
+        )
+
+    @pytest.mark.internal
+    def test_fixed_capacity_only_padding_preserves_qkv_views(self):
+        psp = _make_same_view_psp([0, 3, 8], [0, 4, 8])
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 8),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            max_num_seqs=5,
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        assert torch.equal(padded.cu_seqlens_q, torch.tensor([0, 3, 8, 8, 8, 8], dtype=torch.int32))
+        assert torch.equal(
+            padded.cu_seqlens_q_padded, torch.tensor([0, 4, 8, 8, 8, 8], dtype=torch.int32)
+        )
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_distinct_equal_qkv_views_remain_distinct(self):
+        cu_q = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_kv = cu_q.clone()
+        cu_q_padded = cu_q.clone()
+        cu_kv_padded = cu_q.clone()
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_q_padded=cu_q_padded,
+            cu_seqlens_kv_padded=cu_kv_padded,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            max_num_seqs=5,
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        expected = torch.tensor([0, 3, 5, 8, 8, 8], dtype=torch.int32)
+        assert torch.equal(padded.cu_seqlens_q, expected)
+        assert torch.equal(padded.cu_seqlens_kv, expected)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected)
+        assert torch.equal(padded.cu_seqlens_kv_padded, expected)
+        assert padded.cu_seqlens_q is not padded.cu_seqlens_kv
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_kv.data_ptr()
+        assert padded.cu_seqlens_q_padded is not padded.cu_seqlens_kv_padded
+        assert padded.cu_seqlens_q_padded.data_ptr() != padded.cu_seqlens_kv_padded.data_ptr()
 
 
 class TestPadSequenceForThd:
