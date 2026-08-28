@@ -255,3 +255,20 @@ def test_actual_mcore_skill_names_are_present_in_trusted_inventory_source():
     assert (root / "skills/mcore-testing/SKILL.md").is_file()
     assert (root / "skills/mcore-cicd/SKILL.md").is_file()
     assert (root / "skills/mcore-linting-and-formatting/SKILL.md").is_file()
+
+
+def test_trusted_code_inventory_covers_every_local_review_module():
+    root = SCRIPT.parents[2]
+    actual = {
+        str(path.relative_to(root))
+        for path in (root / ".github/scripts/claude_review").glob("*.py")
+    }
+    actual.add(".github/scripts/claude_review.py")
+    assert set(review.TRUSTED_CODE_PATHS) == actual
+
+
+def test_review_implementation_is_split_into_bounded_components():
+    root = SCRIPT.parents[2]
+    assert sum(1 for _ in SCRIPT.open(encoding="utf-8")) < 100
+    for path in (root / ".github/scripts/claude_review").glob("*.py"):
+        assert sum(1 for _ in path.open(encoding="utf-8")) < 500, path
