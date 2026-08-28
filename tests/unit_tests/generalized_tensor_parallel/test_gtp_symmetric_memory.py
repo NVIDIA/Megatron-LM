@@ -129,12 +129,15 @@ class TestRegisterVersionGuard:
 
 
 def _vmm_pool_or_skip():
+    import shutil
+
     import megatron.core.tensor_parallel.gtp_vmm_allocator as gtp_vmm
 
-    try:
-        return gtp_vmm.create_vmm_mem_pool()
-    except RuntimeError as e:  # nvcc/libcuda unavailable in this environment
-        pytest.skip(f"VMM allocator extension unavailable: {e}")
+    # Preflight only: skip where the extension cannot possibly build, but let a real
+    # build failure FAIL the test (a broad skip would turn compiler regressions green).
+    if shutil.which("nvcc") is None:
+        pytest.skip("nvcc unavailable; cannot build the VMM allocator extension")
+    return gtp_vmm.create_vmm_mem_pool()
 
 
 class TestVmmAllocatorModule:
@@ -152,9 +155,13 @@ class TestVmmAllocatorModule:
         pool = _vmm_pool_or_skip()
         with torch.cuda.use_mem_pool(pool):
             t = torch.full((1024,), 3.0, device="cuda")
-        assert pool.snapshot(), "pool has no segments after an allocation"
-        # Recommended VMM granularity is at least 2 MiB on supported GPUs.
-        assert t.data_ptr() % (2 * 1024 * 1024) == 0
+        segments_after_alloc = pool.snapshot()
+        assert segments_after_alloc, "pool has no segments after an allocation"
+        # The hook's contract: segment base and size are granularity-multiples
+        # (recommended VMM granularity is at least 2 MiB on supported GPUs).
+        granularity = 2 * 1024 * 1024
+        assert segments_after_alloc[0]["address"] % granularity == 0
+        assert segments_after_alloc[0]["total_size"] % granularity == 0
         assert torch.equal(t.cpu(), torch.full((1024,), 3.0))
         segments = len(pool.snapshot())
         del t
