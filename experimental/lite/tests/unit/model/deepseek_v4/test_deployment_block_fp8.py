@@ -177,6 +177,24 @@ def test_fused_dynamic_weight_quant_matches_vllm_bitwise(monkeypatch) -> None:
         assert torch.equal(actual.scales, reference_scales)
 
 
+@pytest.mark.gpus(1)
+def test_fused_ue8m0_weight_pack_matches_vllm_bitwise(monkeypatch) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires one CUDA GPU")
+
+    for shape in ((128, 128), (256, 384), (512, 256)):
+        weight = nn.Parameter(
+            torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        )
+        monkeypatch.setenv("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "0")
+        reference = pack_block_fp8_weight(weight)
+        monkeypatch.setenv("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1")
+        actual = pack_block_fp8_weight(weight)
+
+        assert torch.equal(actual.qweight, reference.qweight)
+        assert torch.equal(actual.scales, reference.scales)
+
+
 def test_weight_path_calls_vllm_and_packs_official_layout(fake_vllm) -> None:
     master = _weight()
     packed = pack_block_fp8_weight(master)

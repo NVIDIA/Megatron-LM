@@ -46,6 +46,31 @@ if triton is not None:
         tl.store(scales + block, scale)
         tl.store(qweight + offsets, values * (1.0 / scale))
 
+    @triton.jit
+    def _requantize_block_fp8_to_ue8m0(
+        qweight,
+        scales,
+        ue8m0_scales,
+        columns: tl.constexpr,
+        scale_columns: tl.constexpr,
+        BLOCK_ELEMENTS: tl.constexpr,
+    ):
+        block = tl.program_id(0)
+        block_row = block // scale_columns
+        block_col = block - block_row * scale_columns
+        local = tl.arange(0, BLOCK_ELEMENTS)
+        row = block_row * 128 + local // 128
+        column = block_col * 128 + local % 128
+        offsets = row * columns + column
+        dequantized = tl.load(qweight + offsets).to(tl.float32) * tl.load(
+            scales + block
+        )
+        amax = tl.maximum(tl.max(tl.abs(dequantized), axis=0), 1.0e-4)
+        exponent = tl.ceil(tl.log2(amax / 448.0))
+        scale = tl.exp2(exponent)
+        tl.store(qweight + offsets, dequantized * (1.0 / scale))
+        tl.store(ue8m0_scales + block, exponent + 127.0)
+
 
 @contextmanager
 def _weight_nvtx_range(name: str):
@@ -109,6 +134,23 @@ def _quantize_block_fp8_weight_fused(
     return CanonicalBlockFP8Weight(qweight, scales)
 
 
+def _quantize_block_fp8_weight_fused_ue8m0(
+    weight: torch.Tensor,
+) -> CanonicalBlockFP8Weight:
+    canonical = _quantize_block_fp8_weight_fused(weight)
+    ue8m0_scales = torch.empty_like(canonical.scales, dtype=torch.uint8)
+    _requantize_block_fp8_to_ue8m0[(canonical.scales.numel(),)](
+        canonical.qweight,
+        canonical.scales,
+        ue8m0_scales,
+        columns=weight.shape[1],
+        scale_columns=canonical.scales.shape[1],
+        BLOCK_ELEMENTS=BLOCK_SHAPE[0] * BLOCK_SHAPE[1],
+        num_warps=8,
+    )
+    return CanonicalBlockFP8Weight(canonical.qweight, ue8m0_scales)
+
+
 def quantize_block_fp8_weight(weight: torch.Tensor):
     _validate_weight(weight)
     scales = getattr(weight, "_fp8_source_scales", None)
@@ -143,6 +185,13 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
             and triton is not None
             and os.environ.get("MLITE_VLLM_FUSED_WEIGHT_QUANT", "1") != "0"
         ):
+            if (
+                os.environ.get(
+                    "MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1"
+                )
+                != "0"
+            ):
+                return _quantize_block_fp8_weight_fused_ue8m0(weight.detach())
             return _quantize_block_fp8_weight_fused(weight.detach())
         from vllm.utils.deep_gemm import per_block_cast_to_fp8
 
