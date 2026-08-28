@@ -709,6 +709,17 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     return pg_collection
 
 
+def _reset_activation_offload(
+    pg_collection: Union[ProcessGroupCollection, MultiModuleProcessGroupCollection],
+) -> None:
+    """Reset activation offload state for single-model and MIMO language ranks."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        if not pg_collection.has_language_model():
+            return
+        pg_collection = pg_collection.get_language_model_collection()
+    off_interface.reset(process_group=pg_collection.tp_dp_cp)
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -860,7 +871,7 @@ def forward_backward_no_pipelining(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Reset all_gather_pipeline bucket status before next validation iteration
     if forward_only:
         for model_chunk in [model]:
@@ -2086,7 +2097,7 @@ def forward_backward_pipelining_with_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2487,7 +2498,7 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     if getattr(config, 'fine_grained_activation_offloading', False):
-        off_interface.reset()
+        _reset_activation_offload(pg_collection)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

@@ -20,12 +20,12 @@ from collections.abc import Iterable
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-import torch.distributed.tensor as dist_tensor
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Partial, Replicate
+from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, Partial, Placement, Replicate, changed_mesh_axis
+from .placement import Flat, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,6 +48,12 @@ def _validate_placements(placements: Iterable[Placement]) -> None:
                 "Flat placements must be a suffix of the placement list so each "
                 "local buffer is a contiguous global-buffer range."
             )
+
+
+def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
+    """Convert a DTensor Partial reduction name to a torch.distributed op."""
+    reduce_ops = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.AVG}
+    return reduce_ops[partial_placement.reduce_op]
 
 
 class DBuffer:
@@ -350,7 +356,7 @@ class DBuffer:
             # buffer without communication. Value-preserving for AVG only -- the
             # mean of identical per-rank locals is that value; SUM would need a
             # 1/axis_size rescale, which no caller needs.
-            if new_placement.reduce_op != dist.ReduceOp.AVG:
+            if new_placement.reduce_op != "avg":
                 raise NotImplementedError(
                     "Replicate -> Partial redistribute supports AVG only, got "
                     f"{new_placement.reduce_op!r}."
@@ -405,7 +411,7 @@ class DBuffer:
         out = self._create_or_validate_out(out, placements=placements)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
-            out.local_buffer, op=partial_placement.reduce_op, group=self.mesh.get_group(axis)
+            out.local_buffer, op=_get_reduce_op(partial_placement), group=self.mesh.get_group(axis)
         )
         return out
 
@@ -424,7 +430,7 @@ class DBuffer:
         placements[axis] = new_placement
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
-        reduce_op = partial_placement.reduce_op
+        reduce_op = _get_reduce_op(partial_placement)
         # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
         # reductions remain supported on older PyTorch versions that lack it.
         if self.is_symmetric_memory:
@@ -440,7 +446,7 @@ class DBuffer:
             op=reduce_op,
             group=self.mesh.get_group(axis),
         )
-        if self.is_symmetric_memory and partial_placement.reduce_op == dist.ReduceOp.AVG:
+        if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
             out.local_buffer.div_(self.mesh.size(axis))
         return out
 
@@ -511,27 +517,6 @@ class DBuffer:
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""
-        torch_placements = []
-        for placement in self.placements:
-            if isinstance(placement, Replicate):
-                torch_placements.append(dist_tensor.Replicate())
-            elif isinstance(placement, Flat):
-                torch_placements.append(dist_tensor.Shard(0))
-            elif isinstance(placement, Partial):
-                # main_grad backs .grad while it rests DP-outer-Partial between
-                # microbatches, so a Partial placement must round-trip to a DTensor.
-                if placement.reduce_op == dist.ReduceOp.AVG:
-                    reduce_op = "avg"
-                elif placement.reduce_op == dist.ReduceOp.SUM:
-                    reduce_op = "sum"
-                else:
-                    raise ValueError(
-                        f"Unsupported Partial reduce op for DTensor: {placement.reduce_op!r}."
-                    )
-                torch_placements.append(dist_tensor.Partial(reduce_op))
-            else:
-                raise TypeError(f"Unsupported placement for DTensor conversion: {placement!r}.")
-
         local_tensor = self.get_local_tensor(index)
         tensor_shape = self.layout.tensor_shapes[index]
         # DBuffer uses contiguous flat storage, and Flat only shards dim 0, so
@@ -539,7 +524,7 @@ class DBuffer:
         return DTensor.from_local(
             local_tensor=local_tensor,
             device_mesh=self.mesh,
-            placements=tuple(torch_placements),
+            placements=self.placements,
             run_check=False,
             shape=tensor_shape,
             stride=local_tensor.stride(),

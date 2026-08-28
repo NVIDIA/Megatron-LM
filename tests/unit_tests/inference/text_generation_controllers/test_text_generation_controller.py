@@ -31,6 +31,7 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleLogitsState,
@@ -57,6 +58,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+
+
+def teardown_module(module):
+    # Some tests build inference_optimized MoE models with the default 'vllm'
+    # grouped-GEMM backend, which allocates class-level persistent intermediate
+    # buffers at context init. Release them so no GPU memory or state leaks
+    # across modules.
+    VllmFusedMoeBuffers._delete_buffers()
 
 
 class TextGenerationControllerTestBase:

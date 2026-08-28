@@ -18,6 +18,8 @@ class NCCLCopyService(CopyService):
     a batch of point-to-point sends and recvs.
     """
 
+    supports_multiple_runs_per_plan = True
+
     def __init__(self, group=None):
         super().__init__(group=group)
         self.send_ops: List[SendOp] = []

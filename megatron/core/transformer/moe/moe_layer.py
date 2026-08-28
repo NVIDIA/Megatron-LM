@@ -60,9 +60,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TENorm, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -276,6 +276,12 @@ class MoELayer(BaseMoELayer):
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
                 else None
             )
+            linear_gtp_kwargs = {}
+            if linear_cls is TELinear:
+                linear_gtp_kwargs = {
+                    "gtp_remat_group": gtp_remat_group,
+                    "gtp_replica_group": pg_collection.dp_cp,
+                }
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -287,8 +293,14 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
-                gtp_remat_group=gtp_remat_group,
+                **linear_gtp_kwargs,
             )
+            if self.config.moe_use_norm_before_up_proj:
+                self.fc2_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
@@ -300,8 +312,13 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
-                gtp_remat_group=gtp_remat_group,
+                **linear_gtp_kwargs,
             )
+            if linear_cls is TELinear:
+                # The duplicated operation has no TP execution group. TELinear uses
+                # `_tp_group` only to encode the owning TP replica coordinate in checkpoints.
+                self.fc1_latent_proj._tp_group = pg_collection.tp
+                self.fc2_latent_proj._tp_group = pg_collection.tp
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -589,6 +606,8 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if self.config.moe_use_norm_before_up_proj:
+                output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:

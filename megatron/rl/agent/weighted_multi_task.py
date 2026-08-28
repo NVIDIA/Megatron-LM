@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+from collections import deque
 from typing import Any, Optional, Type
 
-from .registry import get_agent_class
+from ..types import GroupedRollouts, GroupQueuesPerEnv, RolloutGroup
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -20,6 +21,7 @@ from .api import (
     RolloutGenerator,
     RolloutRequest,
 )
+from .registry import get_agent_class
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,11 @@ class WeightedMultiTask(
         # Initialize all sub-agents
         self.agents = []
         self.agent_configs = agent_configs  # Store the configs for later use
+        # Recovered rollout-bank groups are another producer for each environment.
+        # ``None`` means recovery was not configured; an empty dict means recovery
+        # ran but found no groups. The distinction avoids requiring env_ids when the
+        # durable bank is disabled.
+        self._restored_groups: GroupQueuesPerEnv | None = None
 
         # Calculate total weight only among non-evaluation agents
         total_weight = sum(config.weight for config in agent_configs if not config.evaluation_only)
@@ -167,6 +174,45 @@ class WeightedMultiTask(
             counts[idx] = share
         return counts
 
+    def _env_ids(self) -> list[str]:
+        """Return active env IDs used to route restored rollout-bank groups."""
+        require_env_ids = len(self._rollout_agents) > 1
+        env_ids = []
+        for index, agent in enumerate(self._rollout_agents):
+            env_id = getattr(agent, "env_id", None)
+            if not env_id and require_env_ids:
+                raise ValueError(
+                    f"Active agent {index} ({type(agent).__name__}) has no env_id; it is "
+                    "required to weight-balance restored rollout-bank groups by env. "
+                    "Set env_id when configuring multiple active agents."
+                )
+            env_ids.append(env_id or "")
+        return env_ids
+
+    def set_restored_groups(self, groups: GroupedRollouts) -> int:
+        """Install recovered rollout-bank groups as per-environment producers."""
+        known_env_ids = set(self._env_ids())
+        restored: GroupQueuesPerEnv = {}
+        for group in groups:
+            if not group:
+                continue
+            env_id = group[0].env_id
+            if env_id not in known_env_ids:
+                raise ValueError(
+                    f"Restored rollout-bank group has env_id {env_id!r} which is not in the "
+                    f"current --langrl-env-config (known: {sorted(known_env_ids)}). Changing "
+                    "the environment set across a crash-resume is unsupported; resume with a "
+                    "matching config or clear the rollout bank."
+                )
+            restored.setdefault(env_id, deque()).append(group)
+        self._restored_groups = restored
+        return sum(len(queue) for queue in restored.values())
+
+    def take_restored_group(self, env_id: str) -> RolloutGroup | None:
+        """Return the next recovered group for an environment, if available."""
+        restored = (self._restored_groups or {}).get(env_id)
+        return restored.popleft() if restored else None
+
     def rollout_allocations(self, num_groups: int) -> list[EnvAllocation]:
         """Constant per-batch allocation for each weighted env, in env order.
 
@@ -177,6 +223,7 @@ class WeightedMultiTask(
                 raise TypeError(f"Agent of type {type(agent)} does not support grouped rollouts")
 
         counts = self._quantized_counts(num_groups)
+        env_ids = self._env_ids() if self._restored_groups is not None else self._rollout_env_ids
         exact = [weight * num_groups for weight in self._rollout_weights]
         if any(abs(count - target) > 1e-9 for count, target in zip(counts, exact)):
             logger.warning(
@@ -185,7 +232,7 @@ class WeightedMultiTask(
                 ", ".join(
                     f"{eid}: {weight:g} -> {count}/{num_groups}"
                     for eid, weight, count in zip(
-                        self._rollout_env_ids, self._rollout_weights, counts
+                        env_ids, self._rollout_weights, counts
                     )
                 ),
             )
@@ -194,13 +241,13 @@ class WeightedMultiTask(
             num_groups,
             ", ".join(
                 f"{eid}(groups={c}, weight={w:g})"
-                for eid, c, w in zip(self._rollout_env_ids, counts, self._rollout_weights)
+                for eid, c, w in zip(env_ids, counts, self._rollout_weights)
             ),
         )
         return [
             EnvAllocation(agent=agent, env_id=env_id, num_groups=count)
             for agent, env_id, count in zip(
-                self._rollout_agents, self._rollout_env_ids, counts
+                self._rollout_agents, env_ids, counts
             )
         ]
 

@@ -10,6 +10,7 @@ from transformers import PreTrainedTokenizerFast
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+    _sanitize_chat_template_kwargs,
     _sanitize_messages_for_template,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
@@ -446,3 +447,47 @@ def test_incremental_detokenizer_rejects_unsupported_tokenizer():
         ValueError, match="Streaming is currently supported only for Hugging Face fast tokenizers"
     ):
         HuggingFaceFastIncrementalDetokenizer(_Tokenizer(), [])
+
+
+@pytest.mark.parametrize(
+    "raw_kwargs,expected",
+    [
+        # A caller-supplied Jinja template must never survive sanitization: the
+        # server renders it synchronously, so an expensive one (nested range(),
+        # unbounded string multiplication) would pin the worker's event loop.
+        (
+            {
+                "chat_template": (
+                    "{% for _ in range(100000) %}{% for _ in range(100000) %}"
+                    "{% endfor %}{% endfor %}"
+                )
+            },
+            {},
+        ),
+        (
+            {"chat_template": "{{ 'a' * 100000000 }}", "enable_thinking": False},
+            {"enable_thinking": False},
+        ),
+        # Documented, template-consumed flags stay untouched.
+        (
+            {"enable_thinking": True, "force_nonempty_content": True},
+            {"enable_thinking": True, "force_nonempty_content": True},
+        ),
+        ({}, {}),
+        # Malformed bodies degrade to "no kwargs" rather than raising.
+        (None, {}),
+        ("chat_template", {}),
+        ([{"chat_template": "x"}], {}),
+    ],
+)
+def test_sanitize_chat_template_kwargs_strips_request_supplied_template(raw_kwargs, expected):
+    assert _sanitize_chat_template_kwargs(raw_kwargs) == expected
+
+
+def test_sanitize_chat_template_kwargs_does_not_mutate_caller_payload():
+    raw_kwargs = {"chat_template": "{{ 'x' }}", "enable_thinking": False}
+
+    sanitized = _sanitize_chat_template_kwargs(raw_kwargs)
+
+    assert sanitized == {"enable_thinking": False}
+    assert raw_kwargs["chat_template"] == "{{ 'x' }}"

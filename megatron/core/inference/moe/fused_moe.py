@@ -210,9 +210,14 @@ def mcore_fused_moe(
     n_used = offs[-1:]
     if batch_invariant_mode:
         # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
-        activation_out = batch_invariant.squared_relu_with_probs(
-            fc1_output, permutation_map, n_used, permuted_probs
-        )
+        if activation_type == ActivationType.SWIGLU:
+            activation_out = batch_invariant.swiglu_with_probs(
+                fc1_output, permutation_map, n_used, permuted_probs
+            )
+        else:
+            activation_out = batch_invariant.squared_relu_with_probs(
+                fc1_output, permutation_map, n_used, permuted_probs
+            )
     else:
         activation_out = activation_func(fc1_output, permutation_map, n_used)
     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.

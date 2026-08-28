@@ -1,7 +1,7 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import gc
-import os
+import importlib.util
 import types
 from dataclasses import fields
 from typing import List, Optional, Tuple
@@ -33,6 +33,14 @@ try:
     has_nvshmem = True
 except Exception:
     has_nvshmem = False
+
+try:
+    has_nccl_m2n = (
+        importlib.util.find_spec("nccl.core") is not None
+        and importlib.util.find_spec("nccl.m2n") is not None
+    )
+except (ImportError, ModuleNotFoundError):
+    has_nccl_m2n = False
 
 try:
     import mamba_ssm  # noqa: F401
@@ -305,7 +313,6 @@ def test_swap_gpt_parametrized(
     num_experts: Optional[int],
     moe_mode: Optional[str],
 ):
-
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
     )
@@ -611,6 +618,12 @@ def test_router_expert_bias_refit(
     "refit_backend",
     [
         pytest.param(
+            "nccl_m2n",
+            marks=pytest.mark.skipif(
+                not has_nccl_m2n, reason="NVIDIA/nccl-extensions and NCCL4Py are not installed"
+            ),
+        ),
+        pytest.param(
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
@@ -638,6 +651,9 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
     if world < src_world + dst_world:
         Utils.destroy_model_parallel()
         pytest.skip(f"Non-collocated test requires WORLD_SIZE >= {src_world + dst_world}")
+    if refit_backend == "nccl_m2n" and world != src_world + dst_world:
+        Utils.destroy_model_parallel()
+        pytest.skip("NCCL M2N requires a world containing exactly the source and destination ranks")
 
     try:
         import transformer_engine  # noqa: F401

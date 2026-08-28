@@ -38,6 +38,8 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _CudagraphReplayNode,
+    _CudaGraphRunner,
     create_cudagraphs,
     delete_cuda_graphs,
 )
@@ -413,6 +415,33 @@ class TestCudaGraphConfigAndArguments:
         assert cfg.cuda_graph_scope is None
 
 
+class TestCudaGraphReplay:
+    def test_gtp_forward_ensures_captured_params_ready_before_replay(self, monkeypatch):
+        calls = []
+        first = object()
+        second = object()
+        runner = object.__new__(_CudaGraphRunner)
+        runner._gtp_fwd_params_to_ensure_ready = (first, second)
+        runner.grad_enabled = False
+        runner.fwd_graph_outputs = (object(),)
+        runner.get_mismatch_errors = lambda args, kwargs: []
+        runner.get_tensors = lambda args, kwargs, check_types: []
+        runner.to_list = lambda value: list(value) if isinstance(value, tuple) else [value]
+        runner._make_pipeline_output_viewless = lambda output: output
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "ensure_params_ready",
+            lambda params: calls.append(("ready", tuple(params))),
+        )
+        monkeypatch.setattr(
+            _CudagraphReplayNode, "apply", lambda *args: calls.append("replay") or (object(),)
+        )
+
+        runner.replay_graph_capture(False, (), {})
+
+        assert calls == [("ready", (first, second)), "replay"]
+
+
 class TestParallelTransformerBlockCudagraphs:
     def setup_method(self, method):
         # initialize parallel state
@@ -474,6 +503,26 @@ class TestParallelTransformerBlockCudagraphs:
                 .cudagraph_manager.cudagraph_runners[0]
                 .fwd_graph
             )
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_dense_mlp_scope_constructs(self):
+        config = TransformerConfig(
+            num_layers=8,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[CudaGraphModule.mlp],
+        )
+
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+
+        assert block.layers
+        assert all(not layer.is_moe_layer for layer in block.layers)
+        assert all(isinstance(layer.cudagraph_manager, CudaGraphManager) for layer in block.layers)
 
 
 @pytest.mark.skipif(
@@ -1181,6 +1230,10 @@ class TestTECudaGraphHelper:
         assert (
             'sample_kwargs' in make_graphed_callables_kwargs
         ), "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        if is_te_min_version("2.19.0"):
+            assert make_graphed_callables_kwargs['clone_param_grads_on_return'] is False
+        else:
+            assert 'clone_param_grads_on_return' not in make_graphed_callables_kwargs
         sample_kwargs = make_graphed_callables_kwargs['sample_kwargs']
 
         # Basic checks
@@ -1581,7 +1634,16 @@ class TestPartialCudaGraph:
     )
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep", "ncclep"])
+    @pytest.mark.parametrize(
+        "moe_dispatcher_type",
+        [
+            "alltoall",
+            "deepep",
+            "hybridep",
+            "ncclep",
+            pytest.param("ncclep_fp8", marks=pytest.mark.launch_on_gb200),
+        ],
+    )
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(
@@ -1610,10 +1672,30 @@ class TestPartialCudaGraph:
                 pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
+        elif moe_dispatcher_type == "ncclep_fp8":
+            from tests.unit_tests.transformer.moe.test_token_dispatcher import (
+                is_nccl_ep_fp8_dispatch_available,
+            )
+
+            if not is_nccl_ep_available():
+                pytest.skip("NCCL EP is not available")
+            if ep_size < 2:
+                pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
+            if not is_nccl_ep_fp8_dispatch_available():
+                pytest.skip(
+                    "NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware"
+                )
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
+            # MXFP8 wire dtypes require the op-fuser grouped GEMM (it consumes the carrier).
+            extra_kwargs["moe_grouped_gemm"] = True
+            extra_kwargs["use_transformer_engine_op_fuser"] = True
+            extra_kwargs["moe_dispatch_fwd_dtype"] = "mxfp8"
+            extra_kwargs["moe_combine_bwd_dtype"] = "mxfp8"
         else:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
         if not moe_dropless_dispatcher:
-            if moe_dispatcher_type in ("deepep", "ncclep"):
+            if moe_dispatcher_type in ("deepep", "ncclep", "ncclep_fp8"):
                 pytest.skip(f"{moe_dispatcher_type} doesn't support drop&pad MoE")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
@@ -1631,9 +1713,10 @@ class TestPartialCudaGraph:
                 CudaGraphModule.moe_preprocess,
             ],
         ]:
-            if (moe_dropless_dispatcher or moe_dispatcher_type in ("hybridep", "ncclep")) and (
-                cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules
-            ):
+            if (
+                moe_dropless_dispatcher
+                or moe_dispatcher_type in ("hybridep", "ncclep", "ncclep_fp8")
+            ) and (cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules):
                 # Dropless MoE or a dynamic-shape flex backend (Hybrid EP / NCCL EP) can't be
                 # captured at the "moe" scope (the dispatch does a device-to-host sync). Skip;
                 # the surrounding compute submodules are still graphed.
@@ -1650,7 +1733,7 @@ class TestPartialCudaGraph:
 
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
-        if moe_dispatcher_type == "ncclep":
+        if moe_dispatcher_type in ("ncclep", "ncclep_fp8"):
             from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
 
             nccl_ep_finalize()

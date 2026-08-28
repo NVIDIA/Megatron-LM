@@ -123,8 +123,8 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, gtp_remat=1):
         os.environ["WORLD_SIZE"] = "8"
 
     grid = HyperCommGrid(
-        shape=[tp, gtp_remat, cp, pp, dp],
-        dim_names=["tp", "gtp_remat", "cp", "pp", "dp"],
+        shape=[tp, cp, gtp_remat, pp, dp],
+        dim_names=["tp", "cp", "gtp_remat", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )

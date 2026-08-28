@@ -24,6 +24,7 @@ class Symbols:
     PIPE = '|'
     MTP_SEPARATOR = "/"
     VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
+    ATTENTION_LAYERS = {ATTENTION, DS_ATTENTION, MLA}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:

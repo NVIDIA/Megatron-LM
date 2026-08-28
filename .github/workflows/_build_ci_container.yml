@@ -101,6 +101,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      pull-requests: read
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -141,9 +142,11 @@ jobs:
         id: cache_keys
         shell: bash
         env:
+          BASE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha || '' }}
           BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref || github.ref_name }}
           CACHE_VARIANT: ${{ inputs.lts && 'lts' || 'dev' }}
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
           PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
@@ -170,15 +173,41 @@ jobs:
             KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${BRANCH_NAMESPACE}"
           fi
 
+          BASE_PR_KEY=""
+          if [ -n "$BASE_SHA" ]; then
+            # PR caches are keyed by PR number, so recover the PR associated with the base commit.
+            if BASE_PRS=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BASE_SHA}/pulls"); then
+              BASE_PR=$(printf '%s' "$BASE_PRS" | jq -c --arg sha "$BASE_SHA" '
+                (
+                  [.[] | select(.state == "open" and .head.sha == $sha)]
+                  + [.[] | select(.merge_commit_sha == $sha)]
+                  + [.[] | select(.head.sha == $sha)]
+                ) | first // empty
+              ')
+              if [ -n "$BASE_PR" ]; then
+                BASE_PR_NUMBER=$(printf '%s' "$BASE_PR" | jq -r '.number')
+                BASE_PR_REF=$(printf '%s' "$BASE_PR" | jq -r '.base.ref')
+                BASE_PR_NAMESPACE=$(printf '%s' "$BASE_PR_REF" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+                BASE_PR_KEY="${BASE_PR_NAMESPACE}-${CACHE_VARIANT}-${BASE_PR_NUMBER}"
+              fi
+            else
+              echo "::warning::Unable to resolve a PR cache key for base commit $BASE_SHA"
+            fi
+          fi
+
           if [ "${#KEY}" -gt 100 ]; then
             KEY="${KEY:0:83}-$(printf '%s' "$KEY" | sha256sum | cut -c1-16)"
           fi
           if [ "${#BASELINE_KEY}" -gt 100 ]; then
             BASELINE_KEY="${BASELINE_KEY:0:83}-$(printf '%s' "$BASELINE_KEY" | sha256sum | cut -c1-16)"
           fi
+          if [ "${#BASE_PR_KEY}" -gt 100 ]; then
+            BASE_PR_KEY="${BASE_PR_KEY:0:83}-$(printf '%s' "$BASE_PR_KEY" | sha256sum | cut -c1-16)"
+          fi
 
           echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
           echo "baseline=$BASELINE_KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "base-pr=$BASE_PR_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Parse base image
         id: base-image
@@ -205,25 +234,36 @@ jobs:
         id: cache_from
         shell: bash
         env:
+          BASE_PR_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.base-pr }}-buildcache-${{ matrix.cloud }}
+          BASE_PR_KEY: ${{ steps.cache_keys.outputs.base-pr }}
           BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
+          EVENT_NAME: ${{ github.event_name }}
           LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
           RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
         run: |
-          DONOR_CACHE="$RUN_CACHE"
-          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
-            DONOR_CACHE="$BASELINE_CACHE"
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            CANDIDATES=("$BASELINE_CACHE" "$RUN_CACHE" "$LEGACY_CACHE")
+          elif [ -n "$BASE_PR_KEY" ]; then
+            CANDIDATES=("$RUN_CACHE" "$BASE_PR_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
+          else
+            CANDIDATES=("$RUN_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
           fi
-          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
-            DONOR_CACHE="$LEGACY_CACHE"
-          fi
+
+          DONOR_CACHE="$LEGACY_CACHE"
+          for candidate in "${CANDIDATES[@]}"; do
+            if docker buildx imagetools inspect "$candidate" >/dev/null 2>&1; then
+              DONOR_CACHE="$candidate"
+              break
+            fi
+          done
           echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        env:
-          BUILDX_NO_DEFAULT_OCI_ARTIFACT: "true"
         with:
           file: ${{ steps.base-image.outputs.dockerfile }}
+          provenance: false
+          sbom: false
           push: true
           context: .
           target: main

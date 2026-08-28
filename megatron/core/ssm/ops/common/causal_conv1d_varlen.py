@@ -276,3 +276,162 @@ def _causal_conv1d_varlen_simple(
 
             result = acc * torch.sigmoid(acc)
             out[start + t] = result.to(out.dtype)
+
+
+# Tiny and launch-bound: one program per (request, channel block), each writing
+# d_conv columns. The useful axis is how much of conv_dim a program covers --
+# wide blocks cut the program count, narrow ones keep more SMs busy when the
+# padded request count is small.
+@triton.autotune(
+    configs=autotune_configs(
+        [
+            triton.Config({"BLOCK_C": 64}, num_warps=2),
+            triton.Config({"BLOCK_C": 128}, num_warps=4),
+            triton.Config({"BLOCK_C": 256}, num_warps=4),
+        ]
+    ),
+    key=["conv_dim"],
+)
+@triton.jit
+def _causal_conv1d_carry_states_kernel(
+    x_ptr,
+    cu_seqlens_ptr,
+    previous_states_ptr,
+    out_ptr,
+    total_tokens,
+    conv_dim,
+    x_stride_token,
+    x_stride_dim,
+    prev_stride_req,
+    prev_stride_dim,
+    out_stride_req,
+    out_stride_dim,
+    D_CONV: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Per-request conv state after appending a slice, carrying prior history.
+
+    One program handles one request and a block of channels. The column-by-column
+    rule is in `causal_conv1d_varlen_carry_states`; here it is a `static_range`
+    over `D_CONV`, so the index arithmetic lands in registers and needs no
+    precomputed plan.
+    """
+    pid_req = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    c_off = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    c_mask = c_off < conv_dim
+
+    start = tl.load(cu_seqlens_ptr + pid_req).to(tl.int32)
+    length = tl.load(cu_seqlens_ptr + pid_req + 1).to(tl.int32) - start
+
+    for j in tl.static_range(D_CONV):
+        # Offset of this state column from the slice start. Negative means the
+        # token predates this slice and comes from the incoming state instead.
+        offset = length - D_CONV + j
+        from_slice = offset >= 0
+
+        # Both loads run for every column and `tl.where` picks one, so each index
+        # is clamped into range first. Clamping only ever moves a column the
+        # `where` is about to discard. An out-of-range column that is *not*
+        # discarded reads zero rather than a neighbouring request's token: that
+        # is a caller bug, and folding a foreign token into the state would hide
+        # it.
+        token = start + offset
+        token_ok = (token >= 0) & (token < total_tokens)
+        slice_val = tl.load(
+            x_ptr + tl.maximum(token, 0) * x_stride_token + c_off * x_stride_dim,
+            mask=c_mask & token_ok,
+            other=0.0,
+        )
+
+        prev_col = tl.minimum(tl.maximum(offset + D_CONV, 0), D_CONV - 1)
+        prev_val = tl.load(
+            previous_states_ptr + pid_req * prev_stride_req + c_off * prev_stride_dim + prev_col,
+            mask=c_mask,
+            other=0.0,
+        )
+
+        tl.store(
+            out_ptr + pid_req * out_stride_req + c_off * out_stride_dim + j,
+            tl.where(from_slice, slice_val, prev_val),
+            mask=c_mask,
+        )
+
+
+def causal_conv1d_varlen_carry_states(
+    x: torch.Tensor, cu_seqlens: torch.Tensor, previous_states: torch.Tensor
+) -> torch.Tensor:
+    """Per-request conv state after appending a slice, carrying prior history.
+
+    A request's conv state holds the last `d_conv` tokens it has seen. It exists
+    so that the next call can convolve across the boundary: the causal
+    convolution at token `t` reads tokens `t - d_conv + 1 .. t`, so continuing a
+    sequence requires the tokens that came before the current input.
+
+    When a prompt is processed one slice at a time, the new state is generally a
+    mix of both sources -- the tail of the slice, and whatever the request was
+    already carrying. With `d_conv = 4`, a request whose incoming state is
+    `[a b c d]` and whose slice this call is `[e f]`:
+
+        incoming state   a b c d
+        slice                    e f
+        new state            c d e f
+
+    Two columns survive from the incoming state, two come from the slice. The
+    same request handed a slice of `[e f g h]` or longer takes all four columns
+    from the slice, and the incoming state does not contribute at all:
+
+        incoming state   a b c d
+        slice                    e f g h
+        new state                e f g h
+
+    So the incoming state matters exactly when a slice is shorter than `d_conv`.
+    That is not an edge case to design around -- a prompt of any length can end
+    in a short slice, since the split points are chosen by a token budget that
+    knows nothing about `d_conv`. Reading only the slice in the first example
+    would produce `[0 0 e f]`, and the next call would convolve `e` and `f`
+    against zeros instead of against `c` and `d`.
+
+    Zero-length (padding) requests take every column from the incoming state and
+    so reproduce it unchanged.
+
+    The launch geometry is fixed by the padded request count, `conv_dim` and
+    `d_conv`, and no value crosses to the host, so this is safe to capture in a
+    CUDA graph.
+
+    Args:
+        x: Packed slice tokens `(total_tokens, conv_dim)`.
+        cu_seqlens: Slice boundaries `(num_requests + 1,)`.
+        previous_states: Incoming per-request states `(num_requests, conv_dim,
+            d_conv)`, in the same request order as `cu_seqlens`.
+
+    Returns:
+        The updated states, `(num_requests, conv_dim, d_conv)`.
+    """
+    num_requests, conv_dim, d_conv = previous_states.shape
+    assert cu_seqlens.shape[0] == num_requests + 1, (
+        f"cu_seqlens describes {cu_seqlens.shape[0] - 1} requests but "
+        f"previous_states has {num_requests}"
+    )
+    out = torch.empty_like(previous_states)
+    if num_requests == 0:
+        return out
+
+    grid = lambda meta: (num_requests, triton.cdiv(conv_dim, meta["BLOCK_C"]))
+    _causal_conv1d_carry_states_kernel[grid](
+        x,
+        cu_seqlens,
+        previous_states,
+        out,
+        x.shape[0],
+        conv_dim,
+        x.stride(0),
+        x.stride(1),
+        previous_states.stride(0),
+        previous_states.stride(1),
+        out.stride(0),
+        out.stride(1),
+        D_CONV=d_conv,
+    )
+    return out

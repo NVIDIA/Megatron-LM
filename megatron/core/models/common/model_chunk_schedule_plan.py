@@ -351,6 +351,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         loss_mask: Optional[Tensor] = None,
         padding_mask=None,
         *,
+        mtp_input_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
@@ -370,6 +371,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             extra_block_kwargs: Additional keyword arguments for blocks.
             runtime_gather_output: Whether to gather output at runtime.
             loss_mask (torch.Tensor): Used to mask out some portions of the loss
+            mtp_input_mask (Optional[torch.Tensor]): Tensor of shape ``[batch, sequence]``
+                whose values are converted to booleans. Nonzero/``True`` marks a valid MTP
+                conditioning token; zero/``False`` invalidates that token and any deeper MTP
+                prediction path that crosses it. ``None`` applies no additional conditioning
+                mask.
             output_processor (Callable): Custom postprocess hook to run instead of the
                 default logits/loss path.
             output_processor_context (Any): User-defined context object forwarded to
@@ -398,6 +404,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.labels = labels
         self._model_chunk_state.mtp_hidden_states = None
         self._model_chunk_state.loss_mask = loss_mask
+        self._model_chunk_state.mtp_input_mask = mtp_input_mask  # type: ignore[attr-defined]
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.padding_mask = padding_mask
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
