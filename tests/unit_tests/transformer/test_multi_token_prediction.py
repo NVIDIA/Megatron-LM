@@ -35,6 +35,7 @@ from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
     _initialize_hidden_state_mixing_rng_tracker,
     _mix_hidden_state_history,
     _mtp_logits_are_vocab_sharded,
@@ -3069,6 +3070,57 @@ class TestMultiTokenPredictionHybrid:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         MTPLossLoggingHelper.tracker = {}
+
+    def test_hybrid_mtp_delegates_full_recompute_to_nested_stack(self):
+        """Hybrid MTP must not add an outer checkpoint around its HybridStack."""
+        layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+        torch.nn.Module.__init__(layer)
+        layer.config = types.SimpleNamespace(recompute_granularity='full')
+        layer.mtp_layer_pattern = "M"
+        layer.training = True
+
+        input_ids = torch.arange(4).reshape(1, 4)
+        position_ids = torch.arange(4).reshape(1, 4)
+        padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        decoder_input = torch.randn(4, 1, 8)
+        hidden_states = torch.randn(4, 1, 8)
+        calls = {"inner": 0, "outer": 0}
+
+        def get_embeddings(_self, **_kwargs):
+            return (
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+                decoder_input,
+                hidden_states,
+            )
+
+        def inner_forward(_self, **kwargs):
+            calls["inner"] += 1
+            assert kwargs["hidden_states"] is hidden_states
+            return hidden_states + 1
+
+        def outer_forward(_self, **_kwargs):
+            calls["outer"] += 1
+            raise AssertionError("Hybrid MTP must not use the outer checkpoint")
+
+        layer._get_embeddings = types.MethodType(get_embeddings, layer)
+        layer._proj_and_transformer_layer = types.MethodType(inner_forward, layer)
+        layer._checkpointed_forward = types.MethodType(outer_forward, layer)
+
+        output, *_ = layer(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            padding_mask=padding_mask,
+            embedding=object(),
+        )
+
+        assert calls == {"inner": 1, "outer": 0}
+        torch.testing.assert_close(output, hidden_states + 1)
 
     def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.

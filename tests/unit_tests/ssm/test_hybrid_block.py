@@ -10,6 +10,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -36,6 +37,29 @@ class TestHybridBlock:
 
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
+    def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
+        """Reject overlap before constructing any HybridModel submodule."""
+        config = TransformerConfig(
+            hidden_size=256, num_layers=1, num_attention_heads=4, use_cpu_initialization=True
+        )
+        # Mutate after generic config validation to exercise the pattern-specific guard.
+        config.overlap_moe_expert_parallel_comm = True
+
+        def fail_build(*args, **kwargs):
+            pytest.fail("HybridModel submodule construction must not begin")
+
+        monkeypatch.setattr("megatron.core.models.hybrid.hybrid_model.build_module", fail_build)
+
+        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
+                pg_collection=self.get_pg_collection(),
+            )
 
     def get_hybrid_block(self, layer_pattern, **config_kwargs):
         layer_type_list = validate_segment_layers(layer_pattern)
