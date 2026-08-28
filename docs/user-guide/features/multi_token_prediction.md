@@ -27,8 +27,18 @@ The following table summarizes MTP configuration fields:
 | --- | --- |
 | `mtp_num_layers` | Number of MTP layers. MTP extends prediction to multiple future tokens at each position. This stack uses `mtp_num_layers` sequential modules to predict that many additional tokens per position. Default: `None`. |
 | `mtp_loss_scaling_factor` | Weight for the MTP loss term. The implementation averages MTP losses across depths, multiplies by this factor, and adds the result to the training objective. Default: `0.1`. |
+| `mtp_loss_type` | MTP training objective: `cross_entropy` or `e2e_tv`. Default: `cross_entropy`. |
 | `mtp_use_repeated_layer` | Reuse one physical MTP layer for every prediction depth. Parameters are shared, while the hidden state, shifted token input, and query are recomputed at each iteration. Default: `False`. |
 | `dsa_mtp_index_kv_share` | For repeated-layer DSA MTP, compute latent KV and indexer top-k at iteration 0 and reuse them at later iterations. Queries and sparse attention are still evaluated at every iteration. The indexer loss is computed and tracked only at iteration 0, so `dsa_indexer_loss_coeff` may need retuning when switching from non-sharing. Default: `False`. |
+
+## End-to-End TV Loss
+
+Set `mtp_loss_type: e2e_tv` and `mtp_detach_heads: true` to enable the end-to-end
+TV objective. This mode requires `mtp_num_layers >= 1` and uses
+`mtp_loss_scaling_factor` to scale the auxiliary loss. To train only MTP parameters,
+the optimizer must additionally freeze the base model or select only MTP parameters;
+`mtp_detach_heads` does not change the optimizer parameter set. See
+[Bebop](https://arxiv.org/abs/2606.12370) for the objective definition.
 
 ## Repeated DSA MTP IndexShare and KVShare
 
