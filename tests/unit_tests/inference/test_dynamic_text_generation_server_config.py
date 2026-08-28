@@ -7,6 +7,7 @@ import pytest
 quart = pytest.importorskip("quart")
 from quart import Quart
 
+from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
     bp as chat_completions_blueprint,
 )
@@ -80,6 +81,7 @@ async def test_chat_request_uses_server_defaults(
         tokenizer=_Tokenizer(),
         parsers=[],
         verbose=False,
+        multimodal_prompt_config=MultimodalPromptConfig(),
         default_temperature=0.7,
         default_top_p=0.95,
         default_top_k=20,
