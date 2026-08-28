@@ -1074,7 +1074,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             == ctx.mamba_chunk_size + 1
         )
 
-        with pytest.raises(AssertionError, match="max_tokens > mamba_chunk_size"):
+        with pytest.raises(AssertionError, match="max_tokens > ssm_chunk_alignment"):
             self._mctx(
                 batch_invariant_mode=True,
                 enable_prefix_caching=False,
@@ -1421,6 +1421,196 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list[4]) == fresh_ql
 
 
+class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
+    """Tokens recomputed inside a hash-matched block must write to the dummy block.
+
+    The matched block is shared with the request that cached it and already holds
+    the correct KV for exactly those tokens, so `add_request` redirects their
+    `token_to_block_idx` entries away from the real block.
+    """
+
+    @staticmethod
+    def _write_targets(ctx, start, end):
+        """Block ids this step will write KV to, for token slots [start, end)."""
+        return ctx.token_to_block_idx[start:end].tolist()
+
+    def _mctx(self, **kwargs):
+        """Hybrid context with a Mamba state cache, so prefill skipping is possible."""
+        defaults = dict(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        defaults.update(kwargs)
+        return self._ctx(**defaults)
+
+    def _add_chunk(self, ctx, req, chunk_length=None):
+        """Admit one prefill chunk; return the token slots it claimed.
+
+        Mirrors the continuation bookkeeping the engine does between chunks:
+        advance the prompt window and hand the same request row back to the
+        next `add_request` call.
+        """
+        start = ctx.active_token_count
+        ctx.add_request(req, prefill_chunk_length=chunk_length)
+        end = ctx.active_token_count
+        if chunk_length is not None:
+            req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
+            req.finished_chunk_token_count += chunk_length
+            # `update_requests` decrements this for a continuing chunked prefill so
+            # the next chunk reuses the same request row.
+            ctx.total_request_count -= 1
+        return start, end
+
+    @pytest.mark.internal
+    def test_fully_cached_repeat_redirects_recomputed_block(self):
+        """The `>= 2 computed tokens` clamp forces a matched block to be recomputed."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+        prompt = self._prompt(bs * 3)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        cached_blocks = self._block_ids(ctx, 0, 3)
+
+        # Re-sending the prompt verbatim matches all 3 blocks, but skipping all 96
+        # tokens would leave a 0-token chunk, so the skip is clamped down to 2 blocks
+        # and the third block's 32 tokens are recomputed.
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        start, end = self._add_chunk(ctx, req2)
+        assert end - start == bs
+        assert ctx.request_kv_length_offsets[1].item() == bs * 2
+
+        # Every recomputed token lands in the matched third block, so all of the
+        # chunk's writes are redirected.
+        assert self._write_targets(ctx, start, end) == [dummy] * bs
+        # The block table is untouched: attention still reads the cached KV.
+        assert self._block_ids(ctx, 1, 3) == cached_blocks
+
+    @pytest.mark.internal
+    def test_partial_match_redirects_only_matched_region(self):
+        """A prompt that extends a cached prefix writes fresh blocks normally."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+
+        cached_prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, cached_prompt.clone()))
+
+        # Two cached blocks plus two fresh ones. The skip covers both matched
+        # blocks exactly, so nothing is recomputed and nothing is redirected.
+        extended = torch.cat([cached_prompt, self._prompt(bs * 2, offset=5000)])
+        req2 = self._req(ctx, extended, request_id=2)
+        start, end = self._add_chunk(ctx, req2)
+        assert end - start == bs * 2
+        assert ctx.request_kv_length_offsets[1].item() == bs * 2
+
+        fresh_blocks = self._block_ids(ctx, 1, 4)[2:]
+        assert dummy not in fresh_blocks
+        targets = self._write_targets(ctx, start, end)
+        assert targets == [fresh_blocks[0]] * bs + [fresh_blocks[1]] * bs
+
+    @pytest.mark.internal
+    def test_no_match_writes_every_token_to_a_real_block(self):
+        """Control: with no prefix hit there is nothing to redirect."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
+        req2 = self._req(ctx, self._prompt(bs * 2, offset=9000), request_id=2)
+        start, end = self._add_chunk(ctx, req2)
+
+        assert end - start == bs * 2
+        assert dummy not in self._write_targets(ctx, start, end)
+
+    @pytest.mark.internal
+    def test_hybrid_memory_only_redirects_all_matched_tokens(self):
+        """Hybrid models share blocks without skipping prefill, so all writes redirect."""
+        ctx = self._ctx(mamba_config=self._mamba_config())
+        bs = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+        prompt = self._prompt(bs * 3)
+        assert ctx.is_hybrid_model
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        cached_blocks = self._block_ids(ctx, 0, 3)
+
+        # No Mamba budget here, so prefix_skip_tokens is 0: the whole prompt is
+        # recomputed even though all 3 blocks were matched and shared.
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        start, end = self._add_chunk(ctx, req2)
+        assert end - start == bs * 3
+        assert ctx.request_kv_length_offsets[1].item() == 0
+
+        assert self._write_targets(ctx, start, end) == [dummy] * (bs * 3)
+        assert self._block_ids(ctx, 1, 3) == cached_blocks
+
+    @pytest.mark.parametrize("mamba_cached_blocks", [1, 3])
+    @pytest.mark.internal
+    def test_mamba_skip_shorter_than_kv_match_redirects_remainder(self, mamba_cached_blocks):
+        """Mamba state, not the KV match, bounds the skip -- the rest is recomputed.
+
+        With 1 of 3 blocks holding Mamba state the skip stops after that block; with
+        all 3 it would leave a zero-token chunk, so it backs off to block 2. Either
+        way the recomputed tokens land in KV blocks that were matched.
+        """
+        ctx = self._mctx()
+        bs = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+        prompt = self._prompt(bs * 3)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        cached_blocks = self._block_ids(ctx, 0, 3)
+        self._mamba_allocate_and_register(ctx, cached_blocks[:mamba_cached_blocks])
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        start, end = self._add_chunk(ctx, req2)
+
+        skipped_blocks = 1 if mamba_cached_blocks == 1 else 2
+        assert ctx.request_kv_length_offsets[1].item() == skipped_blocks * bs
+        assert end - start == (3 - skipped_blocks) * bs
+
+        assert self._write_targets(ctx, start, end) == [dummy] * (end - start)
+        assert self._block_ids(ctx, 1, 3) == cached_blocks
+
+    @pytest.mark.internal
+    def test_unaligned_continuation_redirects_inherited_partial_block(self):
+        """A chunk resuming mid-block must not write into it if it was matched too."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+        prompt = self._prompt(bs * 4)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+
+        # Chunk 1 stops at token 40, i.e. 8 tokens into block 1, leaving
+        # `finished_chunk_token_count` unaligned for chunk 2. Both blocks it spans
+        # are matched, so its 8 computed tokens redirect.
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        chunk1_length = bs + 8
+        start1, end1 = self._add_chunk(ctx, req2, chunk_length=chunk1_length)
+        assert end1 - start1 == 8
+        assert req2.finished_chunk_token_count == chunk1_length
+        assert req2.num_matched_prefix_blocks == 2
+        assert self._write_targets(ctx, start1, end1) == [dummy] * 8
+
+        # Chunk 2 covers tokens [40, 128). The first 24 complete block 1 -- which
+        # chunk 1 obtained by match and still shares with the first request -- so
+        # they redirect alongside the 64 tokens in matched blocks 2-3.
+        chunk2_length = bs * 4 - chunk1_length
+        start2, end2 = self._add_chunk(ctx, req2, chunk_length=chunk2_length)
+        assert end2 - start2 == chunk2_length
+        assert ctx.request_kv_length_offsets[1].item() == chunk1_length
+        assert req2.num_matched_prefix_blocks == 4
+
+        assert self._write_targets(ctx, start2, end2) == [dummy] * chunk2_length
+        # Every block this request holds is shared with the first request.
+        for block_id in self._block_ids(ctx, 1, 4):
+            assert ctx.kv_block_allocator.block_ref_counts[block_id].item() == 2
+
+
 def _make_cpu_mamba_slot_allocator(
     monkeypatch, *, total_blocks: int, max_slots: int
 ) -> MambaSlotAllocator:
@@ -1436,6 +1626,15 @@ def _make_cpu_mamba_slot_allocator(
         max_mamba_intermediate_states_per_step=1,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         kv_block_allocator=kv_allocator,
+        # A real context always sets these two together (see
+        # DynamicInferenceContext.__init__), and the allocator asserts their
+        # divisibility on construction. Mamba-only values: a model whose SSM
+        # layers all chunk at 128 aligns at 128.
+        mamba_chunk_size=128,
+        ssm_chunk_alignment=128,
+        # Gated Delta Product prefix caching is unsupported; the allocator
+        # asserts this is 0 on construction (see MambaSlotAllocator.__init__).
+        gdp_num_householder=0,
     )
     return MambaSlotAllocator(
         context=context,
