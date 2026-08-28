@@ -849,7 +849,7 @@ def _get_megatron_emerging_optimizer(
         assert ddp_config.num_distributed_optimizer_instances == 1, (
             "Layer-wise + DistributedOptimizer split path does not yet support "
             "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
+            "is hardcoded to 0 in this path. Pass --layer-wise-param-layout legacy to "
             "fall back to the legacy LayerWise ping-pong path."
         )
     if use_separate_distributed_optimizer and any(
@@ -930,7 +930,7 @@ def _get_megatron_emerging_optimizer(
                         "supported on the layer-wise + DistributedOptimizer "
                         "path: they need a separate DistOpt instance with the "
                         "expert-DP process group, which is not wired up yet. "
-                        "Disable use_layer_wise_param_layout to fall back to "
+                        "Pass --layer-wise-param-layout legacy to fall back to "
                         "the legacy LayerWise ping-pong path for MoE models."
                     )
                 fallback_config.use_distributed_optimizer = True

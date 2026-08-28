@@ -170,7 +170,7 @@ class TestLayerWiseOptimizer:
         if use_param_layout:
             from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig()
+            ddp_config = DistributedDataParallelConfig(layer_wise_param_layout='padded')
             model = wrap_model_chunks_with_ddp(
                 [model],
                 TransformerConfig(num_attention_heads=1, num_layers=1),
@@ -178,7 +178,9 @@ class TestLayerWiseOptimizer:
                 use_layer_wise_distributed_optimizer=use_layer_wise,
             )[0]
         else:
-            ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+            ddp_config = DistributedDataParallelConfig(
+                use_distributed_optimizer=False, layer_wise_param_layout='legacy'
+            )
             model = DistributedDataParallel(
                 TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
             )
@@ -257,6 +259,7 @@ class TestLayerWiseOptimizer:
             from megatron.training.training import wrap_model_chunks_with_ddp
 
             ddp_config = DistributedDataParallelConfig(
+                layer_wise_param_layout='padded',
                 overlap_param_gather=overlap_param_gather,
                 overlap_grad_reduce=overlap_grad_reduce,
                 grad_reduce_in_fp32=grad_reduce_in_fp32,
@@ -271,6 +274,7 @@ class TestLayerWiseOptimizer:
         else:
             ddp_config = DistributedDataParallelConfig(
                 use_distributed_optimizer=False,
+                layer_wise_param_layout='legacy',
                 overlap_param_gather=overlap_param_gather,
                 overlap_grad_reduce=overlap_grad_reduce,
                 grad_reduce_in_fp32=grad_reduce_in_fp32,
