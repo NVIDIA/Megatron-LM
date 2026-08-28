@@ -401,9 +401,16 @@ class CUDAGraphBatchDimensionBuilder:
             # TP-align and dedupe in order; preserve original ordering for parity.
             sizes = list(dict.fromkeys(round_up_to_nearest_multiple(s, tp_size) for s in sizes))
             sizes = [s for s in sizes if s <= cuda_graph_max_tokens]
-            if not sizes or sizes[-1] != cuda_graph_max_tokens:
-                sizes.append(cuda_graph_max_tokens)
+            # Round the top of the ladder down to a TP multiple, as the explicit-N path
+            # does: an unaligned cuda_graph_max_tokens would otherwise be appended as is,
+            # and the prefill loop in generate_cuda_graph_batch_dimensions_list asserts
+            # every token count is TP-aligned.
+            tp_aligned_max = (cuda_graph_max_tokens // tp_size) * tp_size
+            if tp_aligned_max > 0 and (not sizes or sizes[-1] != tp_aligned_max):
+                sizes.append(tp_aligned_max)
             sizes.reverse()
+
+            assert all(s % tp_size == 0 for s in sizes)
             return sizes
 
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
@@ -411,9 +418,11 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_max_tokens > 0
         ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
 
-        # Even stride: step = round_up_to(max / N, rounder), TP-aligned.
-        step = cuda_graph_max_tokens / num_cuda_graphs
-        step = rounder * int(math.ceil(int(step) / rounder))
+        # Even stride: step = round_up_to(max / N, rounder), TP-aligned. Round the
+        # fractional stride up rather than truncating it first: truncating rounds the
+        # step *down*, which yields more sizes than the user asked for (max_tokens=80
+        # with N=32 gives step 2 and 40 graphs, instead of step 4 and 20 graphs).
+        step = rounder * math.ceil(cuda_graph_max_tokens / num_cuda_graphs / rounder)
         step = round_up_to_nearest_multiple(step, tp_size)
         step = max(step, tp_size)
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
@@ -425,6 +434,11 @@ class CUDAGraphBatchDimensionBuilder:
         if not sizes or sizes[-1] != cuda_graph_max_tokens:
             sizes.append(cuda_graph_max_tokens)
         sizes.reverse()
+
+        # Same budget guarantee the exponential path asserts: never capture more graphs
+        # than the caller asked for. Holds because step >= cuda_graph_max_tokens /
+        # num_cuda_graphs, and TP alignment only grows the step.
+        assert len(sizes) <= num_cuda_graphs
         return sizes
 
     @staticmethod
@@ -573,27 +587,51 @@ class CUDAGraphBatchDimensionBuilder:
                 )
             )
 
-            # Include the smallest decode-only graphs when auto-sizing (num_cuda_graphs == -1).
-            # Without this, TP alignment and the num_speculative_tokens floor division can drop
-            # the smallest 1- and 2-request shapes from the captured set.
+            # Include the smallest decode-only graphs. Without this, TP alignment and the
+            # num_speculative_tokens floor division can drop the smallest 1- and 2-request
+            # shapes from the captured set, so a lightly loaded decode step -- one request
+            # while the engine drains, or a low-concurrency workload -- pads up to a graph
+            # many times its size.
             #
             # The minimum valid decode token_count is lcm(spec_unit, tp_size):
             #   - Ensure divisible by tp_size (required so TP / sequence-parallel never produces a
             #     single-token graph when tp_size > 1).
             #   - Ensure a multiple of (spec+1) so it accommodates an integer number of decode
             #     requests when speculative decoding is enabled.
-            if num_cuda_graphs == -1:
-                spec_unit = num_speculative_tokens + 1
-                min_decode_tokens = math.lcm(spec_unit, tp_size)
-                for req_count_multiple in (1, 2):
-                    floor_tokens = min_decode_tokens * req_count_multiple
-                    if (
-                        floor_tokens <= cuda_graph_max_tokens_decode
-                        and floor_tokens not in cuda_graph_decode_token_counts
-                    ):
-                        cuda_graph_decode_token_counts.append(floor_tokens)
+            spec_unit = num_speculative_tokens + 1
+            min_decode_tokens = math.lcm(spec_unit, tp_size)
+            decode_floors = [
+                min_decode_tokens * req_count_multiple
+                for req_count_multiple in (1, 2)
+                if min_decode_tokens * req_count_multiple <= cuda_graph_max_tokens_decode
+            ]
+
+            # The exponential ladder already forces its smallest endpoint, and auto-sizing
+            # (num_cuda_graphs == -1) has no budget to respect, so only an explicit graph
+            # count over a linear decode ladder needs room reserved: its smallest rung is
+            # the stride, cuda_graph_max_tokens_decode / num_cuda_graphs. Rebuild that
+            # ladder with fewer graphs so the floors fit inside the caller's budget rather
+            # than extending past it, keeping the smallest floors when the budget is too
+            # tight for both (and none at all when the caller asked for a single graph).
+            reserve_budget_for_floors = (
+                num_cuda_graphs != -1
+                and decode_distribution == CudaGraphSizingDistribution.LINEAR
+                and any(f not in cuda_graph_decode_token_counts for f in decode_floors)
+            )
+            if reserve_budget_for_floors:
+                decode_floors = decode_floors[: max(0, num_cuda_graphs - 1)]
+                cuda_graph_decode_token_counts = (
+                    CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+                        tp_size=tp_size,
+                        num_cuda_graphs=num_cuda_graphs - len(decode_floors),
+                        cuda_graph_max_tokens=cuda_graph_max_tokens_decode,
+                        sizing_distribution=decode_distribution,
+                    )
+                )
+
+            if num_cuda_graphs == -1 or reserve_budget_for_floors:
                 cuda_graph_decode_token_counts = sorted(
-                    set(cuda_graph_decode_token_counts), reverse=True
+                    set(cuda_graph_decode_token_counts) | set(decode_floors), reverse=True
                 )
 
         cuda_graph_batch_dimensions_list = []
