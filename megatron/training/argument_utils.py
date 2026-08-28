@@ -274,6 +274,21 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
+    """Resolve an omitted DSA backend without changing the shared config default.
+
+    Ordinary DSA keeps the main-branch default of ``none``. DSv4 hybrid
+    historically launches the fused CSA path, so an omitted CLI flag resolves
+    to ``cudnn`` while an explicit ``none`` remains authoritative.
+    """
+    if 'dsa_kernel_backend' not in kw_args or kw_args['dsa_kernel_backend'] is not None:
+        return
+    variant = kw_args.get('experimental_attention_variant') or kw_args.get(
+        'linear_attention_type'
+    )
+    kw_args['dsa_kernel_backend'] = 'cudnn' if variant == 'dsv4_hybrid' else 'none'
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -346,7 +361,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+            if args.experimental_attention_variant != 'dsv4_hybrid':
+                kw_args['experimental_attention_variant'] = 'dsa'
+
+    _resolve_dsa_kernel_backend_cli_default(args, kw_args)
 
     kw_args['inference_sampling_seed'] = args.seed
 
