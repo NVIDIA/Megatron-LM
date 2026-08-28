@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Iterator, Protocol
 
@@ -17,7 +19,7 @@ from .utils import _require
 
 @dataclass(frozen=True)
 class PayloadLease:
-    """A synchronously ready latent payload and its original CP owner."""
+    """A consumer-stream-ordered latent payload and its original CP owner."""
 
     owner: int
     tensor: Tensor
@@ -29,8 +31,82 @@ class LatentCPTransport(Protocol):
     def iter_payloads(
         self, local_payload: Tensor, phase_plan: tuple[PhaseSpec, ...]
     ) -> Iterator[PayloadLease]:
-        """Yield one ready payload lease for every phase."""
+        """Yield one consumer-stream-ordered payload lease for every phase."""
         ...
+
+
+_COMMUNICATION_STREAM_LOCK = threading.RLock()
+_COMMUNICATION_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def _communication_stream(payload: Tensor) -> torch.cuda.Stream | None:
+    """Return one process/device-local stream shared by latent ring transports."""
+
+    if not payload.is_cuda:
+        return None
+    device_index = payload.device.index
+    _require(device_index is not None, "CUDA payload must have a concrete device")
+    key = (os.getpid(), device_index)
+    with _COMMUNICATION_STREAM_LOCK:
+        stream = _COMMUNICATION_STREAMS.get(key)
+        if stream is None:
+            with torch.cuda.device(payload.device):
+                stream = torch.cuda.Stream(device=payload.device)
+            _COMMUNICATION_STREAMS[key] = stream
+        return stream
+
+
+@dataclass
+class _PendingExchange:
+    """CUDA readiness state for one prefetched receive."""
+
+    ready_event: torch.cuda.Event | None = None
+    send_tensor: Tensor | None = None
+    waited: bool = False
+
+    def wait_on_current_stream(self, receive: Tensor) -> None:
+        """Order the consumer stream after the prefetched receive without a host wait."""
+
+        _require(not self.waited, "a prefetched ring payload was consumed twice")
+        if self.ready_event is not None:
+            torch.cuda.current_stream(receive.device).wait_event(self.ready_event)
+        self.waited = True
+        self.send_tensor = None
+
+
+def _launch_ring_exchange(
+    payload: Tensor,
+    cp_group: dist.ProcessGroup,
+    send_peer: int,
+    receive_peer: int,
+    communication_stream: torch.cuda.Stream | None,
+    pending: _PendingExchange,
+) -> Tensor:
+    """Launch one explicit-group exchange, isolated from the attention stream."""
+
+    receive = torch.empty_like(payload)
+    operations = [
+        dist.P2POp(dist.isend, payload, send_peer, group=cp_group),
+        dist.P2POp(dist.irecv, receive, receive_peer, group=cp_group),
+    ]
+    if communication_stream is None:
+        for work in dist.batch_isend_irecv(operations):
+            work.wait()
+        pending.send_tensor = payload
+        return receive
+
+    compute_stream = torch.cuda.current_stream(payload.device)
+    with torch.cuda.stream(communication_stream):
+        communication_stream.wait_stream(compute_stream)
+        for work in dist.batch_isend_irecv(operations):
+            work.wait()
+        ready_event = torch.cuda.Event()
+        ready_event.record(communication_stream)
+        payload.record_stream(communication_stream)
+        receive.record_stream(communication_stream)
+    pending.ready_event = ready_event
+    pending.send_tensor = payload
+    return receive
 
 
 class _LatentRingExchange(torch.autograd.Function):
@@ -43,36 +119,44 @@ class _LatentRingExchange(torch.autograd.Function):
         cp_group: dist.ProcessGroup,
         previous_peer: int,
         next_peer: int,
+        communication_stream: torch.cuda.Stream | None,
+        pending: _PendingExchange,
     ) -> Tensor:
-        """Send one payload clockwise and receive the preceding owner's payload."""
-        receive = torch.empty_like(payload)
-        operations = [
-            dist.P2POp(dist.isend, payload, next_peer, group=cp_group),
-            dist.P2POp(dist.irecv, receive, previous_peer, group=cp_group),
-        ]
-        for work in dist.batch_isend_irecv(operations):
-            work.wait()
+        """Prefetch the preceding owner's payload on the communication stream."""
         ctx.cp_group = cp_group
         ctx.previous_peer = previous_peer
         ctx.next_peer = next_peer
-        return receive
+        ctx.communication_stream = communication_stream
+        return _launch_ring_exchange(
+            payload,
+            cp_group,
+            next_peer,
+            previous_peer,
+            communication_stream,
+            pending,
+        )
 
     @staticmethod
-    def backward(ctx: Any, grad_receive: Tensor) -> tuple[Tensor, None, None, None]:
+    def backward(
+        ctx: Any, grad_receive: Tensor
+    ) -> tuple[Tensor, None, None, None, None, None]:
         """Route the received-payload gradient through the reverse ring hop."""
         grad_receive = grad_receive.contiguous()
-        grad_payload = torch.empty_like(grad_receive)
-        operations = [
-            dist.P2POp(dist.isend, grad_receive, ctx.previous_peer, group=ctx.cp_group),
-            dist.P2POp(dist.irecv, grad_payload, ctx.next_peer, group=ctx.cp_group),
-        ]
-        for work in dist.batch_isend_irecv(operations):
-            work.wait()
-        return grad_payload, None, None, None
+        pending = _PendingExchange()
+        grad_payload = _launch_ring_exchange(
+            grad_receive,
+            ctx.cp_group,
+            ctx.previous_peer,
+            ctx.next_peer,
+            ctx.communication_stream,
+            pending,
+        )
+        pending.wait_on_current_stream(grad_payload)
+        return grad_payload, None, None, None, None, None
 
 
 class P2PRingTransport:
-    """Synchronous wait-at-each-hop v1 transport."""
+    """One-hop-prefetched P2P transport with an explicit reverse autograd ring."""
 
     def __init__(self, cp_group: dist.ProcessGroup):
         self.cp_group = cp_group
@@ -86,7 +170,7 @@ class P2PRingTransport:
     def iter_payloads(
         self, local_payload: Tensor, phase_plan: tuple[PhaseSpec, ...]
     ) -> Iterator[PayloadLease]:
-        """Yield the local payload followed by each synchronous clockwise hop."""
+        """Yield each payload after ordering the consumer behind its prefetched receive."""
         _require(len(phase_plan) == self.size, "phase-plan length must equal CP size")
         for phase_index, phase in enumerate(phase_plan):
             expected_owner = (self.rank - phase_index) % self.size
@@ -99,9 +183,28 @@ class P2PRingTransport:
             )
 
         payload = local_payload
+        pending: _PendingExchange | None = None
+        communication_stream = (
+            _communication_stream(local_payload) if self.size > 1 else None
+        )
         for phase_index, phase in enumerate(phase_plan):
-            yield PayloadLease(owner=phase.owner, tensor=payload)
+            if pending is not None:
+                pending.wait_on_current_stream(payload)
+
+            next_payload: Tensor | None = None
+            next_pending: _PendingExchange | None = None
             if phase_index + 1 < self.size:
-                payload = _LatentRingExchange.apply(
-                    payload, self.cp_group, self.previous_peer, self.next_peer
+                next_pending = _PendingExchange()
+                next_payload = _LatentRingExchange.apply(
+                    payload,
+                    self.cp_group,
+                    self.previous_peer,
+                    self.next_peer,
+                    communication_stream,
+                    next_pending,
                 )
+
+            yield PayloadLease(owner=phase.owner, tensor=payload)
+            if next_payload is not None and next_pending is not None:
+                payload = next_payload
+                pending = next_pending

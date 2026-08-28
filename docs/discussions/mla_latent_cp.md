@@ -510,19 +510,23 @@ full-layer recompute, selective `mla_up_proj`/`core_attn` recompute, and fine-gr
 offload at construction. Supporting
 any of them later requires explicit nested-checkpoint and saved-tensor/offload tests.
 
-### V1 transport, lifetimes, and deadlock ordering
+### Pipelined transport, lifetimes, and deadlock ordering
 
-V1 chooses fixed **wait-at-each-hop** execution. It does not overlap P2P with attention. After phase
-`i`, every rank submits one public `torch.distributed.batch_isend_irecv` batch of `P2POp` objects
-ordered as `[isend(next), irecv(previous)]`. Every `P2POp` sets
-`group=effective_cp_group`; the rank waits every returned `Work` before computing phase `i+1`.
-Backward submits `[isend(previous), irecv(next)]` with the same explicit CP group and likewise waits
-before consuming `dX_r`.
+Before yielding phase `i`, every rank submits the exchange for phase `i+1` on one process/device
+communication stream. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp`
+objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
+`group=effective_cp_group`. The communication stream first waits for the current payload producer;
+each returned `Work.wait` is issued while that stream is current, followed by a CUDA readiness event.
+The generator then yields phase `i` on the ordinary attention stream. When it resumes for phase
+`i+1`, that consumer stream waits on the event, so the intervening attention kernels can overlap the
+one-hop receive without exposing an unready tensor.
 
-P2P uses the current CUDA stream. Send storage remains live through `Work.wait`; receive storage is a
-fresh tensor for the autograd node and is never overwritten before backward. Fixed payload shapes,
-identical operation lists, and identical phase counts prevent mismatched-message and parity-order
-deadlocks.
+Backward submits `[isend(previous), irecv(next)]` on the same communication stream and inserts the
+corresponding event dependency before returning `dX_r`. Send and receive tensors are recorded on the
+communication stream, and the pending lease retains send storage until the consumer dependency is
+installed. CP=1 creates no stream and submits no P2P. Fixed payload shapes, peer order, operation
+lists, and phase counts remain identical across ranks, preventing mismatched-message and
+parity-order deadlocks.
 
 Feature-static config, package, runtime, and capability checks run in the layer constructor, using
 the configured maximum CP/TP groups where group properties are needed. Cheap activation checks run
@@ -535,9 +539,9 @@ that bypasses block preprocessing therefore fails in phase zero
 before the first ring hop. Once P2P starts, the module makes no claim to recover from an arbitrary
 Python, CUDA, or NCCL exception; failures propagate through normal PyTorch/NCCL error handling.
 
-`LatentCPTransport` remains an extension seam. A later explicitly configured transport may return a
-`PayloadLease` plus readiness event from a communication stream, but no overlap setting or fallback
-exists in v1.
+`LatentCPTransport` remains an extension seam. `PayloadLease.tensor` is ordered for use on the
+consumer stream before it is yielded; the readiness event is transport-private. A future explicitly
+configured transport may preserve the same lease contract while changing the collective topology.
 
 ## Direct backend adapters
 
@@ -853,9 +857,10 @@ output restoration. V1's `AlreadyZigZagTHDAdapter` validates and returns views. 
 `ContiguousToZigZagAdapter` can use public `CpPartitionModeConverter`, but remains separate rather
 than hiding an eager conversion in the attention module.
 
-V1's `P2PRingTransport` yields owner and a ready, synchronously received payload. A future
-`HierarchicalA2AP2PTransport` can consume a layout plan and combine contiguous-to-zigzag permutation
-with low-level A2A, then expose the same owner order. Its process groups must be injected, for
+`P2PRingTransport` yields an owner plus a consumer-stream-ordered payload while prefetching the next
+hop. A future `HierarchicalA2AP2PTransport` can consume a layout plan and combine
+contiguous-to-zigzag permutation with low-level A2A, then expose the same owner order and readiness
+contract. Its process groups must be injected, for
 example through `pg_collection.hcp`; no global `parallel_state` read is introduced.
 
 These are extension seams, not placeholder implementations in v1.
@@ -962,8 +967,10 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    gradient, gate gradient, and every base parameter gradient for elementwise and headwise modes.
 4. **Payload and ring tests.** Assert each forward P2P tensor has `T_r*(C+D_r)` elements, never the
    full-K/V size. For CP=2/4, prove forward owner routing, reverse gradient routing, fixed peer order,
-   that every recorded `P2POp` constructor receives the effective CP group, and wait-at-each-hop
-   behavior. After construction, patch `parallel_state.get_tensor_model_parallel_group`,
+   that every recorded `P2POp` constructor receives the effective CP group, and that the next
+   exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
+   work must be waited exactly once. After construction, patch
+   `parallel_state.get_tensor_model_parallel_group`,
    `get_context_parallel_group`, and `get_tensor_and_context_parallel_group` to raise throughout
    the complete TP=2 x CP=2 production forward/backward; test-harness collectives remain explicitly
    bound to injected groups outside that guard.
@@ -1055,8 +1062,9 @@ worklog. The upstream document and GitHub-bound commit contain no internal clust
   FA4 retains full phase replay. Contiguous phase views and subset merge remove benchmark-path
   gather/scatter temporaries, while general packed layouts retain their indexed fallback. The feature
   claims removal of remote full K/V, not O(1) activation memory or free recomputation.
-- **Collectives:** all ranks must construct an identical autograd graph; v1 sacrifices overlap to
-  make ordering and lifetime explicit.
+- **Collectives:** all ranks must construct an identical autograd graph and phase order. The one-hop
+  pipeline overlaps only adjacent P2P/attention work; it does not alter the collective topology or
+  promise full communication hiding.
 - **Projection scope:** only the local MCore Column/RowParallel projection spec, trainable bias-free
   output weight, TP=1 non-SP or TP>1 with SP, and no CPU offloading are supported. The output helper
   deliberately preserves the inherited module/weight/state dict while bypassing only its

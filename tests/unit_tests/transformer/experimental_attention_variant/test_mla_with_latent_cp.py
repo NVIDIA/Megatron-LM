@@ -1038,6 +1038,11 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
             "apply",
             side_effect=AssertionError("CP=1 must not launch P2P"),
         ) as exchange,
+        mock.patch.object(
+            latent_cp._transport,
+            "_communication_stream",
+            side_effect=AssertionError("CP=1 must not create a communication stream"),
+        ) as stream_factory,
     ):
         leases = list(
             latent_cp.P2PRingTransport(cp_group).iter_payloads(payload, layout.phases)
@@ -1045,6 +1050,7 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
     assert len(leases) == 1
     assert leases[0].owner == 0
     assert leases[0].tensor is payload
+    stream_factory.assert_not_called()
     exchange.assert_not_called()
     leases[0].tensor.sum().backward()
     torch.testing.assert_close(payload.grad, torch.ones_like(payload), rtol=0, atol=0)
@@ -2472,7 +2478,9 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         real_batch = latent_cp.dist.batch_isend_irecv
         p2p_records = []
         batch_calls = []
+        batch_streams = []
         returned_proxies = []
+        consumer_stream = torch.cuda.current_stream().cuda_stream
         wait_count = 0
 
         def p2p_op(op, tensor, peer, group=None, tag=0):
@@ -2494,15 +2502,20 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         def batch(operations):
             assert all(proxy.waited for proxy in returned_proxies)
             batch_calls.append(tuple(operations))
+            batch_streams.append(torch.cuda.current_stream().cuda_stream)
             proxies = [WorkProxy(work) for work in real_batch(operations)]
             returned_proxies.extend(proxies)
             return proxies
 
         monkeypatch.setattr(latent_cp.dist, "P2POp", p2p_op)
         monkeypatch.setattr(latent_cp.dist, "batch_isend_irecv", batch)
-        leases = list(
-            latent_cp.P2PRingTransport(pg.cp).iter_payloads(payload, layout.phases)
+        lease_iterator = latent_cp.P2PRingTransport(pg.cp).iter_payloads(
+            payload, layout.phases
         )
+        first_lease = next(lease_iterator)
+        assert len(batch_calls) == 1
+        assert batch_streams[0] != consumer_stream
+        leases = [first_lease, *lease_iterator]
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
         ]
@@ -2533,6 +2546,8 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         assert len(p2p_records) == 2 * len(batch_calls)
         assert returned_proxies and all(proxy.waited for proxy in returned_proxies)
         assert wait_count == len(returned_proxies)
+        assert len(set(batch_streams)) == 1
+        assert batch_streams[0] != consumer_stream
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
