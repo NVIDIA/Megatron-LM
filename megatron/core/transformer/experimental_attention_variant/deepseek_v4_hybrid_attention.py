@@ -484,13 +484,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
         self.q_layernorm = submodules.q_layernorm(
             hidden_size=self.config.q_lora_rank,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
     def get_query_key_value_tensors(
