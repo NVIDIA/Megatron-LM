@@ -1927,6 +1927,24 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _graphable_leaves(module):
+    """Yield graphable leaf layers, descending into grouped HybridStack modules.
+
+    A HybridStack is a MegatronModule rather than a GraphableMegatronModule, so iterating
+    decoder.layers directly yields the stack instead of the inner Mamba/attention/MoE layers.
+    """
+    try:
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+    except ImportError:
+        # Hybrid models are optional; with no HybridStack there is nothing to descend into.
+        HybridStack = ()
+    if isinstance(module, HybridStack):
+        for inner in module.layers:
+            yield from _graphable_leaves(inner)
+    else:
+        yield module
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().

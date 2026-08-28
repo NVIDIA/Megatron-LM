@@ -78,13 +78,20 @@ def clone_tensors_in_struct(tgt, src):
         raise Exception(f"Unsupported copy for tuple yet: {type(src)}")
     elif isinstance(src, list):
         for i in range(len(src)):
-            if isinstance(src[i], (tuple, list, dict, torch.Tensor)):
+            if tgt[i] is None:
+                tgt[i] = src[i]
+            elif isinstance(src[i], (tuple, list, dict, torch.Tensor)):
                 clone_tensors_in_struct(tgt[i], src[i])
             else:
                 tgt[i] = src[i]
     elif isinstance(src, dict):
         for k in src:
-            if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
+            if tgt.get(k) is None:
+                # Static buffer slot was None at capture (field absent/None then), so the
+                # captured graph does not read it as a tensor input. Pass the value through
+                # rather than copying into a None buffer (avoids AttributeError on .copy_).
+                tgt[k] = src[k]
+            elif isinstance(src[k], (tuple, list, dict, torch.Tensor)):
                 clone_tensors_in_struct(tgt[k], src[k])
             else:
                 tgt[k] = src[k]
