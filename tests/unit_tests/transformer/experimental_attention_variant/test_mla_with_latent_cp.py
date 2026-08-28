@@ -820,8 +820,6 @@ class _TorchPackedAttentionAdapter:
         self.forward_calls = 0
         self.raw_output_dtypes: list[torch.dtype] = []
         self.expanded_refs: list[weakref.ReferenceType] = []
-        self.partial_refs: list[weakref.ReferenceType] = []
-        self.partial_lse_refs: list[weakref.ReferenceType] = []
 
     def prepare(self, **_kwargs) -> None:
         self.prepare_calls += 1
@@ -867,8 +865,6 @@ class _TorchPackedAttentionAdapter:
         canonical = raw.float()
         lse = torch.cat(stats, dim=0).float()
         self.raw_output_dtypes.append(raw.dtype)
-        self.partial_refs.append(weakref.ref(canonical))
-        self.partial_lse_refs.append(weakref.ref(lse))
         return canonical, lse
 
 
@@ -967,6 +963,15 @@ def test_phase_plan_exact_causal_pair_coverage(cp_size: int):
             for phase_cu in (phase.cu_seqlens_q, phase.cu_seqlens_kv):
                 assert phase_cu.dtype == torch.int32
                 assert phase_cu.is_contiguous()
+            if phase.kind == "diagonal":
+                assert phase.q_slice == phase.kv_slice == (0, local_tokens)
+            elif phase.kind == "lower":
+                assert phase.q_slice == (0, local_tokens)
+                assert phase.kv_slice is None
+            else:
+                assert phase.q_slice is None
+                assert phase.kv_slice == (0, local_tokens)
+                assert phase.scatter_slice is None
             q_sequences, kv_sequences = _phase_global_rows(
                 lengths, cp_size, rank, phase
             )
@@ -980,6 +985,26 @@ def test_phase_plan_exact_causal_pair_coverage(cp_size: int):
                         observed.append((sequence, q_global, k_global))
     assert len(observed) == len(set(observed))
     assert set(observed) == expected_pairs
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_single_sequence_phase_plan_records_contiguous_spans(cp_size: int):
+    local_tokens = 8
+    cu = _cumulative((local_tokens * cp_size,))
+    for rank in range(cp_size):
+        layout = latent_cp.build_zigzag_layout(cu, local_tokens, cp_size, rank)
+        for phase in layout.phases:
+            if phase.kind == "diagonal":
+                assert phase.q_slice == phase.kv_slice == (0, local_tokens)
+                assert phase.scatter_slice is None
+            elif phase.kind == "lower":
+                assert phase.q_slice == (0, local_tokens)
+                assert phase.kv_slice == (0, local_tokens // 2)
+                assert phase.scatter_slice is None
+            else:
+                assert phase.q_slice == (local_tokens // 2, local_tokens)
+                assert phase.kv_slice == (0, local_tokens)
+                assert phase.scatter_slice == phase.q_slice
 
 
 def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
@@ -1098,16 +1123,49 @@ def test_merge_matches_direct_softmax_and_gradients():
     torch.testing.assert_close(merged_lse, direct_lse, rtol=2e-6, atol=2e-6)
 
     upstream = torch.randn_like(merged)
-    merged.backward(upstream, retain_graph=True)
+    upstream_lse = torch.randn_like(merged_lse)
+    torch.autograd.backward(
+        (merged, merged_lse), (upstream, upstream_lse), retain_graph=True
+    )
     merged_grads = [
         tensor.grad.detach().clone()
         for tensor in (logits_a, logits_b, value_a, value_b)
     ]
     for tensor in (logits_a, logits_b, value_a, value_b):
         tensor.grad = None
-    direct.backward(upstream)
+    torch.autograd.backward((direct, direct_lse), (upstream, upstream_lse))
     for actual, tensor in zip(merged_grads, (logits_a, logits_b, value_a, value_b)):
         torch.testing.assert_close(actual, tensor.grad, rtol=3e-6, atol=3e-6)
+
+
+def test_contiguous_partial_row_merge_matches_scatter_fallback():
+    torch.manual_seed(23)
+    output_a = torch.randn(8, 3, 5, requires_grad=True)
+    lse_a = torch.randn(8, 3, requires_grad=True)
+    output_b = torch.randn(4, 3, 5, requires_grad=True)
+    lse_b = torch.randn(4, 3, requires_grad=True)
+    indices = torch.arange(4, 8)
+
+    actual = latent_cp.merge_attention_partial_rows(
+        output_a, lse_a, output_b, lse_b, indices, (4, 8)
+    )
+    scattered = latent_cp.scatter_upper_phase(output_b, lse_b, indices, 8)
+    expected = latent_cp.merge_attention_partials(
+        output_a, lse_a, scattered[0], scattered[1]
+    )
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+
+    grad_output = torch.randn_like(actual[0])
+    grad_lse = torch.randn_like(actual[1])
+    leaves = (output_a, lse_a, output_b, lse_b)
+    torch.autograd.backward(actual, (grad_output, grad_lse), retain_graph=True)
+    actual_grads = [leaf.grad.detach().clone() for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+    torch.autograd.backward(expected, (grad_output, grad_lse))
+    for actual_grad, leaf in zip(actual_grads, leaves):
+        torch.testing.assert_close(actual_grad, leaf.grad)
 
 
 def test_cudnn_selective_recompute_matches_native_projection_gradients():
@@ -2595,12 +2653,6 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(
                 torch.cuda.synchronize()
                 gc.collect()
                 assert all(reference() is None for reference in backend.expanded_refs)
-                assert any(
-                    reference() is not None for reference in backend.partial_refs
-                )
-                assert any(
-                    reference() is not None for reference in backend.partial_lse_refs
-                )
             output.backward(torch.randn_like(output))
             assert up_projection_calls == 4
             assert backend.forward_calls == 4

@@ -55,6 +55,7 @@ from .utils import (
     LatentCPError,
     QualifiedBackendTuple,
     cudnn_backward_proxy,
+    merge_attention_partial_rows,
     merge_attention_partials,
     scatter_upper_phase,
 )
@@ -92,6 +93,7 @@ __all__ = [
     "cudnn_backward_proxy",
     "get_mla_with_latent_cp_spec",
     "make_mla_with_latent_cp_spec",
+    "merge_attention_partial_rows",
     "merge_attention_partials",
     "preprocess_mla_latent_cp",
     "scatter_upper_phase",

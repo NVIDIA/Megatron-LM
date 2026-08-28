@@ -31,6 +31,9 @@ class PhaseSpec:
     max_seqlen_kv: int
     causal: bool
     scatter_indices: Tensor | None = None
+    q_slice: tuple[int, int] | None = None
+    kv_slice: tuple[int, int] | None = None
+    scatter_slice: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,18 @@ def _packed_half_indices(local_lengths: Tensor) -> tuple[Tensor, Tensor]:
     return torch.cat(front), torch.cat(back)
 
 
+def _contiguous_span(indices: Tensor) -> tuple[int, int] | None:
+    """Return a host slice for contiguous indices, or None for general packed rows."""
+
+    if indices.numel() == 0:
+        return (0, 0)
+    start = int(indices[0].item())
+    expected = torch.arange(
+        start, start + indices.numel(), dtype=indices.dtype, device=indices.device
+    )
+    return (start, start + indices.numel()) if torch.equal(indices, expected) else None
+
+
 def build_zigzag_layout(
     cu_global: Tensor,
     local_tokens: int,
@@ -154,6 +169,9 @@ def build_zigzag_layout(
     max_global = derived_max_global
     max_full = int(local_lengths.max().item())
     max_half = int(half_lengths.max().item())
+    full_slice = (0, local_tokens)
+    front_slice = _contiguous_span(front_indices)
+    back_slice = _contiguous_span(back_indices)
 
     phases: list[PhaseSpec] = []
     for phase in range(cp_size):
@@ -171,6 +189,8 @@ def build_zigzag_layout(
                     max_full,
                     max_full,
                     True,
+                    q_slice=full_slice,
+                    kv_slice=full_slice,
                 )
             )
         elif phase <= cp_rank:
@@ -186,6 +206,8 @@ def build_zigzag_layout(
                     max_full,
                     max_half,
                     False,
+                    q_slice=full_slice,
+                    kv_slice=front_slice,
                 )
             )
         else:
@@ -202,6 +224,9 @@ def build_zigzag_layout(
                     max_full,
                     False,
                     scatter_indices=back_indices,
+                    q_slice=back_slice,
+                    kv_slice=full_slice,
+                    scatter_slice=back_slice,
                 )
             )
 

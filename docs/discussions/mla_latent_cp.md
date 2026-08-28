@@ -169,9 +169,10 @@ rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exac
    Because splitting the contiguous ring payload along its channel dimension produces strided views,
    both the latent and positional slices are materialized as contiguous tensors before either TP
    collective; the collective boundary never relies on backend acceptance of noncontiguous inputs.
-   It then applies the phase KV indices to both full-row tensors. The gather's backward
-   reduce-scatter is the single TP sum for the shared positional-key gradient; the KV up-projection
-   supplies the corresponding latent-input reduce-scatter.
+   Phase Q/KV rows use first-dimension views when the planner recorded a contiguous span, including
+   the single-packed-sequence benchmark path, and retain `index_select` for general packed rows.
+   The gather's backward reduce-scatter is the single TP sum for the shared positional-key gradient;
+   the KV up-projection supplies the corresponding latent-input reduce-scatter.
 5. The merged `[T_r, H_tp, D_v]` output is flattened and cast once to BF16. If
    `attention_output_gate=True`, the inherited public MLA helper projects `hidden_states` through
    the accepted TP-sharded `linear_gate` and applies an FP32 sigmoid followed by BF16 multiplication;
@@ -340,6 +341,9 @@ per-sequence front/back indices and uses:
 - upper phase: `cu_seqlens_q=cu_half`, `cu_seqlens_kv=cu_full`.
 
 These values are backend attention metadata only. They are never used to generate or apply RoPE.
+The planner additionally records optional host `(start, stop)` spans for each Q, KV, and upper
+scatter row map. A span is present only when its exact tensor indices form one contiguous interval;
+otherwise the original index tensor remains the authoritative general packed representation.
 
 V1 rejects inter-sequence and tail padding. The data scheduler sets `pad_between_seqs` from the
 actual valid-versus-physical cumulative boundaries instead of conservatively claiming gaps for every
@@ -353,27 +357,36 @@ Both kernels consume BF16 Q/K/V. Their raw phase output is BF16 and their LSE/st
 adapter immediately returns canonical FP32 `O_i` and FP32 `E_i` with shapes
 `[T_q,H_tp,D_v]` and `[T_q,H_tp]`.
 
-An upper phase is expanded without in-place writes:
+When an upper phase's back rows form a contiguous interval, only that interval of the accumulated
+output/LSE enters the merge and the prefix/suffix are concatenated unchanged. This avoids allocating
+full-size zero/`-inf` scatter buffers. General multi-sequence layouts retain the functional
+`index_copy` fallback below, never an in-place write:
 
 ```text
 O_i_full = zeros([T_r,H_tp,D_v], FP32).index_copy(0, back_indices, O_i)
 E_i_full = full([T_r,H_tp], -inf, FP32).index_copy(0, back_indices, E_i)
 ```
 
-The method is functional `index_copy`, never `index_copy_` or mutation of a tensor saved for
-backward. Merge all phases in FP32:
+Merge all selected rows in FP32:
 
 ```text
 E = logaddexp(E_a, E_b)
-O = O_a * exp(E_a - E) + O_b * exp(E_b - E)
+w_a, w_b = exp(E_a - E), exp(E_b - E)
+O = O_a * w_a + O_b * w_b
 ```
 
-After the last phase there is exactly one `O.to(torch.bfloat16)` before reshape and
-`linear_proj`. There are no intermediate BF16 merges.
+The custom autograd boundary saves `O_a`, `O_b`, `O`, and the two weights and returns the
+analytical gradients:
 
-The merge autograd boundary saves each canonical partial `(O_i,E_i)`, the final `(O_global,
-E_global)`, and row-validity metadata; it recomputes phase weights in backward. Thus partial outputs
-and LSE are deliberately retained in v1 even though expanded K/V are not.
+```text
+dO_a = w_a * dO
+dE_a = w_a * (dE + sum(dO * (O_a - O), dim=-1))
+```
+
+with the symmetric equations for side `b`. This removes the generic elementwise autograd graph
+without changing the FP32 online-softmax math or its LSE-gradient contract. Partial outputs and LSE
+remain deliberately retained even though expanded K/V are not. After the last phase there is exactly
+one `O.to(torch.bfloat16)` before reshape and `linear_proj`; there are no intermediate BF16 merges.
 
 FA4 documents that LSE returned by `return_lse=True` supports `dLSE`. The FP32 merger returns FP32
 `G_i` and `gE_i`; autograd casts `G_i` to the raw BF16 FA4 output dtype at the adapter boundary and
@@ -924,7 +937,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
 1. **Static phase-plan tests.** For CP 1/2/4 and multiple packed sequences, assert owner order,
    front/back indices, exact three-shape schedule, metadata, and one-time causal-pair coverage.
    CP=1 additionally uses odd packed lengths, one full/full phase, equal full/half metadata, and no
-   back rows.
+   back rows. Single-sequence layouts require exact diagonal/lower/upper slice spans; multi-sequence
+   noncontiguous front/back maps retain the index fallback.
    Require every planner-derived diagonal/lower/upper Q/KV cumulative tensor to be contiguous
    `torch.int32`, catching the default integral-`cumsum` promotion to `torch.int64`.
 2. **Global-position parity.** For multi-sequence THD, independently construct original per-sequence
@@ -987,7 +1001,9 @@ All tests live in the new experimental test file; existing MLA tests remain unto
 7. **cuDNN merge backward.** Compare all phase shapes against standard PyTorch, including `G_i`,
    `gE_i`, `O_corr`, zero/tiny norm rows, extreme phase weights/LSE, and BF16 boundary casts.
 8. **Dtype and functional merge.** Assert raw BF16 backend output, canonical/merged FP32 output+LSE,
-   functional upper scatter, and exactly one final BF16 cast before `_explicit_output_projection`.
+   analytical output/LSE gradients against direct softmax, contiguous subset merge parity against
+   the functional upper-scatter fallback, and exactly one final BF16 cast before
+   `_explicit_output_projection`.
 9. **Recompute/lifetime evidence.** Count `P` KV up-projections in forward and `P` in backward replay,
    while cuDNN executes exactly `P` SDPA forwards total. Outer saved-tensor hooks enumerate retained
    shape/numel/dtype/Python class and classify Q/latent plus partial O/LSE state; expanded K/V is
@@ -1036,8 +1052,9 @@ worklog. The upstream document and GitHub-bound commit contain no internal clust
 - **FA4 packaging:** source/distribution identity, import precedence, LSE layout, and `dLSE` remain
   tuple-specific qualification inputs.
 - **Memory/compute:** the cuDNN path retains raw local O/LSE and recomputes KV expansion, not SDPA;
-  FA4 retains full phase replay. The feature claims removal of remote full K/V, not O(1) activation
-  memory or free recomputation.
+  FA4 retains full phase replay. Contiguous phase views and subset merge remove benchmark-path
+  gather/scatter temporaries, while general packed layouts retain their indexed fallback. The feature
+  claims removal of remote full K/V, not O(1) activation memory or free recomputation.
 - **Collectives:** all ranks must construct an identical autograd graph; v1 sacrifices overlap to
   make ordering and lifetime explicit.
 - **Projection scope:** only the local MCore Column/RowParallel projection spec, trainable bias-free

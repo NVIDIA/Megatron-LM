@@ -57,6 +57,50 @@ def scatter_upper_phase(
     return output_full, lse_full
 
 
+class _AttentionPartialMerge(torch.autograd.Function):
+    """Merge two FP32 attention partials with an analytical backward."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        output_a: Tensor,
+        lse_a: Tensor,
+        output_b: Tensor,
+        lse_b: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        merged_lse = torch.logaddexp(lse_a, lse_b)
+        valid_a = torch.isfinite(lse_a) & torch.isfinite(merged_lse)
+        valid_b = torch.isfinite(lse_b) & torch.isfinite(merged_lse)
+        delta_a = torch.where(
+            valid_a, lse_a - merged_lse, torch.full_like(lse_a, -torch.inf)
+        )
+        delta_b = torch.where(
+            valid_b, lse_b - merged_lse, torch.full_like(lse_b, -torch.inf)
+        )
+        weight_a = torch.exp(delta_a)
+        weight_b = torch.exp(delta_b)
+        merged_output = output_a * weight_a.unsqueeze(
+            -1
+        ) + output_b * weight_b.unsqueeze(-1)
+        ctx.save_for_backward(output_a, output_b, merged_output, weight_a, weight_b)
+        return merged_output, merged_lse
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        grad_output: Tensor,
+        grad_lse: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        output_a, output_b, merged_output, weight_a, weight_b = ctx.saved_tensors
+        grad_output_a = grad_output * weight_a.unsqueeze(-1)
+        grad_output_b = grad_output * weight_b.unsqueeze(-1)
+        output_term_a = torch.sum(grad_output * (output_a - merged_output), dim=-1)
+        output_term_b = torch.sum(grad_output * (output_b - merged_output), dim=-1)
+        grad_lse_a = weight_a * (grad_lse + output_term_a)
+        grad_lse_b = weight_b * (grad_lse + output_term_b)
+        return grad_output_a, grad_lse_a, grad_output_b, grad_lse_b
+
+
 def merge_attention_partials(
     output_a: Tensor, lse_a: Tensor, output_b: Tensor, lse_b: Tensor
 ) -> tuple[Tensor, Tensor]:
@@ -67,21 +111,41 @@ def merge_attention_partials(
         "partial outputs must be FP32",
     )
     _require(lse_a.dtype == lse_b.dtype == torch.float32, "partial LSE must be FP32")
-    merged_lse = torch.logaddexp(lse_a, lse_b)
-    valid_a = torch.isfinite(lse_a) & torch.isfinite(merged_lse)
-    valid_b = torch.isfinite(lse_b) & torch.isfinite(merged_lse)
-    delta_a = torch.where(
-        valid_a, lse_a - merged_lse, torch.full_like(lse_a, -torch.inf)
+    return _AttentionPartialMerge.apply(output_a, lse_a, output_b, lse_b)
+
+
+def merge_attention_partial_rows(
+    output_a: Tensor,
+    lse_a: Tensor,
+    output_b: Tensor,
+    lse_b: Tensor,
+    row_indices: Tensor | None,
+    row_slice: tuple[int, int] | None,
+) -> tuple[Tensor, Tensor]:
+    """Merge a row subset without materializing full-size scatter buffers when contiguous."""
+
+    if row_indices is None:
+        return merge_attention_partials(output_a, lse_a, output_b, lse_b)
+    if row_slice is None:
+        scattered_output, scattered_lse = scatter_upper_phase(
+            output_b, lse_b, row_indices, output_a.size(0)
+        )
+        return merge_attention_partials(
+            output_a, lse_a, scattered_output, scattered_lse
+        )
+
+    start, stop = row_slice
+    _require(
+        0 <= start <= stop <= output_a.size(0), "partial row slice is out of range"
     )
-    delta_b = torch.where(
-        valid_b, lse_b - merged_lse, torch.full_like(lse_b, -torch.inf)
+    _require(stop - start == output_b.size(0), "partial row slice has the wrong length")
+    merged_rows, merged_lse_rows = merge_attention_partials(
+        output_a[start:stop], lse_a[start:stop], output_b, lse_b
     )
-    weight_a = torch.exp(delta_a)
-    weight_b = torch.exp(delta_b)
-    merged_output = output_a * weight_a.unsqueeze(-1) + output_b * weight_b.unsqueeze(
-        -1
+    return (
+        torch.cat((output_a[:start], merged_rows, output_a[stop:]), dim=0),
+        torch.cat((lse_a[:start], merged_lse_rows, lse_a[stop:]), dim=0),
     )
-    return merged_output, merged_lse
 
 
 def cudnn_backward_proxy(

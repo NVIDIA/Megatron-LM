@@ -29,16 +29,11 @@ from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 from . import layout as latent_cp_layout
+from . import utils as latent_cp_utils
 from .backend import DirectAttentionAdapter, _qualified_backend_adapter
 from .layout import AlreadyZigZagTHDAdapter
 from .transport import LatentCPTransport, P2PRingTransport
-from .utils import (
-    LatentCPError,
-    QualifiedBackendTuple,
-    _require,
-    merge_attention_partials,
-    scatter_upper_phase,
-)
+from .utils import LatentCPError, QualifiedBackendTuple, _require
 
 
 def _build_local_latent_norm(
@@ -592,6 +587,19 @@ class MLAWithLatentCP(MLASelfAttention):
         )
         return query, payload
 
+    @staticmethod
+    def _phase_rows(
+        tensor: Tensor,
+        indices: Tensor,
+        row_slice: tuple[int, int] | None,
+    ) -> Tensor:
+        """Select phase rows as a view when the packed layout is contiguous."""
+
+        if row_slice is None:
+            return tensor.index_select(0, indices)
+        start, stop = row_slice
+        return tensor[start:stop]
+
     def _expand_phase_kv(
         self,
         payload: Tensor,
@@ -614,8 +622,8 @@ class MLAWithLatentCP(MLASelfAttention):
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
         )
-        expanded = expanded.index_select(0, phase.kv_indices)
-        k_rope = k_rope.index_select(0, phase.kv_indices)
+        expanded = self._phase_rows(expanded, phase.kv_indices, phase.kv_slice)
+        k_rope = self._phase_rows(k_rope, phase.kv_indices, phase.kv_slice)
         k_content, value = torch.split(
             expanded, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
         )
@@ -704,7 +712,7 @@ class MLAWithLatentCP(MLASelfAttention):
             _require(
                 lease.owner == phase.owner, "transport owner order disagrees with plan"
             )
-            q_phase = query.index_select(0, phase.q_indices)
+            q_phase = self._phase_rows(query, phase.q_indices, phase.q_slice)
             payload_phase = lease.tensor
 
             def run_phase(
@@ -735,18 +743,22 @@ class MLAWithLatentCP(MLASelfAttention):
                     self.softmax_scale,
                     self._expand_phase_kv,
                 )
-            if phase.scatter_indices is not None:
-                partial_output, partial_lse = scatter_upper_phase(
-                    partial_output,
-                    partial_lse,
-                    phase.scatter_indices,
-                    layout.local_tokens,
-                )
             if merged_output is None:
+                _require(
+                    phase.scatter_indices is None,
+                    "the first phase must cover every local query row",
+                )
                 merged_output, merged_lse = partial_output, partial_lse
             else:
-                merged_output, merged_lse = merge_attention_partials(
-                    merged_output, merged_lse, partial_output, partial_lse
+                merged_output, merged_lse = (
+                    latent_cp_utils.merge_attention_partial_rows(
+                        merged_output,
+                        merged_lse,
+                        partial_output,
+                        partial_lse,
+                        phase.scatter_indices,
+                        phase.scatter_slice,
+                    )
                 )
 
         _require(
