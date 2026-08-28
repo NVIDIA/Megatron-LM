@@ -156,6 +156,7 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _num_ready_grad_parameters: int
+    _manual_backward_finalize: bool
     _is_root: bool
     _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
@@ -212,6 +213,7 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._num_ready_grad_parameters = 0
+        self._manual_backward_finalize = False
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
@@ -286,14 +288,28 @@ class FsdpModule:
             if module is None:
                 return
             module._num_ready_grad_parameters += 1
-            if module._num_ready_grad_parameters == module._num_trainable_parameters:
+            if (
+                module._num_ready_grad_parameters == module._num_trainable_parameters
+                and not module._manual_backward_finalize
+            ):
                 module.post_backward()
 
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+                parameter = fsdp_parameter.unsharded
+                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+                # gradients are materialized by ``backward_dw()``, not autograd.
+                if not getattr(parameter, "skip_backward_post_hook", False):
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    continue
+
+                module_fqn, _, _ = fsdp_parameter.fqns[0].rpartition(".")
+                parameter_module = module.get_submodule(module_fqn) if module_fqn else module
+                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+                    lambda parameter=parameter: grad_hook(parameter)
+                )
 
     @staticmethod
     def _pre_load_state_dict(
@@ -399,14 +415,31 @@ class FsdpModule:
                 group.release_unsharded_storage()
             self._unshard_event = None
 
-    def pre_backward(self) -> None:
-        """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+    def pre_backward(self, manual_finalize: bool = False) -> None:
+        """Prepare full parameters and prefetch the next FsdpModule in backward order.
+
+        Args:
+            manual_finalize: Whether a segmented backward schedule will explicitly call
+                :meth:`finalize_backward`. This suppresses both the autograd final callback
+                and parameter-readiness finalization for this module.
+        """
+        # A segmented schedule may start an FSDP unit explicitly before launching
+        # the unit's autograd GraphTask. The regular full-backward pre-hook then
+        # observes the same unit a second time. Its parameters are already ready;
+        # preserve the stronger finalization request and avoid a duplicate phase
+        # transition/all-gather.
+        if self.phase is FsdpModule.Phase.BACKWARD:
+            self._manual_backward_finalize |= manual_finalize
+            return
+
+        self._manual_backward_finalize = manual_finalize
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            context.register_post_backward_final_callback()
+            if not manual_finalize:
+                context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
             # part of any active CUDA-graph capture. A stream only joins the
@@ -428,8 +461,29 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
+        self._manual_backward_finalize = False
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
+
+    def finalize_backward(self) -> None:
+        """Finalize a root after a manually segmented backward schedule.
+
+        Schedule nodes execute separate autograd GraphTasks, so the root cannot use an
+        autograd final callback as its completion boundary. Finalize all units that remain
+        in backward, then order the current stream after their reduce-scatters.
+        """
+        if not self.is_root():
+            raise RuntimeError("Only a root FsdpModule can finalize a segmented backward.")
+
+        for fsdp_module in reversed(list(cast(nn.Module, self).modules())):
+            if not isinstance(fsdp_module, FsdpModule):
+                continue
+            if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
+                continue
+            fsdp_module.post_backward()
+            fsdp_module._num_ready_grad_parameters = 0
+
+        self.context.current_stream().wait_stream(self.context.reduce_scatter_stream)
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""

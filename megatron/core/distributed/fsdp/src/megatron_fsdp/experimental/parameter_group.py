@@ -219,12 +219,14 @@ class FsdpParameterGroup:
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
+                # swap_tensors also swaps __dict__, so preserve module-specific parameter
+                # metadata such as TE's delayed-wgrad ``skip_backward_post_hook`` marker.
+                parameter_attributes = parameter.__dict__.copy()
                 materialized_parameter = nn.Parameter(
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
+                parameter.__dict__.update(parameter_attributes)
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None

@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
@@ -258,9 +259,22 @@ class TransformerLayerSchedulePlan:
             Functions or values for next iteration's computation
         """
 
+        if b_layer and isinstance(b_layer.layer, FsdpModule):
+            # The fine-grained schedule invokes layer submodules directly and
+            # splits their backward into separate GraphTasks. Start every nested
+            # FSDP unit explicitly so delayed weight-gradient computation still
+            # sees its full compute parameters. In particular, MoE experts are a
+            # child FSDP unit distinct from the TransformerLayer that owns them.
+            for fsdp_module in b_layer.layer.modules():
+                if isinstance(fsdp_module, FsdpModule):
+                    fsdp_module.pre_backward()
+
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
+
+        if f_layer and isinstance(f_layer.layer, FsdpModule):
+            f_layer.layer.pre_forward()
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -294,6 +308,9 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mtp_post_process.forward(f_input)
+
+        if f_layer and isinstance(f_layer.layer, FsdpModule):
+            f_layer.layer.post_forward()
 
         # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
         # of the first layer) for overlapping with the p2p comm.
@@ -623,6 +640,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
             f_input = f_schedule_plan.post_process.forward(f_input)
+
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)
