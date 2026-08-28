@@ -92,6 +92,22 @@ Backends that support collocated models detect same-rank (local) transfers via
 through the network stack. NCCL M2N is the exception because its source and
 destination meshes must be disjoint.
 
+### Bounding transient execution memory
+
+`execution_batch_bytes` (CLI: `--refit-execution-batch-bytes`) is an optional
+soft per-rank limit on transient execution staging. A single complete logical
+parameter is never split, so one parameter may exceed the limit. Every slice
+and replica of a parameter stays in one batch, which lets MXFP8 destinations
+assemble the complete BF16 value before quantizing it once.
+
+`nccl`, `gloo`, and `nvshmem` execute the resulting batches. `nixl` keeps one
+model-wide submission because its receive address map must remain stable across
+refits. `nccl_m2n` uses the rank-coordinated value as its native grouped-
+submission limit instead. Ranks agree on the smallest configured non-`None`
+value. When every rank uses `None`, generic backends preserve the previous
+single model-wide submission and NCCL M2N preserves its environment setting or
+256 MiB default.
+
 ### NCCL M2N backend
 
 Build the current M2N library from
@@ -192,8 +208,8 @@ across refits.
 
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
-| `_service_cache` | Backend name + process-group identity | `CopyService` instance | Avoid re-creating backend communicators and buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP-remat sizes |
+| `_service_cache` | Backend name + process-group identity + M2N execution limit | `CopyService` instance | Avoid re-creating backend communicators and buffers |
+| `_plan_cache` | (rank, src_config, dst_config, num_experts, execution limit) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP-remat sizes |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.

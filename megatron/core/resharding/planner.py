@@ -379,6 +379,74 @@ def _iter_global_transfer_ops(
                 yield task_id, dst_rank, src_rank, src_slice, dst_slice, src_metadata, dst_metadata
 
 
+def _build_execution_batch_ids(
+    dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
+    src_param_metadata: dict[str, list[ParameterMetadata]],
+    max_batch_bytes: int | None = None,
+) -> tuple[dict[str, int], int]:
+    """Assign complete logical parameters to deterministic memory-bounded batches.
+
+    The planner is replayed from the same global metadata roster on every rank,
+    so these IDs let the generic executor call ``CopyService.run()`` in lockstep
+    without another collective. Source and destination bytes are accumulated per
+    rank; starting a new batch when any rank would cross the soft limit bounds
+    both sender-side dequantization and receiver-side staging. All replicas and
+    shards of one resolved parameter stay in one batch. ``None`` assigns every
+    parameter to one model-wide batch, preserving the uncapped behavior.
+    """
+    parameter_order: list[str] = []
+    destination_bytes: dict[str, dict[int, int]] = {}
+    for dst_rank in sorted(dst_param_metadata_by_rank):
+        for resolved_name, metadata in dst_param_metadata_by_rank[dst_rank].items():
+            if resolved_name not in destination_bytes:
+                parameter_order.append(resolved_name)
+                destination_bytes[resolved_name] = {}
+            # MXFP8 tensors are materialized/received as logical BF16 by the
+            # generic executor, so their one-byte physical element size would
+            # underestimate transient memory. Plain wider dtypes keep their
+            # actual element size.
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            destination_bytes[resolved_name][metadata.owner_rank] = max(
+                destination_bytes[resolved_name].get(metadata.owner_rank, 0), tensor_bytes
+            )
+
+    if max_batch_bytes is None:
+        return {resolved_name: 0 for resolved_name in parameter_order}, 1
+    if max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be positive or None")
+
+    source_bytes: dict[str, dict[int, int]] = {}
+    for resolved_name in parameter_order:
+        rank_bytes: dict[int, int] = {}
+        for metadata in _find_source_metadata(src_param_metadata, resolved_name) or ():
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            rank_bytes[metadata.owner_rank] = max(
+                rank_bytes.get(metadata.owner_rank, 0), tensor_bytes
+            )
+        source_bytes[resolved_name] = rank_bytes
+
+    batch_ids: dict[str, int] = {}
+    batch_id = 0
+    current_rank_bytes: dict[int, int] = {}
+    for resolved_name in parameter_order:
+        parameter_rank_bytes = dict(source_bytes[resolved_name])
+        for rank, tensor_bytes in destination_bytes[resolved_name].items():
+            parameter_rank_bytes[rank] = parameter_rank_bytes.get(rank, 0) + tensor_bytes
+
+        if current_rank_bytes and any(
+            current_rank_bytes.get(rank, 0) + tensor_bytes > max_batch_bytes
+            for rank, tensor_bytes in parameter_rank_bytes.items()
+        ):
+            batch_id += 1
+            current_rank_bytes.clear()
+
+        batch_ids[resolved_name] = batch_id
+        for rank, tensor_bytes in parameter_rank_bytes.items():
+            current_rank_bytes[rank] = current_rank_bytes.get(rank, 0) + tensor_bytes
+
+    return batch_ids, batch_id + 1 if batch_ids else 1
+
+
 def _tensor_mesh(metadata: ParameterMetadata) -> tuple[int, ...]:
     """Return the TP mesh that owns a local parameter shard or replica."""
     ranks = metadata.tensor_parallel_group_ranks
@@ -678,14 +746,22 @@ def build_plan_from_rosters(
     dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
     src_param_metadata: dict[str, list[ParameterMetadata]],
     my_global_rank: int,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Replay the deterministic global schedule and keep only this rank's ops.
 
     Pure and collective-free, so it can be tested or reused with preassembled
     rosters without touching the process group. Live membership orchestration
-    is intentionally outside this module.
+    is intentionally outside this module. ``execution_batch_bytes`` is an optional
+    soft per-rank limit; a single complete parameter may exceed it. ``None`` keeps
+    the model-wide submission behavior.
     """
-    my_plan = ReshardPlan([], [])
+    batch_ids, num_batches = _build_execution_batch_ids(
+        dst_param_metadata_by_rank, src_param_metadata, max_batch_bytes=execution_batch_bytes
+    )
+    my_plan = ReshardPlan(
+        [], [], num_batches=num_batches, execution_batch_bytes=execution_batch_bytes
+    )
     for (
         task_id,
         dst_rank,
@@ -704,6 +780,7 @@ def build_plan_from_rosters(
                     my_slice=dst_slice,
                     peer_slice=src_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
         if src_rank == my_global_rank:
@@ -715,6 +792,7 @@ def build_plan_from_rosters(
                     my_slice=src_slice,
                     peer_slice=dst_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
 
@@ -735,6 +813,7 @@ def build_local_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """
     Build this rank's reshard plan locally: all-gather the parameter metadata,
@@ -749,7 +828,9 @@ def build_local_reshard_plan(
 
     src_module/dst_module may be None for non-collocated ranks (destination-only,
     source-only, or idle). Each rank contributes metadata only for the models it
-    owns, including its parallel-group membership.
+    owns, including its parallel-group membership. ``execution_batch_bytes`` is
+    an optional soft per-rank limit for transient generic-executor staging;
+    ``None`` keeps the model-wide submission behavior.
     """
     # group.rank()/size() (not dist.get_rank(group)) support cross-cluster PGs
     # whose members have independent default PGs.
@@ -767,14 +848,29 @@ def build_local_reshard_plan(
     )
 
     # One all-gather gives every rank the full (src, dst) picture, replacing the
-    # gather-to-0 + scatter.
-    gathered_pairs = [None] * world_size
-    dist.all_gather_object(gathered_pairs, (my_src_metadata, my_dst_metadata), group=group)
+    # gather-to-0 + scatter. Include each rank's configured staging limit so a
+    # heterogeneous source/destination cluster deterministically uses the
+    # smallest configured value and every rank derives matching batches. None
+    # means that rank does not request a cap; all None preserves one model-wide
+    # submission.
+    gathered_entries = [None] * world_size
+    dist.all_gather_object(
+        gathered_entries, (my_src_metadata, my_dst_metadata, execution_batch_bytes), group=group
+    )
     del my_src_metadata, my_dst_metadata
 
+    configured_limits = [entry[2] for entry in gathered_entries if entry[2] is not None]
+    execution_batch_bytes = min(configured_limits) if configured_limits else None
+    gathered_pairs = [(entry[0], entry[1]) for entry in gathered_entries]
+    del gathered_entries
     dst_param_metadata_by_rank, src_param_metadata = index_metadata_rosters(gathered_pairs)
     del gathered_pairs
-    return build_plan_from_rosters(dst_param_metadata_by_rank, src_param_metadata, my_global_rank)
+    return build_plan_from_rosters(
+        dst_param_metadata_by_rank,
+        src_param_metadata,
+        my_global_rank,
+        execution_batch_bytes=execution_batch_bytes,
+    )
 
 
 def build_centralized_reshard_plan(
@@ -784,6 +880,7 @@ def build_centralized_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Deprecated compatibility wrapper for :func:`build_local_reshard_plan`."""
     warnings.warn(
@@ -798,4 +895,5 @@ def build_centralized_reshard_plan(
         group=group,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        execution_batch_bytes=execution_batch_bytes,
     )

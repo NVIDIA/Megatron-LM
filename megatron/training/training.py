@@ -2084,7 +2084,12 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                swap_model_weights(model, inference_model, args.refit_method)
+                swap_model_weights(
+                    model,
+                    inference_model,
+                    args.refit_method,
+                    execution_batch_bytes=args.refit_execution_batch_bytes,
+                )
                 rl_eval_model = inference_model
                 rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
@@ -4949,7 +4954,12 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    swap_model_weights(model, inference_model, args.refit_method)
+                    swap_model_weights(
+                        model,
+                        inference_model,
+                        args.refit_method,
+                        execution_batch_bytes=args.refit_execution_batch_bytes,
+                    )
                     rl_eval_model = inference_model
                     rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(
