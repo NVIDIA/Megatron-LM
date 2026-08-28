@@ -77,17 +77,20 @@ class MockState:
 
 
 @pytest.mark.parametrize(
-    ("checkpoint_args", "expected_mode"),
+    ("runtime_mode", "checkpoint_args", "expected_mode"),
     [
-        (SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "bool"),
-        (SimpleNamespace(), "indices"),
+        ("indices", SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "indices"),
+        (None, SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "bool"),
+        (None, SimpleNamespace(), None),
     ],
 )
-def test_load_args_restores_hybridep_routing_map_mode(checkpoint_args, expected_mode):
+def test_load_args_preserves_runtime_hybridep_routing_map_mode(
+    runtime_mode, checkpoint_args, expected_mode
+):
     args = SimpleNamespace(
         load="checkpoint",
         iteration=0,
-        moe_hybridep_routing_map_mode="indices",
+        moe_hybridep_routing_map_mode=runtime_mode,
         use_tokenizer_model_from_checkpoint_args=False,
         use_mp_args_from_checkpoint_args=False,
     )
