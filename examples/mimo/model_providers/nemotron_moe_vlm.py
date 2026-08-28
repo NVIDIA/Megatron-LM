@@ -183,8 +183,8 @@ def language_model_spec(
         pp_rank = 0
         pp_size = get_grid_dim_size(llm_grid, "pp")
         tp_size = get_grid_dim_size(llm_grid, "tp")
-        ep_size = getattr(args, "llm_ep", 1)
-        expt_tp_size = getattr(args, "llm_expt_tp", None) or 1
+        ep_size = getattr(args, "mimo_llm_ep", 1)
+        expt_tp_size = getattr(args, "mimo_llm_expt_tp", None) or 1
     else:
         assert all(
             getattr(pg_collection, name, None) is not None for name in ("pp", "tp", "ep", "expt_tp")

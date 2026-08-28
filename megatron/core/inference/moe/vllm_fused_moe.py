@@ -29,6 +29,7 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
+from megatron.core.inference.moe import batch_invariant
 from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
@@ -225,6 +226,98 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
+class VllmFusedMoeBuffers:
+    """Class-level persistent intermediate buffers for the vLLM fused-MoE kernels.
+
+    Allocated once at engine init (from DynamicInferenceContext) so the hot
+    path performs no allocations inside CUDA graph capture, and every MoE
+    layer's graph shares this single buffer set. Without this, the
+    intermediates are allocated inside each layer's capture and recycled by
+    the shared graph mempool's free-list reuse — same net memory, but
+    addresses then depend on allocator policy rather than being fixed.
+
+    Sharing one set across all layers/graphs is safe because graph replays are
+    serialized on one stream and each buffer is fully rewritten (gated by the
+    indirection tables) before it is read within a single vllm_fused_moe call.
+
+    Like the dispatcher symmetric-memory buffers, these persist for the process
+    lifetime, including across engine suspend/resume: suspend deletes the CUDA
+    graphs (whose captures bake in these addresses), and resume re-captures
+    against the same live buffers. When not allocated (eager/standalone use,
+    tests), get() falls back to torch.empty.
+    """
+
+    # name -> flat 1D tensor; requests are served as sliced views.
+    _buffers: Optional[dict] = None
+
+    @classmethod
+    def allocate_buffers(
+        cls,
+        max_tokens: int,
+        topk: int,
+        fc1_output_size: int,
+        hidden_size: int,
+        num_local_experts: int,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Allocate worst-case-sized buffers. Must run outside CUDA graph capture.
+
+        Args:
+            max_tokens: max rows of the hidden states entering vllm_fused_moe
+                (for the NVLS dispatcher: per_rank_worst_case_token_count * ep_size).
+            topk: MoE router top-k.
+            fc1_output_size: per-expert FC1 output width (2x ffn size for gated).
+            hidden_size: hidden width at the MoE (moe_latent_size if set).
+            num_local_experts: experts on this rank.
+            device: target device (default: current CUDA device).
+        """
+        if device is None:
+            device = torch.cuda.current_device()
+        num_valid = max_tokens * topk
+        # Worst case over the BLOCK_SIZE_M choices in _get_default_config
+        # ({16, 32, 64, 128}): sorted ids are longest at block_m=128, the
+        # per-block expert table is longest at block_m=16.
+        max_sorted_worst = num_valid + 128 * (num_local_experts + 1)
+        max_blocks_worst = _ceil_div(num_valid, 16) + (num_local_experts + 1)
+        cls._buffers = {
+            'intermediate1': torch.empty(
+                num_valid * fc1_output_size, dtype=torch.bfloat16, device=device
+            ),
+            'intermediate3': torch.empty(
+                num_valid * hidden_size, dtype=torch.bfloat16, device=device
+            ),
+            'sorted_token_ids': torch.empty(max_sorted_worst, dtype=torch.int32, device=device),
+            'expert_ids': torch.empty(max_blocks_worst, dtype=torch.int32, device=device),
+            # _moe_sum output when no external buffer (e.g. RSV) is provided.
+            'moe_sum_out': torch.empty(
+                max_tokens * hidden_size, dtype=torch.float32, device=device
+            ),
+        }
+
+    @classmethod
+    def _delete_buffers(cls) -> None:
+        """Release the buffers (tests / re-init)."""
+        cls._buffers = None
+
+    @classmethod
+    def get(cls, name: str, shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
+        """Return a view of the persistent buffer, or torch.empty when not allocated
+        or the request does not fit (different dtype/device or larger than sized)."""
+        if cls._buffers is not None:
+            buf = cls._buffers.get(name)
+            numel = 1
+            for s in shape:
+                numel *= s
+            if (
+                buf is not None
+                and buf.dtype == dtype
+                and buf.device == torch.device(device)
+                and numel <= buf.numel()
+            ):
+                return buf[:numel].view(shape)
+        return torch.empty(shape, dtype=dtype, device=device)
+
+
 @triton.jit
 def _init_sorted_ids_kernel(
     sorted_token_ids_ptr,
@@ -330,8 +423,10 @@ def _moe_align_block_size_cuda_graphable(
     max_blocks = _ceil_div(max_sorted, block_size)
     sentinel = max_tokens * topk
 
-    sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
-    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+    sorted_token_ids = VllmFusedMoeBuffers.get(
+        "sorted_token_ids", (max_sorted,), torch.int32, device
+    )
+    expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
 
     INIT_BLOCK = 1024
     init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
@@ -452,6 +547,8 @@ def _moe_sum_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
+    APPLY_WEIGHTS: tl.constexpr = True,
+    ACC_FP64: tl.constexpr = False,
 ):
     """Reduce topk dimension with routing weight application.
 
@@ -483,16 +580,25 @@ def _moe_sum_kernel(
             offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
             k_mask = offs_k < K
 
-            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+            acc = tl.zeros([BLOCK_K], dtype=tl.float64 if ACC_FP64 else tl.float32)
             for t in range(topk):
                 eid = tl.load(routing_map_ptr + token_id * topk + t)
                 lid = eid - local_expert_start
                 if lid >= 0 and lid < num_local_experts:
                     v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                    w = tl.load(topk_weights_ptr + token_id * topk + t)
-                    acc += v.to(tl.float32) * w
+                    if APPLY_WEIGHTS:
+                        w = tl.load(topk_weights_ptr + token_id * topk + t)
+                        if ACC_FP64:
+                            acc += v.to(tl.float64) * w.to(tl.float64)
+                        else:
+                            acc += v.to(tl.float32) * w
+                    else:
+                        if ACC_FP64:
+                            acc += v.to(tl.float64)
+                        else:
+                            acc += v.to(tl.float32)
 
-            tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
+            tl.store(output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask)
 
 
 def _moe_sum(
@@ -506,20 +612,30 @@ def _moe_sum(
     local_expert_start: int,
     num_local_experts: int,
     out: Optional[torch.Tensor] = None,
+    apply_weights: bool = True,
+    acc_fp64: bool = False,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] bf16 → [max_tokens, K].
 
     Applies routing weights and reduces over topk in a single kernel.
-    Accumulates in fp32. When `out` is None, allocates and returns an fp32
+    Accumulates in fp32, or fp64 when `acc_fp64` is set (the output buffer
+    stays fp32 either way). When `out` is None, allocates and returns an fp32
     buffer. When `out` is provided (e.g. the RSV symmetric memory tensor),
     writes directly into it — tl.store handles the cast to the buffer's dtype.
     Only writes the first valid_tokens rows; rows beyond are left untouched
     (downstream RSV reads only the valid range). Only accumulates contributions
     from local experts; non-local topk slots are skipped (their values in
     `input` are undefined).
+
+    Args:
+        apply_weights: multiply each slot by its routing probability (default).
+            Pass False when the probabilities were already applied upstream
+            (e.g. at the activation in batch-invariant mode).
+        acc_fp64: accumulate the topk sum in fp64, making the reduction
+            order-independent by precision.
     """
     if out is None:
-        out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
+        out = VllmFusedMoeBuffers.get("moe_sum_out", (max_tokens, K), torch.float32, input.device)
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
     BLOCK_M = _get_num_sms(input.device)
@@ -536,6 +652,8 @@ def _moe_sum(
         BLOCK_M=BLOCK_M,
         BLOCK_K=BLOCK_K,
         NUM_K_BLOCKS=NUM_K_BLOCKS,
+        APPLY_WEIGHTS=apply_weights,
+        ACC_FP64=acc_fp64,
     )
     return out
 
@@ -596,7 +714,18 @@ def vllm_fused_moe(
     # Mirror upstream vLLM: pick the full launch config (tile sizes, warps,
     # stages) host-side from the token-count hint, not from the worst-case
     # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
+    batch_invariant_mode = batch_invariant.enabled()
     config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
+    if batch_invariant_mode:
+        # Batch-invariant mode: pin only the K-reduction recipe. The kernel
+        # accumulates in fp32 with no split-K, so bits depend solely on the
+        # K-loop grouping (BLOCK_SIZE_K); M/N tile shapes, tile grouping and
+        # pipeline depth reorder nothing in the accumulation (bf16 products
+        # are exact in fp32 — only the addition order matters). Keeping the
+        # M/N tiling adaptive preserves the decode-tuned configs; pinning
+        # BLOCK_SIZE_K removes the one field _get_default_config varies that
+        # could change the summation order across co-batch sizes.
+        config['BLOCK_SIZE_K'] = 64
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
         routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
@@ -621,14 +750,20 @@ def vllm_fused_moe(
 
     topk_weights_flat = probs.reshape(-1).contiguous()
 
-    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    # SQUARED_RELU fuses into the GEMM epilogue (elementwise). SwiGLU pairs column c
-    # with c+N/2 across tiles and cannot, so FC1 runs unfused to the 2N-wide
-    # intermediate and gate/up is applied separately below.
+    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]. Outside
+    # batch-invariant mode, SQUARED_RELU fuses into the GEMM epilogue while
+    # SwiGLU runs separately. Batch-invariant mode runs both activations
+    # separately so their probability application and BF16 rounding match the
+    # training TEGroupedMLP path exactly.
     assert activation_type in (ActivationType.SQUARED_RELU, ActivationType.SWIGLU)
     is_swiglu = activation_type == ActivationType.SWIGLU
-    intermediate1 = torch.empty(
-        num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
+    fuse_squared_relu = not is_swiglu
+    if batch_invariant_mode:
+        # Apply the activation separately below to match training-side rounding.
+        fuse_squared_relu = False
+
+    intermediate1 = VllmFusedMoeBuffers.get(
+        "intermediate1", (num_valid, N), hidden_states.dtype, hidden_states.device
     )
     _invoke_fused_moe_kernel(
         hidden_states,
@@ -642,21 +777,40 @@ def vllm_fused_moe(
         top_k=topk,
         config=config,
         grid_size=grid_size_fc1,
-        fuse_squared_relu=not is_swiglu,
+        fuse_squared_relu=fuse_squared_relu,
     )
-    if is_swiglu:
+    if batch_invariant_mode:
+        live_rows = (valid_tokens * topk).to(torch.int32)
+        if is_swiglu:
+            # Match training: routing probabilities multiply at the activation
+            # (before FC2), with the training kernel's exact rounding sequence
+            # (single bf16 round of fp32 silu(gate)*up*prob). The reduction
+            # below then sums with unit weights. Device-bounded to the live
+            # valid_tokens*topk prefix; CUDA-graph safe.
+            bound_elems = valid_tokens.to(torch.int64) * (topk * (intermediate1.shape[1] // 2))
+            intermediate1 = batch_invariant.weighted_silu_mul_bounded(
+                intermediate1, topk_weights_flat, bound_elems
+            )
+        else:
+            # Nemotron-style weighted squared-ReLU rounds the squared BF16
+            # activation before its FP32 probability multiply, then rounds to
+            # BF16 again. Reuse the training-parity kernel with the flattened
+            # routing map as the live-row mask.
+            intermediate1 = batch_invariant.squared_relu_with_probs(
+                intermediate1, routing_map.reshape(-1), live_rows, topk_weights_flat
+            )
+    elif is_swiglu:
         # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
-        n_rows = (valid_tokens * topk).to(torch.int32)
-        intermediate1 = bounded_silu_mul(intermediate1, n_rows)
+        intermediate1 = bounded_silu_mul(intermediate1, (valid_tokens * topk).to(torch.int32))
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
-    # Routing weights are applied in the reduction kernel to avoid an extra
-    # bf16 truncation of prob-scaled values before the topk summation.
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K]. Batch-invariant mode
+    # already applied routing weights at the activation to match training;
+    # ordinary inference applies them in the reduction kernel.
     # Only local-expert blocks are processed; non-local positions are left
     # undefined and skipped by _moe_sum (which checks the routing map).
-    intermediate3 = torch.empty(
-        num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
+    intermediate3 = VllmFusedMoeBuffers.get(
+        "intermediate3", (num_valid, K), hidden_states.dtype, hidden_states.device
     )
     _invoke_fused_moe_kernel(
         intermediate1,
@@ -676,6 +830,14 @@ def vllm_fused_moe(
     # Applies routing weights and accumulates in fp32, writes directly to
     # out (if provided), zeros rows beyond valid_tokens, and skips non-local
     # expert slots.
+    apply_routing_weights = True
+    accumulate_in_fp64 = False
+    if batch_invariant_mode:
+        # Probabilities were applied at the activation to mirror training. Use
+        # training's invariant within-rank accumulation for the unweighted sum.
+        apply_routing_weights = False
+        accumulate_in_fp64 = True
+
     return _moe_sum(
         intermediate3,
         probs,
@@ -687,4 +849,6 @@ def vllm_fused_moe(
         local_expert_start,
         num_local_experts,
         out=out,
+        apply_weights=apply_routing_weights,
+        acc_fp64=accumulate_in_fp64,
     )

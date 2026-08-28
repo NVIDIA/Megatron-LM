@@ -19,12 +19,11 @@ from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
@@ -149,7 +148,7 @@ if __name__ == "__main__":
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
     elif args.load is not None:
-        _ = load_modelopt_checkpoint(model)
+        load_checkpoint(model, None, None)
 
     if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]

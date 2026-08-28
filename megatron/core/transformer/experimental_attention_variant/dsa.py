@@ -396,6 +396,7 @@ def compute_dsa_indexer_loss(
     key_positions: Optional[torch.Tensor] = None,
     query_valid_rows: Optional[torch.Tensor] = None,
     calculate_per_token_loss: bool = False,
+    non_compressed_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute KL divergence loss between index_scores and true attention_scores.
@@ -421,6 +422,10 @@ def compute_dsa_indexer_loss(
         varlen_starts: Optional row-wise key start bounds [sq] for packed THD.
         varlen_ends: Optional row-wise key end bounds [sq] for packed THD.
         key_positions: Optional global key positions [sk] for packed THD.
+        non_compressed_lse: Optional detached FP32 log-sum-exp contribution
+            [batch, heads, seqlen_q] from teacher keys that are intentionally
+            omitted from ``key``. When provided, the selected ``key`` logits
+            are normalized with this external mass before heads are summed.
 
     Returns:
         index_loss: KL divergence loss (scalar).
@@ -489,8 +494,8 @@ def compute_dsa_indexer_loss(
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
 
     # [b, np, sq, sk] -> [b, np, sq, sk]
-    attention_scores = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # [b, sq, sk] -> [b, sq, sk]
     index_log_scores = dsa_masking.masked_log_softmax(
@@ -504,7 +509,7 @@ def compute_dsa_indexer_loss(
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     # The target is already non-negative because it is a sum of softmax probabilities.
-    attention_scores = dsa_indexer_loss.normalize_indexer_target(attention_scores)
+    attention_scores = _normalize_indexer_teacher_target(attention_scores, non_compressed_lse)
     return dsa_indexer_loss.indexer_loss_from_target(
         attention_scores,
         index_log_scores,
@@ -512,6 +517,80 @@ def compute_dsa_indexer_loss(
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
     )
+
+
+def _compute_indexer_teacher_probabilities(
+    attention_scores: torch.Tensor,
+    attention_valid_mask: torch.Tensor,
+    non_compressed_lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return selected-key teacher mass, optionally including omitted mass.
+
+    ``non_compressed_lse`` is a sufficient statistic for teacher logits that
+    must participate in the softmax denominator but must not appear in the
+    compressed-key target returned by this helper. When the absolute compressed
+    mass underflows FP32, all heads in a row receive the same log-domain shift;
+    the returned weights remain proportional and the caller L1-normalizes them.
+    """
+    b, np, sq, sk = attention_scores.shape
+    expanded_valid_mask = attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk)
+    if non_compressed_lse is None:
+        return dsa_masking.masked_softmax(attention_scores.float(), expanded_valid_mask, dim=-1)
+
+    expected_shape = (b, np, sq)
+    if tuple(non_compressed_lse.shape) != expected_shape:
+        raise ValueError(
+            "non_compressed_lse must have shape [batch, heads, seqlen_q], "
+            f"got {tuple(non_compressed_lse.shape)}, expected {expected_shape}"
+        )
+    if non_compressed_lse.device != attention_scores.device:
+        raise ValueError(
+            "non_compressed_lse and attention_scores must be on the same device, "
+            f"got {non_compressed_lse.device} and {attention_scores.device}"
+        )
+    if non_compressed_lse.requires_grad:
+        raise ValueError("non_compressed_lse must be detached")
+
+    masked_scores = attention_scores.float().masked_fill(~expanded_valid_mask, float("-inf"))
+    compressed_lse = torch.logsumexp(masked_scores, dim=-1)
+    row_has_compressed_keys = expanded_valid_mask.any(dim=-1)
+    # Avoid the undefined ``-inf - -inf`` intermediate on fully masked rows.
+    # This is only a [batch, heads, seqlen] tensor, so it does not recreate the
+    # full-size temporary that the log-domain formulation is designed to avoid.
+    safe_compressed_lse = torch.where(
+        row_has_compressed_keys, compressed_lse, torch.zeros_like(compressed_lse)
+    )
+    conditional_probabilities = torch.exp(masked_scores - safe_compressed_lse.unsqueeze(-1))
+    del masked_scores
+
+    full_lse = torch.logaddexp(non_compressed_lse.float(), compressed_lse)
+    log_compressed_mass = (compressed_lse - full_lse).masked_fill(
+        ~row_has_compressed_keys, float("-inf")
+    )
+
+    # The external window/sink mass can put every head's compressed mass below
+    # the FP32 normal range. A common per-row shift across heads
+    # preserves all relative teacher weights and cancels in the downstream L1
+    # normalization. CSA currently requires TP1, so no cross-rank MAX is needed.
+    row_max = log_compressed_mass.amax(dim=1, keepdim=True)
+    needs_rescale = torch.isfinite(row_max) & (row_max < math.log(torch.finfo(torch.float32).tiny))
+    common_shift = torch.where(needs_rescale, row_max, torch.zeros_like(row_max))
+    compressed_mass = torch.exp(log_compressed_mass - common_shift)
+    return conditional_probabilities * compressed_mass.unsqueeze(-1)
+
+
+def _normalize_indexer_teacher_target(
+    target: torch.Tensor, non_compressed_lse: torch.Tensor | None
+) -> torch.Tensor:
+    """L1-normalize teacher mass without changing the legacy DSA path."""
+    if non_compressed_lse is None:
+        return dsa_indexer_loss.normalize_indexer_target(target)
+    row_mass = target.sum(dim=-1, keepdim=True)
+    # External teacher mass can legitimately make the compressed mass smaller
+    # than INDEXER_LOSS_EPS (or even float32 tiny). Only an exactly zero row is
+    # degenerate; keep it zero rather than imposing a numerical floor.
+    safe_row_mass = torch.where(row_mass > 0, row_mass, torch.ones_like(row_mass))
+    return target / safe_row_mass
 
 
 def _compute_index_scores(
@@ -627,6 +706,7 @@ def fwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(
@@ -656,6 +736,7 @@ def fwd_fused_indexer_loss_naive(
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
+        non_compressed_lse=non_compressed_lse,
     )
 
     return topk_indices, indexer_loss
@@ -680,6 +761,7 @@ def bwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of backward pass for indexer loss."""
     query, _ = dsa_layout.ensure_sbhd(query, "query")
@@ -752,8 +834,8 @@ def bwd_fused_indexer_loss_naive(
     else:
         index_valid_mask = base_valid_mask
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
-    attention_scores_softmax = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores_softmax = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # Free attention_scores immediately
     del attention_scores
@@ -776,7 +858,9 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize. Fully masked packed/varlen rows can have zero summed
     # attention mass; clamp the denominator so those rows stay finite and are
     # later zeroed by the row-valid loss mask.
-    attention_scores_normalized = dsa_indexer_loss.normalize_indexer_target(attention_scores_sum)
+    attention_scores_normalized = _normalize_indexer_teacher_target(
+        attention_scores_sum, non_compressed_lse
+    )
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 
@@ -806,11 +890,12 @@ def bwd_fused_indexer_loss_naive(
             dtype=grad_kl_per_element.dtype
         )
 
-    # For KL(target || softmax(logits)), the exact logit gradient is predict - target.
-    # Computing it through -target / (predict + eps) incorrectly suppresses gradients when
-    # valid predicted probabilities are smaller than eps.
+    # For KL(target || softmax(logits)), the exact logit gradient is
+    # predict * target.sum(-1) - target. Positive teacher rows are L1-normalized,
+    # while a fully masked zero-mass row must have zero gradient.
+    attention_target_mass = attention_scores_normalized.sum(dim=-1, keepdim=True)
     grad_index_scores_logits = (
-        index_scores_softmax - attention_scores_normalized
+        index_scores_softmax * attention_target_mass - attention_scores_normalized
     ) * grad_kl_per_element
     del index_scores_softmax, attention_scores_normalized
 
@@ -890,6 +975,7 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "query_valid_rows",
     "calculate_per_token_loss",
     "use_relu",
+    "non_compressed_lse",
 )
 
 
@@ -916,6 +1002,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         query_valid_rows=None,
         calculate_per_token_loss: bool = False,
         use_relu: bool = True,
+        non_compressed_lse: torch.Tensor | None = None,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -938,10 +1025,17 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
             use_relu=use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         # Save for backward (recomputation strategy)
-        ctx.save_for_backward(q, weights, k, query, key, topk_indices)
+        saved_non_compressed_lse = (
+            non_compressed_lse
+            if non_compressed_lse is not None
+            else q.new_empty(0, dtype=torch.float32)
+        )
+        ctx.save_for_backward(q, weights, k, query, key, topk_indices, saved_non_compressed_lse)
+        ctx.has_non_compressed_lse = non_compressed_lse is not None
         ctx.softmax_scale = softmax_scale
         ctx.loss_coeff = loss_coeff
         ctx.sparse_loss = sparse_loss
@@ -953,6 +1047,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.query_valid_rows = query_valid_rows
         ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.use_relu = use_relu
+        ctx.num_inputs = len(ctx.needs_input_grad)
 
         return topk_indices, loss
 
@@ -961,7 +1056,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         Backward: Recompute what we need.
         """
-        q, weights, k, query, key, topk_indices = ctx.saved_tensors
+        q, weights, k, query, key, topk_indices, saved_non_compressed_lse = ctx.saved_tensors
+        non_compressed_lse = saved_non_compressed_lse if ctx.has_non_compressed_lse else None
 
         grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
             q,
@@ -982,6 +1078,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=ctx.query_valid_rows,
             calculate_per_token_loss=ctx.calculate_per_token_loss,
             use_relu=ctx.use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         grad_by_name = {
@@ -991,8 +1088,10 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             # query and key are detached in forward, so return None for their gradients.
             "query": None,
             "key": None,
+            "non_compressed_lse": None,
         }
-        return tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        gradients = tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        return gradients[: ctx.num_inputs]
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):

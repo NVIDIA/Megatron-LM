@@ -58,6 +58,8 @@ ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
+    export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
+    test -n "$TMS_CUDA_MAJOR"
     # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
     # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
     # include path) and scope the build to the target archs. Skipped for the LTS image.

@@ -56,6 +56,10 @@ jobs:
     name: Populate build caches
     needs: validate-source
     if: github.repository == 'NVIDIA/Megatron-LM'
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
     uses: ./.github/workflows/_build_ci_container.yml
     with:
       is-maintainer: true

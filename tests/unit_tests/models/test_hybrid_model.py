@@ -237,6 +237,83 @@ class TestHybridModel:
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
 
+    def test_mtp_placement_uses_model_pipeline_group(self, mocker):
+        placement = mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.mtp_on_this_rank", return_value=False
+        )
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=0.1,
+            use_cpu_initialization=True,
+        )
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-/*",
+        )
+
+        placement.assert_called_once()
+        placement_args = placement.call_args.kwargs
+        assert placement_args["pp_group"] is model.pg_collection.pp
+        assert placement_args["vp_size"] == model_config.virtual_pipeline_model_parallel_size
+
+    def test_forward_propagates_mtp_input_mask(self, mocker):
+        class CaptureMTP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mtp_input_mask = None
+
+            def forward(self, **kwargs):
+                self.mtp_input_mask = kwargs["mtp_input_mask"]
+                hidden_states = kwargs["hidden_states"]
+                return torch.cat((hidden_states, hidden_states), dim=0)
+
+        self.model.config.mtp_num_layers = 1
+        self.model.mtp_process = True
+        self.model.mtp = CaptureMTP()
+        captured_loss_args = {}
+
+        def capture_mtp_loss(**kwargs):
+            captured_loss_args.update(kwargs)
+            return torch.chunk(kwargs["hidden_states"], 2, dim=0)[0]
+
+        mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.process_mtp_loss",
+            side_effect=capture_mtp_loss,
+        )
+
+        sequence_length = self.model.max_sequence_length
+        micro_batch_size = 2
+        self.model.cuda()
+        input_ids = torch.arange(sequence_length, device="cuda").repeat(micro_batch_size, 1)
+        position_ids = input_ids.clone()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=torch.bool, device="cuda"
+        )
+        labels = input_ids.clone()
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+        mtp_input_mask = input_ids != 2
+
+        output = self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        assert output.shape == labels.shape
+        assert self.model.mtp.mtp_input_mask is mtp_input_mask
+        assert captured_loss_args["mtp_input_mask"] is mtp_input_mask
+        assert captured_loss_args["metric_avg_group"] is self.model.pg_collection.dp_cp
+
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config
         sequence_length = self.model.max_sequence_length

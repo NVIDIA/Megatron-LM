@@ -629,13 +629,25 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     engine._pending_kv_imports.append(pending)
     engine._record_handoff_completion_notification(4, failed=True)
 
-    engine._poll_pending_kv_imports()
-    engine._admit_pending_kv_imports()
+    with (
+        mock.patch(
+            "megatron.core.inference.disaggregation.inference_state_handoff.logging.error"
+        ) as log_error,
+        mock.patch(
+            "megatron.core.inference.disaggregation.inference_state_handoff.logging.exception"
+        ) as log_exception,
+    ):
+        engine._poll_pending_kv_imports()
+        engine._admit_pending_kv_imports()
 
     assert isinstance(pending.future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == []
     assert not engine._pending_kv_imports
     assert engine._quarantined_kv_imports == [pending]
+    log_error.assert_called_once_with(
+        "Quarantining request %d cache storage after an incomplete handoff", 4
+    )
+    log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 4)
 
 
 def test_completed_handoff_keeps_notification_while_decode_is_full(handoff_loop):
@@ -995,11 +1007,15 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     engine._handoff_completion_tracker.report.assert_called_once_with(8, True)
 
     engine._record_handoff_completion_notification(8, failed=True)
-    engine._admit_pending_kv_imports()
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.logging.exception"
+    ) as log_exception:
+        engine._admit_pending_kv_imports()
 
     assert isinstance(future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
     assert not engine._pending_kv_imports
+    log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 8)
 
 
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):

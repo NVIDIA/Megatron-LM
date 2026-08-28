@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
@@ -59,6 +60,24 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
 
+        # compute_and_store_offsets() records extraction offsets on the model-wide
+        # SSM chunk quantum, and each mixer converts those offsets to a row of its
+        # own per-chunk states using its own chunk size. That conversion is exact
+        # only if the quantum is a multiple of that chunk size. Which chunk size to
+        # check against follows from the Householder count: ssm_chunking() asserts a
+        # homogeneous SSM stack, so a nonzero count means every SSM layer is Gated
+        # Delta Product, whose prefill kernels chunk at their own fixed size and for
+        # which mamba_chunk_size is an unused default.
+        if context.gdp_num_householder > 0:
+            assert context.ssm_chunk_alignment % GDP_CHUNK_SIZE == 0, (
+                f"SSM chunk alignment must be a multiple of the GDP chunk size "
+                f"({GDP_CHUNK_SIZE}); got {context.ssm_chunk_alignment}."
+            )
+        else:
+            assert context.ssm_chunk_alignment % context.mamba_chunk_size == 0, (
+                "SSM chunk alignment must be a multiple of mamba_chunk_size "
+                f"({context.mamba_chunk_size}); got {context.ssm_chunk_alignment}."
+            )
         gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.pool_size
 
@@ -458,17 +477,18 @@ class MambaSlotAllocator:
         last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
         penultimate_abs = (overall_required_blocks - 1) * bs
 
-        # SSM chunk size the mamba kernel actually runs with. States can only be
-        # extracted at multiples of this value, and it must match the value used
-        # in MambaMetadata (offset -> chunk-index conversion) to stay consistent.
-        mamba_chunk_size = ctx.mamba_chunk_size
+        # Quantum every SSM mixer in the model agrees is a chunk boundary. States
+        # can only be extracted there, and it is a multiple of the Mamba kernel
+        # chunk size (asserted in __init__), so the offset -> chunk-index
+        # conversion in MambaMetadata stays consistent.
+        ssm_chunk_alignment = ctx.ssm_chunk_alignment
 
         # Keep only boundaries that land inside this chunk's computed tokens and on
-        # a mamba-chunk boundary (required for mid-sequence state extraction).
+        # an SSM chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
         for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
             offset = abs_pos - chunk_start
-            if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
+            if offset > 0 and offset < seq_len and offset % ssm_chunk_alignment == 0:
                 offsets_set.add(offset)
 
         offsets = sorted(offsets_set)

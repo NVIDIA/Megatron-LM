@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -123,6 +123,14 @@ class MimoOptimizer(MegatronOptimizer):
         """Clear gradients on all active module optimizers."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
+
+    @property
+    def chained_optimizers(self) -> List[MegatronOptimizer]:
+        """Expose leaf optimizers to stock training, checkpoint, and rerun lifecycle hooks."""
+        optimizers = []
+        for opt in self._active_optimizers:
+            optimizers.extend(getattr(opt, 'chained_optimizers', [opt]))
+        return optimizers
 
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage parameters for explicit synchronization in all active module optimizers."""
@@ -323,7 +331,7 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    Returns (tp_gtp_rank, pp_rank, dp_cp_rank) so only (0, 0, 0) within each
     module's parallelism group is the main replica; all other ranks
     in the same module are non-main replicas of the same object.
     """
@@ -335,9 +343,30 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
-        hasattr(pg_collection, 'dp') and pg_collection.dp is not None
-    ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
+        hasattr(pg_collection, 'dp_cp') and pg_collection.dp_cp is not None
+    ), "pg_collection.dp_cp must be set for checkpoint deduplication"
+    gtp_group = getattr(pg_collection, 'gtp_remat', None)
+    gtp_rank = gtp_group.rank() if gtp_group is not None else 0
+    gtp_size = gtp_group.size() if gtp_group is not None else 1
+    tp_gtp_rank = pg_collection.tp.rank() * gtp_size + gtp_rank
+    return (tp_gtp_rank, pg_collection.pp.rank(), pg_collection.dp_cp.rank())
+
+
+def _optimizer_config_for_module(
+    config: OptimizerConfig, module: torch.nn.Module
+) -> OptimizerConfig:
+    """Derive an optimizer config whose param-gather overlap matches the module's DDP config."""
+    ddp_config = getattr(module, 'ddp_config', None)
+    if ddp_config is None:
+        raise ValueError("Active MIMO modules must be DDP-wrapped before optimizer construction.")
+    overlap_param_gather = ddp_config.overlap_param_gather
+    return replace(
+        config,
+        overlap_param_gather=overlap_param_gather,
+        overlap_param_gather_with_optimizer_step=(
+            config.overlap_param_gather_with_optimizer_step and overlap_param_gather
+        ),
+    )
 
 
 def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
@@ -368,21 +397,19 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 assert (
                     pg_collection is not None
                 ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
-                assert (
-                    not hasattr(module, 'ddp_config')
-                    or module.ddp_config is None
-                    or module.ddp_config.num_distributed_optimizer_instances == 1
-                ), (
+                module_config = _optimizer_config_for_module(config, module)
+                assert module.ddp_config.num_distributed_optimizer_instances == 1, (
                     "MIMO optimizer does not yet support "
                     "num_distributed_optimizer_instances > 1. "
                     f"Module '{module_name}' has "
                     f"{module.ddp_config.num_distributed_optimizer_instances} instances."
                 )
                 optimizer = get_megatron_optimizer(
-                    config=config,
+                    config=module_config,
                     model_chunks=[module],
                     pg_collection=pg_collection,
                     use_gloo_process_groups=False,
+                    param_group_process_group=pg_collection.intra_dist_opt,
                 )
 
         module_infos[module_name] = ModuleOptimizerInfo(

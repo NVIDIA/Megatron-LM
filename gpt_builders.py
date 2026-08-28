@@ -80,7 +80,11 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
         # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
         mtp_block_spec = get_gpt_mtp_block_spec(
-            config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
+            config,
+            transformer_layer_spec_for_mtp,
+            use_transformer_engine=use_te,
+            vp_stage=vp_stage,
+            pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
         )
 
     model = GPTModel(

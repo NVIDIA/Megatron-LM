@@ -241,6 +241,35 @@ class TestModelOptHybridModel(TestModelOptGPTModel):
             hybrid_layer_pattern="M*-",
         )
 
+    def test_mhc_mtp_construction(self):
+        """The local ModelOpt Hybrid spec provides the split mHC MTP projections."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=2,
+            mhc_sinkhorn_iterations=3,
+            hidden_dropout=0.0,
+            mtp_num_layers=1,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=get_hybrid_stack_modelopt_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="-/-",
+        )
+
+        mtp_layer = model.mtp.layers[0]
+        assert mtp_layer.e_proj is not None
+        assert mtp_layer.h_proj is not None
+        assert mtp_layer.eh_proj is None
+        parameter_names = {name for name, _ in model.named_parameters()}
+        assert any(name.startswith("mtp.layers.0.e_proj.") for name in parameter_names)
+        assert any(name.startswith("mtp.layers.0.h_proj.") for name in parameter_names)
+
 
 def test_get_gpt_modelopt_spec_interface():
     # Get the function signature
@@ -357,6 +386,8 @@ def test_get_hybrid_stack_modelopt_spec_local_feature_specs():
     assert mtp_layer_spec.submodules.enorm is Norm
     assert mtp_layer_spec.submodules.hnorm is Norm
     assert mtp_layer_spec.submodules.eh_proj is ColumnParallelLinear
+    assert mtp_layer_spec.submodules.e_proj is ColumnParallelLinear
+    assert mtp_layer_spec.submodules.h_proj is ColumnParallelLinear
     assert mtp_layer_spec.submodules.layer_norm is Norm
 
 

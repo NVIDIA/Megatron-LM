@@ -33,6 +33,7 @@ File any bugs you find, keeping the following in mind:
 ### Do
 
 - Format new code in a style that is consistent with the file being changed. Megatron-LM doesn't (yet) have a style guide or enforced formatting.
+- Use the docstring style and format [the documentation generator is configured for](../conf.py): [Google style](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings) with [MyST format](https://mystmd.org/).
 - Split your changes into separate, atomic commits, that is, a commit per feature or fix.
 - Make sure your commits are rebased on the `main` branch.
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").

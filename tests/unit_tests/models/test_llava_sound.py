@@ -6,6 +6,7 @@ RADIO models) and instead invoke the relevant unbound methods on a
 ``SimpleNamespace`` stub. This focuses the test surface on the new sound
 code paths without dragging in the full multimodal stack.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -167,6 +168,81 @@ class TestHasSoundsSentinel:
         assert self._has_sounds(torch.empty(0)) is False
 
 
+def test_forward_encodes_projects_and_forwards_sound_embeddings():
+    class _SoundModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(sound_pad_to_clip_duration=False)
+            self.calls = []
+
+        def forward(self, clips, lengths):
+            self.calls.append((clips, lengths))
+            return torch.ones(1, 1, 3), torch.tensor([1])
+
+    class _LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding_input_ids = None
+            self.forward_kwargs = None
+
+        def embedding(self, input_ids, position_ids):
+            del position_ids
+            self.embedding_input_ids = input_ids
+            return torch.zeros(input_ids.shape[1], input_ids.shape[0], 3)
+
+        def forward(self, **kwargs):
+            self.forward_kwargs = kwargs
+            return kwargs["decoder_input"]
+
+    model = object.__new__(LLaVAModel)
+    torch.nn.Module.__init__(model)
+    model.add_encoder = True
+    model.add_decoder = True
+    model.pre_process = True
+    model.post_process = True
+    model.vision_model = None
+    model.vision_projection = None
+    model._vision_projection_input_size = None
+    model.sound_model = _SoundModel()
+    model.sound_projection = torch.nn.Identity()
+    model.language_model = _LanguageModel()
+    model.encoder_hidden_state = None
+    model.image_token_index = -200
+    model.sound_token_index = DEFAULT_SOUND_TOKEN_INDEX
+    model.img_seq_len = 4
+    model.patch_dim = 2
+    model.dynamic_resolution = False
+    model._drop_vision_class_token = False
+    model._pixel_shuffle = False
+    model._conv_merging = False
+    model._max_num_tiles = 1
+    model._language_max_sequence_length = 64
+    model._language_is_pipeline_parallel = False
+    model.context_parallel_lm = 1
+    model.sequence_parallel_lm = False
+    clips = torch.ones(1, 16)
+    lengths = torch.tensor([16])
+
+    output, loss_mask = LLaVAModel.forward(
+        model,
+        images=None,
+        input_ids=torch.tensor([[1, DEFAULT_SOUND_TOKEN_INDEX, 2]]),
+        position_ids=torch.tensor([[0, 1, 2]]),
+        attention_mask=None,
+        sound_clips=clips,
+        sound_length=lengths,
+    )
+
+    assert len(model.sound_model.calls) == 1
+    assert torch.equal(model.sound_model.calls[0][0], clips)
+    assert torch.equal(model.sound_model.calls[0][1], lengths)
+    assert model.language_model.embedding_input_ids.tolist() == [[1, 0, 2]]
+    assert model.language_model.forward_kwargs["input_ids"].tolist() == [[1, 0, 2]]
+    assert output.shape == (3, 1, 3)
+    assert torch.equal(output[1, 0], torch.ones(3))
+    assert loss_mask is None
+
+
 # ---------------------------------------------------------------------------
 # Sound replacement in _preprocess_data (light integration)
 # ---------------------------------------------------------------------------
@@ -194,6 +270,11 @@ def _build_preprocess_stub(
         sound_token_index=sound_token_index,
         sound_model=sound_model,
         vision_model=None,
+        dynamic_resolution=False,
+        _drop_vision_class_token=False,
+        _pixel_shuffle=False,
+        _conv_merging=False,
+        _max_num_tiles=1,
         _language_max_sequence_length=language_max_sequence_length,
         _language_is_pipeline_parallel=False,
         context_parallel_lm=1,
@@ -242,20 +323,22 @@ class TestPreprocessDataSoundReplacement:
         sound_embeddings = torch.full((5, 1, 4), 7.0)  # [s, b, h], capacity 5
         sound_embeddings_len = torch.tensor([1])  # only the first 1 is real
 
-        final_embedding, _final_labels, _final_loss_mask = LLaVAModel._preprocess_data(
-            stub,
-            image_embeddings=inputs.image_embeddings,
-            language_embeddings=inputs.language_embeddings,
-            input_ids=inputs.input_ids,
-            loss_mask=inputs.loss_mask,
-            labels=inputs.labels,
-            use_inference_kv_cache=False,
-            inference_context=None,
-            image_token_index=inputs.image_token_index,
-            num_image_tiles=inputs.num_image_tiles,
-            sound_embeddings=sound_embeddings,
-            sound_embeddings_len=sound_embeddings_len,
-            sound_timestamps=None,
+        final_embedding, _final_labels, _final_loss_mask, final_input_ids, _ = (
+            LLaVAModel._preprocess_data(
+                stub,
+                image_embeddings=inputs.image_embeddings,
+                language_embeddings=inputs.language_embeddings,
+                input_ids=inputs.input_ids,
+                loss_mask=inputs.loss_mask,
+                labels=inputs.labels,
+                use_inference_kv_cache=False,
+                inference_context=None,
+                image_token_index=inputs.image_token_index,
+                num_image_tiles=inputs.num_image_tiles,
+                sound_embeddings=sound_embeddings,
+                sound_embeddings_len=sound_embeddings_len,
+                sound_timestamps=None,
+            )
         )
 
         # final_embedding is returned as [s, b, h] (transposed) when CP=1.
@@ -266,6 +349,7 @@ class TestPreprocessDataSoundReplacement:
         assert torch.allclose(
             sound_slot, torch.full((4,), 7.0)
         ), f"sound slot was {sound_slot.tolist()}, expected all 7.0"
+        assert final_input_ids[0, 4].item() == 0
 
     @pytest.mark.internal
     def test_sound_pad_to_clip_duration_true_uses_full_buffer(self):
@@ -282,7 +366,7 @@ class TestPreprocessDataSoundReplacement:
         sound_embeddings = torch.arange(3 * 1 * 4, dtype=torch.float32).reshape(3, 1, 4)
         sound_embeddings_len = torch.tensor([3])
 
-        final_embedding, _, _ = LLaVAModel._preprocess_data(
+        final_embedding, _, _, _, _ = LLaVAModel._preprocess_data(
             stub,
             image_embeddings=inputs.image_embeddings,
             language_embeddings=inputs.language_embeddings,
@@ -320,7 +404,7 @@ class TestPreprocessDataSoundReplacement:
         sound_embeddings_len = torch.tensor([1])
 
         # Should run without error and not modify the embedding at the would-be slot.
-        final_embedding, _, _ = LLaVAModel._preprocess_data(
+        final_embedding, _, _, _, _ = LLaVAModel._preprocess_data(
             stub,
             image_embeddings=inputs.image_embeddings,
             language_embeddings=inputs.language_embeddings,
@@ -351,6 +435,11 @@ class TestPreprocessDataSoundReplacement:
             sound_token_index=DEFAULT_SOUND_TOKEN_INDEX,
             sound_model=SimpleNamespace(config=SimpleNamespace()),  # no attr
             vision_model=None,
+            dynamic_resolution=False,
+            _drop_vision_class_token=False,
+            _pixel_shuffle=False,
+            _conv_merging=False,
+            _max_num_tiles=1,
             _language_max_sequence_length=64,
             _language_is_pipeline_parallel=False,
             context_parallel_lm=1,

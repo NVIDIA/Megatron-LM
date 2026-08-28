@@ -296,7 +296,12 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        mtp_spec = mtp_block_spec(self._model_config, transformer_layer_spec, vp_stage=vp_stage)
+        mtp_spec = mtp_block_spec(
+            self._model_config,
+            transformer_layer_spec,
+            vp_stage=vp_stage,
+            pp_rank=pg_collection.pp.rank(),
+        )
 
         # override spec with local backend if configured
         if self._model_config.attention_backend == AttnBackend.local:
@@ -399,12 +404,18 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
 
 
 def mtp_block_spec(
-    config: "GPTModelConfig", transformer_layer_spec: ModuleSpec, vp_stage: int | None = None
+    config: "GPTModelConfig",
+    transformer_layer_spec: ModuleSpec,
+    vp_stage: int | None = None,
+    pp_rank: int | None = None,
 ) -> ModuleSpec | None:
     """Create MTP block spec if model has MTP layers.
 
     Args:
         config: full model config
+        transformer_layer_spec: decoder layer specification
+        vp_stage: virtual pipeline stage
+        pp_rank: pipeline rank from the model process group
 
     Returns:
         ModuleSpec: The MTP module specification
@@ -423,6 +434,12 @@ def mtp_block_spec(
             decoder_specs = get_gpt_decoder_layer_specs(transformer_cfg, use_transformer_engine=use_te, normalization=transformer_cfg.normalization, qk_l2_norm=transformer_cfg.qk_l2_norm, vp_stage=vp_stage)
             spec = decoder_specs[-1]
 
-        return get_gpt_mtp_block_spec(transformer_cfg, spec, use_transformer_engine=use_te, vp_stage=vp_stage)
+        return get_gpt_mtp_block_spec(
+            transformer_cfg,
+            spec,
+            use_transformer_engine=use_te,
+            vp_stage=vp_stage,
+            pp_rank=pp_rank,
+        )
     else:
         return None

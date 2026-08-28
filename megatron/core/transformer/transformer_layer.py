@@ -306,6 +306,11 @@ class BaseTransformerLayer(ABC):
     implementation in `transformer_block.py` file for more details.
     """
 
+    #: Whether the layer accepts mHC n-stream hidden states ([s, b, n*C])
+    #: when owned directly by a TransformerBlock. Custom layer implementations
+    #: that implement this contract should override the marker with ``True``.
+    supports_mhc_connections: bool = False
+
     def __init__(self):
         pass
 
@@ -316,11 +321,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     Transformer layer takes input with size [s, b, h] and returns an
     output of the same size.
     """
-
-    #: Whether this layer class understands mHC n-stream hidden states
-    #: ([s, b, n*C]). Only HyperConnectionTransformerLayer sets this True;
-    #: __init__ rejects `enable_mhc_connections` on any layer that does not.
-    supports_mhc_connections: bool = False
 
     def __init__(
         self,
@@ -340,6 +340,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules_config = submodules
+        # GraphableMegatronModule may create a local CUDA graph manager during super().__init__().
+        # Dense layers need a default before that hook runs, while MoETransformerLayer sets this
+        # to True before entering this constructor.
+        self.is_moe_layer = getattr(self, "is_moe_layer", False)
         super().__init__(config=config, vp_stage=vp_stage)
 
         if pg_collection is None:
@@ -549,13 +553,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-        if config.enable_mhc_connections and not self.supports_mhc_connections:
-            raise ValueError(
-                f"{type(self).__name__} does not implement mHC residual streams. Build the "
-                "decoder with HyperConnectionTransformerLayer when "
-                "enable_mhc_connections=True."
-            )
-
         # Resolve the legacy `_forward_post_mlp` override once instead of walking the MRO on
         # every MLP bias-dropout-add. See _apply_mlp_bda_step for the deprecation contract.
         self._legacy_forward_post_mlp = None
@@ -590,7 +587,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             CudaGraphModule.mlp in self.config.cuda_graph_modules
             and self.submodules_config.mlp != IdentityOp
         ):
-            # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
+            # Cudagraphing MoE layers is handled by MoETransformerLayer.
             assert not self.is_moe_layer
             self.cudagraph_manager = CudaGraphManager(config)
 
@@ -607,6 +604,73 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             "Please use get_transformer_layer_offset instead."
         )
         return get_transformer_layer_offset(config)
+
+    @staticmethod
+    def _group_offload_output_with_bias(
+        output_with_bias, offload_manager, forced_released_tensors: Optional[list[Tensor]] = None
+    ):
+        """Commit a fine-grained offload group for a raw branch output tuple."""
+        if isinstance(output_with_bias, tuple):
+            output = offload_manager.group_offload(
+                output_with_bias[0], forced_released_tensors=forced_released_tensors
+            )
+            return (output, *output_with_bias[1:])
+        return offload_manager.group_offload(
+            output_with_bias, forced_released_tensors=forced_released_tensors
+        )
+
+    def _forward_self_attention_output_with_bias(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Run input norm and self-attention, returning the raw output before BDA."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        if attn_state:
+            raise RuntimeError(
+                "Raw HybridStack attention execution requires an ordinary TransformerLayer "
+                "without subclass-specific attention state."
+            )
+
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
+        )
+        if using_fused_tp_inference_kernel:
+            self._set_proj_residual(residual)
+
+        nvtx_range_push(suffix="self_attention")
+        attention_output_with_bias = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+        nvtx_range_pop(suffix="self_attention")
+
+        if self._input_layernorm_checkpoint_active:
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        return attention_output_with_bias, self.attn_norm_manager, residual
 
     def _forward_attention(
         self,
@@ -891,6 +955,40 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual = residual.float()
 
         return pre_mlp_layernorm_output, residual, ()
+
+    def _forward_mlp_output_with_bias(
+        self,
+        hidden_states: Tensor,
+        inference_context: BaseInferenceContext | None = None,
+        padding_mask: Tensor | None = None,
+        packed_seq_params=None,
+    ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
+        """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
+        pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
+            hidden_states
+        )
+        if mlp_state:
+            raise RuntimeError(
+                "Raw HybridStack MLP execution requires an ordinary TransformerLayer "
+                "without subclass-specific MLP state."
+            )
+
+        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
+            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        )
+
+        mlp_output_with_bias = self._run_mlp(
+            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+        )
+
+        if moe_unflatten_mbs is not None:
+            mlp_output, mlp_bias = mlp_output_with_bias
+            mlp_output = self._maybe_reflatten_from_moe(
+                mlp_output, packed_seq_params, moe_unflatten_mbs
+            )
+            mlp_output_with_bias = (mlp_output, mlp_bias)
+
+        return mlp_output_with_bias, residual
 
     def _forward_mlp(
         self,
@@ -1747,28 +1845,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if CudaGraphModule.mlp in self.config.cuda_graph_modules:
             submodules.append(self.mlp_hyper_connection)
         return submodules
-
-    def forward(self, *args, **kwargs):
-        """Forward pass with MHC recompute manager support.
-
-        Inherits ``_forward_attention`` and ``_forward_mlp`` from base; the
-        mHC-specific behavior is contained in the ``_run_input_layernorm``,
-        ``_apply_self_attn_bda_step``, ``_pre_mlp_layernorm_and_residual``, and
-        ``_apply_mlp_bda_step`` overrides, which read the manager off
-        ``self`` and thread per-call intermediates through the
-        ``attn_state`` / ``mlp_state`` slots.
-
-        Override exists only to skip the ``enable_mhc_connections`` assert
-        on base ``TransformerLayer.forward``.
-        """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-            packed_seq_params=kwargs.get("packed_seq_params", None),
-        )
-        return output, context
 
     def _run_input_layernorm(self, hidden_states):
         """HC input layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.

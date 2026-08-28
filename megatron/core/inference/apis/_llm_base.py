@@ -13,7 +13,7 @@ helpers, the public sync bridge (``submit``/``run_sync``), and the private
 import asyncio
 import concurrent.futures
 import threading
-from typing import Coroutine, List, Optional, Tuple, Union
+from typing import Any, Coroutine, List, Optional, Tuple, Type, Union
 
 import torch.distributed as dist
 
@@ -21,6 +21,9 @@ from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -261,6 +264,7 @@ class _MegatronLLMBase:
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
     ) -> None:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
@@ -280,7 +284,7 @@ class _MegatronLLMBase:
 
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
         context = DynamicInferenceContext(model.config, inference_config)
-        wrapper = GPTInferenceWrapper(model, context)
+        wrapper = inference_wrapper_cls(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
         engine = DynamicInferenceEngine(controller=controller, context=context)
 
@@ -442,6 +446,29 @@ class _MegatronLLMBase:
             f"got {type(prompts)}"
         )
 
+    def _normalize_multi_modal_data_list(
+        self, multi_modal_data, *, num_prompts: int, is_batch: bool
+    ):
+        """Normalize vLLM-style multimodal dictionaries per prompt."""
+        if multi_modal_data is None:
+            return [None] * num_prompts
+
+        if not is_batch:
+            if not isinstance(multi_modal_data, dict):
+                raise TypeError("For a single prompt, multi_modal_data must be a modality dict.")
+            return [multi_modal_data]
+
+        if not isinstance(multi_modal_data, list):
+            raise TypeError("For batched prompts, multi_modal_data must be list[dict | None].")
+        if len(multi_modal_data) != num_prompts:
+            raise ValueError(
+                "Batched multi_modal_data must be the same length as prompts "
+                f"(got {len(multi_modal_data)} vs {num_prompts})."
+            )
+        if any(item is not None and not isinstance(item, dict) for item in multi_modal_data):
+            raise TypeError("Each batched multi_modal_data entry must be a dict or None.")
+        return list(multi_modal_data)
+
     # ---- private impl coroutines ----
     # Subclasses' public methods bridge to these via ``_EventLoopManager``
     # (coordinator mode, on the runtime loop) or await them directly
@@ -451,7 +478,10 @@ class _MegatronLLMBase:
     # loop to our runtime loop
 
     async def _generate_impl(
-        self, prompts: Union[List[str], List[List[int]]], sp: SamplingParams
+        self,
+        prompts: Union[List[str], List[List[int]]],
+        sp: SamplingParams,
+        multi_modal_data_list: Optional[List[Any]] = None,
     ) -> List["DynamicInferenceRequest"]:
         """Run inference for a non-empty list of prompts; returns input-ordered list.
 
@@ -460,15 +490,33 @@ class _MegatronLLMBase:
           ``client.add_request`` and gathers all futures.
         - Direct mode: runs on the caller's event loop; offloads the synchronous
           ``engine.generate`` to a thread.
+
+        multi_modal_data_list may be ``None`` (text-only, backward-compatible
+        with pre-VLM callers) or a list the same length as ``prompts``.
         """
+        if multi_modal_data_list is None:
+            multi_modal_data_list = [None] * len(prompts)
+        elif len(multi_modal_data_list) != len(prompts):
+            raise ValueError(
+                "multi_modal_data_list must be the same length as prompts "
+                f"(got {len(multi_modal_data_list)} vs {len(prompts)})."
+            )
+
         if self._use_coordinator:
             # ``add_request`` calls ``asyncio.get_running_loop().create_future()``
             # so it must be invoked from a coroutine on the runtime loop. This
             # coroutine runs on that same loop, so ``asyncio.gather`` over the
             # returned futures is safe.
             assert self._coord_runtime is not None and self._coord_runtime.client is not None
-            futures = [self._coord_runtime.client.add_request(p, sp) for p in prompts]
+            futures = [
+                self._coord_runtime.client.add_request(
+                    p, sp, multi_modal_data=sample_multi_modal_data
+                )
+                for p, sample_multi_modal_data in zip(prompts, multi_modal_data_list, strict=True)
+            ]
             return list(await asyncio.gather(*futures))
+        if any(multi_modal_data_list):
+            raise ValueError("multi_modal_data is only supported with use_coordinator=True.")
         # TODO: replace with an upstream ``engine.async_generate`` so direct-mode
         # async generate doesn't block the caller's event loop.
         records = self._engine.generate(prompts, sp)

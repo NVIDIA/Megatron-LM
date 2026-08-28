@@ -17,40 +17,60 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     grid = parser.add_argument_group("hetero module grids")
 
     # Single encoder grid; CP/PP stay fixed at 1.
-    grid.add_argument("--encoder-tp", type=int, default=2,
-                      help="Encoder tensor-model-parallel size.")
-    grid.add_argument("--encoder-dp", type=int, default=2,
-                      help="Encoder data-parallel size.")
+    grid.add_argument(
+        "--mimo-encoder-tp", type=int, default=2, help="Encoder tensor-model-parallel size."
+    )
+    grid.add_argument("--mimo-encoder-dp", type=int, default=2, help="Encoder data-parallel size.")
 
     # Language grid placement + factorization.
-    grid.add_argument("--llm-offset", type=int, default=4,
-                      help="First global rank of the language grid span.")
-    grid.add_argument("--llm-tp", type=int, default=2,
-                      help="Language tensor-model-parallel size.")
-    grid.add_argument("--llm-cp", type=int, default=1,
-                      help="Language context-parallel size (CP=1 only for now).")
-    grid.add_argument("--llm-pp", type=int, default=1,
-                      help="Language pipeline-model-parallel size.")
-    grid.add_argument("--llm-dp", type=int, default=2,
-                      help="Language data-parallel size. Global batch is keyed on this.")
+    grid.add_argument(
+        "--mimo-llm-offset",
+        type=int,
+        default=4,
+        help="First global rank of the language grid span.",
+    )
+    grid.add_argument(
+        "--mimo-llm-tp", type=int, default=2, help="Language tensor-model-parallel size."
+    )
+    grid.add_argument(
+        "--mimo-llm-cp",
+        type=int,
+        default=1,
+        help="Language context-parallel size (CP=1 only for now).",
+    )
+    grid.add_argument(
+        "--mimo-llm-pp", type=int, default=1, help="Language pipeline-model-parallel size."
+    )
+    grid.add_argument(
+        "--mimo-llm-dp",
+        type=int,
+        default=2,
+        help="Language data-parallel size. Global batch is keyed on this.",
+    )
     # MoE expert parallelism for the language grid.
-    grid.add_argument("--llm-ep", type=int, default=1,
-                      help="Language expert-model-parallel size (MoE).")
-    grid.add_argument("--llm-expt-tp", type=int, default=None,
-                      help="Language expert tensor-parallel size; defaults to 1 when unset "
-                           "(experts default to TP=1; the 20L MoE recipe passes --llm-expt-tp 1).")
+    grid.add_argument(
+        "--mimo-llm-ep", type=int, default=1, help="Language expert-model-parallel size (MoE)."
+    )
+    grid.add_argument(
+        "--mimo-llm-expt-tp",
+        type=int,
+        default=None,
+        help="Language expert tensor-parallel size; defaults to 1 when unset "
+        "(experts default to TP=1; the 20L MoE recipe passes "
+        "--mimo-llm-expt-tp 1).",
+    )
 
     grid.add_argument(
-        "--llm-only",
+        "--mimo-llm-only",
         action="store_true",
         help=(
             "Run only the MIMO language module on the LLM grid. Keeps the MIMO "
             "training/data path but creates no encoder ranks or bridge communicators; "
-            "requires --llm-offset 0 so the language grid covers WORLD_SIZE."
+            "requires --mimo-llm-offset 0 so the language grid covers WORLD_SIZE."
         ),
     )
     grid.add_argument(
-        "--encoder-ddp-overlap",
+        "--mimo-encoder-ddp-overlap",
         action="store_true",
         help=(
             "Apply the global grad-reduce and param-gather overlap settings to encoder DDP. "
@@ -63,52 +83,61 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
     gtp_weight_remat_size, _ = resolve_hetero_gtp_degrees(args)
-    if args.llm_cp != 1:
+    if args.mimo_llm_cp != 1:
         raise ValueError("hetero MIMO training currently supports CP=1 only")
 
-    if getattr(args, "encoder_ddp_overlap", False) and not getattr(
+    if getattr(args, "mimo_encoder_ddp_overlap", False) and not getattr(
         args, "overlap_grad_reduce", False
     ):
-        raise ValueError("--encoder-ddp-overlap requires --overlap-grad-reduce")
+        raise ValueError("--mimo-encoder-ddp-overlap requires --overlap-grad-reduce")
 
     # MoE expert count must divide evenly across the language grid's expert parallelism.
     num_experts = _num_experts(args)
-    if num_experts and num_experts % args.llm_ep != 0:
+    if num_experts and num_experts % args.mimo_llm_ep != 0:
         raise ValueError(
-            f"--num-experts ({num_experts}) must be divisible by --llm-ep ({args.llm_ep})"
+            f"--num-experts ({num_experts}) must be divisible by "
+            f"--mimo-llm-ep ({args.mimo_llm_ep})"
         )
 
-    llm_size = args.llm_tp * gtp_weight_remat_size * args.llm_cp * args.llm_pp * args.llm_dp
+    llm_size = (
+        args.mimo_llm_tp
+        * gtp_weight_remat_size
+        * args.mimo_llm_cp
+        * args.mimo_llm_pp
+        * args.mimo_llm_dp
+    )
 
-    if args.llm_only:
-        if getattr(args, "encoder_ddp_overlap", False):
-            raise ValueError("--encoder-ddp-overlap cannot be used with --llm-only")
-        if args.llm_offset != 0:
+    if args.mimo_llm_only:
+        if getattr(args, "mimo_encoder_ddp_overlap", False):
+            raise ValueError("--mimo-encoder-ddp-overlap cannot be used with --mimo-llm-only")
+        if args.mimo_llm_offset != 0:
             raise ValueError(
-                "--llm-only requires --llm-offset 0 so language ranks cover WORLD_SIZE"
+                "--mimo-llm-only requires --mimo-llm-offset 0 so language ranks cover WORLD_SIZE"
             )
-        llm_ranks = set(range(args.llm_offset, args.llm_offset + llm_size))
+        llm_ranks = set(range(args.mimo_llm_offset, args.mimo_llm_offset + llm_size))
         all_ranks = set(range(world_size))
         if llm_ranks != all_ranks:
             raise ValueError(
-                "--llm-only requires the language grid to cover every torchrun rank exactly "
-                f"once; covered={sorted(llm_ranks)}, world={sorted(all_ranks)}"
+                "--mimo-llm-only requires the language grid to cover every torchrun rank "
+                f"exactly once; covered={sorted(llm_ranks)}, world={sorted(all_ranks)}"
             )
+        args.mimo_llm_world_size = llm_size
         return 0, llm_size
 
     # Fan-out divisibility: the bridge splits every LLM data lane across
-    # encoder_dp encoder lanes; the split must be exact.
-    llm_data_parallel_size = args.llm_dp * gtp_weight_remat_size
-    if (args.micro_batch_size * llm_data_parallel_size) % args.encoder_dp != 0:
+    # mimo_encoder_dp encoder lanes; the split must be exact.
+    llm_data_parallel_size = args.mimo_llm_dp * gtp_weight_remat_size
+    if (args.micro_batch_size * llm_data_parallel_size) % args.mimo_encoder_dp != 0:
         raise ValueError(
-            "--micro-batch-size * --llm-dp * GTP must be divisible by --encoder-dp "
-            f"(got {args.micro_batch_size} * {args.llm_dp} * "
-            f"{gtp_weight_remat_size} % {args.encoder_dp} != 0)"
+            "--micro-batch-size * --mimo-llm-dp * GTP must be divisible by "
+            "--mimo-encoder-dp "
+            f"(got {args.micro_batch_size} * {args.mimo_llm_dp} * "
+            f"{gtp_weight_remat_size} % {args.mimo_encoder_dp} != 0)"
         )
 
-    encoder_size = args.encoder_tp * args.encoder_dp
+    encoder_size = args.mimo_encoder_tp * args.mimo_encoder_dp
     encoder_ranks = set(range(encoder_size))  # encoder span always starts at rank 0
-    llm_ranks = set(range(args.llm_offset, args.llm_offset + llm_size))
+    llm_ranks = set(range(args.mimo_llm_offset, args.mimo_llm_offset + llm_size))
     all_ranks = set(range(world_size))
 
     if not encoder_ranks.isdisjoint(llm_ranks):
@@ -122,6 +151,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"covered={sorted(encoder_ranks | llm_ranks)}, world={sorted(all_ranks)}"
         )
 
+    args.mimo_llm_world_size = llm_size
     return encoder_size, llm_size
 
 
@@ -135,23 +165,23 @@ def build_module_grid_specs(
     language_grid_spec = ModuleGridSpec(
         name=MIMO_LANGUAGE_MODULE_KEY,
         num_ranks=llm_size,
-        tp=args.llm_tp,
-        cp=args.llm_cp,
-        pp=args.llm_pp,
-        ep=args.llm_ep,
+        tp=args.mimo_llm_tp,
+        cp=args.mimo_llm_cp,
+        pp=args.mimo_llm_pp,
+        ep=args.mimo_llm_ep,
         gtp_remat=gtp_weight_remat_size,
-        rank_offset=args.llm_offset,
-        expt_tp=args.llm_expt_tp or 1,
+        rank_offset=args.mimo_llm_offset,
+        expt_tp=args.mimo_llm_expt_tp or 1,
         expt_gtp_remat=expert_gtp_weight_remat_size,
     )
 
-    if args.llm_only:
+    if args.mimo_llm_only:
         return [language_grid_spec]
 
     encoder_grid_spec = ModuleGridSpec(
         name=encoder_module_name,
         num_ranks=encoder_size,
-        tp=args.encoder_tp,
+        tp=args.mimo_encoder_tp,
         cp=1,
         pp=1,
         ep=1,
@@ -164,12 +194,12 @@ def build_module_grid_specs(
 def resolve_hetero_gtp_degrees(args: argparse.Namespace) -> tuple[int, int]:
     """Return the language dense and expert GTP degrees."""
     _, gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
-        args.llm_tp,
+        args.mimo_llm_tp,
         getattr(args, "tensor_parallel_num_weight_shards", None),
         getattr(args, "gtp_weight_remat_size", 1),
     )
     _, expert_gtp_weight_remat_size = resolve_tensor_parallel_weight_shards(
-        args.llm_expt_tp or 1,
+        args.mimo_llm_expt_tp or 1,
         getattr(args, "expert_tensor_parallel_num_weight_shards", None),
         getattr(args, "expert_gtp_weight_remat_size", 1),
         shards_field="expert_tensor_parallel_num_weight_shards",

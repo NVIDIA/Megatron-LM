@@ -107,6 +107,23 @@ class TestMambaMixer:
                 assert output.shape[2] == mixer.config.hidden_size
                 assert output.dtype == torch.float32
 
+    @pytest.mark.parametrize("refresh_on_eval", [False, True], ids=["direct", "eval"])
+    def test_refreshes_decode_cache_in_place(self, refresh_on_eval):
+        mixer = self.get_mixer()
+        cache_ptr = mixer._A_neg_exp_cache.data_ptr()
+
+        with torch.no_grad():
+            mixer.A_log.add_(1.0)
+        if refresh_on_eval:
+            mixer.train()
+            mixer.eval()
+        else:
+            mixer.refresh_cache()
+
+        torch.testing.assert_close(mixer._A_neg_exp_cache, -torch.exp(mixer.A_log.float()))
+        assert mixer._A_neg_exp_cache.data_ptr() == cache_ptr
+        assert not mixer._A_neg_exp_cache_stale
+
 
 class TestMambaMixerErrorChecks:
 

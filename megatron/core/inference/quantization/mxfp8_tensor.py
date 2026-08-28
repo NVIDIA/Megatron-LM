@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -122,6 +122,22 @@ class MXFP8Tensor:
     data: torch.Tensor  # [M, K] fp8_e4m3fn
     scale: torch.Tensor  # 1D swizzled or [M, K // 32] unswizzled scales
     backend: Optional[MXFP8Backend] = None  # quantization and GEMM backend
+    # Keyword-only preserves the pre-existing third positional ``backend`` argument.
+    # This metadata supports tensor-like conversion consumers such as Megatron
+    # Bridge; it does not constrain the precision accepted by ``quantize_``/``copy_``.
+    # Legacy direct constructors have unknown logical dtype until their next
+    # successful update.
+    dtype: Optional[torch.dtype] = field(default=None, kw_only=True)
+
+    @property
+    def shape(self) -> torch.Size:
+        """Shape of the quantized data storage."""
+        return self.data.shape
+
+    @property
+    def device(self) -> torch.device:
+        """Device holding the quantized tensor."""
+        return self.data.device
 
     def size(self, idx: Optional[int] = None):
         """Wrapper for calling self.data.size()"""
@@ -141,12 +157,60 @@ class MXFP8Tensor:
         padded_cols = n_col_blocks * MXFP8_SCALE_COL_BLOCK
         return self.scale.reshape(-1, padded_cols)
 
+    def quantize_(self, value: torch.Tensor) -> "MXFP8Tensor":
+        """Quantize a logical tensor into existing storage without changing pointers.
+
+        The source dtype is preserved when supported by the configured backend so
+        the quantizer does not introduce an avoidable intermediate downcast.
+        FlashInfer FP32 inputs are converted to BF16 because that backend accepts
+        FP16/BF16 inputs only. For legacy instances with unknown logical dtype, the
+        first successful update records the dtype actually passed to the quantizer.
+        Shape broadcasting is unsupported because MXFP8 scale storage has fixed
+        geometry.
+        """
+        if self.data.ndim != 2:
+            raise ValueError(
+                "In-place MXFP8 updates require 2D destination storage; "
+                f"got shape {tuple(self.data.shape)}."
+            )
+        if value.shape != self.shape:
+            raise ValueError(
+                f"MXFP8 shape mismatch: expected {tuple(self.shape)}, got {tuple(value.shape)}."
+            )
+        if self.backend is None:
+            raise ValueError("Cannot update an MXFP8Tensor without a quantization backend.")
+        value = value.to(device=self.device)
+        if self.backend == "flashinfer" and value.dtype == torch.float32:
+            value = value.to(dtype=torch.bfloat16)
+        value = value.contiguous()
+        quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
+        self.data.copy_(quantized.data)
+        self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+        if self.dtype is None:
+            self.dtype = value.dtype
+        return self
+
+    def copy_(self, value: torch.Tensor) -> "MXFP8Tensor":
+        """Tensor-compatible alias for :meth:`quantize_` used by generic writeback.
+
+        Unlike ``torch.Tensor.copy_``, this method requires an exact shape and
+        does not accept ``non_blocking``; quantization and storage updates are
+        ordered on the current CUDA stream. The alias lets external conversion
+        integrations such as Megatron Bridge treat plain and MXFP8 destinations
+        uniformly while ``quantize_`` remains available to existing callers.
+        """
+        return self.quantize_(value)
+
     @classmethod
     def from_bf16(cls, x: torch.Tensor, group_size: int = 32, backend: MXFP8Backend = "flashinfer"):
-        """Quantize BF16 tensor to MXFP8.
+        """Quantize a floating-point CUDA tensor to MXFP8.
+
+        The historical method name is retained for compatibility. The Triton
+        backend accepts BF16, FP16, and FP32 inputs; FlashInfer accepts BF16 and
+        FP16 inputs.
 
         Args:
-            x: [M, K] BF16 tensor on CUDA.
+            x: [M, K] floating-point tensor on CUDA.
             group_size: MXFP8 group size (default 32).
             backend: 'triton' (fused quantize + swizzle Triton kernel) or
                      'flashinfer' (single fused FlashInfer CUDA kernel).
@@ -168,4 +232,4 @@ class MXFP8Tensor:
                 f"Unknown MXFP8 quantization backend: '{backend}'. "
                 "Must be 'triton' or 'flashinfer'."
             )
-        return cls(data=data, scale=scale, backend=backend)
+        return cls(data=data, scale=scale, backend=backend, dtype=x.dtype)
