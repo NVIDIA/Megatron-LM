@@ -599,10 +599,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -918,18 +916,10 @@ class ChunkOffloadHandler:
         return self._max_group_size == 0
 
     def finish_all_groups(self, name=None) -> bool:
-        """Finish all groups."""
+        """Return whether this handler has no remaining group named ``name``."""
         debug_rank(
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
-        # TODO: check if this is correct
-        # Mark it as finished when there are no groups to offload or reload
-        if (
-            len(self._groups_to_reload) == 0
-            and len(self._groups_to_offload) == 0
-            and self._offloaded_group_index > 0
-        ):
-            return True
         assert name is not None, "Name is required"
         return (
             self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
