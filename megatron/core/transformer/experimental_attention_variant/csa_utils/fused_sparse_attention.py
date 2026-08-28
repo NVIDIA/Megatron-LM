@@ -1097,6 +1097,8 @@ def _compute_full_csa_teacher_lse(
         max_seqlen_kv=max_seqlen_kv,
         q_causal_offsets=q_causal_offsets,
     )
+
+
 @torch.compile
 def build_thd_compact_k_layout(
     cu_seqlens_q: Tensor, cu_seqlens_k: Tensor, total_k_rows: int, ratio: int

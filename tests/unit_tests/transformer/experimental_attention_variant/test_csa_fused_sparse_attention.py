@@ -552,6 +552,8 @@ class TestDenseCsaTeacherLseReference:
                 compressed_lse = torch.logsumexp(logits, dim=-1)
             expected[row] = torch.logaddexp(non_compressed_lse[row], compressed_lse)
         torch.testing.assert_close(actual, expected)
+
+
 # ---------------------------------------------------------------------------
 # build_thd_compact_k_layout
 # ---------------------------------------------------------------------------
@@ -4584,9 +4586,7 @@ class TestThdPaddingRowMasking:
         )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_padding_protects_attention_backward_when_loss_disabled(
-        self, reset_lazy_kernel_state
-    ):
+    def test_padding_protects_attention_backward_when_loss_disabled(self, reset_lazy_kernel_state):
         """Padding repair must not depend on the indexer loss coefficient."""
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
         dev = 'cuda'

@@ -3004,7 +3004,7 @@ class CompressedSparseAttention(MegatronModule):
                 # Each top-k entry is still a logical compressed id within that
                 # query's sequence here. Only the ids are remapped later; the
                 # compact softmax slots remain aligned with their selected keys.
-                (compressed_topk, indexer_layout, compact_indexer_predict) = (
+                compressed_topk, indexer_layout, compact_indexer_predict = (
                     cp_utils.compute_cp_indexer_topk(
                         q_indexer_cp,
                         weights_indexer_cp,
