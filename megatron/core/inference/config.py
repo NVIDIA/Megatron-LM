@@ -565,8 +565,9 @@ class InferenceConfig:
     enabled), then all DP ranks share the same sampling / generation seed.
     """
 
-    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
-    """Mode used to schedule dynamic batching inference work."""
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
+    """Mode used to schedule dynamic batching inference work. Defaults to async scheduling; use
+    ``AsyncScheduleMode.LEGACY`` to disable it."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
     """Whether returned log-probs are modified by the sampling parameters or not."""

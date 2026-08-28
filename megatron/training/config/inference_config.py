@@ -142,10 +142,10 @@ class InferenceSetupConfig:
     generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
     --deterministic-mode is enabled."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "async"] = "legacy"
-    """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
-    existing resolve-before-prepare path. "async" overlaps asynchronous scheduling phases by
-    reordering them to prepare-before-resolve."""
+    inference_dynamic_batching_async_sched_mode: Literal["async", "legacy"] = "async"
+    """Async scheduling mode for dynamic batching. "async" (default) overlaps asynchronous
+    scheduling phases by reordering them to prepare-before-resolve. Select "legacy" to disable
+    async scheduling and use the resolve-before-prepare path."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
