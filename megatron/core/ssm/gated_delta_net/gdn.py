@@ -27,6 +27,10 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
+    chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
+    prepare_validated_chunk_metadata as prepare_internal_gdr_chunk_metadata,
+)
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 
@@ -60,10 +64,16 @@ class GatedDeltaNet(_GDNBase):
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
 
-        if self.config.deterministic_mode:
+        if self.config.deterministic_mode or self.config.gdn_gdr_backend == "torch":
             self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
+        elif self.config.gdn_gdr_backend == "fla":
             self.gated_delta_rule = chunk_gated_delta_rule
+        elif self.config.gdn_gdr_backend == "internal":
+            self.gated_delta_rule = partial(
+                internal_chunk_gated_delta_rule, recompute_h=self.config.gdn_gdr_recompute_h
+            )
+        else:
+            raise ValueError(f"Unsupported GDN GDR backend: {self.config.gdn_gdr_backend!r}.")
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
         """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""
@@ -227,7 +237,7 @@ class GatedDeltaNet(_GDNBase):
                 if cached is None:
                     cached_cu_seqlens = (
                         torch.arange(
-                            batch + 1, device=torch.cuda.current_device(), dtype=torch.long
+                            batch + 1, device=torch.cuda.current_device(), dtype=torch.int32
                         )
                         * seq_len_global
                     )
@@ -375,6 +385,31 @@ class GatedDeltaNet(_GDNBase):
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        if self.config.gdn_gdr_backend == "internal":
+            metadata_cu_seqlens = cu_seqlens_q
+            include_chunk_indices = True
+            if chunkwise_cp_context is not None:
+                metadata_cu_seqlens = getattr(chunkwise_cp_context, "cu_seqlens", None)
+                # [REMOVE BEFORE MERGE] Current CP experiments rely on the temporary
+                # 64-token-chunk internal backend contract. For the single-local-sequence
+                # CP layout, FLA's local chunk primitives can run dense and only fused
+                # backward needs device chunk offsets prepared before the profiled GDR
+                # scope. Drop this shape-only shortcut when the internal backend grows
+                # full tail/layout support.
+                include_chunk_indices = not (
+                    metadata_cu_seqlens is not None and metadata_cu_seqlens.numel() == 2
+                )
+            if metadata_cu_seqlens is not None:
+                validated_chunk_indices, validated_chunk_offsets = (
+                    prepare_internal_gdr_chunk_metadata(
+                        metadata_cu_seqlens, include_chunk_indices=include_chunk_indices
+                    )
+                )
+                if validated_chunk_indices is not None:
+                    kernel_inputs["validated_chunk_indices"] = validated_chunk_indices
+                if validated_chunk_offsets is not None:
+                    kernel_inputs["validated_chunk_offsets"] = validated_chunk_offsets
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
