@@ -7,6 +7,21 @@ from typing import Callable, ContextManager, Literal, Optional
 import torch
 
 
+def _parse_pad_packed_seq_alignment(value):
+    """Parse THD packed-sequence padding alignment."""
+    if value == "max":
+        return value
+    try:
+        alignment = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pad_packed_seq_alignment must be 'max' or a positive integer alignment."
+        ) from exc
+    if alignment <= 0:
+        raise ValueError("pad_packed_seq_alignment must be 'max' or a positive integer alignment.")
+    return alignment
+
+
 def resolve_tensor_parallel_weight_shards(
     tensor_model_parallel_size: int,
     tensor_parallel_num_weight_shards: Optional[int],

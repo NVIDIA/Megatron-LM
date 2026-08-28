@@ -55,6 +55,13 @@ class _FeatureFlag:
 MultiStorageClientFeature = _FeatureFlag(default=False)
 
 
+def open_file(*args, **kwargs):
+    """Open a path through MSC when enabled, otherwise use the builtin open."""
+    if MultiStorageClientFeature.is_enabled():
+        return MultiStorageClientFeature.import_package().open(*args, **kwargs)
+    return open(*args, **kwargs)
+
+
 class MaybeMultiStorageClient:
     """
     Helper class to use MultiStorageClient
@@ -108,4 +115,4 @@ class MaybeMultiStorageClient:
 
 
 maybe_msc = MaybeMultiStorageClient()
-__all__ = ['MultiStorageClientFeature', 'maybe_msc']
+__all__ = ['MultiStorageClientFeature', 'maybe_msc', 'open_file']

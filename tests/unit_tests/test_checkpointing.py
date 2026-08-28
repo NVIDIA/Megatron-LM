@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -242,6 +243,44 @@ def init_model_parallel():
     yield  # Run the actual test.
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
+
+
+def test_legacy_checkpoint_load_is_restricted(create_ckpt_load_args, tmp_path):
+    """Legacy checkpoint loading must use the restricted torch deserializer."""
+
+    load_dir = tmp_path / "test_legacy_checkpoint_load"
+    load_dir.mkdir()
+    create_checkpoint(load_dir, "torch")
+    create_ckpt_load_args.ckpt_format = "torch"
+
+    with mock.patch(
+        "megatron.training.checkpointing.torch.load",
+        return_value={"args": "dummy", "iteration": 123},
+    ) as load:
+        _load_base_checkpoint(load_dir, create_ckpt_load_args, rank0=True)
+
+    load.assert_called_once()
+    assert load.call_args.kwargs["weights_only"] is True
+
+
+def test_legacy_checkpoint_load_rejects_unsafe_pickle(create_ckpt_load_args, tmp_path):
+    """Loading a crafted legacy checkpoint must not execute its pickle payload."""
+
+    class UnsafeCheckpointPayload:
+        def __reduce__(self):
+            return Path.write_text, (tmp_path / "executed", "unsafe")
+
+    load_dir = tmp_path / "test_unsafe_legacy_checkpoint"
+    load_dir.mkdir()
+    create_checkpoint(load_dir, "torch")
+    create_ckpt_load_args.ckpt_format = "torch"
+    checkpoint_name = load_dir / "iter_0000123" / "mp_rank_00" / "model_optim_rng.pt"
+    torch.save({"payload": UnsafeCheckpointPayload()}, checkpoint_name)
+
+    with pytest.raises(SystemExit):
+        _load_base_checkpoint(load_dir, create_ckpt_load_args, rank0=True)
+
+    assert not (tmp_path / "executed").exists()
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch_dcp"])
