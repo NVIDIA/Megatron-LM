@@ -16,7 +16,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
-from megatron.core.models.hybrid.shortcut_block import ShortcutExecutionMode, ShortcutMoEBlock
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -711,7 +711,7 @@ class TestHybridBlock:
         assert block.num_layers_per_pipeline_rank == 2
         shortcut = block.layers[0]
         assert isinstance(shortcut, ShortcutMoEBlock)
-        assert shortcut.execution_mode == ShortcutExecutionMode.resolve(overlap_a2a=parallel)
+        assert shortcut.overlap_mode is parallel
         assert shortcut.compute_layer.supports_split_output_projection()
         assert isinstance(shortcut.moe_layer, TransformerLayer)
         state_keys = set(block.state_dict())
