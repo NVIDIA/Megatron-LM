@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 
@@ -82,12 +82,16 @@ class TestFSDP1F1BOverlap:
         "offload_modules",
         [[], ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"]],
     )
-    def test_fsdp_1f1b_memory_opt(self, recompute_modules, offload_modules):
+    @pytest.mark.parametrize("early_attn_memory_release", [False, True])
+    def test_fsdp_1f1b_memory_opt(
+        self, recompute_modules, offload_modules, early_attn_memory_release
+    ):
         self._run_test_helper(
             dispatcher_type="alltoall",
             sharding_strategy="optim_grads_params",
             recompute_modules=recompute_modules,
             offload_modules=offload_modules,
+            early_attn_memory_release=early_attn_memory_release,
         )
 
     def _run_test_helper(
@@ -99,6 +103,7 @@ class TestFSDP1F1BOverlap:
         recompute_modules=None,
         offload_modules=None,
         flex_backend=None,
+        early_attn_memory_release=False,
     ):
         """Verify multi-step FSDP training with overlap produces identical
         per-step loss and final weights as standard FSDP training.
@@ -149,7 +154,12 @@ class TestFSDP1F1BOverlap:
             ref_opt = fully_shard_optimizer(optimizer=ref_opt)
 
             # --- Test: FSDP model with overlap training loop ---
-            test_kwargs = {**extra_kwargs, "overlap_moe_expert_parallel_comm": True}
+            test_kwargs = {
+                **extra_kwargs,
+                "overlap_moe_expert_parallel_comm": True,
+                "ep_overlap_early_attn_memory_release": early_attn_memory_release,
+                "ep_overlap_use_scheduled_tensor_lifetime": True,
+            }
             test_config = get_test_config(num_layers=num_layers, extra_kwargs=test_kwargs)
             test_model = build_gpt_model(test_config, vocab_size=VOCAB_SIZE)
             reset_model(test_model, init_params)

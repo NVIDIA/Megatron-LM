@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import gc
 import os
 import sys
@@ -191,6 +191,7 @@ class TestPartialCudaGraphedA2AOverlap:
             TransformerModelChunkSchedulePlan,
         )
         from megatron.core.pipeline_parallel.schedules import set_current_microbatch
+        from megatron.core.pipeline_parallel.tensor_lifetime import register_external_tensor
 
         schedule_plans = []
         losses = []
@@ -220,10 +221,16 @@ class TestPartialCudaGraphedA2AOverlap:
                 if b_schedule_plan is not None:
                     gpt_model[0].zero_grad_buffer()
                     optimizer.zero_grad()
+                b_grad = torch.ones_like(output) if fwd_mb_idx > 0 else None
+                if (
+                    b_grad is not None
+                    and gpt_model[0].config.ep_overlap_use_scheduled_tensor_lifetime
+                ):
+                    register_external_tensor(
+                        b_grad, torch.cuda.current_stream(), "CUDA graph test gradient"
+                    )
                 output = TransformerModelChunkSchedulePlan.run(
-                    f_schedule_plan,
-                    b_schedule_plan,
-                    b_grad=torch.ones_like(output) if fwd_mb_idx > 0 else None,
+                    f_schedule_plan, b_schedule_plan, b_grad=b_grad
                 )
             # Check output shapes
             if fwd_mb_idx < num_iters:
@@ -369,6 +376,7 @@ class TestPartialCudaGraphedA2AOverlap:
                 cuda_graph_modules,
                 cuda_graph_warmup_steps,
                 ep_overlap=True,
+                ep_overlap_use_scheduled_tensor_lifetime=True,
                 **extra_kwargs,
             )
             assert len(loss_list) == len(loss_list_ref)
@@ -415,4 +423,31 @@ class TestPartialCudaGraphedA2AOverlap:
             assert torch.equal(loss_list[i].mean(), loss_list_ref[i].mean()), (
                 f"mHC recompute whole-attention overlap diverged from eager at i={i}: "
                 f"{loss_list[i]} vs {loss_list_ref[i]}"
+            )
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_scheduled_tensor_lifetime_with_partial_cudagraph(self):
+        """A stable capture/replay smoke test for schedule-owned tensor leases."""
+
+        extra_kwargs = {"moe_layer_freq": 1, "moe_token_dispatcher_type": "alltoall"}
+        warmup_steps = 2
+        loss_list_ref = self._run_test_helper(2, "none", None, warmup_steps, **extra_kwargs)
+        cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+        loss_list = self._run_test_helper(
+            2,
+            "transformer_engine",
+            cuda_graph_modules,
+            warmup_steps,
+            ep_overlap=True,
+            ep_overlap_use_scheduled_tensor_lifetime=True,
+            **extra_kwargs,
+        )
+
+        assert len(loss_list) == len(loss_list_ref)
+        for i, (loss, loss_ref) in enumerate(zip(loss_list, loss_list_ref)):
+            assert torch.equal(loss.mean(), loss_ref.mean()), (
+                f"scope={cuda_graph_modules}, i={i}, " f"loss={loss}, loss_ref={loss_ref}"
             )
