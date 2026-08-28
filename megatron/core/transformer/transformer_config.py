@@ -359,6 +359,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
 
+    dsa_mtp_index_kv_share: bool = False
+    """Reuse iteration-0 DSA top-k indices and latent KV across repeated MTP iterations."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
@@ -1770,6 +1773,11 @@ class TransformerConfig(ModelParallelConfig):
                 "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
+        if self.dsa_mtp_index_kv_share and self.experimental_attention_variant != "dsa":
+            raise ValueError(
+                "dsa_mtp_index_kv_share requires experimental_attention_variant='dsa'."
+            )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -1867,6 +1875,11 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_mtp_index_kv_share:
+                if not self.mtp_use_repeated_layer:
+                    raise ValueError("dsa_mtp_index_kv_share requires mtp_use_repeated_layer=True.")
+                if self.mtp_num_layers is None or self.mtp_num_layers <= 1:
+                    raise ValueError("dsa_mtp_index_kv_share requires mtp_num_layers > 1.")
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -2334,6 +2347,17 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
+
+        if (
+            self.dsa_mtp_index_kv_share
+            and self.recompute_granularity == "selective"
+            and "core_attn" in self.recompute_modules
+        ):
+            raise ValueError(
+                "dsa_mtp_index_kv_share does not yet support selective recompute with "
+                "'core_attn' in recompute_modules. Use selective 'mla_up_proj' recompute, "
+                "full activation recompute, or disable MTP DSA sharing."
+            )
 
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
@@ -3389,6 +3413,16 @@ class TransformerConfig(ModelParallelConfig):
                 f"(experimental_attention_variant={self.experimental_attention_variant!r}, "
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
+            )
+        if (
+            self.dsa_mtp_index_kv_share
+            and cuda_graph_captures_attention
+            and self.cuda_graph_impl != "full_iteration"
+        ):
+            raise ValueError(
+                "dsa_mtp_index_kv_share does not support per-layer CUDA graph scopes "
+                "that capture attention. Use a MoE-only scope or a graph scope that "
+                "contains the complete MTP producer-consumer chain."
             )
 
         if self.cuda_graph_parallel_prewarm:

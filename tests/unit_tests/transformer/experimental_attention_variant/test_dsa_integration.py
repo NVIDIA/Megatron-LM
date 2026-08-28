@@ -33,7 +33,11 @@ from megatron.training.arguments import _add_experimental_attention_variant_args
 
 def _index_share_config():
     return SimpleNamespace(
-        dsa_indexer_topk=8, dsa_indexer_topk_freq=4, dsa_indexer_skip_topk_offset=1, kv_channels=16
+        dsa_indexer_topk=8,
+        dsa_indexer_topk_freq=4,
+        dsa_indexer_skip_topk_offset=1,
+        dsa_mtp_index_kv_share=False,
+        kv_channels=16,
     )
 
 
@@ -68,6 +72,7 @@ def test_mtp_layer_number_offsets_index_share_schedule():
         dsa_indexer_topk=4,
         dsa_indexer_topk_freq=4,
         dsa_indexer_skip_topk_offset=1,
+        dsa_mtp_index_kv_share=False,
         kv_channels=16,
     )
     pg_collection = SimpleNamespace(tp=object(), cp=object())
@@ -323,9 +328,19 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group():
     v_up_weight = torch.randn(2, 3, 2)
 
     def get_query_key_value_tensors(
-        hidden_states_arg, key_value_states, packed_seq_params, inference_context=None
+        hidden_states_arg,
+        key_value_states,
+        packed_seq_params,
+        inference_context=None,
+        mtp_dsa_context=None,
     ):
-        del hidden_states_arg, key_value_states, packed_seq_params, inference_context
+        del (
+            hidden_states_arg,
+            key_value_states,
+            packed_seq_params,
+            inference_context,
+            mtp_dsa_context,
+        )
         observed_groups.append(pg_collection.cp)
         return q_absorbed, kv_compressed, q_compressed
 

@@ -112,6 +112,12 @@ class TextGenerationController:
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        if self.num_speculative_tokens and self.model_config.dsa_mtp_index_kv_share:
+            raise ValueError(
+                "dsa_mtp_index_kv_share is not supported with speculative decoding because "
+                "serial compute_mtp_single_step calls do not carry iteration-0 DSA KV/top-k "
+                "tensors. Disable dsa_mtp_index_kv_share or set num_speculative_tokens=0."
+            )
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
@@ -2443,7 +2449,7 @@ class TextGenerationController:
                 if sampling_params.num_tokens_to_generate > 0:
                     # Check end of generation status for each tensor
                     # and update generated sequence lengths
-                    (is_generation_done_tensor, generated_sequence_lengths) = (
+                    is_generation_done_tensor, generated_sequence_lengths = (
                         self.update_generation_status(
                             updated_prompts_tokens=batch_prompt_tokens,
                             generation_started=generation_started,
