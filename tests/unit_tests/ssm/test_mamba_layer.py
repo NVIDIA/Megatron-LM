@@ -48,6 +48,7 @@ class TestMambaLayer:
     def test_gpu_forward(self):
         layer = self.layer
         layer.cuda()
+        layer.eval()
         micro_batch_size = 2
         sequence_length = 32
         hidden_states = torch.ones((sequence_length, micro_batch_size, layer.config.hidden_size))
@@ -57,6 +58,11 @@ class TestMambaLayer:
         )
         attention_mask = attention_mask.cuda()
         output = layer(hidden_states, attention_mask=attention_mask)
+        assert layer.supports_split_output_projection()
+        split_output = layer.forward_output_proj(
+            *layer.forward_pre_output_proj(hidden_states, attention_mask=attention_mask)
+        )
+        torch.testing.assert_close(split_output, output)
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == layer.config.hidden_size

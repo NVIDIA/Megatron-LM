@@ -280,19 +280,6 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         return norm_out
 
-    def forward_output_proj(
-        self, norm_out: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Apply GDN's output projection to the normalized recurrence output."""
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
-
     def _split_projection(
         self, projected: torch.Tensor, batch: int, seq_len: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -419,29 +406,6 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         tensor_masked_update(ssm_state, batch_indices, final_ssm_state)
         y = self._apply_gated_norm(core_attn_out, gate)
         return y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        inference_context: Optional[BaseInferenceContext] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[int] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the GDN recurrence followed by its output projection."""
-        norm_out = self.forward_pre_output_proj(
-            hidden_states,
-            attention_mask,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            inference_params=inference_params,
-            **kwargs,
-        )
-        return self.forward_output_proj(norm_out)
 
 
 ####################
