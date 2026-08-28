@@ -2641,7 +2641,10 @@ class CompressedSparseAttention(MegatronModule):
                 # Switch 1: enable per-pack balanced routing via the config flag.
                 # CP<=1 has nothing to balance.
                 use_balance = self.config.dsa_cp_balance_indexer and cp_size > 1
-                if use_balance:
+                graph_dynamic_packs = bool(
+                    getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
+                )
+                if use_balance and not graph_dynamic_packs:
                     from megatron.core.transformer.experimental_attention_variant import (
                         cp_balanced_indexer,
                     )
@@ -2765,10 +2768,15 @@ class CompressedSparseAttention(MegatronModule):
                         cp_balanced_indexer,
                     )
 
-                    # Create the per-microbatch cache BEFORE the first dispatch so
-                    # the eager pack probe of layer 1 lands in it (frontends that
-                    # never prebuild would otherwise pay a second D2H on layer 2).
-                    if getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None) is None:
+                    # The default path creates its per-microbatch host cache before
+                    # layer 1's dispatch. Dynamic-graph mode deliberately creates no
+                    # host cache: data prep attaches one fixed-shape tensor route to
+                    # PackedSeqParams, and every captured DSA layer consumes those
+                    # refreshed route inputs.
+                    if (
+                        not graph_dynamic_packs
+                        and getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None) is None
+                    ):
                         packed_seq_params._dsa_cp_balance_layout_cache = {}
                     # Issue the chunk dispatch now (async) so the transfer overlaps with the
                     # in-flight compressed-K/KV all-gathers instead of sitting on the
@@ -2779,10 +2787,19 @@ class CompressedSparseAttention(MegatronModule):
                         cp_group,
                         cp_size,
                         l_local,
-                        layout_cache=getattr(
-                            packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                        layout_cache=(
+                            None
+                            if graph_dynamic_packs
+                            else getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
                         ),
                         cu_seqlens=cu_seqlens,
+                        cu_seqlens_compressed=cu_seqlens_compressed,
+                        graph_dynamic_packs=graph_dynamic_packs,
+                        graph_dynamic_plan=(
+                            cp_balanced_indexer.get_graph_dynamic_plan(packed_seq_params)
+                            if graph_dynamic_packs
+                            else None
+                        ),
                     )
 
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_wait")
@@ -2803,10 +2820,12 @@ class CompressedSparseAttention(MegatronModule):
                     # drop-in for compute_cp_indexer_topk, same contiguous layout downstream).
                     # cu_seqlens is constant across layers within a microbatch, so the chunk
                     # layouts are cached on this microbatch's PackedSeqParams.
-                    bal_layout_cache = getattr(
-                        packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                    bal_layout_cache = (
+                        None
+                        if graph_dynamic_packs
+                        else getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
                     )
-                    if bal_layout_cache is None:
+                    if bal_layout_cache is None and not graph_dynamic_packs:
                         bal_layout_cache = {}
                         packed_seq_params._dsa_cp_balance_layout_cache = bal_layout_cache
                     compressed_topk, indexer_layout = (
@@ -2829,6 +2848,7 @@ class CompressedSparseAttention(MegatronModule):
                             use_fused=self.use_fused_kernels,
                             dispatch_handle=bal_dispatch_handle,
                             layout_cache=bal_layout_cache,
+                            graph_dynamic_packs=graph_dynamic_packs,
                         )
                     )
                 else:

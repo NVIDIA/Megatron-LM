@@ -21,7 +21,11 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
-from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.num_microbatches_calculator import (
+    get_current_running_global_batch_size,
+    get_global_batch_size_upper_bound,
+    get_num_microbatches,
+)
 from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -2253,24 +2257,16 @@ class TECudaGraphHelper:
     def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
         """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
 
-        For the post_process chunk (last PP/VPP chunk that holds labels),
-        padding_mask arrives at the full CP-local length because:
-          1. labels are present -> actual_T_is_local=True -> no CP re-partition;
-          2. pre_process=False  -> _preprocess does not scatter under SP.
-        Other non-pre_process chunks (intermediate VPP) have no data, so their
-        captured padding_mask stays at the default scattered size from
-        `get_layer_static_inputs` (~max_seqlen/CP/TP).
-
-        Returns True only for that post_process-with-data case under THD CUDA
-        Graph + SP + PP>1.
+        Every non-pre_process PP/VPP chunk receives an already pipeline-local hidden-state tensor;
+        sequence-parallel preprocessing therefore does not scatter its padding mask. Its replay
+        buffer must use the full CP-local THD capacity, including intermediate VPP chunks that do
+        not own labels. First-stage chunks still use the default scattered static-input shape.
         """
         return (
             hasattr(layer, "_is_thd_cuda_graph")
             and layer._is_thd_cuda_graph()
             and self.config.sequence_parallel
-            and self.config.pipeline_model_parallel_size > 1
             and not getattr(chunk, "pre_process", True)
-            and getattr(chunk, "post_process", False)
             and "padding_mask" in static_inputs
         )
 
@@ -2324,6 +2320,20 @@ class TECudaGraphHelper:
         )
 
     @staticmethod
+    def _get_dynamic_capture_num_microbatches(
+        runtime_num_microbatches, packed_num_microbatches_upper_bound, topology_num_slots
+    ):
+        """Select a capture count that cannot alias any still-live PP/VPP graph input.
+
+        The runtime and packing bounds cover the current data step.  The topology bound is
+        independent of the current global batch size and protects every fixed-GBS PP/VPP
+        schedule; a later source-GBS increase is rejected separately before capture.
+        """
+        return max(
+            runtime_num_microbatches, packed_num_microbatches_upper_bound, topology_num_slots
+        )
+
+    @staticmethod
     def _get_dp_balanced_thd_max_num_microbatches(
         global_batch_size,
         dp_size,
@@ -2355,17 +2365,19 @@ class TECudaGraphHelper:
         return max(1, num_packed_sequences // dp_size)
 
     def _get_thd_varlen_max_num_microbatches(
-        self, runtime_num_microbatches, microbatch_group_size_per_vp_stage
+        self, global_batch_size_upper_bound, microbatch_group_size_per_vp_stage
     ):
-        """Return the THD packing upper bound used for dynamic CUDA graph capture."""
-        if self.config.sequence_packing_scheduler != 'dp_balanced':
-            return runtime_num_microbatches, "runtime"
-        if self.config.max_seqlen_per_dp_cp_rank is None:
-            return runtime_num_microbatches, "runtime"
-
+        """Return the run-level THD packing upper bound used for graph capture."""
         dp_size = self.dp_group.size()
+        runtime_upper_bound = math.ceil(
+            global_batch_size_upper_bound / (self.micro_batch_size * dp_size)
+        )
+        if self.config.sequence_packing_scheduler != 'dp_balanced':
+            return runtime_upper_bound, "run_gbs_upper_bound"
+        if self.config.max_seqlen_per_dp_cp_rank is None:
+            return runtime_upper_bound, "run_gbs_upper_bound"
+
         cp_size = self.dp_cp_group.size() // dp_size
-        global_batch_size = runtime_num_microbatches * self.micro_batch_size * dp_size
         # Use the dataset-produced padded sequence length upper bound when available.
         # Do not use max_seqlen_per_dp_cp_rank here: under CP it is only the per-rank
         # token budget, not the max length of one input sample before packing.
@@ -2386,7 +2398,7 @@ class TECudaGraphHelper:
 
         return (
             self._get_dp_balanced_thd_max_num_microbatches(
-                global_batch_size,
+                global_batch_size_upper_bound,
                 dp_size,
                 cp_size,
                 int(self.config.max_seqlen_per_dp_cp_rank),
@@ -2399,6 +2411,36 @@ class TECudaGraphHelper:
                 max_num_seqs=max_num_seqs,
             ),
             "thd_varlen_upper_bound",
+        )
+
+    def _get_dynamic_capture_plan(self, auto_num_slots, microbatch_group_size_per_vp_stage):
+        """Return run-level graph slot counts and their sizing diagnostics."""
+        runtime_num_microbatches = get_num_microbatches()
+        current_running_global_batch_size = get_current_running_global_batch_size()
+        run_global_batch_size_upper_bound = get_global_batch_size_upper_bound()
+        if run_global_batch_size_upper_bound > current_running_global_batch_size:
+            raise ValueError(
+                "cuda_graph_dynamic_microbatches does not support a "
+                "step_batch_size_schedule that increases the source global batch size after "
+                "CUDA graphs are captured. Capturing every future schedule slot can require an "
+                "unbounded number of graph instances; use a fixed global batch size or capture "
+                "after the schedule reaches its maximum."
+            )
+        packed_num_microbatches_upper_bound, capture_mode = (
+            self._get_thd_varlen_max_num_microbatches(
+                current_running_global_batch_size, microbatch_group_size_per_vp_stage
+            )
+        )
+        capture_num_microbatches = self._get_dynamic_capture_num_microbatches(
+            runtime_num_microbatches, packed_num_microbatches_upper_bound, auto_num_slots
+        )
+        return (
+            capture_num_microbatches,
+            runtime_num_microbatches,
+            current_running_global_batch_size,
+            run_global_batch_size_upper_bound,
+            packed_num_microbatches_upper_bound,
+            capture_mode,
         )
 
     def _get_cuda_graph_input_data(self):
@@ -2459,21 +2501,23 @@ class TECudaGraphHelper:
                     auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
                 )
                 auto_num_slots = int(auto_num_slots_tensor.item())
-            runtime_num_microbatches = get_num_microbatches()
-            max_num_microbatches, capture_mode = self._get_thd_varlen_max_num_microbatches(
-                runtime_num_microbatches, microbatch_group_size_per_vp_stage
-            )
+            (
+                dynamic_capture_num_microbatches,
+                runtime_num_microbatches,
+                current_running_global_batch_size,
+                run_global_batch_size_upper_bound,
+                max_num_microbatches,
+                capture_mode,
+            ) = self._get_dynamic_capture_plan(auto_num_slots, microbatch_group_size_per_vp_stage)
             if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
                 self.num_microbatches = runtime_num_microbatches
                 capture_mode = "runtime"
                 fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
             else:
-                # auto_num_slots is a topology-only theoretical lower bound for PP/VPP graph
-                # slot liveness. THD varlen packing can produce different real microbatch
-                # counts across iterations, so capture uses the THD/GBS-derived upper
-                # bound instead of the reduced slot count for safety. Currently TE cuda
-                # graph backend may crash if use the auto_num_slots.
-                self.num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
+                # THD packing bounds the current data step, while auto_num_slots is the
+                # topology-only liveness floor that stays valid if a later step-batch-size
+                # schedule entry increases the runtime count after capture.
+                self.num_microbatches = dynamic_capture_num_microbatches
                 fallback_reason = None
             log_on_each_pipeline_stage(
                 logger=logger,
@@ -2482,6 +2526,8 @@ class TECudaGraphHelper:
                 level=logging.INFO,
                 msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots '
                 f'enabled. runtime_num_microbatches={runtime_num_microbatches}, '
+                f'current_running_global_batch_size={current_running_global_batch_size}, '
+                f'run_global_batch_size_upper_bound={run_global_batch_size_upper_bound}, '
                 f'auto_num_slots={auto_num_slots}, '
                 f'max_num_microbatches={max_num_microbatches}, '
                 f'capture_num_microbatches={self.num_microbatches}, '

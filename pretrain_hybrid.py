@@ -37,6 +37,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
     prebuild_balanced_layouts,
 )
@@ -139,7 +140,13 @@ def get_batch(data_iterator, vp_stage=None):
             prebuild_balanced_layouts(
                 packed_seq_params,
                 pad_alignment=config.pad_packed_seq_alignment,
-                graphs_enabled=config.cuda_graph_impl != "none",
+                capacity=(
+                    config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
+                    if config.dsa_cp_balance_indexer_graph_dynamic_packs
+                    else None
+                ),
+                graphs_enabled=cuda_graph_captures_attention(config),
+                graph_dynamic_packs=config.dsa_cp_balance_indexer_graph_dynamic_packs,
             )
         return (
             attention_mask,
@@ -357,7 +364,8 @@ def forward_step(data_iterator, model: HybridModel):
             prebuild_balanced_layouts(
                 packed_seq_params,
                 pad_alignment=config.pad_packed_seq_alignment,
-                graphs_enabled=config.cuda_graph_impl != "none",
+                graphs_enabled=cuda_graph_captures_attention(config),
+                graph_dynamic_packs=config.dsa_cp_balance_indexer_graph_dynamic_packs,
             )
 
     timers('batch-generator').stop()

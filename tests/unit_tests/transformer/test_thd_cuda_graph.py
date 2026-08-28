@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Unit tests for THD format with CUDA Graph support.
@@ -26,6 +26,7 @@ import re
 import socket
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -102,6 +103,63 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
         .cuda()
         .bfloat16()
     )
+
+
+@pytest.mark.internal
+def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch):
+    """Hybrid embedding and padding-mask SP splits must use the same explicit TP group."""
+    from megatron.core import tensor_parallel
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    tp_group = object()
+    scatter_calls = []
+
+    def fake_sp_scatter(input_, group=None):
+        scatter_calls.append((input_.dtype, group))
+        return input_.narrow(0, 0, input_.shape[0] // 2)
+
+    monkeypatch.setattr(tensor_parallel, "scatter_to_sequence_parallel_region", fake_sp_scatter)
+
+    class FakeEmbedding:
+        scatter_to_sequence_parallel = False
+
+        def __call__(self, input_ids, position_ids):
+            return torch.zeros(input_ids.shape[1], input_ids.shape[0], 8)
+
+    class FakeDecoder:
+        def __call__(self, *, hidden_states, padding_mask, **_kwargs):
+            assert padding_mask.shape == (1, hidden_states.shape[0])
+            return hidden_states
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            sequence_parallel=True,
+            multi_latent_attention=False,
+            moe_n_hash_layers=0,
+            mtp_num_layers=None,
+        ),
+        pre_process=True,
+        post_process=False,
+        embedding=FakeEmbedding(),
+        decoder=FakeDecoder(),
+        pg_collection=SimpleNamespace(tp=tp_group),
+        position_embedding_type=None,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+    )
+    input_ids = torch.arange(8).view(1, 8)
+    output = HybridModel.forward(
+        model,
+        input_ids=input_ids,
+        position_ids=input_ids,
+        attention_mask=None,
+        padding_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+    )
+
+    assert output.shape == (4, 1, 8)
+    assert scatter_calls == [(torch.float32, tp_group), (torch.bool, tp_group)]
 
 
 # =============================================================================
@@ -918,7 +976,7 @@ class TestDecomposeReconstruct:
         # Use the non-default mode so losing it during reconstruction is observable.
         layer.config.cp_partition_mode = "contiguous"
         kw = {'packed_seq_params': psp, 'other': 'kept'}
-        TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._decompose_packed_seq_params_to_kwargs(kw)
         assert 'packed_seq_params' not in kw and 'cu_seqlens_q' in kw
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
         r = kw['packed_seq_params']
@@ -947,7 +1005,7 @@ class TestDecomposeReconstruct:
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
         kw = {'packed_seq_params': psp}
 
-        TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._decompose_packed_seq_params_to_kwargs(kw)
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
 
         reconstructed = kw['packed_seq_params']
@@ -961,7 +1019,7 @@ class TestDecomposeReconstruct:
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
         kw = {'hidden_states': torch.randn(10, 1, 256, device="cuda")}
         keys = set(kw.keys())
-        TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._decompose_packed_seq_params_to_kwargs(kw)
         assert set(kw.keys()) == keys
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
         assert set(kw.keys()) == keys
@@ -1006,7 +1064,195 @@ class TestStaticInputs:
         assert static_inputs["input_ids"].shape == (1, 128)
 
 
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "pre_process,post_process,pipeline_size,expected",
+    [
+        (False, False, 2, True),
+        (False, True, 2, True),
+        (False, False, 1, True),
+        (True, False, 2, False),
+    ],
+)
+def test_full_local_padding_mask_covers_every_non_preprocess_chunk(
+    pre_process, post_process, pipeline_size, expected
+):
+    """Intermediate and last PP/VPP chunks both consume an unscattered local THD mask."""
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+    helper = SimpleNamespace(
+        config=SimpleNamespace(sequence_parallel=True, pipeline_model_parallel_size=pipeline_size)
+    )
+    layer = SimpleNamespace(_is_thd_cuda_graph=lambda: True)
+    chunk = SimpleNamespace(pre_process=pre_process, post_process=post_process)
+
+    assert (
+        TECudaGraphHelper._needs_full_local_padding_mask(
+            helper, layer, chunk, {"padding_mask": object()}
+        )
+        is expected
+    )
+
+
+def _make_balanced_dynamic_pack_config(monkeypatch, **overrides):
+    """Build a minimal valid opt-in config while isolating optional backend probes."""
+    from megatron.core.transformer import transformer_config as transformer_config_module
+    from megatron.core.transformer.experimental_attention_variant import dsa_kernels
+    from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
+        _make_config,
+    )
+
+    monkeypatch.setattr(dsa_kernels, "use_fused_dsa_kernels", lambda _config: True)
+    monkeypatch.setattr(transformer_config_module, "HAVE_PACKAGING", True)
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+    kwargs = dict(
+        context_parallel_size=2,
+        cp_partition_mode="contiguous",
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=128,
+        pad_packed_seq_alignment="max",
+        thd_max_packed_sequences=8,
+        csa_compress_ratios=[4, 4, 4, 4],
+        csa_dense_mode=False,
+        dsa_kernel_backend="none",
+        dsa_cp_balance_indexer=True,
+        dsa_cp_balance_indexer_graph_dynamic_packs=True,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_dynamic_microbatches=True,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.bfloat16,
+    )
+    kwargs.update(overrides)
+    return _make_config(**kwargs)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("virtual_pipeline_size", [None, 2])
+def test_balanced_dynamic_packs_opt_in_allows_attention_graph_with_pp_vpp(
+    monkeypatch, virtual_pipeline_size
+):
+    config = _make_balanced_dynamic_pack_config(
+        monkeypatch, virtual_pipeline_model_parallel_size=virtual_pipeline_size
+    )
+
+    assert config.pipeline_model_parallel_size == 2
+    assert config.virtual_pipeline_model_parallel_size == virtual_pipeline_size
+    assert config.dsa_cp_balance_indexer_graph_dynamic_packs
+
+
+@pytest.mark.internal
+def test_balanced_dynamic_packs_allows_verified_safe_row_limit_boundary(monkeypatch):
+    """Each half-call may contain exactly 32768 rows; only larger calls are unsafe."""
+    config = _make_balanced_dynamic_pack_config(monkeypatch, max_seqlen_per_dp_cp_rank=2 * 32768)
+
+    assert config.max_seqlen_per_dp_cp_rank // 2 == 32768
+
+
+@pytest.mark.internal
+def test_balanced_static_pack_graph_keeps_pp_rejection(monkeypatch):
+    with pytest.raises(ValueError, match="graph_dynamic_packs=True"):
+        _make_balanced_dynamic_pack_config(
+            monkeypatch, dsa_cp_balance_indexer_graph_dynamic_packs=False
+        )
+
+
+@pytest.mark.internal
+def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatch):
+    config = _make_balanced_dynamic_pack_config(
+        monkeypatch, dsa_cp_balance_indexer_graph_dynamic_packs=False, cuda_graph_modules=["mlp"]
+    )
+
+    assert config.pipeline_model_parallel_size == 2
+    assert not config.dsa_cp_balance_indexer_graph_dynamic_packs
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"dsa_cp_balance_indexer": False}, "requires dsa_cp_balance_indexer=True"),
+        ({"cuda_graph_impl": "local"}, "requires cuda_graph_impl='transformer_engine'"),
+        ({"cuda_graph_impl": "full_iteration"}, "requires cuda_graph_impl='transformer_engine'"),
+        ({"cuda_graph_modules": ["mlp"]}, "requires CUDA graph capture to include attention"),
+        (
+            {"sequence_packing_scheduler": "default_dynamic_cp"},
+            "requires sequence_packing_scheduler='dp_balanced'",
+        ),
+        (
+            {"dynamic_context_parallel": True},
+            "Dynamic context parallelism requires sequence_packing_scheduler=default_dynamic_cp",
+        ),
+        (
+            {"cuda_graph_dynamic_microbatches": False},
+            "with PP/VPP requires cuda_graph_dynamic_microbatches=True",
+        ),
+        ({"max_seqlen_per_dp_cp_rank": 127}, "requires an even max_seqlen_per_dp_cp_rank"),
+        ({"max_seqlen_per_dp_cp_rank": 0}, "requires a positive max_seqlen_per_dp_cp_rank"),
+        ({"max_seqlen_per_dp_cp_rank": -2}, "requires a positive max_seqlen_per_dp_cp_rank"),
+        ({"max_seqlen_per_dp_cp_rank": 65538}, "above the verified-safe limit"),
+        (
+            {"overlap_moe_expert_parallel_comm": True},
+            "does not yet support overlap_moe_expert_parallel_comm or delay_wgrad_compute",
+        ),
+        (
+            {"delay_wgrad_compute": True},
+            "does not yet support overlap_moe_expert_parallel_comm or delay_wgrad_compute",
+        ),
+    ],
+)
+def test_balanced_dynamic_packs_validates_opt_in_contract(monkeypatch, overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _make_balanced_dynamic_pack_config(monkeypatch, **overrides)
+
+
 class TestDynamicMicrobatchSlots:
+
+    @pytest.mark.internal
+    def test_capture_count_includes_topology_liveness_floor(self):
+        """A small capture-step GBS must not discard the PP/VPP slot lower bound."""
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        assert TECudaGraphHelper._get_dynamic_capture_num_microbatches(1, 1, 2) == 2
+        assert TECudaGraphHelper._get_dynamic_capture_num_microbatches(2, 5, 3) == 5
+
+    @pytest.mark.internal
+    def test_production_capture_plan_enforces_run_level_gbs_contract(self, monkeypatch):
+        """Real slot selection sizes fixed-GBS packing and rejects a later GBS increase."""
+        from types import SimpleNamespace
+
+        from megatron.core.transformer import cuda_graphs
+
+        helper = object.__new__(cuda_graphs.TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=4096,
+            virtual_pipeline_model_parallel_size=None,
+            thd_max_packed_sequences=None,
+        )
+        helper.dp_group = SimpleNamespace(size=lambda: 1)
+        helper.dp_cp_group = SimpleNamespace(size=lambda: 2)
+        helper.micro_batch_size = 1
+        helper.seq_length = 4096
+        helper.thd_sequence_length_upper_bound = 4096
+        monkeypatch.setattr(cuda_graphs, "get_num_microbatches", lambda: 1)
+        monkeypatch.setattr(cuda_graphs, "get_current_running_global_batch_size", lambda: 8)
+        monkeypatch.setattr(cuda_graphs, "get_global_batch_size_upper_bound", lambda: 8)
+
+        plan = helper._get_dynamic_capture_plan(
+            auto_num_slots=3, microbatch_group_size_per_vp_stage=2
+        )
+        assert plan == (4, 1, 8, 8, 4, "thd_varlen_upper_bound")
+
+        plan = helper._get_dynamic_capture_plan(
+            auto_num_slots=5, microbatch_group_size_per_vp_stage=2
+        )
+        assert plan[0] == 5
+
+        monkeypatch.setattr(cuda_graphs, "get_current_running_global_batch_size", lambda: 1)
+        with pytest.raises(ValueError, match="step_batch_size_schedule"):
+            helper._get_dynamic_capture_plan(auto_num_slots=3, microbatch_group_size_per_vp_stage=2)
 
     @pytest.mark.internal
     def test_pp2_slots_track_max_outstanding_microbatches(self):
