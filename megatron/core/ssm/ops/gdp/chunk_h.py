@@ -246,6 +246,7 @@ def chunk_gated_delta_product_fwd_h(
     chunk_offsets: torch.Tensor | None = None,
     state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
+    states_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the inter-chunk state recurrence.
 
@@ -270,6 +271,11 @@ def chunk_gated_delta_product_fwd_h(
             `final_state`. `-1` slots are skipped.
         state_indices: `[N]` cache slot per sequence, or `None` for a dense
             `[N, H, K, V]` final state.
+        states_dtype: dtype for the returned per-chunk states `h`. Defaults to
+            the input dtype (bf16/fp16). Pass the state-cache dtype when the
+            caller snapshots `h` for prefix caching: the recurrence accumulates
+            in fp32 and only rounds on store, so an fp32 `h` preserves the full
+            snapshot precision instead of the bf16 the working dtype would keep.
 
     Returns `(h, v_new, final_state)`. `h` holds the state at each unexpanded
     chunk boundary.
@@ -290,7 +296,7 @@ def chunk_gated_delta_product_fwd_h(
         if chunk_offsets is None:
             chunk_offsets = prepare_chunk_offsets(cu_seqlens // num_householder, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
-    h = k.new_empty(B, NT, H, K, V)
+    h = k.new_empty(B, NT, H, K, V, dtype=states_dtype if states_dtype is not None else k.dtype)
 
     # Slot indices without a cache to index would leave the slot/head strides at
     # zero below, aliasing every sequence onto slot 0 while the padding mask still

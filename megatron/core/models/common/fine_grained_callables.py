@@ -36,7 +36,7 @@ def build_mtp_layer_callables(layer):
 
     forward_funcs, backward_dw = build_layer_callables(layer.mtp_model_layer)
     is_moe, _ = get_layer_moe_metadata(layer.mtp_model_layer)
-    (pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _) = forward_funcs
+    pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_pre_dispatch_forward(node, hidden_states):
@@ -63,21 +63,28 @@ def build_mtp_layer_callables(layer):
                         inp=hidden_states, requires_grad=True, keep_graph=True
                     )
 
-            offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
+            model = node.chunk_state.model
+            offset = get_mtp_layer_offset(
+                layer.config, model.vp_stage, pp_rank=model.pg_collection.pp.rank()
+            )
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
             hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
-        input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
-            input_ids=node.chunk_state.input_ids,
-            position_ids=node.chunk_state.position_ids,
-            embedding=node.chunk_state.model.embedding,
-            hidden_states=hidden_states,
-            packed_seq_params=node.chunk_state.packed_seq_params,
-            padding_mask=node.chunk_state.padding_mask,
+        input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
+            layer._get_embeddings(
+                input_ids=node.chunk_state.input_ids,
+                position_ids=node.chunk_state.position_ids,
+                embedding=node.chunk_state.model.embedding,
+                hidden_states=hidden_states,
+                packed_seq_params=node.chunk_state.packed_seq_params,
+                padding_mask=node.chunk_state.padding_mask,
+                mtp_input_mask=getattr(node.chunk_state, 'mtp_input_mask', None),
+            )
         )
         node.chunk_state.input_ids = input_ids
         node.chunk_state.position_ids = position_ids
         node.chunk_state.padding_mask = padding_mask
+        node.chunk_state.mtp_input_mask = mtp_input_mask
 
         # MTP Layer Preprocess
         # norm, linear projection and transformer
