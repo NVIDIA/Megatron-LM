@@ -3,8 +3,10 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.transformer.moe.paged_stash import PagedStashManager, PagedStashRunner
 
 
@@ -76,6 +78,43 @@ class _FakeModelChunk(torch.nn.Module):
 
     def zero_grad_buffer(self):
         self.zero_grad_count += 1
+
+
+@pytest.mark.parametrize("grouped_decoder", [False, True])
+@pytest.mark.parametrize("grouped_mtp", [False, True])
+def test_discovers_moe_layers_in_hybrid_groups(monkeypatch, grouped_decoder, grouped_mtp):
+    """Paged-stash overflow handling must include MoE leaves inside decoder and MTP groups."""
+    config = _config(True)
+    decoder_moe = _FakeMoELayer(config)
+    mtp_moe = _FakeMoELayer(config)
+    model = _FakeModelChunk(config, decoder_moe, mtp_moe, nested_mtp=False)
+
+    def group(layer):
+        stack = HybridStack.__new__(HybridStack)
+        torch.nn.Module.__init__(stack)
+        stack.layers = torch.nn.ModuleList([layer])
+        stack.mlp = None
+        return stack
+
+    if grouped_decoder:
+        model.decoder.layers[0] = group(model.decoder.layers[0])
+    if grouped_mtp:
+        model.mtp.layers[0].mtp_model_layer = group(model.mtp.layers[0].mtp_model_layer)
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.multi_token_prediction.MultiTokenPredictionLayer",
+        _FakeMTPPredictionLayer,
+    )
+    monkeypatch.setattr(PagedStashManager, "STASH_MGR", SimpleNamespace())
+    runner = PagedStashRunner(
+        config=config,
+        copy_main_params=False,
+        model=[model],
+        optimizer=None,
+        forward_backward_func=None,
+    )
+
+    assert runner.moe_layers == [decoder_moe, mtp_moe]
 
 
 def _run_retry(
