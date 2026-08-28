@@ -233,21 +233,29 @@ def test_mcp_surface_is_read_only():
 def test_workflow_has_separate_boundary_and_comment_only_publication():
     root = SCRIPT.parents[2]
     entry = (root / ".github/workflows/claude_review.yml").read_text()
-    isolated = (root / ".github/workflows/_claude-review-isolated.yml").read_text()
-    combined = entry + isolated
+    assert not (root / ".github/workflows/_claude-review-isolated.yml").exists()
     assert "${{ needs.capture.outputs.mode }}" in entry
     assert "concurrency:" in entry
-    assert "Read-only structured analysis" in isolated
-    assert "Validated claude[bot] publication" in isolated
-    assert '"event": "COMMENT"' not in isolated  # Fixed local publisher owns it.
-    assert "--approve" not in combined
-    assert "FW-CI-Templates" not in combined
-    assert "FW-CI-templates" not in combined
-    analyze = isolated.split("  analyze:", 1)[1].split("  publish:", 1)[0]
-    publish = isolated.split("  publish:", 1)[1]
+    assert "Read-only structured analysis" in entry
+    assert "Validated claude[bot] publication" in entry
+    assert '"event": "COMMENT"' not in entry  # Fixed local publisher owns it.
+    assert "--approve" not in entry
+    assert "FW-CI-Templates" not in entry
+    assert "FW-CI-templates" not in entry
+    analyze = entry.split("  analyze:", 1)[1].split("  publish:", 1)[0]
+    publish = entry.split("  publish:", 1)[1]
     assert "id-token: write" not in analyze
     assert "id-token: write" in publish
     assert "anthropics/claude-code-action" not in publish
+
+
+def test_workflow_does_not_add_reusable_secret_plumbing():
+    root = SCRIPT.parents[2]
+    entry = (root / ".github/workflows/claude_review.yml").read_text()
+    assert "workflow_call:" not in entry
+    assert "secrets:" not in entry.split("  analyze:", 1)[0]
+    assert "secrets.NVIDIA_INFERENCE_KEY" in entry
+    assert "secrets.NVIDIA_INFERENCE_URL" in entry
 
 
 def test_actual_mcore_skill_names_are_present_in_trusted_inventory_source():
