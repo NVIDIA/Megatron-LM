@@ -31,7 +31,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, SplitOutputProjection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -91,7 +91,7 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
-class _GDNBase(MegatronModule):
+class _GDNBase(MegatronModule, SplitOutputProjection):
     """Common base class for the Gated Delta Net (GDN) family of layers.
 
     Hosts everything the GDN variants share: the fused input projection, causal
@@ -285,8 +285,11 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
-
         self.reset_parameters()
+
+    def supports_split_output_projection(self) -> bool:
+        """Output-norm recomputation requires the original atomic forward path."""
+        return not self.recompute_norm_out
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.

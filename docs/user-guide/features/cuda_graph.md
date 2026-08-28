@@ -24,7 +24,7 @@ CUDA graph behavior is set by three orthogonal flags:
 | Flag | Values | Purpose |
 |---|---|---|
 | `--cuda-graph-impl` | `none` / `local` / `transformer_engine` / `full_iteration` | Which capture backend or strategy to use |
-| `--cuda-graph-modules` | `attn` / `mlp` / `moe` / `moe_router` / `moe_preprocess` / `mamba` | Per-layer **training** capture coverage; multi-valued and only meaningful for `local` and `transformer_engine` |
+| `--cuda-graph-modules` | `attn` / `mlp` / `moe` / `moe_router` / `moe_preprocess` / `mamba` / `shortcut_block` | Module-level **training** capture coverage; only meaningful for `local` and `transformer_engine` |
 | `--inference-cuda-graph-scope` | `none` / `layer` / `block` | Granularity of CUDA graphs during **inference**; only `local` supports non-`none` values |
 
 Supported combinations:
@@ -70,6 +70,7 @@ Operationally, this path is tightly integrated into MCore training and inference
 | `moe_router` | MoE router + shared experts (if not EP-comm-overlapped) |
 | `moe_preprocess` | `MoELayer.preprocess()` — must be paired with `moe_router` |
 | `mamba` | Mamba SSM layer |
+| `shortcut_block` | Paired shortcut compute/MoE block; local-only and mutually exclusive with other scopes |
 
 **Example — MoE model, capture attention and router:**
 ```bash

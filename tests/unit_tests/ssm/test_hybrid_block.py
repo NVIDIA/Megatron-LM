@@ -15,6 +15,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.shortcut_block import ShortcutExecutionMode, ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -647,6 +648,72 @@ class TestHybridBlock:
             layer.config is layer_config
             for layer, layer_config in zip(block.layers, block.layer_config_list)
         )
+
+    def test_shortcut_pair_is_one_registered_block(self):
+        block = self.get_hybrid_block(
+            Symbols.MAMBA + Symbols.MOE,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=False,
+            moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+
+        assert len(block.layers) == 1
+        shortcut = block.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+        assert shortcut.execution_mode == ShortcutExecutionMode.EAGER_SERIAL
+        assert isinstance(shortcut.compute_layer, MambaLayer)
+        assert isinstance(shortcut.moe_layer, TransformerLayer)
+        assert shortcut.shortcut_pre_mlp_layernorm is not shortcut.moe_layer.pre_mlp_layernorm
+        assert isinstance(shortcut.shortcut_post_norm, torch.nn.RMSNorm)
+        assert block.num_layers_per_pipeline_rank == 2
+
+        state_keys = set(block.state_dict())
+        assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
+        assert "layers.0.shortcut_post_norm.weight" in state_keys
+
+    @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "overlap"])
+    def test_shortcut_pair_eager_forward_backward(self, parallel):
+        block = self.get_hybrid_block(
+            Symbols.MAMBA + Symbols.MOE,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=parallel,
+            moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+        ).cuda()
+        block.train()
+
+        hidden_states = torch.randn(
+            16, 2, block.config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+        )
+        output = block(hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        shortcut = block.layers[0]
+        logical_norms = (
+            shortcut.shortcut_pre_mlp_layernorm,
+            shortcut.moe_layer.pre_mlp_layernorm,
+            shortcut.shortcut_post_norm,
+        )
+        assert len({id(norm.weight) for norm in logical_norms}) == len(logical_norms)
+        for norm in logical_norms:
+            assert norm.weight.grad is not None
+            assert torch.isfinite(norm.weight.grad).all()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_pattern_char = 'X'

@@ -29,6 +29,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.shortcut_block import (
+    ShortcutMoEBlock,
+    group_layers_into_shortcut_blocks,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -316,6 +320,20 @@ class HybridStack(MegatronModule):
                 setattr(self.hc_head_base, 'sequence_parallel', True)
                 setattr(self.hc_head_scale, 'sequence_parallel', True)
 
+        self._execution_layer_config_list = self.layer_config_list
+        if self.config.moe_shortcut_connection:
+            physical_layer_types = self.layer_type_list
+            self.layers = group_layers_into_shortcut_blocks(
+                self.layers,
+                physical_layer_types,
+                self.config,
+            )
+            self._execution_layer_config_list = [
+                layer_config
+                for layer_index, layer_config in enumerate(self.layer_config_list)
+                if layer_index == 0 or physical_layer_types[layer_index] != layer_utils.Symbols.MOE
+            ]
+
     @property
     def layer_type_list(self) -> list[str]:
         """Return layer symbols derived from the per-layer configs.
@@ -551,7 +569,7 @@ class HybridStack(MegatronModule):
                 )
             else:
                 for layer_idx, (layer_config, layer) in enumerate(
-                    zip(self.layer_config_list, self.layers, strict=True)
+                    zip(self._execution_layer_config_list, self.layers, strict=True)
                 ):
                     layer_packed_seq_params = packed_seq_params
                     if cp_layout_state is not None:
@@ -572,37 +590,40 @@ class HybridStack(MegatronModule):
                         else None
                     )
 
-                    with inner_quant_context:
-                        if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
-                            layer_kwargs = dict(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=layer_packed_seq_params,
-                                padding_mask=padding_mask,
-                            )
-                            if layer_cp_metadata is not None:
-                                layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
-                            if mhc_manager is not None and isinstance(
-                                layer, HyperConnectionHybridLayer
-                            ):
-                                layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                            hidden_states, _ = layer(**layer_kwargs)
-                        elif layer_cp_metadata is not None:
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                packed_seq_params=layer_packed_seq_params,
-                                packed_sequence_cp_metadata=layer_cp_metadata,
-                            )
-                        else:  # MambaLayer, Expert, or MLP
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
+                    if isinstance(layer, ShortcutMoEBlock):
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                            packed_seq_params=layer_packed_seq_params,
+                            padding_mask=padding_mask,
+                            quant_context_factory=get_inner_quant_context,
+                            quant_config=self.config,
+                        )
+                    else:
+                        with inner_quant_context:
+                            if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                                layer_kwargs = dict(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    sequence_len_offset=sequence_len_offset,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    padding_mask=padding_mask,
+                                )
+                                if mhc_manager is not None and isinstance(
+                                    layer, HyperConnectionHybridLayer
+                                ):
+                                    layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                                hidden_states, _ = layer(**layer_kwargs)
+                            else:  # MambaLayer, Expert, or MLP
+                                hidden_states = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
                                 packed_seq_params=layer_packed_seq_params,
                             )
 
