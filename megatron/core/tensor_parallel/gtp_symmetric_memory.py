@@ -73,8 +73,9 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
     if not is_torch_min_version("2.9.0a0"):
         raise RuntimeError(
             "[GTP] --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require PyTorch >= 2.9: older "
-            "versions cannot create a symmetric memory pool, so the reduce-scatter would "
-            "not be symmetric."
+            "versions cannot create a symmetric memory pool (create_vmm_mem_pool would "
+            "silently fall back to a non-symmetric one, so the reduce-scatter would not "
+            "be symmetric)."
         )
     pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
