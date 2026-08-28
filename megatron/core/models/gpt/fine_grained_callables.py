@@ -198,7 +198,7 @@ class PreProcessNode(ScheduleNode):
     before the main transformer layers.
     """
 
-    def __init__(self, gpt_model, chunk_state, event, stream):
+    def __init__(self, gpt_model, chunk_state, event, stream, lifetime_manager=None):
         """Initializes a preprocessing node.
 
         Args:
@@ -207,9 +207,25 @@ class PreProcessNode(ScheduleNode):
             event: CUDA event for synchronization.
             stream: CUDA stream for execution.
         """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="pre_process")
+        super().__init__(
+            weak_method(self.forward_impl),
+            stream,
+            event,
+            name="pre_process",
+            lifetime_manager=lifetime_manager,
+        )
         self.gpt_model = gpt_model
         self.chunk_state = chunk_state
+
+    def get_lifetime_inputs(self, inputs):
+        """Expose a pipeline receive buffer that is stored on the decoder state."""
+
+        if inputs:
+            return inputs
+        decoder_input = self.chunk_state.decoder_input
+        if decoder_input is None and not self.gpt_model.pre_process:
+            decoder_input = self.gpt_model.decoder.input_tensor
+        return (decoder_input,) if decoder_input is not None else ()
 
     def forward_impl(self):
         """forward pass for pre-processing.
@@ -260,7 +276,7 @@ class PostProcessNode(ScheduleNode):
     after the main transformer layers.
     """
 
-    def __init__(self, gpt_model, chunk_state, event, stream):
+    def __init__(self, gpt_model, chunk_state, event, stream, lifetime_manager=None):
         """Initializes a postprocessing node.
 
         Args:
@@ -269,7 +285,13 @@ class PostProcessNode(ScheduleNode):
             event: CUDA event for synchronization.
             stream: CUDA stream for execution.
         """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="post_process")
+        super().__init__(
+            weak_method(self.forward_impl),
+            stream,
+            event,
+            name="post_process",
+            lifetime_manager=lifetime_manager,
+        )
         self.gpt_model = gpt_model
         self.chunk_state = chunk_state
 
@@ -333,6 +355,7 @@ class TransformerLayerNode(ScheduleNode):
         name="default",
         bwd_dw_callables=None,
         extra_args={},
+        lifetime_manager=None,
     ):
         """Initialize a transformer layer node.
 
@@ -365,6 +388,7 @@ class TransformerLayerNode(ScheduleNode):
             weak_method(self.backward_impl),
             free_input=free_input,
             name=name,
+            lifetime_manager=lifetime_manager,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state
@@ -377,6 +401,7 @@ class TransformerLayerNode(ScheduleNode):
             "is_last_layer_in_mhc_recompute_group", False
         )
         self.post_wgrad_grad_acc_hooks = None
+        self.detached_grad_hook_handles = []
 
         # Create flags to indicate first and last layer
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -395,6 +420,7 @@ class TransformerLayerNode(ScheduleNode):
         Under full recompute only each segment's input survives the forward->backward
         gap; the same node is later re-run with grad enabled to rebuild its state.
         """
+        self._remove_detached_grad_hooks()
         self.inputs = None
         self.output = None
         self.detached = tuple()
@@ -406,6 +432,10 @@ class TransformerLayerNode(ScheduleNode):
         detached.requires_grad = t.requires_grad
         self.before_detached = self.before_detached + (t,)
         self.detached = self.detached + (detached,)
+        if self.lifetime_manager is not None and detached.requires_grad:
+            self.detached_grad_hook_handles.append(
+                self.lifetime_manager.track_detached_leaf(detached)
+            )
         return detached
 
     def forward_impl(self, *args):
@@ -430,10 +460,19 @@ class TransformerLayerNode(ScheduleNode):
 
     def backward(self, *output_grad):
         """Execute backward pass and corresponding hooks."""
-        grads = super().backward(*output_grad)
+        try:
+            grads = super().backward(*output_grad)
+        finally:
+            self._remove_detached_grad_hooks()
         if not self.delay_wgrad_compute and self.is_layer_first_node:
             self._post_backward_hook()
         return grads
+
+    def _remove_detached_grad_hooks(self):
+        """Remove detached-leaf hooks after their gradients have been consumed."""
+        for handle in getattr(self, "detached_grad_hook_handles", ()):
+            handle.remove()
+        self.detached_grad_hook_handles = []
 
     def backward_dw(self):
         """Computes the weight gradients for the transformer layer node."""
@@ -489,6 +528,7 @@ class TransformerLayerNode(ScheduleNode):
 
     def __del__(self):
         # Release reference as early as possible, this helps avoid memory leak.
+        self._remove_detached_grad_hooks()
         self.before_detached = None
         self.detached = None
         self.layer_state = None

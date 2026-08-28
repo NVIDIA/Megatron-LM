@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from typing import List, Optional, Tuple, Union
@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.pipeline_parallel.tensor_lifetime import register_external_tensor
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
 
@@ -328,20 +329,30 @@ class P2PCommunicator:
             recv_next_shape = tensor_shape
 
         def create_tensor_recv_prev():
-            return torch.empty(
+            tensor = torch.empty(
                 recv_prev_shape,
                 requires_grad=True,
                 device=torch.cuda.current_device(),
                 dtype=config.pipeline_dtype,
             )
+            if config.ep_overlap_use_scheduled_tensor_lifetime:
+                register_external_tensor(
+                    tensor, torch.cuda.current_stream(), producer_node="pipeline recv forward"
+                )
+            return tensor
 
         def create_tensor_recv_next():
-            return torch.empty(
+            tensor = torch.empty(
                 recv_next_shape,
                 requires_grad=True,
                 device=torch.cuda.current_device(),
                 dtype=config.pipeline_dtype,
             )
+            if config.ep_overlap_use_scheduled_tensor_lifetime:
+                register_external_tensor(
+                    tensor, torch.cuda.current_stream(), producer_node="pipeline recv backward"
+                )
+            return tensor
 
         if recv_prev:
             if config.pipeline_dtype is None:

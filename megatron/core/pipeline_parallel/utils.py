@@ -17,6 +17,8 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+from .tensor_lifetime import ReleaseAction, ScheduleTensorLifetimeManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -158,6 +160,7 @@ class ScheduleNode:
         name: str = "schedule_node",
         forward_nvtx_name: Optional[str] = None,
         backward_nvtx_name: Optional[str] = None,
+        lifetime_manager: Optional[ScheduleTensorLifetimeManager] = None,
     ):
         """Initialize a schedule node.
 
@@ -177,6 +180,9 @@ class ScheduleNode:
             name (str): Name of the node for debugging purposes.
             forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
             backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
+            lifetime_manager (ScheduleTensorLifetimeManager, optional): Schedule-aware
+                owner for cross-stream tensor retirement. ``None`` preserves the
+                allocator ``record_stream`` behavior.
         """
         self.name = name
         self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
@@ -186,6 +192,7 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.lifetime_manager = lifetime_manager
         self.inputs = None
         self.outputs = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
@@ -215,7 +222,11 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.forward_nvtx_name):
+        node_name = self.forward_nvtx_name
+        lifetime_inputs = (
+            self.get_lifetime_inputs(inputs) if self.lifetime_manager is not None else inputs
+        )
+        with self.stream_acquire_context(node_name) as acquire_token:
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
@@ -236,15 +247,43 @@ class ScheduleNode:
 
             self.output = data
 
-        # Immediately frees input tensors after they are used for nodes
-        # where inputs are no longer needed after computation.
-        if self.free_input:
+        if self.lifetime_manager is not None:
+            assert acquire_token.completion_generation is not None
+            if self.free_input:
+                self.lifetime_manager.retire_and_publish(
+                    lifetime_inputs,
+                    self.output,
+                    action=ReleaseAction.EMPTY_STORAGE,
+                    producer_stream=self.stream,
+                    consumer_stream=self.stream,
+                    consumer_generation=acquire_token.completion_generation,
+                    node=node_name,
+                )
+            else:
+                # These inputs remain protected by the node's autograd state, so only
+                # transfer their leases to the outputs; do not retire their storage.
+                self.lifetime_manager.consume_and_publish(
+                    lifetime_inputs, self.output, producer_stream=self.stream, node=node_name
+                )
+        elif self.free_input:
+            # Immediately frees input tensors after they are used for nodes
+            # where inputs are no longer needed after computation.
             for input in inputs:
                 if input is not None:
                     input.record_stream(self.stream)
                     input.untyped_storage().resize_(0)
 
         return self.output
+
+    def get_lifetime_inputs(self, inputs):
+        """Return explicit or implicit tensors consumed by this node.
+
+        Most nodes consume their positional inputs.  Nodes such as pipeline
+        preprocessing may override this method to expose state-backed inputs to the
+        lifetime manager without changing their forward API.
+        """
+
+        return inputs
 
     def get_output(self):
         """Get the forward output"""
@@ -260,7 +299,8 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.backward_nvtx_name):
+        node_name = self.backward_nvtx_name
+        with self.stream_acquire_context(node_name) as acquire_token:
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)
@@ -268,15 +308,29 @@ class ScheduleNode:
                 f"{len(outputs)} of {type(outputs[0])} is not equal to "
                 f"{len(output_grad)} of {type(output_grad[0])}"
             )
-            output_grad = self.backward_func(outputs, output_grad)
+            consumed_grads = self.backward_func(outputs, output_grad)
+            if self.lifetime_manager is not None:
+                self.lifetime_manager.publish_dirty_detached_grads(self.stream, node_name)
 
-        # output_grad maybe from another stream
-        if output_grad:
-            for g in output_grad:
+        grads = self.get_grad()
+
+        if self.lifetime_manager is not None:
+            assert acquire_token.completion_generation is not None
+            self.lifetime_manager.retire_and_publish(
+                consumed_grads,
+                grads,
+                action=ReleaseAction.DROP_REFERENCE,
+                producer_stream=self.stream,
+                consumer_stream=self.stream,
+                consumer_generation=acquire_token.completion_generation,
+                node=node_name,
+            )
+        elif consumed_grads:
+            # Gradients may have been produced on another stream.
+            for g in consumed_grads:
                 if g is not None:
                     g.record_stream(self.stream)
 
-        grads = self.get_grad()
         self._release_state()
 
         return grads
@@ -302,16 +356,23 @@ class ScheduleNode:
         Args:
             name: Optional name for NVTX range profiling
         """
-        self.event.wait(self.stream)
+        acquire_token = None
+        if self.lifetime_manager is not None:
+            acquire_token = self.lifetime_manager.acquire(self.stream, name or self.name)
+        else:
+            self.event.wait(self.stream)
         if name:
             nvtx_range_push(name)
         try:
             with torch.cuda.stream(self.stream):
-                yield
+                yield acquire_token
         finally:
             if name:
                 nvtx_range_pop(name)
-            self.event.record(self.stream)
+            if self.lifetime_manager is not None:
+                self.lifetime_manager.record(self.stream, acquire_token)
+            else:
+                self.event.record(self.stream)
 
     def _release_state(self):
         """Clear the state of the node"""

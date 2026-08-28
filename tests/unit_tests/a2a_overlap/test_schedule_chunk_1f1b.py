@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.tensor_lifetime import register_external_tensor
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version
@@ -70,6 +71,7 @@ def run_two_chunk_parity(
     extra_kwargs,
     microbatches=1,
     use_padding_mask=False,
+    cast_model_to_config_dtype=False,
     on_plans_built=None,
     on_forward_done=None,
 ):
@@ -83,6 +85,7 @@ def run_two_chunk_parity(
     after release_layer_activations().
     """
     assert len(layers) == 2, "the 1F1B pattern below is written for exactly two chunks"
+    scheduled_lifetime = extra_kwargs.get("ep_overlap_use_scheduled_tensor_lifetime", False)
 
     gpt_models = []
     schedule_plans = []
@@ -97,6 +100,12 @@ def run_two_chunk_parity(
             # build model
             gpt_model, schedule_plan, data = build_model(config, use_padding_mask=use_padding_mask)
             gpt_model.cuda()
+            if cast_model_to_config_dtype:
+                # The production model wrapper casts embeddings as well as TE modules to
+                # params_dtype.  This standalone helper normally omits that wrapper; dense
+                # TE MLPs require the explicit cast because their BF16 weights reject the
+                # otherwise-FP32 embedding activation outside an autocast region.
+                gpt_model.to(dtype=config.params_dtype)
             gpt_models.append(gpt_model)
             datas.append(data)
             schedule_plans.append(schedule_plan)
@@ -134,14 +143,22 @@ def run_two_chunk_parity(
                 on_forward_done(schedule_plans[0])
             capture_0["outputs"].append(f_input_0)
             # overlap
+            b_grad_0 = torch.ones_like(f_input_0)
+            if scheduled_lifetime:
+                register_external_tensor(
+                    b_grad_0, torch.cuda.current_stream(), "unit-test external gradient"
+                )
             f_input_1 = TransformerModelChunkSchedulePlan.run(
-                schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)
+                schedule_plans[1], schedule_plans[0], b_grad=b_grad_0
             )
             capture_1["outputs"].append(f_input_1)
             # last backward
-            TransformerModelChunkSchedulePlan.run(
-                None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)
-            )
+            b_grad_1 = torch.ones_like(f_input_1)
+            if scheduled_lifetime:
+                register_external_tensor(
+                    b_grad_1, torch.cuda.current_stream(), "unit-test external gradient"
+                )
+            TransformerModelChunkSchedulePlan.run(None, schedule_plans[1], b_grad=b_grad_1)
         for i in range(len(gpt_models)):
             for name, param in gpt_models[i].named_parameters():
                 a2a_captures[i][name] = param.grad
@@ -189,15 +206,19 @@ class TestA2AOverlap:
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
+    @pytest.mark.parametrize("scheduled_lifetime", [False, True])
     def test_1f1b_schedule_model_chunk(
-        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers
+        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers, scheduled_lifetime
     ):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
         """
         # create TransformerConfig
-        extra_kwargs = {}
+        extra_kwargs = {
+            "overlap_moe_expert_parallel_comm": True,
+            "ep_overlap_use_scheduled_tensor_lifetime": scheduled_lifetime,
+        }
         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
@@ -206,6 +227,17 @@ class TestA2AOverlap:
             extra_kwargs["mtp_num_layers"] = mtp_layers
             extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         run_two_chunk_parity(layers, extra_kwargs)
+
+    def test_scheduled_tensor_lifetime_with_mixed_dense_layer(self):
+        """Dense-layer Noop dispatch/combine nodes preserve tensor leases."""
+
+        extra_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_layer_freq": [1, 0],
+            "overlap_moe_expert_parallel_comm": True,
+            "ep_overlap_use_scheduled_tensor_lifetime": True,
+        }
+        run_two_chunk_parity([2, 2], extra_kwargs, cast_model_to_config_dtype=True)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
