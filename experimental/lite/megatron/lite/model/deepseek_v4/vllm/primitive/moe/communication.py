@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -18,6 +19,15 @@ from megatron.lite.primitive.modules.dispatcher import (
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe import hybridep
 
 _HOT_PATH_ASSERTS = os.getenv("MLITE_VLLM_HOT_PATH_ASSERTS") == "1"
+
+
+@contextmanager
+def _moe_nvtx_range(name: str):
+    if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
+        yield
+        return
+    with torch.cuda.nvtx.range(name):
+        yield
 
 
 @triton.jit
@@ -873,13 +883,14 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
     def combine(self, expert_output: torch.Tensor) -> torch.Tensor:
         route_outputs = expert_output.index_select(0, self._metadata_route_rows)
         if self.ep_size > 1:
-            source_routes = _DeepEPCombine.apply(
-                self.buffer,
-                route_outputs,
-                self._route_handle,
-                True,
-                False,
-            )
+            with _moe_nvtx_range("moe/deepep/combine"):
+                source_routes = _DeepEPCombine.apply(
+                    self.buffer,
+                    route_outputs,
+                    self._route_handle,
+                    True,
+                    False,
+                )
         else:
             source_routes = route_outputs
         output = _VLLMEPGatherWithBF16Backward.apply(
@@ -929,39 +940,41 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
         )
         if self.ep_size > 1:
             buffer = self._ensure_deepep_buffer(hidden_states)
-            (
-                received_hidden,
-                received_indices,
-                received_weights,
-                received_per_expert_cpu,
-                _,
-            ) = _DeepEPDispatch.apply(
-                buffer,
-                hidden_states,
-                topk_indices,
-                topk_scores,
-                self.num_experts,
-                False,
-                False,
-            )
+            with _moe_nvtx_range("moe/deepep/primary_dispatch"):
+                (
+                    received_hidden,
+                    received_indices,
+                    received_weights,
+                    received_per_expert_cpu,
+                    _,
+                ) = _DeepEPDispatch.apply(
+                    buffer,
+                    hidden_states,
+                    topk_indices,
+                    topk_scores,
+                    self.num_experts,
+                    False,
+                    False,
+                )
             if received_per_expert_cpu.device.type != "cpu":
                 raise RuntimeError("DeepEP expert counts must remain CPU metadata")
             self._local_tpe_list = received_per_expert_cpu.tolist()
             received_per_expert = received_per_expert_cpu
-            (
-                received_fingerprints,
-                received_route_indices,
-                received_route_weights,
-                _,
-                route_handle,
-                _,
-            ) = _dispatch_route_metadata(
-                buffer,
-                route_fingerprints,
-                route_indices,
-                route_weights,
-                self.num_experts,
-            )
+            with _moe_nvtx_range("moe/deepep/metadata_dispatch"):
+                (
+                    received_fingerprints,
+                    received_route_indices,
+                    received_route_weights,
+                    _,
+                    route_handle,
+                    _,
+                ) = _dispatch_route_metadata(
+                    buffer,
+                    route_fingerprints,
+                    route_indices,
+                    route_weights,
+                    self.num_experts,
+                )
         else:
             received_hidden = hidden_states
             received_indices = topk_indices
@@ -980,31 +993,33 @@ class VLLMAlignedNormalDeepEPDispatcher(TokenDispatcher):
             if route_handle is not None
             else int((received_indices >= 0).sum().item())
         )
-        (
-            expert_hidden,
-            expert_probs,
-            output_index,
-            sanitized_indices,
-            positions,
-        ) = _scatter_deepep_routes_with_padding(
-            received_hidden,
-            received_indices,
-            received_weights,
-            received_per_expert,
-            expected_route_count=expected_route_count,
-        )
-        self._metadata_route_rows = _validate_and_order_route_preserving_outputs(
-            expert_hidden,
-            received_hidden,
-            sanitized_indices,
-            received_weights,
-            output_index,
-            received_fingerprints,
-            received_route_indices.reshape(-1),
-            received_route_weights.reshape(-1),
-            route_positions=positions,
-            return_route_rows=True,
-        )
+        with _moe_nvtx_range("moe/deepep/scatter_routes"):
+            (
+                expert_hidden,
+                expert_probs,
+                output_index,
+                sanitized_indices,
+                positions,
+            ) = _scatter_deepep_routes_with_padding(
+                received_hidden,
+                received_indices,
+                received_weights,
+                received_per_expert,
+                expected_route_count=expected_route_count,
+            )
+        with _moe_nvtx_range("moe/deepep/order_routes"):
+            self._metadata_route_rows = _validate_and_order_route_preserving_outputs(
+                expert_hidden,
+                received_hidden,
+                sanitized_indices,
+                received_weights,
+                output_index,
+                received_fingerprints,
+                received_route_indices.reshape(-1),
+                received_route_weights.reshape(-1),
+                route_positions=positions,
+                return_route_rows=True,
+            )
         self._route_handle = route_handle
         self._source_indices = topk_indices
         self._source_weights = topk_scores
