@@ -31,8 +31,16 @@ def _step_nvtx_range(name: str):
     if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
         yield
         return
+    synchronize = (
+        os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1"
+        and name == "optimizer/step"
+    )
+    if synchronize:
+        torch.cuda.synchronize()
     with torch.cuda.nvtx.range(name):
         yield
+    if synchronize:
+        torch.cuda.synchronize()
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):

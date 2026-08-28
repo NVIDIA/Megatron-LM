@@ -19,8 +19,15 @@ def _step_nvtx_range(name: str):
     if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
         yield
         return
+    synchronize = os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1" and (
+        name.endswith("/forward") or name.endswith("/backward")
+    )
+    if synchronize:
+        torch.cuda.synchronize()
     with torch.cuda.nvtx.range(name):
         yield
+    if synchronize:
+        torch.cuda.synchronize()
 
 
 def run_microbatch_loop(
