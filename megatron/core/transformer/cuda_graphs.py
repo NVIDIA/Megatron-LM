@@ -2707,6 +2707,10 @@ class TECudaGraphHelper:
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
                 # by reusing input/output data buffers between graphs.
                 kwargs['_reuse_graph_input_output_buffers'] = True
+            if is_te_min_version("2.19.0"):
+                # MCore consumes parameter gradients through its accumulation hooks during each
+                # replay, before TE can overwrite the static buffers on a later replay.
+                kwargs['clone_param_grads_on_return'] = False
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs

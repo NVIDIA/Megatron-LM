@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
 
@@ -169,6 +169,16 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
+class MediaCacheCoordinatorPolicy(str, Enum):
+    """Routing policy for the DP inference coordinator with media caching."""
+
+    AFFINITY = "affinity"
+    """Prefer ranks assigned the same media key when vision embeddings are cached."""
+
+    LOAD_BALANCED = "load_balanced"
+    """Ignore media affinity and route using prefix affinity and load."""
+
+
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
 
@@ -227,6 +237,54 @@ class ImageProcessingConfig:
     max_num_tiles: int = 1
     use_thumbnail: bool = False
     num_img_embeddings_per_tile: int = 0
+
+
+@dataclass
+class VideoProcessingConfig:
+    """Configuration for decoding raw video bytes into model input tensors."""
+
+    image_config: ImageProcessingConfig
+    num_frames: int = 8
+    temporal_patch_size: int = 1
+    frame_manifest_magic: Optional[bytes] = None
+    """Prefix for payloads encoded as ``magic + UTF-8 {"frame_paths": [...]}``."""
+    video_maintain_aspect_ratio: bool = True
+
+
+@dataclass(frozen=True)
+class MediaPromptSpec:
+    """Map one API media type to the model's prompt-token contract."""
+
+    model_token: str = "<image>"
+    prefix: str = ""
+    suffix: str = ""
+    input_marker: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MultimodalPromptConfig:
+    """Prompt contracts used to lower structured image/video blocks."""
+
+    image_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+    video_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+
+    def get_spec(self, modality: str) -> MediaPromptSpec:
+        """Return the prompt specification for ``image`` or ``video``."""
+        if modality == "image":
+            return self.image_spec
+        if modality == "video":
+            return self.video_spec
+        raise ValueError(f"Unsupported media modality: {modality!r}")
+
+    @classmethod
+    def from_dict(cls, value):
+        """Build from image and video specs."""
+        if not value:
+            return cls()
+        return cls(
+            image_spec=MediaPromptSpec(**value.get("image_spec", {})),
+            video_spec=MediaPromptSpec(**value.get("video_spec", {})),
+        )
 
 
 @dataclass
@@ -366,6 +424,9 @@ class InferenceConfig:
     image_preprocessing_config: Optional[ImageProcessingConfig] = None
     """Configuration for preprocessing raw image payloads."""
 
+    video_preprocessing_config: Optional[VideoProcessingConfig] = None
+    """Configuration for decoding and preprocessing raw video payloads."""
+
     use_flashinfer_fused_rope: Optional[bool] = False
     """
     If True, use flashinfer's fused rope implementation.
@@ -390,6 +451,15 @@ class InferenceConfig:
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
+    vision_embedding_cache_max_bytes: int = 0
+    """Maximum GPU bytes retained for reusable vision embeddings.
+
+    A value of zero disables the cache. Cache entries use an automatically
+    generated media-content key and, unless ``allow_stale_multimodal_embeddings``
+    is enabled, are discarded whenever the inference engine is suspended or its
+    generation epoch changes.
+    """
+
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
         PrefixCachingEvictionPolicy.REF_ZERO
     )
@@ -411,6 +481,25 @@ class InferenceConfig:
     """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
     Higher alpha favors prefix cache hits; lower alpha favors load balance.
     Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
+        MediaCacheCoordinatorPolicy.AFFINITY
+    )
+    """Media-cache routing policy for the DP inference coordinator.
+
+    Media affinity is active only when ``vision_embedding_cache_max_bytes`` is
+    greater than zero. Media-salted prefix affinity is controlled separately by
+    ``prefix_caching_coordinator_policy``.
+    """
+
+    media_cache_routing_weight: float = 1.0
+    """Estimated vision-encoder reuse cost in compact-prompt block units.
+
+    Multimodal coordinator routing combines this media-hit value with the number
+    of matching routing-prefix blocks before blending cache affinity with load
+    using ``prefix_caching_routing_alpha``. The engine independently uses
+    post-expansion hashes for authoritative KV lookup. Must be non-negative.
     """
 
     prefix_caching_mamba_gb: Optional[float] = None
@@ -509,6 +598,14 @@ class InferenceConfig:
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
 
+    allow_stale_multimodal_embeddings: bool = False
+    """Allow projected-media embeddings to survive weight-change boundaries.
+
+    By default, suspend/resume and generation-epoch changes invalidate both the
+    shared vision-embedding cache and request-local vision state. Enable this
+    only when model weights are guaranteed not to change across those boundaries.
+    """
+
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
@@ -516,6 +613,11 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+        if self.media_cache_routing_weight < 0:
+            raise ValueError(
+                "media_cache_routing_weight must be non-negative, "
+                f"got {self.media_cache_routing_weight}"
             )
 
         if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):

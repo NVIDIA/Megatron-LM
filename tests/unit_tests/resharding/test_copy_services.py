@@ -5,6 +5,7 @@
 Covers:
 - ``match_local_ops_by_task_id``: pairing semantics and every error branch.
 - ``CopyService.close()`` default no-op contract.
+- Explicit opt-in for multiple runs per plan.
 """
 
 import pytest
@@ -16,7 +17,10 @@ from megatron.core.resharding.copy_services.base import (
     SendOp,
     match_local_ops_by_task_id,
 )
+from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.nixl_copy_service import NixlCopyService
+from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
 
 
 def _t():
@@ -170,3 +174,12 @@ class TestCopyServiceClose:
 def test_nixl_service_skips_redundant_process_group_barrier():
     """NIXL's ready/data protocol provides its own peer completion."""
     assert NixlCopyService.requires_process_group_barrier is False
+
+
+def test_multiple_runs_per_plan_require_explicit_backend_support():
+    """Third-party services stay model-wide unless they accept the stream contract."""
+    assert CopyService.supports_multiple_runs_per_plan is False
+    assert GlooCopyService.supports_multiple_runs_per_plan is True
+    assert NCCLCopyService.supports_multiple_runs_per_plan is True
+    assert NVSHMEMCopyService.supports_multiple_runs_per_plan is True
+    assert NixlCopyService.supports_multiple_runs_per_plan is False
