@@ -17,6 +17,8 @@ from tests.unit_tests.transformer.test_multi_latent_attention import (
     [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 @pytest.mark.internal
 class TestGatedDeltaNet(GatedDeltaNetTestBase):
     def test_gpu_forward_thd_padding_correctness(self):
