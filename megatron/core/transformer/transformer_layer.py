@@ -1298,6 +1298,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
+                if self._uses_graph_dynamic_dsa_route():
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    cp_balanced_indexer.add_graph_dynamic_plan_static_inputs(
+                        static_inputs, cu_seqlens, self.pg_collection.cp, max_T
+                    )
 
             slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
             if self.config.sequence_parallel:
@@ -1347,6 +1355,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         return static_inputs
 
+    def _uses_graph_dynamic_dsa_route(self):
+        """Whether this layer's captured attention consumes the opt-in route inputs."""
+        core_attention = getattr(self.self_attention, "core_attention", None)
+        has_dsa_indexer = (
+            getattr(self.self_attention, "indexer", None) is not None
+            or getattr(core_attention, "indexer", None) is not None
+        )
+        return (
+            getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
+            and not isinstance(self.self_attention, IdentityOp)
+            and (
+                not self.config.cuda_graph_modules
+                or CudaGraphModule.attn in self.config.cuda_graph_modules
+            )
+            and has_dsa_indexer
+        )
+
     def _get_submodules_under_cudagraphs(self):
         """
         Get the submodules that are covered by cudagraphs.
@@ -1375,8 +1400,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
-    @staticmethod
-    def _decompose_packed_seq_params_to_kwargs(kwargs):
+    def _decompose_packed_seq_params_to_kwargs(self, kwargs):
         """Decompose PackedSeqParams into individual tensor kwargs for CUDA graph.
 
         CUDA graph requires all inputs to be tensors. This extracts the cu_seqlens
@@ -1392,6 +1416,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
         kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
         kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        if self._uses_graph_dynamic_dsa_route():
+            cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(
+                packed_seq_params, kwargs, required=True
+            )
 
     def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
         """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
@@ -1406,6 +1436,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if 'cu_seqlens_q' not in kwargs:
             return
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
+            kwargs, self.config.context_parallel_size, self.config.max_seqlen_per_dp_cp_rank
+        )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
@@ -1422,6 +1457,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # selection for THD to cuDNN fused attention.
             pad_between_seqs=True,
         )
+        if graph_dynamic_plan is not None:
+            cp_balanced_indexer.attach_graph_dynamic_plan(packed_seq_params, graph_dynamic_plan)
+        elif self._uses_graph_dynamic_dsa_route():
+            raise RuntimeError(
+                "TE CUDA graph input is missing graph-dynamic balanced CP route metadata."
+            )
         kwargs['packed_seq_params'] = packed_seq_params
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
