@@ -11,6 +11,7 @@ import torch
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
@@ -61,9 +62,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TENorm, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -296,6 +297,12 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
+            if self.config.moe_use_norm_before_up_proj:
+                self.fc2_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
@@ -372,6 +379,9 @@ class MoELayer(BaseMoELayer):
                     "Install flashinfer-python or set "
                     "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
+                fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
+                if config.fp8 and fp8_recipe == "mxfp8":
+                    require_flashinfer_routed_mxfp8()
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
                 # when using the FlashInfer backend. The flashinfer-jit-cache package
@@ -600,6 +610,8 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if self.config.moe_use_norm_before_up_proj:
+                output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:
