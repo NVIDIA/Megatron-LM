@@ -331,7 +331,9 @@ class TestDSv4HybridAttentionConstructor:
 
     def test_latent_norm_epsilon_is_scoped_to_q_and_kv_latents(self):
         """The dedicated epsilon must not change the compressor norm."""
-        config = _make_config(layernorm_epsilon=1e-5, attention_latent_norm_epsilon=1e-6)
+        config = _make_config(
+            layernorm_epsilon=1e-5, attention_latent_norm_epsilon=1e-6, qk_layernorm=True
+        )
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 

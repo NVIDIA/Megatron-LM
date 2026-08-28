@@ -808,6 +808,8 @@ class TestMegatronMLAArgumentGeneration:
             'dsv4_hybrid',
             '--attention-latent-norm-epsilon',
             '1e-5',
+            '--csa-compress-ratios',
+            '4',
             '--q-lora-rank',
             '32',
             '--hidden-size',
