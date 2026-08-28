@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -9,6 +9,7 @@ import torch
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     paged_stash_copy_kernel,
@@ -319,6 +320,7 @@ class PipelinePreScheduleFunction(torch.autograd.Function):
             ]
             if next_schedule_layer < 0:
                 ctx.stash_manager.reload_paged_tensors(-next_schedule_layer)
+                ctx.stash_manager.finish_te_graph_capture_group_io()
 
         return grad_output + (None, None)
 
@@ -354,6 +356,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
             else:
                 ctx.stash_manager.remove_paged_tensor_from_stash()
 
+        ctx.stash_manager.finish_te_graph_capture_group_io()
         ctx.stash_manager.current_schedule_index += 1
         # return the identical tensor
         return tensor
@@ -417,6 +420,7 @@ class PagedStashManager:
         self.current_layer = None
         self.current_microbatch = None
         self.current_schedule_index = None
+        self._te_graph_capture = False
 
         # Track max tokens needed across all vp_stages grouped by dtype and hidden_size
         self.max_tokens_across_vp_stages = None
@@ -645,6 +649,44 @@ class PagedStashManager:
             ),
         )
 
+    def prepare_stash_buffers(self, config=None):
+        """Allocate and reset buffers for an already-recorded paged-stash schedule.
+
+        This intentionally leaves the iteration and pipeline schedule coordinates unchanged so
+        TE graph capture can recover buffers released by a warmup fallback without pretending to
+        start another training iteration.
+        """
+        assert (
+            self.status == 'captured'
+        ), "Paged stash buffers can only be prepared after the schedule has been captured."
+        if self.stash_buffers is None:
+            cuda_factor = (
+                config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
+            )
+            cpu_factor = (
+                config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
+            )
+            self.allocate_stash_buffers(
+                moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
+                moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
+            )
+
+        assert (
+            self.stash_buffers is not None
+        ), "Paged stash: captured state but stash_buffers is None after allocation."
+        for dtype_buffers in self.stash_buffers.values():
+            for stash_buffer in dtype_buffers.values():
+                stash_buffer.reset()
+        self.overflow.zero_()
+        self.host_spill.zero_()
+        assert (
+            len(self.paged_tensors_to_stash) == 0
+        ), f"paged_tensors_to_stash is not empty {self.paged_tensors_to_stash}"
+        assert len(self.paged_tensors_stash_in_progress) == 0, (
+            f"paged_tensors_stash_in_progress is not empty "
+            f"{self.paged_tensors_stash_in_progress}"
+        )
+
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
         if self._pp_schedule is None:
@@ -675,6 +717,203 @@ class PagedStashManager:
             self.current_microbatch = [0 for _ in range(self.vp_size)]
         self.current_layer[vp_stage_index] = 1
         self.current_microbatch[vp_stage_index] += 1
+
+    def _get_pp_layer_templates(self):
+        """Return per-VP paged-layer templates from the recorded runtime schedule."""
+        if not self._pp_schedule:
+            raise RuntimeError("Paged stash has no recorded pipeline schedule.")
+
+        events = {}
+        for schedule_layer in self._pp_schedule:
+            encoded_layer = abs(schedule_layer)
+            vp_stage = encoded_layer // 1_000_000
+            layer_and_microbatch = encoded_layer % 1_000_000
+            layer_no = layer_and_microbatch // 1_000
+            microbatch_no = layer_and_microbatch % 1_000
+            direction = 1 if schedule_layer > 0 else -1
+            events.setdefault((direction, vp_stage, microbatch_no), []).append(layer_no)
+
+        layer_templates = {}
+        microbatch_starts = {}
+        for vp_stage in range(1, self.vp_size + 1):
+            forward_microbatches = sorted(
+                microbatch_no
+                for direction, event_vp_stage, microbatch_no in events
+                if direction == 1 and event_vp_stage == vp_stage
+            )
+            if not forward_microbatches:
+                continue
+            if forward_microbatches != list(
+                range(forward_microbatches[0], forward_microbatches[-1] + 1)
+            ):
+                raise RuntimeError(
+                    "Paged-stash warmup recorded non-contiguous microbatch IDs for VP stage "
+                    f"{vp_stage}: {forward_microbatches}."
+                )
+
+            template = events[(1, vp_stage, forward_microbatches[0])]
+            for microbatch_no in forward_microbatches:
+                forward_layers = events[(1, vp_stage, microbatch_no)]
+                backward_layers = events.get((-1, vp_stage, microbatch_no))
+                if forward_layers != template:
+                    raise RuntimeError(
+                        "Paged-stash layer order changed across warmup microbatches for VP stage "
+                        f"{vp_stage}: {forward_layers} != {template}."
+                    )
+                if backward_layers != list(reversed(template)):
+                    raise RuntimeError(
+                        "Paged-stash backward layer order does not reverse the forward order for "
+                        f"VP stage {vp_stage}, microbatch {microbatch_no}: "
+                        f"{backward_layers} != {list(reversed(template))}."
+                    )
+
+            layer_templates[vp_stage] = tuple(template)
+            microbatch_starts[vp_stage] = forward_microbatches[0]
+
+        if not layer_templates:
+            raise RuntimeError("Paged-stash warmup did not record any paged layers.")
+        return layer_templates, microbatch_starts
+
+    def _build_te_graph_capture_schedule(self, order):
+        """Expand TE's chunk-level order into capture-only paged-layer entries."""
+        if order is None:
+            raise RuntimeError("Paged stash requires TE's pipeline order for graph capture.")
+
+        layer_templates, microbatch_starts = self._get_pp_layer_templates()
+        next_forward_microbatch = dict(microbatch_starts)
+        next_backward_microbatch = dict(microbatch_starts)
+        schedule = []
+        for chunk_id in order:
+            if not isinstance(chunk_id, int):
+                raise RuntimeError(
+                    "Paged stash requires a chunk-level integer PP order; layer-wise overlap "
+                    f"entry {chunk_id!r} is not supported."
+                )
+            vp_stage = abs(chunk_id)
+            if not 1 <= vp_stage <= self.vp_size:
+                raise RuntimeError(
+                    "Paged stash received an invalid VP stage in TE's graph capture order: "
+                    f"chunk ID {chunk_id}, expected magnitude in [1, {self.vp_size}]."
+                )
+            template = layer_templates.get(vp_stage)
+            if template is None:
+                continue
+            if chunk_id > 0:
+                microbatch_no = next_forward_microbatch[vp_stage]
+                next_forward_microbatch[vp_stage] += 1
+                for layer_no in template:
+                    schedule.append(self.get_schedule_layer(vp_stage, layer_no, microbatch_no))
+            else:
+                microbatch_no = next_backward_microbatch[vp_stage]
+                next_backward_microbatch[vp_stage] += 1
+                for layer_no in reversed(template):
+                    schedule.append(-self.get_schedule_layer(vp_stage, layer_no, microbatch_no))
+
+        if not schedule:
+            raise RuntimeError("The pipeline order did not contain any paged-stash VP stage.")
+        for vp_stage in layer_templates:
+            if next_forward_microbatch[vp_stage] != next_backward_microbatch[vp_stage]:
+                raise RuntimeError(
+                    "Paged-stash pipeline order has unbalanced forward/backward passes for VP "
+                    f"stage {vp_stage}: next forward microbatch "
+                    f"{next_forward_microbatch[vp_stage]}, next backward microbatch "
+                    f"{next_backward_microbatch[vp_stage]}."
+                )
+        return schedule
+
+    def start_te_graph_capture(self, order, config=None):
+        """Temporarily install TE's final capture order as the paged-stash schedule."""
+        if self.status != 'captured':
+            raise RuntimeError(
+                "Paged stash must finish its schedule and buffer warmup before TE graph capture."
+            )
+        if self._te_graph_capture:
+            raise RuntimeError("Paged-stash TE graph capture is already active.")
+        capture_schedule = self._build_te_graph_capture_schedule(order)
+        self.prepare_stash_buffers(config)
+        runtime_state = (
+            self.enabled,
+            self._pp_schedule,
+            self.current_schedule_index,
+            self.current_layer,
+            self.current_microbatch,
+            self.current_vp_stage,
+        )
+        self._pp_schedule = capture_schedule
+        # Forward-only evaluation disables the singleton manager and can run immediately before
+        # capture. Capture readiness is tracked by ``status``; temporarily re-enable the manager
+        # so the directly-invoked TE callables still execute their stash hooks.
+        self.enabled = True
+        self._te_graph_capture = True
+        self.current_schedule_index = 0
+        # Install capture-private schedule coordinates. The list cursors must not alias the
+        # saved runtime lists; the VP stage stays unset until decoded from the capture schedule.
+        self.current_layer = None
+        self.current_microbatch = None
+        self.current_vp_stage = None
+        return runtime_state
+
+    def finish_te_graph_capture(self, runtime_state):
+        """Leave TE capture mode and restore the current global-batch schedule."""
+        if not self._te_graph_capture:
+            return
+        self._te_graph_capture = False
+        (
+            self.enabled,
+            self._pp_schedule,
+            self.current_schedule_index,
+            self.current_layer,
+            self.current_microbatch,
+            self.current_vp_stage,
+        ) = runtime_state
+
+    def finish_te_graph_capture_group_io(self):
+        """Join auxiliary stash streams before a TE per-layer graph capture ends."""
+        if not self._te_graph_capture:
+            return
+
+        self.wait_for_stash_to_complete()
+        if self._unpack_stream_status == 'reloading':
+            torch.cuda.current_stream().wait_stream(self.unpack_stream)
+            self._unpack_stream_status = 'idle'
+
+    def prepare_te_graph_capture_forward(self):
+        """Align CPU schedule state before each TE capture-time MoE forward.
+
+        ``make_graphed_callables`` captures layers directly without calling the model-level
+        paged-stash chunk handlers. Reuse the already-recorded pipeline schedule as the
+        source of truth for each capture-time forward.
+        """
+        if not self._te_graph_capture:
+            return
+        if self.current_schedule_index == len(self._pp_schedule):
+            self.current_schedule_index = 0
+        if not 0 <= self.current_schedule_index < len(self._pp_schedule):
+            raise RuntimeError(
+                "Paged-stash TE graph capture schedule index is out of range: "
+                f"{self.current_schedule_index} of {len(self._pp_schedule)}."
+            )
+
+        schedule_layer = self._pp_schedule[self.current_schedule_index]
+        if schedule_layer <= 0:
+            raise RuntimeError(
+                "Paged-stash TE graph capture expected a forward schedule entry, "
+                f"but found {schedule_layer} at index {self.current_schedule_index}."
+            )
+
+        vp_stage = schedule_layer // 1_000_000
+        layer_and_microbatch = schedule_layer % 1_000_000
+        layer_no = layer_and_microbatch // 1_000
+        microbatch_no = layer_and_microbatch % 1_000
+        if not 1 <= vp_stage <= self.vp_size:
+            raise RuntimeError(f"Paged-stash TE graph capture decoded invalid VP stage {vp_stage}.")
+
+        if self.current_layer is None or len(self.current_layer) != self.vp_size:
+            self.current_layer = [1 for _ in range(self.vp_size)]
+            self.current_microbatch = [0 for _ in range(self.vp_size)]
+        self.current_vp_stage = vp_stage - 1
+        self.current_layer[self.current_vp_stage] = layer_no
+        self.current_microbatch[self.current_vp_stage] = microbatch_no
 
     def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
         """
@@ -849,6 +1088,7 @@ def paged_stash_group_start(tensor):
     stash_manager = PagedStashManager.get_instance()
     if not stash_manager.enabled:
         return tensor
+    stash_manager.prepare_te_graph_capture_forward()
     return PipelinePreScheduleFunction.apply(tensor, stash_manager)
 
 
@@ -886,6 +1126,21 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
     stash_manager.update_model_chunk(stash_manager.current_vp_stage)
 
 
+@contextmanager
+def paged_stash_te_graph_capture(enabled, order=None, config=None):
+    """Scope TE capture over a stash schedule built from TE's final capture order."""
+    if not enabled:
+        yield
+        return
+
+    stash_manager = PagedStashManager.get_instance()
+    runtime_state = stash_manager.start_te_graph_capture(order, config=config)
+    try:
+        yield
+    finally:
+        stash_manager.finish_te_graph_capture(runtime_state)
+
+
 def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
@@ -907,45 +1162,11 @@ def paged_stash_reset(enabled=True, config=None):
         stash_manager.status = 'capture'
     elif stash_manager.status == 'capture':
         stash_manager.status = 'captured'
-        cuda_factor = config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
-        cpu_factor = config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
-        stash_manager.allocate_stash_buffers(
-            moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
-            moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
-        )
-    elif stash_manager.status == 'captured':
-        # Buffers may have been released after a PagedStashRunner fallback; reallocate using
-        # the same capture-derived maxima and current config factors.
-        if stash_manager.stash_buffers is None:
-            cuda_factor = (
-                config.moe_paged_stash_buffer_size_factor_cuda if config is not None else 1.10
-            )
-            cpu_factor = (
-                config.moe_paged_stash_buffer_size_factor_cpu if config is not None else 0.0
-            )
-            stash_manager.allocate_stash_buffers(
-                moe_paged_stash_buffer_size_factor_cuda=cuda_factor,
-                moe_paged_stash_buffer_size_factor_cpu=cpu_factor,
-            )
 
     if stash_manager.status == 'captured':
-        assert (
-            stash_manager.stash_buffers is not None
-        ), "Paged stash: captured state but stash_buffers is None after reset/allocation."
-        for dtype in stash_manager.stash_buffers.keys():
-            for hidden_size in stash_manager.stash_buffers[dtype].keys():
-                stash_manager.stash_buffers[dtype][hidden_size].reset()
-        stash_manager.overflow.zero_()
-        stash_manager.host_spill.zero_()
+        stash_manager.prepare_stash_buffers(config)
         stash_manager.current_layer = [1 for _ in range(stash_manager.vp_size)]
         stash_manager.current_microbatch = [0 for _ in range(stash_manager.vp_size)]
-        assert (
-            len(stash_manager.paged_tensors_to_stash) == 0
-        ), f"paged_tensors_to_stash is not empty {stash_manager.paged_tensors_to_stash}"
-        assert len(stash_manager.paged_tensors_stash_in_progress) == 0, (
-            f"paged_tensors_stash_in_progress is not empty "
-            f"{stash_manager.paged_tensors_stash_in_progress}"
-        )
 
 
 def check_paged_stash_overflow():
@@ -975,6 +1196,8 @@ class PagedStashRunner:
         self.model = model
         self.optimizer = optimizer
         self.forward_backward_func = forward_backward_func
+        self._te_graph_capture_finished = False
+        self._te_graph_runtime_num_microbatches: int | None = None
         self.moe_layers = []
         # TransformerConfig objects that must stay in sync for moe_paged_stash: the training
         # loop `config` (schedules / paged_stash_reset) plus each VP chunk's GPT root config
@@ -1033,6 +1256,11 @@ class PagedStashRunner:
         for c in self._configs_to_sync_moe_paged_stash:
             c.moe_paged_stash = value
 
+    def mark_te_graph_captured(self, num_microbatches: int) -> None:
+        """Record rank-consistent TE capture completion and its runtime schedule size."""
+        self._te_graph_capture_finished = True
+        self._te_graph_runtime_num_microbatches = num_microbatches
+
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
         data_iterator_saved = []
@@ -1083,6 +1311,47 @@ class PagedStashRunner:
         )
         torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM)
         return flags[0].item(), flags[1].item(), flags[2].item()
+
+    def _raise_if_te_whole_moe_graph_overflow(
+        self, stash_overflow_ranks: int, overbudget_ranks: int, training: bool
+    ) -> None:
+        """Fail fast when a captured TE whole-MoE graph exceeds its static buffers."""
+        te_whole_moe_graph_replay = (
+            training
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and self._te_graph_capture_finished
+        )
+        if not te_whole_moe_graph_replay or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
+            return
+
+        raise RuntimeError(
+            "Transformer Engine whole-MoE CUDA graph overflowed its static sync-free buffers: "
+            f"paged stash overflow on {stash_overflow_ranks} rank(s), "
+            f"expert-rank token budget overflow on {overbudget_ranks} rank(s). "
+            "Dynamic fallback is not supported for an already captured TE whole-MoE graph. "
+            "Increase --moe-expert-rank-capacity-factor and/or "
+            "--moe-paged-stash-buffer-size-factor-cuda, then restart the job."
+        )
+
+    def _validate_te_whole_moe_graph_runtime(self, training: bool, num_microbatches: int) -> None:
+        """Require the runtime microbatch count to remain fixed after TE graph capture."""
+        te_whole_moe_paged_stash_replay = (
+            training
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and self.config.moe_paged_stash
+            and self._te_graph_capture_finished
+        )
+        if not te_whole_moe_paged_stash_replay:
+            return
+
+        if num_microbatches != self._te_graph_runtime_num_microbatches:
+            raise RuntimeError(
+                "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
+                "runtime microbatch count after capture: expected "
+                f"{self._te_graph_runtime_num_microbatches}, got {num_microbatches}."
+            )
 
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun"""
@@ -1179,6 +1448,7 @@ class PagedStashRunner:
 
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
+        self._validate_te_whole_moe_graph_runtime(training, num_microbatches)
         saved_moe_paged_stash = self.config.moe_paged_stash
         num_tries = 0
         while True:
@@ -1194,6 +1464,9 @@ class PagedStashRunner:
             result = self.forward_backward_func(*args, **kwargs)
 
             stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
+            self._raise_if_te_whole_moe_graph_overflow(
+                stash_overflow_ranks, overbudget_ranks, training
+            )
             # if no overflow, set the expert_rank_capacity_factor to the original value
             if stash_overflow_ranks == 0 and overbudget_ranks == 0:
                 if host_spill_ranks > 0:
