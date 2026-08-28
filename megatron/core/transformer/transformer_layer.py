@@ -673,10 +673,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutpu
         return attention_output_with_bias, self.attn_norm_manager, residual
 
     def supports_split_output_projection(self) -> bool:
-        """Return whether the configured self-attention supports split execution."""
+        """Return whether this is an attention-only layer that supports split execution."""
         return (
             isinstance(self.self_attention, SplitOutputProjection)
             and self.self_attention.supports_split_output_projection()
+            and isinstance(self.cross_attention, IdentityOp)
+            and isinstance(self.mlp, IdentityOp)
         )
 
     def forward_pre_output_proj(
@@ -693,7 +695,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutpu
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -766,10 +767,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutpu
         attn_state=(),
     ):
         """Apply attention output projection and the original post-attention operations."""
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
-
         if self.supports_split_output_projection():
             attention_output_with_bias = self.self_attention.forward_output_proj(
                 attention_intermediate
@@ -901,14 +898,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutpu
         attn_state=(),
         context_mask: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
-        padding_mask: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
-        """Finish a split attention layer, including its unchanged MLP tail."""
+        """Finish the output projection and post-attention operations."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        hidden_states, context = self._attention_output_proj(
+        return self._attention_output_proj(
             attention_intermediate,
             residual,
             context=context,
@@ -916,13 +911,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutpu
             inference_context=inference_context,
             attn_state=attn_state,
         )
-        output = self._forward_mlp(
-            hidden_states,
-            inference_context,
-            padding_mask=padding_mask,
-            packed_seq_params=packed_seq_params,
-        )
-        return output, context
 
     def _forward_attention(
         self,
@@ -957,7 +945,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutpu
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
         )
         return self._attention_output_proj(
             attention_intermediate,

@@ -126,6 +126,23 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
             and self.mixer.supports_split_output_projection()
         )
 
+    def _prepare_mixer_input(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
+        """Apply the layer's residual conversion and pre-mixer normalization."""
+        residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
+
+        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+        hidden_states = apply_module(self.norm)(hidden_states)
+        return hidden_states, residual
+
+    def _apply_mixer_output(self, mixer_out_with_bias, residual: Tensor) -> Tensor:
+        """Apply the layer's bias-dropout-add tail to a projected mixer output."""
+        with self.bias_dropout_add_exec_handler():
+            return self.mamba_bda(training=self.training, fused=self.config.bias_dropout_fusion)(
+                mixer_out_with_bias, residual, self.hidden_dropout
+            )
+
     def forward_pre_output_proj(
         self,
         hidden_states: Tensor,
@@ -154,12 +171,7 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
-        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = apply_module(self.norm)(hidden_states)
+        hidden_states, residual = self._prepare_mixer_input(hidden_states)
 
         ssm_output = self.mixer.forward_pre_output_proj(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
@@ -176,13 +188,7 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
         """Apply Mamba's output projection and the original residual/BDA operation."""
         del inference_context, padding_mask
         mixer_out_with_bias = self.mixer.forward_output_proj(ssm_output)
-
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
-
-        return hidden_states
+        return self._apply_mixer_output(mixer_out_with_bias, residual)
 
     def forward(
         self,
@@ -194,23 +200,7 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
-        """
-        Perform a forward pass through the Mamba layer.
-
-        This method implements the core computation of a Mamba layer, including
-        the convolution and the selective SSM/SSD.
-
-        Args:
-            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
-                b is batch size, and h is hidden size.
-            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
-            inference_context (BaseInferenceContext, optional): Parameters for inference-time
-                optimizations.
-            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
-
-        Returns:
-            output (Tensor): Transformed hidden states of shape [s, b, h].
-        """
+        """Run the original atomic Mamba path, including inference-specific mixer handling."""
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -221,29 +211,17 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
-            residual = hidden_states
-            if self.config.fp32_residual_connection:
-                residual = residual.float()
-
-            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-            hidden_states = apply_module(self.norm)(hidden_states)
-
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
+            hidden_states, residual = self._prepare_mixer_input(hidden_states)
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
                 mixer_out_with_bias = self.mixer(
                     hidden_states,
                     inference_context=inference_context,
                     packed_seq_params=packed_seq_params,
                 )
-
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mamba_bda(
-                    training=self.training, fused=self.config.bias_dropout_fusion
-                )(mixer_out_with_bias, residual, self.hidden_dropout)
-
-            return hidden_states
+            return self._apply_mixer_output(mixer_out_with_bias, residual)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

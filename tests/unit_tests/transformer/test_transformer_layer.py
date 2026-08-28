@@ -107,6 +107,7 @@ class TestParallelTransformerLayer:
         sequence_length = 32
         micro_batch_size = 2
         parallel_transformer_layer.cuda()
+        parallel_transformer_layer.eval()
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
@@ -114,12 +115,16 @@ class TestParallelTransformerLayer:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states, context = parallel_transformer_layer(
+        output, context = parallel_transformer_layer(
             hidden_states=hidden_states, attention_mask=attention_mask
         )
-        assert hidden_states.shape[0] == sequence_length
-        assert hidden_states.shape[1] == micro_batch_size
-        assert hidden_states.shape[2] == config.hidden_size
+        assert context is None
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == config.hidden_size
+
+    def test_combined_attention_mlp_layer_does_not_support_split_output_projection(self):
+        assert not self.parallel_transformer_layer.supports_split_output_projection()
 
     def test_chunked_mlp(self):
         with torch.no_grad():

@@ -291,6 +291,19 @@ class _GDNBase(MegatronModule, SplitOutputProjection):
         """Output-norm recomputation requires the original atomic forward path."""
         return not self.recompute_norm_out
 
+    def forward_output_proj(
+        self, norm_out: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply a GDN variant's output projection to its normalized recurrence output."""
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
+        return out, out_bias
+
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
 
@@ -343,9 +356,18 @@ class _GDNBase(MegatronModule, SplitOutputProjection):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # pylint: disable=missing-function-docstring
-        raise NotImplementedError
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run a GDN variant's recurrence followed by its output projection."""
+        norm_out = self.forward_pre_output_proj(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
+        return self.forward_output_proj(norm_out)
 
     def _gated_norm_and_a2a(
         self,

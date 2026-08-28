@@ -472,7 +472,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params=None,
     ):
-        """Run the gated delta product mixer on hidden states."""
+        """Run GDP through its normalized recurrence output, before output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         _, batch_size, _ = hidden_states.shape
@@ -526,9 +526,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
             packed_seq_params=packed_seq_params,
         )
 
-        out, out_bias = self.out_proj(y)
-
-        return out, out_bias
+        return y
 
     def _packed_metadata(self, packed_seq_params, pack_length):
         """Return the ``(seq_idx, cu_seqlens)`` pair describing packed (THD) sequences.

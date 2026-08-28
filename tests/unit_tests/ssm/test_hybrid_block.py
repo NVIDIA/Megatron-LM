@@ -278,10 +278,13 @@ class TestHybridBlock:
         assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
         assert "layers.0.shortcut_post_norm.weight" in state_keys
 
+    @pytest.mark.parametrize(
+        "compute_symbol", [Symbols.MAMBA, Symbols.ATTENTION], ids=["mamba", "attention"]
+    )
     @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "overlap"])
-    def test_shortcut_pair_eager_forward_backward(self, parallel):
+    def test_shortcut_pair_eager_forward_backward(self, monkeypatch, compute_symbol, parallel):
         block = self.get_hybrid_block(
-            Symbols.MAMBA + Symbols.MOE,
+            compute_symbol + Symbols.MOE,
             num_moe_experts=1,
             moe_router_topk=1,
             moe_router_pre_softmax=True,
@@ -296,7 +299,20 @@ class TestHybridBlock:
         hidden_states = torch.randn(
             16, 2, block.config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
         )
-        output = block(hidden_states, attention_mask=None)
+        attention_mask = None
+        if compute_symbol == Symbols.ATTENTION:
+            attention_mask = torch.triu(
+                torch.ones(1, 1, 16, 16, dtype=torch.bool, device=hidden_states.device), diagonal=1
+            )
+            compute_layer = block.layers[0].compute_layer
+            assert compute_layer.supports_split_output_projection()
+
+            def fail_if_mlp_runs(*args, **kwargs):
+                pytest.fail("attention shortcut output projection must not execute an MLP")
+
+            monkeypatch.setattr(compute_layer, "_forward_mlp", fail_if_mlp_runs)
+
+        output = block(hidden_states, attention_mask=attention_mask)
         output.float().square().mean().backward()
 
         assert output.shape == hidden_states.shape
