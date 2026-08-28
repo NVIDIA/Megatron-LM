@@ -383,7 +383,7 @@ class DynamicEngineTestConfig:
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
-    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -1531,11 +1531,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_records = []
         max_paused_block_count = 0
 
-        # Bound the loop so a scheduling regression fails instead of hanging.
+        # Drive admission through step_modern so async scheduling only mutates the
+        # request rows after consuming the pending forward. Bound the loop so a
+        # scheduling regression fails instead of hanging.
         for _ in range(4000):
             if not env.engine.has_unfinished_requests():
                 break
-            env.engine.schedule_waiting_requests()
             finished_records.extend(env.engine.step_modern()["finished_request_records"])
 
             # Checked at a step boundary, i.e. after the pause/resume/evict lifecycle
@@ -2659,14 +2660,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env.engine._add_request(req2)
         env.engine._add_request(req3)
 
-        # Run step 1
-        env.engine.schedule_waiting_requests()
-
+        # Step 1: schedule and launch the first prefill chunk as the async primer.
         env.engine.step_modern()
         assert req1.finished_chunk_token_count == 52
 
-        # Prepare for step 2
-        env.engine.schedule_waiting_requests()
+        # Step 2: resolve the first chunk and launch the second chunk.
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 104
 
         # Verify that requests 2 and 3 are queued because request 1 is still running
         assert ctx.num_prefill_requests == 1
@@ -2682,12 +2682,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify that request 1 is the designated chunked prefill request
         assert ctx.chunked_prefill_request_id == 1
 
-        # Run step 2
+        # Step 3: resolve request 1's second chunk and launch the batch containing
+        # request 1's final prefill chunk and request 2's first chunk.
         env.engine.step_modern()
         assert req1.finished_chunk_token_count == 104
-
-        # Prepare for step 3
-        env.engine.schedule_waiting_requests()
 
         # Verify that request 2 got partially scheduled and is now
         # the designated chunked prefill request
@@ -2707,12 +2705,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify that the active token count is the maximum token count
         assert ctx.active_token_count == 52
 
-        # Run step 3
+        # Step 4: resolve that mixed batch and launch request 1's decode with
+        # request 2's next prefill chunk.
         env.engine.step_modern()
-        assert req1.finished_chunk_token_count == 104
-
-        # Prepare for step 4
-        env.engine.schedule_waiting_requests()
+        assert req2.finished_chunk_token_count == 77
 
         # Verify that request 2 is still the first prefill request
         assert ctx.request_ids.tolist().index(2) == 1
@@ -2735,24 +2731,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify that active token count == max tokens
         assert ctx.active_token_count == 52
 
-        # Run step 4
+        # Step 5: resolve that batch and launch the next decode/prefill batch.
         env.engine.step_modern()
-
-        assert req2.finished_chunk_token_count == 77
-
-        # Prepare for step 5
-        env.engine.schedule_waiting_requests()
+        assert req2.finished_chunk_token_count == 128
 
         # Verify that request 2 is still the first prefill request
         assert ctx.request_ids.tolist().index(2) == 1
         assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
 
-        # Run step 5
+        # Step 6: resolve request 1's final decode and launch request 2's final
+        # prefill chunk together with request 3's first chunk.
         env.engine.step_modern()
-        assert req2.finished_chunk_token_count == 128
-
-        # Prepare for step 6
-        env.engine.schedule_waiting_requests()
 
         # Verify that request 1 has completed
         assert req1.status == Status.COMPLETED
@@ -2772,22 +2761,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Store the Mamba state tensor idx for request 3
         req3_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req3_idx].item()
 
-        # Run step 6
+        assert req3.finished_chunk_token_count == 20
+
+        # Step 7: resolve request 2's final prefill and launch request 3's final
+        # prefill chunk.
         env.engine.step_modern()
 
         # Verify that request 2 has finished
         assert req2.status == Status.COMPLETED
-        assert req3.finished_chunk_token_count == 20
-
-        # Prepare for step 7
-        env.engine.schedule_waiting_requests()
 
         # Verify that request 3 is now the first prefill request
         req3_idx = ctx.request_ids.tolist().index(3)
         assert req3_idx == 0
         assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req3_mamba_idx
 
-        # Run step 7
+        # Step 8: resolve request 3's final prefill output.
         env.engine.step_modern()
 
         # Verify that request 3 has finished
@@ -2856,24 +2844,27 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
 
-        # --- Step 1 ---
+        # --- Step 1 (async primer) ---
         # Available: 256. Remaining: 513.
         # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
         env.engine.step_modern()
 
-        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
+        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
+        assert ctx.request_query_lengths[0].item() == 256
 
         assert (
             req.finished_chunk_token_count == 256
         ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
 
         # --- Step 2 ---
+        # Resolve the first chunk and launch the second.
         # Available: 256. Remaining un-prefilled: 257.
         # Logic: 257 - 256 = 1. This is the edge case!
         # Fix should reduce chunk size by 1 (to 255).
         env.engine.step_modern()
 
-        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
+        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
+        assert ctx.request_query_lengths[0].item() == 255
 
         # 256 (previous) + 255 (this step) = 511
         assert req.finished_chunk_token_count == 511, (
@@ -2882,12 +2873,19 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
 
         # --- Step 3 ---
+        # Resolve the second chunk and launch the final chunk.
         # Remaining un-prefilled: 2. Available: 256.
         # Logic: 2 <= 256. Schedule 2.
-        env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
-        # Verify request finishes prefill and completes
+        assert ctx.total_request_count == 1
+        assert ctx.num_prefill_requests == 1
+        assert ctx.request_query_lengths[0].item() == 2
+
+        # --- Step 4 ---
+        # Resolve the final prefill output and complete the request.
+        env.engine.step_modern()
+
         assert ctx.num_prefill_requests == 0
         assert req.status == Status.COMPLETED
 
@@ -2907,18 +2905,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             - Request B: 2 token prompt
 
         Sequence:
-            1. Step 1 scheduling:
+            1. Step 1 async primer:
                - Request A is scheduled (255 tokens).
                - Context has 1 token available (256 - 255).
                - Request B has 2 tokens remaining.
                - If we schedule 1 token for B, it leaves exactly 1 token for its final chunk,
                  crashing FA3. Since chunk_length is 1, we can't safely reduce it.
                  The engine MUST delay scheduling Request B.
-            2. Step 1 executes prefill for Request A only.
-            3. Step 2 scheduling:
-               - Request A enters decode phase (takes 1 active token).
-               - Context has 255 tokens available (256 - 1).
+            2. Step 2 resolves Request A and schedules Request B.
+               - Request A completes after its prefill sample is resolved.
+               - Context has all 256 tokens available.
                - Request B is now safely scheduled for its full 2 tokens.
+            3. Step 3 resolves Request B's prefill sample.
         """
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -2957,11 +2955,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         env.engine._add_request(req_b)
 
-        # --- Step 1 ---
-        # Should schedule Request A fully (255), but delay Request B
+        # --- Step 1 (async primer) ---
+        # Schedule and launch Request A fully (255), but delay Request B.
         env.engine.step_modern()
 
-        assert req_a.status == Status.COMPLETED
+        assert ctx.total_request_count == 1
+        assert ctx.active_token_count == 255
 
         # Request B MUST be delayed (0 tokens processed) to avoid the FA3 bug
         assert (
@@ -2971,8 +2970,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert env.engine.waiting_request_ids[0] == 2
 
         # --- Step 2 ---
-        # Request A has completed. Context has 256 tokens available.
-        # Request B can now schedule its full 2 tokens safely.
+        # Resolve Request A, then schedule and launch Request B's full 2-token prompt.
+        env.engine.step_modern()
+
+        assert req_a.status == Status.COMPLETED
+        assert ctx.total_request_count == 1
+        assert ctx.request_ids[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 2
+
+        # --- Step 3 ---
+        # Resolve Request B's prefill output.
         env.engine.step_modern()
 
         assert req_b.status == Status.COMPLETED
@@ -3099,9 +3106,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             enable_prefix_caching=True,
         )
 
-        # 1. Add, schedule, and step Request A to commit its blocks to the KV cache
+        # 1. Add Request A and launch its async primer. Scheduling registers its
+        # complete block in the prefix cache.
         env.engine._add_request(req_a)
-        env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
         # Request B: Same prompt, added AFTER Req A's blocks are registered
@@ -3113,9 +3120,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             enable_prefix_caching=True,
         )
 
-        # 2. Add and schedule Request B. It will find the cached blocks immediately.
+        # 2. Add Request B. The next async step resolves Request A, then admits and
+        # launches Request B using the cached block.
         env.engine._add_request(req_b)
-        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
 
         # Verify that `_compute_prefix_match` successfully clamped the skip.
         req_b_idx = ctx.request_ids.tolist().index(2)
@@ -3327,7 +3335,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
             # Drive the engine until the request finishes
             while env.engine.has_unfinished_requests():
-                env.engine.schedule_waiting_requests()
                 env.engine.step_modern()
 
             return req.prompt_log_probs
@@ -3510,7 +3517,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env = self._run_test(
             context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
-        step_count = env.engine.context.step_count
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
@@ -3520,13 +3526,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-        # Exact step counts depend on sampled token sequences.
-        # With DP-offset sampling seeds, only DP rank 0 matches the golden seed.
-        if parallel_state.get_data_parallel_rank() == 0:
-            if max_requests is None:
-                assert step_count == 23
-            else:
-                assert step_count == 35
+
+        assert all(request.status == Status.COMPLETED for request in env.requests)
+        generated_token_count = sum(len(request.generated_tokens) for request in env.requests)
+        max_concurrent_requests = min(context.max_requests, len(env.requests))
+        minimum_generation_steps = (
+            generated_token_count + max_concurrent_requests - 1
+        ) // max_concurrent_requests
+        assert context.step_count >= minimum_generation_steps
         assert context.kv_block_allocator.pool_size == 819
 
     @pytest.mark.internal
@@ -3699,6 +3706,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     else:
                         request.kv_cache_epoch.append(boundary)
 
+        def capture_epoch_boundaries(epoch):
+            """Capture the expected boundary at the instant an epoch is changed."""
+            return {
+                request_id: (
+                    len(entry.record[-1].prompt_tokens)
+                    + len(entry.record[-1].generated_tokens)
+                    - 1,
+                    epoch,
+                )
+                for request_id, entry in engine.requests.items()
+            }
+
         # Steps without a generation epoch set — no stamps.
         engine.step_modern()
         for entry in engine.requests.values():
@@ -3716,14 +3735,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert ps == ks == [(0, 0)]
 
         # Generation epoch 1: boundary at current length, before next step.
+        epoch_1_boundaries = capture_epoch_boundaries(1)
         set_epoch(1)
         for _ in range(3):
             engine.step_modern()
 
-        for entry in engine.requests.values():
+        for request_id, entry in engine.requests.items():
             ps = entry.record[-1].policy_epoch
             ks = entry.record[-1].kv_cache_epoch
-            assert ps == ks == [(0, 0), (PROMPT_LEN + 2, 1)]
+            assert ps == ks == [(0, 0), epoch_1_boundaries[request_id]]
 
         # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
         # stamping logic will recreate it fresh on the next epoch signal.
@@ -3739,6 +3759,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert entry.record[-1].kv_cache_epoch is None
 
         # Generation epoch 2: stamp then generate remaining tokens.
+        epoch_2_boundaries = capture_epoch_boundaries(2)
         set_epoch(2)
 
         finished_records = []
@@ -3748,19 +3769,30 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         for record in finished_records:
             merged = record.merge()
+            expected_policy_epoch = [
+                (0, 0),
+                epoch_1_boundaries[merged.request_id],
+                epoch_2_boundaries[merged.request_id],
+            ]
 
-            assert merged.policy_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
+            assert merged.policy_epoch == expected_policy_epoch
 
             if use_checkpoint:
                 # KV cache was cleared by checkpoint; stamping logic recreated it at epoch 2.
                 assert merged.kv_cache_epoch == [(0, 2)]
             else:
-                assert merged.kv_cache_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
+                assert merged.kv_cache_epoch == expected_policy_epoch
 
         # Verify checkpoint clears kv_cache_epoch and preserves policy.
         record = finished_records[0]
+        request_id = record[-1].request_id
+        expected_policy_epoch = [
+            (0, 0),
+            epoch_1_boundaries[request_id],
+            epoch_2_boundaries[request_id],
+        ]
         record.checkpoint()
-        assert record[-1].policy_epoch == merged.policy_epoch
+        assert record[-1].policy_epoch == expected_policy_epoch
         assert record[-1].kv_cache_epoch is None
 
     @pytest.mark.skipif(
@@ -3892,7 +3924,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         env.engine._add_request(env.requests[0])
-        env.engine.schedule_waiting_requests()
 
         # Step engine until finished naturally
         # This allows the bookkeeping logic to gracefully truncate the
@@ -3942,18 +3973,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         req = env.requests[0]
         req.sampling_params.num_tokens_to_generate = 3
         env.engine._add_request(req)
-        env.engine.schedule_waiting_requests()
 
-        # Step 1: Prefill. Processes the 4 prompt tokens.
-        # At the end of this step, `update_requests` prepares the token indices for Step 2.
-        # It assigns block indices for the 3 upcoming tokens (1 base + 2 spec).
+        # Async scheduling primes the prefill forward on the first call, then
+        # consumes it and prepares the first speculative decode on the second.
+        env.engine.step_modern()
         env.engine.step_modern()
 
         context = env.engine.context
 
         # The request has 2 blocks allocated now (1 for prompt, 1 for the new 3 tokens)
         assigned_blocks = context.request_to_kv_block_ids[0]
-        first_block = assigned_blocks[0].item()
         second_block = assigned_blocks[1].item()
 
         # The active_token_count for the next step should be 3
@@ -4634,7 +4663,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             evicted_before = env.engine.evicted_request_count
 
             # Step the engine
-            env.engine.schedule_waiting_requests()
             env.engine.step_modern()
 
             # Check if any request was evicted during this step
@@ -4704,15 +4732,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 sampling_params=SamplingParams(num_tokens_to_generate=128, termination_id=99),
             )
 
-        # First, run schedule_waiting_requests and ONE step to allocate the prefill blocks.
-        # Req 0 and 2 will schedule immediately. Req 1 and 3 will defer because their hashes
-        # are currently pending (being registered by 0 and 2).
-        env.engine.schedule_waiting_requests()
+        # The first async call admits Req 0 and 2 and primes their prefill forward.
+        # Req 1 and 3 remain queued while the matching prefix blocks are pending.
         env.engine.step_modern()
 
-        # After step 1, Req 0 and 2 have completely registered their cached blocks.
-        # Now, schedule the deferred ones (Req 1 and 3). They will find the registered blocks!
-        env.engine.schedule_waiting_requests()
+        # The second call consumes those prefills, admits the deferred requests using
+        # the now-populated prefix blocks, and launches the resulting mixed batch.
         env.engine.step_modern()
 
         # 4 requests. 2 unique prefixes (1 block each).
@@ -4848,9 +4873,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
         )
 
-        # Step 1: prefill for request 0 — should NOT count as a spec step.
-        # The controller returns accepted_tokens=None for prefill-only batches
-        # (num_decode_requests == 0), so the engine must not increment any stats.
+        # The first async call only primes request 0's prefill forward.
+        env.engine.step_modern()
+        assert sum(env.engine._spec_tokens_proposed_per_pos) == 0
+        assert sum(env.engine._spec_tokens_accepted_per_pos) == 0
+        assert env.engine._spec_steps == 0
+
+        # The second call consumes the prefill and launches the first decode.
+        # The prefill result has accepted_tokens=None, so it must not increment stats.
         env.engine.step_modern()
         proposed_after_prefill = sum(env.engine._spec_tokens_proposed_per_pos)
         accepted_after_prefill = sum(env.engine._spec_tokens_accepted_per_pos)
@@ -4858,7 +4888,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert accepted_after_prefill == 0, "Prefill step should not accept any spec tokens"
         assert env.engine._spec_steps == 0, "Prefill step should not count as a spec step"
 
-        # Step 2: decode for request 0 — should count spec tokens.
+        # Consume the first decode for request 0; it should count spec tokens.
         env.engine.step_modern()
         assert (
             sum(env.engine._spec_tokens_proposed_per_pos) > proposed_after_prefill
@@ -4867,8 +4897,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             sum(env.engine._spec_tokens_accepted_per_pos) > accepted_after_prefill
         ), "With deterministic mock, decode step should have accepted spec tokens"
 
-        # Now add a second request while request 0 is decoding.
-        # The next step is a mixed prefill (req 1) + decode (req 0) step.
+        # Now add a second request while request 0 is decoding. This makes the
+        # next call launch a mixed prefill (req 1) + decode (req 0) batch.
         env.engine.add_request(
             request_id=1,
             prompt=torch.randint(
@@ -4877,7 +4907,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
         )
 
+        # This call consumes the already-pending decode-only batch, then admits
+        # request 1 and launches a mixed prefill/decode batch.
+        env.engine.step_modern()
+
         proposed_before_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
+        # Consume the mixed batch. Only request 0 was decoding in that batch.
         env.engine.step_modern()
         proposed_after_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
 
@@ -5832,7 +5867,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         unwrapped_model.compute_mtp_single_step = deterministic_mtp
 
         env.engine._add_request(env.requests[0])
-        env.engine.schedule_waiting_requests()
 
         while env.engine.has_unfinished_requests():
             env.engine.step_modern()

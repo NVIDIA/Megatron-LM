@@ -83,7 +83,7 @@ class TestInferenceConfig:
     @pytest.mark.parametrize(
         "async_sched_mode, expected",
         [
-            (None, AsyncScheduleMode.LEGACY),
+            (None, AsyncScheduleMode.ASYNC),
             ("legacy", AsyncScheduleMode.LEGACY),
             (AsyncScheduleMode.LEGACY, AsyncScheduleMode.LEGACY),
             ("async", AsyncScheduleMode.ASYNC),
@@ -91,7 +91,7 @@ class TestInferenceConfig:
         ],
     )
     def test_async_sched_mode_default_and_coercion(self, async_sched_mode, expected):
-        """Ensure async scheduling mode defaults to legacy and accepts strings."""
+        """Ensure async scheduling mode defaults to async and accepts strings."""
         kwargs = {} if async_sched_mode is None else {"async_sched_mode": async_sched_mode}
         assert InferenceConfig(**kwargs).async_sched_mode == expected
 
@@ -136,8 +136,22 @@ class TestInferenceConfig:
         assert video_config.video_maintain_aspect_ratio is True
         assert video_config.frame_manifest_magic is None
 
-    def test_async_sched_argparse_plumbing(self):
-        """Ensure the CLI exposes async scheduling mode."""
+    @pytest.mark.parametrize(
+        "cli_args, expected",
+        [
+            ([], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "async"], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "legacy"], "legacy"),
+        ],
+    )
+    def test_async_sched_argparse_plumbing(self, cli_args, expected):
+        """Ensure the CLI defaults to async and supports an explicit legacy opt-out."""
+        parser = _add_inference_args(ArgumentParser())
+        args = parser.parse_args(cli_args)
+        assert args.inference_dynamic_batching_async_sched_mode == expected
+
+    def test_multimodal_argparse_plumbing(self):
+        """Ensure the CLI exposes multimodal inference settings."""
         parser = _add_inference_args(ArgumentParser())
         args = parser.parse_args(
             [
@@ -165,8 +179,41 @@ class TestInferenceConfig:
         with pytest.raises(SystemExit):
             parser.parse_args(["--inference-dynamic-batching-async-sched-mode", invalid_mode])
 
-    def test_inference_setup_config_maps_async_sched_mode(self):
+    @pytest.mark.parametrize(
+        "setup_mode, expected",
+        [
+            (None, AsyncScheduleMode.ASYNC),
+            ("async", AsyncScheduleMode.ASYNC),
+            ("legacy", AsyncScheduleMode.LEGACY),
+        ],
+    )
+    def test_inference_setup_config_maps_async_sched_mode(self, setup_mode, expected):
         """Ensure declarative inference config maps async scheduling mode to runtime config."""
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+        )
+        kwargs = (
+            {}
+            if setup_mode is None
+            else {"inference_dynamic_batching_async_sched_mode": setup_mode}
+        )
+        setup_config = InferenceSetupConfig(**kwargs)
+
+        inference_config = setup_config.to_inference_config(
+            model=model,
+            kv_cache_management_mode="persist",
+            static_kv_memory_pointers=False,
+            enable_cuda_graphs=False,
+            verbose=False,
+        )
+
+        assert inference_config.async_sched_mode == expected
+
+    def test_inference_setup_config_maps_multimodal_fields(self):
+        """Ensure declarative inference config maps multimodal fields to runtime config."""
         model = SimpleNamespace(
             position_embedding_type="rope",
             max_sequence_length=4096,
