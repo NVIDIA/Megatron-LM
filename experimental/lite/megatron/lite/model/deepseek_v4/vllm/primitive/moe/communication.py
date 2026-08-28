@@ -403,11 +403,12 @@ class _DeepEPScatterWithDeterministicBackward(torch.autograd.Function):
             device=ctx.input_device,
         )
         if grad_output.is_cuda:
-            scatter_routes_backward(
-                grad_output.contiguous(),
-                output_index.contiguous(),
-                grad_input,
-            )
+            with _moe_nvtx_range("moe_bwd/route_scatter"):
+                scatter_routes_backward(
+                    grad_output.contiguous(),
+                    output_index.contiguous(),
+                    grad_input,
+                )
         else:
             for start in range(0, output_index.shape[0], _BACKWARD_CHUNK_ROWS):
                 end = min(start + _BACKWARD_CHUNK_ROWS, output_index.shape[0])
@@ -601,15 +602,16 @@ class _VLLMEPGatherWithBF16Backward(torch.autograd.Function):
             grad_hidden = torch.zeros_like(hidden_states) if needs_hidden else None
         grad_weights = torch.zeros_like(topk_weights) if needs_weights else None
 
-        _ordered_route_backward(
-            route_values=hidden_states,
-            topk_weights=topk_weights,
-            output_index=output_index,
-            grad_output=grad_output,
-            grad_routes=grad_hidden,
-            grad_weights=grad_weights,
-            static_mapping_valid=ctx.static_mapping_valid,
-        )
+        with _moe_nvtx_range("moe_bwd/route_gather"):
+            _ordered_route_backward(
+                route_values=hidden_states,
+                topk_weights=topk_weights,
+                output_index=output_index,
+                grad_output=grad_output,
+                grad_routes=grad_hidden,
+                grad_weights=grad_weights,
+                static_mapping_valid=ctx.static_mapping_valid,
+            )
 
         return grad_hidden, None, grad_weights, None, None, None
 
