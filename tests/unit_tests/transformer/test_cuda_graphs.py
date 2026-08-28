@@ -427,6 +427,7 @@ class TestCudaGraphReplay:
         runner.get_mismatch_errors = lambda args, kwargs: []
         runner.get_tensors = lambda args, kwargs, check_types: []
         runner.to_list = lambda value: list(value) if isinstance(value, tuple) else [value]
+        runner._make_pipeline_output_viewless = lambda output: output
         monkeypatch.setattr(
             cuda_graphs_module,
             "ensure_params_ready",
@@ -1229,6 +1230,10 @@ class TestTECudaGraphHelper:
         assert (
             'sample_kwargs' in make_graphed_callables_kwargs
         ), "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        if is_te_min_version("2.19.0"):
+            assert make_graphed_callables_kwargs['clone_param_grads_on_return'] is False
+        else:
+            assert 'clone_param_grads_on_return' not in make_graphed_callables_kwargs
         sample_kwargs = make_graphed_callables_kwargs['sample_kwargs']
 
         # Basic checks

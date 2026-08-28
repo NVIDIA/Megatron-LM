@@ -229,6 +229,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_layers=self.config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=self.vp_stage,
+                pp_group=self.pg_collection.pp,
+                vp_size=self.config.virtual_pipeline_model_parallel_size,
             )
         )
 
@@ -432,6 +434,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        mtp_input_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
@@ -528,7 +531,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -536,6 +539,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
         )
+        if isinstance(decoder_output, tuple):
+            hidden_states, mhc_multistream = decoder_output
+        else:
+            hidden_states = decoder_output
+            mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -559,11 +567,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                mhc_multistream=mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 embedding=self.embedding,
+                mtp_input_mask=mtp_input_mask,
             )
 
         if not self.post_process:
@@ -603,6 +613,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    mtp_input_mask=mtp_input_mask,
+                    metric_avg_group=(
+                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                        or self.pg_collection.dp_cp
+                    ),
                 )
         sequence_parallel_override = False
         if (

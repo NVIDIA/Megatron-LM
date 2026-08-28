@@ -98,24 +98,40 @@ try:
 
             ignore_eos = bool(req.get("ignore_eos", False))
 
-            # Optional vLLM-style multimodal input. Image entries are
-            # base64-encoded bytes ordered to match prompt placeholders.
+            # Optional vLLM-style multimodal input. HTTP callers provide
+            # base64/data-URL bytes; preprocessed tensors are direct-API only.
             request_multi_modal_data = req.get("multi_modal_data") or {}
             if not isinstance(request_multi_modal_data, dict):
                 raise ValueError("multi_modal_data must be a dictionary.")
-            unsupported_modalities = set(request_multi_modal_data) - {"image"}
+            unsupported_modalities = set(request_multi_modal_data) - {"image", "video"}
             if unsupported_modalities:
                 raise ValueError(
-                    "Unsupported multimodal modalities: "
-                    f"{sorted(unsupported_modalities)}; only 'image' is supported."
+                    "Unsupported multimodal modalities: " f"{sorted(unsupported_modalities)}."
                 )
-            encoded_images = request_multi_modal_data.get("image") or []
-            if isinstance(encoded_images, str):
-                encoded_images = [encoded_images]
-            if not isinstance(encoded_images, list):
-                raise ValueError("multi_modal_data.image must be a string or list.")
-            image_bytes_list = [base64.b64decode(encoded_image) for encoded_image in encoded_images]
-            multi_modal_data = {"image": image_bytes_list} if image_bytes_list else None
+            populated_modalities = [
+                modality
+                for modality in ("image", "video")
+                if request_multi_modal_data.get(modality)
+            ]
+            if len(populated_modalities) > 1:
+                raise ValueError("A completions request cannot mix image and video inputs.")
+            multi_modal_data = None
+            if populated_modalities:
+                modality = populated_modalities[0]
+                encoded_media = request_multi_modal_data[modality]
+                if isinstance(encoded_media, str):
+                    encoded_media = [encoded_media]
+                if not isinstance(encoded_media, list) or any(
+                    not isinstance(item, str) for item in encoded_media
+                ):
+                    raise ValueError(f"multi_modal_data.{modality} must be a string or list[str].")
+                media_bytes = [
+                    base64.b64decode(
+                        item.split(",", 1)[1] if item.startswith("data:") and "," in item else item
+                    )
+                    for item in encoded_media
+                ]
+                multi_modal_data = {modality: media_bytes}
 
             sampling_params = SamplingParams(
                 temperature=temperature,
