@@ -33,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _can_prove_all_topk_rows_nonempty,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -407,6 +408,44 @@ def test_dsa_kernel_backend_loader_cache_and_import_errors(monkeypatch):
         dsa_kernels._load_backend(Config)
 
 
+def test_dsa_all_topk_rows_nonempty_certificate():
+    common = {
+        "computes_topk": True,
+        "indexer_topk": 2,
+        "kv_sequence_length": 4,
+        "attention_mask": None,
+        "query_valid_rows": None,
+        "varlen_is_plain_causal": True,
+        "use_local_indexer_varlen": False,
+        "varlen_starts": None,
+        "varlen_ends": None,
+        "key_positions": None,
+    }
+    assert _can_prove_all_topk_rows_nonempty(**common)
+
+    packed_local = {
+        **common,
+        "varlen_is_plain_causal": False,
+        "use_local_indexer_varlen": True,
+        "varlen_starts": torch.tensor([0, 0]),
+        "varlen_ends": torch.tensor([1, 2]),
+    }
+    assert _can_prove_all_topk_rows_nonempty(**packed_local)
+
+    unsupported = [
+        {"computes_topk": False},
+        {"indexer_topk": 0},
+        {"kv_sequence_length": 0},
+        {"attention_mask": torch.zeros((1, 1, 2, 4), dtype=torch.bool)},
+        {"query_valid_rows": torch.ones((1, 2), dtype=torch.bool)},
+        {"varlen_is_plain_causal": False},
+        {**packed_local, "key_positions": torch.arange(4)},
+        {**packed_local, "varlen_ends": None},
+    ]
+    for override in unsupported:
+        assert not _can_prove_all_topk_rows_nonempty(**{**common, **override})
+
+
 def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
     class Config:
         attention_backend = "auto"
@@ -493,7 +532,9 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
         is None
     )
     assert (
-        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, starts.view(1, 1, 1), 1.0, 1)
+        dsa_kernels.run_fused_absorbed_sparse_attention(
+            Config, q, q, starts.view(1, 1, 1), 1.0, 1, all_topk_rows_nonempty=True
+        )
         is None
     )
     assert (
@@ -557,8 +598,9 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
         seen["loss_kwargs"] = kwargs
         return expected_topk_loss
 
-    def run_fused_absorbed_sparse_attention(*args):
+    def run_fused_absorbed_sparse_attention(*args, all_topk_rows_nonempty=False):
         seen["sparse_args"] = args
+        seen["all_topk_rows_nonempty"] = all_topk_rows_nonempty
         return expected_sparse
 
     def run_fused_dsa_attention(**kwargs):
@@ -629,11 +671,12 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     topk_length = torch.ones((1, 1), dtype=torch.int32)
     assert (
         dsa_kernels.run_fused_absorbed_sparse_attention(
-            Config, q, k, topk_indices, 1.0, 1, topk_length
+            Config, q, k, topk_indices, 1.0, 1, topk_length, all_topk_rows_nonempty=True
         )
         is expected_sparse
     )
     assert seen["sparse_args"][-1] is topk_length
+    assert seen["all_topk_rows_nonempty"] is True
 
     assert (
         dsa_kernels.run_fused_dsa_attention(

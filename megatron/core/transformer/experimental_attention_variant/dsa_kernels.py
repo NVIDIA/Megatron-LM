@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from functools import lru_cache
 from importlib import import_module
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -157,6 +158,29 @@ def _resolve_fused_hook(config: TransformerConfig, hook_name: str):
     if fn is None:
         _log_declined_hook(config, hook_name, "hook is not implemented")
     return fn
+
+
+@lru_cache(maxsize=None)
+def _hook_parameter_names(fn):
+    """Return a cached backend-hook signature, or ``None`` for ``**kwargs`` hooks."""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return None
+    return frozenset(signature.parameters)
+
+
+def _hook_kwargs_accepting(fn, **candidate_kwargs):
+    """Keep only optional internal kwargs accepted by a backend hook."""
+    parameter_names = _hook_parameter_names(fn)
+    if parameter_names is None:
+        return candidate_kwargs
+    return {name: value for name, value in candidate_kwargs.items() if name in parameter_names}
 
 
 def use_fused_dsa_kernels(config: TransformerConfig) -> bool:
@@ -312,12 +336,21 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    all_topk_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
+    result = fn(
+        query,
+        key,
+        topk_indices,
+        softmax_scale,
+        v_channels,
+        topk_length,
+        **_hook_kwargs_accepting(fn, all_topk_rows_nonempty=all_topk_rows_nonempty),
+    )
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
     return result
