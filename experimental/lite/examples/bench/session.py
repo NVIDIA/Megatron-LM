@@ -6,8 +6,10 @@ from __future__ import annotations
 import importlib
 import hashlib
 import math
+import os
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,9 +46,29 @@ def _sync(device: str) -> None:
         torch.cuda.synchronize()
 
 
+@contextmanager
+def _nvtx_range(name: str):
+    if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
+        yield
+        return
+    with torch.cuda.nvtx.range(name):
+        yield
+
+
 def _reset_peak_memory(device: str) -> None:
     if _is_cuda_device(device):
         torch.cuda.reset_peak_memory_stats()
+
+
+def _profile_capture_step(cfg: PretrainSessionConfig) -> int | None:
+    if (
+        os.environ.get("MLITE_NSYS_CAPTURE") != "1"
+        or not _is_cuda_device(cfg.device)
+    ):
+        return None
+    if int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))) != 0:
+        return None
+    return int(os.environ.get("MLITE_NSYS_CAPTURE_STEP", cfg.warmup))
 
 
 def _memory_snapshot(device: str) -> dict[str, int]:
@@ -269,32 +291,41 @@ def run_pretrain_session(
 
     step_traces: list[StepTrace] = []
     timings: list[float] = []
+    profile_capture_step = _profile_capture_step(cfg)
 
     _reset_peak_memory(cfg.device)
     mode = rt.eval_mode(handle) if cfg.forward_only else rt.train_mode(handle)
     with mode:
         for step in range(cfg.steps):
-            if cfg.empty_cache_between_steps and _is_cuda_device(cfg.device):
-                torch.cuda.empty_cache()
-            _reset_peak_memory(cfg.device)
+            with _nvtx_range(f"bench/step_{step}"):
+                if cfg.empty_cache_between_steps and _is_cuda_device(cfg.device):
+                    torch.cuda.empty_cache()
+                _reset_peak_memory(cfg.device)
 
-            if not cfg.forward_only:
-                rt.zero_grad(handle)
-            _sync(cfg.device)
-            t0 = time.perf_counter()
-            result = rt.forward_backward(
-                handle,
-                data_iter,
-                loss_fn=None,
-                num_microbatches=cfg.num_microbatches,
-                forward_only=cfg.forward_only,
-            )
-            if not cfg.forward_only and not cfg.no_optimizer:
-                _, grad_norm, _ = rt.optimizer_step(handle)
-                rt.lr_scheduler_step(handle)
-            else:
-                grad_norm = 0.0
-            _sync(cfg.device)
+                if not cfg.forward_only:
+                    rt.zero_grad(handle)
+                _sync(cfg.device)
+                capture_this_step = step == profile_capture_step
+                if capture_this_step:
+                    torch.cuda.profiler.start()
+                t0 = time.perf_counter()
+                with _nvtx_range("bench/forward_backward"):
+                    result = rt.forward_backward(
+                        handle,
+                        data_iter,
+                        loss_fn=None,
+                        num_microbatches=cfg.num_microbatches,
+                        forward_only=cfg.forward_only,
+                    )
+                if not cfg.forward_only and not cfg.no_optimizer:
+                    with _nvtx_range("bench/optimizer"):
+                        _, grad_norm, _ = rt.optimizer_step(handle)
+                        rt.lr_scheduler_step(handle)
+                else:
+                    grad_norm = 0.0
+                _sync(cfg.device)
+                if capture_this_step:
+                    torch.cuda.profiler.stop()
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
             memory = _memory_snapshot(cfg.device)

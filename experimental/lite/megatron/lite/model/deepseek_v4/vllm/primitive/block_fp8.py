@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -15,6 +17,15 @@ from megatron.lite.model.deepseek_v4.quantization import (
     CanonicalBlockFP8Weight,
     requantize_block_fp8_weight,
 )
+
+
+@contextmanager
+def _weight_nvtx_range(name: str):
+    if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
+        yield
+        return
+    with torch.cuda.nvtx.range(name):
+        yield
 
 
 @dataclass(frozen=True)
@@ -62,7 +73,7 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
             # Repeating torch.all(...)->bool for every lazy deployment pack
             # introduces a device-to-host synchronization and can exhaust the
             # CUDA launch path while a full 43-layer EP model is first packed.
-            with torch.no_grad():
+            with torch.no_grad(), _weight_nvtx_range("fp8_weight/source_requantize"):
                 qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
                 ds4_quantization._requantize[
                     ((weight.numel() + 255) // 256,)
@@ -77,7 +88,7 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
                 )
             return CanonicalBlockFP8Weight(qweight, scales)
         return requantize_block_fp8_weight(weight, scales)
-    with torch.no_grad():
+    with torch.no_grad(), _weight_nvtx_range("fp8_weight/dynamic_quantize"):
         from vllm.utils.deep_gemm import per_block_cast_to_fp8
 
         qweight, scales = per_block_cast_to_fp8(
@@ -144,7 +155,7 @@ def bind_source_scale_to_visible_weight(
 
 
 def _post_process(qweight, scales):
-    with torch.no_grad():
+    with torch.no_grad(), _weight_nvtx_range("fp8_weight/post_process"):
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             deepgemm_post_process_fp8_weight_block,
         )
@@ -247,8 +258,10 @@ class DeploymentBlockFP8Adapter:
             and self._cached_weight is not None
             and self._cached_weight.cache_key == key
         ):
-            return self._cached_weight
-        packed = pack_block_fp8_weight(weight)
+            with _weight_nvtx_range("fp8_weight/cache_hit"):
+                return self._cached_weight
+        with _weight_nvtx_range("fp8_weight/cache_miss"):
+            packed = pack_block_fp8_weight(weight)
         if self.cache_weight:
             self._cached_weight = packed
         return packed
@@ -266,13 +279,15 @@ class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
             and self._cached_weight is not None
             and self._cached_weight.cache_key == key
         ):
-            return self._cached_weight
-        canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
-        qweight, scales = _post_process(
-            torch.cat([item.qweight for item in canonical]),
-            torch.cat([item.scales for item in canonical]),
-        )
-        packed = PackedBlockFP8Weight(qweight, scales, key)
+            with _weight_nvtx_range("fp8_weight/fused_cache_hit"):
+                return self._cached_weight
+        with _weight_nvtx_range("fp8_weight/fused_cache_miss"):
+            canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
+            qweight, scales = _post_process(
+                torch.cat([item.qweight for item in canonical]),
+                torch.cat([item.scales for item in canonical]),
+            )
+            packed = PackedBlockFP8Weight(qweight, scales, key)
         if self.cache_weight:
             self._cached_weight = packed
         return packed
@@ -304,8 +319,10 @@ class DeploymentGroupedBlockFP8Adapter:
             and cached is not None
             and cached.cache_key == key
         ):
-            return cached
-        packed = pack_grouped_block_fp8_weight(weights)
+            with _weight_nvtx_range("fp8_weight/grouped_cache_hit"):
+                return cached
+        with _weight_nvtx_range("fp8_weight/grouped_cache_miss"):
+            packed = pack_grouped_block_fp8_weight(weights)
         if self.cache_weight:
             self._cached_weights[slot] = packed
         return packed

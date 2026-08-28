@@ -6,6 +6,7 @@ from __future__ import annotations
 import gc
 import os
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -23,6 +24,15 @@ from megatron.lite.runtime.contracts.loss import (
     split_loss_context,
     use_loss_context,
 )
+
+
+@contextmanager
+def _step_nvtx_range(name: str):
+    if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
+        yield
+        return
+    with torch.cuda.nvtx.range(name):
+        yield
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -632,11 +642,13 @@ class MegatronLiteRuntime(RuntimeBase):
     def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
         if handle._optimizer is None:
             return True, 0.0, 0
-        update_successful, grad_norm, num_zeros = handle._optimizer.step()
+        with _step_nvtx_range("optimizer/step"):
+            update_successful, grad_norm, num_zeros = handle._optimizer.step()
         if update_successful:
             hook = handle._extras.get("post_optimizer_step_hook")
             if callable(hook):
-                hook()
+                with _step_nvtx_range("optimizer/post_step_hook"):
+                    hook()
         return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
