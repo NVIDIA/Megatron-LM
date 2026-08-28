@@ -223,6 +223,46 @@ class DBuffer:
         buffer.allocation_stream = allocation_stream
         return buffer
 
+    def view(self, placements: Iterable[Placement]) -> "DBuffer":
+        """Return a storage-sharing buffer with supported ``placements``.
+
+        Views preserve placements or locally slice one Replicate axis to Flat.
+        Other placement changes require communication and are not views.
+        """
+        placements = tuple(placements)
+        if len(placements) != self.mesh.ndim:
+            raise ValueError(
+                f"Expected {self.mesh.ndim} placements for device mesh, got {len(placements)}."
+            )
+
+        changed_axis = changed_mesh_axis(self.placements, placements)
+        if changed_axis is None:
+            return DBuffer.from_local(
+                self.local_buffer,
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
+            )
+        if isinstance(self.placements[changed_axis], Replicate) and isinstance(
+            placements[changed_axis], Flat
+        ):
+            offset, local_numel = self.layout.get_local_range(self.mesh, placements)
+            local_offset = offset - self.offset
+            if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
+                raise RuntimeError("DBuffer view is not contained in its source local buffer.")
+            return DBuffer.from_local(
+                self.local_buffer.narrow(0, local_offset, local_numel),
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
+            )
+        raise ValueError(
+            "DBuffer.view() supports identical placements or a Replicate-to-Flat slice, "
+            f"got {self.placements!r} -> {placements!r}."
+        )
+
     @classmethod
     def distribute_tensors(
         cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Iterable[Placement]
@@ -350,7 +390,12 @@ class DBuffer:
         if isinstance(old_placement, Partial) and isinstance(new_placement, Flat):
             return self.reduce_scatter(axis, new_placement, out=out)
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
-            return self.scatter(axis, new_placement, out=out)
+            view = self.view(new_placements)
+            if out is None:
+                return view
+            out = self._create_or_validate_out(out, placements=new_placements)
+            out.local_buffer.copy_(view.local_buffer)
+            return out
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
             # Replicate and Partial share the same local layout, so relabel the
             # buffer without communication. Value-preserving for AVG only -- the
@@ -448,48 +493,6 @@ class DBuffer:
         )
         if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
             out.local_buffer.div_(self.mesh.size(axis))
-        return out
-
-    def scatter(
-        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
-    ) -> "DBuffer":
-        """Locally chunk a Replicate axis into ``new_placement``."""
-        axis = mesh_axis
-        if not isinstance(new_placement, Flat):
-            raise NotImplementedError("DBuffer currently supports scatter() to Flat only.")
-        if not isinstance(self.placements[axis], Replicate):
-            raise ValueError(f"scatter() requires Replicate placement on axis {mesh_axis!r}.")
-
-        placements = list(self.placements)
-        placements[axis] = new_placement
-        _validate_placements(placements)
-
-        if out is None:
-            destination_offset, destination_numel = self.layout.get_local_range(
-                self.mesh, placements
-            )
-        else:
-            out = self._create_or_validate_out(out, placements=placements)
-            destination_offset = out.offset
-            destination_numel = out.local_buffer.numel()
-
-        local_buffer_offset = destination_offset - self.offset
-        if (
-            local_buffer_offset < 0
-            or local_buffer_offset + destination_numel > self.local_buffer.numel()
-        ):
-            raise RuntimeError("scatter() destination is not contained in the source local buffer.")
-        local_slice = self.local_buffer.narrow(0, local_buffer_offset, destination_numel)
-        if out is None:
-            return DBuffer.from_local(
-                local_slice,
-                self.mesh,
-                placements,
-                self.layout.tensor_shapes,
-                allocation_stream=self.allocation_stream,
-            )
-
-        out.local_buffer.copy_(local_slice)
         return out
 
     def get_local_tensor(self, index: int) -> torch.Tensor:

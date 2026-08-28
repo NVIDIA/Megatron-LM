@@ -250,17 +250,20 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
 
-def test_scatter_aliases_owner_and_allgathers_into_it(distributed_setup):
-    """Scatter returns an alias that can materialize its owner in place."""
+def test_view_aliases_owner_and_allgathers_into_it(distributed_setup):
+    """A placement view aliases its owner and can materialize it in place."""
     if distributed_setup.world_size < 2:
-        pytest.skip("DBuffer scatter-alias test requires at least 2 ranks.")
+        pytest.skip("DBuffer view test requires at least 2 ranks.")
 
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     owner = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-    sharded_buffer = owner.scatter(0, Flat())
+    same_layout_view = owner.view([Replicate()])
+    sharded_buffer = owner.view([Flat()])
     owner_data_ptr = owner.local_buffer.data_ptr()
 
+    assert same_layout_view is not owner
+    assert same_layout_view.local_buffer.data_ptr() == owner_data_ptr
     assert (
         sharded_buffer.local_buffer.untyped_storage().data_ptr()
         == owner.local_buffer.untyped_storage().data_ptr()
@@ -283,6 +286,20 @@ def test_scatter_aliases_owner_and_allgathers_into_it(distributed_setup):
         owner.local_buffer,
         torch.arange(owner.local_buffer.numel(), device=owner.device, dtype=owner.dtype),
     )
+
+
+def test_view_rejects_non_aliasing_placement_change(distributed_setup):
+    """A view rejects placement changes that need communication."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("DBuffer view test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    buffer = DBuffer.distribute_tensors(
+        _same_tensors_on_all_ranks(distributed_setup.device), mesh, [Flat()]
+    )
+
+    with pytest.raises(ValueError, match="Replicate-to-Flat slice"):
+        buffer.view([Replicate()])
 
 
 def test_replicate_get_local_tensor_and_dtensor(distributed_setup):
@@ -366,13 +383,13 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     _assert_dbuffer_local_tensors_close(destination, tensors)
 
 
-def test_replicate_scatter_round_trip(distributed_setup):
-    """Replicated buffers locally chunk into sharded buffers and all-gather back."""
+def test_replicate_view_round_trip(distributed_setup):
+    """Replicated buffers view sharded local storage and all-gather back."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
 
     replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-    sharded_buffer = replicated_buffer.scatter(0, Flat())
+    sharded_buffer = replicated_buffer.view([Flat()])
     redistribute_destination = DBuffer(
         mesh=mesh,
         placements=[Flat()],
@@ -700,8 +717,8 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-def test_2d_mesh_replicate_flat_scatter_to_flat_flat(distributed_setup):
-    """Replicate+Flat scatter chunks the existing Flat local shard."""
+def test_2d_mesh_replicate_flat_view_to_flat_flat(distributed_setup):
+    """A Replicate+Flat view chunks the existing Flat local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
 
@@ -713,7 +730,7 @@ def test_2d_mesh_replicate_flat_scatter_to_flat_flat(distributed_setup):
     )
 
     replicated_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
-    fully_sharded_buffer = replicated_sharded_buffer.scatter(0, Flat())
+    fully_sharded_buffer = replicated_sharded_buffer.view([Flat(), Flat()])
     replicated_buffer = fully_sharded_buffer.allgather(0).allgather(1)
 
     assert fully_sharded_buffer.placements == (Flat(), Flat())

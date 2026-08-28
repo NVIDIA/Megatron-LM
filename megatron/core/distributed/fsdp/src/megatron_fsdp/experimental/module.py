@@ -40,8 +40,9 @@ class FsdpContext:
 
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
-    # HFSDP/HSDP need explicit last-microbatch state. Parameter groups track whether
-    # a post-step model-weight sync needs its first all-gather independently.
+    # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
+    # unnecessary because each parameter group tracks whether model_weight is stale
+    # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool

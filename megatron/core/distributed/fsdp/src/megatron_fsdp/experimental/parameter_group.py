@@ -28,7 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Flat, changed_mesh_axis
+from .placement import changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -165,6 +165,7 @@ class FsdpParameterGroup:
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
         else:
             self._symm_mem_pool = None
+
         if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
         else:
@@ -180,20 +181,7 @@ class FsdpParameterGroup:
                     dtype=self.dtype,
                     device=self.main_weight.device,
                 )
-        sync_axis = changed_mesh_axis(model_weight_placements, main_weight_placements)
-        if sync_axis is None:
-            self.post_optimizer_model_weight = self.model_weight
-        elif isinstance(model_weight_placements[sync_axis], Replicate) and isinstance(
-            main_weight_placements[sync_axis], Flat
-        ):
-            self.post_optimizer_model_weight = self.model_weight.scatter(
-                sync_axis, main_weight_placements[sync_axis]
-            )
-        else:
-            raise ValueError(
-                "Optimizer/main-weight placements must match the parameter/model-weight "
-                "placements or be a Replicate-to-Flat slice."
-            )
+        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         # Cast into the preallocated optimizer-layout view on the current stream.
         self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
         self._model_weight_is_stale = (
