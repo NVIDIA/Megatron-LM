@@ -5,6 +5,11 @@ from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+    HCALayerConfig,
+    WindowAttentionLayerConfig,
+)
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -17,7 +22,10 @@ class Symbols:
     GDN = 'G'
     ATTENTION = "*"
     DS_ATTENTION = "D"
+    CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
+    HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
     MLA = "+"
+    WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0)
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
@@ -27,11 +35,22 @@ class Symbols:
         GDN: GDNLayerConfig,
         ATTENTION: AttentionLayerConfig,
         DS_ATTENTION: DSALayerConfig,
+        CSA: CSALayerConfig,
+        HCA: HCALayerConfig,
         MLA: MLALayerConfig,
+        WINDOW: WindowAttentionLayerConfig,
         MLP: MLPLayerConfig,
         MOE: MoELayerConfig,
     }
-    ATTENTION_LAYER_CONFIGS = {AttentionLayerConfig, DSALayerConfig, MLALayerConfig}
+    MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
+    ATTENTION_LAYER_CONFIGS = {
+        AttentionLayerConfig,
+        DSALayerConfig,
+        CSALayerConfig,
+        HCALayerConfig,
+        MLALayerConfig,
+        WindowAttentionLayerConfig,
+    }
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -101,13 +120,15 @@ def validate_tp_comm_overlap(
         has_mtp: Whether this model instance will build an MTP block.
 
     Raises:
-        ValueError: If TP communication overlap is enabled with MLA, DSA, or MTP.
+        ValueError: If TP communication overlap is enabled with MLA, DSA, DSv4 attention, or MTP.
     """
     unsupported_features: list[str] = []
     if Symbols.MLA in segment:
         unsupported_features.append("MLA")
     if Symbols.DS_ATTENTION in segment:
         unsupported_features.append("DSA")
+    if any(symbol in segment for symbol in (Symbols.CSA, Symbols.HCA, Symbols.WINDOW)):
+        unsupported_features.append("DSv4 attention")
     if has_mtp:
         unsupported_features.append("MTP")
 
