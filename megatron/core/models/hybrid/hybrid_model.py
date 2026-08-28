@@ -204,6 +204,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
+                "overlap scheduler does not expand the nested HybridStack."
+            )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
