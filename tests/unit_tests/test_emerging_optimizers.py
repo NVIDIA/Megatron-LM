@@ -804,12 +804,8 @@ class TestMuonOptimizerMultiRankTP:
             model.weight.data, original_weight
         ), "Weight should be updated with mode=blockwise"
 
-    def test_muon_optimizer_per_head_split_gathers_fragmented_heads(self, monkeypatch):
+    def test_muon_optimizer_per_head_split_gathers_fragmented_heads(self):
         """Per-head splitting reconstructs heads that cross TP rank boundaries."""
-        monkeypatch.setattr(
-            "megatron.core.optimizer.emerging_optimizers.EMERGING_OPTIMIZERS_VERSION",
-            Version("0.3.0"),
-        )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         tp_group = pg_collection.tp
         tp_rank = tp_group.rank()
@@ -1101,11 +1097,8 @@ def test_muon_optimizer_qkv_split():
     ), "Weights should be different between split_qkv=True and split_qkv=False"
 
 
-def test_muon_optimizer_qkv_split_per_head_is_opt_in(monkeypatch):
+def test_muon_optimizer_qkv_split_per_head_is_opt_in():
     """Per-head splitting is guarded and differs from projection splitting."""
-    monkeypatch.setattr(
-        "megatron.core.optimizer.emerging_optimizers.EMERGING_OPTIMIZERS_VERSION", Version("0.3.0")
-    )
     grad = torch.arange(48, dtype=torch.float32, device='cuda').view(16, 3)
     projection_param = torch.nn.Parameter(torch.zeros_like(grad))
     projection_param.is_qkv = True
@@ -1159,11 +1152,8 @@ def test_muon_optimizer_qkv_split_per_head_requires_split_qkv():
         )
 
 
-def test_muon_optimizer_uniform_per_head_splits_fall_back_without_batched_ns(monkeypatch):
-    """Uniform per-head splits use individual 2D calls before Emerging-Optimizers 0.3."""
-    monkeypatch.setattr(
-        "megatron.core.optimizer.emerging_optimizers.EMERGING_OPTIMIZERS_VERSION", Version("0.2.0")
-    )
+def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
+    """Uniform per-head splits use Emerging-Optimizers' batched Newton-Schulz path."""
     grad = torch.arange(16, dtype=torch.float32, device='cuda').view(4, 4)
     param = torch.nn.Parameter(torch.zeros_like(grad))
     param.is_qkv = True
@@ -1185,18 +1175,43 @@ def test_muon_optimizer_uniform_per_head_splits_fall_back_without_batched_ns(mon
 
     optimizer.scaled_orthogonalize_fn = center_rows
     actual = optimizer.orthogonalize(param, grad)
-    assert call_shapes == [(2, 4), (2, 4)]
+    assert call_shapes == [(2, 2, 4)]
     expected = torch.cat(
         [head - head.mean(dim=-2, keepdim=True) for head in torch.split(grad, [2, 2])]
     )
     torch.testing.assert_close(actual, expected)
 
 
-def test_muon_optimizer_nonuniform_per_head_splits_do_not_require_batched_ns(monkeypatch):
-    """Nonuniform per-head splits keep using the unbatched compatibility path."""
-    monkeypatch.setattr(
-        "megatron.core.optimizer.emerging_optimizers.EMERGING_OPTIMIZERS_VERSION", Version("0.2.0")
+def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
+    """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
+    torch.manual_seed(42)
+    grad = torch.randn(8, 16, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = [2] * 4
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2] * 4,
+        fp32_matmul_prec="highest",
+        num_ns_steps=2,
+        pg_collection=None,
     )
+
+    actual = optimizer.orthogonalize(param, grad)
+    expected = torch.cat(
+        [
+            optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
+            for head in torch.split(grad, [2] * 4)
+        ]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
+    """Nonuniform per-head splits keep using individual Newton-Schulz calls."""
     grad = torch.arange(12, dtype=torch.float32, device='cuda').view(3, 4)
     param = torch.nn.Parameter(torch.zeros_like(grad))
     param.is_qkv = True
@@ -1209,13 +1224,16 @@ def test_muon_optimizer_nonuniform_per_head_splits_do_not_require_batched_ns(mon
         qkv_split_shapes=[2, 1],
         pg_collection=None,
     )
+    call_shapes = []
 
     def center_rows(x, tp_group=None, partition_dim=None):
         del tp_group, partition_dim
+        call_shapes.append(tuple(x.shape))
         return x - x.mean(dim=-2, keepdim=True)
 
     optimizer.scaled_orthogonalize_fn = center_rows
     actual = optimizer.orthogonalize(param, grad)
+    assert call_shapes == [(2, 4), (1, 4)]
     expected = torch.cat([center_rows(head) for head in torch.split(grad, [2, 1])])
     torch.testing.assert_close(actual, expected)
 
