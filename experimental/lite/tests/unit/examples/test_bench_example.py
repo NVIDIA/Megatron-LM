@@ -257,6 +257,78 @@ def test_bench_main_writes_output_json_only_on_rank_zero(tmp_path, monkeypatch):
     assert not output_path.exists()
 
 
+def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeypatch):
+    from examples.bench.bench import BenchCliConfig, _benchmark_config_snapshot
+
+    monkeypatch.setenv("MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "0")
+    monkeypatch.setenv("MLITE_PROFILE_SYNC_PHASES", "1")
+    snapshot = _benchmark_config_snapshot(
+        BenchCliConfig(
+            model_name="deepseek_v4",
+            impl="vllm",
+            ep=8,
+            steps=10,
+            warmup=5,
+            seq_len=16384,
+            skip_load_hf_weights=True,
+            trace_fingerprints=True,
+            impl_cfg_json=(
+                '{"optimizer":"fsdp2","recompute":["full"],'
+                '"cache_deployment_weights":false}'
+            ),
+        )
+    )
+
+    assert snapshot["load_hf_weights"] is False
+    assert snapshot["optimizer_backend"] == "fsdp2"
+    assert snapshot["parallel"]["ep"] == 8
+    assert snapshot["schedule"]["warmup"] == 5
+    assert snapshot["recompute"] == ["full"]
+    assert snapshot["cache_deployment_weights"] is False
+    assert snapshot["correctness"]["trace_fingerprints"] is True
+    assert snapshot["fp8"]["batched_grouped_weight_quant"] == "0"
+    assert snapshot["profiling"]["sync_phases"] is True
+
+
+def test_result_summary_records_allocated_reserved_and_active_memory():
+    from examples.bench.results import RunResult, StepTrace
+
+    result = RunResult(
+        backend="mlite",
+        model_name="deepseek_v4",
+        impl="vllm",
+        optimizer_backend="fsdp2",
+        tp=1,
+        etp=None,
+        ep=4,
+        pp=1,
+        vpp=1,
+        cp=1,
+        seq_len=16,
+        num_microbatches=1,
+        step_traces=[
+            StepTrace(
+                step=0,
+                loss=1.0,
+                grad_norm=2.0,
+                step_ms=3.0,
+                peak_reserved_bytes=12_000_000_000,
+                post_allocated_bytes=10_000_000_000,
+                post_reserved_bytes=11_000_000_000,
+                active_bytes=9_000_000_000,
+            )
+        ],
+        peak_mem_gb=8.0,
+    )
+
+    summary = result.summary_dict()
+    assert summary["peak_mem_gb"] == 8.0
+    assert summary["peak_reserved_gb"] == 12.0
+    assert summary["post_allocated_gb"] == 10.0
+    assert summary["post_reserved_gb"] == 11.0
+    assert summary["active_gb"] == 9.0
+
+
 def test_result_artifact_summary_and_trace_compare(tmp_path):
     from examples.bench.results import compare_step_traces, load_result_artifact, result_summary
 

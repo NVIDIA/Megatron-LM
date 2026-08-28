@@ -411,6 +411,76 @@ def _step_reporter(trace: StepTrace) -> None:
     print(" ".join(parts), flush=True)
 
 
+def _benchmark_config_snapshot(cfg: BenchCliConfig) -> dict[str, Any]:
+    impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
+    optimizer_backend = None if cfg.no_optimizer else impl_cfg.get("optimizer")
+    return {
+        "schema_version": 1,
+        "backend": cfg.backend,
+        "model_name": cfg.model_name,
+        "impl": cfg.impl,
+        "hf_path": cfg.hf_path,
+        "load_hf_weights": not cfg.skip_load_hf_weights,
+        "build_optimizer": not cfg.skip_optimizer_build,
+        "optimizer_backend": optimizer_backend,
+        "parallel": {
+            "tp": cfg.tp,
+            "etp": cfg.etp,
+            "ep": cfg.ep,
+            "pp": cfg.pp,
+            "vpp": cfg.vpp,
+            "cp": cfg.cp,
+        },
+        "schedule": {
+            "steps": cfg.steps,
+            "warmup": cfg.warmup,
+            "num_microbatches": cfg.num_microbatches,
+            "seq_len": cfg.seq_len,
+            "seed": cfg.seed,
+            "use_thd": cfg.use_thd,
+            "same_data_across_dp": cfg.same_data_across_dp,
+            "forward_only": cfg.forward_only,
+            "no_optimizer": cfg.no_optimizer,
+        },
+        "recompute": list(impl_cfg.get("recompute", [])),
+        "cache_deployment_weights": impl_cfg.get("cache_deployment_weights"),
+        "impl_config": impl_cfg,
+        "overrides": {
+            "ddp": _json_mapping(cfg.override_ddp_json, name="override_ddp_json"),
+            "transformer": _json_mapping(
+                cfg.override_transformer_json, name="override_transformer_json"
+            ),
+            "optimizer": _json_mapping(
+                cfg.override_optimizer_json, name="override_optimizer_json"
+            ),
+        },
+        "memory": {
+            "empty_cache_between_steps": cfg.empty_cache_between_steps,
+            "enforce_steady_memory": cfg.enforce_steady_memory,
+            "max_steady_peak_growth": cfg.max_steady_peak_growth,
+        },
+        "correctness": {
+            "trace_fingerprints": cfg.trace_fingerprints,
+        },
+        "fp8": {
+            "fused_weight_quant": os.environ.get(
+                "MLITE_VLLM_FUSED_WEIGHT_QUANT", "1"
+            ),
+            "fused_ue8m0_weight_quant": os.environ.get(
+                "MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1"
+            ),
+            "batched_grouped_weight_quant": os.environ.get(
+                "MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "1"
+            ),
+        },
+        "profiling": {
+            "nsys_capture": os.environ.get("MLITE_NSYS_CAPTURE") == "1",
+            "nsys_capture_step": os.environ.get("MLITE_NSYS_CAPTURE_STEP"),
+            "sync_phases": os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1",
+        },
+    }
+
+
 def run(cfg: BenchCliConfig) -> dict[str, Any]:
     if cfg.dry_run:
         return build_dry_run_plan(cfg)
@@ -426,6 +496,7 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
         build_session_config(cfg),
         step_reporter=_step_reporter,
     )
+    result.metadata["benchmark_config"] = _benchmark_config_snapshot(cfg)
     artifact = result.to_dict()
     close = getattr(rt, "close", None)
     if close is not None:

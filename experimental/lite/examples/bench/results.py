@@ -76,8 +76,26 @@ class RunResult:
     tflops_per_gpu: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def _memory_summary(self) -> dict[str, float]:
+        fields = {
+            "peak_reserved_gb": "peak_reserved_bytes",
+            "post_allocated_gb": "post_allocated_bytes",
+            "post_reserved_gb": "post_reserved_bytes",
+            "active_gb": "active_bytes",
+        }
+        summary: dict[str, float] = {}
+        for output_name, trace_name in fields.items():
+            values = [
+                value
+                for trace in self.step_traces
+                if (value := getattr(trace, trace_name)) is not None
+            ]
+            if values:
+                summary[output_name] = max(values) / 1e9
+        return summary
+
     def summary_dict(self) -> dict[str, Any]:
-        return {
+        summary = {
             "backend": self.backend,
             "model_name": self.model_name,
             "impl": self.impl,
@@ -89,6 +107,8 @@ class RunResult:
             "tflops_per_gpu": self.tflops_per_gpu,
             "steps_measured": len(self.step_traces),
         }
+        summary.update(self._memory_summary())
+        return summary
 
     def to_dict(self) -> dict[str, Any]:
         return {
